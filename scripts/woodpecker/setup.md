@@ -188,9 +188,14 @@ fields.
 
 ## 4. Secrets
 
-**None are required for the default pipelines.** All gates are deterministic
-and offline-capable apart from image/package downloads (Rust crates, npm
-packages, Gradle distribution/toolchain downloads).
+**No secrets are required for the lanes themselves.** Every gate is
+deterministic and offline-capable apart from image/package downloads (Rust
+crates, npm packages, Gradle distribution/toolchain downloads). The trusted
+workflow's final `attestation` step is the one exception: it is
+**fail-closed** and needs the signing key described below — without it the
+step fails with the typed `signing-key-missing` error and writes no
+attestation (release certification is then impossible, though the build/test
+lanes still record their markers).
 Provider-key (real-model) runs are deliberately not part of the PR/trusted
 pipelines; the nightly `coding-benchmark-real-model` lane records an explicit
 skip marker unless `FAKTOR_BENCH_PROVIDER`, `FAKTOR_BENCH_MODEL` and
@@ -203,10 +208,11 @@ environment (self-hosted) or register project secrets with
 `environment: {FAKTOR_BENCH_API_KEY: {from_secret: ...}}` entries to the lane
 in `.woodpecker/trusted/nightly.yaml`.
 
-The release attestation (`trusted.yaml`, step `attestation`) follows the
-same rule: without a key it is emitted UNSIGNED (loudly) and
-`scripts/certify.sh` refuses it as release-grade evidence. To sign it:
-generate an ed25519 pair with `node scripts/certification/attestation.mjs
+The release attestation (`trusted.yaml`, step `attestation`) is signed or it
+does not exist: `scripts/certification/attestation.mjs create` exits 3 with
+the typed `signing-key-missing` refusal and writes no artifact when the key
+is absent, and `scripts/certify.sh` refuses unsigned objects anyway. To sign
+it: generate an ed25519 pair with `node scripts/certification/attestation.mjs
 keygen --out-key release.pem --out-keys release-keys.json --key-id
 faktor-ci-release`, store the private key as the trusted-project secret
 `faktor_attest_signing_key` (`activate.sh --secret
@@ -214,8 +220,9 @@ faktor_attest_signing_key="$(cat release.pem)"`), add
 `environment: {FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
 faktor_attest_signing_key}, FAKTOR_ATTEST_SIGN_KEY_ID: faktor-ci-release}`
 to the step, and hand operators `release-keys.json` as `FAKTOR_ATTEST_KEYS`
-— never the private key. Sigstore/keyless is the documented upgrade path
-when the instance can mint OIDC tokens.
+— never the private key. Sigstore/keyless signing of the same payload is the
+documented alternative when the instance can mint OIDC tokens
+(`docs/certification.md` §2.12).
 
 Secrets are registered on the **trusted project only** (`activate.sh` targets
 it): a secret that exists for the untrusted PR project would be readable by

@@ -102,6 +102,49 @@ struct VerifiedEntry {
     stored_mtime: Option<SystemTime>,
 }
 
+/// On-disk identity of a blob file at one instant: compressed length +
+/// mtime. A verification is only cached when the identity observed on the
+/// open handle (the bytes actually decoded) still matches the identity at
+/// record time: an in-place corruption or atomic repair landing in between
+/// abandons the record instead of poisoning the LRU with metadata for bytes
+/// that were never verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
+impl FileIdentity {
+    fn of_file(file: &fs::File) -> Option<Self> {
+        file.metadata().ok().map(|m| Self {
+            len: m.len(),
+            mtime: m.modified().ok(),
+        })
+    }
+
+    fn of_path(path: &Path) -> Option<Self> {
+        fs::metadata(path).ok().map(|m| Self {
+            len: m.len(),
+            mtime: m.modified().ok(),
+        })
+    }
+}
+
+/// Test-only interleave seam: fires inside [`Cas::record_verified`] *after*
+/// the decode succeeded but *before* the identity snapshot, so a test can
+/// land a corrupting write in the exact window this race needs. Inert and
+/// never armed outside tests.
+#[cfg(test)]
+#[derive(Default)]
+struct RecordHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for RecordHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecordHook")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic crash seam (fault-certification campaigns only)
 //
@@ -196,6 +239,10 @@ pub struct Cas {
     /// a performance seam for hot paths: every miss is verified streamingly.
     verified: Mutex<VecDeque<VerifiedEntry>>,
     seam: CrashSeam,
+    /// Test-only interleave seam for the record-vs-corruption window; see
+    /// [`RecordHook`].
+    #[cfg(test)]
+    record_hook: RecordHook,
 }
 
 impl Clone for Cas {
@@ -208,6 +255,8 @@ impl Clone for Cas {
             // A crash arm never crosses a clone boundary either: the clone
             // is a fresh instance with an inert seam.
             seam: CrashSeam::default(),
+            #[cfg(test)]
+            record_hook: RecordHook::default(),
         }
     }
 }
@@ -219,6 +268,8 @@ impl Cas {
             writes: AtomicU64::new(0),
             verified: Mutex::new(VecDeque::new()),
             seam: CrashSeam::default(),
+            #[cfg(test)]
+            record_hook: RecordHook::default(),
         }
     }
 
@@ -369,10 +420,11 @@ impl Cas {
         let Ok(file) = fs::File::open(path) else {
             return false;
         };
+        let verified_identity = FileIdentity::of_file(&file);
         let mut sink = std::io::sink();
         match self.decode_verified(hash, file, &mut sink, None) {
             Ok(Some(size)) => {
-                self.record_verified(hash, size, path);
+                self.record_verified(hash, size, path, verified_identity);
                 true
             }
             _ => false,
@@ -455,12 +507,28 @@ impl Cas {
         Some(size)
     }
 
-    fn record_verified(&self, hash: FileHash, size: u64, path: &Path) {
-        let meta = fs::metadata(path).ok();
-        let (stored_len, stored_mtime) = match meta {
-            Some(m) => (m.len(), m.modified().ok()),
-            None => (0, None),
+    /// Record a successful verification in the advisory LRU — but only when
+    /// the blob file identity (length + mtime) observed on the verified
+    /// handle still matches the file at `path` *now*. A concurrent in-place
+    /// corruption or repair inside the decode window changes the identity,
+    /// so the record is abandoned: the cache may never claim bytes are
+    /// verified that were never decoded. Callers MUST pass the identity
+    /// captured from the very handle that was decoded.
+    fn record_verified(
+        &self,
+        hash: FileHash,
+        size: u64,
+        path: &Path,
+        verified_identity: Option<FileIdentity>,
+    ) {
+        #[cfg(test)]
+        self.run_record_hook();
+        let Some(verified_identity) = verified_identity else {
+            return;
         };
+        if FileIdentity::of_path(path) != Some(verified_identity) {
+            return;
+        }
         let mut verified = self.verified.lock().unwrap();
         if let Some(pos) = verified.iter().position(|e| e.hash == hash) {
             verified.remove(pos);
@@ -469,11 +537,27 @@ impl Cas {
             hash,
             size,
             verified_at: Instant::now(),
-            stored_len,
-            stored_mtime,
+            stored_len: verified_identity.len,
+            stored_mtime: verified_identity.mtime,
         });
         while verified.len() > VERIFIED_CACHE_MAX {
             verified.pop_front();
+        }
+    }
+
+    /// Arm the test-only record interleave seam: the hook fires exactly once,
+    /// inside [`Cas::record_verified`], after a decode succeeded and before
+    /// the identity snapshot is taken.
+    #[cfg(test)]
+    pub(crate) fn arm_record_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.record_hook.0.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_record_hook(&self) {
+        let hook = self.record_hook.0.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -594,12 +678,13 @@ impl Cas {
             CasError::Malformed(format!("{hash_hex:?} is not a 64-char hex BLAKE3 hash"))
         })?;
         let file = self.open_blob(hash)?;
+        let verified_identity = FileIdentity::of_file(&file);
         let mut sink = std::io::sink();
         let size = match self.decode_verified(hash, file, &mut sink, None)? {
             Some(s) => s,
             None => unreachable!("no cap means the decode always completes"),
         };
-        self.record_verified(hash, size, &self.blob_path(hash));
+        self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         Ok(ContentVerified {
             hash,
             size,
@@ -617,12 +702,13 @@ impl Cas {
     /// integrity paths.
     pub fn get_verified_now(&self, hash: FileHash) -> CasResult<Vec<u8>> {
         let file = self.open_blob(hash)?;
+        let verified_identity = FileIdentity::of_file(&file);
         let mut out = Vec::new();
         let size = match self.decode_verified(hash, file, &mut out, None)? {
             Some(s) => s,
             None => unreachable!("no cap means the decode always completes"),
         };
-        self.record_verified(hash, size, &self.blob_path(hash));
+        self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         Ok(out)
     }
 
@@ -642,6 +728,7 @@ impl Cas {
             return Ok(None);
         }
         let file = self.open_blob(hash)?;
+        let verified_identity = FileIdentity::of_file(&file);
         let mut out = Vec::new();
         let size = match known {
             // LRU hit (file identity still matches): decode only.
@@ -651,7 +738,7 @@ impl Cas {
         match size {
             Some(size) => {
                 if known.is_none() {
-                    self.record_verified(hash, size, &self.blob_path(hash));
+                    self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
                 }
                 Ok(Some(out))
             }
@@ -665,11 +752,12 @@ impl Cas {
     /// `w` — it may have received bytes before the corruption was found.
     pub fn copy_verified_to<W: Write>(&self, hash: FileHash, mut w: W) -> CasResult<()> {
         let file = self.open_blob(hash)?;
+        let verified_identity = FileIdentity::of_file(&file);
         let size = match self.decode_verified(hash, file, &mut w, None)? {
             Some(s) => s,
             None => unreachable!("no cap means the decode always completes"),
         };
-        self.record_verified(hash, size, &self.blob_path(hash));
+        self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         Ok(())
     }
 
@@ -1201,6 +1289,42 @@ mod tests {
             cas.get_verified_now(h).unwrap(),
             payload,
             "end state must be a valid blob"
+        );
+        assert!(cas.verify_integrity().is_empty());
+    }
+
+    /// Deterministic reproduction of the `concurrent_put_repair_race` flake
+    /// (observed once as `Zstd("Unknown frame descriptor")` at the strict
+    /// fetch): the corrupting writer is interleaved at the exact window —
+    /// after a verification decoded the healthy bytes, before the advisory
+    /// LRU record snapshots the file identity. A record taken in that window
+    /// poisoned the cache with the corrupt file's (len, mtime), so the next
+    /// put deduped instead of repairing. The invariant under test is
+    /// unchanged: after the interleaved corruption exactly one put must
+    /// restore a valid blob and integrity must be clean.
+    #[test]
+    fn corruption_between_decode_and_record_must_not_poison_dedup() {
+        let (_d, cas) = tmp_cas();
+        let payload: Vec<u8> = (0..4096).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+        let h = cas.put(&payload).unwrap();
+        let path = cas.blob_path(h);
+        // Interleave the corruptor exactly inside the verification window.
+        let hook_path = path.clone();
+        cas.arm_record_hook(move || {
+            fs::write(&hook_path, b"deliberate corruption, not valid zstd").unwrap();
+        });
+        // This strict verification decodes the healthy bytes; the hook then
+        // corrupts the blob before the LRU record's identity snapshot.
+        let proof = cas.verify_now(&h.to_hex()).unwrap();
+        assert_eq!(proof.hash, h);
+        // With the poisoned record this put deduped and left the corrupt
+        // blob in place; the record must be abandoned instead, so the put
+        // detects the corruption and repairs it.
+        assert_eq!(cas.put(&payload).unwrap(), h);
+        assert_eq!(
+            cas.get_verified_now(h).unwrap(),
+            payload,
+            "the put after the interleaved corruption must repair the blob"
         );
         assert!(cas.verify_integrity().is_empty());
     }

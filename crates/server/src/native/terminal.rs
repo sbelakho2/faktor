@@ -19,6 +19,21 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+/// The ONE terminal service behind every native terminal operation,
+/// constructed under the INJECTED terminal execution-authority policy (the
+/// host's configured `[sandbox]` shell contract, wired through
+/// [`ServerDeps::terminal_policy`](crate::api::ServerDeps::terminal_policy)).
+/// No handler reads a global policy: the configured mode is enforced and
+/// recorded because it is the policy of the service this daemon built. The
+/// process-wide registry keeps exactly one service per session manager, so
+/// the ACP host and this surface share the same authority.
+fn terminal_service(state: &AppState) -> std::sync::Arc<TerminalService> {
+    TerminalService::for_manager_with_policy(
+        &state.deps.session,
+        state.deps.terminal_policy.clone(),
+    )
+}
+
 /// `GET /native/session/{id}/terminal` — the daemon-level terminal view:
 /// every durable session-owned terminal row (`{id, pid, alive}`), with the
 /// numeric `ptyId` projected additively when a live handle of this boot
@@ -44,7 +59,7 @@ pub(crate) async fn native_session_terminal(
         Ok(sessions) => sessions,
         Err(e) => return api_err(&e),
     };
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     for handle in sessions {
         match service.list(&handle.id().to_string()) {
             Ok(views) => {
@@ -94,7 +109,7 @@ pub(crate) async fn native_terminal_output(
     if terminal_id.trim().is_empty() || terminal_id.len() > 256 {
         return wire_status(malformed_body("invalid terminal id"));
     }
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     match service.output_snapshot(&handle.id().to_string(), &terminal_id) {
         Ok((output, alive)) => Json(serde_json::json!({
             "ok": true,
@@ -141,7 +156,7 @@ fn terminal_event_frame(record: &faktor_session::TerminalLedgerRecord) -> serde_
 /// Refresh the bounded derived event cache of one session from the durable
 /// rows (the cache is NEVER an authority: it is cleared and rebuilt here).
 fn refresh_terminal_events(state: &AppState, session_id: &str) -> Result<(), TerminalServiceError> {
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(state);
     let (records, _) = service.events(session_id, None, TERMINAL_EVENT_RING as u64)?;
     let mut ring = state
         .terminal_events
@@ -183,7 +198,7 @@ pub(crate) async fn native_terminals(
         Err(r) => return *r,
     };
     let sid = handle.id();
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     let sid_string = sid.to_string();
     let views = match tokio::task::spawn_blocking(move || service.list(&sid_string)).await {
         Ok(Ok(views)) => views,
@@ -368,7 +383,7 @@ pub(crate) async fn native_terminal_spawn(
         rows,
         cols,
     };
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     let sid = handle.id().to_string();
     let creation = match tokio::task::spawn_blocking(move || service.spawn(&sid, &request)).await {
         Ok(Ok(creation)) => creation,
@@ -429,7 +444,7 @@ pub(crate) async fn native_terminal_input(
     if body.data.len() > MAX_NATIVE_TERMINAL_INPUT_BYTES {
         return wire_status(malformed_body("terminal input is oversized"));
     }
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     let sid = handle.id().to_string();
     let data = body.data.into_bytes();
     match tokio::task::spawn_blocking(move || service.input(&sid, &terminal_id, &data)).await {
@@ -473,7 +488,7 @@ pub(crate) async fn native_terminal_resize(
         Ok(cols) if cols > 0 => cols,
         _ => return wire_status(malformed_body("terminal cols must be 1..=65535")),
     };
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     let sid = handle.id().to_string();
     match tokio::task::spawn_blocking(move || service.resize(&sid, &terminal_id, rows, cols)).await
     {
@@ -519,7 +534,7 @@ pub(crate) async fn native_terminal_kill(
         Ok(h) => h,
         Err(r) => return *r,
     };
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     let sid = handle.id().to_string();
     match tokio::task::spawn_blocking(move || service.kill(&sid, &terminal_id, &reason)).await {
         Ok(Ok(killed)) => Json(serde_json::json!({ "ok": true, "killed": killed })).into_response(),
@@ -579,7 +594,7 @@ pub(crate) async fn native_terminal_reconcile(
         Ok(h) => h,
         Err(r) => return *r,
     };
-    let service = TerminalService::for_manager(&state.deps.session);
+    let service = terminal_service(&state);
     let sid = handle.id().to_string();
     match tokio::task::spawn_blocking(move || {
         service.reconcile(&sid, &terminal_id, disposition, observed)

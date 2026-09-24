@@ -41,6 +41,12 @@ mod validation;
 /// configured secret names on every backend.
 pub use faktor_core::command::EnvSpec;
 
+// Spawn confinement: the spawn AUTHORITY (the terminal execution policy)
+// decides what OS-level confinement a PTY child runs under; this layer only
+// transports it onto the child command. See `SpawnConfinement` and
+// `Pty::spawn_confined` — on unix the authority's hook is installed before
+// exec; on Windows it is refused typed (never faked).
+
 /// Pure Win32 mapping helpers (error tables, COORD geometry bounds, command
 /// line quoting, env block layout). Windows-only by nature, but compiled on
 /// unix in the test build so the adversarial tests in it run everywhere.
@@ -66,6 +72,40 @@ pub use unix::Pty;
 
 #[cfg(windows)]
 pub use windows::Pty;
+
+/// A caller-supplied, OS-level confinement plan for one PTY child (the
+/// spawn-authority seam; audit P0-39). The AUTHORITY decides what
+/// confinement exists and supplies the install hook ([`PtyConfig`] stays
+/// policy-free); this layer only installs it on the exact command it
+/// spawns, via [`Pty::spawn_confined`]. The hook receives the built child
+/// command before spawn and installs platform confinement on it (e.g. a
+/// pre-exec network-namespace hook); a failure it causes refuses the spawn
+/// before exec, so a child NEVER execs unconfined. On platforms whose
+/// process API cannot install pre-exec hooks (Windows) a confinement is
+/// refused typed, never silently dropped.
+#[derive(Clone)]
+pub struct SpawnConfinement {
+    install: std::sync::Arc<dyn Fn(&mut std::process::Command) + Send + Sync>,
+}
+
+impl SpawnConfinement {
+    /// Wrap one install hook. It runs on the spawning thread and receives
+    /// the child command; the confinement it installs is enforced by the
+    /// OS in the forked child before exec.
+    pub fn new(install: std::sync::Arc<dyn Fn(&mut std::process::Command) + Send + Sync>) -> Self {
+        Self { install }
+    }
+
+    pub(crate) fn install(&self, cmd: &mut std::process::Command) {
+        (self.install)(cmd)
+    }
+}
+
+impl std::fmt::Debug for SpawnConfinement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnConfinement").finish_non_exhaustive()
+    }
+}
 
 /// Spawn configuration for [`Pty`].
 ///

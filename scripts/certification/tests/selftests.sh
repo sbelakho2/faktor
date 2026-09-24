@@ -8,12 +8,15 @@
 #
 # Covered:
 #   scripts/certification/attestation.mjs   create/verify binding + refusal matrix
+#                                           incl. fail-closed signing (no key -> typed
+#                                           refusal, no artifact)
 #   scripts/certify.sh --selftest           immutable context registry, observed-value
 #                                           recording, attestation fetch/verification,
 #                                           certificate wording, temp-name migration
 #   scripts/cross-target-check.sh           status classifier + temp-name migration
 #   scripts/check-gradle-integrity.sh       planted tampering + temp-name migration
-#   scripts/check-ci-image-pins.sh          image pins + apt-residual annotations
+#   scripts/check-ci-image-pins.sh          image pins + apt-snapshot/apt-pinned audit
+#   scripts/build-ci-image.sh --selftest    Faktor CI image pin hygiene
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -40,6 +43,7 @@ run "certify.sh --selftest" bash scripts/certify.sh --selftest
 run "cross-target-check.sh classify selftest" env CROSS_TARGET_SELFTEST=classify bash scripts/cross-target-check.sh
 run "check-gradle-integrity.sh --selftest" bash scripts/check-gradle-integrity.sh --selftest
 run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --selftest
+run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
 
 printf '\n=====================\n'
 if [ "$failures" -eq 0 ]; then

@@ -5450,7 +5450,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/terminal/src/sandbox/linux.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
         // --- function-level allows in mixed files ---
-        ("crates/terminal/src/lib.rs", 12),
+        ("crates/terminal/src/lib.rs", 13),
         ("crates/fs/src/tree_manifest.rs", 3),
         ("crates/git/src/guard.rs", 3),
         ("crates/session/src/actor.rs", 1),

@@ -81,8 +81,8 @@
 //! the absolute path converted to the NT object namespace
 //! ([`dos_path_to_nt_units`]), and a reparse/directory check. Every rooted
 //! content mutation (`create_dir_all`, `open_create_new`, `remove_tree`,
-//! `remove_file`, `atomic_publish`) then acts strictly relative to that
-//! handle:
+//! `remove_file`, `atomic_publish`, `create_symlink`) then acts strictly
+//! relative to that handle:
 //!
 //! * [`anchored_create_dir`] / [`anchored_create_file`]: relative
 //!   `NtCreateFile` with `FILE_CREATE` (exclusive, `EEXIST` on collision);
@@ -92,13 +92,18 @@
 //!   opened reparse-aware relative to its parent and THAT handle is marked
 //!   for disposition (`FileDispositionInfoEx`, POSIX semantics);
 //! * [`anchored_rename`]: `FileRenameInfoEx` with the anchored destination
-//!   parent handle as `RootDirectory`.
+//!   parent handle as `RootDirectory`;
+//! * [`anchored_create_symlink`]: the link entry is created relative to the
+//!   pinned parent (`NtCreateFile` with
+//!   `FILE_CREATE | FILE_OPEN_REPARSE_POINT`) and the symlink reparse
+//!   record built by [`build_symlink_reparse_data`] is written to THAT
+//!   handle with `FSCTL_SET_REPARSE_POINT`.
 //!
 //! After an operation begins, no absolute pathname selects the mutated
 //! object. The `cfg(windows)` seam suite
 //! (`anchored_*_survives_parent_swap_to_outside_junction`) pins this on a
 //! Windows runner: a parent swapped for an outside junction after anchoring
-//! cannot redirect create/delete/recursive-delete/publish.
+//! cannot redirect create/delete/recursive-delete/publish/symlink.
 //!
 //! Honest limits
 //! -------------
@@ -106,15 +111,10 @@
 //! either, so the guarded writers keep the same recheck-to-rename window
 //! unix documents; the anchored mutation surface removes the
 //! swap-the-parent window (handles, not pathnames, select the objects).
-//! `RootedDir::create_symlink` still validates its parent through the
-//! reparse-aware walk and then creates the link with the Win32 API
-//! (reparse creation strictly relative to a parent handle needs
-//! `FSCTL_SET_REPARSE_POINT` with a hand-built reparse record and is the
-//! one documented mutation residual). This module is compiled under
-//! `cfg(test)` on unix hosts too, but only its platform-independent
-//! validators/parser run there; the Win32 walk and the anchored mutation
-//! seam suite require a Windows runner (the code is additionally
-//! type-checked for the MSVC target in a hermetic harness).
+//! This module is compiled under `cfg(test)` on unix hosts too, but only its
+//! platform-independent validators/parser run there; the Win32 walk and the
+//! anchored mutation seam suite require a Windows runner (the code is
+//! additionally type-checked for the MSVC target in a hermetic harness).
 
 #![allow(unsafe_code)] // platform authority module: every unsafe
                        // block/function in this module carries a `// SAFETY:` justification and is
@@ -716,6 +716,62 @@ pub(crate) fn parse_reparse_data(data: &[u8]) -> Result<ParsedReparse, ReparseEr
     }
 }
 
+/// Build the `REPARSE_DATA_BUFFER` payload for an `IO_REPARSE_TAG_SYMLINK`
+/// reparse point — the byte-for-byte record `FSCTL_SET_REPARSE_POINT`
+/// accepts (8-byte buffer header, 12-byte symlink body with the four
+/// offset/length fields and the flags word, then the substitute and print
+/// names as UTF-16). `substitute` is the NT-namespace path for an absolute
+/// target or the literal relative target; `relative` sets
+/// [`SYMLINK_FLAG_RELATIVE`]. An empty target, an embedded NUL, a target
+/// over the NT 32 KiB reparse bound or a non-representable record is a
+/// typed error, never a truncated write.
+pub(crate) fn build_symlink_reparse_data(
+    substitute: &[u16],
+    print: &[u16],
+    relative: bool,
+) -> Result<Vec<u8>, Error> {
+    if substitute.is_empty() {
+        return Err(Error::malformed("symlink target is empty"));
+    }
+    if substitute.contains(&0) || print.contains(&0) {
+        return Err(Error::malformed("symlink target contains a NUL byte"));
+    }
+    let sub_bytes = substitute
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| Error::oversized("symlink target is too long"))?;
+    let print_bytes = print
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| Error::oversized("symlink target is too long"))?;
+    let body = 12usize
+        .checked_add(sub_bytes)
+        .and_then(|n| n.checked_add(print_bytes))
+        .ok_or_else(|| Error::oversized("symlink target is too long"))?;
+    if body > u16::MAX as usize {
+        return Err(Error::oversized(format!(
+            "symlink reparse record is {body} bytes; the NT reparse bound is {}",
+            u16::MAX
+        )));
+    }
+    let mut data = Vec::with_capacity(8 + body);
+    data.extend_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+    data.extend_from_slice(&(body as u16).to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&(sub_bytes as u16).to_le_bytes());
+    data.extend_from_slice(&(sub_bytes as u16).to_le_bytes());
+    data.extend_from_slice(&(print_bytes as u16).to_le_bytes());
+    data.extend_from_slice(&(if relative { SYMLINK_FLAG_RELATIVE } else { 0 }).to_le_bytes());
+    for unit in substitute {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    for unit in print {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(data)
+}
+
 #[cfg(windows)]
 mod nt {
     use std::collections::VecDeque;
@@ -735,29 +791,31 @@ mod nt {
     use windows_sys::Win32::Foundation::{
         GetLastError, RtlNtStatusToDosError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
         ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
-        HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED,
-        STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+        ERROR_PRIVILEGE_NOT_HELD, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
+        STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION,
+        STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileAttributeTagInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
         FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx,
         GetFileSizeEx, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
-        FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-        FILE_READ_DATA, FILE_READ_EA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+        FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
+        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+        OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
     };
-    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+    use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
     use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
     use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
     use super::{
-        dos_path_to_nt_units, lexical_components, parse_reparse_data, rebase_target,
-        split_relative, strip_root_prefix, ParsedReparse, Rebase, IO_REPARSE_TAG_MOUNT_POINT,
-        IO_REPARSE_TAG_SYMLINK, MAX_COMPONENTS, MAX_SYMLINK_HOPS, SYMLINK_FLAG_RELATIVE,
+        build_symlink_reparse_data, dos_path_to_nt_units, lexical_components, parse_reparse_data,
+        rebase_target, split_relative, strip_root_prefix, ParsedReparse, Rebase,
+        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, MAX_COMPONENTS, MAX_SYMLINK_HOPS,
+        SYMLINK_FLAG_RELATIVE,
     };
     use crate::platform::OpenKind;
     use crate::rooted::{RootedEntryKind, RootedEntryMeta};
@@ -1383,6 +1441,127 @@ mod nt {
             )),
             other => anchored_nt_error(rel, name, other),
         })
+    }
+
+    /// Create a symlink at `name` under the verified parent handle: the link
+    /// entry is created RELATIVE to `parent` (`NtCreateFile` with
+    /// `FILE_CREATE | FILE_OPEN_REPARSE_POINT`; the directory/file attribute
+    /// is chosen by `directory`) and the symlink reparse record built by
+    /// [`build_symlink_reparse_data`] is written to THAT handle with
+    /// `FSCTL_SET_REPARSE_POINT`. No absolute pathname selects the created
+    /// object after the call begins — the parent handle is the anchor, so a
+    /// parent swapped for an outside junction cannot redirect the create.
+    /// `target` is stored literally (NT namespace for an absolute target,
+    /// the relative spelling with `SYMLINK_FLAG_RELATIVE` otherwise); it is
+    /// never resolved here. An existing entry is refused with `EEXIST`
+    /// semantics and a failed reparse write removes the just-created plain
+    /// entry (best effort) so no file/directory is left where a link belongs.
+    pub(crate) fn anchored_create_symlink(
+        parent: &OwnedHandle,
+        name: &[u16],
+        target: &Path,
+        directory: bool,
+        rel: &Path,
+    ) -> Result<(), Error> {
+        let target_units: Vec<u16> = target.as_os_str().encode_wide().collect();
+        let (substitute, print, relative) = if target.is_absolute() {
+            let nt = dos_path_to_nt_units(&target_units).map_err(|h| h.into_error(target))?;
+            (nt, target_units, false)
+        } else {
+            (target_units.clone(), target_units, true)
+        };
+        let data = build_symlink_reparse_data(&substitute, &print, relative)?;
+        let options = if directory {
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+        } else {
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+        };
+        // WRITE_DATA|APPEND_DATA because the kernel's reparse-set check uses
+        // the handle's write access (the directory spelling of those bits is
+        // ADD_FILE|ADD_SUBDIRECTORY); DELETE is requested for the cleanup
+        // path and retried without it, so unlinking never demands more than
+        // the create itself.
+        let full = FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_READ_DATA
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE
+            | DELETE;
+        let minimal = full & !DELETE;
+        let handle = match nt_open(raw(parent), name, full, FILE_CREATE, options) {
+            Ok(handle) => handle,
+            Err(NtOpenError::Status(STATUS_ACCESS_DENIED)) => {
+                nt_open(raw(parent), name, minimal, FILE_CREATE, options)
+                    .map_err(|e| anchored_symlink_error(rel, name, e))?
+            }
+            Err(e) => return Err(anchored_symlink_error(rel, name, e)),
+        };
+        let mut returned = 0u32;
+        // SAFETY: `handle` is a live handle just created with write access;
+        // `data` is a live, fully initialized reparse record and its exact
+        // length is passed as the input buffer, with no output buffer.
+        let ok = unsafe {
+            DeviceIoControl(
+                raw(&handle),
+                FSCTL_SET_REPARSE_POINT,
+                data.as_ptr().cast::<c_void>(),
+                data.len() as u32,
+                ptr::null_mut(),
+                0,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            // SAFETY: GetLastError reads the calling thread's last-error slot
+            // after the failed call above and takes no arguments.
+            let code = unsafe { GetLastError() };
+            // Best-effort cleanup: never leave a plain file/directory where
+            // the caller asked for a link (only possible with DELETE access).
+            let disposition = FILE_DISPOSITION_INFO_EX {
+                Flags: FILE_DISPOSITION_FLAG_DELETE
+                    | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                    | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+            };
+            // SAFETY: `handle` is the live created entry; `disposition` is a
+            // live, correctly sized record and its exact size is passed.
+            let _ = unsafe {
+                SetFileInformationByHandle(
+                    raw(&handle),
+                    FileDispositionInfoEx,
+                    (&disposition as *const FILE_DISPOSITION_INFO_EX).cast::<c_void>(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+                )
+            };
+            return Err(match code {
+                ERROR_ACCESS_DENIED => Error::permission(format!(
+                    "cannot create symlink {}: access denied (FSCTL_SET_REPARSE_POINT)",
+                    rel.display()
+                )),
+                ERROR_PRIVILEGE_NOT_HELD => Error::permission(format!(
+                    "cannot create symlink {}: SeCreateSymbolicLinkPrivilege is not held \
+                     (FSCTL_SET_REPARSE_POINT, win32 error {code})",
+                    rel.display()
+                )),
+                _ => Error::internal(format!(
+                    "cannot create symlink {}: FSCTL_SET_REPARSE_POINT failed: win32 error {code}",
+                    rel.display()
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    /// Map an anchored symlink-create open failure to a typed error with the
+    /// `EEXIST` case named like the unix `symlinkat(2)` path.
+    fn anchored_symlink_error(what: &Path, name: &[u16], err: NtOpenError) -> Error {
+        match err {
+            NtOpenError::Status(STATUS_OBJECT_NAME_COLLISION) => Error::internal(format!(
+                "cannot create symlink {}: the entry already exists",
+                what.display()
+            )),
+            other => anchored_nt_error(what, name, other),
+        }
     }
 
     /// Open a child directory relative to an already-open parent with the
@@ -2093,11 +2272,12 @@ mod nt {
 
 #[cfg(windows)]
 pub(crate) use nt::{
-    anchored_create_dir, anchored_create_file, anchored_delete_entry, anchored_open_entry,
-    anchored_rename, canonicalize_within, entry_meta, lexical_check, open_no_follow_walk,
-    open_root_anchor, opened_is_path, read_reparse_link, validated_relative_units,
-    windows_list_dir_raw, windows_open_child_dir, windows_open_child_dir_anchored,
-    windows_reparse_class, AnchoredCreateOutcome, AnchoredEntry, RawDirEntry, ReparseClass,
+    anchored_create_dir, anchored_create_file, anchored_create_symlink, anchored_delete_entry,
+    anchored_open_entry, anchored_rename, canonicalize_within, entry_meta, lexical_check,
+    open_no_follow_walk, open_root_anchor, opened_is_path, read_reparse_link,
+    validated_relative_units, windows_list_dir_raw, windows_open_child_dir,
+    windows_open_child_dir_anchored, windows_reparse_class, AnchoredCreateOutcome, AnchoredEntry,
+    RawDirEntry, ReparseClass,
 };
 
 #[cfg(test)]
@@ -2495,6 +2675,53 @@ mod tests {
         // A cloud/placeholder tag is not whitelisted.
         let data = reparse(0x9000_001A, &[0u8; 12]);
         assert_eq!(parse_reparse_data(&data), Err(ReparseError::UnsupportedTag));
+    }
+
+    /// The symlink reparse record the anchored Windows create writes must be
+    /// exactly the record the walker parses back: tag, body length, offsets,
+    /// flags and both names round-trip (relative and absolute spellings).
+    #[test]
+    fn symlink_reparse_builder_round_trips_through_the_parser() {
+        let sub = u(r"\??\C:\ws\real.txt");
+        let print = u(r"C:\ws\real.txt");
+        let data = build_symlink_reparse_data(&sub, &print, false).unwrap();
+        assert_eq!(data.len(), 8 + 12 + sub.len() * 2 + print.len() * 2);
+        let parsed = parse_reparse_data(&data).unwrap();
+        assert_eq!(parsed.tag, IO_REPARSE_TAG_SYMLINK);
+        assert_eq!(parsed.flags, 0);
+        assert_eq!(text(&parsed.substitute), r"\??\C:\ws\real.txt");
+        assert_eq!(text(&parsed.print), r"C:\ws\real.txt");
+
+        let target = u(r"..\real.txt");
+        let data = build_symlink_reparse_data(&target, &target, true).unwrap();
+        let parsed = parse_reparse_data(&data).unwrap();
+        assert_eq!(parsed.tag, IO_REPARSE_TAG_SYMLINK);
+        assert_eq!(parsed.flags & SYMLINK_FLAG_RELATIVE, 1);
+        assert_eq!(text(&parsed.substitute), r"..\real.txt");
+        assert_eq!(text(&parsed.print), r"..\real.txt");
+    }
+
+    #[test]
+    fn symlink_reparse_builder_refuses_empty_nul_and_oversized_targets() {
+        assert_eq!(
+            build_symlink_reparse_data(&[], &[], true).unwrap_err().kind,
+            ErrorKind::Malformed
+        );
+        let mut nul = u("target");
+        nul.push(0);
+        assert_eq!(
+            build_symlink_reparse_data(&nul, &nul, true)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Malformed
+        );
+        let huge = vec![u16::from(b'a'); (u16::MAX as usize) / 2 + 1];
+        assert_eq!(
+            build_symlink_reparse_data(&huge, &huge, true)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Oversized
+        );
     }
 
     #[test]
@@ -3255,6 +3482,119 @@ mod win_tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["marker".to_string()]);
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
+    }
+
+    /// (create_symlink) `create_symlink` after the parent was swapped: the
+    /// link is created in the pinned original directory through the anchored
+    /// parent handle (`NtCreateFile(FILE_CREATE)` +
+    /// `FSCTL_SET_REPARSE_POINT` on the created child), never through the
+    /// junction; the outside directory is byte-identical.
+    #[test]
+    fn anchored_create_symlink_survives_parent_swap_to_outside_junction() {
+        let _seam = SeamTest::new();
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        // The reparse write needs SeCreateSymbolicLinkPrivilege on
+        // non-developer boxes; probe it before staging the swap.
+        let probe = tempfile::tempdir().unwrap();
+        if !try_file_symlink(&probe.path().join("probe-link"), Path::new("probe-target")) {
+            return;
+        }
+        let out = outside.path().to_path_buf();
+        let hook_root = root.clone();
+        mutation_swap_seam("p/link.txt", move |_rel| {
+            swap_to_outside_junction(&hook_root, "p", &out);
+        });
+        let dir = RootedDir::open(&root).unwrap();
+        dir.create_symlink(Path::new("target.txt"), Path::new("p/link.txt"))
+            .unwrap();
+        // The link landed in the pinned original directory (now `p-moved`),
+        // as a real symlink reparse point with the literal relative target.
+        let moved = root.join("p-moved/link.txt");
+        let meta = std::fs::symlink_metadata(&moved).unwrap();
+        assert!(meta.file_type().is_symlink(), "{meta:?}");
+        assert_eq!(
+            dir.read_link(Path::new("p-moved/link.txt")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+        assert!(!outside.path().join("link.txt").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("marker")).unwrap(),
+            b"OUTSIDE-MARKER"
+        );
+    }
+
+    /// The anchored reparse create produces links the rooted walker itself
+    /// follows: a relative file link, a relative directory link and an
+    /// absolute in-root link, plus `EEXIST` on a second create.
+    #[test]
+    fn anchored_create_symlink_round_trips_through_the_walk() {
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        let probe = tempfile::tempdir().unwrap();
+        if !try_file_symlink(&probe.path().join("probe-link"), Path::new("probe-target")) {
+            return;
+        }
+        std::fs::write(root.join("real.txt"), b"REAL").unwrap();
+        std::fs::create_dir_all(root.join("realdir")).unwrap();
+        std::fs::write(root.join("realdir/f.txt"), b"VIA-DIR-LINK").unwrap();
+        let dir = RootedDir::open(&root).unwrap();
+
+        dir.create_symlink(Path::new("real.txt"), Path::new("link.txt"))
+            .unwrap();
+        assert_eq!(h.read(Path::new("link.txt"), 100).unwrap().bytes, b"REAL");
+        assert_eq!(
+            dir.read_link(Path::new("link.txt")).unwrap(),
+            PathBuf::from("real.txt")
+        );
+
+        dir.create_symlink(Path::new("realdir"), Path::new("dlink"))
+            .unwrap();
+        assert_eq!(
+            h.read(Path::new("dlink/f.txt"), 100).unwrap().bytes,
+            b"VIA-DIR-LINK"
+        );
+
+        dir.create_symlink(&root.join("real.txt"), Path::new("abs-link.txt"))
+            .unwrap();
+        assert_eq!(
+            h.read(Path::new("abs-link.txt"), 100).unwrap().bytes,
+            b"REAL"
+        );
+
+        // A second create at the same name is refused (`EEXIST` semantics).
+        assert!(dir
+            .create_symlink(Path::new("real.txt"), Path::new("link.txt"))
+            .is_err());
+    }
+
+    /// A junction planted at the link's parent BEFORE anchoring is refused
+    /// by the anchored parent open (a reparse component is never followed)
+    /// and nothing appears outside.
+    #[test]
+    fn anchored_create_symlink_refuses_a_junction_parent_without_touching_outside() {
+        let (_d, _s, h) = fixture();
+        let root: PathBuf = h.root().to_path_buf();
+        let probe = tempfile::tempdir().unwrap();
+        if !try_file_symlink(&probe.path().join("probe-link"), Path::new("probe-target")) {
+            return;
+        }
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("marker"), b"OUTSIDE-MARKER").unwrap();
+        make_junction(&root.join("evil"), outside.path());
+        let dir = RootedDir::open(&root).unwrap();
+        let err = dir
+            .create_symlink(Path::new("target.txt"), Path::new("evil/link.txt"))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(!outside.path().join("link.txt").exists());
         assert_eq!(
             std::fs::read(outside.path().join("marker")).unwrap(),
             b"OUTSIDE-MARKER"

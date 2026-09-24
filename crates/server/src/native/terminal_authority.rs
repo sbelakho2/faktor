@@ -297,6 +297,15 @@ pub struct ExecutionProfile {
     /// tag is fabricated for evidence that never recorded one.
     #[serde(default)]
     pub shell: String,
+    /// The spawn-layer network isolation ACTUALLY applied to this
+    /// terminal's child (`deny_all` | `inherit`; see
+    /// `faktor_terminal::NetworkIsolation::as_tag`). On Linux an
+    /// `os_isolated` shell runs inside the sandbox network namespace and
+    /// records `deny_all`; a fail-closed refusal writes NO row at all, so a
+    /// recorded value is never an unapplied claim. Legacy rows default to
+    /// the empty string.
+    #[serde(default)]
+    pub network_isolation: String,
     /// The REQUESTED budgets of the profile.
     pub budgets: TerminalBudgets,
     /// Whether the profile was enforced STRICTLY: a requested limit the
@@ -526,6 +535,47 @@ pub struct TerminalAuthorityPolicy {
     pub budget_platform: BudgetPlatform,
 }
 
+impl TerminalAuthorityPolicy {
+    /// The terminal authority policy over the HOST's configured sandbox
+    /// policy: the shell-execution contract (`shell_execution` mode and its
+    /// backing `network_guarantee`) is carried VERBATIM from the operator's
+    /// configuration — this layer never widens it. `execute_shell` stays
+    /// allowed (an already-proven session-owned terminal, not an untrusted
+    /// tool request); everything else is this authority's own default. An
+    /// operator who wants the strictly weaker network-capable shell must
+    /// configure it EXPLICITLY (`[sandbox] shell = "network_capable_user_granted"`
+    /// with a non-`required` guarantee); the configured policy is validated
+    /// at the config boundary before it reaches here.
+    pub fn for_configured_sandbox(configured: &SandboxPolicy) -> Self {
+        let mut policy = Self::default();
+        policy.sandbox.shell_execution = configured.shell_execution;
+        policy.sandbox.network_guarantee = configured.network_guarantee;
+        policy
+    }
+
+    /// The EXPLICIT user-granted shell contract: a network-capable shell
+    /// (`NetworkCapableUserGranted` with a non-`Required` guarantee) — the
+    /// strictly weaker shape an operator selects ON PURPOSE. Hosts and tests
+    /// that define the grant directly construct it through this; production
+    /// config reaches the authority through [`Self::for_configured_sandbox`].
+    /// Nothing else in this crate ever mints it.
+    pub fn explicit_user_granted_shell() -> Self {
+        let mut policy = Self::default();
+        policy.sandbox.network_guarantee = SandboxGuarantee::None;
+        policy.sandbox.shell_execution = ShellExecutionMode::NetworkCapableUserGranted;
+        policy
+    }
+
+    /// The effective shell-execution contract this authority enforces and
+    /// records — the ONE surface doctor/UI reads. Exactly the contract the
+    /// authority was constructed with (host config via
+    /// [`Self::for_configured_sandbox`], or the fail-closed default): never
+    /// a value this layer invented.
+    pub fn shell_execution_state(&self) -> faktor_sandbox::ShellExecutionState {
+        self.sandbox.shell_execution_state()
+    }
+}
+
 impl Default for TerminalAuthorityPolicy {
     fn default() -> Self {
         Self {
@@ -536,22 +586,24 @@ impl Default for TerminalAuthorityPolicy {
             // rule of the tool path does not apply to an already-proven
             // session-owned terminal).
             //
-            // Phase D shell contract: a session terminal is the user's OWN
-            // interactive shell, requested through the authenticated
-            // native/ACP control surface, so this production policy carries
-            // the EXPLICIT user-granted network-capable shape. The crate's
-            // secure `Required`/`OsIsolated` default governs untrusted tool
-            // shell execution; pushing it into this PTY layer (which has no
-            // per-process network-isolation backend) would refuse every
-            // interactive terminal. The durable profile records the weaker
-            // mode honestly (`network: "none"`,
-            // `shell: "network_capable_user_granted"`), and a policy that
-            // really demands `Required` still refuses the spawn typed at
-            // the PTY layer (never a warn-and-run downgrade).
+            // Phase D shell contract (residual closed): the authority DEFAULT
+            // is the crate's SECURE shape — `Required` + `OsIsolated` — never
+            // a hardcoded user-granted network-capable shell. The host's
+            // configured `[sandbox] shell` contract enters EXPLICITLY through
+            // [`Self::for_configured_sandbox`] at construction (dependency
+            // injection; no global read anywhere on this path). The secure
+            // default fails closed: on Linux the PTY child is placed in the
+            // shared sandbox network namespace before exec (the same
+            // `unshare(CLONE_NEWNET)` backend the supervised shell path uses),
+            // and a host whose kernel/user-namespace policy refuses that
+            // unshare refuses the spawn TYPED before any child exists. On
+            // platforms with no backend (macOS/Windows) the typed refusal IS
+            // the platform truth. Either way the durable profile records the
+            // honest `os_isolated`/`required` demand plus the isolation
+            // actually applied. Only an explicit operator grant selects the
+            // strictly weaker `network_capable_user_granted` shell.
             sandbox: SandboxPolicy {
                 execute_shell: Rule::Allow,
-                network_guarantee: SandboxGuarantee::None,
-                shell_execution: ShellExecutionMode::NetworkCapableUserGranted,
                 ..SandboxPolicy::default()
             },
             budgets: TerminalBudgets::default(),
@@ -801,6 +853,7 @@ impl ExecutionAuthority for SessionExecutionAuthority {
             filesystem: spawn_profile.filesystem,
             network: spawn_profile.network,
             shell: spawn_profile.shell,
+            network_isolation: network_isolation.as_tag().to_string(),
             budgets,
             strict_budgets: self.policy.strict_budgets,
             budget_enforcement: None,
@@ -1181,8 +1234,25 @@ pub type TerminalRegistry = TerminalService;
 impl TerminalService {
     /// The daemon's ONE service for `session` (created on first use). Every
     /// caller sharing this `SessionManager` shares the service, its live
-    /// rows and its durable authority.
+    /// rows and its durable authority. Uses the fail-closed default policy
+    /// ([`TerminalAuthorityPolicy::default`]: `os_isolated`/`Required`);
+    /// hosts that carry a configured shell contract construct the service
+    /// through [`Self::for_manager_with_policy`] with it.
     pub fn for_manager(session: &Arc<SessionManager>) -> Arc<Self> {
+        Self::for_manager_with_policy(session, TerminalAuthorityPolicy::default())
+    }
+
+    /// [`Self::for_manager`] over an EXPLICIT execution policy: the caller
+    /// injects the policy (the daemon passes its configured
+    /// `[sandbox]` shell contract) instead of this layer reading one. The
+    /// registry still guarantees ONE service per `SessionManager` (the ACP
+    /// host and the native surface share it); the first constructor wins, so
+    /// a service already built for this manager is returned untouched and a
+    /// later call can never widen it.
+    pub fn for_manager_with_policy(
+        session: &Arc<SessionManager>,
+        policy: TerminalAuthorityPolicy,
+    ) -> Arc<Self> {
         let key = Arc::as_ptr(session) as usize;
         let mut registry = services()
             .lock()
@@ -1199,9 +1269,10 @@ impl TerminalService {
         if registry.len() >= MAX_REGISTERED_SERVICES {
             registry.remove(0);
         }
-        let service = Arc::new(Self::with_probe(
+        let service = Arc::new(Self::with_probe_and_policy(
             session.clone(),
             Arc::new(default_identity_probe),
+            policy,
         ));
         registry.push((key, Arc::downgrade(session), Arc::clone(&service)));
         service
@@ -1237,7 +1308,18 @@ impl TerminalService {
     }
 
     fn with_probe(session: Arc<SessionManager>, probe: IdentityProbe) -> Self {
-        let authority = Arc::new(SessionExecutionAuthority::new(session.clone()));
+        Self::with_probe_and_policy(session, probe, TerminalAuthorityPolicy::default())
+    }
+
+    fn with_probe_and_policy(
+        session: Arc<SessionManager>,
+        probe: IdentityProbe,
+        policy: TerminalAuthorityPolicy,
+    ) -> Self {
+        let authority = Arc::new(SessionExecutionAuthority::with_policy(
+            session.clone(),
+            policy,
+        ));
         Self::with_probe_and_authority(session, probe, authority)
     }
 
@@ -1699,23 +1781,17 @@ impl TerminalService {
     ) -> Result<TerminalCreation, TerminalServiceError> {
         let mut profile = authorized.profile().clone();
         let task_id = TaskId::new(profile.task_id);
-        // Fail-closed spawn-layer gate (audit P0-39): the policy DECIDES the
-        // network-isolation requirement; this PTY layer ENFORCES it or
-        // refuses typed BEFORE any child exists. A `DenyAll` request demands
-        // OS-level network isolation, which the interactive PTY backends do
-        // not provide on any platform — so the spawn is refused typed with
-        // the canonical "sandbox unavailable" wording, never a warn-and-run
-        // unenforced shell (no PTY, no child, no durable row).
-        if authorized.network_isolation() == NetworkIsolation::DenyAll {
-            return Err(TerminalServiceError::Denied(format!(
-                "sandbox unavailable: refusing spawn under NetworkIsolation::DenyAll of `{}` \
-                 BEFORE spawn: this PTY layer provides no per-process network-isolation \
-                 backend; never running the child unenforced",
-                authorized.command()
-            )));
-        }
+        // Fail-closed spawn-layer enforcement (audit P0-39): the policy
+        // DECIDES the network-isolation requirement; this PTY layer ENFORCES
+        // it or refuses typed BEFORE any child exists. A `DenyAll` request
+        // runs the child under the shared sandbox network-namespace backend
+        // (the SAME `unshare(CLONE_NEWNET)` pre-exec hook the supervised
+        // shell path installs — one backend, two spawn seams) where the
+        // platform has one; platforms without a backend (macOS/Windows) keep
+        // the typed refusal — never a warn-and-run unenforced shell (no PTY,
+        // no child, no durable row).
         let cfg = authorized.to_pty_config();
-        let pty = Pty::spawn(&cfg).map_err(|e| TerminalServiceError::Refused(e.message))?;
+        let pty = spawn_pty_under_network_isolation(&cfg, authorized.network_isolation())?;
         let pid = pty.pid();
         // OWNERSHIP FROM BIRTH: the child enters the service's pending
         // ownership map BEFORE any budget enforcement, journaling or
@@ -2638,6 +2714,77 @@ fn validate_spawn_request(request: &TerminalSpawnRequest) -> Result<(), Terminal
     Ok(())
 }
 
+/// The spawn-layer bridge from the admitted policy requirement to the
+/// interactive PTY spawn. `Inherit` spawns plain; `DenyAll` installs the
+/// shared sandbox network-namespace confinement (the SAME backend the
+/// supervised shell path uses) or refuses typed BEFORE any child exists —
+/// never a warn-and-run unenforced shell. Platform truth is kept honest: on
+/// macOS/Windows there is no backend and the refusal is the only outcome.
+/// Loopback semantics are the backend's own: the fresh namespace has no
+/// interface, no route and `lo` DOWN, so neither external destinations nor
+/// the daemon's loopback are reachable from an `os_isolated` PTY child.
+fn spawn_pty_under_network_isolation(
+    cfg: &PtyConfig,
+    isolation: NetworkIsolation,
+) -> Result<Pty, TerminalServiceError> {
+    match isolation {
+        NetworkIsolation::Inherit => {
+            Pty::spawn(cfg).map_err(|e| TerminalServiceError::Refused(e.message))
+        }
+        NetworkIsolation::DenyAll => {
+            #[cfg(target_os = "linux")]
+            {
+                let confinement = faktor_terminal::deny_all_spawn_confinement()
+                    .map(faktor_pty::SpawnConfinement::new)
+                    .ok_or_else(|| {
+                        // Defensive only: Linux always ships the hook. A
+                        // missing backend is a typed refusal, never a run.
+                        TerminalServiceError::Denied(format!(
+                            "sandbox unavailable: refusing spawn under \
+                             NetworkIsolation::DenyAll of `{}` BEFORE spawn: no per-process \
+                             network-isolation backend; never running the child unenforced",
+                            cfg.command
+                        ))
+                    })?;
+                let pty = Pty::spawn_confined(cfg, confinement).map_err(|e| {
+                    // ANY failure to bring the child up INSIDE the namespace
+                    // is a typed permission refusal (the OS error names the
+                    // cause, e.g. a refused unshare): never unenforced.
+                    TerminalServiceError::Denied(format!(
+                        "sandbox unavailable: refusing spawn under NetworkIsolation::DenyAll of \
+                         `{}`: the isolated child could not be created ({e}); never running the \
+                         child unenforced",
+                        cfg.command
+                    ))
+                })?;
+                // The pre-exec unshare ran on a child that exec'd: the
+                // shared backend proved itself active at spawn here.
+                faktor_terminal::record_deny_all_isolation_proven();
+                Ok(pty)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Platform truth (audit P0-39): no per-process
+                // network-isolation backend exists on this platform, so the
+                // spawn is refused typed BEFORE any child exists — the same
+                // fail-closed wording as the supervised shell path.
+                Err(TerminalServiceError::Denied(format!(
+                    "sandbox unavailable: refusing spawn under NetworkIsolation::DenyAll of `{}` \
+                     BEFORE spawn: this platform provides no per-process network-isolation \
+                     backend; never running the child unenforced",
+                    cfg.command
+                )))
+            }
+        }
+        NetworkIsolation::BrokerOnly { .. } => Err(TerminalServiceError::Denied(format!(
+            "sandbox unavailable: refusing spawn under NetworkIsolation::BrokerOnly of `{}` \
+             BEFORE spawn: the interactive terminal authority never brokers a child; never \
+             running it unconfined",
+            cfg.command
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2684,6 +2831,42 @@ mod tests {
         (probe, map)
     }
 
+    /// The EXPLICIT user-granted shell contract: tests that exercise a REAL
+    /// PTY spawn carry it (the authority default is the fail-closed
+    /// `os_isolated` shape, so a test grants exactly like an operator).
+    fn granted_policy() -> TerminalAuthorityPolicy {
+        TerminalAuthorityPolicy::explicit_user_granted_shell()
+    }
+
+    /// A service over `manager`/`probe` whose authority carries `policy`
+    /// (the explicit test seam; unregistered).
+    fn service_over(
+        manager: &Arc<SessionManager>,
+        probe: IdentityProbe,
+        policy: TerminalAuthorityPolicy,
+    ) -> Arc<TerminalService> {
+        TerminalService::with_execution_authority(
+            manager.clone(),
+            probe,
+            Arc::new(SessionExecutionAuthority::with_policy(
+                manager.clone(),
+                policy,
+            )),
+        )
+    }
+
+    /// A spawn-hook service whose authority carries the explicit test grant.
+    fn hook_service(
+        manager: &Arc<SessionManager>,
+        probe: IdentityProbe,
+        hook: SpawnHook,
+    ) -> Arc<TerminalService> {
+        let mut service =
+            TerminalService::with_probe_and_policy(manager.clone(), probe, granted_policy());
+        service.spawn_hook = Some(hook);
+        Arc::new(service)
+    }
+
     fn terminal_kinds(handle: &SessionHandle) -> Vec<TerminalEventKind> {
         handle
             .ledger_terminal_rows(None)
@@ -2706,6 +2889,96 @@ mod tests {
                 None
             }
             Err(other) => panic!("unexpected spawn failure: {other}"),
+        }
+    }
+
+    /// The platform-honest outcome of one `os_isolated` spawn attempt: on
+    /// Linux the child is either admitted INSIDE the sandbox network
+    /// namespace (the durable profile records the applied `deny_all`
+    /// isolation and the child body ran) or — when the host's kernel/
+    /// user-namespace policy refuses the unshare — refused typed with no
+    /// child and nothing journaled. On every other platform the typed
+    /// fail-closed refusal is the ONLY possible outcome (platform truth).
+    /// Returns the creation when the spawn was admitted.
+    fn expect_os_isolated_outcome(
+        service: &Arc<TerminalService>,
+        manager: &Arc<SessionManager>,
+        sid: &str,
+        request: &TerminalSpawnRequest,
+        marker: &std::path::Path,
+    ) -> Option<TerminalCreation> {
+        match service.spawn(sid, request) {
+            Ok(creation) => {
+                if !cfg!(target_os = "linux") {
+                    panic!(
+                        "only Linux has a per-process network-isolation backend; no other \
+                         platform may admit an os_isolated spawn"
+                    );
+                }
+                let profile =
+                    ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+                assert_eq!(profile.shell, "os_isolated");
+                assert_eq!(profile.network, "required");
+                assert_eq!(
+                    profile.network_isolation, "deny_all",
+                    "an admitted os_isolated spawn records the isolation it applied"
+                );
+                // The child body runs after the spawn returns: bound the wait
+                // so this is never a fork/exec race.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !marker.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                assert!(
+                    marker.exists(),
+                    "an admitted os_isolated child runs its body (a network namespace confines \
+                     the network, never the filesystem)"
+                );
+                Some(creation)
+            }
+            Err(TerminalServiceError::Denied(message)) => {
+                assert!(message.contains("sandbox unavailable"), "{message}");
+                assert!(message.contains("DenyAll"), "{message}");
+                assert!(
+                    message.contains("unenforced") || message.contains("unconfined"),
+                    "{message}"
+                );
+                assert_eq!(service.live_rows(), 0);
+                assert!(
+                    !marker.exists(),
+                    "the refused child never exec'd its program body"
+                );
+                let handle = manager
+                    .get_session(SessionId::new(sid.parse().unwrap()))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    handle.ledger_terminal_rows(None).unwrap().is_empty(),
+                    "a fail-closed refusal journals nothing"
+                );
+                None
+            }
+            other => panic!(
+                "an os_isolated spawn must isolate the child or refuse typed, never anything \
+                 else: {:?}",
+                other.err()
+            ),
+        }
+    }
+
+    /// Drain a live terminal until `needle` appears (or `timeout` elapses);
+    /// returns everything accumulated.
+    #[cfg(target_os = "linux")]
+    fn drain_until(handle: &TerminalHandle, needle: &str, timeout: std::time::Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            out.extend_from_slice(&handle.drain_output());
+            let text = String::from_utf8_lossy(&out).into_owned();
+            if text.contains(needle) || std::time::Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
 
@@ -2927,19 +3200,21 @@ mod tests {
     }
 
     #[test]
-    fn required_network_guarantee_refuses_the_pty_spawn_typed_before_any_child_exists() {
-        // Phase D (audit P0-39): the crate-default `SandboxPolicy` demands
-        // OS-level network isolation (`Required` + `os_isolated`). The
-        // interactive PTY layer has no per-process network-isolation
-        // backend on any platform, so a spawn under that verbatim policy
-        // must be refused TYPED before any child exists — never a
-        // warn-and-run unenforced shell. (The production daemon terminal
-        // policy carries the explicit user-granted shape instead; see the
-        // profile test above.)
+    fn required_network_guarantee_isolates_the_pty_spawn_or_refuses_typed_never_unenforced() {
+        // Phase D (audit P0-39) + the interactive-terminal gap: the
+        // crate-default `SandboxPolicy` demands OS-level network isolation
+        // (`Required` + `os_isolated`) — exactly the authority's fail-closed
+        // default (the host config default too). The spawn under it is
+        // EITHER genuinely confined (Linux: the shared network-namespace
+        // backend, the SAME pre-exec `unshare` hook the shell supervisor
+        // installs) OR refused TYPED before any child exists (macOS/Windows
+        // by platform truth; Linux when the unshare is refused) — never a
+        // warn-and-run unenforced shell. (The explicit operator grant admits
+        // the strictly weaker network-capable spawn; see the profile test.)
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("candidate");
         std::fs::create_dir_all(&root).unwrap();
-        let (manager, sid) = manager_at(dir.path(), &root, "authority-required-refusal");
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-required-gate");
         let policy = TerminalAuthorityPolicy {
             sandbox: SandboxPolicy {
                 execute_shell: Rule::Allow,
@@ -2970,35 +3245,286 @@ mod tests {
         assert_eq!(admitted.profile().network, "required");
         assert_eq!(admitted.profile().shell, "os_isolated");
 
-        // Spawn level: typed refusal, no PTY, no child body, nothing
-        // journaled.
+        // Spawn level: isolated (Linux) or the typed fail-closed refusal —
+        // never an unenforced child and never an unapplied isolation claim.
         let marker = root.join("required-body-ran.txt");
         let program = format!("echo ran > {}", marker.display());
         let request = spawn_request("/bin/sh", &["-c", program.as_str()]);
         let service = service_with_policy(&manager, policy);
-        match service.spawn(&sid, &request) {
-            Err(TerminalServiceError::Denied(message)) => {
-                assert!(message.contains("sandbox unavailable"), "{message}");
-                assert!(message.contains("DenyAll"), "{message}");
-                assert!(message.contains("unenforced"), "{message}");
-            }
-            other => panic!(
-                "a Required policy must refuse the PTY spawn typed: {:?}",
-                other.err()
-            ),
-        }
-        assert_eq!(service.live_rows(), 0);
+        let creation = expect_os_isolated_outcome(&service, &manager, &sid, &request, &marker);
+        #[cfg(not(target_os = "linux"))]
         assert!(
-            !marker.exists(),
-            "the refused child never exec'd its program body"
+            creation.is_none(),
+            "platform truth: with no backend the os_isolated spawn MUST refuse typed"
         );
         let handle = manager
             .get_session(SessionId::new(sid.parse().unwrap()))
             .unwrap()
             .unwrap();
+        for record in handle.ledger_terminal_rows(None).unwrap() {
+            let profile = ExecutionProfile::parse(&record.row.execution_profile).expect("profile");
+            assert_eq!(
+                profile.network_isolation, "deny_all",
+                "every durable row of an os_isolated terminal records the applied isolation"
+            );
+        }
+        if let Some(creation) = creation {
+            let _ = service.kill(&sid, creation.handle.terminal_id(), "required cleanup");
+        }
+    }
+
+    /// Linux-only: an `os_isolated` interactive terminal runs INSIDE the
+    /// sandbox network namespace with a fully working pty (stdin/stdout
+    /// through the master). When the host refuses the unshare (no
+    /// CAP_SYS_ADMIN and no unprivileged user namespaces) the spawn is
+    /// refused typed and the test skips — the backend is never faked into a
+    /// grant.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn os_isolated_terminal_runs_interactively_inside_the_network_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "os-isolated-interactive");
+        let policy = TerminalAuthorityPolicy {
+            sandbox: SandboxPolicy {
+                execute_shell: Rule::Allow,
+                ..SandboxPolicy::default()
+            },
+            ..TerminalAuthorityPolicy::default()
+        };
+        let service = service_with_policy(&manager, policy);
+        let creation = match service.spawn(&sid, &spawn_request("/bin/sh", &[])) {
+            Ok(creation) => creation,
+            Err(TerminalServiceError::Denied(message)) => {
+                assert!(message.contains("sandbox unavailable"), "{message}");
+                assert_eq!(service.live_rows(), 0);
+                let handle = manager
+                    .get_session(SessionId::new(sid.parse().unwrap()))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    handle.ledger_terminal_rows(None).unwrap().is_empty(),
+                    "an unprivileged refusal journals nothing"
+                );
+                eprintln!(
+                    "skipping: the sandbox network namespace is not creatable here: {message}"
+                );
+                return;
+            }
+            other => panic!("unexpected spawn failure: {:?}", other.err()),
+        };
+        let profile = ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+        assert_eq!(profile.shell, "os_isolated");
+        assert_eq!(profile.network, "required");
+        assert_eq!(profile.network_isolation, "deny_all");
+        // The arithmetic marker can only appear as the shell's OUTPUT, not
+        // as the line-discipline echo of our input.
+        creation.handle.write(b"echo isolated-$((40+2))\n").unwrap();
+        let out = drain_until(
+            &creation.handle,
+            "isolated-42",
+            std::time::Duration::from_secs(10),
+        );
         assert!(
-            handle.ledger_terminal_rows(None).unwrap().is_empty(),
-            "a sandbox-refused spawn journals nothing"
+            out.contains("isolated-42"),
+            "interactive round-trip through the isolated pty: {out}"
+        );
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_kinds(&handle),
+            vec![TerminalEventKind::Created, TerminalEventKind::Running]
+        );
+        assert!(service
+            .kill(
+                &sid,
+                creation.handle.terminal_id(),
+                "isolated interactive cleanup"
+            )
+            .unwrap());
+        assert_eq!(
+            terminal_kinds(&handle),
+            vec![
+                TerminalEventKind::Created,
+                TerminalEventKind::Running,
+                TerminalEventKind::Killed
+            ]
+        );
+    }
+
+    /// Linux-only: inside the `os_isolated` namespace NOTHING is reachable —
+    /// no external route (the namespace has no interface and no route) and
+    /// no loopback either (the reused DenyAll backend leaves `lo` DOWN by
+    /// design; that is the documented loopback semantics) — while the SAME
+    /// probe under the explicit user-granted shell reaches the daemon's
+    /// loopback listener. Skips (typed) when the host refuses the unshare or
+    /// `curl` is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn os_isolated_terminal_denies_external_and_loopback_while_the_grant_reaches_the_daemon() {
+        use std::io::{Read, Write};
+        // A daemon-side loopback listener: the granted child must reach it,
+        // the isolated child must not.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let hits = Arc::clone(&hits);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut buf = [0u8; 1024];
+                            let _ = stream.read(&mut buf);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            );
+                            hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        // `192.0.2.0/24` (TEST-NET-1) is never routable: inside the fresh
+        // namespace the connect fails immediately at the route layer, and
+        // outside it blackholes (bounded by --max-time).
+        let script = format!(
+            "command -v curl >/dev/null 2>&1 || {{ echo PROBE_NO_CURL; echo PROBE_DONE; exit 0; }}; \
+             curl -sS --max-time 5 -o /dev/null http://127.0.0.1:{port}/ && echo PROBE_LOOPBACK_OK || echo PROBE_LOOPBACK_FAIL; \
+             curl -sS --max-time 5 -o /dev/null http://192.0.2.1:443/ && echo PROBE_EXTERNAL_OK || echo PROBE_EXTERNAL_FAIL; \
+             echo PROBE_DONE"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "os-isolated-network");
+
+        let isolated = service_with_policy(
+            &manager,
+            TerminalAuthorityPolicy {
+                sandbox: SandboxPolicy {
+                    execute_shell: Rule::Allow,
+                    ..SandboxPolicy::default()
+                },
+                ..TerminalAuthorityPolicy::default()
+            },
+        );
+        let (iso_creation, iso_out) =
+            match isolated.spawn(&sid, &spawn_request("/bin/sh", &["-c", script.as_str()])) {
+                Ok(creation) => (
+                    creation,
+                    drain_until(
+                        &creation.handle,
+                        "PROBE_DONE",
+                        std::time::Duration::from_secs(30),
+                    ),
+                ),
+                Err(TerminalServiceError::Denied(message)) => {
+                    assert!(message.contains("sandbox unavailable"), "{message}");
+                    assert_eq!(isolated.live_rows(), 0);
+                    eprintln!(
+                        "skipping: the sandbox network namespace is not creatable here: {message}"
+                    );
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = server.join();
+                    return;
+                }
+                other => panic!("unexpected isolated spawn failure: {:?}", other.err()),
+            };
+        if iso_out.contains("PROBE_NO_CURL") {
+            eprintln!("skipping: curl is not available on the test host");
+            let _ = isolated.kill(&sid, iso_creation.handle.terminal_id(), "no-curl cleanup");
+            stop.store(true, Ordering::SeqCst);
+            let _ = server.join();
+            return;
+        }
+        assert!(
+            iso_out.contains("PROBE_LOOPBACK_FAIL"),
+            "loopback must be unreachable inside the DenyAll namespace (lo is left DOWN by \
+             design): {iso_out}"
+        );
+        assert!(
+            iso_out.contains("PROBE_EXTERNAL_FAIL"),
+            "no external destination may be reachable inside the DenyAll namespace: {iso_out}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the isolated child never reached the daemon listener"
+        );
+        let _ = isolated.kill(
+            &sid,
+            iso_creation.handle.terminal_id(),
+            "isolated network cleanup",
+        );
+
+        // The explicit user grant: the SAME probe reaches the daemon's
+        // loopback listener (grant mode is honestly network-capable).
+        let granted = service_with_policy(&manager, granted_policy());
+        let (grant_creation, grant_out) =
+            match granted.spawn(&sid, &spawn_request("/bin/sh", &["-c", script.as_str()])) {
+                Ok(creation) => (
+                    creation,
+                    drain_until(
+                        &creation.handle,
+                        "PROBE_DONE",
+                        std::time::Duration::from_secs(30),
+                    ),
+                ),
+                other => panic!("the grant must admit the PTY: {:?}", other.err()),
+            };
+        assert!(
+            grant_out.contains("PROBE_LOOPBACK_OK"),
+            "the user-granted shell must reach the daemon loopback: {grant_out}"
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "the daemon listener observed the granted child's connection"
+        );
+        let _ = granted.kill(
+            &sid,
+            grant_creation.handle.terminal_id(),
+            "grant network cleanup",
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+
+        // Journal honesty: the isolated row records deny_all/os_isolated,
+        // the grant row inherit/network_capable_user_granted — never the
+        // other way round.
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let profiles: Vec<ExecutionProfile> = handle
+            .ledger_terminal_rows(None)
+            .unwrap()
+            .iter()
+            .map(|record| ExecutionProfile::parse(&record.row.execution_profile).expect("profile"))
+            .collect();
+        assert!(
+            profiles
+                .iter()
+                .any(|p| p.shell == "os_isolated" && p.network_isolation == "deny_all"),
+            "{profiles:?}"
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|p| p.shell == "network_capable_user_granted"
+                    && p.network_isolation == "inherit"),
+            "{profiles:?}"
         );
     }
 
@@ -3010,16 +3536,19 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let (manager, sid) = manager_at(dir.path(), &root, "authority-profile");
         let (probe, _map) = recording_probe();
-        // The PRODUCTION authority (`SessionExecutionAuthority::new` over
-        // `TerminalAuthorityPolicy::default()`): the daemon terminal policy
-        // carries the explicit user-granted network-capable shell, so the
-        // spawn is admitted (no sandbox refusal) and the durable profile
-        // records that honest, strictly-weaker mode — never an OS-isolation
-        // claim the PTY layer does not enforce.
+        // The production authority over the EXPLICIT operator grant
+        // (`TerminalAuthorityPolicy::explicit_user_granted_shell`): the
+        // authority default is the fail-closed `os_isolated` shape, and only
+        // an explicit grant admits the PTY. The durable profile records that
+        // honest, strictly-weaker mode — never an OS-isolation claim the PTY
+        // layer does not enforce.
         let service = TerminalService::with_execution_authority(
             manager.clone(),
             probe,
-            Arc::new(SessionExecutionAuthority::new(manager.clone())),
+            Arc::new(SessionExecutionAuthority::with_policy(
+                manager.clone(),
+                granted_policy(),
+            )),
         );
         let mut request = spawn_request("/bin/sleep", &["30"]);
         request.cwd = Some("sub".into());
@@ -3046,6 +3575,10 @@ mod tests {
         assert_eq!(
             profile.shell, "network_capable_user_granted",
             "the durable row records the explicit user-granted shell shape, never os_isolated"
+        );
+        assert_eq!(
+            profile.network_isolation, "inherit",
+            "the grant applies no OS-level isolation and records exactly that"
         );
         assert_eq!(profile.budgets, TerminalBudgets::default());
         assert_eq!(
@@ -3076,6 +3609,208 @@ mod tests {
         let _ = service.kill(&sid, view.terminal_id.as_str(), "profile cleanup");
     }
 
+    #[test]
+    fn default_and_configured_os_isolated_isolate_or_fail_closed_and_record_the_mode() {
+        // The authority default (no injected policy) IS the configured
+        // default `[sandbox] shell = "os_isolated"` — `Required` +
+        // `OsIsolated`, exactly what `for_configured_sandbox` carries from a
+        // default config. The mode is enforced (DenyAll requirement) and is
+        // what the profile records; the spawn either genuinely isolates the
+        // child (Linux, through the shared network-namespace backend) or is
+        // refused typed BEFORE any child exists (no backend platform /
+        // refused unshare) — never an unenforced run.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-os-isolated");
+
+        let default_policy = TerminalAuthorityPolicy::default();
+        assert_eq!(
+            default_policy.sandbox.shell_execution,
+            ShellExecutionMode::OsIsolated
+        );
+        assert_eq!(
+            default_policy.sandbox.network_guarantee,
+            SandboxGuarantee::Required
+        );
+        assert!(default_policy.sandbox.validate().is_ok());
+
+        // The configured path carries the config's contract verbatim.
+        let configured = SandboxPolicy {
+            execute_shell: Rule::Allow,
+            ..SandboxPolicy::default()
+        };
+        let from_config = TerminalAuthorityPolicy::for_configured_sandbox(&configured);
+        let state = from_config.shell_execution_state();
+        assert_eq!(state.mode, ShellExecutionMode::OsIsolated);
+        assert_eq!(state.network_guarantee, SandboxGuarantee::Required);
+        assert_eq!(
+            from_config, default_policy,
+            "the authority default is exactly what the configured default resolves to"
+        );
+
+        let principal = principal_of(&manager, &sid);
+        for (index, policy) in [default_policy, from_config].into_iter().enumerate() {
+            // Authority level: admission records the honest profile before
+            // any PTY exists; the spawn gate derives DenyAll from it.
+            let authority = SessionExecutionAuthority::with_policy(manager.clone(), policy.clone());
+            let admitted = authority
+                .authorize_terminal_spawn(
+                    &principal,
+                    &sid,
+                    &spawn_request("/bin/sh", &["-c", "true"]),
+                )
+                .expect("admission records the profile before any PTY exists");
+            assert_eq!(admitted.network_isolation(), NetworkIsolation::DenyAll);
+            assert_eq!(admitted.profile().shell, "os_isolated");
+            assert_eq!(admitted.profile().network, "required");
+
+            // Spawn level: isolated (Linux) or the typed fail-closed refusal.
+            let marker = root.join(format!("os-isolated-body-ran-{index}.txt"));
+            let program = format!("echo ran > {}", marker.display());
+            let service = service_with_policy(&manager, policy);
+            let creation = expect_os_isolated_outcome(
+                &service,
+                &manager,
+                &sid,
+                &spawn_request("/bin/sh", &["-c", program.as_str()]),
+                &marker,
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert!(
+                creation.is_none(),
+                "platform truth: with no backend the os_isolated spawn MUST refuse typed"
+            );
+            if let Some(creation) = creation {
+                let _ = service.kill(&sid, creation.handle.terminal_id(), "os-isolated cleanup");
+            }
+        }
+
+        // Journal honesty: every durable row of an os_isolated terminal
+        // records os_isolated/deny_all; a fail-closed platform journals
+        // nothing at all.
+        let handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        let rows = handle.ledger_terminal_rows(None).unwrap();
+        for record in &rows {
+            let profile = ExecutionProfile::parse(&record.row.execution_profile).expect("profile");
+            assert_eq!(profile.shell, "os_isolated");
+            assert_eq!(profile.network, "required");
+            assert_eq!(profile.network_isolation, "deny_all");
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(rows.is_empty(), "a fail-closed refusal journals nothing");
+    }
+
+    #[test]
+    fn explicit_grant_spawns_and_records_the_honest_user_granted_tag() {
+        // Only the EXPLICIT operator grant admits a PTY; the durable profile
+        // records the strictly weaker mode honestly, never an OS-isolation
+        // claim the PTY layer does not enforce.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "authority-explicit-grant");
+        let policy = granted_policy();
+        let state = policy.shell_execution_state();
+        assert_eq!(state.mode, ShellExecutionMode::NetworkCapableUserGranted);
+        assert_eq!(state.network_guarantee, SandboxGuarantee::None);
+        assert!(policy.sandbox.validate().is_ok());
+        let service = service_with_policy(&manager, policy);
+        let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
+        else {
+            return;
+        };
+        let profile = ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+        assert_eq!(profile.shell, "network_capable_user_granted");
+        assert_eq!(profile.network, "none");
+        assert_eq!(
+            profile.network_isolation, "inherit",
+            "grant mode spawns inside the daemon namespace and records it honestly"
+        );
+        let _ = service.kill(&sid, creation.handle.terminal_id(), "grant cleanup");
+    }
+
+    #[test]
+    fn a_planted_grant_never_widens_another_authority() {
+        // Daemon A is explicitly granted; daemon B (a separate session
+        // manager, i.e. a separate authority) is constructed with the
+        // fail-closed default. A's planted grant must not change what B
+        // enforces, and the registry's first-wins rule returns B's secure
+        // service untouched when a later grant names the same manager.
+        let dir_a = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().join("candidate");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let (manager_a, sid_a) = manager_at(dir_a.path(), &root_a, "granted-daemon");
+        let granted = service_with_policy(&manager_a, granted_policy());
+        let Some(creation) = spawn_or_skip(&granted, &sid_a, &spawn_request("/bin/sleep", &["30"]))
+        else {
+            return;
+        };
+        let profile = ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+        assert_eq!(profile.shell, "network_capable_user_granted");
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_b = dir_b.path().join("candidate");
+        std::fs::create_dir_all(&root_b).unwrap();
+        let (manager_b, sid_b) = manager_at(dir_b.path(), &root_b, "secure-daemon");
+        let secure = TerminalService::for_manager_with_policy(
+            &manager_b,
+            TerminalAuthorityPolicy::default(),
+        );
+        let later_grant = TerminalService::for_manager_with_policy(&manager_b, granted_policy());
+        assert!(
+            Arc::ptr_eq(&secure, &later_grant),
+            "one service per manager: the first (secure) policy wins, a later grant cannot widen it"
+        );
+        for (index, service) in [&secure, &later_grant].into_iter().enumerate() {
+            let authority = SessionExecutionAuthority::with_policy(
+                manager_b.clone(),
+                TerminalAuthorityPolicy::default(),
+            );
+            let admitted = authority
+                .authorize_terminal_spawn(
+                    &principal_of(&manager_b, &sid_b),
+                    &sid_b,
+                    &spawn_request("/bin/sh", &["-c", "true"]),
+                )
+                .unwrap();
+            assert_eq!(admitted.profile().shell, "os_isolated");
+            // B's spawn is isolated (Linux) or refused typed — never the
+            // planted grant's network-capable shape.
+            let marker = root_b.join(format!("planted-body-ran-{index}.txt"));
+            let program = format!("echo ran > {}", marker.display());
+            let creation = expect_os_isolated_outcome(
+                service,
+                &manager_b,
+                &sid_b,
+                &spawn_request("/bin/sh", &["-c", program.as_str()]),
+                &marker,
+            );
+            if let Some(creation) = creation {
+                let _ = service.kill(&sid_b, creation.handle.terminal_id(), "planted cleanup");
+            }
+        }
+        let handle_b = manager_b
+            .get_session(SessionId::new(sid_b.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        for record in handle_b.ledger_terminal_rows(None).unwrap() {
+            let profile = ExecutionProfile::parse(&record.row.execution_profile).expect("profile");
+            assert_eq!(
+                profile.shell, "os_isolated",
+                "a planted grant must never widen another authority"
+            );
+            assert_eq!(profile.network_isolation, "deny_all");
+        }
+
+        // A's explicitly granted terminal is untouched by B's refusal.
+        assert_eq!(granted.list(&sid_a).unwrap().len(), 1);
+        let _ = granted.kill(&sid_a, creation.handle.terminal_id(), "planted cleanup");
+    }
+
     /// A service over `manager` whose authority carries `policy`.
     fn service_with_policy(
         manager: &Arc<SessionManager>,
@@ -3098,7 +3833,7 @@ mod tests {
         let root = dir.path().join("candidate");
         std::fs::create_dir_all(&root).unwrap();
         let (manager, sid) = manager_at(dir.path(), &root, "budget-profile");
-        let service = service_with_policy(&manager, TerminalAuthorityPolicy::default());
+        let service = service_with_policy(&manager, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -3182,11 +3917,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let (manager, sid) = manager_at(dir.path(), &root, "budget-disabled");
         // Even a STRICT profile with NO requested limit must spawn: there is
-        // nothing to enforce, so nothing can be unenforceable.
+        // nothing to enforce, so nothing can be unenforceable. (The explicit
+        // operator grant admits the PTY; this test is about budgets.)
         let policy = TerminalAuthorityPolicy {
             budgets: TerminalBudgets::disabled(),
             strict_budgets: true,
-            ..TerminalAuthorityPolicy::default()
+            ..granted_policy()
         };
         let service = service_with_policy(&manager, policy);
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
@@ -3284,7 +4020,7 @@ mod tests {
         let policy = TerminalAuthorityPolicy {
             strict_budgets: false,
             budget_platform: BudgetPlatform::all_unenforceable(),
-            ..TerminalAuthorityPolicy::default()
+            ..granted_policy()
         };
         let service = service_with_policy(&manager, policy);
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
@@ -3321,7 +4057,7 @@ mod tests {
                 ..TerminalBudgets::disabled()
             },
             strict_budgets: true,
-            ..TerminalAuthorityPolicy::default()
+            ..granted_policy()
         };
         let service = service_with_policy(&manager, policy);
         // A LEADER WITH DESCENDANTS: the deadline must take the whole
@@ -3398,7 +4134,7 @@ mod tests {
                 wall_time_ms: 400,
                 ..TreeBudgets::disabled()
             },
-            ..TerminalAuthorityPolicy::default()
+            ..granted_policy()
         };
         let service = service_with_policy(&manager, policy);
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
@@ -3425,7 +4161,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-roundtrip");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -3541,7 +4277,7 @@ mod tests {
             }
             Ok(())
         });
-        let service = TerminalService::with_spawn_hook(manager.clone(), probe, hook);
+        let service = hook_service(&manager, probe, hook);
         let spawn_service = Arc::clone(&service);
         let spawn_sid = sid.clone();
         let spawning = std::thread::spawn(move || {
@@ -3625,7 +4361,7 @@ mod tests {
             *seen_hook.lock().unwrap() = Some(pid);
             Err("injected refusal inside the birth window".into())
         });
-        let service = TerminalService::with_spawn_hook(manager.clone(), probe, hook);
+        let service = hook_service(&manager, probe, hook);
         let error = match service.spawn(&sid, &spawn_request("/bin/sleep", &["30"])) {
             Ok(_) => panic!("the injected refusal must fail the create"),
             Err(error) => error,
@@ -3668,7 +4404,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-cycle-load");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let mut workers = Vec::new();
         for worker in 0..3u32 {
             let service = Arc::clone(&service);
@@ -3725,7 +4461,7 @@ mod tests {
         let a = session(&manager, "scope-a");
         let b = session(&manager, "scope-b");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &a, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -3766,7 +4502,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-restart");
         let (probe, identities) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -3843,7 +4579,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-recycled");
         let (probe, identities) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -3889,7 +4625,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-race");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -3940,7 +4676,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-equality");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(first) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -4002,7 +4738,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-reconcile-live");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -4024,8 +4760,7 @@ mod tests {
         let sid = session(&manager, "terminal-unverified");
         // The spawn probe observes nothing: the durable row records no
         // verifiable identity.
-        let service =
-            TerminalService::with_identity_probe(manager.clone(), Arc::new(|_pid: u32| None));
+        let service = service_over(&manager, Arc::new(|_pid: u32| None), granted_policy());
         let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
         else {
             return;
@@ -4059,7 +4794,7 @@ mod tests {
         let (_dir, manager) = manager();
         let sid = session(&manager, "terminal-exit");
         let (probe, _map) = recording_probe();
-        let service = TerminalService::with_identity_probe(manager.clone(), probe);
+        let service = service_over(&manager, probe, granted_policy());
         let Some(creation) =
             spawn_or_skip(&service, &sid, &spawn_request("/bin/sh", &["-c", "exit 0"]))
         else {

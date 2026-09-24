@@ -1,0 +1,17 @@
+# Fixture: apt usage pinned to a fixed Debian snapshot timestamp with exact
+# package versions; the snapshot URL is present in the same step.
+# `scripts/check-ci-image-pins.sh --dir` must accept this file.
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ fixture
+    commands:
+      # apt-snapshot: 20260923T000000Z Debian trixie snapshot + exact versions (fixture)
+      - |
+        set -eu
+        SNAPSHOT=https://snapshot.debian.org/archive/debian/20260923T000000Z
+        SNAPSHOT_SECURITY=https://snapshot.debian.org/archive/debian-security/20260923T000000Z
+        printf 'deb [check-valid-until=no] %s trixie main\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
+        printf 'deb [check-valid-until=no] %s trixie-security main\n' "$SNAPSHOT_SECURITY" >> /etc/apt/sources.list.d/faktor-snapshot.list
+        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
+        apt-get update
+        apt-get install -y --no-install-recommends python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419

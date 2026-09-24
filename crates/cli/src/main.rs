@@ -2253,6 +2253,27 @@ fn serve_config_and_semantic(
     Ok((config, semantic))
 }
 
+/// The terminal execution-authority policy for the configured `[sandbox]`
+/// shell contract: the ONE construction the daemon entry points (`serve`,
+/// `acp`) inject into the terminal authority AT CONSTRUCTION and the doctor
+/// reads back. The configured `ShellExecutionMode`/isolation policy is
+/// carried VERBATIM (no global read, no hardcoded grant, no widening); the
+/// fail-closed `os_isolated`/`Required` default applies when nothing is
+/// configured, and an invalid pairing (e.g. a user-granted shell with a
+/// `required` guarantee) is refused here, never half-honored.
+fn terminal_authority_policy(
+    config: &config::Config,
+) -> Result<faktor_server::native::terminal_authority::TerminalAuthorityPolicy, String> {
+    let policy = config
+        .sandbox_policy()
+        .map_err(|e| format!("sandbox config: {e}"))?;
+    Ok(
+        faktor_server::native::terminal_authority::TerminalAuthorityPolicy::for_configured_sandbox(
+            &policy,
+        ),
+    )
+}
+
 /// Forced-exit code of the SECOND shutdown signal during the drain (`128 +
 /// SIGINT`, the conventional interrupted exit; SIGTERM maps to the same
 /// bounded force-exit since the daemon's own drain is the graceful path).
@@ -2914,6 +2935,14 @@ async fn serve_impl(
         Ok(loaded) => loaded,
         Err(e) => return Err(format!("config error: {e}")),
     };
+    // The terminal execution-authority policy — the configured `[sandbox]`
+    // shell contract (`ShellExecutionMode` + its isolation guarantee) —
+    // resolved BEFORE the config is consumed and injected EXPLICITLY into
+    // the server surface below. The authority never reads a global and never
+    // widens the contract: the configured mode is what it enforces and what
+    // the durable execution profile records; the fail-closed `os_isolated`
+    // default applies when nothing is configured.
+    let terminal_policy = terminal_authority_policy(&config)?;
     // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
     // coalescing under backpressure — a slow SSE consumer can never grow
     // the agent's memory. The drainer spawn lives in serve().
@@ -3058,6 +3087,10 @@ async fn serve_impl(
         graph.tasks.clone(),
         graph.budgets.clone(),
     );
+    // Explicit dependency injection: the daemon's terminal authority is
+    // constructed under the configured shell contract resolved above (the
+    // same source doctor reads), never under a hardcoded grant.
+    deps = deps.with_terminal_policy(terminal_policy);
     deps.chunk_rx = Some(chunk_rx);
     // The additive real GitHub App surface (built only while the section is
     // enabled; its initial sync is backgrounded after readiness below).
@@ -3574,6 +3607,17 @@ async fn run(prompt: String, provider: &str, model: &str, workspace: PathBuf, da
 /// ACP wire protocol on stdin/stdout until EOF or `shutdown`.
 async fn acp(data_dir: PathBuf) {
     let config = load_acp_config(&data_dir);
+    // The terminal execution-authority policy — the configured `[sandbox]`
+    // shell contract — resolved BEFORE the config is consumed: the ACP
+    // terminal authority receives it at construction (explicit injection;
+    // no global read, no hardcoded grant).
+    let terminal_policy = match terminal_authority_policy(&config) {
+        Ok(policy) => policy,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         eprintln!("data dir error: {e}");
         std::process::exit(1);
@@ -3610,8 +3654,9 @@ async fn acp(data_dir: PathBuf) {
     // native terminal surface serves) over the SAME session manager the
     // backend drives. Without this the extension is never negotiated and
     // every `terminal/*` method stays the official -32601.
-    let terminal_authority: Arc<dyn faktor_acp::TerminalAuthority> =
-        Arc::new(DaemonTerminalAuthority::new(session.clone()));
+    let terminal_authority: Arc<dyn faktor_acp::TerminalAuthority> = Arc::new(
+        DaemonTerminalAuthority::new(session.clone(), terminal_policy),
+    );
     let backend = DaemonAcpBackend::new(session, agent, prompts);
     match AcpServer::new(backend)
         .with_terminal_authority(terminal_authority)
@@ -4053,9 +4098,18 @@ impl DaemonTerminalAuthority {
     /// The authority is rooted at the SAME session manager the ACP backend
     /// drives, so a terminal can only be created for a real durable session
     /// and its row carries that session's durable task/operation identity.
-    fn new(session: Arc<SessionManager>) -> Self {
+    /// The execution policy (the configured `[sandbox]` shell contract) is
+    /// injected AT CONSTRUCTION — the same instance value the native surface
+    /// gets, so both adapters enforce and record one configured mode.
+    fn new(
+        session: Arc<SessionManager>,
+        policy: faktor_server::native::terminal_authority::TerminalAuthorityPolicy,
+    ) -> Self {
         Self {
-            registry: faktor_server::native::terminal_authority::TerminalRegistry::new(session),
+            registry:
+                faktor_server::native::terminal_authority::TerminalRegistry::for_manager_with_policy(
+                    &session, policy,
+                ),
         }
     }
 }
@@ -5335,9 +5389,13 @@ fn doctor_sandbox_shell_line(
         },
         None => config::Config::default(),
     };
-    match cfg.sandbox_policy() {
-        Ok(policy) => {
-            let state = policy.shell_execution_state();
+    match terminal_authority_policy(&cfg) {
+        Ok(terminal_authority) => {
+            // The effective contract is read back from the SAME construction
+            // seam the daemon injects into its terminal authority: what
+            // doctor prints is exactly the mode the daemon enforces and
+            // records.
+            let state = terminal_authority.shell_execution_state();
             lines.push(format!(
                 "sandbox shell execution: {} (mode={}, network_guarantee={})",
                 state.strength_label(),
@@ -6259,6 +6317,15 @@ mod tests {
             service,
             backend,
         }
+    }
+
+    /// The EXPLICIT user-granted shell contract tests inject into the
+    /// daemon terminal authority when they exercise real PTY spawns — the
+    /// authority default is the fail-closed `os_isolated` shape, so a test
+    /// that wants a live terminal grants it exactly like an operator would.
+    fn granted_terminal_policy(
+    ) -> faktor_server::native::terminal_authority::TerminalAuthorityPolicy {
+        faktor_server::native::terminal_authority::TerminalAuthorityPolicy::explicit_user_granted_shell()
     }
 
     /// A minimal REAL daemon over a temp data dir: one scripted provider
@@ -8830,6 +8897,128 @@ mod tests {
         );
         assert!(report.issues >= 1, "{:?}", report.lines);
     }
+
+    /// The doctor's shell-execution surface reads the SAME source the daemon
+    /// injects into its terminal authority: the effective
+    /// `TerminalAuthorityPolicy` mode. The config default is the fail-closed
+    /// `os_isolated`; only an explicit grant config flips it to
+    /// `network_capable_user_granted`, and the printed mode equals the
+    /// authority's `shell_execution_state()`.
+    #[test]
+    fn doctor_prints_the_terminal_authority_effective_shell_mode() {
+        // No --config: the daemon default contract (os_isolated/Required).
+        let mut lines = Vec::new();
+        let mut issues = 0usize;
+        doctor_sandbox_shell_line(None, &mut lines, &mut issues);
+        assert_eq!(issues, 0);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("mode=os_isolated")
+                && lines[0].contains("network_guarantee=required"),
+            "the default is the fail-closed OS-isolated contract: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("OS-isolated"), "{}", lines[0]);
+
+        // Explicit OS isolation in config: same contract, same source.
+        let dir = tempfile::tempdir().unwrap();
+        let os_config = dir.path().join("os.json");
+        std::fs::write(
+            &os_config,
+            r#"{"model": "m", "sandbox": {"network_guarantee": "required", "shell": "os_isolated"}}"#,
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        let mut issues = 0usize;
+        doctor_sandbox_shell_line(Some(&os_config), &mut lines, &mut issues);
+        assert_eq!(issues, 0, "{lines:?}");
+        assert!(lines[0].contains("mode=os_isolated"), "{}", lines[0]);
+
+        // The EXPLICIT operator grant: the doctor reports exactly the mode
+        // the authority constructed from the same config enforces.
+        let grant_config = dir.path().join("grant.json");
+        std::fs::write(
+            &grant_config,
+            r#"{"model": "m", "sandbox": {"network_guarantee": "none", "shell": "network_capable_user_granted"}}"#,
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        let mut issues = 0usize;
+        doctor_sandbox_shell_line(Some(&grant_config), &mut lines, &mut issues);
+        assert_eq!(issues, 0, "{lines:?}");
+        assert!(
+            lines[0].contains("mode=network_capable_user_granted")
+                && lines[0].contains("GRANTED BY USER"),
+            "the grant is surfaced as strictly weaker, never as isolation: {}",
+            lines[0]
+        );
+
+        // The SAME config feeds the authority the daemon injects, and the
+        // authority reports the mode doctor printed.
+        let cfg = serve_config_and_semantic(Some(grant_config))
+            .expect("the grant config is valid")
+            .0;
+        let policy = terminal_authority_policy(&cfg).expect("the grant config resolves a policy");
+        assert_eq!(
+            policy.shell_execution_state().mode,
+            faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted
+        );
+    }
+
+    /// The construction seam both daemon entry points use injects exactly
+    /// the configured contract: the default resolves the fail-closed
+    /// `os_isolated`/`Required` shape, an explicit grant config resolves the
+    /// honest user-granted mode, and an invalid pairing is refused here —
+    /// never silently reinterpreted.
+    #[test]
+    fn terminal_authority_policy_carries_the_configured_shell_contract_verbatim() {
+        let default_policy = terminal_authority_policy(&config::Config::default())
+            .expect("the default config resolves");
+        let state = default_policy.shell_execution_state();
+        assert_eq!(state.mode, faktor_sandbox::ShellExecutionMode::OsIsolated);
+        assert_eq!(
+            state.network_guarantee,
+            faktor_sandbox::SandboxGuarantee::Required
+        );
+
+        let grant = config::Config {
+            sandbox: config::SandboxCfg {
+                network_guarantee: faktor_sandbox::SandboxGuarantee::None,
+                shell: faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted,
+                ..config::SandboxCfg::default()
+            },
+            ..config::Config::default()
+        };
+        let granted = terminal_authority_policy(&grant).expect("an explicit grant resolves");
+        let state = granted.shell_execution_state();
+        assert_eq!(
+            state.mode,
+            faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted
+        );
+        assert_eq!(
+            state.network_guarantee,
+            faktor_sandbox::SandboxGuarantee::None
+        );
+
+        // A user-granted shell paired with the OS-isolation requirement is
+        // the invalid pairing `SandboxPolicy::validate` refuses (the daemon
+        // would refuse the config); the seam must refuse it too.
+        let invalid = config::Config {
+            sandbox: config::SandboxCfg {
+                network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
+                shell: faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted,
+                ..config::SandboxCfg::default()
+            },
+            ..config::Config::default()
+        };
+        let refused = terminal_authority_policy(&invalid)
+            .expect_err("an invalid shell/guarantee pairing must be refused");
+        assert!(
+            refused.contains("network_capable_user_granted"),
+            "{refused}"
+        );
+    }
+
     /// The additive `cloud-db` doctor section (P1 durability): a real
     /// control-plane database is reported with its writer-recorded
     /// `synchronous=FULL` policy, integrity, verified backup age and its
@@ -10983,7 +11172,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acp_terminal_round_trip_runs_on_the_daemon_authority() {
         let rig = acp_shadow_rig(Vec::new());
-        let authority_impl = Arc::new(DaemonTerminalAuthority::new(rig.session.clone()));
+        let authority_impl = Arc::new(DaemonTerminalAuthority::new(
+            rig.session.clone(),
+            granted_terminal_policy(),
+        ));
         let registry = authority_impl.registry.clone();
         let authority: Arc<dyn faktor_acp::TerminalAuthority> = authority_impl.clone();
         let (mut client, task) = start_daemon_terminal_server(rig.backend, Some(authority));
@@ -11135,8 +11327,9 @@ mod tests {
     async fn acp_terminal_methods_are_method_not_found_when_not_negotiated() {
         // (a) Authority attached, extension NOT negotiated.
         let rig = acp_shadow_rig(Vec::new());
-        let authority: Arc<dyn faktor_acp::TerminalAuthority> =
-            Arc::new(DaemonTerminalAuthority::new(rig.session.clone()));
+        let authority: Arc<dyn faktor_acp::TerminalAuthority> = Arc::new(
+            DaemonTerminalAuthority::new(rig.session.clone(), granted_terminal_policy()),
+        );
         let (mut client, task) = start_daemon_terminal_server(rig.backend, Some(authority));
         client
             .request("initialize", json!({ "protocolVersion": 1 }))

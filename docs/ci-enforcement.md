@@ -174,7 +174,7 @@ container fallback in `scripts/woodpecker/setup.md` §13) plus the
 dependency-light PyYAML parse gate in the same section; both run before any
 CI change is pushed.
 
-## 5. Trusted-build attestation and the CI-image residual
+## 5. Trusted-build attestation and apt reproducibility
 
 - **Attestation (P1-J).** The trusted workflow's `attestation` step (after
   `certificate`, `linux/amd64` only, `when.status: [success]`) writes a
@@ -185,24 +185,31 @@ CI change is pushed.
   from the lane markers (VSIX, JetBrains zip) with every digest re-hashed at
   attestation time. `scripts/certify.sh` fetches that block for the EXACT
   trusted pipeline and refuses release certification on any mismatch.
-  Signing: register an ed25519 key on the trusted project and add
-  `FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret: faktor_attest_signing_key}`
-  to the step (a `from_secret` to a missing secret is a Woodpecker config
-  error, so it is documented, not hardcoded). Generate the pair with
-  `node scripts/certification/attestation.mjs keygen --out-key release.pem
-  --out-keys release-keys.json --key-id faktor-ci-release` and give
-  operators `release-keys.json` as `FAKTOR_ATTEST_KEYS`. Without the secret
-  the attestation is emitted UNSIGNED (loud) and is never release-grade.
-  Preferred release model: distribute the CI-built artifacts the
-  attestation covers, not local rebuilds.
-- **CI-image/apt residual (P2-D).** No Faktor CI image or Debian
-  snapshot+exact-version pin exists yet, so six `apt-get` command items run
-  against live Debian repositories. `scripts/check-ci-image-pins.sh` now
-  audits apt usage: every item needs `# apt-residual: <reason>` (current
-  state; printed on every run) or `# apt-pinned: <image@sha256:...>`, and an
-  item with neither (or a bare annotation) fails the `image-pins` step. The
-  target state is one Faktor CI image whose digest feeds the attestation's
-  `build_environment_digest`; see `docs/certification.md` §2.14.
+  Signing is **fail-closed**: register an ed25519 key on the trusted project
+  and add `FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
+  faktor_attest_signing_key}` to the step (a `from_secret` to a missing
+  secret is a Woodpecker config error, so it is documented, not hardcoded).
+  Generate the pair with `node scripts/certification/attestation.mjs keygen
+  --out-key release.pem --out-keys release-keys.json --key-id
+  faktor-ci-release` and give operators `release-keys.json` as
+  `FAKTOR_ATTEST_KEYS`. WITHOUT the secret the step exits 3 with the typed
+  `signing-key-missing` error and writes NO attestation — there is no
+  unsigned code path. The documented alternative is Sigstore/keyless
+  signing of the same payload against the pipeline OIDC identity
+  (`docs/certification.md` §2.12). Preferred release model: distribute the
+  CI-built artifacts the attestation covers, not local rebuilds.
+- **apt reproducibility (P2-D, closed).** Every apt install in
+  `.woodpecker/**` runs against a fixed Debian/Ubuntu snapshot timestamp
+  (`20260923T000000Z`) with exact `pkg=version` pins; nothing reaches live
+  distribution repositories. `scripts/check-ci-image-pins.sh` audits this:
+  each apt-bearing step needs `# apt-snapshot: <timestamp> <reason>` (with
+  the matching `snapshot.debian.org`/`snapshot.ubuntu.com` URL in the same
+  step and exact-version installs) or `# apt-pinned: <image@sha256:...>`
+  when the step runs on the dedicated Faktor CI image. The legacy
+  `apt-residual` annotation is rejected outright. `docker/faktor-ci/` +
+  `scripts/build-ci-image.sh` build the dedicated image (pinned base digest
+  + snapshot + exact versions); lanes switch to `image@sha256:<digest>` once
+  the operator publishes it. See `docs/certification.md` §2.14.
 
 ## 6. Context registry for release certification
 

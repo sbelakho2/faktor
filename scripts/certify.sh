@@ -44,13 +44,19 @@
 #     ({source_sha, tree_sha, workflow, event, pipeline_id, pipeline_number,
 #     build_environment_digest (CI image digest), rust_toolchain,
 #     artifacts{name: sha256}}) into the step log (base64 marker block).
+#     Signing is FAIL-CLOSED: without the signing-key secret the step exits
+#     with the typed `signing-key-missing` error and writes no attestation,
+#     so an unsigned object can only arrive from foreign/legacy tooling.
 #     This script FETCHES the attestation belonging to the exact trusted
 #     pipeline, verifies the ed25519 signature against the operator allowlist
 #     (FAKTOR_ATTEST_KEYS / --attestation-keys), verifies source SHA, tree,
 #     workflow, event, pipeline number/id, and re-hashes EVERY local/shipped
 #     artifact against the attested digests. Any mismatch is a failure.
 #     Distributing the CI-built artifacts (the attested bytes) rather than
-#     locally rebuilt ones is the preferred release model.
+#     locally rebuilt ones is the preferred release model. The documented
+#     alternative to the ed25519 allowlist is Sigstore/keyless verification
+#     of the same payload against the pipeline's OIDC identity
+#     (docs/certification.md §2.12).
 #
 #   * CERTIFICATE CLASS (P1-K): `--verify-ci-evidence` (the renamed
 #     `--ci-only`) verifies the embedded CI run and terminates with
@@ -1496,8 +1502,20 @@ assert m["release_certificate"] is True, m
         set_state
     expect foreign-signature 1
     expect_problem foreign-signature 'attestation-invalid'
-    # --- unsigned attestation is not release-grade.
-    make_attestation "$tmp/unsigned-att.json" >/dev/null 2>&1
+    # --- unsigned attestation is not release-grade. The trusted workflow's
+    # `create` is fail-closed (no unsigned code path), so this fixture is a
+    # legacy/foreign object: a valid signed attestation with the signature
+    # stripped, exactly what the verifier must refuse.
+    python3 - "$tmp/trusted-att.json" "$tmp/unsigned-att.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as fh:
+    attestation = json.load(fh)
+attestation["signature"] = None
+with open(sys.argv[2], "w") as fh:
+    json.dump(attestation, fh)
+PY
     log_block "$tmp/unsigned-att.json" >"$tmp/unsigned-block.txt"
     CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
         CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
