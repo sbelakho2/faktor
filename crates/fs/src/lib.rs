@@ -21,10 +21,12 @@ use tokio::sync::mpsc;
 
 pub mod atomic;
 pub mod entry_state;
+pub mod legacy;
 mod platform;
 pub mod rooted;
 pub mod tree_manifest;
 
+pub use legacy::{legacy_relative_path_within, workspace_relative_path_rejection};
 pub use rooted::RootedDir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,7 +196,7 @@ impl WorkspaceFileService {
             workspace_id,
             root,
             rooted,
-            _watcher: Arc::new(Mutex::new(watcher)),
+            _watcher: Some(Arc::new(Mutex::new(watcher))),
             events: Arc::new(Mutex::new(rx)),
         };
         recover_lock(&self.workspaces).insert(workspace_id, handle.clone());
@@ -231,7 +233,10 @@ pub struct WorkspaceHandle {
     /// root path per operation: a root directory entry swapped after the
     /// open cannot redirect those operations.
     rooted: Arc<RootedDir>,
-    _watcher: Arc<Mutex<RecommendedWatcher>>,
+    /// Retained filesystem-event watcher. `None` on scoped handles
+    /// ([`WorkspaceHandle::open_scoped`]), which create no watcher and emit
+    /// no events: their whole lifetime is one caller operation.
+    _watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
     events: Arc<Mutex<mpsc::Receiver<FsEvent>>>,
 }
 
@@ -262,6 +267,37 @@ impl WorkspaceHandle {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Open a one-shot, watcher-less handle whose whole lifetime is ONE
+    /// caller operation (recovery verification): every read runs through the
+    /// same handle-relative anchored walk and post-open identity net as a
+    /// service-owned handle, but no recursive watcher is created and the
+    /// handle is never registered in a [`WorkspaceFileService`]. The root is
+    /// canonicalized and validated exactly like [`WorkspaceFileService::open`]
+    /// (missing/non-directory roots fail typed). No file is opened here.
+    pub fn open_scoped(workspace_id: WorkspaceId, root: PathBuf) -> Result<Self, Error> {
+        let root = root
+            .canonicalize()
+            .map_err(|e| Error::not_found(format!("workspace root {}: {e}", root.display())))?;
+        if !root.is_dir() {
+            return Err(Error::not_found(format!(
+                "workspace root {} is not a directory",
+                root.display()
+            )));
+        }
+        let rooted = Arc::new(RootedDir::open(&root)?);
+        // No producer: a scoped handle emits no filesystem events, and no
+        // consumer outside its one caller can ever observe the channel.
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        Ok(Self {
+            workspace_id,
+            root,
+            rooted,
+            _watcher: None,
+            events: Arc::new(Mutex::new(rx)),
+        })
     }
 
     /// Traversal/symlink-safe resolution of a relative path under the root.

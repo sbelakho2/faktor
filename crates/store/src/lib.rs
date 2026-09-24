@@ -2575,6 +2575,86 @@ impl Store {
         Ok((id, seq))
     }
 
+    /// The CONTENT-AWARE checkpoint command: allocate the per-session
+    /// sequence, insert the existence-bearing checkpoint row and append its
+    /// `CheckpointCreated` event in ONE transaction, after verifying the
+    /// session is still in `expected_state` (a moved session refuses typed
+    /// before any write). This is the production path of the CAS-backed
+    /// checkpoint store (faktor-snapshot): a row can never commit without
+    /// its journal event, and two concurrent writers can never both receive
+    /// the same sequence. [`Store::put_checkpoint_and_event`] remains the
+    /// caller-sequenced hash-only variant.
+    ///
+    /// The event carries the store's canonical `CheckpointCreated` payload
+    /// shape (`sequence` is the value this transaction allocated, matching
+    /// the row) and is stamped with the transaction's wall clock, exactly
+    /// like the row's `created_ms`. Returns
+    /// `(checkpoint_row_id, allocated_sequence, event_seq)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_checkpoint_and_event(
+        &self,
+        session_id: SessionId,
+        path: &str,
+        before_exists: bool,
+        before_hash: &str,
+        after_exists: bool,
+        after_hash: &str,
+        after_cas_hash: Option<&str>,
+        expected_state: AgentState,
+    ) -> StoreResult<(i64, i64, EventSeq)> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let prev: i64 = txn.tx.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM checkpoint WHERE session_id = ?1",
+            params![session_id.raw() as i64],
+            |r| r.get(0),
+        )?;
+        let sequence = prev + 1;
+        let ts = now_ms();
+        let changed = txn.tx.execute(
+            "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, before_exists, after_exists, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session_id.raw() as i64,
+                sequence,
+                path,
+                before_hash,
+                after_hash,
+                after_cas_hash,
+                before_exists as i64,
+                after_exists as i64,
+                ts
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Migration(
+                "insert_checkpoint_and_event: expected exactly one inserted row".into(),
+            ));
+        }
+        let id = txn.tx.last_insert_rowid();
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            None,
+            EventKind::CheckpointCreated,
+            expected_state,
+            ts,
+            Some(serde_json::json!({
+                "sequence": sequence,
+                "path": path,
+                "before_hash": before_hash,
+                "after_hash": after_hash,
+                "before_exists": before_exists,
+                "after_exists": after_exists,
+            })),
+            1,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok((id, sequence, seq))
+    }
+
     /// `record_compaction` as ONE transaction: insert the compaction row and
     /// append the accepted/rejected compaction event together.
     #[allow(clippy::too_many_arguments)]
@@ -5157,6 +5237,12 @@ impl Store {
     /// `before_hash`/`after_hash` carry the side's content hash, or the empty
     /// string when that side does not exist (`before_exists=false`). Returns
     /// the row id and the allocated sequence.
+    ///
+    /// ROW-ONLY: this path appends no journal event. Production checkpoint
+    /// writes go through [`Store::insert_checkpoint_and_event`], which
+    /// commits the row and its `CheckpointCreated` event in one
+    /// `SessionCommandTxn`; this raw insert survives for tests that need to
+    /// fabricate rows directly (corrupt/legacy fixtures).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_checkpoint(
         &self,
@@ -5196,10 +5282,12 @@ impl Store {
         Ok((id, sequence))
     }
 
-    /// Raw checkpoint insert at an explicit caller-chosen sequence (the
-    /// session layer's journal-backed path, which validates duplicates
-    /// itself). Both sides exist. Prefer [`Store::insert_checkpoint`] for
-    /// content-aware checkpoints: it allocates the sequence atomically.
+    /// Raw ROW-ONLY checkpoint insert at an explicit caller-chosen sequence
+    /// (test fixtures that need a bare row: corrupt/legacy shapes). Both
+    /// sides exist. The production content-aware path is
+    /// [`Store::insert_checkpoint_and_event`] (atomic sequence allocation +
+    /// `CheckpointCreated` event); the caller-sequenced journaled path is
+    /// [`Store::put_checkpoint_and_event`].
     pub fn put_checkpoint(
         &self,
         session_id: SessionId,
@@ -20622,6 +20710,97 @@ mod session_command_txn_tests {
                 }
             }
         }
+    }
+
+    /// The content-aware checkpoint command (the production path of
+    /// faktor-snapshot): ONE transaction allocates the sequence, inserts the
+    /// existence-bearing row and appends its `CheckpointCreated` event; a
+    /// wrong expected state refuses typed BEFORE any write.
+    #[test]
+    fn content_checkpoint_allocates_sequence_and_journals_atomically() {
+        let (_dir, store, sid) = setup();
+        let (id, sequence, seq) = store
+            .insert_checkpoint_and_event(
+                sid,
+                "new.rs",
+                false,
+                "",
+                true,
+                &"aa".repeat(32),
+                Some(&"aa".repeat(32)),
+                AgentState::Idle,
+            )
+            .unwrap();
+        assert_eq!(sequence, 1);
+        let rows = store.checkpoints_of(sid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert!(
+            !rows[0].before_exists,
+            "the missing before side is recorded"
+        );
+        assert_eq!(rows[0].before_hash, "");
+        assert!(rows[0].after_exists);
+        let events = store.events_range(sid, seq.raw(), None).unwrap();
+        assert_eq!(events.len(), 1, "exactly one event per checkpoint row");
+        assert_eq!(events[0].kind, EventKind::CheckpointCreated);
+        assert_eq!(events[0].state, AgentState::Idle);
+        assert_eq!(
+            events[0].payload.as_ref().unwrap()["sequence"],
+            serde_json::json!(1),
+            "the event names the sequence the same transaction allocated"
+        );
+        // The next command allocates the NEXT sequence, never a duplicate.
+        let (_, sequence2, _) = store
+            .insert_checkpoint_and_event(
+                sid,
+                "second.rs",
+                true,
+                &"bb".repeat(32),
+                true,
+                &"cc".repeat(32),
+                None,
+                AgentState::Idle,
+            )
+            .unwrap();
+        assert_eq!(sequence2, 2);
+        // A wrong expected state refuses with Conflict before any write: no
+        // new row, no event.
+        let rows_before: Vec<i64> = store
+            .checkpoints_of(sid)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let events_before = store.events_range(sid, 1, None).unwrap().len();
+        let err = store
+            .insert_checkpoint_and_event(
+                sid,
+                "third.rs",
+                true,
+                &"dd".repeat(32),
+                true,
+                &"ee".repeat(32),
+                None,
+                AgentState::Suspended,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            store
+                .checkpoints_of(sid)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            rows_before,
+            "a refused checkpoint writes no row"
+        );
+        assert_eq!(
+            store.events_range(sid, 1, None).unwrap().len(),
+            events_before,
+            "a refused checkpoint writes no event"
+        );
     }
 
     #[test]

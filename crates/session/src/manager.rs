@@ -17,7 +17,6 @@ use crate::handle::SessionHandle;
 use crate::ops::OpRegistry;
 use crate::process::ProcessRegistry;
 use crate::read_service::DbReadKind;
-use crate::recovery::SystemFileHasher;
 use crate::{SessionError, DEFAULT_TURN_BUDGET_MS};
 
 // ------------------------------------------------------------- shadow roots
@@ -130,7 +129,6 @@ pub struct SessionManager {
     reads: crate::read_service::DbReadService,
     op_ids: Mutex<OpIdRange>,
     resources: Mutex<HashMap<SessionId, Arc<SessionResources>>>,
-    system_hasher: Arc<SystemFileHasher>,
     pub(crate) artifact_sizes: ArtifactSizes,
     /// Layered lifetime bound (audit 26): wall-clock budget of ONE logical
     /// turn — the prompt operation's deadline and the runtime's per-turn
@@ -217,7 +215,6 @@ impl SessionManager {
         let cas_root = cas_root.into();
         let cas = Cas::open(cas_root).map_err(SessionError::from)?;
         let cas = Arc::new(cas);
-        let system_hasher = Arc::new(SystemFileHasher::new(cas.clone()));
         let actor = crate::actor::DbActor::spawn(store.clone(), Default::default());
         let reads = crate::read_service::DbReadService::spawn(store.clone(), Default::default());
         Ok(Arc::new(SessionManager {
@@ -228,7 +225,6 @@ impl SessionManager {
             reads,
             op_ids: Mutex::new(OpIdRange::default()),
             resources: Mutex::new(HashMap::new()),
-            system_hasher,
             artifact_sizes: ArtifactSizes::default(),
             turn_budget_ms: AtomicU64::new(DEFAULT_TURN_BUDGET_MS),
         }))
@@ -859,7 +855,6 @@ impl SessionManager {
             self.clone(),
             row.id,
             self.resources(row.id),
-            self.system_hasher.clone(),
         ))
     }
 
@@ -888,12 +883,7 @@ impl SessionManager {
     ) -> faktor_core::Result<Option<SessionHandle>> {
         match self.store.get_session(id).map_err(crate::map_store_err)? {
             Some(_row) => {
-                let handle = SessionHandle::new(
-                    self.clone(),
-                    id,
-                    self.resources(id),
-                    self.system_hasher.clone(),
-                );
+                let handle = SessionHandle::new(self.clone(), id, self.resources(id));
                 // Open-time typed-ledger verification (audit 27): an entry
                 // that fails its schema decode fails the session open
                 // loudly — never a silent drop.
@@ -911,12 +901,7 @@ impl SessionManager {
         let rows = self.store.list_sessions(ws).map_err(crate::map_store_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let handle = SessionHandle::new(
-                self.clone(),
-                r.id,
-                self.resources(r.id),
-                self.system_hasher.clone(),
-            );
+            let handle = SessionHandle::new(self.clone(), r.id, self.resources(r.id));
             // Open-time typed-ledger verification (audit 27): a corrupt
             // typed entry fails the session open loudly.
             handle.ledger_verify_open()?;

@@ -42,7 +42,7 @@ fn loopback_config(bearer: Option<&str>) -> WorkerPlaneBindConfig {
         transport: WorkerPlaneTransport::Plaintext,
         trusted_gateway: false,
         auth: WorkerPlaneAuth::WorkerTokens,
-        bearer: bearer.map(str::to_string),
+        bearer: bearer.map(faktor_security::secret::SecretValue::new),
     }
 }
 
@@ -65,9 +65,12 @@ fn capabilities_json(org: &str) -> serde_json::Value {
 // ------------------------------------------------------------ typed refusals
 
 /// The transport bearer is a credential: `Debug` must never print it (a
-/// config type that leaks into a log line must leak nothing).
+/// config type that leaks into a log line must leak nothing), and neither
+/// the exposure witness, the audit line, nor a malformed-bearer refusal may
+/// carry the planted value.
 #[test]
 fn bind_config_debug_redacts_the_transport_bearer() {
+    const PLANTED: &str = "PLANTED-GATEWAY-BEARER-do-not-leak-0123456789";
     let mut config = loopback_config(Some("gw-super-secret"));
     config.auth = WorkerPlaneAuth::GatewayMtls;
     config.trusted_gateway = true;
@@ -75,6 +78,29 @@ fn bind_config_debug_redacts_the_transport_bearer() {
     let debug = format!("{config:?}");
     assert!(!debug.contains("gw-super-secret"), "{debug}");
     assert!(debug.contains("<redacted>"), "{debug}");
+    // Planted value: Debug of the config, the validated exposure, the
+    // startup audit line and a boundary refusal never carry the bytes.
+    let mut planted = loopback_config(Some(PLANTED));
+    planted.auth = WorkerPlaneAuth::GatewayMtls;
+    planted.trusted_gateway = true;
+    let exposure = planted.validate().unwrap();
+    for rendered in [
+        format!("{planted:?}"),
+        format!("{exposure:?}"),
+        exposure.audit_line(),
+    ] {
+        assert!(!rendered.contains(PLANTED), "leaked: {rendered}");
+    }
+    // The oversized/malformed refusal names the shape, never the value.
+    let mut malformed = planted.clone();
+    malformed.bearer = Some(faktor_security::secret::SecretValue::new("x".repeat(513)));
+    let refusal = malformed.validate().unwrap_err();
+    let rendered = format!("{refusal} {refusal:?}");
+    assert!(!rendered.contains("xxx"), "refusal leaked: {rendered}");
+    assert!(
+        rendered.contains("printable ASCII"),
+        "the refusal names the shape: {rendered}"
+    );
 }
 
 /// A non-loopback worker bind without TLS or the gateway acknowledgement is
@@ -158,7 +184,7 @@ fn gateway_mtls_requires_acknowledgement_and_bearer() {
             WorkerPlaneBoundaryRefusal::MalformedTransportBearer { .. }
         ));
     }
-    config.bearer = Some("x".repeat(crate::MAX_WORKER_PLANE_BEARER_BYTES + 1));
+    config.bearer = Some("x".repeat(crate::MAX_WORKER_PLANE_BEARER_BYTES + 1).into());
     assert!(matches!(
         config.validate().unwrap_err(),
         WorkerPlaneBoundaryRefusal::MalformedTransportBearer { .. }

@@ -71,6 +71,7 @@ use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use faktor_protocol::error::ApiError;
+use faktor_security::secret::SecretValue;
 
 use crate::api::{AppState, ServerDeps, MAX_BODY_BYTES};
 use crate::auth::check_bearer_value;
@@ -137,8 +138,10 @@ pub struct WorkerPlaneBindConfig {
     pub trusted_gateway: bool,
     pub auth: WorkerPlaneAuth,
     /// Optional transport bearer required on every worker-plane request (the
-    /// gateway's credential in `GatewayMtls` mode).
-    pub bearer: Option<String>,
+    /// gateway's credential in `GatewayMtls` mode). A [`SecretValue`]:
+    /// zeroized on drop, redacted `Debug`, no `Display`/serde — the only
+    /// reader is the constant-time header check.
+    pub bearer: Option<SecretValue>,
 }
 
 impl std::fmt::Debug for WorkerPlaneBindConfig {
@@ -257,7 +260,7 @@ impl WorkerPlaneBindConfig {
         if let Some(bearer) = &self.bearer {
             let shaped = !bearer.is_empty()
                 && bearer.len() <= MAX_WORKER_PLANE_BEARER_BYTES
-                && bearer.bytes().all(|b| b.is_ascii_graphic());
+                && bearer.expose().bytes().all(|b| b.is_ascii_graphic());
             if !shaped {
                 return Err(WorkerPlaneBoundaryRefusal::MalformedTransportBearer { bind });
             }
@@ -703,7 +706,7 @@ impl WorkerPlaneStatusProbe {
 /// Every native route (health/ready, sessions, operator worker routes, SSO,
 /// …) is absent here and answers 404 — the socket's whole purpose is the
 /// remote worker contract, nothing else.
-fn worker_plane_router(deps: Arc<ServerDeps>, bearer: Option<String>) -> Router {
+fn worker_plane_router(deps: Arc<ServerDeps>, bearer: Option<SecretValue>) -> Router {
     let next_terminal_event_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let state = AppState {
         deps,
@@ -739,7 +742,7 @@ fn worker_plane_router(deps: Arc<ServerDeps>, bearer: Option<String>) -> Router 
                             .headers()
                             .get(header::AUTHORIZATION)
                             .and_then(|value| value.to_str().ok());
-                        if check_bearer_value(&expected, presented) {
+                        if check_bearer_value(expected.expose(), presented) {
                             next.run(request).await
                         } else {
                             wire_status(unauthorized())

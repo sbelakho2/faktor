@@ -82,36 +82,79 @@ impl fmt::Debug for OidcTokenSet {
     }
 }
 
+/// The OIDC `nonce` of one login: the replay binding of the ID token. A
+/// domain secret TYPE by security value, not by name — `nonce` does not look
+/// secret-ish, so no field-name scan can be the authority that keeps it out
+/// of logs; the wrapper is. Zeroized on drop, redacted `Debug`, no
+/// `Display`/serde/`AsRef`: plaintext leaves only through the explicit
+/// [`OidcNonce::expose`] escape hatch (the token-endpoint comparison and the
+/// authorization URL).
+#[derive(Clone, PartialEq, Eq)]
+pub struct OidcNonce(SecretValue);
+
+impl OidcNonce {
+    /// Wrap an explicit nonce. Callers that mint one should use
+    /// cryptographic randomness ([`crate::sso::SsoLogin`] does).
+    pub fn new(nonce: impl Into<String>) -> Self {
+        Self(SecretValue::new(nonce))
+    }
+
+    /// The explicit escape hatch: the ONLY way to read the plaintext
+    /// (crate-internal — the verification comparison and the authorization
+    /// URL are the only readers).
+    pub(crate) fn expose(&self) -> &str {
+        self.0.expose()
+    }
+}
+
+impl fmt::Debug for OidcNonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OidcNonce([redacted])")
+    }
+}
+
+impl From<String> for OidcNonce {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for OidcNonce {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
 /// What a verifier must check besides the signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// No serde: the wrapped [`OidcNonce`] must never be serialized, and the
+/// struct is constructed in-process from the login authority (the token
+/// endpoint's ID-token input is the opaqueness boundary), so there is no
+/// wire shape to mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdTokenExpectations {
     pub issuer: String,
     pub audience: String,
-    #[serde(default)]
-    pub nonce: Option<String>,
+    pub nonce: Option<OidcNonce>,
     pub now_ms: i64,
-    #[serde(default)]
     pub clock_skew_ms: i64,
 }
 
-/// The verified ID-token claims (bounded; never the raw token).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The verified ID-token claims (bounded; never the raw token). Like
+/// [`IdTokenExpectations`] this deliberately has NO serde: the nonce is a
+/// wrapped secret, and claims are parsed from the signed JWT payload
+/// directly, never re-serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OidcClaims {
     pub issuer: String,
     pub subject: String,
     pub audience: Vec<String>,
-    #[serde(default)]
     pub email: Option<String>,
-    #[serde(default)]
     pub email_verified: bool,
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
-    #[serde(default)]
-    pub nonce: Option<String>,
+    pub nonce: Option<OidcNonce>,
     /// Group memberships (the membership-mapping input).
-    #[serde(default)]
     pub groups: Vec<String>,
 }
 
@@ -334,6 +377,10 @@ impl FakeOidcAdapter {
             .map(|key| key.secret.clone())
             .unwrap_or_else(|| b"unknown-kid".to_vec());
         let header = serde_json::json!({"alg": "HS256", "kid": kid, "typ": "JWT"});
+        // The nonce is a SecretValue wrapper: it leaves only here, into the
+        // signed payload JSON the token itself carries (the explicit
+        // escape hatch), and never into Debug/serde of the claim type.
+        let nonce = claims.nonce.as_ref().map(OidcNonce::expose);
         let payload = serde_json::json!({
             "iss": claims.issuer,
             "sub": claims.subject,
@@ -342,7 +389,7 @@ impl FakeOidcAdapter {
             "email_verified": claims.email_verified,
             "iat": claims.issued_at_ms / 1000,
             "exp": claims.expires_at_ms / 1000,
-            "nonce": claims.nonce,
+            "nonce": nonce,
             "groups": claims.groups,
         });
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -544,9 +591,11 @@ impl OidcAdapter for FakeOidcAdapter {
         let nonce = payload
             .get("nonce")
             .and_then(|value| value.as_str())
-            .map(str::to_string);
+            .map(OidcNonce::new);
         if let Some(expected_nonce) = &expected.nonce {
-            if nonce.as_deref() != Some(expected_nonce.as_str()) {
+            // Wrapped comparison: constant-time through the wrapper, and the
+            // mismatch refusal names neither value.
+            if nonce.as_ref() != Some(expected_nonce) {
                 return Err(OidcError::NonceMismatch);
             }
         }
@@ -851,10 +900,16 @@ mod tests {
     fn planted_tokens_never_leak_through_debug_display_serde_or_panic() {
         assert_no_display_no_serialize!(OidcTokenSet);
         assert_no_display_no_serialize!(CodeExchangeRequest);
+        // The nonce-carrying types are serde-free too: the wrapper, not the
+        // field-name scan, is what keeps the nonce out of wire renderings.
+        assert_no_display_no_serialize!(IdTokenExpectations);
+        assert_no_display_no_serialize!(OidcClaims);
+        assert_no_display_no_serialize!(OidcNonce);
         const PLANTED_ACCESS: &str = "PLANTED-ACCESS-TOKEN-do-not-leak-0123456789";
         const PLANTED_ID: &str = "PLANTED-ID-TOKEN-do-not-leak-0123456789";
         const PLANTED_CODE: &str = "PLANTED-AUTH-CODE-do-not-leak-0123456789";
         const PLANTED_VERIFIER: &str = "PLANTED-PKCE-VERIFIER-do-not-leak-0123456789";
+        const PLANTED_NONCE: &str = "PLANTED-OIDC-NONCE-do-not-leak-0123456789";
         let tokens = OidcTokenSet {
             access_token: PLANTED_ACCESS.into(),
             id_token: PLANTED_ID.into(),
@@ -866,6 +921,15 @@ mod tests {
             redirect_uri: "https://app.example/cb".into(),
             code_verifier: PLANTED_VERIFIER.into(),
         };
+        let expectations = IdTokenExpectations {
+            issuer: ISSUER.into(),
+            audience: CLIENT.into(),
+            nonce: Some(OidcNonce::new(PLANTED_NONCE)),
+            now_ms: 1_700_000_000_000,
+            clock_skew_ms: 0,
+        };
+        let mut planted_claims = claims(1_700_000_000_000);
+        planted_claims.nonce = Some(OidcNonce::new(PLANTED_NONCE));
         for (planted, rendered) in [
             (PLANTED_ACCESS, format!("{tokens:?}")),
             (PLANTED_ID, format!("{tokens:?}")),
@@ -874,12 +938,22 @@ mod tests {
             (PLANTED_ACCESS, format!("{:?}", Some(tokens.clone()))),
             (PLANTED_ID, format!("{:?}", vec![tokens.clone()])),
             (PLANTED_CODE, format!("{:?}", (request.clone(), 1u8))),
+            (PLANTED_NONCE, format!("{expectations:?}")),
+            (
+                PLANTED_NONCE,
+                format!("{:?}", Some(expectations.nonce.clone())),
+            ),
+            (PLANTED_NONCE, format!("{planted_claims:?}")),
+            (PLANTED_NONCE, format!("{:?}", vec![planted_claims.clone()])),
         ] {
             assert!(!rendered.contains(planted), "leaked via {rendered}");
         }
         // Panic formatting of both carriers stays redacted.
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panic!("exchange failed for {request:?} / {tokens:?}")
+            panic!(
+                "exchange failed for {request:?} / {tokens:?} / {expectations:?} / \
+                 {planted_claims:?}"
+            )
         }))
         .expect_err("the closure must panic");
         let message = payload
@@ -887,12 +961,36 @@ mod tests {
             .cloned()
             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
-        for planted in [PLANTED_ACCESS, PLANTED_ID, PLANTED_CODE, PLANTED_VERIFIER] {
+        for planted in [
+            PLANTED_ACCESS,
+            PLANTED_ID,
+            PLANTED_CODE,
+            PLANTED_VERIFIER,
+            PLANTED_NONCE,
+        ] {
             assert!(
                 !message.contains(planted),
                 "panic payload leaked: {message}"
             );
         }
+        // Verification refusals (a nonce mismatch against the planted value,
+        // and a wrong nonce expectation) carry neither nonce.
+        let adapter = FakeOidcAdapter::new(ISSUER, CLIENT, b"secret-one");
+        let token = adapter.sign_claims(&planted_claims);
+        let mut expected_planted = expectations.clone();
+        assert!(
+            adapter.verify_id_token(&token, &expected_planted).is_ok(),
+            "the planted nonce verifies against itself"
+        );
+        expected_planted.nonce = Some(OidcNonce::new("some-other-nonce"));
+        let mismatch = adapter
+            .verify_id_token(&token, &expected_planted)
+            .unwrap_err();
+        let rendered = format!("{mismatch} {mismatch:?}");
+        assert!(
+            !rendered.contains(PLANTED_NONCE),
+            "nonce mismatch leaked: {rendered}"
+        );
         // A code-exchange refusal names only the cause, never the inputs.
         let err = adapter_refusal_with_planted_code();
         let rendered = format!("{err} {err:?}");

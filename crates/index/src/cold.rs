@@ -25,6 +25,14 @@
 //! existing view logic serves full index evidence — nothing here caches or
 //! upgrades; this is purely the pre-Ready fallback.
 //!
+//! Containment (audit bypass 2): the lexical sanitizer is only the FIRST
+//! line. Every evidence file read resolves through ONE anchored
+//! [`faktor_fs::RootedDir`] opened over the canonical workspace root,
+//! component-by-component with no-follow semantics — a symlink/reparse point
+//! on any component is a typed refusal — and the opened fd's identity is
+//! checked against the no-follow classification before any byte is read.
+//! Nothing on the evidence path re-resolves a pathname.
+//!
 //! Process authority (audit 14/26): cold git/rg children are NOT spawned
 //! here. Every command runs through the workspace's single
 //! [`faktor_terminal::ProcessSupervisor`] (typed
@@ -38,6 +46,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use faktor_fs::rooted::RootedEntryKind;
+use faktor_fs::RootedDir;
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 use crate::generation::GenerationFile;
@@ -244,6 +254,14 @@ impl CommandRunner for SupervisorColdCommandRunner {
     }
 }
 
+/// The ONE anchored containment authority for every cold evidence read: the
+/// canonical workspace root opened no-follow ONCE (symlinked/non-directory
+/// roots fail typed). `None` when the root cannot be anchored — every read
+/// then refuses typed; never a pathname fallback.
+fn anchored_root(root: &Path) -> Option<RootedDir> {
+    RootedDir::open(&root.canonicalize().ok()?).ok()
+}
+
 /// The cheap pre-Ready evidence provider (P0-30). Synchronous and bounded:
 /// every step is an O(references) file read or a deadline-killed targeted
 /// tool call through the one [`ProcessSupervisor`]; nothing here walks the
@@ -256,6 +274,11 @@ pub struct ColdEvidenceProvider {
     generations_dir: PathBuf,
     overall_deadline: Duration,
     run: Arc<dyn CommandRunner>,
+    /// The ONE anchored containment authority for every evidence file read:
+    /// the canonical workspace root, opened no-follow once. `None` when the
+    /// root cannot be anchored — every read then refuses typed; no pathname
+    /// fallback exists.
+    rooted: Option<RootedDir>,
 }
 
 impl std::fmt::Debug for ColdEvidenceProvider {
@@ -281,6 +304,7 @@ impl ColdEvidenceProvider {
     ) -> Self {
         let run = SupervisorColdCommandRunner::with_supervisor(supervisor, root.clone(), workspace);
         Self {
+            rooted: anchored_root(&root),
             root,
             workspace,
             generations_dir,
@@ -299,6 +323,7 @@ impl ColdEvidenceProvider {
         run: Arc<dyn CommandRunner>,
     ) -> Self {
         Self {
+            rooted: anchored_root(&root),
             root,
             workspace,
             generations_dir,
@@ -329,8 +354,8 @@ impl ColdEvidenceProvider {
             if !seen.insert(raw.clone()) {
                 continue;
             }
-            if let Some(p) = sanitize_reference(&self.root, raw) {
-                references.push((raw.clone(), p));
+            if let Some(rel) = sanitize_reference(raw) {
+                references.push((raw.clone(), rel));
             }
         }
 
@@ -348,12 +373,20 @@ impl ColdEvidenceProvider {
                 let mut scored = search_index(&index, self.workspace, &concepts);
                 scored.truncate(COLD_MAX_HITS);
                 for (path, score) in scored {
-                    let snippet = self.snippet_of(&path, &mut stats);
-                    discovery.push(ColdHit {
-                        path,
-                        snippet: snippet.unwrap_or_default(),
-                        score,
-                    });
+                    match self.snippet_of(&path, &mut stats) {
+                        // A hostile link never surfaces at all.
+                        Err(ColdReadRefusal::Symlink) => continue,
+                        Ok(snippet) => discovery.push(ColdHit {
+                            path,
+                            snippet,
+                            score,
+                        }),
+                        Err(_) => discovery.push(ColdHit {
+                            path,
+                            snippet: String::new(),
+                            score,
+                        }),
+                    }
                 }
                 gen_served = Some(generation);
             }
@@ -365,15 +398,15 @@ impl ColdEvidenceProvider {
         // along (their content IS the targeted evidence; stale generation
         // hits may add more, never replace these).
         let mut direct_reads = 0usize;
-        for (rel, path) in &references {
+        for (raw, rel) in &references {
             if !self.time_left(started) {
                 degraded += 1;
                 break;
             }
-            if let Some(text) = self.snippet_of_file(path, &mut stats) {
+            if let Ok(text) = self.snippet_of_rel(rel, &mut stats) {
                 direct_reads += 1;
                 direct.push(ColdHit {
-                    path: rel.clone(),
+                    path: raw.clone(),
                     snippet: text,
                     score: 0.99,
                 });
@@ -435,16 +468,26 @@ impl ColdEvidenceProvider {
         }
     }
 
-    /// Head snippet of a file, counted as a read when it happens.
-    fn snippet_of(&self, rel: &str, stats: &mut ColdStats) -> Option<String> {
-        let path = sanitize_reference(&self.root, rel)?;
-        stats.files_read += 1;
-        read_head(&path)
+    /// Head snippet of a discovery path string (generation or rg output):
+    /// the lexical sanitizer runs first, then the anchored rooted read.
+    fn snippet_of(&self, rel: &str, stats: &mut ColdStats) -> Result<String, ColdReadRefusal> {
+        let rel = sanitize_reference(rel).ok_or(ColdReadRefusal::RejectedPath)?;
+        self.snippet_of_rel(&rel, stats)
     }
 
-    fn snippet_of_file(&self, path: &Path, stats: &mut ColdStats) -> Option<String> {
-        stats.files_read += 1;
-        read_head(path)
+    /// Head snippet of one already-sanitized workspace-relative path through
+    /// the ONE anchored authority; never a pathname reopen.
+    fn snippet_of_rel(&self, rel: &Path, stats: &mut ColdStats) -> Result<String, ColdReadRefusal> {
+        let rooted = self.rooted.as_ref().ok_or(ColdReadRefusal::Unavailable)?;
+        read_head_rooted(rooted, rel, stats)
+    }
+
+    /// Test seam: the typed refusal of one anchored evidence read (the
+    /// public package shape stays Option-like).
+    #[cfg(test)]
+    fn read_for_test(&self, rel: &Path) -> Result<String, ColdReadRefusal> {
+        let rooted = self.rooted.as_ref().ok_or(ColdReadRefusal::Unavailable)?;
+        read_head_rooted(rooted, rel, &mut ColdStats::default())
     }
 
     /// The newest persisted generation whose file is cheap to decode.
@@ -552,15 +595,20 @@ impl ColdEvidenceProvider {
             if tracked.as_ref().is_some_and(|t| !t.contains(&path)) {
                 continue; // untracked noise never rides cold evidence
             }
-            if sanitize_reference(&self.root, &path).is_none() {
-                continue;
+            match self.snippet_of(&path, stats) {
+                // Lexically hostile and symlinked paths surface nothing.
+                Err(ColdReadRefusal::RejectedPath | ColdReadRefusal::Symlink) => continue,
+                Ok(snippet) => hits.push(ColdHit {
+                    snippet,
+                    path,
+                    score: 0.9,
+                }),
+                Err(_) => hits.push(ColdHit {
+                    snippet: String::new(),
+                    path,
+                    score: 0.9,
+                }),
             }
-            let snippet = self.snippet_of(&path, stats);
-            hits.push(ColdHit {
-                snippet: snippet.unwrap_or_default(),
-                path,
-                score: 0.9,
-            });
         }
         if hits.is_empty() {
             return None;
@@ -569,30 +617,113 @@ impl ColdEvidenceProvider {
     }
 }
 
-/// Direct head read of one file (bounded, text-only). Missing, oversized,
-/// or binary files yield `None` — never a panic, never a big allocation.
-fn read_head(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > COLD_MAX_READ_BYTES_PER_FILE || meta.len() == 0 {
-        return None;
+/// Typed refusal of one cold evidence read. The public package is
+/// Option-shaped (a refused reference contributes no hit), but the reason is
+/// explicit and adversarially testable — never a silent pathname read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdReadRefusal {
+    /// The lexical sanitizer rejected the reference shape.
+    RejectedPath,
+    /// The workspace root could not be anchored at provider construction.
+    Unavailable,
+    /// No such entry under the anchored root.
+    Missing,
+    /// A symlink/reparse entry on any component (the no-follow walk refuses
+    /// links), or an open that met a link swapped in after classification.
+    Symlink,
+    /// A directory or special file (FIFO/device/socket): never read.
+    NotRegularFile,
+    /// A zero-length file (parity with the historical snippet policy).
+    Empty,
+    /// Larger than [`COLD_MAX_READ_BYTES_PER_FILE`].
+    Oversized,
+    /// A NUL byte among the first 8192 bytes (binary sniff).
+    Binary,
+    /// Any other anchored-read failure.
+    Io,
+}
+
+/// Map a rooted-authority error to the typed cold refusal: the anchored walk
+/// reports a symlink/non-directory component as `Permission`.
+fn refusal_of(e: &faktor_core::error::Error) -> ColdReadRefusal {
+    match e.kind {
+        faktor_core::error::ErrorKind::NotFound => ColdReadRefusal::Missing,
+        faktor_core::error::ErrorKind::Permission => ColdReadRefusal::Symlink,
+        faktor_core::error::ErrorKind::Oversized => ColdReadRefusal::Oversized,
+        _ => ColdReadRefusal::Io,
     }
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    f.read_to_end(&mut bytes).ok()?;
+}
+
+/// Head read of one file through the anchored root (bounded, text-only),
+/// refusing every hostile shape typed. The containment ladder:
+///
+/// 1. the lexical sanitizer already ran (caller);
+/// 2. no-follow classification via [`RootedDir::entry_meta`]: a symlink /
+///    reparse point / directory / special file is refused BEFORE any open;
+/// 3. the no-follow anchored walk opens the final component (`O_NOFOLLOW`
+///    on unix, reparse-refusing relative open on Windows);
+/// 4. post-open identity net: the OPENED fd's metadata must still be the
+///    regular file of the classified size — a swap between classification
+///    and open is refused — and the read never exceeds that size.
+fn read_head_rooted(
+    rooted: &RootedDir,
+    rel: &Path,
+    stats: &mut ColdStats,
+) -> Result<String, ColdReadRefusal> {
+    let meta = rooted
+        .entry_meta(rel)
+        .map_err(|e| refusal_of(&e))?
+        .ok_or(ColdReadRefusal::Missing)?;
+    match meta.kind {
+        RootedEntryKind::File => {}
+        RootedEntryKind::Symlink => return Err(ColdReadRefusal::Symlink),
+        RootedEntryKind::Directory | RootedEntryKind::Other => {
+            return Err(ColdReadRefusal::NotRegularFile)
+        }
+    }
+    if meta.size == 0 {
+        return Err(ColdReadRefusal::Empty);
+    }
+    if meta.size > COLD_MAX_READ_BYTES_PER_FILE {
+        return Err(ColdReadRefusal::Oversized);
+    }
+    stats.files_read += 1;
+    let mut file = rooted.open_read(rel).map_err(|e| refusal_of(&e))?;
+    // Post-open identity net: trust only the fd, never a pathname.
+    let opened = file.metadata().map_err(|_| ColdReadRefusal::Io)?;
+    if !opened.is_file() || opened.len() != meta.size {
+        return Err(ColdReadRefusal::NotRegularFile);
+    }
+    // Bounded read: at most the classified size, even when the file grows
+    // after the fstat (a hostile growth never inflates the allocation).
+    let mut bytes = vec![0u8; meta.size as usize];
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(ColdReadRefusal::Io),
+        }
+    }
+    bytes.truncate(filled);
     if bytes.iter().take(8192).any(|b| *b == 0) {
-        return None; // binary sniff
+        return Err(ColdReadRefusal::Binary);
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut out: String = text.chars().take(COLD_MAX_SNIPPET_CHARS).collect();
     if text.chars().count() > COLD_MAX_SNIPPET_CHARS {
         out.push('…');
     }
-    Some(out)
+    Ok(out)
 }
 
-/// Reject hostile references: absolute paths, parent traversal, NUL bytes,
-/// empty strings, anything escaping the workspace root.
-fn sanitize_reference(root: &Path, raw: &str) -> Option<PathBuf> {
+/// Lexical FIRST LINE ONLY: reject hostile reference shapes (absolute paths,
+/// parent traversal, NUL bytes, empty/overlength strings) and normalize the
+/// rest to workspace-relative components. This is NOT the containment
+/// authority: containment is decided by the anchored [`RootedDir`] read,
+/// which refuses links on every component and never reopens a pathname.
+fn sanitize_reference(raw: &str) -> Option<PathBuf> {
     if raw.is_empty() || raw.len() > 4096 || raw.contains('\0') {
         return None;
     }
@@ -600,17 +731,18 @@ fn sanitize_reference(root: &Path, raw: &str) -> Option<PathBuf> {
     if p.is_absolute() {
         return None;
     }
+    let mut rel = PathBuf::new();
     for comp in p.components() {
         match comp {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-            Component::CurDir | Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::Normal(name) => rel.push(name),
         }
     }
-    let joined = root.join(p);
-    if !joined.starts_with(root) {
+    if rel.as_os_str().is_empty() {
         return None;
     }
-    Some(joined)
+    Some(rel)
 }
 
 /// Concepts from the retrieval signal (bounded, deduped — mirrors every
@@ -1312,5 +1444,225 @@ mod tests {
                 "cold.rs must not contain a private child lifecycle ({token})"
             );
         }
+    }
+
+    /// Containment 1 (audit bypass 2): a committed symlink under the root
+    /// pointing at an outside secret is refused TYPED by the anchored read
+    /// (never via a pathname stat/open) and its target bytes never surface;
+    /// honest files still serve snippets.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_reference_never_reads_outside_and_refuses_typed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "honest.rs", b"pub fn honest() -> i64 { 7 }\n");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), b"TOP_SECRET_MARKER_9911\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.rs"), root.join("link.rs")).unwrap();
+        let ws = ws_of(31);
+        let provider = provider(root.clone(), ws, dir.path());
+        assert_eq!(
+            provider.read_for_test(Path::new("link.rs")).unwrap_err(),
+            ColdReadRefusal::Symlink,
+            "the anchored read owns the containment decision (typed refusal)"
+        );
+        let mut q = query("marker", &["link.rs"]);
+        q.referenced_paths = vec!["honest.rs".into()];
+        let evidence = provider.evidence(&q);
+        assert!(
+            evidence.hits.iter().all(|h| h.path != "link.rs"),
+            "a symlink never surfaces: {:?}",
+            evidence.hits
+        );
+        assert!(
+            evidence
+                .hits
+                .iter()
+                .all(|h| !h.snippet.contains("TOP_SECRET_MARKER_9911")),
+            "the link target's bytes must never reach the package: {:?}",
+            evidence.hits
+        );
+        assert!(
+            evidence
+                .hits
+                .iter()
+                .any(|h| h.path == "honest.rs" && h.snippet.contains("honest")),
+            "honest files still serve snippets: {:?}",
+            evidence.hits
+        );
+        assert_eq!(
+            evidence.stats.files_read, 1,
+            "only the honest file was read"
+        );
+    }
+
+    /// Containment 2: a symlink swapped in AFTER the enumeration named the
+    /// path (the rg result arrives, then the hostile swap) is refused at
+    /// read time — the lexical reference is byte-identical to the honest
+    /// path, yet the anchored walk owns the decision.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_swapped_between_enumeration_and_read_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        write(&root, "src/app.rs", b"pub fn payments() {}\n");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), b"SWAP_SECRET_MARKER_2288\n").unwrap();
+        struct SwapOnRg {
+            root: PathBuf,
+            outside: PathBuf,
+        }
+        impl CommandRunner for SwapOnRg {
+            fn run(&self, program: &str, _args: &[String]) -> std::io::Result<String> {
+                if program == "git" {
+                    return Ok("src/app.rs\0".into());
+                }
+                // The enumeration names src/app.rs and the hostile swap
+                // lands before the ladder's read of that path.
+                let live = self.root.join("src/app.rs");
+                std::fs::remove_file(&live).unwrap();
+                std::os::unix::fs::symlink(self.outside.join("secret.rs"), &live).unwrap();
+                Ok("src/app.rs\n".into())
+            }
+        }
+        let ws = ws_of(33);
+        let provider = ColdEvidenceProvider::with_runner(
+            root.clone(),
+            ws,
+            dir.path().join("generations"),
+            Arc::new(SwapOnRg {
+                root: root.clone(),
+                outside,
+            }),
+        );
+        let evidence = provider.evidence(&ColdQuery {
+            prompt: "payments".into(),
+            ..Default::default()
+        });
+        assert_eq!(evidence.stats.commands_run, 2, "{:?}", evidence.stats);
+        assert!(
+            evidence.hits.iter().all(|h| h.path != "src/app.rs"),
+            "the swapped link never surfaces: {:?}",
+            evidence.hits
+        );
+        assert!(
+            evidence
+                .hits
+                .iter()
+                .all(|h| !h.snippet.contains("SWAP_SECRET_MARKER_2288")),
+            "the swapped link's target bytes never reach the package: {:?}",
+            evidence.hits
+        );
+        assert_eq!(evidence.stats.files_read, 0);
+    }
+
+    /// Containment 3: a nested symlinked directory (root/sub -> outside) is
+    /// refused — the anchored walk rejects the link at the component level
+    /// even though the final entry under it is a real file.
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlinked_directory_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "ok.rs", b"pub fn ok() {}\n");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), b"NESTED_SECRET_MARKER_7733\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+        let ws = ws_of(35);
+        let provider = provider(root.clone(), ws, dir.path());
+        assert_eq!(
+            provider
+                .read_for_test(Path::new("sub/secret.rs"))
+                .unwrap_err(),
+            ColdReadRefusal::Symlink
+        );
+        let evidence = provider.evidence(&query("nested", &["sub/secret.rs", "ok.rs"]));
+        assert!(
+            evidence.hits.iter().all(|h| h.path != "sub/secret.rs"),
+            "{:?}",
+            evidence.hits
+        );
+        assert!(
+            evidence
+                .hits
+                .iter()
+                .all(|h| !h.snippet.contains("NESTED_SECRET_MARKER_7733")),
+            "{:?}",
+            evidence.hits
+        );
+        assert!(
+            evidence.hits.iter().any(|h| h.path == "ok.rs"),
+            "{:?}",
+            evidence.hits
+        );
+        assert_eq!(evidence.stats.files_read, 1);
+    }
+
+    /// Containment 4: bounds stay typed through the anchored read —
+    /// oversized, empty and binary files refuse with their own variants; a
+    /// long honest file still yields a snippet capped at
+    /// [`COLD_MAX_SNIPPET_CHARS`].
+    #[test]
+    fn anchored_read_bounds_are_typed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let big = vec![b'a'; COLD_MAX_READ_BYTES_PER_FILE as usize + 1];
+        write(&root, "big.rs", &big);
+        write(&root, "bin.rs", b"ok\x00binary");
+        std::fs::write(root.join("empty.rs"), b"").unwrap();
+        write(
+            &root,
+            "long.rs",
+            "a".repeat(COLD_MAX_SNIPPET_CHARS + 10).as_bytes(),
+        );
+        let ws = ws_of(37);
+        let provider = provider(root.clone(), ws, dir.path());
+        assert_eq!(
+            provider.read_for_test(Path::new("big.rs")).unwrap_err(),
+            ColdReadRefusal::Oversized
+        );
+        assert_eq!(
+            provider.read_for_test(Path::new("bin.rs")).unwrap_err(),
+            ColdReadRefusal::Binary
+        );
+        assert_eq!(
+            provider.read_for_test(Path::new("empty.rs")).unwrap_err(),
+            ColdReadRefusal::Empty
+        );
+        assert_eq!(
+            provider.read_for_test(Path::new("missing.rs")).unwrap_err(),
+            ColdReadRefusal::Missing
+        );
+        let long = provider.read_for_test(Path::new("long.rs")).unwrap();
+        assert_eq!(long.chars().count(), COLD_MAX_SNIPPET_CHARS + 1);
+        assert!(long.ends_with('…'));
+    }
+
+    /// Containment 5 (source scan): the evidence path never reopens a
+    /// pathname — no pathname-based open, no unbounded read-to-end anywhere
+    /// in cold.rs; the containment authority is the anchored `RootedDir`
+    /// (walk + post-open identity net).
+    #[test]
+    fn cold_evidence_path_never_reopens_by_pathname() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cold.rs")).unwrap();
+        let banned = [
+            "std::fs::File::".to_string() + "open",
+            "read_to_".to_string() + "end",
+        ];
+        for token in banned {
+            assert!(
+                !src.contains(&token),
+                "cold evidence reads must resolve through the anchored RootedDir, never by pathname ({token})"
+            );
+        }
+        assert!(src.contains("entry_meta") && src.contains("open_read"));
     }
 }

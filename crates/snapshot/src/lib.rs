@@ -35,10 +35,12 @@ pub struct FileState {
 }
 
 /// Raw join of `rel` under `root` (absolute `rel` replaces the root,
-/// mirroring the resolver's path assembly). Used ONLY for the ENOENT
-/// classification in [`FileState::probe`] — never followed for content:
-/// the workspace handle stays the only path to actual reads, so a hostile
-/// symlink is classified (metadata) but never read.
+/// mirroring the resolver's path assembly). Used ONLY as a lexical liveness
+/// probe for the P0-51 genuine-ENOENT carve-out when the anchored walk
+/// refuses the path (see [`FileState::probe`]): it decides "the raw path is
+/// genuinely gone" vs "the raw path is present but refused", and NEVER
+/// classifies an entry as existing, opens it, or hashes through it — the
+/// classification that matters runs through the anchored handle walk.
 fn joined_raw(root: &Path, rel: &Path) -> PathBuf {
     if rel.is_absolute() {
         rel.to_path_buf()
@@ -78,6 +80,14 @@ impl FileState {
     /// hash is the whole-file BLAKE3 — results are bit-identical to the
     /// legacy whole-buffer read for every file the legacy code could read,
     /// so recorded checkpoints and conflict comparisons are unchanged.
+    ///
+    /// Anchored classification (audit bypass 3): the metadata that decides
+    /// existence comes from the OPENED entry of the handle-relative walk
+    /// ([`WorkspaceHandle::resolve_fd`], the same anchored walk
+    /// `hash_file_streaming` uses) — never from re-stat'ing a resolved
+    /// pathname. A parent directory swapped after any earlier resolution
+    /// can therefore no longer flip the classification: the walk that
+    /// classifies and the walk that hashes both refuse the swap typed.
     pub fn probe(workspace: &WorkspaceHandle, rel: &Path) -> Result<Self, Error> {
         // NUL bytes inside a stored path are ALWAYS corrupt (P0-51): POSIX
         // syscalls truncate at the first NUL, so a hostile row could alias
@@ -90,59 +100,58 @@ impl FileState {
                 rel
             )));
         }
-        let resolved = match workspace.resolve(rel) {
-            Ok(p) => p,
-            Err(resolve_err) => {
-                // P0-51 classification: a path the workspace refuses to
-                // resolve (traversal, absolute escape, symlink escape,
-                // unresolvable parent) is only `missing` when the raw path
-                // GENUINELY does not exist (ENOENT — e.g. a deleted parent
-                // directory). A path that resolves through the raw
-                // filesystem but not through the workspace discipline
-                // (hostile symlink to an existing outside file, absolute
-                // escape) is a loud TYPED error — the metadata check below
-                // is classification ONLY and never hashes outside content.
+        // The walk IS the resolution: no path string is re-resolved after it
+        // starts, and the final entry is inspected through the fd the walk
+        // opened (fstat), so metadata and content can never disagree about
+        // which object `rel` names.
+        match workspace.resolve_fd(rel) {
+            Ok(handle) => {
+                let file = std::fs::File::from(handle);
+                let meta = file
+                    .metadata()
+                    .map_err(|e| Error::new(ErrorKind::Internal, format!("stat {rel:?}: {e}")))?;
+                // A directory has no file content: for FILE states it is
+                // missing. (The legacy probe failed with an internal read
+                // error; a directory under a file path is not a state
+                // rollback can restore either way, and hashing it would be
+                // meaningless.)
+                if meta.is_dir() {
+                    return Ok(Self::missing());
+                }
+                let (_hashed_bytes, hash) = workspace.hash_file_streaming(rel, None)?;
+                Ok(Self::existing(hash))
+            }
+            // A genuinely absent final entry: ENOENT is a state, not an
+            // error.
+            Err(walk_err) if walk_err.kind == ErrorKind::NotFound => Ok(Self::missing()),
+            // The anchored walk refuses the path: traversal, absolute
+            // escape, a hostile symlink, or an intermediate component the
+            // walk could not open (which on unix is reported as Permission,
+            // including a genuinely deleted parent directory).
+            Err(walk_err) if walk_err.kind == ErrorKind::Permission => {
+                // P0-51 genuine-ENOENT carve-out: a raw path that is
+                // genuinely GONE (deleted parent chain, dangling symlink
+                // target) stays `missing`; a path that exists on the raw
+                // filesystem but is refused by the workspace discipline is a
+                // loud TYPED error — never a silent `missing`. This lexical
+                // liveness probe is classification-only: it never yields
+                // `existing`, never opens and never hashes through the raw
+                // path; the anchored walk stays the sole authority for
+                // every workspace read.
                 match std::fs::metadata(joined_raw(workspace.root(), rel)) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(Self::missing());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                        return Err(Error::malformed(format!(
-                            "corrupt checkpoint path {rel:?}: {e}"
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(Error::new(
-                            ErrorKind::Internal,
-                            format!("stat {rel:?}: {e}"),
-                        ))
-                    }
-                    // Exists on the raw filesystem but refuses workspace
-                    // resolution: hostile (escape/traversal). The typed
-                    // resolution error is surfaced — never a silent missing.
-                    Ok(_) => return Err(resolve_err),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::missing()),
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(
+                        Error::malformed(format!("corrupt checkpoint path {rel:?}: {e}")),
+                    ),
+                    Err(e) => Err(Error::new(
+                        ErrorKind::Internal,
+                        format!("stat {rel:?}: {e}"),
+                    )),
+                    Ok(_) => Err(walk_err),
                 }
             }
-        };
-        let meta = match std::fs::metadata(&resolved) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::missing()),
-            Err(e) => {
-                return Err(Error::new(
-                    ErrorKind::Internal,
-                    format!("stat {}: {e}", resolved.display()),
-                ))
-            }
-        };
-        // A directory has no file content: for FILE states it is missing.
-        // (The legacy probe failed with an internal read error; a directory
-        // under a file path is not a state rollback can restore either way,
-        // and hashing it would be meaningless.)
-        if meta.is_dir() {
-            return Ok(Self::missing());
+            Err(walk_err) => Err(walk_err),
         }
-        let (_hashed_bytes, hash) = workspace.hash_file_streaming(rel, None)?;
-        Ok(Self::existing(hash))
     }
 }
 
@@ -257,6 +266,15 @@ impl CheckpointStore {
     /// empty-hash}) and IS recorded, and a rollback can distinguish "delete
     /// the file" from "write the empty content".
     ///
+    /// ATOMIC: the row and its `CheckpointCreated` journal event commit in
+    /// ONE store transaction (`Store::insert_checkpoint_and_event`, a
+    /// `SessionCommandTxn` command that re-verifies the session state
+    /// observed here before any write), so a checkpoint row can never exist
+    /// without its event — the invariant is enforced on the PRODUCTION path,
+    /// not only in session-layer tests. The CAS blob writes above may
+    /// precede the row (content-addressed and idempotent, an orphan blob is
+    /// harmless), but the row+event pair is atomic.
+    ///
     /// Content rules:
     /// - a side with `exists=true` needs its bytes: pass them in
     ///   `before_content`/`after_content` (the blob is CAS-stored and the
@@ -340,9 +358,19 @@ impl CheckpointStore {
             }
             None => None,
         };
-        let (id, _allocated_sequence) = self
+        // The state the session command re-verifies INSIDE the same
+        // transaction as the row insert and event append: a session that
+        // moved (or vanished) between this read and the commit refuses the
+        // whole checkpoint typed, never a row without its event.
+        let expected_state = self
             .store
-            .insert_checkpoint(
+            .get_session(session)
+            .map_err(map_store)?
+            .ok_or_else(|| Error::not_found(format!("session {session} for checkpoint {path}")))?
+            .state;
+        let (id, _allocated_sequence, _event_seq) = self
+            .store
+            .insert_checkpoint_and_event(
                 session,
                 path,
                 before.exists,
@@ -350,6 +378,7 @@ impl CheckpointStore {
                 after.exists,
                 &side_hash(after),
                 after_cas.as_deref(),
+                expected_state,
             )
             .map_err(map_store)?;
         Ok(id)
@@ -1944,6 +1973,51 @@ mod tests {
         );
     }
 
+    /// Audit bypass 3: classification must be anchored to the SAME walk that
+    /// hashes content. The old flow resolved `rel` to a canonical pathname
+    /// and then stat'ed THAT string: a parent directory swapped after the
+    /// resolve redirected the stat (here into an outside directory holding a
+    /// same-named file), so metadata and content could describe different
+    /// objects and flip the probe's classification. The anchored probe
+    /// refuses the swapped parent typed and never classifies, reads or
+    /// hashes the outside file.
+    #[cfg(unix)]
+    #[test]
+    fn probe_never_classifies_a_parent_swapped_after_resolve() {
+        let (_d, _cps, h, _id, _session) = fixture();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("f"), b"outside-marker").unwrap();
+        fs::create_dir_all(h.root().join("d")).unwrap();
+        fs::write(h.root().join("d/f"), b"inside").unwrap();
+        // The stale canonical pathname the old resolve would have captured.
+        let stale = h.root().join("d/f");
+        // The swap: the parent entry becomes an outside-pointing symlink.
+        fs::remove_dir_all(h.root().join("d")).unwrap();
+        symlink(outside.path(), h.root().join("d")).unwrap();
+        // The pathname stat follows the swapped parent — the old
+        // classification input is attacker-controlled and sees OUTSIDE
+        // content…
+        assert!(
+            std::fs::metadata(&stale).is_ok(),
+            "the raw pathname is attacker-controlled"
+        );
+        // …while the probe classifies through the anchored walk: a loud
+        // typed refusal, never `existing` (of either side) and never
+        // `missing`.
+        let err = FileState::probe(&h, Path::new("d/f")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // Swapping the parent back to an in-workspace directory makes the
+        // same path stream the INSIDE content hash — the walk, not a stale
+        // pathname, decides.
+        fs::remove_file(h.root().join("d")).unwrap();
+        fs::create_dir_all(h.root().join("d")).unwrap();
+        fs::write(h.root().join("d/f"), b"inside").unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("d/f")).unwrap(),
+            FileState::existing(CheckpointStore::hash_of(b"inside"))
+        );
+    }
+
     /// P0-52 end-to-end: recovery/rollback restore uses the STRICT CAS
     /// variant, so a same-size/same-mtime in-place corruption that the
     /// advisory cache would trust (its window was primed by a prior read)
@@ -2243,5 +2317,112 @@ mod tests {
         let outcome = cps.rollback(&h, &id, session, cid).unwrap();
         assert!(matches!(outcome, RollbackOutcome::Restored { .. }));
         assert_eq!(fs::read(h.root().join("big.rs")).unwrap(), original);
+    }
+
+    /// PRODUCTION invariant: `record_change` — the row writer the
+    /// write_file/edit_file tools reach through `after_write` — commits the
+    /// checkpoint ROW and its `CheckpointCreated` journal event in ONE
+    /// transaction: exactly one of each, and the event names the sequence
+    /// the same transaction allocated.
+    #[test]
+    fn record_change_commits_row_and_event_together() {
+        let (_d, cps, _h, _id, session) = fixture();
+        let before = cps.before_write(session, "f.txt", b"original").unwrap();
+        let after_content = b"edited";
+        let after = CheckpointStore::hash_of(after_content);
+        let id = cps
+            .record_change(
+                session,
+                "f.txt",
+                FileState::existing(before),
+                None,
+                FileState::existing(after),
+                Some(after_content),
+            )
+            .unwrap();
+        let rows = cps.checkpoints(session).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        let events = cps.store.events_range(session, 1, None).unwrap();
+        let created: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::CheckpointCreated)
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "exactly one CheckpointCreated event per checkpoint row"
+        );
+        assert_eq!(
+            created[0].payload.as_ref().unwrap()["sequence"],
+            serde_json::json!(rows[0].sequence),
+            "the event names the allocated sequence"
+        );
+        assert_eq!(
+            created[0].state,
+            cps.store.get_session(session).unwrap().unwrap().state,
+            "the event state is the session state the command verified"
+        );
+        // The CAS after-blob is referenceable from the row (redo/diff parity).
+        assert_eq!(
+            rows[0].after_cas_hash.as_deref(),
+            Some(after.to_hex().as_str())
+        );
+    }
+
+    /// The content-aware checkpoint command is ONE transaction: a crash at
+    /// any durability boundary reopens on exactly the old world (no row, no
+    /// event) or exactly the new one (row AND event) — never a row without
+    /// its `CheckpointCreated` event.
+    #[test]
+    fn checkpoint_command_seams_reopen_old_or_new_only() {
+        for seam in [
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ] {
+            let dir = tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let cas_path = dir.path().join("cas");
+            let (session, after) = {
+                let cas = Arc::new(Cas::open(cas_path.clone()).unwrap());
+                let store = Arc::new(Store::open(&store_path, true).unwrap());
+                let ws = store.create_workspace("/w").unwrap();
+                let row = store.create_session(ws, "t", "p", "m").unwrap();
+                let cps = CheckpointStore::new(cas, store.clone());
+                let before = cps.before_write(row.id, "f.txt", b"original").unwrap();
+                let after = CheckpointStore::hash_of(b"edited");
+                store.crash_arm(faktor_store::CrashArm {
+                    point: seam,
+                    ordinal: 0,
+                });
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = cps.after_write(row.id, "f.txt", before, after, 1, b"edited");
+                }));
+                assert!(caught.is_err(), "seam {seam} must fire");
+                (row.id, after)
+            };
+            let cas = Arc::new(Cas::open(cas_path.clone()).unwrap());
+            let store = Arc::new(Store::open(&store_path, true).unwrap());
+            let cps = CheckpointStore::new(cas, store.clone());
+            let rows = cps.checkpoints(session).unwrap();
+            let created = store
+                .events_range(session, 1, None)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == faktor_core::event::EventKind::CheckpointCreated)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(rows.len(), 1, "committed checkpoint row is durable");
+                    assert_eq!(rows[0].after_hash, after.to_hex());
+                    assert_eq!(created, 1, "committed checkpoint event is durable");
+                }
+                _ => {
+                    assert!(rows.is_empty(), "rolled-back checkpoint leaves no row");
+                    assert_eq!(created, 0, "rolled-back checkpoint leaves no event");
+                }
+            }
+        }
     }
 }

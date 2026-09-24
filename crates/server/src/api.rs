@@ -2631,7 +2631,7 @@ pub(crate) mod tests {
                 transport: WorkerPlaneTransport::Plaintext,
                 trusted_gateway: false,
                 auth: WorkerPlaneAuth::WorkerTokens,
-                bearer: bearer.map(str::to_string),
+                bearer: bearer.map(faktor_security::secret::SecretValue::new),
             }
         }
 

@@ -46,7 +46,7 @@ use crate::enterprise::SsoConfigRef;
 use crate::error::ControlPlaneError;
 use crate::ids::OrganizationId;
 use crate::oidc::{
-    ClaimMapping, CodeExchangeRequest, IdTokenExpectations, OidcError, OidcMembership,
+    ClaimMapping, CodeExchangeRequest, IdTokenExpectations, OidcError, OidcMembership, OidcNonce,
 };
 use crate::oidc_net::{urlencode, AsyncOidcAdapter};
 use crate::rbac::Role;
@@ -88,30 +88,6 @@ impl OAuthState {
 impl fmt::Debug for OAuthState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OAuthState([redacted])")
-    }
-}
-
-/// The OIDC `nonce` of one started login: the replay binding of the ID token.
-/// A domain secret type for the same reason as [`OAuthState`] (see the
-/// module-level secret authority note): it never appears in a rendering and
-/// leaves the process only inside the authorization URL.
-#[derive(Clone, PartialEq, Eq)]
-pub struct OidcNonce(SecretValue);
-
-impl OidcNonce {
-    fn new(value: String) -> Self {
-        Self(SecretValue::new(value))
-    }
-
-    /// The only in-process reader of the plaintext (module-private).
-    fn expose(&self) -> &str {
-        self.0.expose()
-    }
-}
-
-impl fmt::Debug for OidcNonce {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("OidcNonce([redacted])")
     }
 }
 
@@ -368,7 +344,9 @@ impl SsoLogin {
                 &IdTokenExpectations {
                     issuer: sso.issuer.clone(),
                     audience: sso.client_id.clone(),
-                    nonce: Some(pending.nonce.expose().to_string()),
+                    // The wrapped nonce moves straight into the verifier
+                    // expectations: no plaintext copy is made here.
+                    nonce: Some(pending.nonce),
                     now_ms: now,
                     clock_skew_ms: 0,
                 },

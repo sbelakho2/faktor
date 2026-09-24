@@ -1252,6 +1252,12 @@ mod tests {
         sandbox: Arc<PermissionEngine>,
         snapshots: Arc<faktor_snapshot::CheckpointStore>,
         cas: Arc<faktor_cas::Cas>,
+        /// The durable store behind `snapshots`, so tests can assert the
+        /// journal half (CheckpointCreated) of each checkpoint.
+        store: Arc<faktor_store::Store>,
+        /// Store path, so fault tests can reopen the durable world after an
+        /// injected crash seam.
+        store_path: PathBuf,
     }
 
     fn fixture(policy: SandboxPolicy) -> ToolFixture {
@@ -1303,6 +1309,8 @@ mod tests {
         let _opened = fs_service.open(ws_id, root.clone()).unwrap();
         let identity = WorkspaceIdentity::new(ws_id, WorktreeId::new(1), TaskId::new(1));
         let cas = manager.cas();
+        let store = manager.store();
+        let store_path = dir.path().join("store");
         ToolFixture {
             _dir: dir,
             root: root.clone(),
@@ -1311,10 +1319,23 @@ mod tests {
             sandbox: Arc::new(PermissionEngine::new(policy, Some(root))),
             snapshots: Arc::new(faktor_snapshot::CheckpointStore::new(
                 cas.clone(),
-                manager.store(),
+                store.clone(),
             )),
             cas,
+            store,
+            store_path,
         }
+    }
+
+    /// Every `CheckpointCreated` event of the fixture session, from the
+    /// durable journal.
+    fn checkpoint_created_events(f: &ToolFixture) -> Vec<faktor_core::event::Event> {
+        f.store
+            .events_range(f.session, 1, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::CheckpointCreated)
+            .collect()
     }
 
     fn ctx(f: &ToolFixture) -> ToolRunCtx {
@@ -2055,9 +2076,18 @@ mod tests {
         assert_eq!(FileHash::from_hex(&rows[0].after_hash).unwrap(), after);
         assert_eq!(f.cas.get_verified_now(before).unwrap(), b"original");
         assert_eq!(f.cas.get_verified_now(after).unwrap(), b"new content");
+        // The row never exists without its journal event: exactly one
+        // CheckpointCreated, naming the row's stored sequence.
+        let events = checkpoint_created_events(&f);
+        assert_eq!(events.len(), 1, "one checkpoint = one CheckpointCreated");
+        assert_eq!(
+            events[0].payload.as_ref().unwrap()["sequence"],
+            serde_json::json!(rows[0].sequence)
+        );
 
         // An unchanged rewrite must NOT record a second checkpoint (the
-        // store rejects no-op checkpoints as malformed).
+        // store rejects no-op checkpoints as malformed) and must add no
+        // event either.
         (tool.execute)(
             ctx(&f),
             serde_json::json!({"path": "a.txt", "content": "new content"}),
@@ -2065,6 +2095,139 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(f.snapshots.checkpoints(f.session).unwrap().len(), 1);
+        assert_eq!(checkpoint_created_events(&f).len(), 1);
+    }
+
+    /// Production write_file AND edit_file checkpoints each carry exactly
+    /// one `CheckpointCreated` event, paired by the transaction-allocated
+    /// sequence.
+    #[tokio::test]
+    async fn write_and_edit_checkpoints_carry_one_event_each() {
+        let f = fixture(SandboxPolicy::default());
+        std::fs::write(f.root.join("a.txt"), "original\n").unwrap();
+        (write_file_tool().execute)(
+            ctx(&f),
+            serde_json::json!({"path": "a.txt", "content": "written\n"}),
+        )
+        .await
+        .unwrap();
+        (edit_file_tool().execute)(
+            ctx(&f),
+            edit_args(
+                "a.txt",
+                serde_json::json!([
+                    {"type": "replace_exact", "search": "written", "replace": "edited"}
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        let rows = f.snapshots.checkpoints(f.session).unwrap();
+        assert_eq!(rows.len(), 2, "write + edit = two checkpoint rows");
+        let events = checkpoint_created_events(&f);
+        assert_eq!(events.len(), 2, "one CheckpointCreated per checkpoint row");
+        for row in &rows {
+            let named = events
+                .iter()
+                .filter(|e| {
+                    e.payload
+                        .as_ref()
+                        .and_then(|p| p.get("sequence"))
+                        .and_then(|s| s.as_i64())
+                        == Some(row.sequence)
+                })
+                .count();
+            assert_eq!(
+                named, 1,
+                "row sequence {} must be journaled exactly once",
+                row.sequence
+            );
+        }
+    }
+
+    /// A crash injected at each durability seam of the checkpoint command
+    /// (the production path write_file/edit_file reach through
+    /// `snapshot::record_change`): reopening the durable world shows either
+    /// no row and no event, or the row AND its single `CheckpointCreated`
+    /// event — never a committed row without its event.
+    #[test]
+    fn checkpoint_seam_crash_never_leaves_row_without_event() {
+        for tool_name in ["write_file", "edit_file"] {
+            for seam in [
+                "session_command_side_row",
+                "session_command_precommit",
+                "session_command_committed",
+            ] {
+                let f = fixture(SandboxPolicy::default());
+                std::fs::write(f.root.join("a.txt"), "original").unwrap();
+                f.store.crash_arm(faktor_store::CrashArm {
+                    point: seam,
+                    ordinal: 0,
+                });
+                let tool = if tool_name == "write_file" {
+                    write_file_tool()
+                } else {
+                    edit_file_tool()
+                };
+                let args = if tool_name == "write_file" {
+                    serde_json::json!({"path": "a.txt", "content": "changed"})
+                } else {
+                    edit_args(
+                        "a.txt",
+                        serde_json::json!([
+                            {"type": "replace_exact", "search": "original", "replace": "changed"}
+                        ]),
+                    )
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let ctx = ctx(&f);
+                    rt.block_on(async { (tool.execute)(ctx, args).await })
+                }));
+                assert!(
+                    caught.is_err(),
+                    "{tool_name} at seam {seam} must fire the injected crash"
+                );
+                // The seam fired inside the checkpoint command: the durable
+                // world is exactly the old one (side row / precommit) or
+                // exactly the new one (committed), never a hybrid.
+                let reopened =
+                    Arc::new(faktor_store::Store::open(f.store_path.as_path(), true).unwrap());
+                let rows = reopened.checkpoints_of(f.session).unwrap();
+                let created = reopened
+                    .events_range(f.session, 1, None)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == faktor_core::event::EventKind::CheckpointCreated)
+                    .count();
+                match seam {
+                    "session_command_committed" => {
+                        assert_eq!(
+                            rows.len(),
+                            1,
+                            "{tool_name}/{seam}: the committed row is durable"
+                        );
+                        assert_eq!(
+                            created, 1,
+                            "{tool_name}/{seam}: the committed event is durable"
+                        );
+                    }
+                    _ => {
+                        assert!(
+                            rows.is_empty(),
+                            "{tool_name}/{seam}: no row may survive the rollback"
+                        );
+                        assert_eq!(
+                            created, 0,
+                            "{tool_name}/{seam}: no event may survive the rollback"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

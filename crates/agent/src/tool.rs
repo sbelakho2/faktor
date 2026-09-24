@@ -9,7 +9,6 @@ use std::sync::Arc;
 use faktor_context::compiler::ProvenanceSource;
 use faktor_core::capability::Capability;
 use faktor_core::error::Error;
-use faktor_core::hash::FileHash;
 use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use faktor_core::model::{ModelCapabilities, RouterPhase};
 use faktor_core::resource::ResourceClass;
@@ -39,18 +38,13 @@ pub enum RecoveryHint {
     UnknownEffect,
 }
 
-/// Durable workspace-write postcondition (spec §7, v7): the expected state a
-/// deterministic write tool declared for the file it wrote — `relative_path`
-/// is resolved against the workspace root (canonical, traversal/symlink-safe)
-/// and `expected_hash` is BLAKE3 of the bytes AS WRITTEN (never of JSON
-/// encoding of the content argument).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FilePostcondition {
-    pub workspace_id: WorkspaceId,
-    pub worktree_id: WorktreeId,
-    pub relative_path: String,
-    pub expected_hash: FileHash,
-}
+/// Durable workspace-write postcondition (spec §7, v7): re-exported from
+/// [`faktor_core::op`] so the session recovery sweep and the agent runtime
+/// speak the ONE canonical durable shape — `relative_path` is resolved
+/// against the workspace root (canonical, traversal/symlink-safe) and
+/// `expected_hash` is BLAKE3 of the bytes AS WRITTEN (never of JSON encoding
+/// of the content argument).
+pub use faktor_core::op::FilePostcondition;
 
 /// Durable replay descriptor (spec §7, v7): the stored invocation crash
 /// recovery may re-execute ONCE for an interrupted idempotent tool run — a

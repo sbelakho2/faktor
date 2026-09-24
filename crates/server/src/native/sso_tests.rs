@@ -173,7 +173,7 @@ async fn sso_start_callback_mints_a_control_plane_session() {
             email_verified: true,
             issued_at_ms: NOW_MS - 1_000,
             expires_at_ms: NOW_MS + 60_000,
-            nonce: Some(nonce),
+            nonce: Some(nonce.into()),
             groups: vec!["faktor-admins".into()],
         },
     );

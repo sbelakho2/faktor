@@ -49,11 +49,15 @@ impl SessionHandle {
             current,
             None,
             self.now_ms(),
+            // Same payload shape the store's content-aware checkpoint
+            // command writes (this API is hash-only, so both sides exist).
             Some(serde_json::json!({
                 "sequence": sequence,
                 "path": path,
                 "before_hash": before_hash.to_hex(),
                 "after_hash": after_hash.to_hex(),
+                "before_exists": true,
+                "after_exists": true,
             })),
         )?;
         let (id, _seq) = self

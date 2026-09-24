@@ -1140,9 +1140,89 @@ mod scans {
     /// gate applies to every provider. The default allowlist is empty.
     /// Out-of-line test modules (see [`is_test_file`]) are test-only by
     /// declaration; `rel` is normalized for the same reason as scan 1.
+    ///
+    /// Matchers:
+    /// * qualified markers — `reqwest::Client`, `Client::builder`,
+    ///   `.execute(`;
+    /// * an import that brings `Client` into scope UNQUALIFIED
+    ///   (`use reqwest::*;`, `use reqwest::Client;`,
+    ///   `use reqwest::{Client, ...}`) is itself a client marker: it means
+    ///   the bare `Client::new(...)`/`Client::builder(...)` spellings
+    ///   construct a raw reqwest client without ever writing
+    ///   `reqwest::Client`, so the wildcard form can no longer escape the
+    ///   scan. Bare markers are word-boundary checked (`MyClient::new(`
+    ///   never matches) and `::`-prefixed qualified spellings are left to
+    ///   the qualified markers.
+    const REQWEST_CLIENT_MARKERS: &[&str] = &["reqwest::Client", "Client::builder", ".execute("];
+
+    /// `true` when this (trimmed) production line imports `Client` from
+    /// `reqwest` WITHOUT a `reqwest::` path qualifier: a glob import, a
+    /// direct `use reqwest::Client`, a `pub use` or a braced import whose
+    /// member list contains `Client` (optionally aliased).
+    fn reqwest_client_imported_unqualified(line: &str) -> bool {
+        // `pub use reqwest::...` contains `use reqwest::...` verbatim, so a
+        // single split covers both.
+        let Some((_, after)) = line.split_once("use reqwest::") else {
+            return false;
+        };
+        let after = after.trim();
+        if after.starts_with('*') || after.starts_with("::*") {
+            return true; // the glob re-exports `Client` (and friends)
+        }
+        if after.starts_with("Client")
+            && after["Client".len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+        {
+            return true;
+        }
+        match line.split_once('{') {
+            Some((_, members)) => members
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|token| token == "Client"),
+            None => false,
+        }
+    }
+
+    /// Scan-2 offenders of one production file: raw reqwest client
+    /// construction/execute, including the bare spellings a
+    /// `use reqwest::*;` / `use reqwest::Client;` import makes possible.
+    fn reqwest_client_offenders(f: &File<'_>) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for (line, text) in find_markers(f, REQWEST_CLIENT_MARKERS) {
+            offenders.push(format!("{}:{line}: {text}", f.rel));
+        }
+        let imports_client = find_markers(f, &["use reqwest::"])
+            .iter()
+            .any(|(_, text)| reqwest_client_imported_unqualified(text));
+        if imports_client {
+            for marker in ["Client::new(", "Client::builder("] {
+                for at in find_marker_offsets(f, marker) {
+                    // Word boundary: `MyClient::new(` is a different type,
+                    // and `reqwest::Client::new(` is already flagged above.
+                    let before = at
+                        .checked_sub(1)
+                        .map(|i| f.src.as_bytes()[i])
+                        .filter(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b':');
+                    if before.is_none() {
+                        let line = line_of(f.src, at);
+                        offenders.push(format!(
+                            "{}:{line}: {}  [bare Client from a reqwest import]",
+                            f.rel,
+                            trim_line(f.src, at)
+                        ));
+                    }
+                }
+            }
+        }
+        offenders.sort_unstable();
+        offenders.dedup();
+        offenders
+    }
+
     #[test]
     fn no_production_reqwest_client_outside_the_checked_transport() {
-        const MARKERS: &[&str] = &["reqwest::Client", "Client::builder", ".execute("];
         let mut offenders = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
@@ -1156,9 +1236,7 @@ mod scans {
             if !has_reqwest {
                 continue; // no reqwest in production here: nothing to gate
             }
-            for (line, text) in find_markers(&f, MARKERS) {
-                offenders.push(format!("{rel}:{line}: {text}"));
-            }
+            offenders.extend(reqwest_client_offenders(&f));
             scanned += 1;
         }
         assert_no_offenders(
@@ -2953,19 +3031,74 @@ fn prod_only() {}
 
     #[test]
     fn reqwest_scan_fires_on_a_violating_adapter() {
-        const MARKERS: &[&str] = &["reqwest::Client", "Client::builder", ".execute("];
         let f = synthetic_file(
             "crates/openai/src/lib.rs",
             "use reqwest::Client;\npub fn send() { let c = Client::new(); let _ = c.execute(r); }\n",
         );
         let has_reqwest = !find_markers(&f, &["reqwest"]).is_empty();
         assert!(has_reqwest);
-        let hits = find_markers(&f, MARKERS);
+        let hits = find_markers(&f, REQWEST_CLIENT_MARKERS);
         assert!(
             hits.iter()
-                .any(|(_, t)| t.contains("Client::new") || t.contains(".execute(")),
+                .any(|(_, t)| t.contains("Client::new") || t.contains(".execute("))
+                || !reqwest_client_offenders(&f).is_empty(),
             "raw client code in an adapter must be flagged: {hits:?}"
         );
+        // The bare-import escape: `use reqwest::Client;` + `Client::new()`
+        // with NO `.execute(`/`reqwest::Client` spelling anywhere.
+        let f = synthetic_file(
+            "crates/openai/src/lib.rs",
+            "use reqwest::Client;\nfn send() -> Client { Client::new() }\n",
+        );
+        let offenders = reqwest_client_offenders(&f);
+        assert_eq!(
+            offenders.len(),
+            2,
+            "the import line and the bare construction both fire: {offenders:?}"
+        );
+        assert!(
+            offenders.iter().any(|o| o.contains("bare Client")),
+            "the bare construction must be named: {offenders:?}"
+        );
+        // The WILDCARD-import escape (the audit blind spot): `use reqwest::*;`
+        // plus a bare `Client::new()` must fire.
+        let f = synthetic_file(
+            "crates/openai/src/lib.rs",
+            "use reqwest::*;\nfn send() { let c = Client::new(); let _ = c.get(\"u\"); }\n",
+        );
+        let offenders = reqwest_client_offenders(&f);
+        assert_eq!(
+            offenders.len(),
+            1,
+            "`use reqwest::*; Client::new()` must fire: {offenders:?}"
+        );
+        assert!(offenders[0].contains("bare Client"), "{offenders:?}");
+        // A braced import that brings Client in unqualified fires too.
+        let f = synthetic_file(
+            "crates/openai/src/lib.rs",
+            "use reqwest::{Client, RequestBuilder};\nfn b() -> Client { Client::builder().build().unwrap() }\n",
+        );
+        assert!(
+            reqwest_client_offenders(&f)
+                .iter()
+                .any(|o| o.contains("bare Client")),
+            "a braced `Client` import plus bare construction must fire"
+        );
+        // Compliant shapes pass: a glob import that never constructs a
+        // client, a same-named local type (`MyClient`), and a non-reqwest
+        // `Client`.
+        for compliant in [
+            "use reqwest::*;\nfn f() { let _ = reqwest::Url::parse(\"https://x\"); }\n",
+            "use reqwest::*;\nfn f() { let c = MyClient::new(); let _ = c; }\n",
+            "use other::*;\nfn f() { let c = Client::new(); let _ = c; }\n",
+        ] {
+            let f = synthetic_file("crates/openai/src/lib.rs", compliant);
+            assert!(
+                reqwest_client_offenders(&f).is_empty(),
+                "compliant shape must pass: {compliant:?} -> {:?}",
+                reqwest_client_offenders(&f)
+            );
+        }
         // A file whose production text never mentions reqwest is not gated.
         let f = synthetic_file(
             "crates/store/src/lib.rs",
@@ -4525,16 +4658,50 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
 
     /// A field name is secret-shaped when it is `password`, any `*_token`
     /// (this covers `access_token` / `id_token` / `refresh_token`), any
-    /// `private_key*` (this covers `private_key_pkcs8_pem`) or exactly
-    /// `client_secret`. Everything else (`token_type`, `token_hash`,
-    /// `password_hash`, `webhook_secret`, `credentials_path`, …) is not a
-    /// credential value and deliberately passes.
+    /// `private_key*` (this covers `private_key_pkcs8_pem`), exactly
+    /// `client_secret`, an OIDC/authorization-flow credential name
+    /// (`nonce`/`*_nonce`, `code_verifier`/`*_code_verifier`,
+    /// `authorization_code`/`*_authorization_code`) or an auth-flow
+    /// qualified state name. Everything else (`token_type`, `token_hash`,
+    /// `password_hash`, `webhook_secret`, `credentials_path`, bare
+    /// `state`/`*_state` state-machine phases, …) is not a credential value
+    /// and deliberately passes.
+    ///
+    /// `nonce`, `code_verifier` and `authorization_code` are exactly the
+    /// names the audit bypass used: security value does not follow from the
+    /// `*_token` shape, so the gate must recognise the OAuth credential
+    /// vocabulary directly. Bare `state`/`task_state`/`delivery_state` are
+    /// overwhelmingly state-machine PHASES (session/job/billing state
+    /// names), so only state names qualified by an auth-flow token are
+    /// credentials: `oauth_state`, `csrf_state`, `login_state`, …
     fn is_secret_field_name(name: &str) -> bool {
         let name = name.to_ascii_lowercase();
         name == "password"
             || name.ends_with("_token")
             || name.starts_with("private_key")
             || name == "client_secret"
+            || name == "nonce"
+            || name.ends_with("_nonce")
+            || name == "code_verifier"
+            || name.ends_with("_code_verifier")
+            || name == "authorization_code"
+            || name.ends_with("_authorization_code")
+            || is_auth_flow_state_name(&name)
+    }
+
+    /// `state`-shaped credential names: a `state` field is secret-shaped
+    /// only when it is QUALIFIED by an authorization-flow token
+    /// (`oauth_state`, `oidc_state`, `sso_state`, `csrf_state`,
+    /// `login_state`, `logout_state`, `authorization_state`). An unqualified
+    /// `state` or a non-auth `*_state` is a phase name, not a credential.
+    fn is_auth_flow_state_name(name: &str) -> bool {
+        let Some(prefix) = name.strip_suffix("_state") else {
+            return false;
+        };
+        matches!(
+            prefix,
+            "oauth" | "oauth2" | "oidc" | "sso" | "csrf" | "login" | "logout" | "authorization"
+        )
     }
 
     /// The documented wire-DTO annotation marker. The justification must be
@@ -4935,6 +5102,25 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 "pub struct Cfg { pub private_key_pkcs8_pem: String }\n",
                 "private_key_pkcs8_pem",
             ),
+            // The audit-bypass vocabulary: OAuth flow credentials are
+            // secret-shaped even though their names never say "token".
+            ("struct Cfg { nonce: Option<String> }\n", "nonce"),
+            ("struct Cfg { id_nonce: String }\n", "id_nonce"),
+            (
+                "struct Cfg { code_verifier: Option<String> }\n",
+                "code_verifier",
+            ),
+            (
+                "struct Cfg { pkce_code_verifier: String }\n",
+                "pkce_code_verifier",
+            ),
+            (
+                "struct Cfg { authorization_code: Option<String> }\n",
+                "authorization_code",
+            ),
+            ("struct Cfg { oauth_state: String }\n", "oauth_state"),
+            ("struct Cfg { csrf_state: Option<String> }\n", "csrf_state"),
+            ("struct Cfg { login_state: String }\n", "login_state"),
         ] {
             let f = synthetic_file("crates/cloud/src/evil.rs", src);
             let offenders = secret_field_offenders("crates/cloud/src/evil.rs", &f);
@@ -4963,11 +5149,25 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         let f = synthetic_file(
             "crates/cloud/src/good.rs",
             "struct Cfg {\n    password: SecretValue,\n    access_token: Option<SecretValue>,\n\
-             client_secret: WrappedSecret,\n    private_key_pem: Pem,\n}\n",
+             client_secret: WrappedSecret,\n    private_key_pem: Pem,\n\
+             nonce: Option<OidcNonce>,\n    code_verifier: SecretValue,\n\
+             authorization_code: SecretValue,\n    oauth_state: OAuthState,\n}\n",
         );
         assert!(
             secret_field_offenders("crates/cloud/src/good.rs", &f).is_empty(),
             "{:?}",
+            secret_field_offenders("crates/cloud/src/good.rs", &f)
+        );
+        // State-machine phase names are not credentials: bare `state` and
+        // non-auth `*_state` fields deliberately pass.
+        let f = synthetic_file(
+            "crates/cloud/src/good.rs",
+            "struct Cfg {\n    state: String,\n    task_state: String,\n    delivery_state: Option<String>,\n\
+             token_type: String,\n}\n",
+        );
+        assert!(
+            secret_field_offenders("crates/cloud/src/good.rs", &f).is_empty(),
+            "phase names must pass: {:?}",
             secret_field_offenders("crates/cloud/src/good.rs", &f)
         );
         // A mention in a comment, a string or a test-gated struct is never
@@ -5330,7 +5530,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             if !code[at..at + 6].iter().all(|c| *c) {
                 continue;
             }
-            let tail = src[at + 6..].trim_start_matches([' ', '\t']);
+            // Any whitespace may separate `unsafe` from its block: a newline
+            // (or several) before `{` is still an unsafe SITE and must not
+            // escape the scan (the old space/tab-only trim let `unsafe\n{`
+            // through silently).
+            let tail = src[at + 6..].trim_start();
             if !(tail.starts_with('{')
                 || tail.starts_with("fn")
                 || tail.starts_with("impl")
@@ -5472,6 +5676,25 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert!(
             !offenders.iter().any(|o| o.contains("SAFETY:")),
             "a justified site must not be a SAFETY offender: {offenders:?}"
+        );
+        // The audit blind spot: `unsafe` with its block brace on the NEXT
+        // line (`unsafe\n{`) is still a site and must fire.
+        let multiline = "pub fn f() {\n    unsafe\n    { libc::kill(0, 0) }\n}\n";
+        assert_eq!(
+            unsafe_sites_in(multiline).len(),
+            1,
+            "a newline-separated unsafe block is a site: {:?}",
+            unsafe_sites_in(multiline)
+        );
+        assert!(
+            !unsafe_policy_offenders("crates/evil/src/lib.rs", multiline).is_empty(),
+            "the newline-separated unsafe block must fire the policy scan"
+        );
+        let multiline_justified = "pub fn f() {\n    // SAFETY: zero-signal probe on a live pid.\n    #[allow(unsafe_code)]\n    unsafe\n    { libc::kill(0, 0) }\n}\n";
+        let offenders = unsafe_policy_offenders("crates/session/src/actor.rs", multiline_justified);
+        assert!(
+            !offenders.iter().any(|o| o.contains("SAFETY:")),
+            "the newline form with SAFETY must pass the justification check: {offenders:?}"
         );
         // A comment that merely names unsafe never counts as a site.
         assert!(unsafe_sites_in("// unsafe { inside a comment }\nfn f() {}\n").is_empty());
