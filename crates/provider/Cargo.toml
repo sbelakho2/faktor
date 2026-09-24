@@ -27,3 +27,6 @@ zeroize.workspace = true
 # A production build must never enable this: production code receives the
 # policy-checked transport injected by the daemon.
 test-utils = []
+
+[lints]
+workspace = true

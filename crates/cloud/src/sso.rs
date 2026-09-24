@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use faktor_security::secret::SecretValue;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
@@ -64,7 +65,9 @@ struct PendingLogin {
     organization: OrganizationId,
     redirect_uri: String,
     nonce: String,
-    code_verifier: String,
+    /// Wrapped: the PKCE verifier is a credential (it proves possession of
+    /// the code) and is moved straight into the exchange request.
+    code_verifier: SecretValue,
     created_ms: i64,
 }
 
@@ -128,9 +131,9 @@ impl SsoLogin {
         let discovery = self.adapter.discovery(&sso.issuer).await?;
         let state = Self::random_hex(32);
         let nonce = Self::random_hex(32);
-        let code_verifier = Self::random_hex(32);
+        let code_verifier = SecretValue::new(Self::random_hex(32));
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(code_verifier.as_bytes()));
+            .encode(Sha256::digest(code_verifier.expose().as_bytes()));
         let now = self.clock.now_ms();
         {
             let mut pending = self.lock_pending();
@@ -212,7 +215,7 @@ impl SsoLogin {
         let tokens = self
             .adapter
             .exchange_code(&CodeExchangeRequest {
-                code: code.to_string(),
+                code: SecretValue::new(code),
                 redirect_uri: redirect_uri.to_string(),
                 code_verifier: pending.code_verifier,
             })
@@ -220,7 +223,7 @@ impl SsoLogin {
         let claims = self
             .adapter
             .verify_id_token(
-                &tokens.id_token,
+                tokens.id_token.expose(),
                 &IdTokenExpectations {
                     issuer: sso.issuer.clone(),
                     audience: sso.client_id.clone(),

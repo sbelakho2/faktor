@@ -1,0 +1,10 @@
+steps:
+  - name: fault-scale
+    commands:
+      - cargo test -p faktor-tests-fault --release -- --ignored
+  - name: longrun
+    commands:
+      - cargo test -p faktor-tests-longrun --release
+  - name: soak
+    commands:
+      - cargo test -p faktor-demo --release -- --ignored

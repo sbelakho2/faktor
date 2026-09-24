@@ -1108,6 +1108,17 @@ fn map_egress_error(error: EgressError) -> connectors::TransportError {
         | EgressError::AddressClassRefused { .. }
         | EgressError::DnsAnswerSetTooLarge { .. } => ConnectorError::DestinationDenied,
         EgressError::ResponseTooLarge { .. } => ConnectorError::ResponseTooLarge,
+        // A stalled head/idle/overall read is a timeout; a byte/frame
+        // breach is an over-bound response.
+        EgressError::ResponseBudgetExceeded {
+            component:
+                faktor_provider::egress::BudgetComponent::Head
+                | faktor_provider::egress::BudgetComponent::Idle
+                | faktor_provider::egress::BudgetComponent::Total,
+            ..
+        } => ConnectorError::Timeout,
+        EgressError::ResponseBudgetExceeded { .. } => ConnectorError::ResponseTooLarge,
+        EgressError::ClientBuild { .. } => ConnectorError::EgressUnavailable,
         EgressError::UnsupportedScheme(_)
         | EgressError::UnparseableUrl(_)
         | EgressError::Build(_)
@@ -1123,6 +1134,7 @@ impl connectors::HttpTransport for CommerceEgress {
     async fn execute(
         &self,
         request: connectors::HttpRequest,
+        budget: connectors::http::ResponseBudget,
     ) -> Result<connectors::HttpResponse, connectors::TransportError> {
         // Per-request destination gate on the PARSED target: a
         // non-allowlisted host is refused typed before any request object is
@@ -1138,12 +1150,26 @@ impl connectors::HttpTransport for CommerceEgress {
             raw = raw.bytes_body(body.to_vec());
         }
         let timeout = Duration::from_millis(request.timeout_ms().max(1));
-        let response =
-            match tokio::time::timeout(timeout, execute_raw(self.inner.as_ref(), raw)).await {
-                Err(_) => return Err(connectors::TransportError::Timeout),
-                Ok(Err(error)) => return Err(map_egress_error(error)),
-                Ok(Ok(response)) => response,
-            };
+        // The connector-layer budget is converted field-for-field into the
+        // checked egress budget at this boundary (the connector crate never
+        // depends on the egress crate).
+        let egress_budget = faktor_provider::egress::ResponseBudget::new(
+            budget.head_timeout,
+            budget.idle_timeout,
+            budget.total_deadline,
+            budget.max_bytes,
+            budget.max_frames,
+        );
+        let response = match tokio::time::timeout(
+            timeout,
+            execute_raw(self.inner.as_ref(), raw, &egress_budget),
+        )
+        .await
+        {
+            Err(_) => return Err(connectors::TransportError::Timeout),
+            Ok(Err(error)) => return Err(map_egress_error(error)),
+            Ok(Ok(response)) => response,
+        };
         if response.body.len() > connectors::MAX_RESPONSE_BYTES {
             return Err(connectors::TransportError::ResponseTooLarge);
         }
@@ -1855,10 +1881,10 @@ pub fn commerce_egress_transport(
     outbound_scan: OutboundScanConfig,
 ) -> Result<Arc<PolicyCheckedHttpTransport>, String> {
     let destinations = commerce_destination_policy(cfg)?;
-    Ok(Arc::new(PolicyCheckedHttpTransport::with_policy_and_scan(
-        destinations,
-        Some(outbound_scan),
-    )))
+    let transport =
+        PolicyCheckedHttpTransport::try_with_policy_and_scan(destinations, Some(outbound_scan))
+            .map_err(|e| format!("commerce egress client: {e}"))?;
+    Ok(Arc::new(transport))
 }
 
 /// The daemon seams for [`open_commerce_service_with`]: the commerce
@@ -2471,6 +2497,15 @@ mod tests {
     use faktor_core::cancellation::CancellationToken;
     use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
     use faktor_core::WorkspaceIdentity;
+
+    /// The response budget the test call sites pass (these tests exercise
+    /// the budget plumbing, not the bounds themselves).
+    fn test_budget() -> connectors::http::ResponseBudget {
+        connectors::http::ResponseBudget::for_timeout(
+            std::time::Duration::from_secs(30),
+            connectors::MAX_RESPONSE_BYTES as u64,
+        )
+    }
 
     fn run_ctx() -> ToolRunCtx {
         ToolRunCtx {
@@ -3365,7 +3400,9 @@ mod tests {
         let request =
             connectors::HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber")
                 .expect("request");
-        let response = rt.block_on(egress.execute(request)).expect("response");
+        let response = rt
+            .block_on(egress.execute(request, test_budget()))
+            .expect("response");
         assert_eq!(response.status(), 200);
         assert_eq!(response.body(), br#"{"ok":true}"#);
         assert_eq!(
@@ -3381,7 +3418,7 @@ mod tests {
             connectors::HttpRequest::get("https://api.digikey.com/products/v4/search/keyword")
                 .expect("request");
         assert_eq!(
-            rt.block_on(egress.execute(denied)),
+            rt.block_on(egress.execute(denied, test_budget())),
             Err(connectors::TransportError::DestinationDenied)
         );
         assert_eq!(
@@ -3399,7 +3436,7 @@ mod tests {
             connectors::HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber")
                 .expect("request");
         assert_eq!(
-            rt.block_on(failing.execute(request)),
+            rt.block_on(failing.execute(request, test_budget())),
             Err(connectors::TransportError::Protocol)
         );
     }
@@ -3525,11 +3562,12 @@ mod tests {
         let request =
             connectors::HttpRequest::get("https://api.mouser.com/api/v1/search/partnumber")
                 .expect("request");
-        rt.block_on(egress.execute(request)).expect("allowed");
+        rt.block_on(egress.execute(request, test_budget()))
+            .expect("allowed");
         assert_eq!(inner.request_count(), 1);
         let denied = connectors::HttpRequest::get("https://evil.example/collect").expect("request");
         assert_eq!(
-            rt.block_on(egress.execute(denied)),
+            rt.block_on(egress.execute(denied, test_budget())),
             Err(connectors::TransportError::DestinationDenied)
         );
         assert_eq!(inner.request_count(), 1);
@@ -3619,7 +3657,10 @@ mod tests {
         let request =
             connectors::HttpRequest::get(&format!("{}/api/v1/search/partnumber", allow.base()))
                 .expect("request");
-        let response = egress.execute(request).await.expect("allowed response");
+        let response = egress
+            .execute(request, test_budget())
+            .await
+            .expect("allowed response");
         assert_eq!(response.status(), 200);
         assert_eq!(allow.request_count(), 1);
 
@@ -3627,7 +3668,7 @@ mod tests {
             connectors::HttpRequest::get(&format!("{}/api/v1/search/partnumber", deny.base()))
                 .expect("request");
         assert_eq!(
-            egress.execute(denied).await,
+            egress.execute(denied, test_budget()).await,
             Err(connectors::TransportError::DestinationDenied),
             "a non-allowlisted host is refused typed"
         );
@@ -3655,7 +3696,7 @@ mod tests {
         let request =
             connectors::HttpRequest::get(&format!("{}/start", origin.base())).expect("request");
         assert_eq!(
-            egress.execute(request).await,
+            egress.execute(request, test_budget()).await,
             Err(connectors::TransportError::DestinationDenied),
             "the redirect hop to a non-allowlisted host is refused"
         );
@@ -3687,7 +3728,10 @@ mod tests {
         ]));
         let request =
             connectors::HttpRequest::get(&format!("{}/start", origin.base())).expect("request");
-        let response = egress.execute(request).await.expect("followed redirect");
+        let response = egress
+            .execute(request, test_budget())
+            .await
+            .expect("followed redirect");
         assert_eq!(response.status(), 200);
         assert_eq!(origin.request_count(), 1);
         assert_eq!(next.request_count(), 1);

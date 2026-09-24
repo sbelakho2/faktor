@@ -248,9 +248,13 @@ Defense-in-depth (not the boundary):
   bootstraps Rust from the pinned rustup-init binary after verifying its
   published SHA-256, and reads the toolchain channel from
   `rust-toolchain.toml` (never a second hard-coded version). The
-  `rust:1.98` image is only a rustup baseline — the toolchain file is the
-  version authority — and every other container image is pinned by its
-  multi-arch index digest (see `docs/ci-enforcement.md`). The remaining PR
+  `rust:1.98.0` image (digest-pinned like every other image) is only a
+  rustup baseline — the toolchain file is the
+  version authority — and every container image is pinned by its
+  multi-arch index digest (see `docs/ci-enforcement.md`); the
+  `image-pins` step fails any workflow image without `@sha256:` (the
+  Windows self-hosted `powershell` line is the only documented
+  `digest-exempt:` case). The remaining PR
   fetches are the lockfile-pinned dependency install (`npm ci`;
   `@vscode/vsce` is exact in `apps/vscode/package-lock.json` and invoked
   as `npx --no-install vsce`); they never pipe to a

@@ -242,13 +242,18 @@ pub struct HookRegistry {
 }
 
 impl HookRegistry {
-    /// A registry over the process-wide shared supervisor with an
-    /// unrestricted envelope. Kept for constructors that predate the
-    /// supervisor wiring (env-var registry, crate tests); production callers
-    /// pass their daemon-rooted supervisor through
-    /// [`HookRegistry::with_supervisor`].
-    pub fn new() -> Self {
-        Self::with_supervisor(ProcessSupervisor::shared(), CapabilitySet::ALL)
+    /// A standalone registry over [`ProcessSupervisor::try_shared`] with an
+    /// unrestricted envelope. Only callers that genuinely cannot receive a
+    /// supervisor through DI (crate tests, one-shot CLI helpers) may use
+    /// this; the DAEMON graph always passes its ONE supervisor through
+    /// [`HookRegistry::with_supervisor`], so no global process authority
+    /// exists in the normal graph. A failure to initialize the standalone
+    /// authority is a typed error, never a panic.
+    pub fn try_new() -> Result<Self, faktor_core::error::Error> {
+        Ok(Self::with_supervisor(
+            ProcessSupervisor::try_shared()?,
+            CapabilitySet::ALL,
+        ))
     }
 
     /// The production constructor (audit P0-40): every hook run is
@@ -533,9 +538,14 @@ impl HookRegistry {
     }
 }
 
+/// TEST convenience: standalone registry over the process-wide
+/// `try_shared` supervisor. Production graphs inject through
+/// [`HookRegistry::with_supervisor`]; no global fallback exists in a
+/// non-test build.
+#[cfg(test)]
 impl Default for HookRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::try_new().expect("standalone supervisor for crate tests")
     }
 }
 
@@ -566,7 +576,7 @@ mod tests {
 
     #[test]
     fn poisoned_hook_policy_refuses_mutations_and_recovers_reads() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "first".into(),
             command: "true".into(),
@@ -598,7 +608,7 @@ mod tests {
 
     #[test]
     fn allow_path_via_json_stdout() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "ok".into(),
             command: "sh".into(),
@@ -615,7 +625,7 @@ mod tests {
 
     #[test]
     fn deny_path_blocks() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "no".into(),
             command: "sh".into(),
@@ -635,7 +645,7 @@ mod tests {
 
     #[test]
     fn fail_closed_on_crash_without_verdict() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "crash".into(),
             command: "sh".into(),
@@ -673,7 +683,7 @@ mod tests {
 
     #[test]
     fn zero_session_id_hook_payload_is_a_typed_refusal() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "ok".into(),
             command: "sh".into(),
@@ -718,7 +728,7 @@ mod tests {
 
     #[test]
     fn fail_open_proceeds_with_warn_audit() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "soft".into(),
             command: "sh".into(),
@@ -737,7 +747,7 @@ mod tests {
 
     #[test]
     fn timeout_kills_and_policy_decides() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "slow".into(),
             command: "sh".into(),
@@ -769,7 +779,7 @@ mod tests {
         // a secret in the daemon env never reaches a hook whose spec lists
         // nothing — even when the spec never opted into an allowlist.
         std::env::set_var("FAKTOR_TOKEN", "sekrit");
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "env".into(),
             command: "sh".into(),
@@ -791,7 +801,7 @@ mod tests {
     fn explicit_env_entries_pass_under_the_allowlist() {
         // allowlist=true still passes EXPLICIT entries: listed keys are the
         // config's deliberate choice.
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "env".into(),
             command: "sh".into(),
@@ -815,7 +825,7 @@ mod tests {
         // benign set (HOME/PATH/...) plus explicit entries reaches the hook
         // — the daemon's secret is stripped in BOTH modes.
         std::env::set_var("FAKTOR_TOKEN", "sekrit");
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "env".into(),
             command: "sh".into(),
@@ -840,7 +850,7 @@ mod tests {
         // head (nothing past stdout_cap is retained) and the remainder is
         // drained, so the hook completes instead of deadlocking on a full
         // pipe. Peak memory is not asserted; the audit head must be capped.
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "noisy".into(),
             command: "sh".into(),
@@ -882,7 +892,7 @@ mod tests {
         // that partial stdout is discarded for verdict purposes — the
         // outcome is the failure policy's (FailClosed -> Deny), never the
         // parsed Allow. The partial head still lands in the audit record.
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "liar".into(),
             command: "sh".into(),
@@ -919,7 +929,7 @@ mod tests {
         );
 
         // Same partial output under FailOpen: the policy outcome is Warn.
-        let r2 = HookRegistry::new();
+        let r2 = HookRegistry::try_new().unwrap();
         r2.register(HookSpec {
             id: "liar-open".into(),
             command: "sh".into(),
@@ -941,7 +951,7 @@ mod tests {
 
     #[test]
     fn verdict_precedence_deny_wins() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "a".into(),
             command: "sh".into(),
@@ -969,7 +979,7 @@ mod tests {
 
     #[test]
     fn modify_metadata_passthrough_and_audit_completeness() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         r.register(HookSpec {
             id: "m".into(),
             command: "sh".into(),
@@ -996,7 +1006,7 @@ mod tests {
 
     #[test]
     fn hostile_registrations_rejected() {
-        let r = HookRegistry::new();
+        let r = HookRegistry::try_new().unwrap();
         assert!(r
             .register(HookSpec {
                 id: String::new(),
@@ -1144,7 +1154,7 @@ mod tests {
             .expect("grandchild pid file");
         let mut gone = false;
         for _ in 0..100 {
-            let alive = unsafe { libc::kill(gc as i32, 0) == 0 };
+            let alive = sup.pid_alive(gc);
             if !alive {
                 gone = true;
                 break;

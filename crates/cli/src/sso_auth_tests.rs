@@ -49,7 +49,7 @@ fn sso_cfg(issuer: String, secret: Option<&str>) -> CloudSsoCfg {
         enabled: true,
         issuer: Some(issuer),
         client_id: Some("client-1".into()),
-        client_secret: secret.map(str::to_string),
+        client_secret_payload: secret.map(str::to_string),
         client_secret_method: None,
         discovery_max_age_ms: None,
         jwks_max_age_ms: None,

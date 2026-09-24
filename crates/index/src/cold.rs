@@ -166,12 +166,16 @@ pub struct SupervisorColdCommandRunner {
 }
 
 impl SupervisorColdCommandRunner {
-    /// The process-wide shared supervisor (the same authority every
-    /// crate-level child uses); [`ColdEvidenceProvider::new`] installs
-    /// this runner.
-    fn shared(cwd: PathBuf, workspace: WorkspaceId) -> Arc<dyn CommandRunner> {
+    /// The injected daemon supervisor: [`ColdEvidenceProvider::new`]
+    /// receives the daemon's ONE `Arc<ProcessSupervisor>` and installs this
+    /// runner over it. No global fallback exists on this path.
+    fn with_supervisor(
+        supervisor: Arc<ProcessSupervisor>,
+        cwd: PathBuf,
+        workspace: WorkspaceId,
+    ) -> Arc<dyn CommandRunner> {
         Arc::new(Self {
-            supervisor: ProcessSupervisor::shared(),
+            supervisor,
             cwd,
             workspace,
             deadline: COLD_COMMAND_TIMEOUT,
@@ -265,8 +269,17 @@ impl std::fmt::Debug for ColdEvidenceProvider {
 }
 
 impl ColdEvidenceProvider {
-    pub fn new(root: PathBuf, workspace: WorkspaceId, generations_dir: PathBuf) -> Self {
-        let run = SupervisorColdCommandRunner::shared(root.clone(), workspace);
+    /// The production constructor: every cold git/rg child is submitted to
+    /// the `supervisor` injected by the daemon (the index service receives
+    /// the daemon's ONE `Arc<ProcessSupervisor>` at open time) — no global
+    /// process authority is ever constructed here.
+    pub fn new(
+        root: PathBuf,
+        workspace: WorkspaceId,
+        generations_dir: PathBuf,
+        supervisor: Arc<ProcessSupervisor>,
+    ) -> Self {
+        let run = SupervisorColdCommandRunner::with_supervisor(supervisor, root.clone(), workspace);
         Self {
             root,
             workspace,
@@ -726,9 +739,13 @@ mod tests {
         }
     }
 
-    /// The production runner over the process-wide shared supervisor.
-    fn shared_runner(cwd: PathBuf, workspace: WorkspaceId) -> Arc<dyn CommandRunner> {
-        SupervisorColdCommandRunner::shared(cwd, workspace)
+    /// The production runner over an INJECTED supervisor.
+    fn supervised_runner(
+        sup: &Arc<ProcessSupervisor>,
+        cwd: PathBuf,
+        workspace: WorkspaceId,
+    ) -> Arc<dyn CommandRunner> {
+        SupervisorColdCommandRunner::with_supervisor(sup.clone(), cwd, workspace)
     }
 
     /// One fixture command through the SAME supervisor authority (audit
@@ -1043,7 +1060,7 @@ mod tests {
             b"pub fn balance_account() -> i64 { 42 }\n",
         );
         write(&root, "src/other.rs", b"pub fn unrelated() {}\n");
-        let sup = ProcessSupervisor::shared();
+        let sup = ProcessSupervisor::try_shared().expect("standalone supervisor");
         if !supervised_fixture(&sup, &root, "git", &["--version"])
             || !supervised_fixture(&sup, &root, "rg", &["--version"])
         {
@@ -1059,7 +1076,12 @@ mod tests {
             "git add failed"
         );
         let ws = ws_of(21);
-        let provider = ColdEvidenceProvider::new(root.clone(), ws, dir.path().join("generations"));
+        let provider = ColdEvidenceProvider::new(
+            root.clone(),
+            ws,
+            dir.path().join("generations"),
+            sup.clone(),
+        );
         let evidence = provider.evidence(&ColdQuery {
             prompt: "continue".into(),
             changed_files: vec!["src/app.rs".into()],
@@ -1110,7 +1132,7 @@ mod tests {
             "d003/f0001.rs",
             b"pub fn balance_account() -> i64 { 42 }\n",
         );
-        let sup = ProcessSupervisor::shared();
+        let sup = ProcessSupervisor::try_shared().expect("standalone supervisor");
         if !supervised_fixture(&sup, &root, "git", &["--version"])
             || !supervised_fixture(&sup, &root, "rg", &["--version"])
         {
@@ -1130,7 +1152,7 @@ mod tests {
             root.clone(),
             ws,
             dir.path().join("generations"),
-            shared_runner(root.clone(), ws),
+            supervised_runner(&sup, root.clone(), ws),
         );
         // No references: the rg scope is the tree root and the prompt is a
         // concept signal. Either rg beats its 900 ms deadline (hits from
@@ -1182,7 +1204,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
         write(&root, "src/app.rs", b"pub fn payments() {}\n");
-        let sup = ProcessSupervisor::shared();
+        let sup = ProcessSupervisor::try_shared().expect("standalone supervisor");
         if !supervised_fixture(&sup, &root, "git", &["--version"]) {
             eprintln!("skipping slow-rg fixture: git not installed");
             return;

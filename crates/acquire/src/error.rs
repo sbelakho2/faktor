@@ -230,6 +230,14 @@ impl From<EgressError> for AcquisitionError {
             EgressError::ResponseTooLarge { limit_bytes } => {
                 AcquisitionError::ResponseTooLarge { limit_bytes }
             }
+            // The response budget is the pre-existing byte bound, enforced
+            // on the live stream by the shared budget-aware reader.
+            EgressError::ResponseBudgetExceeded {
+                component: faktor_provider::egress::BudgetComponent::Bytes,
+                limit,
+                ..
+            } => AcquisitionError::ResponseTooLarge { limit_bytes: limit },
+            EgressError::ResponseBudgetExceeded { .. } => AcquisitionError::NetworkTimeout,
             other => invalid(other.to_string()),
         }
     }

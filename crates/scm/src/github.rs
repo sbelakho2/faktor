@@ -35,7 +35,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse};
+use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse, RouteLabel};
+use faktor_security::secret::SecretValue;
 
 use crate::error::ScmError;
 use crate::ids::{
@@ -123,23 +124,25 @@ impl GitHubAppConfig {
     }
 }
 
-/// One short-lived installation (or app) token. Never logged: `Debug` is
-/// redacted and the token is only exposed through [`InstallationToken::expose`].
+/// One short-lived installation (or app) token. Never logged: the bearer
+/// value is a [`faktor_security::secret::SecretValue`] (zeroized on drop,
+/// redacted `Debug`, no `Display` and no serde) and leaves only through
+/// [`InstallationToken::expose`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct InstallationToken {
-    token: String,
+    token: SecretValue,
     expires_at_ms: i64,
     permissions: Vec<(String, String)>,
 }
 
 impl InstallationToken {
     pub fn new(
-        token: impl Into<String>,
+        token: impl Into<SecretValue>,
         expires_at_ms: i64,
         permissions: Vec<(String, String)>,
     ) -> Result<Self, ScmError> {
         let token = token.into();
-        if token.is_empty() || token.len() > 4096 || token.contains(char::is_whitespace) {
+        if token.is_empty() || token.len() > 4096 || token.expose().contains(char::is_whitespace) {
             return Err(ScmError::Unauthorized(
                 "installation token has an illegal shape".into(),
             ));
@@ -153,7 +156,7 @@ impl InstallationToken {
 
     /// The bearer value (call sites must never log it).
     pub fn expose(&self) -> &str {
-        &self.token
+        self.token.expose()
     }
 
     pub fn expires_at_ms(&self) -> i64 {
@@ -483,6 +486,7 @@ impl GitHubApp {
         };
         let url = format!("{}{}{}", self.config.api_base, path, query);
         let mut request = RawRequest::new(method, url.clone())
+            .route(RouteLabel::GithubApi)
             .header("accept", "application/vnd.github+json")
             .header("x-github-api-version", "2022-11-28")
             .header("user-agent", self.config.user_agent.clone())
@@ -499,7 +503,9 @@ impl GitHubApp {
             request = request.header("if-none-match", etag);
         }
         if let Some(body) = &body {
-            request = request.json_body(body);
+            request = request
+                .json_body(body)
+                .map_err(|e| ScmError::Transport(format!("request json body: {e}")))?;
         }
         let response = crate::execute_raw_bounded(
             self.transport.as_ref(),
@@ -1439,6 +1445,52 @@ mod tests {
         assert!(InstallationToken::new("", 5, vec![]).is_err());
         assert!(InstallationToken::new("has space", 5, vec![]).is_err());
         assert!(InstallationToken::new("x".repeat(4097), 5, vec![]).is_err());
+    }
+
+    /// The compile-time negative proof: `InstallationToken` has NO `Display`
+    /// and NO `Serialize`.
+    macro_rules! assert_no_display_no_serialize {
+        ($ty:ty) => {{
+            trait AmbiguousIfImpl<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            impl<T: ?Sized + std::fmt::Display> AmbiguousIfImpl<u8> for T {}
+            impl<T: ?Sized + ::serde::Serialize> AmbiguousIfImpl<u16> for T {}
+            let _ = <$ty as AmbiguousIfImpl<_>>::probe;
+        }};
+    }
+
+    #[test]
+    fn planted_token_never_leaks_through_debug_display_serde_or_panic() {
+        assert_no_display_no_serialize!(InstallationToken);
+        const PLANTED: &str = "PLANTED-INSTALLATION-TOKEN-do-not-leak-0123456789";
+        let token = InstallationToken::new(PLANTED, 5, vec![]).unwrap();
+        for rendered in [
+            format!("{token:?}"),
+            format!("{:?}", Some(token.clone())),
+            format!("{:?}", vec![token.clone()]),
+            format!("{:?}", (token.clone(), 1u8)),
+        ] {
+            assert!(!rendered.contains(PLANTED), "leaked via {rendered}");
+        }
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("installation token {token:?}")
+        }))
+        .expect_err("the closure must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            !message.contains(PLANTED),
+            "panic payload leaked: {message}"
+        );
+        // The shape refusal names the shape, never the planted bytes.
+        let err = InstallationToken::new(format!("{PLANTED} with space"), 5, vec![]).unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PLANTED), "error leaked: {rendered}");
     }
 
     #[test]

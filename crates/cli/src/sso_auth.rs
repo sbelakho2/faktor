@@ -53,7 +53,7 @@ pub fn build_sso_authority(
         allowed_algorithms: cfg.allowed_algorithms()?,
         ..Default::default()
     };
-    if let Some(name) = cfg.client_secret.as_deref() {
+    if let Some(name) = cfg.client_secret_payload.as_deref() {
         // The secret is loaded per the operator-staged payload contract and
         // handed to the adapter: it is never logged, never rendered and
         // never carried in an error.

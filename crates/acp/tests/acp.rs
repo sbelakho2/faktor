@@ -3266,7 +3266,7 @@ async fn durable_terminal_round_trip_through_acp_and_native_adapters_is_identica
     use faktor_server::native::terminal_authority::{TerminalService, TerminalSpawnRequest};
 
     let root = std::env::temp_dir().join(format!(
-        "kp-acp-durable-terminal-{}-{:?}",
+        "faktor-acp-durable-terminal-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));

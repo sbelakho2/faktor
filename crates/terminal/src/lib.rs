@@ -603,6 +603,7 @@ impl ReapState {
     /// that the negative pgid still names the owned group). Never signal
     /// pid 0. Returns whether a signal was actually attempted.
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     fn try_signal_group(&self, pid: u32, signal: libc::c_int) -> bool {
         if pid == 0 {
             return false;
@@ -636,6 +637,7 @@ impl ReapState {
     /// kill and the consumption. `waitpid` returns immediately for a SIGKILLed
     /// child (and `ECHILD` when another authority already consumed it).
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     fn consume_killed_child(&self, pid: u32) {
         let _serial = self
             .serial
@@ -789,6 +791,123 @@ pub(crate) mod group_probe_injection {
     }
 }
 
+/// Prefix of the capture spill files the CURRENT writer mints:
+/// `faktor-spill-<pid>-<uuid>` in the system temp dir.
+pub const FAKTOR_SPILL_PREFIX: &str = "faktor-spill-";
+
+/// Prefix of pre-migration spill residue (`kp-spill-*`). Recognized and
+/// cleaned for compatibility, never written.
+pub const LEGACY_KP_SPILL_PREFIX: &str = "kp-spill-";
+
+/// Prefix of the current per-process supervisor roots:
+/// `faktor-supervisor-shared-<pid>`.
+pub const FAKTOR_SUPERVISOR_PREFIX: &str = "faktor-supervisor-";
+
+/// Prefix of pre-migration supervisor roots (`kp-supervisor-*`). Recognized
+/// and cleaned for compatibility, never written.
+pub const LEGACY_KP_SUPERVISOR_PREFIX: &str = "kp-supervisor-";
+
+/// True when `name` is an internal capture spill file under either spelling.
+///
+/// Compatibility intent: cleanup must accept the legacy spelling so crash
+/// residue from an older release in the shared system temp dir is never
+/// mistaken for user files. Retirement note: [`LEGACY_KP_SPILL_PREFIX`] can
+/// be deleted once no supported installation can still leave `kp-spill-*`
+/// residue.
+pub fn is_internal_spill_name(name: &str) -> bool {
+    name.starts_with(FAKTOR_SPILL_PREFIX) || name.starts_with(LEGACY_KP_SPILL_PREFIX)
+}
+
+/// True when `name` is an internal supervisor root under either spelling.
+/// Same compatibility/retirement contract as [`is_internal_spill_name`].
+pub fn is_internal_supervisor_name(name: &str) -> bool {
+    name.starts_with(FAKTOR_SUPERVISOR_PREFIX) || name.starts_with(LEGACY_KP_SUPERVISOR_PREFIX)
+}
+
+/// The pid of a `*-supervisor-shared-<pid>` root, when the name carries one.
+fn supervisor_root_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix(FAKTOR_SUPERVISOR_PREFIX)
+        .or_else(|| name.strip_prefix(LEGACY_KP_SUPERVISOR_PREFIX))?;
+    rest.strip_prefix("shared-")?.parse().ok()
+}
+
+/// Best-effort bounded cleanup of stale spill files (both spellings) left in
+/// the system temp dir by crashed commands. Only regular files older than a
+/// day are removed — a live spool is written continuously by its command and
+/// can never be that old; symlinks and directories are never followed or
+/// removed. Runs at most once per capture, when a new spill starts.
+fn sweep_stale_spill_files() {
+    const MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+    const MAX_ENTRIES: usize = 4096;
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for (scanned, entry) in entries.flatten().enumerate() {
+        if scanned >= MAX_ENTRIES {
+            break;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_internal_spill_name(&name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age >= MIN_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Best-effort bounded cleanup of supervisor roots left in the system temp
+/// dir by crashed runs (both spellings). Only directories named exactly
+/// `*-supervisor-shared-<pid>`, older than an hour, whose owning pid is
+/// provably gone are removed; a live owner (pid reuse included) keeps its
+/// root. Symlinks are never followed or removed.
+fn sweep_stale_supervisor_roots() {
+    const MIN_AGE: Duration = Duration::from_secs(60 * 60);
+    const MAX_ENTRIES: usize = 4096;
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for (scanned, entry) in entries.flatten().enumerate() {
+        if scanned >= MAX_ENTRIES {
+            break;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(pid) = supervisor_root_pid(&name) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age >= MIN_AGE);
+        if stale && !process_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// A bounded head (lossy text, truncated?) published by one stream reader.
 type HeadSlot = Arc<Mutex<(String, bool)>>;
 
@@ -830,9 +949,10 @@ impl SharedCapture {
         // `artifact_truncated`. Finalization streams the file into the CAS
         // without ever materializing it in memory.
         if self.spill.is_none() && self.artifact_max > 0 {
+            sweep_stale_spill_files();
             let dir = std::env::temp_dir();
             let path = dir.join(format!(
-                "kp-spill-{}-{}",
+                "{FAKTOR_SPILL_PREFIX}{}-{}",
                 std::process::id(),
                 uuid::Uuid::new_v4()
             ));
@@ -896,6 +1016,13 @@ pub struct ProcessSupervisor {
     /// Serializes [admit → spawn → register] so the live ceiling is exact
     /// even under a spawn race (100 concurrent spawners never overshoot).
     spawn_serial: Mutex<()>,
+    /// The ephemeral CAS root [`ProcessSupervisor::try_shared`] created for
+    /// this supervisor, OWNED for the supervisor's whole lifetime (dropped
+    /// together with the last `Arc`, so the temp dir can never be deleted
+    /// under a live child or another `try_shared()` clone). `None` for
+    /// every injected supervisor: daemon-owned supervisors are rooted by
+    /// their constructor (the daemon CAS), never by a global temp root.
+    _standalone_root: Option<tempfile::TempDir>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -936,6 +1063,14 @@ impl ProcessSupervisor {
     /// Like [`ProcessSupervisor::new`] with an explicit live-child ceiling
     /// (bounded registry; spawns past the ceiling fail `Oversized`).
     pub fn with_limit(cas: Arc<faktor_cas::Cas>, max_live: usize) -> Arc<Self> {
+        Self::with_limit_and_root(cas, max_live, None)
+    }
+
+    fn with_limit_and_root(
+        cas: Arc<faktor_cas::Cas>,
+        max_live: usize,
+        standalone_root: Option<tempfile::TempDir>,
+    ) -> Arc<Self> {
         let max_live = max_live.max(1);
         Arc::new(Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
@@ -944,33 +1079,88 @@ impl ProcessSupervisor {
             timeline: Arc::new(Mutex::new(VecDeque::new())),
             max_live,
             spawn_serial: Mutex::new(()),
+            _standalone_root: standalone_root,
         })
     }
 
-    /// The process-wide shared supervisor (audit P0-40). Callers that
+    /// The process-wide standalone supervisor, for callers that genuinely
     /// cannot receive a daemon-rooted supervisor through their constructor
-    /// (the env-var hook registry, crate-level tests) spawn their children
-    /// here instead of building a private process layer. Rooted at an
-    /// ephemeral per-process temp CAS: every spawn path used through
-    /// `shared()` (env-exact, bounded-head) never touches the artifact
-    /// spool, so no durable state lives there.
-    pub fn shared() -> Arc<Self> {
-        static SHARED: std::sync::OnceLock<Arc<ProcessSupervisor>> = std::sync::OnceLock::new();
-        SHARED
-            .get_or_init(|| {
-                let dir = std::env::temp_dir()
-                    .join(format!("kp-supervisor-shared-{}", std::process::id()));
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    if let Ok(cas) = faktor_cas::Cas::open(dir.join("cas")) {
-                        return ProcessSupervisor::new(Arc::new(cas));
-                    }
-                }
-                panic!(
-                    "ProcessSupervisor::shared: cannot open its ephemeral CAS root at {:?}",
-                    dir
-                );
-            })
-            .clone()
+    /// (env-var hook registry, crate-level tests, one-shot CLI helpers).
+    ///
+    /// Daemon-owned subsystems MUST receive `Arc<ProcessSupervisor>` by
+    /// injection instead of calling this: index, hooks and verification all
+    /// take the daemon's ONE supervisor from their constructors, so the
+    /// normal graph has no global fallback.
+    ///
+    /// Failure to create the process authority is a typed initialization
+    /// failure (`Error`), NEVER a panic: the ephemeral root is a
+    /// `tempfile::Builder` temp dir with the reserved `faktor-supervisor-`
+    /// prefix, explicitly set to and VERIFIED at owner-only (`0700`) mode on
+    /// Unix before the supervisor is built. The temp dir is OWNED by the
+    /// returned supervisor for its whole lifetime (dropped with the last
+    /// `Arc`), so the root cannot disappear under a live child or a clone.
+    pub fn try_shared() -> Result<Arc<Self>, Error> {
+        static SHARED: std::sync::OnceLock<Result<Arc<ProcessSupervisor>, Error>> =
+            std::sync::OnceLock::new();
+        SHARED.get_or_init(Self::init_shared).clone()
+    }
+
+    fn init_shared() -> Result<Arc<ProcessSupervisor>, Error> {
+        // Legacy sweep (best effort, age- and liveness-gated): the old
+        // pid-named shared roots a crashed process may have left behind.
+        sweep_stale_supervisor_roots();
+        let dir = tempfile::Builder::new()
+            .prefix(FAKTOR_SUPERVISOR_PREFIX)
+            .tempdir()
+            .map_err(|e| {
+                Error::internal(format!(
+                    "process supervisor initialization failed: cannot create its ephemeral \
+                     root: {e}"
+                ))
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    Error::internal(format!(
+                        "process supervisor initialization failed: cannot set owner-only \
+                         permissions on {}: {e}",
+                        dir.path().display()
+                    ))
+                },
+            )?;
+            let mode = std::fs::metadata(dir.path())
+                .map_err(|e| {
+                    Error::permission(format!(
+                        "process supervisor initialization failed: cannot verify the mode of \
+                         {}: {e}",
+                        dir.path().display()
+                    ))
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != 0o700 {
+                return Err(Error::permission(format!(
+                    "process supervisor initialization failed: ephemeral root {} is not \
+                     owner-only ({mode:o}); refusing to root a supervisor there",
+                    dir.path().display()
+                )));
+            }
+        }
+        let cas = faktor_cas::Cas::open(dir.path().join("cas")).map_err(|e| {
+            Error::internal(format!(
+                "process supervisor initialization failed: cannot open its ephemeral CAS root \
+                 at {}: {e}",
+                dir.path().display()
+            ))
+        })?;
+        Ok(Self::with_limit_and_root(
+            Arc::new(cas),
+            DEFAULT_MAX_LIVE_CHILDREN,
+            Some(dir),
+        ))
     }
 
     fn alloc_id(&self) -> u64 {
@@ -990,6 +1180,7 @@ impl ProcessSupervisor {
     /// network-isolation request installs its pre-exec hook here, so EVERY
     /// spawn entry point (async, sync, detached) carries the backend or
     /// none.
+    #[allow(unsafe_code)]
     fn command_base(&self, cfg: &SpawnConfig) -> std::process::Command {
         let mut cmd = std::process::Command::new(&cfg.cmd);
         cmd.args(&cfg.args).current_dir(&cfg.cwd);
@@ -2325,6 +2516,7 @@ mod win_spawn {
         })
     }
 
+    #[allow(unsafe_code)]
     fn resume(pid: u32) -> Result<(), u32> {
         // SAFETY: `pid` names the just-created, still-suspended child; the
         // handle is closed on every path.
@@ -2392,6 +2584,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -2422,6 +2615,7 @@ fn process_alive(pid: u32) -> bool {
 /// (the pgid may have been recycled), which is why it is used solely for
 /// early return AND why every signal is refused after the reap.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn group_gone(pgid: u32) -> bool {
     if pgid == 0 {
         return true;
@@ -2472,6 +2666,7 @@ fn taskkill_best_effort(pid: u32) {
 /// is exercised only by the budget tests, which own their unreaped fixture
 /// children directly. On Windows the primary tree kill is the containment
 /// job ([`ChildContainment::terminate`]).
+#[allow(unsafe_code)]
 #[cfg(all(test, unix))]
 fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
@@ -2517,6 +2712,7 @@ fn kill_group(pid: u32, grace_ms: u64) -> Result<(), Error> {
 /// tests, which own their unreaped fixture children; every production kill
 /// path for a registered child goes through the guarded
 /// [`ReapState::try_signal_group`] (or the child's containment job).
+#[allow(unsafe_code)]
 #[cfg(all(test, unix))]
 async fn kill_group_async(pid: u32, grace_ms: u64) -> Result<(), Error> {
     #[cfg(unix)]
@@ -2631,6 +2827,7 @@ mod tests {
         (dir, ProcessSupervisor::with_limit(cas, limit))
     }
 
+    #[allow(unsafe_code)]
     fn pid_is_gone(pid: u32) -> bool {
         #[cfg(unix)]
         {
@@ -2664,10 +2861,10 @@ mod tests {
                 "the browser allowlist must never name a denied variable: {name}"
             );
         }
-        std::env::set_var("KP_BROWSER_TEST_PATH", "/tmp/kp-browser-test-bin");
+        std::env::set_var("FAKTOR_TEST_BROWSER_PATH", "/tmp/faktor-ci-browser-bin");
         let spec = browser_env_spec(vec![(
             "HOME".into(),
-            OsString::from("/tmp/kp-browser-test-home"),
+            OsString::from("/tmp/faktor-ci-browser-home"),
         )])
         .unwrap();
         let resolved = spec.resolve();
@@ -2678,16 +2875,17 @@ mod tests {
         assert!(names.iter().any(|n| n == "PATH"), "{names:?}");
         assert!(names.iter().any(|n| n == "HOME"), "{names:?}");
         assert!(
-            !names.iter().any(|n| n == "KP_BROWSER_TEST_PATH"),
+            !names.iter().any(|n| n == "FAKTOR_TEST_BROWSER_PATH"),
             "a non-allowlisted daemon name must never resolve: {names:?}"
         );
         assert!(
             resolved
                 .iter()
-                .any(|(k, v)| k == "HOME" && v == std::ffi::OsStr::new("/tmp/kp-browser-test-home")),
+                .any(|(k, v)| k == "HOME"
+                    && v == std::ffi::OsStr::new("/tmp/faktor-ci-browser-home")),
             "the exact scratch HOME must win"
         );
-        std::env::remove_var("KP_BROWSER_TEST_PATH");
+        std::env::remove_var("FAKTOR_TEST_BROWSER_PATH");
 
         for denied in ["OPENAI_API_KEY", "FAKTOR_SERVER_PASSWORD", "PROXY_PASSWORD"] {
             let err = browser_env_spec(vec![(denied.into(), OsString::from("x"))])
@@ -2796,7 +2994,7 @@ mod tests {
         drop(CmdScriptGuard(materialized_cmd_script(&cfg)));
         assert!(!reserved.exists(), "the run guard deletes the script");
 
-        let user = std::env::temp_dir().join(format!("kp-user-{}.cmd", uuid::Uuid::new_v4()));
+        let user = std::env::temp_dir().join(format!("faktor-user-{}.cmd", uuid::Uuid::new_v4()));
         std::fs::write(&user, b"echo user").unwrap();
         let cfg = SpawnConfig {
             cmd: "cmd.exe".into(),
@@ -2868,21 +3066,21 @@ mod tests {
         // Empty-value-inherit: benign keys and the daemon's own value for
         // an explicitly-listed key arrive; the hostile var still does not.
         std::env::set_var("FAKTOR_HOSTILE", "sekrit");
-        std::env::set_var("KP_DAEMON_ONLY", "xyz");
+        std::env::set_var("FAKTOR_TEST_DAEMON_ONLY", "xyz");
         let mut cfg = sh(
-            "test -n \"$PATH\" && test -n \"$HOME\" && test \"$KP_DAEMON_ONLY\" = xyz && test -z \"$FAKTOR_HOSTILE\" && echo benign",
+            "test -n \"$PATH\" && test -n \"$HOME\" && test \"$FAKTOR_TEST_DAEMON_ONLY\" = xyz && test -z \"$FAKTOR_HOSTILE\" && echo benign",
         );
         cfg.env = EnvSpec::Explicit(vec![
             ("PATH".into(), OsString::new()),
             ("HOME".into(), OsString::new()),
-            ("KP_DAEMON_ONLY".into(), OsString::new()),
+            ("FAKTOR_TEST_DAEMON_ONLY".into(), OsString::new()),
         ]);
         let out = sup
             .run_sync(cfg, Duration::from_secs(10), 4096, 4096)
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
         std::env::remove_var("FAKTOR_HOSTILE");
-        std::env::remove_var("KP_DAEMON_ONLY");
+        std::env::remove_var("FAKTOR_TEST_DAEMON_ONLY");
     }
 
     #[test]
@@ -2921,7 +3119,7 @@ mod tests {
             "FAKTOR_SERVER_PASSWORD",
             "OPENAI_API_KEY",
             "TEST_PRIVATE_SECRET",
-            "KP_UNDECLARED_DAEMON_VAR",
+            "FAKTOR_TEST_UNDECLARED_DAEMON_VAR",
         ];
         let _restore = RestoreEnv(
             names
@@ -2934,7 +3132,7 @@ mod tests {
         std::env::set_var("FAKTOR_SERVER_PASSWORD", "hunter2");
         std::env::set_var("OPENAI_API_KEY", "sk-test-secret");
         std::env::set_var("TEST_PRIVATE_SECRET", "private");
-        std::env::set_var("KP_UNDECLARED_DAEMON_VAR", "must-not-arrive");
+        std::env::set_var("FAKTOR_TEST_UNDECLARED_DAEMON_VAR", "must-not-arrive");
         // The child PRINTS its environment; the assertions run on the
         // printed set (not on a hand-written probe).
         let mut cfg = sh("env");
@@ -2960,7 +3158,7 @@ mod tests {
             "FAKTOR_SERVER_PASSWORD",
             "OPENAI_API_KEY",
             "TEST_PRIVATE_SECRET",
-            "KP_UNDECLARED_DAEMON_VAR",
+            "FAKTOR_TEST_UNDECLARED_DAEMON_VAR",
         ] {
             assert!(
                 !out.stdout_head.contains(secret),
@@ -3042,9 +3240,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_returns_the_process_wide_singleton() {
-        let a = ProcessSupervisor::shared();
-        let b = ProcessSupervisor::shared();
+    fn try_shared_returns_the_process_wide_singleton() {
+        let a = ProcessSupervisor::try_shared().expect("try_shared");
+        let b = ProcessSupervisor::try_shared().expect("try_shared");
         assert!(Arc::ptr_eq(&a, &b));
         // The shared supervisor actually runs env-cleared children.
         let mut cfg = sh("echo shared-ok");
@@ -3054,6 +3252,44 @@ mod tests {
             .unwrap();
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout_head.contains("shared-ok"));
+    }
+
+    /// The standalone root is a reserved-prefix temp dir, owner-only on
+    /// unix, and OWNED by the supervisor (it outlives every child and is
+    /// removed only when the last reference drops).
+    #[test]
+    fn try_shared_root_is_owner_only_and_supervisor_owned() {
+        let sup = ProcessSupervisor::try_shared().expect("try_shared");
+        let root = sup
+            ._standalone_root
+            .as_ref()
+            .expect("try_shared roots itself in an owned temp dir")
+            .path()
+            .to_path_buf();
+        assert!(
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(FAKTOR_SUPERVISOR_PREFIX)),
+            "reserved prefix: {}",
+            root.display()
+        );
+        assert!(root.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "owner-only root: {:o} at {}",
+                mode,
+                root.display()
+            );
+        }
+        assert!(
+            root.join("cas").is_dir(),
+            "the CAS root exists under the owned temp dir"
+        );
     }
 
     #[test]
@@ -3422,6 +3658,7 @@ mod tests {
     /// test's own `waitpid(WNOHANG)` after the guard drops reports ECHILD,
     /// proving the guard (not some other party) consumed the child.
     #[test]
+    #[allow(unsafe_code)]
     fn run_group_guard_drop_consumes_the_child_it_killed() {
         use std::os::unix::process::CommandExt;
         let mut child = std::process::Command::new("/bin/sh");
@@ -3459,6 +3696,7 @@ mod tests {
     /// an already-consumed (ECHILD) child is the documented alternative and
     /// `reaped` is then truthful — there is no unreaped child to signal.
     #[test]
+    #[allow(unsafe_code)]
     fn run_group_guard_drop_is_truthful_when_the_kill_cannot_reach_a_group() {
         use std::os::unix::process::CommandExt;
         let mut child = std::process::Command::new("/bin/sh");
@@ -3581,6 +3819,121 @@ mod tests {
             "ring must drop the head"
         );
         assert!(out.excerpt.len() < 64 * 1024);
+    }
+
+    /// Backdate a path (file or directory) so an age-gated sweep can prove
+    /// it stale.
+    fn backdate_path(p: &std::path::Path, age: Duration) {
+        let old = std::time::SystemTime::now() - age;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .or_else(|_| std::fs::File::open(p))
+            .unwrap();
+        f.set_modified(old).unwrap();
+    }
+
+    /// Phase F item 24: the writers mint Faktor names, while recognition
+    /// accepts BOTH spellings so crash residue from an older release is never
+    /// mistaken for user temp content.
+    #[test]
+    fn internal_spill_and_supervisor_names_recognize_both_spellings() {
+        for name in [
+            "faktor-spill-123-456",
+            "kp-spill-123-456",
+            "faktor-supervisor-shared-123",
+            "kp-supervisor-shared-123",
+        ] {
+            assert!(
+                is_internal_spill_name(name) || is_internal_supervisor_name(name),
+                "{name}"
+            );
+        }
+        assert!(!is_internal_spill_name("my-faktor-spill-1"));
+        assert!(!is_internal_supervisor_name("my-kp-supervisor-shared-1"));
+        assert!(!is_internal_spill_name("faktor.txt"));
+        assert_eq!(supervisor_root_pid("faktor-supervisor-shared-42"), Some(42));
+        assert_eq!(supervisor_root_pid("kp-supervisor-shared-42"), Some(42));
+        assert_eq!(supervisor_root_pid("faktor-supervisor-shared-x"), None);
+        assert_eq!(supervisor_root_pid("faktor-supervisor-notes"), None);
+    }
+
+    /// Cleanup accepts BOTH spellings: stale residue (regular files /
+    /// owner-dead dirs) is removed; fresh files, live owners, symlinks and
+    /// non-matching names survive.
+    #[test]
+    fn stale_spill_and_supervisor_residue_of_both_spellings_is_swept() {
+        let temp = std::env::temp_dir();
+        let nonce = uuid::Uuid::new_v4();
+        let stale_age = Duration::from_secs(48 * 60 * 60);
+
+        let stale_faktor_spill = temp.join(format!("{FAKTOR_SPILL_PREFIX}{nonce}-stale"));
+        let stale_legacy_spill = temp.join(format!("{LEGACY_KP_SPILL_PREFIX}{nonce}-stale"));
+        let fresh_spill = temp.join(format!("{FAKTOR_SPILL_PREFIX}{nonce}-fresh"));
+        let sacred = temp.join(format!("faktor-ci-reviewer-sacred-{nonce}.bin"));
+        let spill_link = temp.join(format!("{LEGACY_KP_SPILL_PREFIX}{nonce}-link"));
+        for p in [&stale_faktor_spill, &stale_legacy_spill] {
+            std::fs::write(p, b"torn spill").unwrap();
+            backdate_path(p, stale_age);
+        }
+        std::fs::write(&fresh_spill, b"live spool").unwrap();
+        std::fs::write(&sacred, b"SACRED-BYTES").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sacred, &spill_link).unwrap();
+
+        let stale_faktor_sup = temp.join(format!("{FAKTOR_SUPERVISOR_PREFIX}shared-0"));
+        // A pid far above any real pid_t: provably gone, never recycled.
+        let stale_legacy_sup = temp.join(format!("{LEGACY_KP_SUPERVISOR_PREFIX}shared-2147483647"));
+        let fresh_sup = temp.join(format!("{LEGACY_KP_SUPERVISOR_PREFIX}shared-0"));
+        let live_sup = temp.join(format!(
+            "{FAKTOR_SUPERVISOR_PREFIX}shared-{}",
+            std::process::id()
+        ));
+        for p in [&stale_faktor_sup, &stale_legacy_sup, &live_sup] {
+            std::fs::create_dir_all(p).unwrap();
+            backdate_path(p, stale_age);
+        }
+        std::fs::create_dir_all(&fresh_sup).unwrap();
+
+        sweep_stale_spill_files();
+        sweep_stale_supervisor_roots();
+
+        assert!(!stale_faktor_spill.exists(), "Faktor spill residue swept");
+        assert!(!stale_legacy_spill.exists(), "legacy spill residue swept");
+        assert!(
+            fresh_spill.exists(),
+            "a fresh spill belongs to a live writer"
+        );
+        assert!(sacred.exists(), "a symlink target must never be touched");
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&spill_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a symlink named like a spill is never followed or removed"
+        );
+        assert!(
+            !stale_faktor_sup.exists(),
+            "Faktor dead supervisor root swept"
+        );
+        assert!(
+            !stale_legacy_sup.exists(),
+            "legacy dead supervisor root swept"
+        );
+        assert!(
+            fresh_sup.exists(),
+            "a fresh supervisor root survives the age gate"
+        );
+        assert!(live_sup.exists(), "a live owner keeps its supervisor root");
+
+        for p in [&fresh_spill, &sacred, &spill_link, &fresh_sup, &live_sup] {
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(p)
+            } else {
+                std::fs::remove_file(p)
+            };
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3828,7 +4181,7 @@ mod tests {
                         "-c".into(),
                         "printf '%s' \"$1\"".into(),
                         "x".into(),
-                        "; rm -rf /tmp/kp-evil".into(),
+                        "; rm -rf /tmp/faktor-ci-evil".into(),
                     ],
                     cwd: std::env::temp_dir(),
                     ..Default::default()
@@ -3839,8 +4192,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.exit_code, Some(0));
-        assert!(out.excerpt.contains("; rm -rf /tmp/kp-evil"));
-        assert!(!std::path::Path::new("/tmp/kp-evil").exists());
+        assert!(out.excerpt.contains("; rm -rf /tmp/faktor-ci-evil"));
+        assert!(!std::path::Path::new("/tmp/faktor-ci-evil").exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4520,10 +4873,66 @@ mod tests {
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
     }
 
+    // --------------------------- test env names (Phase F item 24) -------
+
+    /// Test env readers accept BOTH the current `FAKTOR_TEST_*` spelling and
+    /// the legacy `KP_*` one during the naming migration. The Faktor
+    /// spelling wins when both are set; the legacy spelling emits a warning
+    /// and reports itself so tests can assert the fallback.
+    fn read_test_env(suffix: &str) -> Option<(String, bool)> {
+        let current = format!("FAKTOR_TEST_{suffix}");
+        if let Ok(value) = std::env::var(&current) {
+            return Some((value, false));
+        }
+        let legacy = format!("KP_{suffix}");
+        if let Ok(value) = std::env::var(&legacy) {
+            tracing::warn!(
+                legacy = %legacy,
+                current = %current,
+                "legacy test env spelling accepted during the naming migration; \
+                 writers must use the Faktor name"
+            );
+            return Some((value, true));
+        }
+        None
+    }
+
+    /// Readers accept both spellings during the migration; the Faktor
+    /// spelling wins and the legacy one still resolves (with a warning).
+    #[test]
+    fn test_env_reader_falls_back_to_the_legacy_spelling() {
+        std::env::remove_var("FAKTOR_TEST_FALLBACK_PROBE");
+        std::env::remove_var("KP_FALLBACK_PROBE");
+        assert_eq!(read_test_env("FALLBACK_PROBE"), None);
+        std::env::set_var("KP_FALLBACK_PROBE", "legacy-value");
+        assert_eq!(
+            read_test_env("FALLBACK_PROBE"),
+            Some(("legacy-value".to_string(), true))
+        );
+        std::env::set_var("FAKTOR_TEST_FALLBACK_PROBE", "faktor-value");
+        assert_eq!(
+            read_test_env("FALLBACK_PROBE"),
+            Some(("faktor-value".to_string(), false)),
+            "the Faktor spelling must win when both are present"
+        );
+        std::env::remove_var("KP_FALLBACK_PROBE");
+        assert_eq!(
+            read_test_env("FALLBACK_PROBE"),
+            Some(("faktor-value".to_string(), false))
+        );
+        std::env::remove_var("FAKTOR_TEST_FALLBACK_PROBE");
+    }
+
     // ------------------------------ linux: the real unshare backend -----
 
     #[cfg(target_os = "linux")]
-    const NET_PROBE_ENV: &str = "KP_TERMINAL_NET_PROBE";
+    const NET_PROBE_ENV: &str = "FAKTOR_TEST_TERMINAL_NET_PROBE";
+
+    /// The probe child's env reader (Faktor spelling first, legacy fallback).
+    #[cfg(target_os = "linux")]
+    fn net_probe_env(suffix: &str) -> Option<String> {
+        read_test_env(&format!("NET_{suffix}")).map(|(value, _legacy)| value)
+    }
 
     #[cfg(target_os = "linux")]
     fn netns_inode() -> Option<u64> {
@@ -4540,11 +4949,11 @@ mod tests {
         // a machine-readable report; the parent interprets it. A child
         // that cannot even write its report exits 3 (the parent then fails
         // on the missing file).
-        let port: u16 = std::env::var("KP_NET_TCP_PORT").unwrap().parse().unwrap();
-        let udp_port: u16 = std::env::var("KP_NET_UDP_PORT").unwrap().parse().unwrap();
-        let uds = std::env::var("KP_NET_UDS").unwrap();
-        let report = std::env::var("KP_NET_REPORT").unwrap();
-        let compute = std::env::var("KP_NET_COMPUTE").unwrap();
+        let port: u16 = net_probe_env("TCP_PORT").unwrap().parse().unwrap();
+        let udp_port: u16 = net_probe_env("UDP_PORT").unwrap().parse().unwrap();
+        let uds = net_probe_env("UDS").unwrap();
+        let report = net_probe_env("REPORT").unwrap();
+        let compute = net_probe_env("COMPUTE").unwrap();
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!(
             "netns={}",
@@ -4609,37 +5018,40 @@ mod tests {
         // after writing the report. The probe vars ride an explicit
         // EnvSpec — no daemon environment is inherited.
         std::env::set_var(NET_PROBE_ENV, "1");
-        std::env::set_var("KP_NET_TCP_PORT", targets.tcp_port.to_string());
-        std::env::set_var("KP_NET_UDP_PORT", targets.udp_port.to_string());
-        std::env::set_var("KP_NET_UDS", targets.uds.to_string_lossy().into_owned());
+        std::env::set_var("FAKTOR_TEST_NET_TCP_PORT", targets.tcp_port.to_string());
+        std::env::set_var("FAKTOR_TEST_NET_UDP_PORT", targets.udp_port.to_string());
         std::env::set_var(
-            "KP_NET_REPORT",
+            "FAKTOR_TEST_NET_UDS",
+            targets.uds.to_string_lossy().into_owned(),
+        );
+        std::env::set_var(
+            "FAKTOR_TEST_NET_REPORT",
             targets.report.to_string_lossy().into_owned(),
         );
         std::env::set_var(
-            "KP_NET_COMPUTE",
+            "FAKTOR_TEST_NET_COMPUTE",
             targets.compute.to_string_lossy().into_owned(),
         );
         let probe_env = EnvSpec::Explicit(vec![
             (NET_PROBE_ENV.into(), "1".into()),
             (
-                "KP_NET_TCP_PORT".into(),
+                "FAKTOR_TEST_NET_TCP_PORT".into(),
                 targets.tcp_port.to_string().into(),
             ),
             (
-                "KP_NET_UDP_PORT".into(),
+                "FAKTOR_TEST_NET_UDP_PORT".into(),
                 targets.udp_port.to_string().into(),
             ),
             (
-                "KP_NET_UDS".into(),
+                "FAKTOR_TEST_NET_UDS".into(),
                 targets.uds.to_string_lossy().into_owned().into(),
             ),
             (
-                "KP_NET_REPORT".into(),
+                "FAKTOR_TEST_NET_REPORT".into(),
                 targets.report.to_string_lossy().into_owned().into(),
             ),
             (
-                "KP_NET_COMPUTE".into(),
+                "FAKTOR_TEST_NET_COMPUTE".into(),
                 targets.compute.to_string_lossy().into_owned().into(),
             ),
         ]);
@@ -4888,10 +5300,12 @@ mod windows_tests {
     use super::*;
     use faktor_core::error::ErrorKind;
 
+    #[allow(unsafe_code)]
     fn pid_alive(pid: u32) -> bool {
         if pid == 0 {
             return false;
         }
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         unsafe {
             let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
             if handle.is_null() {

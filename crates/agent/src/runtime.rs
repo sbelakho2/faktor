@@ -8291,7 +8291,14 @@ impl AgentRuntime {
         // derivation input would silently miss manifests/sources beyond a
         // cap, so the whole integrated-root verification is Unavailable with
         // the typed reason.
-        let inventory = faktor_verify::discover_repo_inventory(root);
+        let inventory = match &self.deps.supervisor {
+            Some(supervisor) => faktor_verify::discover_repo_inventory_with_supervisor(
+                root,
+                &faktor_verify::InventoryBudget::default(),
+                supervisor,
+            ),
+            None => faktor_verify::discover_repo_inventory(root),
+        };
         let repo_files = inventory.files.clone();
         if let Some(reason) = inventory.refusal_reason() {
             let criteria_rows = criterion_verdicts_from_attempt(
@@ -8521,7 +8528,14 @@ impl AgentRuntime {
                 verification: Some(verification),
             });
         }
-        let inventory = faktor_verify::discover_repo_inventory(root);
+        let inventory = match &self.deps.supervisor {
+            Some(supervisor) => faktor_verify::discover_repo_inventory_with_supervisor(
+                root,
+                &faktor_verify::InventoryBudget::default(),
+                supervisor,
+            ),
+            None => faktor_verify::discover_repo_inventory(root),
+        };
         let repo_files = inventory.files.clone();
         if let Some(reason) = inventory.refusal_reason() {
             let criteria_rows = criterion_verdicts_from_attempt(
@@ -9272,7 +9286,14 @@ impl AgentRuntime {
         // suite). ANY non-Complete inventory classifies the turn Unavailable
         // with the typed reason BEFORE any review or derivation: the model's
         // claim is never gated by checks derived from a truncated tree.
-        let inventory = faktor_verify::discover_repo_inventory(&root);
+        let inventory = match &self.deps.supervisor {
+            Some(supervisor) => faktor_verify::discover_repo_inventory_with_supervisor(
+                &root,
+                &faktor_verify::InventoryBudget::default(),
+                supervisor,
+            ),
+            None => faktor_verify::discover_repo_inventory(&root),
+        };
         if let Some(reason) = inventory.refusal_reason() {
             return self.unverified_verdict(
                 handle,
@@ -11335,11 +11356,22 @@ impl AgentRuntime {
                 .parent()
                 .map(|p| p.join("index_data"))
                 .unwrap_or_else(|| std::path::PathBuf::from("index_data"));
-            match faktor_index::IndexService::open(
-                store.clone(),
-                data_root,
-                self.deps.workspaces.clone(),
-            ) {
+            // DI: the daemon's injected supervisor roots every cold git/rg
+            // child of this index host. Standalone hosts without a
+            // supervisor fall back to the typed standalone constructor.
+            match match self.deps.supervisor.clone() {
+                Some(supervisor) => faktor_index::IndexService::open_with_supervisor(
+                    store.clone(),
+                    data_root,
+                    self.deps.workspaces.clone(),
+                    supervisor,
+                ),
+                None => faktor_index::IndexService::open(
+                    store.clone(),
+                    data_root,
+                    self.deps.workspaces.clone(),
+                ),
+            } {
                 Ok(svc) => {
                     // Embedding persistence wiring (no re-embed of unchanged
                     // chunks): the configured embedder + its stable identity
@@ -20096,7 +20128,7 @@ mod tests {
             ]),
             vec![counting_echo_tool(executions.clone())],
         );
-        let hooks = Arc::new(faktor_hooks::HookRegistry::new());
+        let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone supervisor"));
         hooks
             .register(failing_closed_hook(
                 "pre_deny",
@@ -23844,7 +23876,10 @@ mod tests {
             vec![real_write_tool()],
         );
         deps.verification = crate::VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            Arc::new(
+                faktor_verify::exec::AsyncCheckExecutor::try_shared()
+                    .expect("standalone supervisor"),
+            ),
             faktor_verify::exec::VerificationPolicy::default(),
         );
         deps.compact_at_usage = 0.65;
@@ -24007,7 +24042,10 @@ mod tests {
             vec![real_write_tool()],
         );
         deps.verification = crate::VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            Arc::new(
+                faktor_verify::exec::AsyncCheckExecutor::try_shared()
+                    .expect("standalone supervisor"),
+            ),
             faktor_verify::exec::VerificationPolicy::default(),
         );
         let outcome = {
@@ -24206,7 +24244,10 @@ mod tests {
 
     fn real_background_verifier() -> Arc<crate::VerificationService> {
         crate::VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::new()),
+            Arc::new(
+                faktor_verify::exec::AsyncCheckExecutor::try_shared()
+                    .expect("standalone supervisor"),
+            ),
             faktor_verify::exec::VerificationPolicy::default(),
         )
     }
@@ -32146,7 +32187,7 @@ mod tests {
             ]),
             vec![echo_tool()],
         );
-        let hooks = Arc::new(faktor_hooks::HookRegistry::new());
+        let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone supervisor"));
         hooks
             .register(failing_closed_hook(
                 "post_deny",
@@ -32247,7 +32288,8 @@ mod tests {
             .unwrap();
         assert!(audit_plain.is_empty(), "no registry wired -> no audit");
 
-        let registry = Arc::new(faktor_hooks::HookRegistry::new());
+        let registry =
+            Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone supervisor"));
         registry
             .register(file_writing_hook(
                 "tool_err",
@@ -32333,7 +32375,7 @@ mod tests {
             ]),
             vec![],
         );
-        let hooks = Arc::new(faktor_hooks::HookRegistry::new());
+        let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone supervisor"));
         hooks
             .register(file_writing_hook(
                 "task_done",
@@ -32371,7 +32413,7 @@ mod tests {
         let out_dir = tempdir().unwrap();
         let out = out_dir.path().join("end.json");
         let (mut deps, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
-        let hooks = Arc::new(faktor_hooks::HookRegistry::new());
+        let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone supervisor"));
         hooks
             .register(file_writing_hook(
                 "end_hook",
@@ -32435,7 +32477,7 @@ mod tests {
             ScriptedResponse::End,
         ]);
         let (mut deps2, _keep2) = reopen_runtime(&dir, Arc::new(inner), vec![]);
-        let hooks = Arc::new(faktor_hooks::HookRegistry::new());
+        let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone supervisor"));
         hooks
             .register(failing_closed_hook(
                 "resume",

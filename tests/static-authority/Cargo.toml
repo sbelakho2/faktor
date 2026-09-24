@@ -11,3 +11,6 @@ rust-version.workspace = true
 # the lib target exists only so the workspace builds the crate.
 
 [dependencies]
+
+[lints]
+workspace = true

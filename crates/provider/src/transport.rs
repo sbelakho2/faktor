@@ -366,6 +366,35 @@ impl Default for StreamDeadlines {
     }
 }
 
+/// Absolute cap on the raw bytes of ONE provider response body stream (all
+/// adapters). Individual SSE/NDJSON lines are already capped by
+/// [`MAX_LINE_BYTES`]; this bounds the WHOLE body so a hostile or broken
+/// server cannot drip an unbounded stream at any adapter.
+pub const MAX_STREAM_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+impl StreamDeadlines {
+    /// The [`crate::egress::ResponseBudget`] equivalent of these deadlines,
+    /// for the shared budget-aware body reader
+    /// ([`crate::egress::BudgetedBody`]): head/idle carry these values, the
+    /// total deadline is the overall bound (or [`PROVIDER_CEILING_MS`] when
+    /// the operation set none), and the byte cap is
+    /// [`MAX_STREAM_BODY_BYTES`].
+    pub fn response_budget(self) -> crate::egress::ResponseBudget {
+        let overall_ms = if self.overall_ms == 0 {
+            PROVIDER_CEILING_MS
+        } else {
+            self.overall_ms.min(PROVIDER_CEILING_MS)
+        };
+        crate::egress::ResponseBudget::from_millis(
+            self.first_byte_ms.max(1),
+            self.idle_ms.max(1),
+            overall_ms.max(1),
+            MAX_STREAM_BODY_BYTES,
+            None,
+        )
+    }
+}
+
 /// Wrap an adapter's parsed LINE stream with the hang controls. The item
 /// stream carries `Result<String, ProviderError>` (adapters parse
 /// SSE/NDJSON lines into provider errors), so the guard emits the REAL

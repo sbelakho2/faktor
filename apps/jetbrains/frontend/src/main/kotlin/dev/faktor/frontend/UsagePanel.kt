@@ -159,10 +159,15 @@ data class UsagePanelModel(
             )
         }
         for (txn in inFlight) {
+            // `endedMs` is a `val` of NativeInFlightTxn in the shared module;
+            // Kotlin forbids smart casts across module boundaries, so bind the
+            // nullable locally before formatting (compiles under Gradle's
+            // separate shared/frontend modules as well as the single-module
+            // kotlinc smoke).
+            val ended = txn.endedMs?.let { " — ended ${utcSeconds(it)}" } ?: ""
             out.add(
                 "in-flight ${txn.kind} ${txn.id} (${txn.reference}) since " +
-                    utcSeconds(txn.startedMs) +
-                    (if (txn.endedMs == null) "" else " — ended ${utcSeconds(txn.endedMs)}")
+                    utcSeconds(txn.startedMs) + ended
             )
         }
         if (state == "ok" || cursor != null || nextCursor != null) {

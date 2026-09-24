@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use faktor_security::secret::SecretValue;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -118,10 +119,11 @@ impl fmt::Display for TokenHash {
     }
 }
 
-/// One plaintext secret token, exposed exactly once at issuance. `Debug` is
-/// redacted; the value is never serialized.
+/// One plaintext secret token, exposed exactly once at issuance. The value
+/// is a [`SecretValue`]: zeroized on drop, redacted `Debug`, no `Display` and
+/// no serde; it leaves only through [`SecretToken::expose`].
 #[derive(Clone, PartialEq, Eq)]
-pub struct SecretToken(String);
+pub struct SecretToken(SecretValue);
 
 impl SecretToken {
     pub fn try_new(raw: impl Into<String>) -> Result<Self, ControlPlaneError> {
@@ -131,12 +133,12 @@ impl SecretToken {
                 "token must be 1..=512 non-whitespace bytes".into(),
             ));
         }
-        Ok(Self(raw))
+        Ok(Self(SecretValue::new(raw)))
     }
 
     /// The secret value (call sites must never log it).
     pub fn expose(&self) -> &str {
-        &self.0
+        self.0.expose()
     }
 }
 
@@ -188,5 +190,56 @@ mod tests {
         assert!(SecretToken::try_new("").is_err());
         assert!(SecretToken::try_new("a b").is_err());
         assert!(SecretToken::try_new("x".repeat(MAX_TOKEN_BYTES + 1)).is_err());
+    }
+
+    /// The compile-time negative proof: `SecretToken` has NO `Display` and
+    /// NO `Serialize`. The probe below only compiles while neither impl
+    /// exists (the `AmbiguousIfImpl` shape: an extra candidate impl makes the
+    /// `_` placeholder un-inferable).
+    macro_rules! assert_no_display_no_serialize {
+        ($ty:ty) => {{
+            trait AmbiguousIfImpl<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            impl<T: ?Sized + std::fmt::Display> AmbiguousIfImpl<u8> for T {}
+            impl<T: ?Sized + ::serde::Serialize> AmbiguousIfImpl<u16> for T {}
+            let _ = <$ty as AmbiguousIfImpl<_>>::probe;
+        }};
+    }
+
+    #[test]
+    fn planted_secret_never_leaks_through_debug_display_serde_or_panic() {
+        assert_no_display_no_serialize!(SecretToken);
+        const PLANTED: &str = "PLANTED-TOKEN-do-not-leak-0123456789abcdef";
+        let token = SecretToken::try_new(PLANTED).unwrap();
+        // Debug through every nesting level.
+        for rendered in [
+            format!("{token:?}"),
+            format!("{:?}", Some(token.clone())),
+            format!("{:?}", vec![token.clone()]),
+            format!("{:?}", (token.clone(), 1u8)),
+        ] {
+            assert!(!rendered.contains(PLANTED), "leaked via {rendered}");
+        }
+        assert_eq!(format!("{token:?}"), "SecretToken(<redacted>)");
+        // Panic formatting must stay redacted.
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("session mint {token:?}")
+        }))
+        .expect_err("the closure must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            !message.contains(PLANTED),
+            "panic payload leaked: {message}"
+        );
+        // A validation refusal names only the SHAPE, never the planted bytes.
+        let err = SecretToken::try_new(format!("{PLANTED} with space")).unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PLANTED), "error leaked: {rendered}");
     }
 }

@@ -33,9 +33,9 @@
 //!
 //! A denied destination returns a typed [`EgressError::Denied`] carrying
 //! which rule fired and how far its match got — as a credential-free
-//! [`SafeUrlDiagnostic`] (scheme, canonical host, effective port, bounded
-//! path; userinfo dropped, query masked, fragment dropped), never a raw
-//! URL. The authoritative check runs at `execute` time on the final request
+//! [`SafeUrlDiagnostic`] (scheme, canonical host, effective port, path
+//! SEGMENT COUNT; raw path bytes, userinfo, query and fragment are never
+//! retained), never a raw URL. The authoritative check runs at `execute` time on the final request
 //! object (so no caller can construct a request that bypasses the gate);
 //! `get`/`post` validate the URL shape up front with typed errors, and
 //! [`CheckedHttpClient::check`] exposes the same decision for callers that
@@ -84,10 +84,24 @@
 //! (its final URL differs from the checked hop URL) and fails closed with
 //! [`EgressError::UncheckedRedirectFollowed`].
 //!
+//! # Every response body is budgeted
+//!
+//! No production consumer reads a response body directly. [`BudgetedBody`]
+//! enforces a caller-supplied [`ResponseBudget`] (head/idle/total deadlines
+//! plus byte and frame caps) on every chunk; a stalled, dripping, oversized
+//! or over-framed body is the typed
+//! [`EgressError::ResponseBudgetExceeded`] naming the component that fired,
+//! and [`execute_raw`] materializes only under a budget (its byte cap is
+//! never above [`MAX_RAW_RESPONSE_BYTES`]). The provider streaming path, the
+//! wire adapters, SCM, cloud OIDC, the updater, semantic and the commerce
+//! connectors all pass one; the `static-authority` scan refuses direct
+//! `.bytes()`/`.text()`/`.chunk()`/`bytes_stream()` reads in those trees.
+//!
 //! # Error size
 //!
 //! [`EgressError`] carries bounded, pre-redacted [`SafeUrlDiagnostic`]
-//! values (scheme/host/port + a capped path) rather than raw URLs, and the
+//! values (scheme/host/port + a path SEGMENT COUNT, never path bytes)
+//! rather than raw URLs, and the
 //! diagnostic payload itself lives behind one `Box`, so the error — and
 //! every `Result<_, EgressError>` in the transport seam — stays small
 //! enough for `clippy::result_large_err` without any lint allowance.
@@ -95,6 +109,7 @@
 //! error route is allowed to fall back to echoing a raw URL.
 
 use futures::future::BoxFuture;
+use futures::Stream;
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION, TRANSFER_ENCODING, WWW_AUTHENTICATE,
@@ -102,6 +117,7 @@ use reqwest::header::{
 use reqwest::{Body, Method, Request, RequestBuilder, Response, ResponseBuilderExt, Url};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub use crate::resolver::{AddressClass, EgressAddressPolicy};
 use crate::resolver::{EgressResolveError, EgressResolver, ReqwestDnsResolver};
@@ -110,27 +126,83 @@ use faktor_security::destination::{Decision, DeniedReason, DestinationPolicy, Re
 use faktor_security::payload::{scan_payload, ScanOutcome, ScanPolicy};
 use faktor_security::registry::SecretRegistry;
 
-/// Hard bound on the path fragment a [`SafeUrlDiagnostic`] renders, so a
-/// hostile URL cannot inflate a log line or error message.
-pub const MAX_DIAGNOSTIC_PATH_CHARS: usize = 256;
+/// A known-safe label for one production egress route.
+///
+/// Labels exist so an error/log line can name WHICH route a call hit without
+/// ever deriving text from an untrusted URL: every label is a compile-time
+/// constant chosen by the calling code, while the URL contributes at most
+/// the credential-free [`SafeUrlDiagnostic`] shape. A label can therefore
+/// never smuggle a path, query, userinfo or fragment — even when the
+/// request's URL is fully attacker-influenced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteLabel {
+    /// GitHub App installation-token minting.
+    GithubInstallationToken,
+    /// The GitHub REST API surface.
+    GithubApi,
+    /// OIDC discovery document fetch.
+    OidcDiscovery,
+    /// OIDC JWKS fetch.
+    OidcJwks,
+    /// OIDC authorization-code token exchange.
+    OidcTokenExchange,
+    /// Billing vendor usage-report page.
+    BillingVendorReport,
+    /// Updater artifact/manifest download.
+    UpdaterArtifact,
+    /// An external semantic provider call.
+    SemanticProvider,
+    /// A commerce source connector call.
+    CommerceSource,
+    /// A worker's control-plane call.
+    WorkerControlPlane,
+    /// A provider chat/embedding stream.
+    ProviderStream,
+}
+
+impl std::fmt::Display for RouteLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RouteLabel::GithubInstallationToken => "github_installation_token",
+            RouteLabel::GithubApi => "github_api",
+            RouteLabel::OidcDiscovery => "oidc_discovery",
+            RouteLabel::OidcJwks => "oidc_jwks",
+            RouteLabel::OidcTokenExchange => "oidc_token_exchange",
+            RouteLabel::BillingVendorReport => "billing_vendor_report",
+            RouteLabel::UpdaterArtifact => "updater_artifact",
+            RouteLabel::SemanticProvider => "semantic_provider",
+            RouteLabel::CommerceSource => "commerce_source",
+            RouteLabel::WorkerControlPlane => "worker_control_plane",
+            RouteLabel::ProviderStream => "provider_stream",
+        })
+    }
+}
 
 /// Bounded, credential-free rendering of a URL for diagnostics.
 ///
 /// Carries ONLY the scheme, the canonical parsed host, the effective port
-/// (scheme default resolved) and the path. Userinfo is dropped, the query is
-/// reduced to a presence marker (`?<redacted>`) so no query name or value —
-/// plain or percent-encoded — can ever be echoed, the fragment is dropped,
-/// and the path is bounded. [`SafeUrlDiagnostic::from_raw`] never returns
-/// unparseable input either: it reports `<unparseable>` instead. Both
-/// `Debug` and `Display` produce this form, so no error route can regress
-/// into echoing a credential-bearing URL.
+/// (scheme default resolved), the NUMBER of path segments and whether a
+/// query was present. Raw path bytes are never retained: a path routinely
+/// carries credentials (`/token/<secret>`), and percent-encoding makes any
+/// character-level masking heuristic unsafe. Userinfo is dropped, the query
+/// is reduced to a presence marker (`?<redacted>`) so no query name or
+/// value — plain or percent-encoded — can ever be echoed, and the fragment
+/// is dropped. [`SafeUrlDiagnostic::from_raw`] never returns unparseable
+/// input either: it reports `<unparseable>` instead. Both `Debug` and
+/// `Display` produce this form, so no error route can regress into echoing
+/// a credential-bearing URL.
+///
+/// An optional [`RouteLabel`] may be attached by the caller: it is a
+/// compile-time constant that describes the route in words, so diagnostics
+/// never have to derive a human label from (untrusted) URL text.
 ///
 /// The fields live behind one `Box` so the value carried in every URL-bearing
 /// [`EgressError`] variant (and therefore every `Result<_, EgressError>`)
 /// stays small; diagnostics are constructed only on rejection paths, so the
 /// single allocation is never on a success path. `Serialize`/`Deserialize`
-/// are transparent over the box (the wire shape is the flat field object,
-/// unchanged), and `From`/`Display`/`Debug` ergonomics are untouched.
+/// are transparent over the box (the wire shape is the flat field object),
+/// and `From`/`Display`/`Debug` ergonomics are untouched.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SafeUrlDiagnostic {
@@ -143,29 +215,42 @@ struct SafeUrlFields {
     scheme: String,
     host: String,
     port: u16,
-    path: String,
+    /// How many path segments the URL had. NEVER the segment bytes.
+    path_segments: u16,
     query_present: bool,
+    /// The caller-chosen known-safe route label, when one was attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route: Option<RouteLabel>,
 }
 
 impl SafeUrlDiagnostic {
     /// Diagnostic of an already-parsed URL (canonical host, port resolved).
     pub fn from_url(url: &Url) -> Self {
-        let path = url.path();
-        let path = if path.chars().count() > MAX_DIAGNOSTIC_PATH_CHARS {
-            let truncated: String = path.chars().take(MAX_DIAGNOSTIC_PATH_CHARS).collect();
-            format!("{truncated}<truncated>")
-        } else {
-            path.to_string()
-        };
+        // A lone `/` is the empty path: an absolute URL always carries one,
+        // and only NON-EMPTY segments describe a real path shape.
+        let segments = url
+            .path_segments()
+            .map(|segments| segments.filter(|segment| !segment.is_empty()).count())
+            .unwrap_or(0);
         Self {
             fields: Box::new(SafeUrlFields {
                 scheme: url.scheme().to_string(),
                 host: url.host_str().unwrap_or("<no-host>").to_string(),
                 port: url.port_or_known_default().unwrap_or(0),
-                path,
+                path_segments: segments.min(u16::MAX as usize) as u16,
                 query_present: url.query().is_some(),
+                route: None,
             }),
         }
+    }
+
+    /// Diagnostic of an already-parsed URL carrying a caller-chosen
+    /// known-safe route label (display/Debug only; never derived from the
+    /// URL itself).
+    pub fn from_url_route(url: &Url, route: RouteLabel) -> Self {
+        let mut diagnostic = Self::from_url(url);
+        diagnostic.fields.route = Some(route);
+        diagnostic
     }
 
     /// Diagnostic of a raw URL string. Parse failure yields a fixed
@@ -178,11 +263,22 @@ impl SafeUrlDiagnostic {
                     scheme: String::new(),
                     host: "<unparseable>".to_string(),
                     port: 0,
-                    path: String::new(),
+                    path_segments: 0,
                     query_present: false,
+                    route: None,
                 }),
             },
         }
+    }
+
+    /// Diagnostic of a raw URL string carrying a caller-chosen known-safe
+    /// route label. Parse failure yields the same fixed `<unparseable>`
+    /// marker as [`SafeUrlDiagnostic::from_raw`] (the label is still
+    /// rendered: it is a compile-time constant, not URL text).
+    pub fn from_raw_route(raw: &str, route: RouteLabel) -> Self {
+        let mut diagnostic = Self::from_raw(raw);
+        diagnostic.fields.route = Some(route);
+        diagnostic
     }
 
     pub fn scheme(&self) -> &str {
@@ -199,13 +295,19 @@ impl SafeUrlDiagnostic {
         self.fields.port
     }
 
-    /// The path only — never the query or fragment.
-    pub fn path(&self) -> &str {
-        &self.fields.path
+    /// How many path segments the URL carried (0 = no path). Never the
+    /// segment bytes.
+    pub fn path_segments(&self) -> u16 {
+        self.fields.path_segments
     }
 
     pub fn query_present(&self) -> bool {
         self.fields.query_present
+    }
+
+    /// The caller-chosen known-safe route label, when one was attached.
+    pub fn route(&self) -> Option<RouteLabel> {
+        self.fields.route
     }
 }
 
@@ -232,13 +334,17 @@ impl std::fmt::Display for SafeUrlDiagnostic {
         } else {
             fields.host.clone()
         };
-        write!(
-            f,
-            "{}://{}:{}{}",
-            fields.scheme, host, fields.port, fields.path
-        )?;
+        write!(f, "{}://{}:{}", fields.scheme, host, fields.port)?;
+        // The path contributes only its shape: whether one existed, never a
+        // byte of it (a path is a routine credential carrier).
+        if fields.path_segments > 0 {
+            write!(f, "/<redacted-path>")?;
+        }
         if fields.query_present {
             write!(f, "?<redacted>")?;
+        }
+        if let Some(route) = fields.route {
+            write!(f, " [{route}]")?;
         }
         Ok(())
     }
@@ -343,6 +449,13 @@ impl From<EgressError> for ProviderError {
         let message = e.to_string();
         match e {
             EgressError::Transport(_) => ProviderError::new(ProviderErrorKind::Network, message),
+            // A stalled head/idle/overall read is a transient peer problem:
+            // retryable like a transport failure. A byte/frame breach is a
+            // hostile or broken response shape: never retried unchanged.
+            EgressError::ResponseBudgetExceeded {
+                component: BudgetComponent::Head | BudgetComponent::Idle | BudgetComponent::Total,
+                ..
+            } => ProviderError::new(ProviderErrorKind::Network, message),
             _ => ProviderError::new(ProviderErrorKind::BadRequest, message),
         }
     }
@@ -412,22 +525,25 @@ impl PolicyCheckedHttpTransport {
     /// A transport with the given allowlist installed. The policy is
     /// REQUIRED: there is no production default-allow constructor, and the
     /// address-class rule defaults to external-only (loopback refused).
-    pub fn with_policy(policy: DestinationPolicy) -> Self {
-        Self {
-            inner: CheckedHttpClient::with_policy(policy),
-        }
+    /// Construction is fallible: a failed client build surfaces typed
+    /// ([`EgressError::ClientBuild`]) and the daemon propagates it as a
+    /// startup failure instead of running a degraded client.
+    pub fn try_with_policy(policy: DestinationPolicy) -> Result<Self, EgressError> {
+        Ok(Self {
+            inner: CheckedHttpClient::try_with_policy(policy)?,
+        })
     }
 
     /// A transport with the given allowlist AND an installed outbound
     /// secret scan (audit P0-37/P0-38): every request body passes the
     /// full-payload scan before any connect (see [`OutboundScanConfig`]).
-    pub fn with_policy_and_scan(
+    pub fn try_with_policy_and_scan(
         policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
-    ) -> Self {
-        Self {
-            inner: CheckedHttpClient::with_policy_and_scan(policy, outbound_scan),
-        }
+    ) -> Result<Self, EgressError> {
+        Ok(Self {
+            inner: CheckedHttpClient::try_with_policy_and_scan(policy, outbound_scan)?,
+        })
     }
 
     /// A transport with an explicit address-class rule in addition to the
@@ -435,18 +551,18 @@ impl PolicyCheckedHttpTransport {
     /// (Ollama) whose typed config carries `allow_loopback`: every other
     /// special class stays refused, so no address class is ever allowed
     /// globally.
-    pub fn with_policy_scan_and_addresses(
+    pub fn try_with_policy_scan_and_addresses(
         policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
         addresses: EgressAddressPolicy,
-    ) -> Self {
-        Self {
-            inner: CheckedHttpClient::with_policy_scan_and_addresses(
+    ) -> Result<Self, EgressError> {
+        Ok(Self {
+            inner: CheckedHttpClient::try_with_policy_scan_and_addresses(
                 policy,
                 outbound_scan,
                 addresses,
-            ),
-        }
+            )?,
+        })
     }
 
     /// The installed outbound secret scan (`None` = no secret scanning).
@@ -490,31 +606,31 @@ impl HttpTransport for CheckedHttpClient {
 /// DISABLED — [`CheckedHttpClient::execute`] follows redirects itself so
 /// every hop passes the destination/scan gate. The redirect policy is
 /// applied LAST and is not overridable by callers.
-fn default_timeout_client(resolver: EgressResolver) -> reqwest::Client {
-    reqwest::Client::builder()
-        .dns_resolver(Arc::new(ReqwestDnsResolver::new(resolver.clone())))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| redirect_disabled_client(resolver))
-}
-
-/// A resolver-pinned client with automatic redirects disabled (no connect
-/// timeout). The fallback for [`default_timeout_client`] keeps BOTH the
-/// `Policy::none()` redirect policy and the checked resolver even when the
-/// preferred build fails: a plain `reqwest::Client::new()` would silently
-/// reintroduce the unchecked internal follower and the OS resolver.
-fn redirect_disabled_client(resolver: EgressResolver) -> reqwest::Client {
+///
+/// Construction is FALLIBLE and there is exactly ONE build: no fallback
+/// client exists. The previous `unwrap_or_else` fallback silently dropped
+/// the connect timeout (and any future builder knob) on a build failure;
+/// every failure now surfaces as the typed
+/// [`EgressError::ClientBuild`] and the daemon refuses to run without a
+/// correctly-gated client instead of running with a degraded one.
+fn try_default_timeout_client(resolver: EgressResolver) -> Result<reqwest::Client, EgressError> {
     reqwest::Client::builder()
         .dns_resolver(Arc::new(ReqwestDnsResolver::new(resolver)))
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .expect("redirect-disabled resolver-pinned HTTP client build")
+        .map_err(|e| EgressError::ClientBuild {
+            // `without_url` keeps even the build error URL-free; the
+            // message carries only the builder's typed reason.
+            detail: e.without_url().to_string(),
+        })
 }
 
 /// Execute a GET through a transport. Request building and the raw
 /// `Client::execute` call happen only here (adapter code never constructs a
-/// `reqwest::Client`).
+/// `reqwest::Client`). The returned response is a stream: every production
+/// consumer reads it through [`BudgetedBody`] under a [`ResponseBudget`]
+/// (the static-authority scan refuses direct body reads).
 pub async fn execute_get(
     transport: &dyn HttpTransport,
     url: &str,
@@ -523,7 +639,9 @@ pub async fn execute_get(
     transport.execute(Request::new(Method::GET, parsed)).await
 }
 
-/// Execute a JSON POST through a transport (no extra headers).
+/// Execute a JSON POST through a transport (no extra headers). The returned
+/// response is a stream: read it through [`BudgetedBody`] under a
+/// [`ResponseBudget`].
 pub async fn execute_post_json(
     transport: &dyn HttpTransport,
     url: &str,
@@ -566,10 +684,259 @@ pub async fn execute_post_json_with_extras(
     transport.execute(request).await
 }
 
+/// Which [`ResponseBudget`] component fired on an over-budget body read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetComponent {
+    /// No first body chunk inside `head_timeout`.
+    Head,
+    /// Silence between chunks exceeded `idle_timeout`.
+    Idle,
+    /// The whole read outlived `total_deadline`.
+    Total,
+    /// The body crossed `max_bytes`.
+    Bytes,
+    /// The body carried more than `max_frames` frames.
+    Frames,
+}
+
+impl BudgetComponent {
+    /// The limit's unit for diagnostics (`ms`, `bytes`, `frames`).
+    pub const fn unit(self) -> &'static str {
+        match self {
+            BudgetComponent::Head | BudgetComponent::Idle | BudgetComponent::Total => "ms",
+            BudgetComponent::Bytes => "bytes",
+            BudgetComponent::Frames => "frames",
+        }
+    }
+}
+
+impl std::fmt::Display for BudgetComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BudgetComponent::Head => "head-timeout",
+            BudgetComponent::Idle => "idle-timeout",
+            BudgetComponent::Total => "total-deadline",
+            BudgetComponent::Bytes => "max-bytes",
+            BudgetComponent::Frames => "max-frames",
+        })
+    }
+}
+
+/// The typed budget ONE response-body read must obey.
+///
+/// Every production [`HttpTransport`] consumer passes one to the read
+/// helpers ([`BudgetedBody`], [`execute_raw`]), which enforce it against the
+/// live response stream; a breach is the typed
+/// [`EgressError::ResponseBudgetExceeded`] naming the component that fired:
+///
+/// | component        | enforced as |
+/// |------------------|-------------|
+/// | `head_timeout`   | time from read start to the FIRST body chunk |
+/// | `idle_timeout`   | maximum silence between consecutive chunks |
+/// | `total_deadline` | overall wall clock for the whole read |
+/// | `max_bytes`      | hard byte cap; the chunk that would cross it is refused |
+/// | `max_frames`     | hard frame (network chunk) cap when `Some` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseBudget {
+    pub head_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub total_deadline: Duration,
+    pub max_bytes: u64,
+    pub max_frames: Option<u64>,
+}
+
+impl ResponseBudget {
+    /// An explicit budget.
+    pub const fn new(
+        head_timeout: Duration,
+        idle_timeout: Duration,
+        total_deadline: Duration,
+        max_bytes: u64,
+        max_frames: Option<u64>,
+    ) -> Self {
+        Self {
+            head_timeout,
+            idle_timeout,
+            total_deadline,
+            max_bytes,
+            max_frames,
+        }
+    }
+
+    /// A one-wall-clock budget: head, idle and total all equal `timeout`
+    /// (the shape a single-`timeout` consumer such as an OIDC round trip
+    /// needs), with an explicit byte cap and no frame cap.
+    pub const fn for_timeout(timeout: Duration, max_bytes: u64) -> Self {
+        Self::new(timeout, timeout, timeout, max_bytes, None)
+    }
+
+    /// The millisecond spelling of [`ResponseBudget::new`].
+    pub const fn from_millis(
+        head_ms: u64,
+        idle_ms: u64,
+        total_ms: u64,
+        max_bytes: u64,
+        max_frames: Option<u64>,
+    ) -> Self {
+        Self::new(
+            Duration::from_millis(head_ms),
+            Duration::from_millis(idle_ms),
+            Duration::from_millis(total_ms),
+            max_bytes,
+            max_frames,
+        )
+    }
+}
+
+/// A response body wrapper that enforces its [`ResponseBudget`] on every
+/// chunk: the ONE way production consumers read a body.
+///
+/// `next_chunk` is the choke point: it bounds the wait for each chunk by the
+/// head/idle and remaining-total budgets (a `tokio::time::timeout` per
+/// chunk, so a stalled peer cannot park the read), refuses the chunk that
+/// would cross `max_bytes` or `max_frames` BEFORE it is handed out, and maps
+/// a transport failure to [`EgressError::Transport`] with `without_url()`.
+/// After any terminal error the wrapper is dead: the next call returns
+/// `Ok(None)` and a wrapped stream ends, so exactly one typed error is
+/// emitted.
+pub struct BudgetedBody {
+    response: Response,
+    budget: ResponseBudget,
+    started: Instant,
+    last_activity: Option<Instant>,
+    bytes: u64,
+    frames: u64,
+    finished: bool,
+}
+
+impl BudgetedBody {
+    /// Wrap a streaming response under `budget`.
+    pub fn new(response: Response, budget: ResponseBudget) -> Self {
+        Self {
+            response,
+            budget,
+            started: Instant::now(),
+            last_activity: None,
+            bytes: 0,
+            frames: 0,
+            finished: false,
+        }
+    }
+
+    /// The response's parsed URL (for diagnostics).
+    pub fn url(&self) -> &Url {
+        self.response.url()
+    }
+
+    /// The installed budget.
+    pub fn budget(&self) -> ResponseBudget {
+        self.budget
+    }
+
+    /// Bytes handed out so far.
+    pub fn bytes_seen(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Frames handed out so far.
+    pub fn frames_seen(&self) -> u64 {
+        self.frames
+    }
+
+    fn exceeded(&self, component: BudgetComponent, limit: u64) -> EgressError {
+        EgressError::ResponseBudgetExceeded {
+            url: SafeUrlDiagnostic::from_url(self.response.url()),
+            component,
+            limit,
+        }
+    }
+
+    /// The next budget-checked chunk (`None` = body ended). See the type
+    /// docs for the enforcement contract.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, EgressError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let remaining = self
+            .budget
+            .total_deadline
+            .saturating_sub(self.started.elapsed());
+        let total_limit_ms = self.budget.total_deadline.as_millis() as u64;
+        if remaining.is_zero() {
+            self.finished = true;
+            return Err(self.exceeded(BudgetComponent::Total, total_limit_ms));
+        }
+        let (phase, component) = match self.last_activity {
+            Some(_) => (self.budget.idle_timeout, BudgetComponent::Idle),
+            None => (self.budget.head_timeout, BudgetComponent::Head),
+        };
+        let wait = phase.min(remaining);
+        match tokio::time::timeout(wait, self.response.chunk()).await {
+            Err(_) => {
+                self.finished = true;
+                if remaining <= wait {
+                    Err(self.exceeded(BudgetComponent::Total, total_limit_ms))
+                } else {
+                    Err(self.exceeded(component, phase.as_millis() as u64))
+                }
+            }
+            Ok(Err(e)) => {
+                self.finished = true;
+                Err(EgressError::Transport(e.without_url().to_string()))
+            }
+            Ok(Ok(None)) => {
+                self.finished = true;
+                Ok(None)
+            }
+            Ok(Ok(Some(chunk))) => {
+                let len = chunk.len() as u64;
+                if self.bytes.saturating_add(len) > self.budget.max_bytes {
+                    self.finished = true;
+                    return Err(self.exceeded(BudgetComponent::Bytes, self.budget.max_bytes));
+                }
+                self.frames = self.frames.saturating_add(1);
+                if let Some(max_frames) = self.budget.max_frames {
+                    if self.frames > max_frames {
+                        self.finished = true;
+                        return Err(self.exceeded(BudgetComponent::Frames, max_frames));
+                    }
+                }
+                self.bytes = self.bytes.saturating_add(len);
+                self.last_activity = Some(Instant::now());
+                Ok(Some(chunk.to_vec()))
+            }
+        }
+    }
+
+    /// Read the whole body under the budget (the materializing helper).
+    pub async fn read_all(&mut self) -> Result<Vec<u8>, EgressError> {
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = self.next_chunk().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// Turn the budgeted reader into a stream of budget-checked chunks. The
+    /// stream yields exactly one terminal error (if any) and then ends.
+    pub fn into_stream(self) -> impl Stream<Item = Result<Vec<u8>, EgressError>> + Send + 'static {
+        futures::stream::unfold(Some(self), |state| async move {
+            let mut body = state?;
+            match body.next_chunk().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), Some(body))),
+                Ok(None) => None,
+                Err(e) => Some((Err(e), None)),
+            }
+        })
+    }
+}
+
 /// Hard bound on one materialized [`RawResponse`] body: an adapter that
 /// needs a verb/header shape beyond the JSON helpers still must not buffer
-/// an unbounded remote body in RAM (bounded everything). The read aborts
-/// with a typed [`EgressError::ResponseTooLarge`] at the bound.
+/// an unbounded remote body in RAM (bounded everything). The effective read
+/// budget is `min(caller max_bytes, this)`; the read aborts with the typed
+/// [`EgressError::ResponseBudgetExceeded`] (`Bytes`) at the bound.
 pub const MAX_RAW_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// One neutral request description for adapters (e.g. the SCM GitHub-App
@@ -578,63 +945,50 @@ pub const MAX_RAW_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// non-provider adapter never names a `reqwest` type and every send still
 /// passes the request-time destination gate of the transport it is handed.
 ///
-/// `Debug` is REDACTING (audit: the derived form leaked API keys and
-/// bearers from the URL query, the fragment and auth-ish headers into logs):
-/// URL userinfo, every query value and the fragment are masked, headers
-/// whose name looks auth-bearing are `<redacted>`, and the body is reported
-/// by length only. `Clone`/`PartialEq` carry the real values unchanged.
+/// `Debug` is REDACTING, and the policy is deny-by-default: the URL renders
+/// through [`SafeUrlDiagnostic`] (path bytes, userinfo, query values and
+/// fragment are never echoed), EVERY header value is `<redacted; N bytes>`
+/// except a tiny known-safe allowlist (`content-type`, `content-length`,
+/// `accept`, `user-agent` — none of which can carry a credential), and the
+/// body is reported by length only. A name-based "looks sensitive" heuristic
+/// is deliberately NOT used: an arbitrary custom header (`X-Session-ID`,
+/// `X-Signature`, ...) must be redacted without having to guess its name.
+/// `Clone`/`PartialEq` carry the real values unchanged.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RawRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    /// Optional caller-chosen known-safe route label (never derived from
+    /// the URL) for diagnostics.
+    pub route: Option<RouteLabel>,
 }
 
-/// True for header names that conventionally carry credentials/tokens; such
-/// values are never rendered by [`RawRequest`]'s `Debug`.
-fn header_name_is_sensitive(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    [
-        "authorization",
-        "auth",
-        "cookie",
-        "proxy-",
-        "api-key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "credential",
-        "key",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+/// The tiny allowlist of header names whose values may render verbatim in a
+/// [`RawRequest`]'s `Debug`: request-shape metadata that carries no user or
+/// machine credential. Everything else is redacted by DEFAULT — the
+/// inverted policy means a genuinely credential-bearing custom header
+/// (`x-signature`, `x-session-id`, `x-anything`) cannot leak just because no
+/// heuristic named it.
+const SAFE_HEADER_VALUE_NAMES: [&str; 4] =
+    ["content-type", "content-length", "accept", "user-agent"];
+
+/// True when the header value may render verbatim (see
+/// [`SAFE_HEADER_VALUE_NAMES`]).
+fn header_value_is_safe(name: &str) -> bool {
+    SAFE_HEADER_VALUE_NAMES
+        .iter()
+        .any(|safe| safe.eq_ignore_ascii_case(name))
 }
 
-/// The display form of one URL with credential-bearing parts masked: userinfo,
-/// every query value and the fragment. An unparseable URL is never echoed
-/// (it may itself contain a planted secret) — a fixed marker is used instead.
-fn redacted_url(url: &str) -> String {
-    match Url::parse(url) {
-        Ok(mut parsed) => {
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                let _ = parsed.set_username("***");
-                let _ = parsed.set_password(Some("***"));
-            }
-            if parsed.query().is_some() {
-                let masked: Vec<String> = parsed
-                    .query_pairs()
-                    .map(|(name, _)| format!("{name}=***"))
-                    .collect();
-                parsed.set_query(Some(&masked.join("&")));
-            }
-            if parsed.fragment().is_some() {
-                parsed.set_fragment(Some("***"));
-            }
-            parsed.to_string()
-        }
-        Err(_) => "<unparseable url>".to_string(),
+/// One redacted header rendering: safe-named values verbatim, every other
+/// value as `<redacted; N bytes>` (length only, never bytes).
+fn render_header(name: &str, value: &str) -> String {
+    if header_value_is_safe(name) {
+        format!("{name}: {value}")
+    } else {
+        format!("{name}: <redacted; {} bytes>", value.len())
     }
 }
 
@@ -643,17 +997,16 @@ impl std::fmt::Debug for RawRequest {
         let headers: Vec<String> = self
             .headers
             .iter()
-            .map(|(name, value)| {
-                if header_name_is_sensitive(name) {
-                    format!("{name}: <redacted>")
-                } else {
-                    format!("{name}: {value}")
-                }
-            })
+            .map(|(name, value)| render_header(name, value))
             .collect();
-        f.debug_struct("RawRequest")
+        let url = match self.route {
+            Some(route) => SafeUrlDiagnostic::from_raw_route(&self.url, route),
+            None => SafeUrlDiagnostic::from_raw(&self.url),
+        };
+        let mut debug = f.debug_struct("RawRequest");
+        debug
             .field("method", &self.method)
-            .field("url", &redacted_url(&self.url))
+            .field("url", &url)
             .field("headers", &headers)
             .field(
                 "body",
@@ -661,8 +1014,11 @@ impl std::fmt::Debug for RawRequest {
                     .body
                     .as_ref()
                     .map(|body| format!("<{} bytes>", body.len())),
-            )
-            .finish()
+            );
+        if let Some(route) = self.route {
+            debug.field("route", &route);
+        }
+        debug.finish()
     }
 }
 
@@ -673,6 +1029,7 @@ impl RawRequest {
             url: url.into(),
             headers: Vec::new(),
             body: None,
+            route: None,
         }
     }
 
@@ -683,12 +1040,24 @@ impl RawRequest {
         self
     }
 
-    /// Attach an application/json body.
-    pub fn json_body(mut self, body: &serde_json::Value) -> Self {
+    /// Attach the known-safe route label for diagnostics (a compile-time
+    /// constant; never derived from the URL).
+    pub fn route(mut self, route: RouteLabel) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// Attach an application/json body. Encoding failure is a typed build
+    /// refusal: the request is NEVER silently sent with a defaulted empty
+    /// body (the old `unwrap_or_default` sent `{}`-less bytes under a
+    /// content-type that promised JSON).
+    pub fn json_body(mut self, body: &serde_json::Value) -> Result<Self, EgressError> {
+        let encoded = serde_json::to_vec(body)
+            .map_err(|e| EgressError::Build(format!("json body encoding failed: {e}")))?;
         self.headers
             .push(("content-type".to_string(), "application/json".to_string()));
-        self.body = Some(serde_json::to_vec(body).unwrap_or_default());
-        self
+        self.body = Some(encoded);
+        Ok(self)
     }
 
     /// Attach raw bytes.
@@ -723,12 +1092,15 @@ impl RawResponse {
 }
 
 /// Execute one [`RawRequest`] through the injected transport and materialize
-/// the response under [`MAX_RAW_RESPONSE_BYTES`]. Adapter code never touches
-/// `reqwest` directly; this is the ONLY execution site for
-/// non-JSON-POST shapes.
+/// the response under the caller's [`ResponseBudget`] (its `max_bytes` is
+/// itself capped by [`MAX_RAW_RESPONSE_BYTES`]). Adapter code never touches
+/// `reqwest` directly; this is the ONLY execution site for non-JSON-POST
+/// shapes, and the budget is a REQUIRED parameter so no production consumer
+/// can read a body without one.
 pub async fn execute_raw(
     transport: &dyn HttpTransport,
     request: RawRequest,
+    budget: &ResponseBudget,
 ) -> Result<RawResponse, EgressError> {
     let method = Method::from_bytes(request.method.as_bytes())
         .map_err(|e| EgressError::Build(format!("invalid method {:?}: {e}", request.method)))?;
@@ -756,17 +1128,13 @@ pub async fn execute_raw(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
-    let mut stream = response.bytes_stream();
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
-        let chunk = chunk.map_err(|e| EgressError::Transport(e.without_url().to_string()))?;
-        if body.len().saturating_add(chunk.len()) > MAX_RAW_RESPONSE_BYTES {
-            return Err(EgressError::ResponseTooLarge {
-                limit_bytes: MAX_RAW_RESPONSE_BYTES as u64,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
+    // The hard materialization cap always applies: a caller can lower its
+    // own byte bound, never raise the seam's absolute one.
+    let effective = ResponseBudget {
+        max_bytes: budget.max_bytes.min(MAX_RAW_RESPONSE_BYTES as u64),
+        ..*budget
+    };
+    let body = BudgetedBody::new(response, effective).read_all().await?;
     Ok(RawResponse {
         status,
         headers,
@@ -898,13 +1266,29 @@ pub enum EgressError {
     },
     /// Building the request object failed (URL-free message).
     Build(String),
+    /// Building the checked HTTP client itself failed (TLS backend, resolver
+    /// pinning, ...). A typed STARTUP failure: the daemon refuses to run
+    /// rather than fall back to a degraded client that could skip the
+    /// redirect or resolver gate. URL-free by construction.
+    ClientBuild { detail: String },
+    /// One response body read exceeded its [`ResponseBudget`]. The typed
+    /// component distinguishes a stalled head (`Head`), a stalled body
+    /// (`Idle`), an overall deadline (`Total`), a byte cap (`Bytes`) and a
+    /// frame cap (`Frames`); `limit` is in ms, bytes or frames respectively.
+    ResponseBudgetExceeded {
+        url: SafeUrlDiagnostic,
+        component: BudgetComponent,
+        limit: u64,
+    },
     /// The transport itself failed (connect/io); the request was allowed
     /// by the policy. The message is URL-free by construction (reqwest
     /// errors are stripped with `without_url()` before stringifying).
     Transport(String),
-    /// A materialized response exceeded [`MAX_RAW_RESPONSE_BYTES`]; the
-    /// adapter refuses to buffer it (bounded everything), and the partial
-    /// body is discarded rather than parsed.
+    /// A materialized response exceeded an absolute materialization bound
+    /// (e.g. [`MAX_RAW_RESPONSE_BYTES`]); the adapter refuses to buffer it
+    /// (bounded everything), and the partial body is discarded rather than
+    /// parsed. Budget-driven reads raise
+    /// [`EgressError::ResponseBudgetExceeded`] instead.
     ResponseTooLarge { limit_bytes: u64 },
     /// A redirect chain exceeded [`MAX_REDIRECT_HOPS`]. Each hop is a fresh
     /// policy-checked request, so a chain that long is refused typed; the
@@ -975,6 +1359,19 @@ impl std::fmt::Display for EgressError {
                  over the bound of {limit}"
             ),
             EgressError::Build(s) => write!(f, "request build failed: {s}"),
+            EgressError::ClientBuild { detail } => {
+                write!(f, "egress client construction failed: {detail}")
+            }
+            EgressError::ResponseBudgetExceeded {
+                url,
+                component,
+                limit,
+            } => write!(
+                f,
+                "egress response read of {url} exceeded the {component} budget \
+                 ({limit} {})",
+                component.unit()
+            ),
             EgressError::Transport(s) => write!(f, "transport error: {s}"),
             EgressError::ResponseTooLarge { limit_bytes } => write!(
                 f,
@@ -1185,7 +1582,8 @@ impl CheckedHttpClient {
     pub fn permissive() -> CheckedHttpClient {
         let resolver = EgressResolver::system(EgressAddressPolicy::LOCAL);
         CheckedHttpClient {
-            inner: default_timeout_client(resolver.clone()),
+            inner: try_default_timeout_client(resolver.clone())
+                .expect("test-only egress client build"),
             policy: None,
             outbound_scan: None,
             resolver,
@@ -1194,8 +1592,10 @@ impl CheckedHttpClient {
 
     /// A redirect-disabled, resolver-pinned client with the given REQUIRED
     /// allowlist (external address-class rule: loopback refused).
-    pub fn with_policy(policy: DestinationPolicy) -> CheckedHttpClient {
-        CheckedHttpClient::with_policy_scan_and_addresses(
+    /// Construction is FALLIBLE — a failed build is a typed
+    /// [`EgressError::ClientBuild`], never a silent fallback client.
+    pub fn try_with_policy(policy: DestinationPolicy) -> Result<CheckedHttpClient, EgressError> {
+        CheckedHttpClient::try_with_policy_scan_and_addresses(
             policy,
             None,
             EgressAddressPolicy::EXTERNAL,
@@ -1204,11 +1604,11 @@ impl CheckedHttpClient {
 
     /// A client with the given allowlist AND an installed outbound secret
     /// scan (see [`OutboundScanConfig`]).
-    pub fn with_policy_and_scan(
+    pub fn try_with_policy_and_scan(
         policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
-    ) -> CheckedHttpClient {
-        CheckedHttpClient::with_policy_scan_and_addresses(
+    ) -> Result<CheckedHttpClient, EgressError> {
+        CheckedHttpClient::try_with_policy_scan_and_addresses(
             policy,
             outbound_scan,
             EgressAddressPolicy::EXTERNAL,
@@ -1221,7 +1621,12 @@ impl CheckedHttpClient {
     /// `test-utils` exposes it to dependent crates' dev-dependencies only.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn with_policy_for_tests(policy: DestinationPolicy) -> CheckedHttpClient {
-        CheckedHttpClient::with_policy_scan_and_addresses(policy, None, EgressAddressPolicy::LOCAL)
+        CheckedHttpClient::try_with_policy_scan_and_addresses(
+            policy,
+            None,
+            EgressAddressPolicy::LOCAL,
+        )
+        .expect("test-only egress client build")
     }
 
     /// TEST-ONLY: production-part-equivalent client with an INJECTED
@@ -1238,7 +1643,8 @@ impl CheckedHttpClient {
     ) -> CheckedHttpClient {
         let resolver = EgressResolver::with_resolver(resolver, addresses, max_answers);
         CheckedHttpClient {
-            inner: default_timeout_client(resolver.clone()),
+            inner: try_default_timeout_client(resolver.clone())
+                .expect("test-only injected-resolver client build"),
             policy: Some(policy),
             outbound_scan: None,
             resolver,
@@ -1252,30 +1658,33 @@ impl CheckedHttpClient {
         policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
     ) -> CheckedHttpClient {
-        CheckedHttpClient::with_policy_scan_and_addresses(
+        CheckedHttpClient::try_with_policy_scan_and_addresses(
             policy,
             outbound_scan,
             EgressAddressPolicy::LOCAL,
         )
+        .expect("test-only egress client build")
     }
 
     /// A client with an explicit address-class rule in addition to the
     /// allowlist and scan (the local-provider `allow_loopback` seam). The
     /// client is built HERE with the central resolver and
     /// [`reqwest::redirect::Policy::none()`] applied last — neither is
-    /// overridable by any caller.
-    pub fn with_policy_scan_and_addresses(
+    /// overridable by any caller. A failed build is the typed
+    /// [`EgressError::ClientBuild`]; there is no fallback client.
+    pub fn try_with_policy_scan_and_addresses(
         policy: DestinationPolicy,
         outbound_scan: Option<OutboundScanConfig>,
         addresses: EgressAddressPolicy,
-    ) -> CheckedHttpClient {
+    ) -> Result<CheckedHttpClient, EgressError> {
         let resolver = EgressResolver::system(addresses);
-        CheckedHttpClient {
-            inner: default_timeout_client(resolver.clone()),
+        let inner = try_default_timeout_client(resolver.clone())?;
+        Ok(CheckedHttpClient {
+            inner,
             policy: Some(policy),
             outbound_scan,
             resolver,
-        }
+        })
     }
 
     /// Install (or clear) the outbound secret scan on this client.
@@ -1825,24 +2234,43 @@ mod tests {
     }
 
     #[test]
-    fn raw_request_debug_redacts_url_queries_fragments_and_auth_headers() {
+    fn raw_request_debug_redacts_every_url_part_and_header_value_by_default() {
+        // Planted secrets live in every hostile position the Debug face can
+        // reach: path, userinfo, query, fragment, a named auth header, an
+        // arbitrary custom header, a signature-style header, a session
+        // header and the body.
         let request = RawRequest::new(
             "POST",
-            "https://api.example.com/v1/token?api_key=SECRET_QUERY&plain=SECRET_TOO#SECRET_FRAGMENT",
+            "https://user:SECRET_USERINFO@api.example.com/v1/SECRET_PATH?api_key=SECRET_QUERY&plain=SECRET_TOO#SECRET_FRAGMENT",
         )
         .header("authorization", "Bearer SECRET_HEADER")
         .header("x-api-key", "SECRET_KEY")
         .header("cookie", "session=SECRET_COOKIE")
+        .header("x-signature", "SECRET_SIGNATURE")
+        .header("x-session-id", "SECRET_SESSION")
+        .header("x-custom", "SECRET_CUSTOM")
+        .header("content-type", "application/json")
+        .header("content-length", "42")
         .header("accept", "application/json")
-        .json_body(&serde_json::json!({ "password": "SECRET_BODY" }));
+        .header("user-agent", "faktor-test/0.1")
+        .json_body(&serde_json::json!({ "password": "SECRET_BODY" }))
+        .expect("json body encodes");
+        // `route` is a compile-time constant: it renders in full and can
+        // never be influenced by the hostile URL.
+        let request = request.route(RouteLabel::GithubApi);
         let debug = format!("{request:?}");
         for secret in [
+            "SECRET_USERINFO",
+            "SECRET_PATH",
             "SECRET_QUERY",
             "SECRET_TOO",
             "SECRET_FRAGMENT",
             "SECRET_HEADER",
             "SECRET_KEY",
             "SECRET_COOKIE",
+            "SECRET_SIGNATURE",
+            "SECRET_SESSION",
+            "SECRET_CUSTOM",
             "SECRET_BODY",
             "Bearer",
         ] {
@@ -1851,17 +2279,45 @@ mod tests {
                 "planted secret {secret:?} leaked through Debug: {debug}"
             );
         }
-        assert!(debug.contains("api_key=***"), "{debug}");
-        assert!(debug.contains("authorization: <redacted>"), "{debug}");
+        assert!(debug.contains("route: GithubApi"), "{debug}");
+        // The URL keeps only the safe shape: no userinfo, no path bytes, no
+        // query values, no fragment.
+        assert!(
+            debug.contains("https://api.example.com:443/<redacted-path>?<redacted>"),
+            "{debug}"
+        );
+        // Header policy is deny-by-default: every non-allowlisted value is a
+        // length marker, whatever its name.
+        assert!(
+            debug.contains("authorization: <redacted; 20 bytes>"),
+            "{debug}"
+        );
+        assert!(
+            debug.contains("x-signature: <redacted; 16 bytes>"),
+            "{debug}"
+        );
+        assert!(
+            debug.contains("x-session-id: <redacted; 14 bytes>"),
+            "{debug}"
+        );
+        assert!(debug.contains("x-custom: <redacted; 13 bytes>"), "{debug}");
+        // The tiny safe-value allowlist renders verbatim.
+        assert!(debug.contains("content-type: application/json"), "{debug}");
+        assert!(debug.contains("content-length: 42"), "{debug}");
         assert!(
             debug.contains("accept: application/json"),
-            "non-sensitive headers stay visible: {debug}"
+            "safe headers stay visible: {debug}"
         );
+        assert!(debug.contains("user-agent: faktor-test/0.1"), "{debug}");
         assert!(debug.contains("bytes>"), "body is length-only: {debug}");
         // An unparseable URL must not be echoed raw (it could itself carry a
-        // planted secret).
-        let hostile = RawRequest::new("GET", "not a url ?secret=RAW_SECRET");
-        assert!(!format!("{hostile:?}").contains("RAW_SECRET"));
+        // planted secret); the route label survives.
+        let hostile =
+            RawRequest::new("GET", "not a url ?secret=RAW_SECRET").route(RouteLabel::OidcDiscovery);
+        let hostile_debug = format!("{hostile:?}");
+        assert!(!hostile_debug.contains("RAW_SECRET"), "{hostile_debug}");
+        assert!(hostile_debug.contains("<unparseable>"), "{hostile_debug}");
+        assert!(hostile_debug.contains("OidcDiscovery"), "{hostile_debug}");
         // Clone/PartialEq are untouched by the manual Debug.
         assert_eq!(request.clone(), request);
     }
@@ -1926,10 +2382,11 @@ mod tests {
     /// The boxed-diagnostic size contract: `Result<_, EgressError>` must
     /// stay under clippy's large-error threshold WITHOUT any lint allowance
     /// (a regression to inline diagnostics re-fires `result_large_err`), and
-    /// the serde shape must stay the flat field object so durable/wire JSON
-    /// is byte-compatible with the pre-boxing form.
+    /// the serde shape stays the flat field object — now WITHOUT any raw
+    /// path bytes (`path_segments` only). An attached route label is a
+    /// compile-time constant and is the only label text the wire can carry.
     #[test]
-    fn egress_error_is_small_and_diagnostic_serialization_is_unchanged() {
+    fn egress_error_is_small_and_diagnostic_carries_no_path_bytes() {
         assert!(
             std::mem::size_of::<EgressError>() < 128,
             "EgressError grew to {} bytes; box oversized payloads",
@@ -1940,8 +2397,10 @@ mod tests {
             std::mem::size_of::<Box<()>>(),
             "the diagnostic fields must live behind the box"
         );
-        let url = Url::parse("https://user:pass@api.example.com:8443/v1/chat?api_key=SECRET#frag")
-            .unwrap();
+        let url = Url::parse(
+            "https://user:pass@api.example.com:8443/v1/chat/SECRET_PATH?api_key=SECRET#frag",
+        )
+        .unwrap();
         let diag = SafeUrlDiagnostic::from_url(&url);
         let json = serde_json::to_value(&diag).unwrap();
         assert_eq!(
@@ -1950,21 +2409,32 @@ mod tests {
                 "scheme": "https",
                 "host": "api.example.com",
                 "port": 8443,
-                "path": "/v1/chat",
+                "path_segments": 3,
                 "query_present": true,
             }),
-            "the wire shape is the flat field object (userinfo/query/fragment dropped)"
+            "the wire shape keeps only the segment count (no path bytes)"
         );
+        assert!(!json.to_string().contains("SECRET"), "{json}");
         let back: SafeUrlDiagnostic = serde_json::from_value(json).unwrap();
         assert_eq!(back, diag);
-        // Credential masking survives the boxing: neither the planted query
-        // value nor the userinfo may appear in any rendering.
+        // Credential masking survives the boxing: neither the planted path
+        // or query bytes nor the userinfo may appear in any rendering.
         for rendered in [diag.to_string(), format!("{diag:?}")] {
             assert!(!rendered.contains("SECRET"), "{rendered}");
+            assert!(!rendered.contains("chat"), "{rendered}");
             assert!(!rendered.contains("pass"), "{rendered}");
             assert!(rendered.contains("api.example.com:8443"), "{rendered}");
+            assert!(rendered.contains("/<redacted-path>"), "{rendered}");
             assert!(rendered.contains("?<redacted>"), "{rendered}");
         }
+        // A labelled diagnostic renders the compile-time constant, never
+        // URL-derived text.
+        let labelled = SafeUrlDiagnostic::from_url_route(&url, RouteLabel::OidcDiscovery);
+        assert_eq!(
+            labelled.to_string(),
+            "https://api.example.com:8443/<redacted-path>?<redacted> [oidc_discovery]"
+        );
+        assert_eq!(labelled.route(), Some(RouteLabel::OidcDiscovery));
     }
 
     // ------------------------------------------------------------ transport
@@ -3871,9 +4341,10 @@ mod redirect_tests {
             .unwrap();
         let err = client.execute(request).await.unwrap_err();
         assert!(
-            matches!(&err, EgressError::RedirectBodyNotReplayable { url } if url.path().ends_with("/stream")),
+            matches!(&err, EgressError::RedirectBodyNotReplayable { url } if url.path_segments() == 1),
             "{err:?}"
         );
+        assert!(!err.to_string().contains("/stream"), "{err}");
         assert_eq!(server.count(), 1, "only the checked first hop was sent");
     }
 
@@ -3928,9 +4399,14 @@ mod redirect_tests {
         server.route("GET", "/final", Route::respond(200, "final"));
         let url = format!("http://127.0.0.1:{}/go", addr.port());
 
-        let raw = default_timeout_client(EgressResolver::system(EgressAddressPolicy::LOCAL));
+        let raw = try_default_timeout_client(EgressResolver::system(EgressAddressPolicy::LOCAL))
+            .expect("client build");
         let resp = raw.get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), 302, "default_timeout_client must not follow");
+        assert_eq!(
+            resp.status(),
+            302,
+            "try_default_timeout_client must not follow"
+        );
 
         let checked = CheckedHttpClient::permissive();
         let resp = checked.inner.get(&url).send().await.unwrap();
@@ -3963,8 +4439,12 @@ mod redirect_tests {
             .unwrap_err();
         match &err {
             EgressError::UncheckedRedirectFollowed { from, to } => {
-                assert!(from.path().ends_with("/go"), "{err}");
-                assert!(to.path().ends_with("/final"), "{err}");
+                // Only the path SHAPE survives: `/go` and `/final` are one
+                // segment each, and no path bytes are carried anywhere.
+                assert_eq!(from.path_segments(), 1, "{err}");
+                assert_eq!(to.path_segments(), 1, "{err}");
+                assert!(!err.to_string().contains("/go"), "{err}");
+                assert!(!err.to_string().contains("/final"), "{err}");
             }
             other => panic!("expected UncheckedRedirectFollowed, got {other:?}"),
         }
@@ -4116,8 +4596,10 @@ mod diagnostic_leak_tests {
     }
 
     fn hostile_diagnostic() -> SafeUrlDiagnostic {
+        // The secret is planted in EVERY hostile position: path segment,
+        // userinfo, query value, percent-encoded query name and fragment.
         let raw = format!(
-            "https://user:{SECRET}@allowed.example:8443/benign?a={SECRET}&%73ecret={SECRET}#frag-{SECRET}"
+            "https://user:{SECRET}@allowed.example:8443/benign/{SECRET}/end?a={SECRET}&%73ecret={SECRET}#frag-{SECRET}"
         );
         SafeUrlDiagnostic::from_raw(&raw)
     }
@@ -4177,10 +4659,15 @@ mod diagnostic_leak_tests {
         ] {
             assert_secret_free(&err, route);
         }
-        // The diagnostic itself keeps only the safe shape: userinfo gone,
-        // query masked to a marker, fragment gone.
+        // The diagnostic itself keeps only the safe shape: path bytes gone
+        // (segment count only), userinfo gone, query masked to a marker,
+        // fragment gone.
         let rendered = format!("{diag}");
-        assert_eq!(rendered, "https://allowed.example:8443/benign?<redacted>");
+        assert_eq!(
+            rendered,
+            "https://allowed.example:8443/<redacted-path>?<redacted>"
+        );
+        assert_eq!(diag.path_segments(), 3);
         assert!(!format!("{diag:?}").contains(SECRET));
     }
 
@@ -4193,20 +4680,29 @@ mod diagnostic_leak_tests {
             "unparseable",
         );
         assert!(!hostile.is_empty());
-        // A raw userinfo URL: the diagnostic drops the userinfo, the query
-        // and the fragment entirely (the path is rendered by design, so
-        // this hostile URL plants nothing there).
+        // A raw userinfo URL whose PATH also carries the secret: the
+        // diagnostic drops the userinfo, the query and the fragment
+        // entirely, and never carries a path byte (the planted
+        // percent-encoded segment included).
         let diag = SafeUrlDiagnostic::from_raw(&format!(
-            "https://user:{SECRET}@allowed.example/benign%2f?{SECRET}#{SECRET}"
+            "https://user:{SECRET}@allowed.example/{SECRET}%2f?{SECRET}#{SECRET}"
         ));
         assert!(!diag.host().contains(SECRET));
-        assert!(!format!("{diag}").contains(SECRET));
+        let rendered = format!("{diag}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert_eq!(
+            rendered,
+            "https://allowed.example:443/<redacted-path>?<redacted>"
+        );
         // Percent-encoded query NAMES are dropped with the whole query.
         let diag = SafeUrlDiagnostic::from_raw(&format!(
             "https://allowed.example/ok?%73ecret%2dname={SECRET}&plain={SECRET}"
         ));
         let rendered = format!("{diag}");
-        assert_eq!(rendered, "https://allowed.example:443/ok?<redacted>");
+        assert_eq!(
+            rendered,
+            "https://allowed.example:443/<redacted-path>?<redacted>"
+        );
     }
 
     #[tokio::test]
@@ -4288,11 +4784,28 @@ mod diagnostic_leak_tests {
     }
 
     #[test]
-    fn safe_url_diagnostic_bounds_the_path() {
-        let long_path = "p".repeat(MAX_DIAGNOSTIC_PATH_CHARS * 2);
-        let diag = SafeUrlDiagnostic::from_raw(&format!("https://allowed.example/{long_path}"));
-        assert!(diag.path().len() <= MAX_DIAGNOSTIC_PATH_CHARS + "<truncated>".len());
-        assert!(diag.path().ends_with("<truncated>"));
+    fn safe_url_diagnostic_carries_no_path_bytes_however_long_or_hostile() {
+        // A long, secret-bearing path renders as one fixed marker: nothing
+        // derived from the path is retained (not even a truncation suffix
+        // that could splice hostile bytes).
+        let long_path: String = (0..600).map(|i| format!("/seg-{SECRET}-{i}")).collect();
+        let diag = SafeUrlDiagnostic::from_raw(&format!("https://allowed.example{long_path}?x=y"));
+        assert_eq!(diag.path_segments(), 600);
+        let rendered = format!("{diag}");
+        assert_eq!(
+            rendered,
+            "https://allowed.example:443/<redacted-path>?<redacted>"
+        );
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        // A path with more than u16::MAX segments saturates (never wraps).
+        let huge: String = std::iter::repeat_n("/s", u16::MAX as usize + 100).collect();
+        let diag = SafeUrlDiagnostic::from_raw(&format!("https://allowed.example{huge}"));
+        assert_eq!(diag.path_segments(), u16::MAX);
+        assert!(!format!("{diag}").contains("/s"), "{diag}");
+        // A root path (no segments) omits the path marker entirely.
+        let diag = SafeUrlDiagnostic::from_raw("https://allowed.example");
+        assert_eq!(diag.path_segments(), 0);
+        assert_eq!(format!("{diag}"), "https://allowed.example:443");
     }
 }
 
@@ -4378,7 +4891,7 @@ mod resolver_rebinding_tests {
         // A literal-IP host cannot be rebound: the exact allowlist rule is
         // the operator explicitly naming that address, so it is admitted
         // even under the external-only address rule.
-        let external = CheckedHttpClient::with_policy(policy.clone());
+        let external = CheckedHttpClient::try_with_policy(policy.clone()).expect("client build");
         let resp = external
             .send_checked(external.get(&literal_url).unwrap())
             .await
@@ -4574,5 +5087,260 @@ mod resolver_rebinding_tests {
         // DNS refusals are security refusals: never retried.
         let converted: ProviderError = err.into();
         assert!(!converted.retryable, "{}", converted.message);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    type BodyStream = futures::stream::BoxStream<'static, Result<Vec<u8>, std::io::Error>>;
+
+    /// A body stream that never yields a chunk (the stalled-head shape).
+    fn pending_body() -> BodyStream {
+        Box::pin(futures::stream::pending())
+    }
+
+    /// A body that yields the scripted `(delay_ms, bytes)` chunks and then
+    /// stays silent forever (the stalled-idle / dripped shapes).
+    fn chunks_then_pending(chunks: Vec<(u64, Vec<u8>)>) -> BodyStream {
+        let scripted = futures::stream::iter(chunks).then(|(delay_ms, bytes)| async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Ok::<Vec<u8>, std::io::Error>(bytes)
+        });
+        Box::pin(scripted.chain(futures::stream::pending()))
+    }
+
+    /// A body that yields the scripted chunks and then ends cleanly.
+    fn chunks_then_end(chunks: Vec<Vec<u8>>) -> BodyStream {
+        Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+    }
+
+    /// A transport serving ONE scripted body stream (no network).
+    struct ScriptedBodyTransport {
+        body: std::sync::Mutex<Option<BodyStream>>,
+    }
+
+    impl ScriptedBodyTransport {
+        fn new(body: BodyStream) -> Self {
+            Self {
+                body: std::sync::Mutex::new(Some(body)),
+            }
+        }
+    }
+
+    impl HttpTransport for ScriptedBodyTransport {
+        fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+            let body = self
+                .body
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one scripted body per test");
+            let url = req.url().clone();
+            Box::pin(async move {
+                let response = http::Response::builder()
+                    .status(200u16)
+                    .url(url)
+                    .body(Body::wrap_stream(body))
+                    .map_err(|e| EgressError::Build(e.to_string()))?;
+                Ok(Response::from(response))
+            })
+        }
+    }
+
+    fn request() -> RawRequest {
+        RawRequest::new("GET", "https://allowed.example/data?token=PLANTED_SECRET")
+            .route(RouteLabel::ProviderStream)
+    }
+
+    /// Run one scripted body through `execute_raw` under `budget`, with an
+    /// outer test guard so a broken bound surfaces as a test timeout.
+    async fn run(body: BodyStream, budget: ResponseBudget) -> Result<RawResponse, EgressError> {
+        let transport = ScriptedBodyTransport::new(body);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_raw(&transport, request(), &budget),
+        )
+        .await
+        .expect("the budget must fire without the test timeout")
+    }
+
+    #[tokio::test]
+    async fn head_component_fires_typed_on_a_silent_body() {
+        let budget = ResponseBudget::from_millis(60, 60, 5_000, 1024, None);
+        let err = run(pending_body(), budget).await.unwrap_err();
+        match &err {
+            EgressError::ResponseBudgetExceeded {
+                component: BudgetComponent::Head,
+                limit: 60,
+                url,
+            } => {
+                // The diagnostic carries only the credential-free shape.
+                assert_eq!(url.host(), "allowed.example");
+                assert!(url.query_present());
+            }
+            other => panic!("expected a typed Head budget error, got {other:?}"),
+        }
+        // The planted query secret never renders.
+        assert!(!err.to_string().contains("PLANTED_SECRET"), "{err}");
+        assert!(!format!("{err:?}").contains("PLANTED_SECRET"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn idle_component_fires_typed_after_a_partial_body() {
+        let body = chunks_then_pending(vec![(0, b"first".to_vec())]);
+        let budget = ResponseBudget::from_millis(2_000, 60, 5_000, 1024, None);
+        let err = run(body, budget).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Idle,
+                    limit: 60,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn total_component_fires_typed_on_a_slow_drip() {
+        // A chunk every 30 ms is inside the idle window, so only the overall
+        // deadline can stop the drip.
+        let chunks: Vec<(u64, Vec<u8>)> = (0..40).map(|_| (30, vec![b'x'])).collect();
+        let budget = ResponseBudget::from_millis(5_000, 5_000, 150, 100_000, None);
+        let err = run(chunks_then_pending(chunks), budget).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Total,
+                    limit: 150,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_component_fires_typed_before_the_crossing_chunk_is_handed_out() {
+        let body = chunks_then_end(vec![vec![7u8; 64], vec![7u8; 64]]);
+        let budget = ResponseBudget::from_millis(2_000, 2_000, 5_000, 100, None);
+        let err = run(body, budget).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Bytes,
+                    limit: 100,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_component_fires_typed_on_the_over_cap_frame() {
+        let body = chunks_then_end(vec![vec![1], vec![2], vec![3]]);
+        let budget = ResponseBudget::from_millis(2_000, 2_000, 5_000, 1024, Some(2));
+        let err = run(body, budget).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Frames,
+                    limit: 2,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_inside_its_budget_materializes() {
+        let body = chunks_then_end(vec![b"ab".to_vec(), b"cd".to_vec()]);
+        let budget = ResponseBudget::from_millis(2_000, 2_000, 5_000, 64, Some(4));
+        let response = run(body, budget).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn budgeted_stream_emits_exactly_one_typed_error_then_ends() {
+        let transport = ScriptedBodyTransport::new(pending_body());
+        let url = Url::parse("https://allowed.example/stream").unwrap();
+        let response = transport
+            .execute(Request::new(Method::GET, url))
+            .await
+            .unwrap();
+        let budget = ResponseBudget::from_millis(50, 50, 5_000, 1024, None);
+        let mut stream = Box::pin(BudgetedBody::new(response, budget).into_stream());
+        let first = stream.next().await.expect("one error item").unwrap_err();
+        assert!(
+            matches!(
+                first,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Head,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        assert!(stream.next().await.is_none(), "stream ends after the error");
+    }
+
+    /// The fallible-construction contract (item 9): production constructors
+    /// return `Result`, a build failure is the typed `ClientBuild` (never a
+    /// panicking or fallback path), and the deleted `unwrap_or_else`
+    /// fallback cannot reappear unnoticed.
+    #[test]
+    fn checked_client_construction_is_fallible_without_a_fallback_path() {
+        let client = CheckedHttpClient::try_with_policy(DestinationPolicy::empty())
+            .expect("an empty policy still builds the one checked client");
+        assert!(client.policy().is_some());
+        let scanned = CheckedHttpClient::try_with_policy_and_scan(
+            DestinationPolicy::empty(),
+            Some(OutboundScanConfig::default()),
+        )
+        .expect("client build");
+        assert!(scanned.outbound_scan().is_some());
+        let transport = PolicyCheckedHttpTransport::try_with_policy_scan_and_addresses(
+            DestinationPolicy::empty(),
+            None,
+            EgressAddressPolicy::EXTERNAL,
+        )
+        .expect("client build");
+        assert_eq!(transport.address_policy(), EgressAddressPolicy::EXTERNAL);
+        let rendered = EgressError::ClientBuild {
+            detail: "tls backend unavailable".into(),
+        }
+        .to_string();
+        assert_eq!(
+            rendered,
+            "egress client construction failed: tls backend unavailable"
+        );
+        // Source certification of the deleted fallback: the old fallback
+        // client constructor must not come back. Markers are assembled at
+        // runtime so this test's own text cannot satisfy them.
+        let own = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/egress.rs"))
+            .expect("egress.rs is readable");
+        let fallback_fn = format!("fn redirect_disabled{}", "_client");
+        assert!(
+            !own.contains(&fallback_fn),
+            "the fallback client constructor returned; construction must stay fallible"
+        );
+        let fallback_call = format!("unwrap_or_else(|_| default_timeout{}", "_client");
+        assert!(
+            !own.contains(&fallback_call),
+            "the unwrap_or_else client fallback returned; start-up must fail typed"
+        );
     }
 }

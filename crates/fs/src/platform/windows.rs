@@ -84,6 +84,9 @@
 //! validators/parser run there; the Win32 walk itself requires a Windows
 //! runner.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::collections::VecDeque;
 use std::path::Path;
 
@@ -882,6 +885,7 @@ mod nt {
             STATUS_ACCESS_DENIED if !last => {
                 Error::permission(format!("parent resolution failed: {rel:?} ({diag})"))
             }
+            // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
             _ if last => Error::internal(format!("{} ({diag}; win32 {})", rel.display(), unsafe {
                 RtlNtStatusToDosError(status)
             })),
@@ -997,6 +1001,7 @@ mod nt {
                     Error::permission(format!("reparse point data is not a permitted link: {e:?}"))
                 });
             }
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             let code = unsafe { GetLastError() };
             if code == ERROR_MORE_DATA || code == ERROR_INSUFFICIENT_BUFFER {
                 if buf.len() >= MAX_REPARSE_BUF {

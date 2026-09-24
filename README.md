@@ -96,7 +96,7 @@ cargo test --workspace
 
 ```bash
 cargo run -p faktor-cli -- serve --port 0
-cargo run -p faktor-cli -- run --data-dir /tmp/kp-demo "explain this repo"
+cargo run -p faktor-cli -- run --data-dir /tmp/faktor-demo "explain this repo"
 cargo run -p faktor-cli -- doctor
 ```
 

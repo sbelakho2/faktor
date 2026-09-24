@@ -21,3 +21,6 @@ faktor-cas = { path = "../cas" }
 faktor-security = { path = "../security" }
 tempfile = "3"
 tokio = { version = "1.53", features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

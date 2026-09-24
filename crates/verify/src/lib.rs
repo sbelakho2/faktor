@@ -45,9 +45,10 @@ pub mod inventory;
 pub mod review;
 
 pub use inventory::{
-    discover_repo_inventory, discover_repo_inventory_with_budget, probe_manifest_text,
-    CandidateGeneration, InventoryBudget, InventoryCompleteness, InventorySource, ManifestProbe,
-    ManifestProbeRefusal, RepoInventory, MAX_INVENTORY_DEPTH,
+    discover_repo_inventory, discover_repo_inventory_with_budget,
+    discover_repo_inventory_with_supervisor, probe_manifest_text, CandidateGeneration,
+    InventoryBudget, InventoryCompleteness, InventorySource, ManifestProbe, ManifestProbeRefusal,
+    RepoInventory, MAX_INVENTORY_DEPTH,
 };
 
 /// The ONE check-command identity surface of the verification crate: the

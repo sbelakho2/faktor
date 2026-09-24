@@ -1193,7 +1193,7 @@ async fn fake_adapter_is_usable_through_the_async_seam() {
         .unwrap();
     let claims = fake
         .verify_id_token(
-            &tokens.id_token,
+            tokens.id_token.expose(),
             &IdTokenExpectations {
                 issuer: ISSUER.into(),
                 audience: CLIENT.into(),

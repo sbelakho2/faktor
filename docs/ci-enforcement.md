@@ -132,13 +132,14 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   `rustup show active-toolchain`, and the JetBrains smoke lane reads
   `channel` from the file for `rustup-init --default-toolchain`.
   Verify locally from the repo root: `rustup show active-toolchain`.
-- Container images: non-Rust images are pinned as
+- Container images: EVERY image (including the Rust baseline) is pinned as
   `image:tag@sha256:<multi-arch index digest>` with the tag and recording
-  date in a trailing comment. Digests recorded 2026-09-23 (cross-checked
+  date in a trailing comment. Digests recorded 2026-09-23/24 (cross-checked
   with `docker buildx imagetools inspect`):
 
   | Image | Digest |
   | --- | --- |
+  | `rust:1.98.0` | `sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959` |
   | `node:24` | `sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4` |
   | `eclipse-temurin:17-jdk` | `sha256:bc033b57e11b773c3043babfd664e7a5ef110805548b921cbfc3e8c67a0725d6` |
   | `ubuntu:24.04` | `sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3` |
@@ -147,11 +148,21 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   | `woodpeckerci/woodpecker-server:v3` | `sha256:58dafbe56bb3529d78b48ee8d56a1f4b0886748763fd04ac23c01cc06c3dd24e` |
   | `woodpeckerci/woodpecker-agent:v3` | `sha256:73ee7cc63161b40bfefa4a26eae45c518a09124ab34f7e3c5e781df85e1ba4ac` |
 
-  `rust:1.98` intentionally stays tag-based (the toolchain file is the Rust
-  version authority); `powershell` stays tag-based because no `docker.io`
-  library image exists to record a digest from (self-hosted Windows agents
-  provide it). Bump a digest deliberately with
+  `rust:1.98.0` is a rustup baseline only — `rust-toolchain.toml` remains the
+  Rust channel authority. `sh scripts/check-ci-image-pins.sh` enforces the
+  pin in CI (the `image-pins` step in the PR and trusted workflows); the
+  Windows self-hosted `powershell` line is the only documented
+  `digest-exempt:` exception (no `docker.io` library image exists to record
+  a digest from). Bump a digest deliberately with
   `docker buildx imagetools inspect <image:tag>`.
+- Gradle: `apps/jetbrains/gradle/wrapper/gradle-wrapper.properties` pins
+  `distributionSha256Sum` (published
+  `gradle-9.7.1-bin.zip.sha256`), the committed wrapper JAR is validated in
+  CI against the published `gradle-9.7.1-wrapper.jar.sha256`, and
+  dependency verification metadata + per-subproject `gradle.lockfile`
+  dependency locks are committed (`apps/jetbrains/gradle/wrapper/wrapper-checksums.txt`
+  is the file of record). Verify with
+  `bash scripts/check-gradle-integrity.sh`.
 - vsce: `@vscode/vsce` is an exact devDependency (`4.0.0`) in
   `apps/vscode/package.json`, resolved through `apps/vscode/package-lock.json`;
   CI and `scripts/package-artifacts.sh` run `npx --no-install vsce package`

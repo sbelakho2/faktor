@@ -1,0 +1,137 @@
+{
+  "schema": "faktor-ignored-tests/v1",
+  "allowed_tags": ["fault", "soak", "security", "release", "perf", "live-paid", "visual"],
+  "required_nightly_lanes": ["fault", "release", "soak"],
+  "lanes": {
+    "fault": {
+      "workflow": "nightly",
+      "step": "fault-scale",
+      "command": "cargo test -p faktor-tests-fault -p faktor-updater --release -- --ignored"
+    },
+    "release": {
+      "workflow": "nightly",
+      "step": "longrun",
+      "command": "cargo test -p faktor-tests-longrun --release"
+    },
+    "soak": {
+      "workflow": "nightly",
+      "step": "soak",
+      "command": "cargo test -p faktor-tests-accounting-modelcheck --release -- --ignored"
+    },
+    "perf": {
+      "workflow": "trusted",
+      "step": "perf",
+      "command": "cargo test -p faktor-tests-performance --release -- --ignored"
+    },
+    "live-paid": {
+      "workflow": "nightly",
+      "step": "coding-benchmark-real-model",
+      "command": "cargo test -p faktor-tests-coding-benchmark --test real -- --ignored"
+    }
+  },
+  "assignments": [
+    {"file": "tests/fault/src/lib.rs", "fn": "accounting_campaign_full", "lane": "fault"},
+    {"file": "tests/fault/src/campaigns/cas.rs", "fn": "full_cas_crash_mid_write", "lane": "fault"},
+    {"file": "tests/fault/src/campaigns/edit_txn.rs", "fn": "full_edit_txn_journal_crash", "lane": "fault"},
+    {"file": "tests/fault/src/campaigns/scheduler_dag.rs", "fn": "full_scheduler_dag_crash", "lane": "fault"},
+    {"file": "tests/fault/src/campaigns/session_commands.rs", "fn": "full_session_command_boundaries", "lane": "fault"},
+    {"file": "tests/fault/src/campaigns/store_journal.rs", "fn": "full_store_journal_boundaries", "lane": "fault"},
+    {"file": "crates/updater/tests/release_flip.rs", "fn": "the_running_binary_changes_with_the_activated_release", "lane": "fault"},
+    {"file": "tests/accounting-modelcheck/src/lib.rs", "fn": "durable_reference_comparison_full", "lane": "soak"},
+    {"file": "tests/performance/src/lib.rs", "fn": "cold_start_under_150ms", "lane": "perf"},
+    {"file": "tests/performance/src/lib.rs", "fn": "idle_memory_under_80mb", "lane": "perf"},
+    {"file": "tests/performance/src/lib.rs", "fn": "perf_context_plan_20k_message_window", "lane": "perf"},
+    {"file": "tests/performance/src/lib.rs", "fn": "perf_growing_transcript_cost_stays_bounded", "lane": "perf"},
+    {"file": "tests/performance/src/lib.rs", "fn": "perf_json_wire_roundtrip_p50_lt_100us", "lane": "perf"},
+    {"file": "tests/performance/src/lib.rs", "fn": "perf_messages_before_paging_p95_lt_5ms", "lane": "perf"},
+    {"file": "tests/coding-benchmark/tests/real.rs", "fn": "real_model_corpus_run", "lane": "live-paid"},
+    {"file": "tests/coding-benchmark/tests/real.rs", "fn": "real_daemon_mechanics_with_stub_provider", "lane": "live-paid"}
+  ],
+  "manual": [
+    {
+      "file": "crates/cli/src/acquire_certification.rs",
+      "fn": "fault_acquire_restart_recovers_pending_jobs",
+      "tag": "fault",
+      "reason": "opt-in acquire restart storm; the source file marks it 'never run in CI' — operator-run only"
+    },
+    {
+      "file": "crates/cli/src/acquire_certification.rs",
+      "fn": "soak_acquire_cache_breaker_and_quota_storm",
+      "tag": "soak",
+      "reason": "opt-in acquire cache/connector storm; the source file marks it 'never run in CI' — operator-run only"
+    },
+    {
+      "file": "crates/commerce-connectors/tests/security_certification.rs",
+      "fn": "soak_live_mouser_canary",
+      "tag": "soak",
+      "reason": "live network canary gated by FAKTOR_LIVE_MOUSER_KEY (live-paid class); never in CI"
+    },
+    {
+      "file": "crates/fs/src/lib.rs",
+      "fn": "perf_fd_walk_within_2x_of_canonicalize",
+      "tag": "perf",
+      "reason": "timing bound run explicitly; not part of the trusted perf lane package set"
+    },
+    {
+      "file": "crates/security/src/payload.rs",
+      "fn": "soak_ten_gib_logical_stream_stays_bounded",
+      "tag": "soak",
+      "reason": "release-only 10 GiB logical payload manual soak"
+    },
+    {
+      "file": "crates/security/src/payload.rs",
+      "fn": "soak_ten_gib_real_bytes_stream_bounded_memory",
+      "tag": "soak",
+      "reason": "release-only 10 GiB real-bytes manual soak"
+    },
+    {
+      "file": "crates/terminal/src/lib.rs",
+      "fn": "timeline_ring_stays_bounded_under_300_spawns",
+      "tag": "perf",
+      "reason": "timing/ring bound run explicitly; not part of the trusted perf lane package set"
+    },
+    {
+      "file": "tests/benchmark/src/lib.rs",
+      "fn": "live_benchmark_requires_env",
+      "tag": "soak",
+      "reason": "env-gated live skeleton (FAKTOR_BENCH_LIVE=1); run explicitly, never in CI"
+    },
+    {
+      "file": "tests/benchmark/src/lib.rs",
+      "fn": "bench_corpus_tasks_end_to_end_slow_entries_twin",
+      "tag": "soak",
+      "reason": "slow offline twin over slow-marked corpus entries; run explicitly"
+    },
+    {
+      "file": "tests/longrun/src/lib.rs",
+      "fn": "soak_24h_zero_drift_certification",
+      "tag": "soak",
+      "reason": "24h wall-clock soak exceeds the nightly pipeline timeout; run explicitly"
+    },
+    {
+      "file": "tests/quality/src/lib.rs",
+      "fn": "quality_10000_turn_no_quality_regression",
+      "tag": "soak",
+      "reason": "10k-turn no-quality-regression certification; run explicitly"
+    },
+    {
+      "file": "tests/soak/src/lib.rs",
+      "fn": "soak_12h_scale",
+      "tag": "soak",
+      "reason": "12-hour wall-clock scale soak; run explicitly"
+    },
+    {
+      "file": "tests/visual/tests/gen_fixtures.rs",
+      "fn": "gen_fixtures",
+      "tag": "visual",
+      "reason": "visual fixture regeneration (AGENTS.md [visual] category); run explicitly to regenerate"
+    }
+  ],
+  "non_test": [
+    {
+      "file": "crates/git/src/guard.rs",
+      "fn": "windows_lease_holder_helper",
+      "reason": "re-exec helper process (carries #[test] + #[ignore] only to be drivable), not a test; exercised by the Windows multiprocess lease tests"
+    }
+  ]
+}

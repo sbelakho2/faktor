@@ -99,6 +99,19 @@ pub(crate) async fn execute_raw_bounded(
     .await
 }
 
+/// The response budget every SCM read passes to the materializing egress
+/// seam: head/idle/total all equal the caller's wall bound, and the body is
+/// capped by the seam's own [`faktor_provider::egress::MAX_RAW_RESPONSE_BYTES`]
+/// materialization bound.
+pub(crate) fn scm_response_budget(
+    bound: std::time::Duration,
+) -> faktor_provider::egress::ResponseBudget {
+    faktor_provider::egress::ResponseBudget::for_timeout(
+        bound,
+        faktor_provider::egress::MAX_RAW_RESPONSE_BYTES as u64,
+    )
+}
+
 /// Testable variant of [`execute_raw_bounded`] with an explicit bound.
 pub(crate) async fn execute_raw_bounded_with(
     transport: &dyn faktor_provider::egress::HttpTransport,
@@ -106,9 +119,10 @@ pub(crate) async fn execute_raw_bounded_with(
     bound: std::time::Duration,
     what: &str,
 ) -> Result<faktor_provider::egress::RawResponse, ScmError> {
+    let budget = scm_response_budget(bound);
     match tokio::time::timeout(
         bound,
-        faktor_provider::egress::execute_raw(transport, request),
+        faktor_provider::egress::execute_raw(transport, request, &budget),
     )
     .await
     {

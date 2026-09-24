@@ -306,10 +306,10 @@ fn manifest_entry(
         ))
     })?;
     // Internal atomic-write temporaries (an in-flight or crashed CAS
-    // writer's `.{name}.kp-tmp-*`) are daemon bookkeeping, never working
-    // content: they are invisible to the canonical manifest exactly like
-    // `.git` is (a materialized root must digest the same with or without a
-    // crash residue temp).
+    // writer's `.{name}.faktor-tmp-*`, or legacy `.{name}.kp-tmp-*` residue)
+    // are daemon bookkeeping, never working content: they are invisible to
+    // the canonical manifest exactly like `.git` is (a materialized root
+    // must digest the same with or without a crash residue temp).
     if crate::atomic::is_internal_temp_name(name) {
         // Internal atomic-write temporaries are daemon bookkeeping, never
         // content: a temp-named DIRECTORY is not descended either.
@@ -389,8 +389,9 @@ pub fn tree_manifest_digest(root: &Path, max_entries: usize) -> Result<String, T
 /// stream through the durable atomic sequence with their permission bits
 /// preserved, so the canonical mode of the copy is the source's. Special
 /// files are the typed [`TreeManifestError::SpecialFile`] refusal. Internal
-/// atomic temporaries (`.kp-tmp-*`) are skipped exactly like
-/// [`crate::copy_tree_skip`]. The returned manifest covers the copied entries
+/// atomic temporaries (`.faktor-tmp-*`, or legacy `.kp-tmp-*` residue) are
+/// skipped exactly like [`crate::copy_tree_skip`]. The returned manifest
+/// covers the copied entries
 /// (sorted), so a caller can record it without a second walk of the source.
 pub fn copy_tree_manifest(
     src_root: &Path,
@@ -600,12 +601,7 @@ fn copy_open_file_rooted(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let parent = dst_rel.parent().unwrap_or_else(|| Path::new(""));
-    let tmp_rel = parent.join(format!(
-        ".{}.kp-tmp-{}-{}",
-        name,
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let tmp_rel = parent.join(crate::atomic::temp_name(&name));
     let result = (|| -> Result<(u64, crate::FileHash), crate::Error> {
         let mut out = dst.open_create_new(&tmp_rel)?;
         let mut hasher = blake3::Hasher::new();
@@ -865,6 +861,7 @@ mod tests {
     /// intact (the walk never follows the replacement).
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn manifest_refuses_a_dir_swapped_for_an_outside_symlink_before_descent() {
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("outside");
@@ -928,7 +925,10 @@ mod tests {
         assert!(!dst.join("copy-seam.txt").exists());
         for entry in fs::read_dir(&dst).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.contains("kp-tmp-"), "temp leaked: {name}");
+            assert!(
+                !crate::atomic::is_internal_temp_name(&name),
+                "temp leaked: {name}"
+            );
         }
         assert_eq!(
             fs::read(outside.join("secret.txt")).unwrap(),
@@ -947,7 +947,11 @@ mod tests {
         let dst = dir.path().join("dst");
         write(&src, "keep.txt", b"keep");
         write(&src, ".git/objects/blob", b"plumbing");
+        // A planted directory under EACH spelling — legacy crash residue
+        // (`.kp-tmp-*`) and the current Faktor name — is daemon bookkeeping:
+        // recognized as internal temp, never mistaken for workspace content.
         write(&src, "x.kp-tmp-crash/sub/file.txt", b"residue");
+        write(&src, "x.faktor-tmp-crash/sub/file.txt", b"residue");
         fs::create_dir_all(&dst).unwrap();
         let manifest = copy_tree_manifest(
             &src,
@@ -969,7 +973,11 @@ mod tests {
         );
         assert!(
             !dst.join("x.kp-tmp-crash").exists(),
-            "a temp-named dir must not be materialized"
+            "a legacy temp-named dir must not be materialized"
+        );
+        assert!(
+            !dst.join("x.faktor-tmp-crash").exists(),
+            "a Faktor temp-named dir must not be materialized"
         );
         assert_eq!(fs::read(dst.join("keep.txt")).unwrap(), b"keep");
     }
@@ -1200,6 +1208,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn fifo_is_a_typed_refusal_with_a_completeness_note() {
         use std::ffi::CString;
         let dir = tempfile::tempdir().unwrap();
@@ -1426,6 +1435,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn copy_refuses_special_files_and_respects_caps() {
         use std::ffi::CString;
         let dir = tempfile::tempdir().unwrap();

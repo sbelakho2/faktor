@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use faktor_provider::egress::{execute_raw, RawRequest, RawResponse};
+use faktor_provider::egress::{execute_raw, RawRequest, RawResponse, ResponseBudget};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{CacheEntry, CacheKey, ConditionalValidators, FieldFreshnessClass};
@@ -274,7 +274,14 @@ async fn execute_guarded(
         Some(remaining) => policy.request_timeout_ms.min(remaining.max(1)),
         None => policy.request_timeout_ms,
     };
-    let request = execute_raw(ctx.transport().as_ref(), raw);
+    // The REQUIRED response budget: head/idle/total all equal this
+    // attempt's wall bound and the byte cap is the source policy's response
+    // bound (itself under the seam's materialization cap).
+    let budget = ResponseBudget::for_timeout(
+        Duration::from_millis(budget_ms.max(1)),
+        policy.max_response_bytes,
+    );
+    let request = execute_raw(ctx.transport().as_ref(), raw, &budget);
     tokio::pin!(request);
     let timed = tokio::time::timeout(Duration::from_millis(budget_ms.max(1)), request);
     tokio::pin!(timed);

@@ -16,6 +16,10 @@
 //! slow CI reaper can never hang the suite; ping self-terminates after
 //! ~60 s, so even a failed assertion cannot leave an eternal sleeper.
 
+#![allow(unsafe_code)]
+// platform authority module: every unsafe
+// block/function in this module carries a `// SAFETY:` justification and is
+// enumerated by tests/static-authority.
 #![cfg(windows)]
 
 use std::path::Path;
@@ -40,6 +44,7 @@ fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
     unsafe {
         let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
         if handle.is_null() {
@@ -64,7 +69,7 @@ fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, mut cond: F) {
 
 fn pid_file_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "kp-winjob-tree-{}-{}.pid",
+        "faktor-winjob-tree-{}-{}.pid",
         std::process::id(),
         PIDFILE_SEQ.fetch_add(1, Ordering::Relaxed)
     ))

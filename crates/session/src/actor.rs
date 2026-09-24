@@ -995,6 +995,7 @@ fn run_maintenance(shared: &Arc<ActorShared>, cfg: &DbActorConfig) {
 /// work segment"). `None` on platforms without the clock: callers fall back
 /// to the store's own wall-clock `BatchTiming` split.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn thread_cpu_time() -> Option<Duration> {
     let mut ts = libc::timespec {
         tv_sec: 0,

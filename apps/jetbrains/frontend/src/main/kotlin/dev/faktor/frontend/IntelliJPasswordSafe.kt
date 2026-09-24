@@ -27,11 +27,14 @@ class IntelliJPasswordSafeVault : SecretVault {
     private fun attributes(service: String, account: String): CredentialAttributes =
         CredentialAttributes(service, account)
 
+    // Platform 241+ exposes the service through the companion `instance`
+    // property (the JVM-visible `getInstance()` static does not resolve from
+    // Kotlin). `PasswordSafe.instance` is the supported Kotlin accessor.
     override fun getPassword(service: String, account: String): String? =
-        PasswordSafe.getInstance().get(attributes(service, account))?.getPasswordAsString()
+        PasswordSafe.instance.get(attributes(service, account))?.getPasswordAsString()
 
     override fun setPassword(service: String, account: String, password: String?) {
-        PasswordSafe.getInstance().set(
+        PasswordSafe.instance.set(
             attributes(service, account),
             password?.let { Credentials(account, it) }
         )

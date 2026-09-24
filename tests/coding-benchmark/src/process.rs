@@ -61,6 +61,7 @@ impl ManagedChild {
     /// Kill the child's whole process group (best effort). On unix this is
     /// killpg on the group we created at spawn; elsewhere it is the direct
     /// child's kill.
+    #[allow(unsafe_code)]
     pub fn terminate_tree(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {

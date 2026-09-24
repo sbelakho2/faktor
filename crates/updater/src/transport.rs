@@ -11,7 +11,9 @@
 //! checked up front and the stream aborts the moment the limit is crossed
 //! (never an unbounded read into memory or disk).
 
-use faktor_provider::egress::CheckedHttpClient;
+use faktor_provider::egress::{
+    BudgetComponent, BudgetedBody, CheckedHttpClient, EgressError, ResponseBudget,
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::UpdateError;
@@ -75,6 +77,12 @@ pub const ARTIFACT_HEAD_TIMEOUT_MS: u64 = 30_000;
 /// byte count is capped.
 pub const ARTIFACT_IDLE_TIMEOUT_MS: u64 = 60_000;
 
+/// Absolute overall bound for ONE artifact body download (the
+/// [`ResponseBudget::total_deadline`] the updater passes): an artifact that
+/// keeps trickling inside the idle window still cannot occupy the updater
+/// forever.
+pub const ARTIFACT_TOTAL_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+
 impl CheckedHttpFetcher {
     /// Bounded form of [`ArtifactFetcher::fetch_to`]; production passes the
     /// documented constants, tests pass short bounds against stalled hosts.
@@ -94,7 +102,7 @@ impl CheckedHttpFetcher {
             .client
             .get(url)
             .map_err(|e| transport_err(format!("checked URL refused: {e}")))?;
-        let mut response =
+        let response =
             match tokio::time::timeout(head_bound, self.client.send_checked(builder)).await {
                 Ok(result) => {
                     result.map_err(|e| transport_err(format!("request refused/failed: {e}")))?
@@ -110,30 +118,63 @@ impl CheckedHttpFetcher {
         if !status.is_success() {
             return Err(transport_err(format!("HTTP status {status}")));
         }
+        // The REQUIRED response budget: head/idle carry the documented
+        // bounds, the total is the overall artifact bound and the byte cap
+        // is the caller's artifact limit. Reads go through the shared
+        // budget-aware reader — never a direct body read.
+        let budget = ResponseBudget::from_millis(
+            head_bound.as_millis() as u64,
+            idle_bound.as_millis() as u64,
+            ARTIFACT_TOTAL_TIMEOUT_MS,
+            max_bytes,
+            None,
+        );
+        let mut body = BudgetedBody::new(response, budget);
         let mut streamed: u64 = 0;
         loop {
-            let chunk = match tokio::time::timeout(idle_bound, response.chunk()).await {
-                Ok(result) => result.map_err(|e| transport_err(format!("body stream: {e}")))?,
-                Err(_) => {
+            match body.next_chunk().await {
+                Ok(Some(chunk)) => {
+                    streamed = streamed.saturating_add(chunk.len() as u64);
+                    if streamed > max_bytes {
+                        return Err(UpdateError::ArtifactTooLarge {
+                            artifact: url.to_string(),
+                            max_bytes,
+                        });
+                    }
+                    sink.write_all(&chunk)
+                        .await
+                        .map_err(|e| transport_err(format!("staging write: {e}")))?;
+                }
+                Ok(None) => break,
+                Err(EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Bytes,
+                    ..
+                }) => {
+                    return Err(UpdateError::ArtifactTooLarge {
+                        artifact: url.to_string(),
+                        max_bytes,
+                    })
+                }
+                Err(EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Head,
+                    ..
+                }) => {
+                    return Err(transport_err(format!(
+                        "artifact body stalled before the first chunk ({} ms bound)",
+                        head_bound.as_millis()
+                    )))
+                }
+                Err(EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Idle | BudgetComponent::Total,
+                    ..
+                }) => {
                     return Err(transport_err(format!(
                         "artifact body stalled beyond the {} ms idle bound",
                         idle_bound.as_millis()
                     )))
                 }
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            streamed = streamed.saturating_add(chunk.len() as u64);
-            if streamed > max_bytes {
-                return Err(UpdateError::ArtifactTooLarge {
-                    artifact: url.to_string(),
-                    max_bytes,
-                });
+                Err(e) => return Err(transport_err(format!("body stream: {e}"))),
             }
-            sink.write_all(&chunk)
-                .await
-                .map_err(|e| transport_err(format!("staging write: {e}")))?;
         }
         Ok(streamed)
     }

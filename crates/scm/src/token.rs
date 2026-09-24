@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse};
+use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse, RouteLabel};
+use faktor_security::secret::SecretValue;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 
 use crate::error::ScmError;
@@ -56,8 +57,9 @@ pub struct GitHubAppTokenConfig {
     /// The GitHub App id (`iss` of every app JWT).
     pub app_id: u64,
     /// The app's unencrypted PKCS#8 private key PEM (`BEGIN PRIVATE KEY`).
-    /// A secret: never logged (`Debug` is redacted).
-    pub private_key_pkcs8_pem: String,
+    /// A [`SecretValue`]: zeroized on drop, redacted `Debug`, no `Display`
+    /// and no serde — it leaves only through the PKCS#8 decode.
+    pub private_key_pkcs8_pem: SecretValue,
     /// REST API base (no trailing slash): `https://api.github.com` in
     /// production, a loopback mock in tests.
     pub api_base: String,
@@ -76,7 +78,7 @@ impl Default for GitHubAppTokenConfig {
     fn default() -> Self {
         Self {
             app_id: 0,
-            private_key_pkcs8_pem: String::new(),
+            private_key_pkcs8_pem: SecretValue::new(String::new()),
             api_base: "https://api.github.com".to_string(),
             user_agent: "faktor-scm/0.1".to_string(),
             max_attempts: MAX_APP_TOKEN_ATTEMPTS,
@@ -153,10 +155,12 @@ impl GitHubAppTokenConfig {
     }
 }
 
-/// One cached app JWT with its absolute expiry.
+/// One cached app JWT with its absolute expiry. The token is a
+/// [`SecretValue`] (zeroized, redacted `Debug`); it is exposed exactly once,
+/// into the installation-token mint request's bearer header.
 #[derive(Clone)]
 struct AppJwt {
-    token: String,
+    token: SecretValue,
     expires_at_ms: i64,
 }
 
@@ -199,7 +203,7 @@ impl GitHubAppTokenSource {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ScmError> {
         config.validate()?;
-        let der = decode_pkcs8_pem(&config.private_key_pkcs8_pem)?;
+        let der = decode_pkcs8_pem(config.private_key_pkcs8_pem.expose())?;
         let key = RsaKeyPair::from_pkcs8(&der).map_err(|e| {
             ScmError::Config(format!(
                 "GitHub App private key is not a valid PKCS#8 RSA key: {e}"
@@ -264,7 +268,7 @@ impl GitHubAppTokenSource {
             )
             .map_err(|_| ScmError::Config("app JWT signing failed".into()))?;
         let jwt = AppJwt {
-            token: format!("{signing_input}.{}", b64url(&signature)),
+            token: SecretValue::new(format!("{signing_input}.{}", b64url(&signature))),
             expires_at_ms: exp.saturating_mul(1000),
         };
         *self.jwt_lock()? = Some(jwt.clone());
@@ -304,6 +308,7 @@ impl GitHubAppTokenSource {
         let mut attempt = 0u32;
         loop {
             let request = RawRequest::new("POST", url.clone())
+                .route(RouteLabel::GithubInstallationToken)
                 .header("accept", "application/vnd.github+json")
                 .header("x-github-api-version", "2022-11-28")
                 .header("user-agent", self.config.user_agent.clone())
@@ -446,7 +451,7 @@ impl InstallationTokenSource for GitHubAppTokenSource {
             }
         }
         let jwt = self.app_jwt(now)?;
-        let token = self.mint(installation, &jwt.token).await?;
+        let token = self.mint(installation, jwt.token.expose()).await?;
         self.token_lock()?.insert(installation.raw(), token.clone());
         Ok(token)
     }
@@ -557,7 +562,7 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDOdaRv7SIbH6qK
         GitHubAppTokenSource::new(
             GitHubAppTokenConfig {
                 app_id: 7,
-                private_key_pkcs8_pem: pem.to_string(),
+                private_key_pkcs8_pem: pem.into(),
                 ..Default::default()
             },
             Arc::new(MockHttpTransport::new(200, "{}")),
@@ -581,7 +586,7 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDOdaRv7SIbH6qK
             },
             GitHubAppTokenConfig {
                 app_id: 7,
-                private_key_pkcs8_pem: String::new(),
+                private_key_pkcs8_pem: String::new().into(),
                 ..Default::default()
             },
             GitHubAppTokenConfig {
@@ -629,6 +634,71 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDOdaRv7SIbH6qK
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("super-secret-key-material"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    /// The compile-time negative proof: neither the app-key config nor the
+    /// cached app JWT has `Display` or `Serialize`.
+    macro_rules! assert_no_display_no_serialize {
+        ($ty:ty) => {{
+            trait AmbiguousIfImpl<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            impl<T: ?Sized + std::fmt::Display> AmbiguousIfImpl<u8> for T {}
+            impl<T: ?Sized + ::serde::Serialize> AmbiguousIfImpl<u16> for T {}
+            let _ = <$ty as AmbiguousIfImpl<_>>::probe;
+        }};
+    }
+
+    #[test]
+    fn planted_key_and_app_jwt_never_leak_through_debug_display_serde_or_panic() {
+        assert_no_display_no_serialize!(GitHubAppTokenConfig);
+        assert_no_display_no_serialize!(AppJwt);
+        const PLANTED: &str = "PLANTED-APP-KEY-do-not-leak-0123456789abcdef";
+        let config = GitHubAppTokenConfig {
+            app_id: 7,
+            private_key_pkcs8_pem: PLANTED.into(),
+            ..Default::default()
+        };
+        let jwt = AppJwt {
+            token: SecretValue::new(PLANTED),
+            expires_at_ms: 42,
+        };
+        for rendered in [
+            format!("{config:?}"),
+            format!("{jwt:?}"),
+            format!("{:?}", Some(config.clone())),
+            format!("{:?}", vec![jwt.clone()]),
+            format!("{:?}", (jwt.clone(), config.clone())),
+        ] {
+            assert!(!rendered.contains(PLANTED), "leaked via {rendered}");
+        }
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("app jwt {jwt:?} built from {config:?}")
+        }))
+        .expect_err("the closure must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            !message.contains(PLANTED),
+            "panic payload leaked: {message}"
+        );
+        // Both refusal paths (config validation and key parsing) stay free of
+        // the planted bytes.
+        let invalid = GitHubAppTokenConfig {
+            app_id: 0,
+            private_key_pkcs8_pem: PLANTED.into(),
+            ..Default::default()
+        };
+        let err = invalid.validate().unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PLANTED), "error leaked: {rendered}");
+        let err = source_with_key(PLANTED).unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PLANTED), "error leaked: {rendered}");
     }
 
     #[tokio::test]

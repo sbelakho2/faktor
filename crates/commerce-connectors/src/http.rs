@@ -29,6 +29,7 @@
 //! checked transport) is documented in the crate root.
 
 use std::fmt;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use faktor_commerce::text::CanonicalUrl;
@@ -37,6 +38,37 @@ use serde::de::DeserializeOwned;
 
 use crate::context::AcquireCtx;
 use crate::secrets::SecretString;
+
+/// The response budget ONE connector transport call must obey.
+///
+/// This mirrors the checked egress budget (`head_timeout`, `idle_timeout`,
+/// `total_deadline`, `max_bytes`, `max_frames`) field-for-field, but lives
+/// here because the connector layer MUST NOT depend on the egress crate
+/// (the crate's own dependency scan enforces it). The production transport
+/// converts it into the checked budget before executing: head/idle/total
+/// bound a stalled/never-ending body, `max_bytes` caps the buffered body
+/// and `max_frames` caps the frame count when set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseBudget {
+    pub head_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub total_deadline: Duration,
+    pub max_bytes: u64,
+    pub max_frames: Option<u64>,
+}
+
+impl ResponseBudget {
+    /// A one-wall-clock budget: head, idle and total all equal `timeout`.
+    pub const fn for_timeout(timeout: Duration, max_bytes: u64) -> Self {
+        Self {
+            head_timeout: timeout,
+            idle_timeout: timeout,
+            total_deadline: timeout,
+            max_bytes,
+            max_frames: None,
+        }
+    }
+}
 
 /// Hard bound for a request URL (matches [`CanonicalUrl`]'s own bound).
 pub const MAX_URL_BYTES: usize = 2048;
@@ -597,12 +629,20 @@ impl From<TransportError> for SourceError {
 ///
 /// The production implementation is the daemon's policy-checked egress
 /// transport; connectors only ever see this trait, and the fixture transport
-/// in the test suite implements it for offline replay.
+/// in the test suite implements it for offline replay. Every call passes a
+/// REQUIRED [`ResponseBudget`]: the transport enforces destination policy,
+/// secret scanning, cancellation and that budget (head/idle/total/bytes/
+/// frames) against the live response body.
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
-    /// Execute one built request. The transport enforces destination
-    /// policy, its own response bound, secret scanning and cancellation.
-    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError>;
+    /// Execute one built request under `budget`. The transport enforces
+    /// destination policy, its own response bound, secret scanning,
+    /// cancellation and the passed response budget.
+    async fn execute(
+        &self,
+        request: HttpRequest,
+        budget: ResponseBudget,
+    ) -> Result<HttpResponse, TransportError>;
 }
 
 /// Map a request-shape failure onto the typed domain error. These are
@@ -738,7 +778,14 @@ pub(crate) async fn send(
         Some(&host),
     );
     let started = ctx.now_ms();
-    let outcome = ctx.transport().execute(request).await;
+    // The REQUIRED response budget every production transport honors:
+    // head/idle/total from the request timeout and bytes from the request's
+    // response bound (never above the connector's own bound).
+    let budget = ResponseBudget::for_timeout(
+        Duration::from_millis(request.timeout_ms().max(1)),
+        request.max_response_bytes() as u64,
+    );
+    let outcome = ctx.transport().execute(request, budget).await;
     let elapsed = ctx.now_ms().saturating_sub(started);
     match outcome {
         Ok(response) => {

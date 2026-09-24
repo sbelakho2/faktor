@@ -54,17 +54,21 @@
 # remote script into a shell.
 #
 # Toolchain authority: `rust-toolchain.toml` pins channel 1.98.0 with
-# components rustfmt+clippy (profile minimal). The `rust:1.98` image is only
-# a rustup baseline: the cargo/rustc shims resolve the exact channel from the
-# toolchain file, and the linux lane asserts that resolution before running
-# the gates. The JetBrains smoke lane derives its rustup-init
+# components rustfmt+clippy (profile minimal). The `rust:1.98.0` image is
+# only a rustup baseline: the cargo/rustc shims resolve the exact channel
+# from the toolchain file, and the linux lane asserts that resolution before
+# running the gates. The JetBrains smoke lane derives its rustup-init
 # `--default-toolchain` from the same file — never a second hard-coded Rust
 # version.
 #
-# Image pinning: every non-Rust container image is pinned by its multi-arch
-# index digest (the trailing comment records the original tag and the date
-# the digest was recorded). `rust:1.98` intentionally stays tag-based
-# because the toolchain file, not the image, is the Rust version authority.
+# Image pinning: EVERY container image in every workflow is pinned by its
+# multi-arch index digest (the trailing comment records the original tag and
+# the date the digest was recorded), including the Rust baseline image.
+# `scripts/check-ci-image-pins.sh` enforces this in the `image-pins` step: an
+# image line without `@sha256:` fails the pipeline unless it is explicitly
+# annotated `digest-exempt: <reason>` (the Windows self-hosted `powershell`
+# image is the only exemption). The toolchain file, not the image, remains
+# the Rust channel authority.
 #
 # Commit-status contexts (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
 #   push: ci/woodpecker/push/trusted   tag: ci/woodpecker/tag/trusted
@@ -88,13 +92,24 @@ when:
     evaluate: 'platform != "linux/amd64"'
 
 steps:
+  # ---------------------------------------------------------- image pins --
+  # Every image in every workflow must be digest-pinned (the Windows
+  # self-hosted powershell line is the only documented digest-exempt case).
+  - name: image-pins
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc # alpine:3.20 @ 2026-09-23
+    when:
+      matrix:
+        platform: linux/amd64
+    commands:
+      - sh scripts/check-ci-image-pins.sh
+
   # ---------------------------------------------------------------- linux --
   # The default lane (hosted linux/amd64 runners). Same commands the CI
   # gates always ran: fmt + clippy -D warnings + check/test --all-features +
   # doctor. Protocol/stream tests ride the --workspace all-features run.
   # Long lanes stay #[ignore]-gated.
   - name: linux
-    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
       matrix:
         platform: linux/amd64
@@ -114,7 +129,7 @@ steps:
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
       - cargo test --workspace --all-features
-      - cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -126,7 +141,7 @@ steps:
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo test --workspace --all-features
-        cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+        cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
@@ -140,7 +155,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
   - name: static
-    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
       matrix:
         platform: linux/amd64
@@ -177,7 +192,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/static.json
   - name: docs
-    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
       matrix:
         platform: linux/amd64
@@ -270,6 +285,8 @@ steps:
       - faktor-trusted-gradle-home:/root/.gradle
     commands:
       - cd apps/jetbrains
+      # Validate wrapper jar + distribution sha256 + verification metadata + locks first.
+      - bash ../../scripts/check-gradle-integrity.sh
       - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
       - cd "$CI_WORKSPACE"
       - |
@@ -277,6 +294,7 @@ steps:
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
         cd apps/jetbrains
+        bash ../../scripts/check-gradle-integrity.sh
         ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
         cd "$CI_WORKSPACE"
         CMDS
@@ -348,7 +366,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
   - name: perf
-    image: rust:1.98 # rustup baseline only; rust-toolchain.toml is authoritative
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     depends_on: [linux, static, docs]
     when:
       matrix:
@@ -434,12 +452,12 @@ steps:
       matrix:
         platform: darwin/arm64
     commands:
-      - cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+        cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | shasum -a 256 | cut -d' ' -f1)"
@@ -453,7 +471,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-doctor","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-doctor.json
   - name: windows-check
-    image: powershell # powershell:latest stays tag-based: no docker.io library image exists to record a digest from (self-hosted Windows agents)
+    image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
     when:
       matrix:
         platform: windows/amd64
@@ -485,7 +503,7 @@ steps:
         } | ConvertTo-Json -Compress -Depth 6
         Set-Content -Path target/certification/lanes/windows-check.json -Value $marker
   - name: windows-test
-    image: powershell # powershell:latest stays tag-based: no docker.io library image exists to record a digest from (self-hosted Windows agents)
+    image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
     when:
       matrix:
         platform: windows/amd64
@@ -531,6 +549,10 @@ steps:
         platform: linux/amd64
       status: [success, failure]
     commands:
+      # Enforce the ignored-test inventory first: every #[ignore] site must be
+      # conventionally tagged and lane-assigned in .woodpecker/trusted/nightly.yaml
+      # or documented as manual/live-paid (scripts/certification/ignored-tests.json).
+      - node scripts/check-ignored-tests.mjs
       - node scripts/certification/evidence.mjs verify-markers --workflow trusted --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
       - node scripts/certification/evidence.mjs write --kind ci_certification_trusted --status passed --from-markers target/certification/lanes --commands "woodpecker trusted linux workflow certificate"
   - name: certificate-darwin
@@ -565,7 +587,7 @@ steps:
         echo "certification=$st platform=darwin"
         [ "$rc" -eq 0 ]
   - name: certificate-windows
-    image: powershell # powershell:latest stays tag-based: no docker.io library image exists to record a digest from (self-hosted Windows agents)
+    image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
     depends_on: [windows-check, windows-test]
     when:
       matrix:

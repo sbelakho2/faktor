@@ -30,6 +30,10 @@
 //! slow CI reaper can never hang the suite; ping self-terminates after
 //! ~60 s, so even a failed assertion cannot leave an eternal sleeper.
 
+#![allow(unsafe_code)]
+// platform authority module: every unsafe
+// block/function in this module carries a `// SAFETY:` justification and is
+// enumerated by tests/static-authority.
 #![cfg(windows)]
 
 use std::path::Path;
@@ -51,6 +55,7 @@ fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
     unsafe {
         let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
         if handle.is_null() {
@@ -77,7 +82,7 @@ static CONPTY_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn pid_file_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "kp-pty-lifecycle-{}-{}.pid",
+        "faktor-pty-lifecycle-{}-{}.pid",
         std::process::id(),
         PIDFILE_SEQ.fetch_add(1, Ordering::Relaxed)
     ))
@@ -326,7 +331,7 @@ fn command_argument_runs_the_script_to_completion() {
     // change) and waits are generous but bounded.
     let _serial = CONPTY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let marker = std::env::temp_dir().join(format!(
-        "kp-pty-command-{}-{}.txt",
+        "faktor-pty-command-{}-{}.txt",
         std::process::id(),
         PIDFILE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -361,7 +366,7 @@ fn command_argument_runs_the_script_to_completion() {
 #[test]
 fn create_process_failure_names_the_step_and_win32_code() {
     let bogus = std::env::temp_dir().join(format!(
-        "kp-pty-not-a-pe-{}-{}.bin",
+        "faktor-pty-not-a-pe-{}-{}.bin",
         std::process::id(),
         PIDFILE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));

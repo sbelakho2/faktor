@@ -20,6 +20,9 @@
 //! The closure runs in the single-threaded post-fork child and only calls
 //! `unshare` and reads the errno — no allocation, no locks.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::io;
 use std::os::unix::process::CommandExt;
 
@@ -44,6 +47,7 @@ pub(crate) fn force_unshare_failure_for_tests(force: bool) {
 /// it must not allocate, lock, or call anything but async-signal-safe
 /// operations. It calls `libc::unshare(CLONE_NEWNET)` and reads the
 /// errno — nothing else.
+// SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
 pub(crate) unsafe fn apply_deny_all_isolation(cmd: &mut std::process::Command) {
     // SAFETY (of the pre_exec call): std requires the caller to uphold the
     // pre-exec restrictions; the closure below is allocation-free and

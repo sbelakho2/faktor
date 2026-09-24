@@ -1,0 +1,8 @@
+# Planted violation: this image is tag-only and carries no digest-exempt
+# annotation. `scripts/check-ci-image-pins.sh --dir` must reject this file
+# (this is the fixture the selftest asserts against).
+steps:
+  - name: linux
+    image: rust:1.98
+    commands:
+      - echo unpinned

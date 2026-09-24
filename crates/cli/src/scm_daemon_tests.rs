@@ -43,7 +43,7 @@ fn github_app_cfg(base: &str) -> CloudCfg {
         github_app: Some(CloudGithubAppCfg {
             enabled: true,
             app_id: Some(12345),
-            private_key: Some("app.pem".into()),
+            key_payload: Some("app.pem".into()),
             webhook_secret: Some("hook.secret".into()),
             api_base: Some(base.to_string()),
             organization: Some("org_acme".into()),

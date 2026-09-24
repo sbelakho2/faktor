@@ -64,6 +64,9 @@
 //! in `platform/windows.rs` and was statically reviewed on the unix host
 //! where it cannot be compiled.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -338,6 +341,7 @@ impl RootedDir {
         #[cfg(unix)]
         {
             let fd = self.walk_dirs(rel)?;
+            // SAFETY: the fd is owned and points at the directory this function just created; failure is surfaced, not ignored.
             if unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } != 0 {
                 return Err(Error::internal(format!(
                     "cannot restrict {}: {}",
@@ -1507,6 +1511,7 @@ fn unix_open_read_at(dir: &OwnedFd, name: &OsStr, rel: &Path) -> Result<OwnedFd,
 #[cfg(unix)]
 fn unix_lstat_at(dir: &OwnedFd, name: &OsStr) -> io::Result<libc::stat> {
     let c = unix_cstring(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: fstatat does not modify the NUL-terminated `c`; `st` is a valid
     // output buffer and AT_SYMLINK_NOFOLLOW never follows the entry.

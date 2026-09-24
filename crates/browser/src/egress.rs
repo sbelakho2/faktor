@@ -2747,8 +2747,23 @@ mod tests {
         );
     }
 
+    /// The compile-time negative proof: `ProxyCredentials` has NO `Display`
+    /// and NO `Serialize` (only the redacted `Debug`).
+    macro_rules! assert_no_display_no_serialize {
+        ($ty:ty) => {{
+            trait AmbiguousIfImpl<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            impl<T: ?Sized + std::fmt::Display> AmbiguousIfImpl<u8> for T {}
+            impl<T: ?Sized + ::serde::Serialize> AmbiguousIfImpl<u16> for T {}
+            let _ = <$ty as AmbiguousIfImpl<_>>::probe;
+        }};
+    }
+
     #[test]
     fn credentials_are_bounded_and_never_render_their_secrets() {
+        assert_no_display_no_serialize!(ProxyCredentials);
         let credentials = ProxyCredentials::new("PLANTED-USER-NAME", "PLANTED-PASSWORD-2f6c");
         let proxy = UpstreamProxy::new("proxy.test", 8080).with_credentials(credentials.clone());
         let selector = UpstreamSelector::new(Some(proxy.clone()));
@@ -2763,11 +2778,34 @@ mod tests {
             format!("{proxy:?}"),
             format!("{selector:?}"),
             format!("{config:?}"),
+            format!("{:?}", Some(credentials.clone())),
+            format!("{:?}", vec![credentials.clone()]),
         ] {
             assert!(!rendered.contains("PLANTED-USER-NAME"), "{rendered}");
             assert!(!rendered.contains("PLANTED-PASSWORD-2f6c"), "{rendered}");
         }
         assert!(format!("{credentials:?}").contains("[redacted]"));
+        // Panic formatting must stay redacted too.
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("proxy setup {credentials:?}")
+        }))
+        .expect_err("the closure must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            !message.contains("PLANTED-PASSWORD-2f6c") && !message.contains("PLANTED-USER-NAME"),
+            "panic payload leaked: {message}"
+        );
+        // A refused credential names the field and reason, never the material.
+        let err = ProxyCredentials::try_new("u", "PLANTED-PASSWORD\r2f6c").unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains("PLANTED-PASSWORD"),
+            "error leaked: {rendered}"
+        );
         // The Basic value carries the real material (only ever written to
         // the upstream socket) and is base64 of `user:pass`.
         let header = credentials.basic_header();

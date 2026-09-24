@@ -1,0 +1,21 @@
+{
+  "pipelines": [
+    {
+      "number": 11,
+      "status": "success",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "event": "pull_request",
+      "branch": "feature/certify"
+    }
+  ],
+  "detail": {
+    "number": 11,
+    "status": "success",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "event": "pull_request",
+    "workflows": [
+      {"name": "pr", "state": "success"},
+      {"name": "linux", "state": "success"}
+    ]
+  }
+}

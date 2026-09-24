@@ -462,11 +462,7 @@ pub(crate) enum TransitionStep {
 type Seam<'a> = &'a mut dyn FnMut(TransitionStep) -> Result<(), Error>;
 
 fn unique_temp_path(parent: &Path, name: &str) -> PathBuf {
-    parent.join(format!(
-        ".{name}.kp-tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ))
+    parent.join(crate::atomic::temp_name(name))
 }
 
 #[cfg(unix)]
@@ -1385,16 +1381,18 @@ mod tests {
                     "{name} @ {at:?}: replay must converge"
                 );
                 assert_eq!(live(root, "f"), *next, "{name} @ {at:?}: converged");
-                // A genuine crash may leave an orphan `.kp-tmp-*` residue, but
-                // it is INVISIBLE to the canonical manifest (daemon
-                // bookkeeping, exactly like `.git`): the root digest must not
-                // move, so a crashed landing's equality proof still holds.
+                // A genuine crash may leave an orphan atomic-temp residue
+                // (`.faktor-tmp-*` now, legacy `.kp-tmp-*` from older
+                // releases), but it is INVISIBLE to the canonical manifest
+                // (daemon bookkeeping, exactly like `.git`): the root digest
+                // must not move, so a crashed landing's equality proof still
+                // holds.
                 let digest_with_residue =
                     crate::tree_manifest::tree_manifest_digest(root, 10_000).unwrap();
                 let mut swept = 0usize;
                 for entry in fs::read_dir(root).unwrap().flatten() {
                     let n = entry.file_name().to_string_lossy().into_owned();
-                    if n.contains(".kp-tmp-") {
+                    if crate::atomic::is_internal_temp_name(&n) {
                         fs::remove_file(entry.path()).unwrap();
                         swept += 1;
                     }

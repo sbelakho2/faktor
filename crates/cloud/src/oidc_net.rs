@@ -61,7 +61,11 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use serde::Deserialize;
 
-use faktor_provider::egress::{execute_raw, HttpTransport, RawRequest, RawResponse};
+use faktor_provider::egress::{
+    execute_raw, HttpTransport, RawRequest, RawResponse, ResponseBudget, RouteLabel,
+    MAX_RAW_RESPONSE_BYTES,
+};
+use faktor_security::secret::SecretValue;
 
 use crate::oidc::{
     constant_time_eq, hmac_sha256, map_membership_claims, ClaimMapping, CodeExchangeRequest,
@@ -106,9 +110,16 @@ async fn execute_raw_bounded(
     request: RawRequest,
     what: &str,
 ) -> Result<RawResponse, String> {
+    // Every OIDC read passes an explicit response budget: head/idle/total
+    // all equal the documented network bound, and the body is capped by the
+    // seam's materialization bound.
+    let budget = ResponseBudget::for_timeout(
+        std::time::Duration::from_millis(OIDC_NETWORK_TIMEOUT_MS),
+        MAX_RAW_RESPONSE_BYTES as u64,
+    );
     match tokio::time::timeout(
         std::time::Duration::from_millis(OIDC_NETWORK_TIMEOUT_MS),
-        execute_raw(transport, request),
+        execute_raw(transport, request, &budget),
     )
     .await
     {
@@ -488,10 +499,13 @@ impl NetworkOidcAdapter {
 
     async fn fetch_discovery(&self) -> Result<CachedDiscovery, OidcError> {
         let url = format!("{}/.well-known/openid-configuration", self.config.issuer);
-        let response =
-            execute_raw_bounded(&*self.transport, RawRequest::new("GET", url), "discovery")
-                .await
-                .map_err(OidcError::DiscoveryUnavailable)?;
+        let response = execute_raw_bounded(
+            &*self.transport,
+            RawRequest::new("GET", url).route(RouteLabel::OidcDiscovery),
+            "discovery",
+        )
+        .await
+        .map_err(OidcError::DiscoveryUnavailable)?;
         if !(200..300).contains(&response.status) {
             return Err(OidcError::DiscoveryUnavailable(format!(
                 "discovery endpoint answered {}",
@@ -543,7 +557,7 @@ impl NetworkOidcAdapter {
         let doc = self.discovery(&self.config.issuer).await?;
         let response = execute_raw_bounded(
             &*self.transport,
-            RawRequest::new("GET", doc.jwks_uri),
+            RawRequest::new("GET", doc.jwks_uri).route(RouteLabel::OidcJwks),
             "jwks",
         )
         .await
@@ -775,9 +789,9 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
             body.push_str(&urlencode(value));
         };
         field("grant_type", "authorization_code");
-        field("code", request.code.as_str());
+        field("code", request.code.expose());
         field("redirect_uri", request.redirect_uri.as_str());
-        field("code_verifier", request.code_verifier.as_str());
+        field("code_verifier", request.code_verifier.expose());
         match self.config.client_auth {
             // RFC 6749 §2.3.1: the client_id rides the Basic header, never
             // the form, when the client authenticates with HTTP Basic.
@@ -790,6 +804,7 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
             field("client_secret", secret.unwrap_or_default());
         }
         let mut raw_request = RawRequest::new("POST", doc.token_endpoint)
+            .route(RouteLabel::OidcTokenExchange)
             .header("content-type", "application/x-www-form-urlencoded")
             .header("accept", "application/json")
             .bytes_body(body.into_bytes());
@@ -813,22 +828,9 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
         }
         let token: RawTokenResponse = serde_json::from_slice(&raw.body)
             .map_err(|e| OidcError::CodeExchangeRefused(format!("token json: {e}")))?;
-        if token.id_token.is_empty() {
-            return Err(OidcError::CodeExchangeRefused(
-                "token response carries no id_token".into(),
-            ));
-        }
-        if token.token_type.is_empty() {
-            return Err(OidcError::CodeExchangeRefused(
-                "token response carries no token_type".into(),
-            ));
-        }
-        Ok(OidcTokenSet {
-            access_token: token.access_token.unwrap_or_default(),
-            id_token: token.id_token,
-            token_type: token.token_type,
-            expires_in_s: token.expires_in.unwrap_or(0),
-        })
+        // The wire DTO's secret-bearing fields are consumed EXACTLY here and
+        // wrapped immediately; no `String` token ever enters the domain.
+        token_set_from_raw(token)
     }
 
     async fn verify_id_token(
@@ -1107,7 +1109,14 @@ struct RawJwk {
     e: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// The OIDC token-endpoint WIRE response (a provider payload). Its
+/// token-bearing fields exist only for the immediate conversion into
+/// [`OidcTokenSet`] (wrapped in [`SecretValue`] before any domain use); the
+/// strict shape of the consumed fields is enforced at conversion. `Debug` is
+/// manual and redacts both token fields so even a stray `{:?}` of the
+/// short-lived capture cannot print a bearer token.
+// SECRET-FIELD-GATE-WIRE-DTO: provider token-endpoint response parsed and converted to OidcTokenSet in the same expression block, never stored as plaintext.
+#[derive(Deserialize)]
 struct RawTokenResponse {
     #[serde(default)]
     access_token: Option<String>,
@@ -1116,6 +1125,40 @@ struct RawTokenResponse {
     token_type: String,
     #[serde(default)]
     expires_in: Option<i64>,
+}
+
+impl std::fmt::Debug for RawTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawTokenResponse")
+            .field("access_token", &"[redacted]")
+            .field("id_token", &"[redacted]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// Convert one parsed OIDC token-endpoint WIRE response into the domain
+/// [`OidcTokenSet`]: the plaintext tokens are wrapped in [`SecretValue`] in
+/// this one expression block and the wire `String`s are dropped. This is the
+/// ONLY place the wire DTO's secret-bearing fields are read.
+fn token_set_from_raw(token: RawTokenResponse) -> Result<OidcTokenSet, OidcError> {
+    if token.id_token.is_empty() {
+        return Err(OidcError::CodeExchangeRefused(
+            "token response carries no id_token".into(),
+        ));
+    }
+    if token.token_type.is_empty() {
+        return Err(OidcError::CodeExchangeRefused(
+            "token response carries no token_type".into(),
+        ));
+    }
+    Ok(OidcTokenSet {
+        access_token: SecretValue::new(token.access_token.unwrap_or_default()),
+        id_token: SecretValue::new(token.id_token),
+        token_type: token.token_type,
+        expires_in_s: token.expires_in.unwrap_or(0),
+    })
 }
 
 /// Parse one `Cache-Control` header's `max-age` (seconds). Pure; garbage or
@@ -1147,4 +1190,78 @@ pub(crate) fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_dto_accepts_a_real_provider_payload_and_converts_immediately() {
+        // A real token-endpoint payload shape: extra provider fields are
+        // ignored, the consumed fields convert into `OidcTokenSet` with both
+        // bearer tokens wrapped.
+        let body = serde_json::json!({
+            "access_token": "PLANTED-ACCESS-TOKEN-0123456789",
+            "id_token": "PLANTED-ID-TOKEN-0123456789",
+            "token_type": "Bearer",
+            "expires_in": 3599,
+            "scope": "openid email profile",
+            "refresh_token": "ignored-by-the-strict-shape",
+        })
+        .to_string();
+        let raw: RawTokenResponse = serde_json::from_str(&body).expect("a real payload parses");
+        let tokens = token_set_from_raw(raw).expect("the payload converts");
+        assert_eq!(
+            tokens.access_token.expose(),
+            "PLANTED-ACCESS-TOKEN-0123456789"
+        );
+        assert_eq!(tokens.id_token.expose(), "PLANTED-ID-TOKEN-0123456789");
+        assert_eq!(tokens.token_type, "Bearer");
+        assert_eq!(tokens.expires_in_s, 3599);
+        // The converted carrier never renders the planted token.
+        let rendered = format!("{tokens:?}");
+        assert!(!rendered.contains("PLANTED-ACCESS-TOKEN-0123456789"));
+        assert!(!rendered.contains("PLANTED-ID-TOKEN-0123456789"));
+        // The short-lived wire capture itself is redacted too: even a stray
+        // `{:?}` of the DTO cannot print the bearer tokens.
+        let capture: RawTokenResponse = serde_json::from_str(&body).unwrap();
+        let rendered = format!("{capture:?}");
+        assert!(!rendered.contains("PLANTED-ACCESS-TOKEN-0123456789"));
+        assert!(!rendered.contains("PLANTED-ID-TOKEN-0123456789"));
+        assert!(rendered.contains("[redacted]"));
+
+        // The documented defaults: no access_token and no expires_in.
+        let raw: RawTokenResponse =
+            serde_json::from_str(r#"{"id_token":"jwt","token_type":"Bearer"}"#).unwrap();
+        let tokens = token_set_from_raw(raw).unwrap();
+        assert!(tokens.access_token.is_empty());
+        assert_eq!(tokens.expires_in_s, 0);
+    }
+
+    #[test]
+    fn wire_dto_conversion_refuses_incomplete_payloads() {
+        // A payload without the required id_token never even parses into the
+        // wire DTO (the only required member), so it can never convert.
+        assert!(serde_json::from_str::<RawTokenResponse>(
+            r#"{"access_token":"a","token_type":"Bearer"}"#
+        )
+        .is_err());
+        // An empty id_token parses but is refused at conversion.
+        let empty_id: RawTokenResponse =
+            serde_json::from_str(r#"{"id_token":"","token_type":"Bearer"}"#).unwrap();
+        assert!(matches!(
+            token_set_from_raw(empty_id),
+            Err(OidcError::CodeExchangeRefused(_))
+        ));
+        // A missing token_type stays a typed conversion refusal.
+        let missing_type: RawTokenResponse =
+            serde_json::from_str(r#"{"access_token":"a","id_token":"jwt"}"#).unwrap();
+        let err = token_set_from_raw(missing_type).unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("access_token"));
+        // A payload that is not an object at all is a parse refusal, never a
+        // silent default.
+        assert!(serde_json::from_str::<RawTokenResponse>("[]").is_err());
+    }
 }

@@ -1,0 +1,12 @@
+# Fixture: every image pinned by multi-arch index digest; the Windows
+# self-hosted powershell line carries an explicit digest-exempt annotation.
+# `scripts/check-ci-image-pins.sh --dir` must accept this file.
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24
+    commands:
+      - echo pinned
+  - name: windows
+    image: powershell # digest-exempt: self-hosted Windows agents run the shell natively; no docker.io library image exists
+    commands:
+      - Write-Host pinned

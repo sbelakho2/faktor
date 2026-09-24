@@ -977,8 +977,9 @@ pub fn copy_tree_skip(
         &mut count,
         &mut |rel, abs, f| {
             // Internal atomic-write temporaries (a concurrent CAS writer's
-            // in-flight `.kp-tmp-*` files) are never part of a snapshot:
-            // materialized roots must contain exactly the manifest entries.
+            // in-flight `.faktor-tmp-*` files, or legacy `.kp-tmp-*` crash
+            // residue) are never part of a snapshot: materialized roots must
+            // contain exactly the manifest entries.
             let fname = rel
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -1623,14 +1624,11 @@ pub(crate) fn copy_open_file(
         .ok_or_else(|| Error::malformed(format!("{target:?} has no parent")))?;
     fs::create_dir_all(parent)
         .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
-    let tmp = parent.join(format!(
-        ".{}.kp-tmp-{}-{}",
-        target
+    let tmp = parent.join(atomic::temp_name(
+        &target
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default(),
-        std::process::id(),
-        uuid::Uuid::new_v4()
     ));
     let (n, hash) = {
         let mut out = fs::File::create(&tmp)
@@ -1899,7 +1897,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(
-            !names.iter().any(|n| n.contains("kp-tmp-")),
+            !names.iter().any(|n| atomic::is_internal_temp_name(n)),
             "temp leaked: {names:?}"
         );
     }

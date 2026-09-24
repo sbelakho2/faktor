@@ -1,0 +1,50 @@
+# This is a Gradle generated file for dependency locking.
+# Manual edits can break the build and are not advised.
+# This file is expected to be part of source control.
+# To regenerate this file, run: ./gradlew :frontend:dependencies --write-locks
+bundledModule:intellij-platform-test-runtime:IC-241.19416.15=intellijPlatformTestRuntimeFixClasspath
+com.jetbrains.intellij.java:java-compiler-ant-tasks:241.19416.15=intellijPlatformJavaCompiler
+com.jetbrains.intellij.java:java-compiler-instrumentation-util-java8:241.19416.15=intellijPlatformJavaCompiler
+com.jetbrains.intellij.java:java-compiler-instrumentation-util:241.19416.15=intellijPlatformJavaCompiler
+com.jetbrains.intellij.java:java-gui-forms-compiler:241.19416.15=intellijPlatformJavaCompiler
+com.jetbrains.intellij.java:java-gui-forms-rt:241.19416.15=intellijPlatformJavaCompiler
+com.jetbrains.intellij.platform:util-jdom:241.19416.15=intellijPlatformJavaCompiler
+com.jgoodies:forms:1.1-preview=intellijPlatformJavaCompiler
+idea:ideaIC:2024.1.7=compileClasspath,intellijPlatformClasspath,intellijPlatformDependency,intellijPlatformDependencyArchive,intellijPlatformTestClasspath,testCompileClasspath
+jaxen:jaxen:1.2.0=intellijPlatformJavaCompiler
+localIde:IC:IC-241.19416.15=intellijPluginVerifierIdesLocalInstance
+org.jetbrains.compose.hot-reload:hot-reload-agent:1.1.0-alpha03=composeHotReloadAgent
+org.jetbrains.intellij.deps:asm-all:9.5.3=intellijPlatformJavaCompiler
+org.jetbrains.intellij.plugins:verifier-cli:1.410=intellijPluginVerifier
+org.jetbrains.kotlin:kotlin-build-tools-api:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-build-tools-api:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-build-tools-compat:2.4.20=kotlinAbiValidationCompatClasspath,kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
+org.jetbrains.kotlin:kotlin-build-tools-cri-impl:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-build-tools-cri-impl:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
+org.jetbrains.kotlin:kotlin-build-tools-impl:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-build-tools-impl:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
+org.jetbrains.kotlin:kotlin-compiler-embeddable:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-compiler-embeddable:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-compiler-runner:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-compiler-runner:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
+org.jetbrains.kotlin:kotlin-daemon-client:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-daemon-client:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
+org.jetbrains.kotlin:kotlin-daemon-embeddable:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-daemon-embeddable:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-klib-commonizer-embeddable:2.4.20=kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-reflect:1.6.10=kotlinAbiValidationCompatClasspath,kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-script-runtime:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-script-runtime:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest,kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-scripting-common:2.4.20=kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest
+org.jetbrains.kotlin:kotlin-scripting-compiler-embeddable:2.4.20=kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest
+org.jetbrains.kotlin:kotlin-scripting-compiler-impl-embeddable:2.4.20=kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest
+org.jetbrains.kotlin:kotlin-scripting-jvm:2.4.20=kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest
+org.jetbrains.kotlin:kotlin-stdlib:1.9.22=compileClasspath
+org.jetbrains.kotlin:kotlin-stdlib:2.4.0=kotlinAbiValidationCompatClasspath
+org.jetbrains.kotlin:kotlin-stdlib:2.4.20=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest,kotlinKlibCommonizerClasspath
+org.jetbrains.kotlin:kotlin-tooling-core:2.4.20=kotlinAbiValidationCompatClasspath,kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
+org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.8.0=kotlinAbiValidationCompatClasspath,kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinKlibCommonizerClasspath
+org.jetbrains:annotations:13.0=compileClasspath,kotlinAbiValidationCompatClasspath,kotlinBuildToolsApiClasspath,kotlinCompilerClasspath,kotlinCompilerPluginClasspathMain,kotlinCompilerPluginClasspathTest,kotlinKlibCommonizerClasspath
+org.jetbrains:annotations:24.0.0=intellijPlatformJavaCompiler
+org.jetbrains:marketplace-zip-signer:0.1.43=marketplaceZipSigner
+empty=annotationProcessor,implementationDependenciesMetadata,intellijPlatformBackendPluginModuleDependencies,intellijPlatformBundledModules,intellijPlatformBundledPlugins,intellijPlatformComposedJar,intellijPlatformDependencies,intellijPlatformFrontendPluginModuleDependencies,intellijPlatformLocal,intellijPlatformPlugin,intellijPlatformPluginComposedModule,intellijPlatformPluginDependency,intellijPlatformPluginLocal,intellijPlatformPluginModule,intellijPlatformPluginModuleDependencies,intellijPlatformRuntimeClasspath,intellijPlatformTestBundledModules,intellijPlatformTestBundledPlugins,intellijPlatformTestDependencies,intellijPlatformTestPlugin,intellijPlatformTestPluginDependency,intellijPlatformTestPluginLocal,intellijPlatformTestRuntimeClasspath,intellijPluginVerifierIdesDependency,jetbrainsRuntime,jetbrainsRuntimeDependency,jetbrainsRuntimeLocalInstance,kotlinCompilerPluginClasspath,kotlinNativeCompilerPluginClasspath,kotlinScriptDefExtensions,runtimeClasspath,testAnnotationProcessor,testImplementationDependenciesMetadata,testKotlinScriptDefExtensions,testRuntimeClasspath

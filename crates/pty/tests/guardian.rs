@@ -11,6 +11,10 @@
 //! inert pass in the ordinary suite otherwise. That keeps the forking out of
 //! the libtest process entirely (the helper is a fresh, exec'd process).
 
+#![allow(unsafe_code)]
+// platform authority module: every unsafe
+// block/function in this module carries a `// SAFETY:` justification and is
+// enumerated by tests/static-authority.
 #![cfg(unix)]
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -70,6 +74,7 @@ fn simulated_daemon_helper() {
         .and_then(|pid| pid.parse().ok())
         .expect("grandchild pid in the pty output");
     let msg = format!("{} {}\n", pty.pid(), grandchild);
+    // SAFETY: the fd is owned/open on this path and the buffer is a live bounded slice whose length is passed exactly.
     unsafe {
         assert_eq!(
             libc::write(report_fd, msg.as_ptr().cast(), msg.len()),
@@ -83,6 +88,7 @@ fn simulated_daemon_helper() {
     // immediately before the simulated crash: both the leader and the
     // grandchild must be signallable right now. On failure the helper does
     // not SIGKILL itself, so the test's daemon-was-SIGKILLed assertion fails.
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     unsafe {
         assert_eq!(
             libc::kill(pty.pid() as i32, 0),
@@ -102,6 +108,7 @@ fn simulated_daemon_helper() {
         std::thread::sleep(Duration::from_millis(hold_ms));
         return;
     }
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     unsafe {
         // Simulated daemon crash: no Drop, no shutdown, no pipe close
         // performed by us — only the process death closes the control pipe.
@@ -126,6 +133,7 @@ fn parse_report(line: &str) -> (i32, i32) {
 /// classify the survivor as `StillAlive`). Only `ESRCH` proves the group has
 /// no member left, live or zombie.
 fn group_alive(pgid: i32) -> bool {
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     if unsafe { libc::kill(-pgid, 0) } == 0 {
         return true;
     }
@@ -135,6 +143,7 @@ fn group_alive(pgid: i32) -> bool {
 /// Same probe semantics for one pid: `EPERM` is "exists, not ours to signal"
 /// — a live target, never a settled one.
 fn pid_alive(pid: i32) -> bool {
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
@@ -168,6 +177,7 @@ fn read_line(fd: RawFd, timeout: Duration) -> Option<String> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: `pfd` is a live stack `pollfd` with the validated master fd; the timeout bounds the call.
         let r = unsafe {
             libc::poll(
                 &mut pfd,
@@ -178,6 +188,7 @@ fn read_line(fd: RawFd, timeout: Duration) -> Option<String> {
         if r <= 0 {
             return None;
         }
+        // SAFETY: the fd is owned/open on this path and the buffer is a live bounded slice whose length is passed exactly.
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n <= 0 {
             return None;
@@ -197,6 +208,7 @@ fn spawn_simulated_daemon(
     own_group: bool,
 ) -> (OwnedFd, std::process::Child) {
     let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a live 2-element stack array the kernel fills; the return value is checked.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
     let exe = std::env::current_exe().expect("current exe");
@@ -222,9 +234,11 @@ fn spawn_simulated_daemon(
         cmd.process_group(0);
     }
     let child = cmd.spawn().expect("spawn simulated daemon");
+    // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
     unsafe {
         libc::close(write_fd);
     }
+    // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
     (unsafe { OwnedFd::from_raw_fd(read_fd) }, child)
 }
 
@@ -247,6 +261,7 @@ fn daemon_crash_kills_the_whole_pty_group_and_leaves_no_zombie() {
         Duration::from_secs(10),
         "guardian must kill the whole pty group",
     );
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     unsafe {
         assert_eq!(libc::kill(-leader, 0), -1);
         assert_eq!(
@@ -315,6 +330,7 @@ fn a_healthy_daemon_does_not_trigger_the_guardian() {
     assert!(pid_alive(grandchild));
     // Clean up: SIGKILL the daemon (crash path), then the guardian settles
     // the group; reap the daemon.
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     unsafe {
         libc::kill(daemon.id() as i32, libc::SIGKILL);
     }
@@ -336,6 +352,7 @@ fn daemon_group_kill_does_not_take_the_guardian_with_it() {
         .expect("the simulated daemon reports its pids");
     let (leader, _grandchild) = parse_report(&line);
     let daemon_pgid = daemon.id() as i32;
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     unsafe {
         libc::kill(-daemon_pgid, libc::SIGKILL);
     }
@@ -346,6 +363,7 @@ fn daemon_group_kill_does_not_take_the_guardian_with_it() {
         Duration::from_secs(10),
         "the detached guardian must still kill the pty group",
     );
+    // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
     unsafe {
         assert_eq!(libc::kill(-leader, 0), -1);
         assert_eq!(

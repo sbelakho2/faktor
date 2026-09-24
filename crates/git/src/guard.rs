@@ -136,6 +136,7 @@ pub fn lease_verdict(owner_pid: u32, owner_created_ms: i64, observed: ObserveRes
 /// add a spawn site to a production crate; the static spawn authority scan
 /// enforces that).
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn unix_pid_start_marker(pid: u32) -> String {
     // SAFETY: `proc_bsdinfo` is a plain C POD struct whose all-zero bit
     // pattern is a valid initial value; the kernel fills it via
@@ -208,6 +209,7 @@ fn filetime_to_unix_ms(ft: windows_sys::Win32::Foundation::FILETIME) -> i64 {
 /// unopenable process yields `ERROR_ACCESS_DENIED` (UNKNOWN identity => live);
 /// any other failure is UNKNOWN too, never death.
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn platform_observe_process(pid: u32) -> ObserveResult {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FILETIME, INVALID_HANDLE_VALUE,
@@ -257,6 +259,7 @@ fn platform_observe_process(pid: u32) -> ObserveResult {
 /// string [`pid_start_marker`], checked by [`lease_check`], so `created_ms`
 /// is 0 here.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn platform_observe_process(pid: u32) -> ObserveResult {
     if pid == 0 {
         return ObserveResult::InvalidPid;

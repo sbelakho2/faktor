@@ -981,17 +981,21 @@ fn daemon_egress_transport(
     policy: &faktor_sandbox::SandboxPolicy,
     scan: OutboundScanConfig,
     addresses: EgressAddressPolicy,
-) -> Arc<dyn HttpTransport> {
+) -> Result<Arc<dyn HttpTransport>, String> {
     let destinations = policy
         .network
         .installed()
         .cloned()
         .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
-    Arc::new(PolicyCheckedHttpTransport::with_policy_scan_and_addresses(
+    // Construction is FALLIBLE: a client-build failure is a typed start-up
+    // refusal, never a silently degraded (fallback) client.
+    let transport = PolicyCheckedHttpTransport::try_with_policy_scan_and_addresses(
         destinations,
         Some(scan),
         addresses,
-    ))
+    )
+    .map_err(|e| format!("egress client construction: {e}"))?;
+    Ok(Arc::new(transport))
 }
 
 /// The daemon verification service from the configured `[verification]`
@@ -1239,13 +1243,13 @@ fn build_daemon_core(
         &sandbox_policy,
         egress.clone(),
         EgressAddressPolicy::EXTERNAL,
-    );
+    )?;
     // A second client object with the ONE explicit loopback exception,
     // built ONLY for entries whose typed config asked for it
     // (`allow_loopback`): every other entry keeps the external-only
     // transport, and no address class is ever allowed globally.
     let loopback_transport =
-        daemon_egress_transport(&sandbox_policy, egress.clone(), EgressAddressPolicy::LOCAL);
+        daemon_egress_transport(&sandbox_policy, egress.clone(), EgressAddressPolicy::LOCAL)?;
     // Steps 5-6 — provider registry + catalog/pricing: every configured
     // adapter is built through the checked transport its entry selected;
     // Ollama providers are kept CONCRETE for live probing (spec §10:
@@ -1315,10 +1319,11 @@ fn build_daemon_core(
         .parent()
         .map(|p| p.join("index_data"))
         .unwrap_or_else(|| std::path::PathBuf::from("index_data"));
-    let index = match faktor_index::IndexService::open(
+    let index = match faktor_index::IndexService::open_with_supervisor(
         store.clone(),
         index_data_root,
         workspaces.clone(),
+        supervisor.clone(),
     ) {
         Ok(svc) => {
             tracing::info!("repository IndexService hosted");
@@ -2992,7 +2997,8 @@ async fn serve_impl(
                 .map_err(|e| format!("updater store {}: {e}", db.display()))?,
         );
         let fetcher = Arc::new(faktor_updater::CheckedHttpFetcher::new(
-            faktor_provider::egress::CheckedHttpClient::with_policy(policy),
+            faktor_provider::egress::CheckedHttpClient::try_with_policy(policy)
+                .map_err(|e| format!("updater egress client: {e}"))?,
         ));
         let updater_config = faktor_updater::UpdaterConfig {
             channel: config
@@ -4211,7 +4217,8 @@ fn build_local_updater(
             .map_err(|e| format!("updater store {}: {e}", db.display()))?,
     );
     let fetcher = Arc::new(faktor_updater::CheckedHttpFetcher::new(
-        faktor_provider::egress::CheckedHttpClient::with_policy(policy),
+        faktor_provider::egress::CheckedHttpClient::try_with_policy(policy)
+            .map_err(|e| format!("updater egress client: {e}"))?,
     ));
     let config = faktor_updater::UpdaterConfig {
         channel: cfg.channel()?,
@@ -4732,6 +4739,7 @@ fn doctor_run_with_config(
     let mut lines: Vec<String> = Vec::new();
     let mut issues = 0usize;
     doctor_worker_plane_line(config_path, &mut lines, &mut issues);
+    doctor_sandbox_shell_line(config_path, &mut lines, &mut issues);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
             lines.push("store: ok".into());
@@ -5305,6 +5313,44 @@ fn doctor_index_reason_fragment(reason: &str) -> String {
 /// (`serve_config_and_semantic`: structural strictness, `[semantic]` split,
 /// semantic validation, provider/MCP/embedding/billing/worker bounds). A
 /// config the daemon would refuse is reported as `state=refused` — never as
+/// The doctor's shell-execution surface (item 10): reports the effective
+/// `[sandbox]` shell contract with its honest strength label, so an
+/// OS-isolated shell and a user-granted network-capable shell are never
+/// presented as equivalent. Uses the explicit `--config` when given and the
+/// daemon defaults otherwise; a config the daemon would refuse is reported
+/// as an issue, never silently rendered as a healthy state.
+fn doctor_sandbox_shell_line(
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let cfg = match config_path {
+        Some(path) => match serve_config_and_semantic(Some(path.to_path_buf())) {
+            Ok((config, _semantic)) => config,
+            // The config refusal is already reported loudly by
+            // doctor_worker_plane_line (the daemon would not start); do not
+            // imply any shell state from a refused config.
+            Err(_) => return,
+        },
+        None => config::Config::default(),
+    };
+    match cfg.sandbox_policy() {
+        Ok(policy) => {
+            let state = policy.shell_execution_state();
+            lines.push(format!(
+                "sandbox shell execution: {} (mode={}, network_guarantee={})",
+                state.strength_label(),
+                state.mode.as_tag(),
+                state.network_guarantee.as_tag(),
+            ));
+        }
+        Err(e) => {
+            lines.push(format!("sandbox shell execution: FAILED {e}"));
+            *issues += 1;
+        }
+    }
+}
+
 /// "enabled" — so the doctor cannot certify a daemon that would not start.
 fn doctor_worker_plane_line(
     config_path: Option<&std::path::Path>,
@@ -5617,19 +5663,23 @@ fn deep_doctor(session: &Arc<SessionManager>, lines: &mut Vec<String>, issues: &
     //     map of THIS process (informational: the zero-orphan guarantee is
     //     an in-process lifetime contract, not durable rows another process
     //     could audit).
-    {
-        let shared = ProcessSupervisor::shared();
-        let alive = shared.alive();
-        let session_owned = alive
-            .iter()
-            .filter(|c| matches!(c.owner, ProcessOwner::Session(_)))
-            .count();
-        lines.push(format!(
-            "process ownership: 0 durable session-owned process row(s) (ownership is in-memory only); daemon-level live children in this process: {} alive ({} registered, {} session-owned)",
-            alive.len(),
-            shared.registered(),
-            session_owned
-        ));
+    match ProcessSupervisor::try_shared() {
+        Ok(shared) => {
+            let alive = shared.alive();
+            let session_owned = alive
+                .iter()
+                .filter(|c| matches!(c.owner, ProcessOwner::Session(_)))
+                .count();
+            lines.push(format!(
+                "process ownership: 0 durable session-owned process row(s) (ownership is in-memory only); daemon-level live children in this process: {} alive ({} registered, {} session-owned)",
+                alive.len(),
+                shared.registered(),
+                session_owned
+            ));
+        }
+        Err(e) => lines.push(format!(
+            "process ownership: standalone process authority unavailable in this process: {e}"
+        )),
     }
 }
 
@@ -7187,7 +7237,10 @@ mod tests {
         // log gains the record). /bin/echo exists on the CI platforms.
         let specs = parse_hooks_env("post_tool:/bin/echo hook-fired");
         assert_eq!(specs.len(), 1);
-        let registry = Arc::new(faktor_hooks::HookRegistry::new());
+        let registry = Arc::new(faktor_hooks::HookRegistry::with_supervisor(
+            ProcessSupervisor::try_shared().expect("standalone supervisor"),
+            faktor_core::CapabilitySet::ALL,
+        ));
         for spec in specs {
             registry.register(spec).unwrap();
         }
@@ -7893,6 +7946,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     fn send_self_signal(signal: i32) {
         // SAFETY: `kill(2)` with our own pid and a valid signal number; the
         // signal tests install the tokio handlers BEFORE sending.
@@ -10200,7 +10254,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn daemon_secret_registry_blocks_a_configured_key_echo_before_connect() {
-        const KEY_ENV: &str = "KP_CLI_WIRING_FAKE_KEY";
+        const KEY_ENV: &str = "FAKTOR_TEST_CLI_WIRING_FAKE_KEY";
         const SECRET: &str = "kp-cli-secret-token-91f7c2e8d4";
         // The value must not trip the frozen GENERIC scan patterns (sk-*,
         // ghp_, AKIA, ...): only the configured-secret registry can catch
@@ -10262,7 +10316,7 @@ mod tests {
         )
         .unwrap();
         let cfg = serve_config(Some(path.clone())).expect("explicit sane config");
-        let supervisor = ProcessSupervisor::shared();
+        let supervisor = ProcessSupervisor::try_shared().expect("standalone supervisor");
         let service = daemon_verification(&cfg.verification, &supervisor);
         assert!(!service.is_disabled());
         let policy = service.policy();
@@ -10294,7 +10348,7 @@ mod tests {
         )
         .unwrap();
         let cfg = serve_config(Some(path)).expect("zero quick budget is a valid config");
-        let supervisor = ProcessSupervisor::shared();
+        let supervisor = ProcessSupervisor::try_shared().expect("standalone supervisor");
         let service = daemon_verification(&cfg.verification, &supervisor);
         assert!(
             service.is_disabled(),
@@ -10356,7 +10410,7 @@ mod tests {
         // (supervisor-rooted, daemon envelope) runs a hook whose env is
         // cleared EXACTLY (only explicit entries + FAKTOR_HOOK_INPUT), and
         // the audit row lands with the bounded stdout.
-        std::env::set_var("KP_DAEMON_ONLY_SECRET", "must-not-leak-to-hooks");
+        std::env::set_var("FAKTOR_TEST_DAEMON_ONLY_SECRET", "must-not-leak-to-hooks");
         let dir = tempfile::tempdir().unwrap();
         let session =
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
@@ -10366,7 +10420,7 @@ mod tests {
             events: vec![faktor_hooks::HookEvent::PreTool],
             command: "/usr/bin/env".into(),
             args: vec![],
-            env: vec![("KP_HOOK_VISIBLE".into(), "visible".into())],
+            env: vec![("FAKTOR_TEST_HOOK_VISIBLE".into(), "visible".into())],
             env_allowlist: true,
             deadline_ms: 5000,
             failure_policy: faktor_hooks::FailurePolicy::FailClosed,
@@ -10383,7 +10437,7 @@ mod tests {
         assert_eq!(audit[0].hook_id, "env-0");
         let stdout = &audit[0].stdout_head;
         assert!(
-            stdout.contains("KP_HOOK_VISIBLE=visible"),
+            stdout.contains("FAKTOR_TEST_HOOK_VISIBLE=visible"),
             "explicit entries pass: {stdout}"
         );
         assert!(
@@ -10391,7 +10445,7 @@ mod tests {
             "the input JSON rides the env: {stdout}"
         );
         assert!(
-            !stdout.contains("KP_DAEMON_ONLY_SECRET"),
+            !stdout.contains("FAKTOR_TEST_DAEMON_ONLY_SECRET"),
             "env-clear exact: the daemon env must never reach the hook: {stdout}"
         );
         // The run went through the supervisor registry and left nothing
@@ -10401,7 +10455,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "child leaked");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        std::env::remove_var("KP_DAEMON_ONLY_SECRET");
+        std::env::remove_var("FAKTOR_TEST_DAEMON_ONLY_SECRET");
     }
 
     #[test]
@@ -10774,6 +10828,7 @@ mod tests {
     /// load (`EAGAIN`/`ENOMEM`) can never be misread as "the child died", and
     /// the probe matches the wait's observable state exactly.
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     fn pid_probe(pid: u32) -> Result<(), i32> {
         if pid == 0 {
             return Err(libc::ESRCH);
@@ -12336,9 +12391,9 @@ mod tests {
 
     #[test]
     fn daemon_outbound_scan_registers_every_configured_commerce_credential_value() {
-        const KEY_ENV: &str = "KP_CLI_COMMERCE_SCAN_KEY";
-        const ID_ENV: &str = "KP_CLI_COMMERCE_SCAN_ID";
-        const SECRET_ENV: &str = "KP_CLI_COMMERCE_SCAN_SECRET";
+        const KEY_ENV: &str = "FAKTOR_TEST_CLI_COMMERCE_SCAN_KEY";
+        const ID_ENV: &str = "FAKTOR_TEST_CLI_COMMERCE_SCAN_ID";
+        const SECRET_ENV: &str = "FAKTOR_TEST_CLI_COMMERCE_SCAN_SECRET";
         // Values must not trip the frozen GENERIC patterns (sk-*, AKIA, …):
         // only the configured-secret registry can catch them, so a hit proves
         // the commerce credential VALUE was registered by name resolution.

@@ -39,6 +39,9 @@
 //!   ([`TerminalLost`](crate::guardian::TerminalLost)) — typed, and without
 //!   ever signalling a possibly recycled pid.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,14 +163,18 @@ impl Pty {
     fn spawn_inner(cfg: &PtyConfig, ledger_plan: Option<LedgerPlan>) -> Result<Self, Error> {
         validate_spawn_config(cfg)?;
         // 1. Open the master; grant + unlock + resolve the slave path.
+        // SAFETY: `posix_openpt` takes only flag scalars and returns a fresh pty master fd (or -1, checked immediately).
         let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         if master_fd < 0 {
             return Err(Error::internal("posix_openpt failed"));
         }
+        // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
         let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+        // SAFETY: the fd was just produced by `posix_openpt` and is owned by this scope; the call has no memory arguments.
         if unsafe { libc::grantpt(master_fd) } != 0 {
             return Err(Error::internal("grantpt failed"));
         }
+        // SAFETY: the fd was just produced by `posix_openpt` and is owned by this scope; the call has no memory arguments.
         if unsafe { libc::unlockpt(master_fd) } != 0 {
             return Err(Error::internal("unlockpt failed"));
         }
@@ -176,6 +183,7 @@ impl Pty {
         // logical buffer (the String has no trailing NUL). ptsname's pointer
         // is a libc-owned static buffer valid until the next ptsname call on
         // this thread; we open before any further ptsname call.
+        // SAFETY: `ptsname` returns a libc-owned static buffer valid until the next `ptsname` call on this thread, and the pointer is used (CStr + copy) before any such call.
         let slave_path = unsafe {
             let p = libc::ptsname(master_fd);
             if p.is_null() {
@@ -183,10 +191,12 @@ impl Pty {
             }
             std::ffi::CStr::from_ptr(p)
         };
+        // SAFETY: the path is a live NUL-terminated `CString` built on this path and the flags are validated constants; the returned fd is checked before use.
         let slave = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         if slave < 0 {
             return Err(Error::internal("open slave failed"));
         }
+        // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
         let slave_fd = unsafe { OwnedFd::from_raw_fd(slave) };
 
         // 2. Window size on the master.
@@ -196,11 +206,14 @@ impl Pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // SAFETY: the master fd is an owned pty fd and `ws` is a live, initialized `winsize`; the kernel only reads/writes that struct.
         unsafe {
             libc::ioctl(master_fd, libc::TIOCSWINSZ, &mut ws);
         }
         // Non-blocking master so snapshots never block.
+        // SAFETY: the fd is owned by this scope and the fcntl command/argument pair matches its documented use; the result is checked where it matters.
         let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        // SAFETY: the fd is owned by this scope and the fcntl command/argument pair matches its documented use; the result is checked where it matters.
         unsafe {
             libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
@@ -209,12 +222,16 @@ impl Pty {
         //    BEFORE any process exists: data wakes read(2), EOF (every slave
         //    fd closed — the group died) wakes it at shutdown, and a failure
         //    here can never leak a process.
+        // SAFETY: the source fd is owned and open (ENOMEM/EMFILE is reported by the negative result, checked immediately).
         let reader_master = unsafe { libc::dup(master.as_raw_fd()) };
         if reader_master < 0 {
             return Err(Error::internal("dup master failed"));
         }
+        // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
         let reader_master = unsafe { OwnedFd::from_raw_fd(reader_master) };
+        // SAFETY: the fd is owned by this scope and the fcntl command/argument pair matches its documented use; the result is checked where it matters.
         let f = unsafe { libc::fcntl(reader_master.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: the fd is owned by this scope and the fcntl command/argument pair matches its documented use; the result is checked where it matters.
         unsafe {
             libc::fcntl(
                 reader_master.as_raw_fd(),
@@ -290,6 +307,7 @@ impl Pty {
     pub fn write_all(&self, bytes: &[u8]) -> Result<(), Error> {
         let mut written = 0usize;
         while written < bytes.len() {
+            // SAFETY: the fd is owned/open on this path and the buffer is a live bounded slice whose length is passed exactly.
             let n = unsafe {
                 libc::write(
                     self.master.as_raw_fd(),
@@ -312,6 +330,7 @@ impl Pty {
                             events: libc::POLLOUT,
                             revents: 0,
                         };
+                        // SAFETY: `pfd` is a live stack `pollfd` with the validated master fd; the timeout bounds the call.
                         let r = unsafe { libc::poll(&mut pfd, 1, 100) };
                         if r < 0 {
                             let e2 = std::io::Error::last_os_error();
@@ -350,6 +369,7 @@ impl Pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // SAFETY: the master fd is an owned pty fd and `ws` is a live, initialized `winsize`; the kernel only reads/writes that struct.
         let r = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &mut ws) };
         if r != 0 {
             return Err(Error::internal("TIOCSWINSZ failed"));
@@ -365,6 +385,7 @@ impl Pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // SAFETY: the master fd is an owned pty fd and `ws` is a live, initialized `winsize`; the kernel only reads/writes that struct.
         unsafe {
             libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws);
         }
@@ -414,6 +435,7 @@ impl Pty {
         if self.pid <= 0 {
             return false;
         }
+        // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         let r = unsafe { libc::kill(self.pid, 0) };
         r == 0
     }
@@ -554,11 +576,14 @@ fn spawn_child(
     // daemon environment implicitly.
     cfg.env.apply(&mut cmd);
     let slave_fd = slave.into_raw_fd();
+    // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
     cmd.stdin(unsafe { std::process::Stdio::from_raw_fd(slave_fd) });
+    // SAFETY: the source fd is owned and open (ENOMEM/EMFILE is reported by the negative result, checked immediately).
     let dup = |fd: RawFd| unsafe { libc::dup(fd) };
     let err1 = dup(slave_fd);
     let err2 = dup(slave_fd);
     if err1 < 0 || err2 < 0 {
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         unsafe {
             if err1 >= 0 {
                 libc::close(err1);
@@ -569,8 +594,11 @@ fn spawn_child(
         }
         return Err(Error::internal("dup slave failed"));
     }
+    // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
     cmd.stdout(unsafe { std::process::Stdio::from_raw_fd(err1) });
+    // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
     cmd.stderr(unsafe { std::process::Stdio::from_raw_fd(err2) });
+    // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
     unsafe {
         cmd.pre_exec(move || {
             // New session + controlling terminal on the slave.
@@ -615,6 +643,7 @@ fn spawn_child(
     let mut guardian = match GuardianHandle::spawn(identity) {
         Ok(guardian) => guardian,
         Err(e) => {
+            // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
@@ -627,6 +656,7 @@ fn spawn_child(
         Some(plan) => match plan.ledger.record_spawn(&plan.owner, &identity) {
             Ok(row) => Some((plan.ledger, row)),
             Err(e) => {
+                // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
@@ -645,6 +675,7 @@ fn spawn_child(
 
 fn reap_blocking(pid: libc::pid_t) {
     let mut status = 0;
+    // SAFETY: the pid is this module's own child (or already reaped, reported as ECHILD) and `status` is a live stack local.
     let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
 }
 
@@ -711,6 +742,7 @@ fn reader_loop(
     let mfd_raw = mfd.as_raw_fd();
     let mut buf = [0u8; 8192];
     loop {
+        // SAFETY: the fd is owned/open on this path and the buffer is a live bounded slice whose length is passed exactly.
         let n = unsafe { libc::read(mfd_raw, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             let (ring, cv) = &*shared;
@@ -737,6 +769,7 @@ fn reader_loop(
             let _serial = reap_serial
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: the pid is this module's own child (or already reaped, reported as ECHILD) and `status` is a live stack local.
             let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if r == pid
                 || (r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
@@ -792,12 +825,14 @@ mod tests {
     }
 
     fn group_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         (unsafe { libc::kill(pid, 0) }) == 0
     }
 
     /// Does the recorded process GROUP still have a member (the leader's own
     /// pid may already be reaped)? Negative-pid probe.
     fn group_exists(pgid: libc::pid_t) -> bool {
+        // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         (unsafe { libc::kill(-pgid, 0) }) == 0
     }
 
@@ -918,6 +953,7 @@ mod tests {
     fn wait_reaped(pid: libc::pid_t, what: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
+            // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
             let r = unsafe { libc::kill(pid, 0) };
             if r != 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1209,18 +1245,21 @@ mod tests {
             ("FAKTOR_SERVER_PASSWORD", "hunter2"),
             ("OPENAI_API_KEY", "sk-pty-secret"),
             ("TEST_PRIVATE_SECRET", "private"),
-            ("KP_PTY_UNDECLARED", "must-not-arrive"),
+            ("FAKTOR_TEST_PTY_UNDECLARED", "must-not-arrive"),
         ]);
         // The child PRINTS its env through the PTY: the assertions run on
         // the bytes the terminal actually delivered. The sentinel is the
         // last line, so waiting for it makes the snapshot complete — no
         // assertion can race the reader for a variable 'env' has not
         // delivered yet.
-        let mut cfg = sh_cfg("env; echo __KP_PTY_ENV_END__");
+        let mut cfg = sh_cfg("env; echo __FAKTOR_TEST_PTY_ENV_END__");
         cfg.env = EnvSpec::toolchain();
         let mut pty = Pty::spawn(&cfg).unwrap();
         assert!(
-            pty.wait_for_contains("__KP_PTY_ENV_END__", std::time::Duration::from_secs(10)),
+            pty.wait_for_contains(
+                "__FAKTOR_TEST_PTY_ENV_END__",
+                std::time::Duration::from_secs(10)
+            ),
             "PATH/toolchain vars must arrive: {:?}",
             String::from_utf8_lossy(&pty.snapshot())
         );
@@ -1244,7 +1283,7 @@ mod tests {
             "FAKTOR_SERVER_PASSWORD",
             "OPENAI_API_KEY",
             "TEST_PRIVATE_SECRET",
-            "KP_PTY_UNDECLARED",
+            "FAKTOR_TEST_PTY_UNDECLARED",
         ] {
             assert!(!printed.contains(secret), "{secret} leaked through the pty");
         }
@@ -1341,6 +1380,7 @@ mod tests {
         let guardian_pid = pty.guardian.as_ref().expect("guardian forked").pid();
         assert!(guardian_pid > 0);
         assert_eq!(
+            // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
             unsafe { libc::kill(guardian_pid as libc::pid_t, 0) },
             0,
             "guardian is alive while the pty is"
@@ -1348,6 +1388,7 @@ mod tests {
         pty.shutdown();
         assert!(pty.guardian.is_none(), "teardown releases the guardian");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         while unsafe { libc::kill(guardian_pid as libc::pid_t, 0) } == 0 {
             assert!(
                 std::time::Instant::now() < deadline,

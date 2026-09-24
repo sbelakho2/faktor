@@ -507,9 +507,11 @@ pub struct CloudSsoCfg {
     #[serde(default)]
     pub client_id: Option<String>,
     /// The payload NAME (inside `[cloud] payload_dir`) of the confidential
-    /// client's secret. Optional: absent = the public PKCE client path.
-    #[serde(default)]
-    pub client_secret: Option<String>,
+    /// client's secret. Optional: absent = the public PKCE client path. The
+    /// Rust field carries a NAME (not the secret itself), hence the
+    /// `_payload` suffix; the config wire key is `client_secret`.
+    #[serde(default, rename = "client_secret")]
+    pub client_secret_payload: Option<String>,
     /// How the confidential client authenticates at the token endpoint:
     /// `client_secret_post` (the default when a secret is staged) or
     /// `client_secret_basic`. Only meaningful together with `client_secret`;
@@ -542,9 +544,11 @@ pub struct CloudGithubAppCfg {
     pub enabled: bool,
     #[serde(default)]
     pub app_id: Option<u64>,
-    /// The payload NAME of the app's PKCS#8 private key PEM.
-    #[serde(default)]
-    pub private_key: Option<String>,
+    /// The payload NAME of the app's PKCS#8 private key PEM. The Rust field
+    /// carries a NAME (not the key itself), hence the different name; the
+    /// config wire key is `private_key`.
+    #[serde(default, rename = "private_key")]
+    pub key_payload: Option<String>,
     /// The payload NAME of the app's webhook HMAC secret.
     #[serde(default)]
     pub webhook_secret: Option<String>,
@@ -809,12 +813,12 @@ impl CloudSsoCfg {
     /// slash and a bounded client id, a bounded payload name for the
     /// optional client secret and the documented cache bounds.
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(client_secret) = &self.client_secret {
+        if let Some(client_secret) = &self.client_secret_payload {
             crate::payload::PayloadDir::validate_name(client_secret)
                 .map_err(|e| format!("cloud sso: client_secret {e}"))?;
         }
         if let Some(method) = &self.client_secret_method {
-            if self.client_secret.is_none() {
+            if self.client_secret_payload.is_none() {
                 return Err(
                     "cloud sso: client_secret_method requires a `client_secret` payload name"
                         .into(),
@@ -950,7 +954,7 @@ impl CloudGithubAppCfg {
     /// NAMES and the tenant organization, and its api base must validate.
     pub fn validate(&self) -> Result<(), String> {
         for (field, name) in [
-            ("private_key", self.private_key.as_deref()),
+            ("private_key", self.key_payload.as_deref()),
             ("webhook_secret", self.webhook_secret.as_deref()),
         ] {
             if let Some(name) = name {
@@ -972,7 +976,7 @@ impl CloudGithubAppCfg {
         if self.app_id.unwrap_or(0) == 0 {
             return Err("cloud github_app: an enabled section requires a non-zero `app_id`".into());
         }
-        if self.private_key.is_none() {
+        if self.key_payload.is_none() {
             return Err(
                 "cloud github_app: an enabled section requires `private_key` (a payload name)"
                     .into(),
@@ -2805,9 +2809,15 @@ impl Default for VerificationCfg {
 /// crate's rule syntax (e.g. `http://127.0.0.1:8080`); `None` keeps the
 /// sandbox crate's frozen default provider-endpoint allowlist, while an
 /// explicit list — even an empty one (deny-all) — replaces it. The
-/// `network_guarantee` (`none` default, `best_effort`, `required`) declares
+/// `network_guarantee` (`required` default, `best_effort`, `none`) declares
 /// what the policy requires of OS-level network isolation for shell
-/// commands. Unknown keys inside the section are parse errors.
+/// commands; the `shell` mode (`os_isolated` default,
+/// `network_capable_user_granted`) distinguishes an OS-isolated shell from
+/// the strictly weaker, EXPLICITLY user-granted network-capable shell.
+/// Choosing `network_guarantee` other than `required` REQUIRES setting
+/// `shell = "network_capable_user_granted"`: full functionality is an
+/// explicit grant, never a silent default, and the two are never presented
+/// as equivalent strength. Unknown keys inside the section are parse errors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCfg {
@@ -2815,6 +2825,8 @@ pub struct SandboxCfg {
     pub network: Option<Vec<String>>,
     #[serde(default)]
     pub network_guarantee: SandboxGuarantee,
+    #[serde(default)]
+    pub shell: faktor_sandbox::ShellExecutionMode,
 }
 
 /// The config FILE shape: `Config` plus `config_version` (default 1 when
@@ -3031,6 +3043,8 @@ impl Config {
                 NetworkGate::parse(rows).map_err(|e| format!("network rule error: {e}"))?;
         }
         policy.network_guarantee = self.sandbox.network_guarantee;
+        policy.shell_execution = self.sandbox.shell;
+        policy.validate()?;
         Ok(policy)
     }
 }
@@ -5327,11 +5341,11 @@ mod tests {
 
     #[test]
     fn keys_read_from_env_not_file() {
-        std::env::set_var("KP_TEST_KEY", "secret-value");
+        std::env::set_var("FAKTOR_TEST_KEY", "secret-value");
         let cfg = ProviderCfg::OpenAi {
             id: "t".into(),
             base_url: "http://x".into(),
-            api_key_env: Some("KP_TEST_KEY".into()),
+            api_key_env: Some("FAKTOR_TEST_KEY".into()),
             api: None,
             pricing: None,
             allow_loopback: true,
@@ -5340,7 +5354,7 @@ mod tests {
             cfg.key().as_ref().map(SecretValue::expose),
             Some("secret-value")
         );
-        std::env::remove_var("KP_TEST_KEY");
+        std::env::remove_var("FAKTOR_TEST_KEY");
         assert_eq!(
             cfg.key(),
             None,
@@ -5829,11 +5843,13 @@ mod tests {
 
     #[test]
     fn sandbox_section_maps_guarantees_and_rows_strictly() {
-        use faktor_sandbox::{SandboxGuarantee, SandboxPolicy};
-        // Absent section: crate defaults (frozen gate, guarantee None).
+        use faktor_sandbox::{SandboxGuarantee, SandboxPolicy, ShellExecutionMode};
+        // Absent section: crate defaults (frozen gate, secure guarantee
+        // Required + OS-isolated shell).
         let cfg = Config::default();
         let policy = cfg.sandbox_policy().unwrap();
-        assert_eq!(policy.network_guarantee, SandboxGuarantee::None);
+        assert_eq!(policy.network_guarantee, SandboxGuarantee::Required);
+        assert_eq!(policy.shell_execution, ShellExecutionMode::OsIsolated);
         assert!(policy.network.installed().is_some(), "frozen allowlist");
         assert_eq!(
             policy,
@@ -5860,24 +5876,48 @@ mod tests {
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.sandbox_policy().unwrap(), policy);
-        // best_effort parses; a hostile guarantee value is a parse error;
-        // unknown keys inside [sandbox] are rejected.
+        // A non-Required guarantee WITHOUT the explicit user grant is a
+        // typed policy error: full functionality is opt-in, never a silent
+        // default, and the error names the exact key to set.
+        std::fs::write(&path, r#"{"sandbox": {"network_guarantee": "none"}}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let e = cfg.sandbox_policy().expect_err("implicit grant refused");
+        assert!(e.contains("network_capable_user_granted"), "{e}");
+        // best_effort/none parse WITH the explicit network-capable shell
+        // grant; a hostile guarantee value is a parse error; unknown keys
+        // inside [sandbox] are rejected.
         for (text, expect) in [
             (
-                r#"{"sandbox": {"network_guarantee": "best_effort"}}"#,
+                r#"{"sandbox": {"network_guarantee": "best_effort", "shell": "network_capable_user_granted"}}"#,
                 SandboxGuarantee::BestEffort,
             ),
             (
-                r#"{"sandbox": {"network_guarantee": "none"}}"#,
+                r#"{"sandbox": {"network_guarantee": "none", "shell": "network_capable_user_granted"}}"#,
                 SandboxGuarantee::None,
             ),
         ] {
             std::fs::write(&path, text).unwrap();
             let cfg = Config::load(&path).unwrap();
-            assert_eq!(cfg.sandbox_policy().unwrap().network_guarantee, expect);
+            let policy = cfg.sandbox_policy().unwrap();
+            assert_eq!(policy.network_guarantee, expect);
+            assert_eq!(
+                policy.shell_execution,
+                ShellExecutionMode::NetworkCapableUserGranted
+            );
+            assert_eq!(policy.spawn_profile().shell, "network_capable_user_granted");
         }
+        // The explicit grant is disjoint from OS isolation: Required +
+        // network_capable_user_granted is refused typed.
+        std::fs::write(
+            &path,
+            r#"{"sandbox": {"shell": "network_capable_user_granted"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.sandbox_policy().is_err(), "contradictory pairing");
         for bad in [
             r#"{"sandbox": {"network_guarantee": "mandatory"}}"#,
+            r#"{"sandbox": {"shell": "network_capable"}}"#,
             r#"{"sandbox": {"network": ["http://127.0.0.1:1"], "bogus": true}}"#,
         ] {
             std::fs::write(&path, bad).unwrap();

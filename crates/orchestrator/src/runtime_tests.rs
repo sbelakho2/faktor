@@ -2768,9 +2768,10 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
     let copied = faktor_fs::snapshot_tree(&reviewer_root, 100).unwrap();
     // Manifest purity (Wave A item 4): the materialized reviewer root
     // contains EXACTLY the manifest entries — a concurrent CAS writer's
-    // in-flight `.kp-tmp-*` temporaries in the source are skipped at copy
-    // time (fs::copy_tree), so they can never appear inside the
-    // materialized root, whatever the race timing.
+    // in-flight atomic temporaries (`.faktor-tmp-*` now, legacy `.kp-tmp-*`
+    // from older releases) in the source are skipped at copy time
+    // (fs::copy_tree), so they can never appear inside the materialized
+    // root, whatever the race timing.
     assert_eq!(
         copied.len(),
         2,
@@ -2782,9 +2783,8 @@ async fn reviewer_spawn_copies_whole_files_under_concurrent_cas_writers_and_surv
             && !e
                 .path
                 .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains(".kp-tmp-")),
+                .map(|n| faktor_fs::atomic::is_internal_temp_name(&n.to_string_lossy()))
+                .unwrap_or(true)),
         "no internal temp metadata may exist in the materialized root"
     );
     let real_files: Vec<&faktor_fs::SnapshotEntry> = copied.iter().collect();

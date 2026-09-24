@@ -332,8 +332,9 @@ impl InstallLayout {
     /// either the previous state or the COMPLETE release, never a
     /// manifest-less `versions/<id>/faktor` that the bootstrap launcher would
     /// refuse. An existing INCOMPLETE/corrupt directory is rebuilt the same
-    /// way (temp built first, then replaced), and stale `.kp-tmp-` residue of
-    /// this release is cleared. Idempotent: an already-materialized release
+    /// way (temp built first, then replaced), and stale atomic-temp residue
+    /// of this release under either spelling (`.faktor-tmp-*` / legacy
+    /// `.kp-tmp-*`) is cleared. Idempotent: an already-materialized release
     /// with the identical binary and manifest is kept; a complete directory
     /// whose signed manifest bytes changed is re-signed in place (atomic file
     /// replace — it is already complete).
@@ -409,7 +410,7 @@ impl InstallLayout {
         // manifest is written first; a crash leaves only temp residue, which
         // is never a release id callers can derive and is cleared below.
         let tmp = versions.join(format!(
-            ".{release_id}.kp-tmp-{}-{}",
+            ".{release_id}.faktor-tmp-{}-{}",
             std::process::id(),
             unique_nonce()
         ));
@@ -456,12 +457,15 @@ impl InstallLayout {
         Ok(dir)
     }
 
-    /// Remove stale `.kp-tmp-` build residue of one release (a crash during
+    /// Remove stale atomic-temp build residue of one release (a crash during
     /// [`InstallLayout::materialize_release`] leaves only hidden temp
-    /// directories). A cleanup failure is logged, never silently discarded;
-    /// it can never make the just-published release incomplete.
+    /// directories). BOTH spellings are recognized — the current
+    /// `.{id}.faktor-tmp-*` and legacy `.{id}.kp-tmp-*` crash residue — so an
+    /// upgrade over an older installation never leaves unrecognized temp
+    /// directories behind. A cleanup failure is logged, never silently
+    /// discarded; it can never make the just-published release incomplete.
     fn clear_stale_release_temps(&self, release_id: &str) {
-        let prefix = format!(".{release_id}.kp-tmp-");
+        let prefix = format!(".{release_id}.");
         let entries = match fs::read_dir(self.versions_dir()) {
             Ok(entries) => entries,
             Err(e) => {
@@ -477,7 +481,7 @@ impl InstallLayout {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(&prefix) || !faktor_fs::atomic::is_internal_temp_name(name) {
                 continue;
             }
             if let Some(note) = remove_temp_dir(&entry.path()) {
@@ -524,7 +528,7 @@ impl InstallLayout {
             )));
         }
         let tmp = self.root().join(format!(
-            ".{LAUNCHER_FILE_NAME}.kp-tmp-{}-{}",
+            ".{LAUNCHER_FILE_NAME}.faktor-tmp-{}-{}",
             std::process::id(),
             unique_nonce()
         ));

@@ -26,6 +26,7 @@ use faktor_provider::catalog::{
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{execute_get, execute_post_json, EgressError, HttpTransport};
+use faktor_provider::egress::{BudgetComponent, BudgetedBody, ResponseBudget};
 use faktor_provider::sanitize::ErrorScrubber;
 use faktor_provider::transport::{
     guarded_lines, utf8_line_stream, StreamDeadlines, MAX_LINE_BYTES, PROVIDER_CEILING_MS,
@@ -138,15 +139,24 @@ enum ErrorBodyRead {
     Stalled,
 }
 
-/// Read an error body under a hard BYTE cap and a wall-clock bound: chunked
-/// reads only, at most `cap` bytes retained (the rest is dropped, never
-/// buffered), and a typed note appended when the body was truncated or the
-/// read stalled. The HTTP status still classifies the error.
-async fn read_error_body_bounded(mut resp: reqwest::Response, cap: usize, bound_ms: u64) -> String {
+/// Read an error body under a hard BYTE cap and a wall-clock bound through
+/// the shared budget-aware reader: at most `cap` bytes retained (the rest
+/// is dropped, never buffered), and a typed note appended when the body was
+/// truncated or the read stalled. The HTTP status still classifies the
+/// error. The budget is REQUIRED — an adapter never reads a response body
+/// directly.
+async fn read_error_body_bounded(resp: reqwest::Response, cap: usize, bound_ms: u64) -> String {
+    let budget_ms = if bound_ms == 0 {
+        PROVIDER_CEILING_MS
+    } else {
+        bound_ms
+    };
+    let budget = ResponseBudget::from_millis(budget_ms, budget_ms, budget_ms, cap as u64, None);
     let read = async {
+        let mut body = BudgetedBody::new(resp, budget);
         let mut out: Vec<u8> = Vec::new();
         loop {
-            match resp.chunk().await {
+            match body.next_chunk().await {
                 Ok(Some(chunk)) => {
                     if out.len().saturating_add(chunk.len()) > cap {
                         let keep = cap.saturating_sub(out.len());
@@ -154,6 +164,16 @@ async fn read_error_body_bounded(mut resp: reqwest::Response, cap: usize, bound_
                         return ErrorBodyRead::Truncated(out);
                     }
                     out.extend_from_slice(&chunk);
+                }
+                // The budget refused the chunk that would cross the cap:
+                // exactly the historical truncation semantics.
+                Err(EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Bytes,
+                    ..
+                }) => return ErrorBodyRead::Truncated(out),
+                // A stalled read keeps the historical "stalled" note.
+                Err(EgressError::ResponseBudgetExceeded { .. }) => {
+                    return ErrorBodyRead::Stalled;
                 }
                 Ok(None) | Err(_) => return ErrorBodyRead::Complete(out),
             }
@@ -908,7 +928,10 @@ pub(crate) fn ollama_chat_stream(
                                 ));
                             }
                             let lines: LineStream = Box::pin(guarded_lines(
-                                utf8_line_stream(r.bytes_stream(), MAX_LINE_BYTES),
+                                utf8_line_stream(
+                                    BudgetedBody::new(r, deadlines.response_budget()).into_stream(),
+                                    MAX_LINE_BYTES,
+                                ),
                                 deadlines,
                                 cancel.clone(),
                             ));
@@ -1347,28 +1370,30 @@ fn validate_embedding_batch(inputs: &[String]) -> Result<(), ProviderError> {
     Ok(())
 }
 
-/// Read a response body with a hard byte cap: a hostile daemon can never
-/// stream an unbounded body into memory. Over the cap is a typed
-/// `Malformed` refusal (retrying the same hostile body can never help).
-async fn read_body_bounded(
-    mut resp: reqwest::Response,
-    cap: usize,
-) -> Result<Vec<u8>, ProviderError> {
-    let mut out: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| ProviderError::new(ProviderErrorKind::Network, format!("ollama body: {e}")))?
-    {
-        if out.len().saturating_add(chunk.len()) > cap {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Malformed,
-                format!("ollama /api/embed response exceeds the {cap}-byte bound"),
-            ));
-        }
-        out.extend_from_slice(&chunk);
+/// Read a response body with a hard byte cap through the shared
+/// budget-aware reader: a hostile daemon can never stream an unbounded body
+/// into memory. Over the cap is a typed `Malformed` refusal (retrying the
+/// same hostile body can never help); any other budget/transport failure is
+/// the retryable `Network` error.
+async fn read_body_bounded(resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, ProviderError> {
+    let budget = ResponseBudget::for_timeout(
+        std::time::Duration::from_millis(PROVIDER_CEILING_MS),
+        cap as u64,
+    );
+    match BudgetedBody::new(resp, budget).read_all().await {
+        Ok(bytes) => Ok(bytes),
+        Err(EgressError::ResponseBudgetExceeded {
+            component: BudgetComponent::Bytes,
+            ..
+        }) => Err(ProviderError::new(
+            ProviderErrorKind::Malformed,
+            format!("ollama /api/embed response exceeds the {cap}-byte bound"),
+        )),
+        Err(e) => Err(ProviderError::new(
+            ProviderErrorKind::Network,
+            format!("ollama body: {e}"),
+        )),
     }
-    Ok(out)
 }
 
 /// Lower one `/api/embed` body into a validated [`EmbeddingResponse`]:

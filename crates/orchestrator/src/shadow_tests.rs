@@ -13,6 +13,9 @@
 //! The "shadowed drive writes" below are staged as DIRECT writes into the
 //! shadow root — the exact operation a shadow-aware tool context performs.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::fs;
 use std::path::{Path, PathBuf};
 

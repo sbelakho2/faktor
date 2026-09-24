@@ -40,6 +40,9 @@
 //! continues inside the pinned directory), which the post-open identity net
 //! in `lib.rs` then cross-checks against the path name.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::io;

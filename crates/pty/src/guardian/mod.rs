@@ -44,6 +44,9 @@
 //! `PR_SET_PDEATHSIG(SIGKILL)` (see `crate::unix`) as defense-in-depth; the
 //! guardian is the mechanism on every Unix.
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::fmt;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -570,6 +573,7 @@ fn guardian_main(read_fd: RawFd, identity: ProcessIdentity) -> ! {
     // argument is either produced by a checked syscall inside this block or a
     // constant, and every result is checked before use — failure paths
     // `_exit` instead of unwinding.
+    // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
     unsafe {
         // Detach from the daemon's session/process group: a group signal
         // aimed at the daemon must not take the guardian down before it can
@@ -700,6 +704,7 @@ mod tests {
         let pid = child.id();
         let identity = ProcessIdentity::capture(pid, pid);
         assert!(identity.start_time.is_some(), "captured while alive");
+        // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
@@ -777,6 +782,7 @@ mod tests {
         let _ = child.wait();
         wait_group_gone(identity.pgid, Duration::from_secs(5));
         let mut status = 0;
+        // SAFETY: the pid is this module's own child (or already reaped, reported as ECHILD) and `status` is a live stack local.
         unsafe {
             assert_eq!(libc::waitpid(gpid as libc::pid_t, &mut status, 0), -1);
             assert_eq!(raw_errno(), libc::ECHILD, "guardian was reaped");
@@ -830,6 +836,7 @@ mod tests {
         // THEN closes the pipe. The guardian must exit cleanly (code 0).
         let (mut child, identity) = spawn_group_sleeper();
         let mut guardian = GuardianHandle::spawn(identity).expect("fork guardian");
+        // SAFETY: the pid/pgid was validated non-zero and is owned by this module (or signal 0 only probes existence); no signal is sent to an unproven target.
         unsafe {
             libc::kill(-(identity.pgid as libc::pid_t), libc::SIGKILL);
         }

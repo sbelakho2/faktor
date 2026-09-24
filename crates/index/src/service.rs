@@ -51,6 +51,7 @@ use faktor_core::cancellation::CancellationToken;
 use faktor_core::id::WorkspaceId;
 use faktor_fs::{FsEventKind, WorkspaceFileService, WorkspaceHandle};
 use faktor_store::Store;
+use faktor_terminal::ProcessSupervisor;
 
 use crate::cold::ColdEvidenceProvider;
 use crate::embedding::{
@@ -190,6 +191,11 @@ pub enum IndexError {
     /// typed and diagnosable; never normalized into a clean-looking value.
     #[error("corrupt persisted index state: {0}")]
     CorruptState(String),
+    /// The process authority the index needs for cold git/rg children could
+    /// not be initialized (standalone [`IndexService::open`] path only:
+    /// daemon graphs inject the daemon's supervisor and never hit this).
+    #[error("index process authority unavailable: {0}")]
+    ProcessAuthority(String),
 }
 
 /// One immutable published-generation snapshot. Holding an [`IndexView`]
@@ -256,6 +262,10 @@ struct Inner {
     store: Arc<Store>,
     data_root: PathBuf,
     fs: Arc<WorkspaceFileService>,
+    /// The daemon's ONE process supervisor, injected at open time and
+    /// carried into every cold git/rg runner this service builds. No global
+    /// fallback: the index never constructs its own process authority.
+    supervisor: Arc<ProcessSupervisor>,
     cfg: Mutex<ServiceConfig>,
     live: Mutex<HashMap<WorkspaceId, LiveWs>>,
     /// OPTIONAL build-time embedding source plus the operator-pinned model
@@ -347,10 +357,32 @@ pub(crate) fn clear_seam() {
 impl IndexService {
     /// Open (creating when needed) an index service rooted at `data_root`,
     /// persisted through `store`, watching workspaces via `fs`.
+    ///
+    /// Standalone form: the cold git/rg authority comes from
+    /// [`ProcessSupervisor::try_shared`], and a failure to initialize it is
+    /// a typed [`IndexError::ProcessAuthority`] — never a panic and never an
+    /// unenforced child. Daemon graphs must call
+    /// [`IndexService::open_with_supervisor`] with the daemon's ONE
+    /// supervisor instead.
     pub fn open(
         store: Arc<Store>,
         data_root: PathBuf,
         fs: Arc<WorkspaceFileService>,
+    ) -> Result<Arc<Self>, IndexError> {
+        let supervisor = ProcessSupervisor::try_shared()
+            .map_err(|e| IndexError::ProcessAuthority(e.to_string()))?;
+        Self::open_with_supervisor(store, data_root, fs, supervisor)
+    }
+
+    /// [`IndexService::open`] over an INJECTED process supervisor: every
+    /// cold git/rg child this service builds runs under the daemon's single
+    /// `ProcessSupervisor` (bounded registry, daemon-shutdown scope). No
+    /// global fallback exists on this path.
+    pub fn open_with_supervisor(
+        store: Arc<Store>,
+        data_root: PathBuf,
+        fs: Arc<WorkspaceFileService>,
+        supervisor: Arc<ProcessSupervisor>,
     ) -> Result<Arc<Self>, IndexError> {
         fs::create_dir_all(data_root.join("generations"))?;
         fs::create_dir_all(data_root.join("scratch"))?;
@@ -364,6 +396,7 @@ impl IndexService {
                 store,
                 data_root,
                 fs,
+                supervisor,
                 cfg: Mutex::new(ServiceConfig::default()),
                 live: Mutex::new(HashMap::new()),
                 embedding: Mutex::new(None),
@@ -651,11 +684,12 @@ impl IndexService {
                 return Ok(());
             }
         }
-        // Crash-residue sweep (fresh attach only): stale `.kp-tmp-*` atomic
-        // temps and legacy `gen-*.tmp` staging files in this workspace's
-        // generation/scratch dirs are bounded-cleaned before the machine
-        // resumes. Age-gated and regular-file-only: a live writer's temp, a
-        // symlink named like a temp, and every real generation file survive.
+        // Crash-residue sweep (fresh attach only): stale atomic temps
+        // (`.faktor-tmp-*` and legacy `.kp-tmp-*`) plus legacy `gen-*.tmp`
+        // staging files in this workspace's generation/scratch dirs are
+        // bounded-cleaned before the machine resumes. Age-gated and
+        // regular-file-only: a live writer's temp, a symlink named like a
+        // temp, and every real generation file survive.
         let sweep = sweep_stale_temp_orphans(&self.inner.data_root, workspace);
         log_sweep_summary("attach", workspace.raw(), sweep);
         // Fresh workspace: resolve root + watcher handle. P0-48 root
@@ -831,6 +865,7 @@ impl IndexService {
             root,
             workspace,
             self.inner.data_root.join("generations"),
+            self.inner.supervisor.clone(),
         ))
     }
 
@@ -2067,10 +2102,13 @@ impl SweepSummary {
 }
 
 /// Names the sweep may ever remove: the shared atomic writer's
-/// `.<name>.kp-tmp-<pid>-<uuid>` temps and the legacy pre-atomic staging
-/// `gen-<g>-<pid>-<nonce>.tmp` files. `gen-<g>.json` never matches.
+/// `.<name>.faktor-tmp-<pid>-<uuid>` temps, its pre-migration legacy
+/// `.<name>.kp-tmp-<pid>-<uuid>` residue (accepted for compatibility, see
+/// `faktor_fs::atomic::is_internal_temp_name`), and the legacy pre-atomic
+/// staging `gen-<g>-<pid>-<nonce>.tmp` files. `gen-<g>.json` never matches.
 fn is_sweepable_temp_name(name: &str) -> bool {
-    name.contains(".kp-tmp-") || (name.starts_with("gen-") && name.ends_with(".tmp"))
+    faktor_fs::atomic::is_internal_temp_name(name)
+        || (name.starts_with("gen-") && name.ends_with(".tmp"))
 }
 
 /// A temp is stale once its mtime is at least `min_age` in the past. An
@@ -2792,7 +2830,9 @@ mod tests {
             "the old generation stays visible: {names:?}"
         );
         assert!(
-            names.iter().any(|n| n.contains(".kp-tmp-")),
+            names
+                .iter()
+                .any(|n| faktor_fs::atomic::is_internal_temp_name(n)),
             "the crash leaves the writer's orphan temp, proving the seam was \
              between staging and the rename: {names:?}"
         );
@@ -3495,10 +3535,14 @@ mod tests {
                 .unwrap();
         };
 
-        // Open path: a stale atomic temp seeded before open is swept.
+        // Open path: stale atomic temps under BOTH spellings (legacy crash
+        // residue and the current Faktor name) are swept.
         let open_stale = gen_dir.join(".gen-1.json.kp-tmp-1111-open");
-        std::fs::write(&open_stale, b"torn residue").unwrap();
-        backdate(&open_stale);
+        let open_stale_faktor = gen_dir.join(".gen-1.json.faktor-tmp-1112-open");
+        for p in [&open_stale, &open_stale_faktor] {
+            std::fs::write(p, b"torn residue").unwrap();
+            backdate(p);
+        }
         let svc2 = IndexService::open(
             store.clone(),
             env.data_root.clone(),
@@ -3506,20 +3550,27 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !open_stale.exists(),
-            "open must sweep stale `.kp-tmp-*` residue"
+            !open_stale.exists() && !open_stale_faktor.exists(),
+            "open must sweep stale atomic temps of both spellings"
         );
 
-        // Attach path: stale atomic + legacy staging temps in the generation
-        // and scratch dirs are swept; a FRESH temp (possibly a live writer)
-        // survives because only provably stale residue is removed.
+        // Attach path: stale atomic (both spellings) + legacy staging temps
+        // in the generation and scratch dirs are swept; a FRESH temp
+        // (possibly a live writer) survives because only provably stale
+        // residue is removed.
         let stale_atomic = gen_dir.join(".gen-1.json.kp-tmp-2222-attach");
+        let stale_atomic_faktor = gen_dir.join(".gen-1.json.faktor-tmp-2223-attach");
         let stale_staging = gen_dir.join("gen-2-2222-1.tmp");
         let scratch = scratch_dir(&env.data_root, ws);
         std::fs::create_dir_all(&scratch).unwrap();
         let stale_scratch_staging = scratch.join("gen-3-2222-1.tmp");
-        let fresh_temp = gen_dir.join(".gen-3.json.kp-tmp-3333-live");
-        for p in [&stale_atomic, &stale_staging, &stale_scratch_staging] {
+        let fresh_temp = gen_dir.join(".gen-3.json.faktor-tmp-3333-live");
+        for p in [
+            &stale_atomic,
+            &stale_atomic_faktor,
+            &stale_staging,
+            &stale_scratch_staging,
+        ] {
             std::fs::write(p, b"torn residue").unwrap();
             backdate(p);
         }
@@ -3539,6 +3590,10 @@ mod tests {
         svc2.attach(ws).unwrap();
 
         assert!(!stale_atomic.exists(), "stale atomic temp swept at attach");
+        assert!(
+            !stale_atomic_faktor.exists(),
+            "stale Faktor atomic temp swept at attach"
+        );
         assert!(
             !stale_staging.exists(),
             "stale staging temp swept at attach"

@@ -535,42 +535,42 @@ mod tests {
 
     #[test]
     fn allowlisted_copies_only_named_daemon_values() {
-        std::env::set_var("KP_ENV_TEST_VISIBLE", "visible");
-        std::env::set_var("KP_ENV_TEST_SECRET_TOKEN", "never");
+        std::env::set_var("FAKTOR_TEST_ENV_VISIBLE", "visible");
+        std::env::set_var("FAKTOR_TEST_ENV_SECRET_TOKEN", "never");
         let spec = EnvSpec::Allowlisted(vec![
-            "KP_ENV_TEST_VISIBLE".into(),
-            "KP_ENV_TEST_SECRET_TOKEN".into(),
+            "FAKTOR_TEST_ENV_VISIBLE".into(),
+            "FAKTOR_TEST_ENV_SECRET_TOKEN".into(),
         ]);
         let resolved = spec.resolve();
         assert!(resolved
             .iter()
-            .any(|(k, v)| k == "KP_ENV_TEST_VISIBLE" && v == "visible"));
+            .any(|(k, v)| k == "FAKTOR_TEST_ENV_VISIBLE" && v == "visible"));
         assert!(
             !resolved
                 .iter()
-                .any(|(k, _)| k == "KP_ENV_TEST_SECRET_TOKEN"),
+                .any(|(k, _)| k == "FAKTOR_TEST_ENV_SECRET_TOKEN"),
             "the deny-set drops secret-shaped names even when allowlisted: {resolved:?}"
         );
-        std::env::remove_var("KP_ENV_TEST_VISIBLE");
-        std::env::remove_var("KP_ENV_TEST_SECRET_TOKEN");
+        std::env::remove_var("FAKTOR_TEST_ENV_VISIBLE");
+        std::env::remove_var("FAKTOR_TEST_ENV_SECRET_TOKEN");
     }
 
     #[test]
     fn explicit_empty_value_copies_and_later_entries_win() {
-        std::env::set_var("KP_ENV_TEST_COPY", "from-daemon");
+        std::env::set_var("FAKTOR_TEST_ENV_COPY", "from-daemon");
         let spec = EnvSpec::Explicit(vec![
-            ("KP_ENV_TEST_COPY".into(), OsString::new()),
-            ("KP_ENV_TEST_EXACT".into(), "exact".into()),
-            ("KP_ENV_TEST_COPY".into(), "override".into()),
+            ("FAKTOR_TEST_ENV_COPY".into(), OsString::new()),
+            ("FAKTOR_TEST_ENV_EXACT".into(), "exact".into()),
+            ("FAKTOR_TEST_ENV_COPY".into(), "override".into()),
         ]);
         let resolved = spec.resolve();
         assert!(resolved
             .iter()
-            .any(|(k, v)| k == "KP_ENV_TEST_COPY" && v == "override"));
+            .any(|(k, v)| k == "FAKTOR_TEST_ENV_COPY" && v == "override"));
         assert!(resolved
             .iter()
-            .any(|(k, v)| k == "KP_ENV_TEST_EXACT" && v == "exact"));
-        std::env::remove_var("KP_ENV_TEST_COPY");
+            .any(|(k, v)| k == "FAKTOR_TEST_ENV_EXACT" && v == "exact"));
+        std::env::remove_var("FAKTOR_TEST_ENV_COPY");
     }
 
     #[test]

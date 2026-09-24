@@ -9,6 +9,13 @@ allprojects {
     repositories {
         mavenCentral()
     }
+
+    // Dependency locking: every resolvable configuration is locked; the
+    // committed `gradle.lockfile` files are the reviewable dependency set.
+    // Regenerate deliberately with `./gradlew --write-locks :frontend:buildPlugin`.
+    dependencyLocking {
+        lockAllConfigurations()
+    }
 }
 
 subprojects {

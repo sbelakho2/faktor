@@ -361,44 +361,33 @@ impl std::fmt::Debug for CancellationToken {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::task::RawWakerVTable;
     use std::thread;
     use std::time::{Duration, Instant};
 
     // ------------------------------------------------------------ async wait
 
+    /// The safe wake channel: `std::task::Wake` over the mpsc sender — no
+    /// hand-rolled `RawWaker` vtable, so this test executor contains zero
+    /// unsafe code (the workspace denies `unsafe_code` outside the platform
+    /// authority crates).
+    struct ChannelWake(mpsc::Sender<()>);
+
+    impl std::task::Wake for ChannelWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+
     /// Minimal wake-driven executor (no tokio in core): polls the future;
     /// a wake sends `()` on the channel and the executor re-polls. Proves
     /// the async wait is woken by `cancel()` from another thread.
-    fn wake_channel_vtable() -> &'static RawWakerVTable {
-        use std::task::{RawWaker, RawWakerVTable};
-        unsafe fn clone_raw(ptr: *const ()) -> RawWaker {
-            let arc = Arc::from_raw(ptr as *const mpsc::Sender<()>);
-            let cloned = arc.clone();
-            std::mem::forget(arc);
-            RawWaker::new(Arc::into_raw(cloned) as *const (), wake_channel_vtable())
-        }
-        unsafe fn wake_raw(ptr: *const ()) {
-            let arc = Arc::from_raw(ptr as *const mpsc::Sender<()>);
-            let _ = arc.send(());
-        }
-        unsafe fn wake_by_ref_raw(ptr: *const ()) {
-            let arc = Arc::from_raw(ptr as *const mpsc::Sender<()>);
-            let _ = arc.send(());
-            std::mem::forget(arc);
-        }
-        unsafe fn drop_raw(ptr: *const ()) {
-            drop(Arc::from_raw(ptr as *const mpsc::Sender<()>));
-        }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
-        &VTABLE
-    }
-
     fn thread_waker(tx: mpsc::Sender<()>) -> Waker {
-        use std::task::{RawWaker, Waker};
-        let ptr = Arc::into_raw(Arc::new(tx)) as *const ();
-        unsafe { Waker::from_raw(RawWaker::new(ptr, wake_channel_vtable())) }
+        use std::task::Waker;
+        Waker::from(Arc::new(ChannelWake(tx)))
     }
 
     /// Block until `fut` resolves or 5s pass without a wake (returns the

@@ -1,0 +1,15 @@
+{
+  "schema": "faktor-ignored-tests/v1",
+  "allowed_tags": ["fault", "soak", "security", "release", "perf", "live-paid", "visual"],
+  "required_nightly_lanes": ["fault", "release", "soak"],
+  "lanes": {
+    "fault": {"workflow": "nightly", "step": "fault-scale", "command": "cargo test -p faktor-tests-fault --release -- --ignored"},
+    "release": {"workflow": "nightly", "step": "longrun", "command": "cargo test -p faktor-tests-longrun --release"},
+    "soak": {"workflow": "nightly", "step": "soak", "command": "cargo test -p faktor-demo --release -- --ignored"}
+  },
+  "assignments": [
+    {"file": "crates/demo/src/lib.rs", "fn": "demo_soak_bounded", "lane": "soak"}
+  ],
+  "manual": [],
+  "non_test": []
+}

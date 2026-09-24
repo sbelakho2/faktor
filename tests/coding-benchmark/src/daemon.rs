@@ -497,6 +497,7 @@ fn wait_for_startup_line(child: &mut Child, rx: &Receiver<String>) -> Result<Str
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn kill_group(child: &mut Child) {
     let pid = child.id() as i32;
     // SAFETY: pgid == pid because the daemon was spawned with
@@ -1079,7 +1080,7 @@ pub fn write_config_file(data_dir: &Path, cfg: &DaemonBenchConfig) -> Result<Pat
             // path prefix such as /v1.
             rows.push(origin_of(url));
         }
-        config["sandbox"] = json!({ "network": rows, "network_guarantee": "none" });
+        config["sandbox"] = json!({ "network": rows, "network_guarantee": "none", "shell": "network_capable_user_granted" });
     }
     let path = data_dir.join("daemon-config.json");
     let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;

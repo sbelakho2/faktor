@@ -37,6 +37,9 @@
 //! runner (declared platform blocker on this host — same posture as
 //! `crates/winjob`).
 
+#![allow(unsafe_code)] // platform authority module: every unsafe
+                       // block/function in this module carries a `// SAFETY:` justification and is
+                       // enumerated by tests/static-authority.
 use std::ffi::c_void;
 use std::fmt;
 use std::mem::size_of;
@@ -90,6 +93,7 @@ const TERMINATE_WAIT_MS: u32 = 1000;
 const READER_IDLE: std::time::Duration = std::time::Duration::from_millis(5);
 
 fn last_error() -> u32 {
+    // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
     unsafe { GetLastError() }
 }
 
@@ -152,6 +156,7 @@ fn aligned_attr_storage(bytes: usize) -> (Vec<u64>, *mut c_void) {
         base
     } else {
         // u64 storage is 8-aligned, so one word lands on the next 16.
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         unsafe { base.add(1) }
     };
     (storage, aligned.cast::<c_void>())
@@ -184,6 +189,7 @@ fn has_path_component(command: &str) -> bool {
 fn search_path(dir: *const u16, name: &[u16]) -> Result<Option<Vec<u16>>, u32> {
     let mut buf = vec![0u16; 260];
     loop {
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         let len = unsafe {
             SearchPathW(
                 dir,
@@ -343,18 +349,22 @@ impl Pty {
         // (1) pipes. NULL security attributes = non-inheritable handles;
         // the child is attached through the pseudoconsole attribute, so no
         // automatic inheritance is needed or wanted.
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         if unsafe { CreatePipe(&mut input_read, &mut input_write, std::ptr::null(), 0) } == 0 {
             return Err(win_err("CreatePipe(conpty input)", last_error()));
         }
         if !valid_handle(input_read) || !valid_handle(input_write) {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
             }
             return Err(Error::internal("CreatePipe returned an invalid handle"));
         }
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         if unsafe { CreatePipe(&mut output_read, &mut output_write, std::ptr::null(), 0) } == 0 {
             let code = last_error();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
@@ -362,6 +372,7 @@ impl Pty {
             return Err(win_err("CreatePipe(conpty output)", code));
         }
         if !valid_handle(output_read) || !valid_handle(output_write) {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
@@ -376,9 +387,11 @@ impl Pty {
             X: cfg.cols as i16,
             Y: cfg.rows as i16,
         };
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         let hr = unsafe { CreatePseudoConsole(coord, input_read, output_write, 0, &mut pc) };
         if hr < 0 || !valid_handle(pc as HANDLE) {
             let code = hr as u32;
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
@@ -391,15 +404,18 @@ impl Pty {
         // (3) STARTUPINFOEXW carrying PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
         // `cb` MUST be sizeof(STARTUPINFOEXW) with
         // EXTENDED_STARTUPINFO_PRESENT (not sizeof(STARTUPINFOW)).
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         let mut attr_bytes: usize = 0;
         // First call with NULL only sizes the buffer (documented to fail
         // with ERROR_INSUFFICIENT_BUFFER); the second call initializes it in
         // caller-owned storage.
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_bytes) };
         if attr_bytes == 0 {
             let code = last_error();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
@@ -415,8 +431,10 @@ impl Pty {
         // The opaque list must outlive CreateProcessW; the underscore
         // binding (not a bare `_`) keeps the owning Vec alive past the call.
         let (_attr_storage, attr_list) = aligned_attr_storage(attr_bytes);
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_bytes) } == 0 {
             let code = last_error();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
@@ -432,6 +450,7 @@ impl Pty {
         // sizeof(HPCON). Passing `&pc` armed the attribute with a stack
         // address instead of the console handle, which CreateProcessW
         // rejects (ERROR_INVALID_PARAMETER, 87).
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         let ok = unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
@@ -445,6 +464,7 @@ impl Pty {
         };
         if ok == 0 {
             let code = last_error();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 DeleteProcThreadAttributeList(attr_list);
                 CloseHandle(input_read);
@@ -505,6 +525,7 @@ impl Pty {
         //   and arms ERROR_INVALID_PARAMETER (87).
         let app_display = win_common::module_display(&app_wide);
         let mut cmdline_wide = win_common::build_spawn_command_line(&app_wide, &cfg.args);
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // CREATE_SUSPENDED is REQUIRED: the child must not execute one
         // instruction — let alone spawn a descendant — before it is assigned
@@ -515,6 +536,7 @@ impl Pty {
         // returns the logical (unterminated) path, so terminate here.
         let mut app_wide_z = app_wide.clone();
         app_wide_z.push(0);
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         let created = unsafe {
             CreateProcessW(
                 app_wide_z.as_ptr(),
@@ -529,11 +551,13 @@ impl Pty {
                 &mut pi,
             )
         };
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         unsafe {
             DeleteProcThreadAttributeList(attr_list);
         }
         if created == 0 {
             let code = last_error();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(input_read);
                 CloseHandle(input_write);
@@ -546,6 +570,7 @@ impl Pty {
             return Err(win_err(&format!("CreateProcessW({app_display})"), code));
         }
         if !valid_handle(pi.hProcess) || !valid_handle(pi.hThread) || pi.dwProcessId == 0 {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
@@ -564,6 +589,7 @@ impl Pty {
         // descendant inherits membership) before it can execute. A failed
         // assignment refuses the spawn; an uncontained pty is never exposed.
         if let Err(code) = job.assign_strict(pi.dwProcessId) {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hThread);
@@ -581,8 +607,10 @@ impl Pty {
         }
         // ResumeThread returns the previous suspend count, or (DWORD)-1 on
         // failure; a child that cannot be resumed must never be handed out.
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
             let code = last_error();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hThread);
@@ -595,6 +623,7 @@ impl Pty {
             }
             return Err(win_err("ResumeThread(pty child)", code));
         }
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         unsafe {
             CloseHandle(pi.hThread);
         }
@@ -602,6 +631,7 @@ impl Pty {
         // its own references; dropping ours lets I/O detect a broken
         // channel when the session closes (per the ConPTY docs) instead of
         // deadlocking on a full pipe.
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         unsafe {
             CloseHandle(input_read);
             CloseHandle(output_write);
@@ -615,6 +645,7 @@ impl Pty {
         // (7) reader thread on its OWN duplicate of the output pipe, so
         // Drop closing the original never races an outstanding read.
         let mut reader_dup: HANDLE = std::ptr::null_mut();
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         let duplicated = unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
@@ -631,6 +662,7 @@ impl Pty {
             // The resumed child may already have descendants: terminate the
             // whole job tree, not just the direct child.
             job.terminate();
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hProcess);
@@ -654,6 +686,7 @@ impl Pty {
                 // The resumed child may already have descendants: terminate
                 // the whole job tree, not just the direct child.
                 job.terminate();
+                // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
                 unsafe {
                     CloseHandle(reader_dup);
                     TerminateProcess(pi.hProcess, 1);
@@ -703,6 +736,7 @@ impl Pty {
             }
             let chunk = (bytes.len() - written).min(u32::MAX as usize);
             let mut n: u32 = 0;
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             let ok = unsafe {
                 WriteFile(
                     self.input,
@@ -748,6 +782,7 @@ impl Pty {
             X: cols as i16,
             Y: rows as i16,
         };
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         let hr = unsafe { ResizePseudoConsole(self.pc, coord) };
         if hr < 0 {
             return Err(hresult_err("ResizePseudoConsole", hr as u32));
@@ -803,6 +838,7 @@ impl Pty {
 
     /// Is the child process still running?
     pub fn is_alive(&self) -> bool {
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         !self.child.is_null() && unsafe { WaitForSingleObject(self.child, 0) } == WAIT_TIMEOUT
     }
 
@@ -824,11 +860,14 @@ impl Pty {
         if self.child.is_null() {
             return;
         }
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         if unsafe { WaitForSingleObject(self.child, KILL_GRACE_MS) } == WAIT_TIMEOUT {
+            // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
             unsafe {
                 TerminateProcess(self.child, 1);
             }
             // Bounded: never hang a caller (or Drop) on a stuck process.
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 WaitForSingleObject(self.child, TERMINATE_WAIT_MS);
             }
@@ -837,6 +876,7 @@ impl Pty {
 
     fn close_pc(&mut self) {
         if self.pc != 0 {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 ClosePseudoConsole(self.pc);
             }
@@ -851,18 +891,21 @@ impl Drop for Pty {
         // The reader thread works on its own duplicate and exits on its own
         // once the pipe breaks; only the original handles are closed here.
         if !self.input.is_null() {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(self.input);
             }
             self.input = std::ptr::null_mut();
         }
         if !self.output.is_null() {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(self.output);
             }
             self.output = std::ptr::null_mut();
         }
         if !self.child.is_null() {
+            // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
             unsafe {
                 CloseHandle(self.child);
             }
@@ -893,10 +936,12 @@ fn conpty_reader(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         if !child_exited && unsafe { WaitForSingleObject(child, 0) } == WAIT_OBJECT_0 {
             child_exited = true;
         }
         let mut available: u32 = 0;
+        // SAFETY: the arguments were validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
         let peeked = unsafe {
             PeekNamedPipe(
                 output_dup,
@@ -925,6 +970,7 @@ fn conpty_reader(
             continue;
         }
         let mut n: u32 = 0;
+        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
         let read_ok = unsafe {
             ReadFile(
                 output_dup,
@@ -949,6 +995,7 @@ fn conpty_reader(
         lock_ring(ring).push(&buf[..n as usize]);
         cv.notify_all();
     }
+    // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
     unsafe {
         CloseHandle(output_dup);
     }

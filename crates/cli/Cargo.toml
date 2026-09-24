@@ -79,3 +79,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # distinguish ESRCH (gone) from EPERM (exists, not ours) and paid a
 # process-spawn per probe under full-suite load.
 libc = "0.2"
+
+[lints]
+workspace = true

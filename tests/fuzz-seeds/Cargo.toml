@@ -21,6 +21,9 @@ tempfile.workspace = true
 futures.workspace = true
 
 [lints.rust]
+# Manual lint config (Cargo forbids inheriting workspace lints while
+# overriding one): the workspace unsafe policy still applies in full.
+unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [dev-dependencies]
