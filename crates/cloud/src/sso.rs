@@ -19,8 +19,22 @@
 //!   the user, link the external subject and mint ONE one-shot session
 //!   token. Existing memberships keep their role (the IdP authorizes
 //!   joining, never a privilege change).
+//!
+//! Secret authority note (P2-B): `state` and `nonce` are credential material
+//! whose security value does NOT follow from their names — they are the
+//! single-use CSRF credential and the ID-token replay binding. They are
+//! therefore DOMAIN SECRET TYPES ([`OAuthState`], [`OidcNonce`]) wrapping
+//! [`SecretValue`], and the pending-login map is keyed by SHA-256(state)
+//! rather than the plaintext. A source scan over secret-ish field names
+//! ("secret", "token", "password") can never be the PRIMARY secret
+//! authority, precisely because ordinary names like `state`/`nonce` carry
+//! security value; the type wrapper — not the identifier — is what keeps
+//! them out of `Debug`/`Display`/serde/errors. The only plaintext escape is
+//! the wire projection ([`SsoStart::into_wire_response`]) the frontend must
+//! present back at callback.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -36,21 +50,143 @@ use crate::oidc::{
 };
 use crate::oidc_net::{urlencode, AsyncOidcAdapter};
 use crate::rbac::Role;
-use crate::service::{Clock, ControlPlane, ExternalLogin};
+use crate::service::{sha256_hex, Clock, ControlPlane, ExternalLogin};
 
 /// How long one started login may wait for its callback.
 pub const SSO_STATE_TTL_MS: i64 = 10 * 60 * 1000;
 /// Bound on concurrently pending (started, not yet completed) logins.
 pub const MAX_PENDING_SSO_LOGINS: usize = 256;
 
+/// The OIDC `state` of one started login: the single-use CSRF credential the
+/// callback must present back. A domain secret TYPE by security value, not
+/// by name: `state` does not look secret-ish, so no field-name scan can be
+/// the authority that keeps it out of logs — the wrapper is.
+///
+/// Deliberately has NO `Display`, serde or public accessor. Plaintext leaves
+/// only through [`SsoStart::into_wire_response`]; the pending map holds the
+/// SHA-256 digest, never the plaintext.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthState(SecretValue);
+
+impl OAuthState {
+    fn new(value: String) -> Self {
+        Self(SecretValue::new(value))
+    }
+
+    /// The only in-process reader of the plaintext (module-private).
+    fn expose(&self) -> &str {
+        self.0.expose()
+    }
+
+    /// The pending-map key: SHA-256 of the plaintext, so a dump of the
+    /// pending map yields digests, never the credentials themselves.
+    fn digest_key(&self) -> String {
+        state_key(self.expose())
+    }
+}
+
+impl fmt::Debug for OAuthState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OAuthState([redacted])")
+    }
+}
+
+/// The OIDC `nonce` of one started login: the replay binding of the ID token.
+/// A domain secret type for the same reason as [`OAuthState`] (see the
+/// module-level secret authority note): it never appears in a rendering and
+/// leaves the process only inside the authorization URL.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OidcNonce(SecretValue);
+
+impl OidcNonce {
+    fn new(value: String) -> Self {
+        Self(SecretValue::new(value))
+    }
+
+    /// The only in-process reader of the plaintext (module-private).
+    fn expose(&self) -> &str {
+        self.0.expose()
+    }
+}
+
+impl fmt::Debug for OidcNonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OidcNonce([redacted])")
+    }
+}
+
+/// The pending-map key of a presented state: SHA-256 hex of the plaintext.
+/// Both the insert (mint) and the lookup (callback) sides go through this,
+/// so the map itself never holds credential material.
+fn state_key(state: &str) -> String {
+    sha256_hex(state.as_bytes())
+}
+
 /// One started login: the authorization URL to redirect the browser to plus
-/// the state the callback must present (the nonce is returned for the local
-/// test surface; production adapters keep it private to the exchange).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the single-use state the callback must present (the nonce stays private
+/// to the authority and rides only the authorization URL to the IdP).
+///
+/// `Debug` is CUSTOM and redacts every field: the URL embeds the plaintext
+/// state and nonce as query parameters, so a derived rendering would leak
+/// both secrets even though the fields are wrapped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SsoStart {
-    pub authorization_url: String,
-    pub state: String,
-    pub nonce: String,
+    authorization_url: String,
+    state: OAuthState,
+    nonce: OidcNonce,
+}
+
+impl fmt::Debug for SsoStart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SsoStart")
+            .field("authorization_url", &"[redacted]")
+            .field("state", &self.state)
+            .field("nonce", &self.nonce)
+            .finish()
+    }
+}
+
+impl SsoStart {
+    /// The wire projection: the authorization URL the browser is redirected
+    /// to and the plaintext state the frontend must present back at
+    /// callback. This constructor is the ONLY plaintext escape hatch for the
+    /// state; the returned type still redacts `Debug`, so only the explicit
+    /// accessors (used by the wire serializer) read the values.
+    pub fn into_wire_response(self) -> SsoStartWireResponse {
+        SsoStartWireResponse {
+            authorization_url: self.authorization_url,
+            state: self.state.expose().to_string(),
+        }
+    }
+}
+
+/// The wire projection of one started login (P2-B): carries the
+/// authorization URL and the state for the frontend. Serialized only by the
+/// route layer; `Debug` stays redacted so an accidental log never leaks the
+/// embedded credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SsoStartWireResponse {
+    authorization_url: String,
+    state: String,
+}
+
+impl SsoStartWireResponse {
+    pub fn authorization_url(&self) -> &str {
+        &self.authorization_url
+    }
+
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+}
+
+impl fmt::Debug for SsoStartWireResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SsoStartWireResponse")
+            .field("authorization_url", &"[redacted]")
+            .field("state", &"[redacted]")
+            .finish()
+    }
 }
 
 /// One completed SSO login: the control-plane session (token visible once)
@@ -64,14 +200,17 @@ pub struct SsoLoginOutcome {
 struct PendingLogin {
     organization: OrganizationId,
     redirect_uri: String,
-    nonce: String,
+    /// Wrapped: the nonce is the replay binding of the ID token and never
+    /// leaves this process except inside the authorization URL.
+    nonce: OidcNonce,
     /// Wrapped: the PKCE verifier is a credential (it proves possession of
     /// the code) and is moved straight into the exchange request.
     code_verifier: SecretValue,
     created_ms: i64,
 }
 
-/// The SSO login authority over one asynchronous OIDC adapter.
+/// The SSO login authority over one asynchronous OIDC adapter. The pending
+/// map is keyed by SHA-256(state) — never the plaintext state.
 pub struct SsoLogin {
     adapter: Arc<dyn AsyncOidcAdapter>,
     clock: Arc<dyn Clock>,
@@ -129,8 +268,8 @@ impl SsoLogin {
             ));
         }
         let discovery = self.adapter.discovery(&sso.issuer).await?;
-        let state = Self::random_hex(32);
-        let nonce = Self::random_hex(32);
+        let state = OAuthState::new(Self::random_hex(32));
+        let nonce = OidcNonce::new(Self::random_hex(32));
         let code_verifier = SecretValue::new(Self::random_hex(32));
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(code_verifier.expose().as_bytes()));
@@ -144,7 +283,7 @@ impl SsoLogin {
                 )));
             }
             pending.insert(
-                state.clone(),
+                state.digest_key(),
                 PendingLogin {
                     organization: organization.clone(),
                     redirect_uri: redirect_uri.to_string(),
@@ -159,8 +298,8 @@ impl SsoLogin {
             ("client_id", sso.client_id.clone()),
             ("redirect_uri", redirect_uri.to_string()),
             ("scope", "openid email profile".to_string()),
-            ("state", state.clone()),
-            ("nonce", nonce.clone()),
+            ("state", state.expose().to_string()),
+            ("nonce", nonce.expose().to_string()),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256".to_string()),
         ];
@@ -197,7 +336,9 @@ impl SsoLogin {
         let now = self.clock.now_ms();
         let pending = {
             let mut pending = self.lock_pending();
-            let Some(login) = pending.remove(state) else {
+            // The wire carries the plaintext state; the map is keyed by its
+            // SHA-256, so only the digest is ever stored or compared here.
+            let Some(login) = pending.remove(&state_key(state)) else {
                 return Err(OidcError::StateInvalid);
             };
             if now.saturating_sub(login.created_ms) >= SSO_STATE_TTL_MS {
@@ -227,7 +368,7 @@ impl SsoLogin {
                 &IdTokenExpectations {
                     issuer: sso.issuer.clone(),
                     audience: sso.client_id.clone(),
-                    nonce: Some(pending.nonce),
+                    nonce: Some(pending.nonce.expose().to_string()),
                     now_ms: now,
                     clock_skew_ms: 0,
                 },
@@ -278,3 +419,7 @@ fn control_plane_error_into_oidc(error: ControlPlaneError) -> OidcError {
         other => OidcError::MembershipRefused(other.to_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "sso_tests.rs"]
+mod sso_tests;

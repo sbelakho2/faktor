@@ -267,6 +267,8 @@ async fn proxy_only_cannot_be_overridden_by_extra_args() {
         owner_profile: "p1".to_string(),
         extra_args: vec!["--disable-gpu".to_string()],
         launch_timeout_ms: 1000,
+        network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+        app_level_reason: Some("test: app-level proxy only".to_string()),
     });
     assert_eq!(
         argv.iter()
@@ -1380,6 +1382,8 @@ async fn hostile_devtools_endpoint_is_rejected_and_the_child_is_killed() {
                 owner_profile: "p1".to_string(),
                 extra_args: Vec::new(),
                 launch_timeout_ms: 3_000,
+                network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+                app_level_reason: Some("test: app-level proxy only".to_string()),
             },
             &CancellationToken::new(),
         )
@@ -2281,4 +2285,69 @@ async fn symlink_swapped_download_directory_cannot_publish_outside_the_profile()
     );
     let _ = page.close().await;
     harness.manager.shutdown_all().await;
+}
+
+// ------------------------------------------------- isolation honesty (item 8)
+
+/// The per-child isolation state is reported honestly: an OS-confined child
+/// (Linux BrokerOnly namespace) or an explicit app-level proxy-only state
+/// with the platform reason — never app-level worded as confinement, and
+/// never a Linux launch silently falling back to app-level. A host that
+/// cannot create the sandbox namespace produces a typed IsolationUnavailable
+/// skip, never a silent pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_reports_honest_network_isolation_strength() {
+    let harness = Harness::new(json!({}), |_| {}).await;
+    match harness.acquire("p-isolation").await {
+        Ok(page) => {
+            let health = harness.manager.health();
+            let isolation = health
+                .iter()
+                .find(|h| h.profile == "p-isolation")
+                .map(|h| h.isolation.clone())
+                .expect("live browser health");
+            let label = isolation.strength_label();
+            if faktor_terminal::broker_only_supported() {
+                assert!(
+                    isolation.is_os_confined(),
+                    "a supported platform must report the OS-confined state, got {label}"
+                );
+                assert!(label.contains("OS-confined"), "{label}");
+                assert!(!label.contains("NOT OS-confined"), "{label}");
+            } else {
+                let faktor_browser::BrowserIsolationState::AppLevelProxyOnly { reason } =
+                    &isolation
+                else {
+                    panic!("unsupported platform must report app-level, got {label}");
+                };
+                assert!(
+                    reason.contains("no OS-level BrokerOnly backend"),
+                    "{reason}"
+                );
+                assert!(!isolation.is_os_confined(), "{label}");
+                assert!(
+                    label.contains("NOT OS-confined"),
+                    "app-level wording must never claim confinement: {label}"
+                );
+            }
+            let _ = page.close().await;
+            harness.manager.shutdown_all().await;
+        }
+        Err(faktor_browser::BrowserError::IsolationUnavailable { detail }) => {
+            assert!(
+                faktor_terminal::broker_only_supported(),
+                "an unsupported platform must never select BrokerOnly: {detail}"
+            );
+            assert!(detail.contains("BrokerOnly"), "{detail}");
+            eprintln!(
+                "SKIP (typed, unprivileged host): the confined browser launch was refused \
+                 fail-closed and no child ran: {detail}"
+            );
+            assert!(
+                harness.browser_children().is_empty(),
+                "the refused confined launch left a child behind"
+            );
+        }
+        Err(other) => panic!("unexpected acquire failure: {other:?}"),
+    }
 }

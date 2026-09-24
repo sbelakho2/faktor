@@ -1937,6 +1937,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-cas",
  "faktor-core",
+ "faktor-fs",
  "faktor-terminal",
  "libc",
  "serde",

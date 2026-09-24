@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use faktor_provider::egress::{EgressError, HttpTransport};
+use faktor_provider::egress::{CheckedResponse, EgressError, HttpTransport};
 use faktor_scm::github::ManualClock;
 use faktor_scm::{
     GitHubAppTokenConfig, GitHubAppTokenSource, InstallationTokenSource, ScmError,
@@ -133,7 +133,7 @@ impl HttpTransport for ScriptedTransport {
         &self,
         req: Request,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<reqwest::Response, EgressError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<CheckedResponse, EgressError>> + Send + '_>,
     > {
         let recorded = Recorded {
             method: req.method().to_string(),
@@ -164,7 +164,9 @@ impl HttpTransport for ScriptedTransport {
             let response = builder
                 .body(reqwest::Body::from(reply.body))
                 .map_err(|e| EgressError::Build(e.to_string()))?;
-            Ok(reqwest::Response::from(response))
+            Ok(CheckedResponse::from_response(reqwest::Response::from(
+                response,
+            )))
         })
     }
 }

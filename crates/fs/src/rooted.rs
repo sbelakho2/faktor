@@ -26,25 +26,46 @@
 //!
 //! * unix: `openat(2)`/`mkdirat(2)`/`renameat(2)`/`unlinkat(2)` on the
 //!   anchored directory fd with `O_NOFOLLOW | O_CLOEXEC` everywhere.
-//! * Windows: resolution goes through the workspace's reparse-aware,
-//!   handle-relative walk (`crate::platform::open_no_follow_walk` /
-//!   `canonicalize_within`), which opens every component with
-//!   `FILE_FLAG_OPEN_REPARSE_POINT`, validates permitted reparse targets
-//!   itself and refuses out-of-root/unverified targets. Directory creation,
-//!   file creation and rename then act on the verified location; publish is a
-//!   same-directory rename, and `open_create_new` re-checks the created
-//!   entry's identity against a no-follow open of its path. Windows directory
-//!   fsync has no equivalent, so `sync_dir` is a documented no-op there.
+//! * Windows: the root is opened ONCE (`CreateFileW`-equivalent absolute
+//!   `NtCreateFile`, `FILE_OPEN_REPARSE_POINT`, reparse/directory checks)
+//!   and retained as a HANDLE with the caller's maximum granted rights.
+//!   Reads (`read`/`list_entries`/`walk_bounded`) use the reparse-aware
+//!   handle-relative walk. Every MUTATION — `create_dir_all`,
+//!   `open_create_new`, `remove_tree`, `remove_file`, `atomic_publish` — is
+//!   anchored on the retained root handle: the parent chain is opened
+//!   component-by-component RELATIVE to it with strict no-follow semantics,
+//!   creation is a relative `NtCreateFile` with `FILE_CREATE`, deletion
+//!   opens the target reparse-aware relative to its parent and marks that
+//!   handle for disposition (`FileDispositionInfoEx`), and rename/publish
+//!   is `FileRenameInfoEx` naming an anchored destination parent. After an
+//!   operation begins, no absolute pathname selects the mutated object.
+//!   Windows directory fsync has no equivalent, so `sync_dir` is a
+//!   documented no-op there.
+//!
+//! # Verification (Windows)
+//!
+//! The Windows anchored mutation path cannot be exercised on a unix host.
+//! It is type-checked against the Windows target in a hermetic harness, and
+//! its behavioral guarantees are pinned by the `cfg(windows)` seam suite in
+//! `platform/windows.rs` (`anchored_*_survives_parent_swap_to_outside_junction`)
+//! which must run on a Windows runner: each test anchors a parent, swaps it
+//! for a junction to an outside directory in the mutation seam, then proves
+//! the mutation acted on the pinned original and the outside marker is
+//! byte-identical. The unix suite (`tests::unix_tests`) pins the same
+//! scenarios on symlinks.
 //!
 //! # Honest limit (Windows only)
 //!
-//! Between the reparse-aware walk of an operation and the Win32 call that
-//! performs it, a hostile process could swap the directory entry once more.
-//! `open_create_new` closes that with the post-open identity net;
-//! `remove_tree` uses `std::fs::remove_dir_all`, which on modern Rust deletes
-//! by reparse-point-opening handles and never follows a link out of the tree.
-//! The unix implementation has no such window: every step is an `openat` on
-//! the fd produced by the previous step.
+//! A hostile process that RENAMES a directory the operation already holds a
+//! handle to can only move that directory within the root's volume; the
+//! operation still acts on the pinned object, never on whatever now answers
+//! the old pathname. The irreducible window is the same as unix: the single
+//! rename/create/delete syscall itself (no compare-and-swap form exists).
+//! One mutation is NOT in this surface: [`RootedDir::create_symlink`] still
+//! validates its parent through the reparse-aware walk and then creates the
+//! link with the Win32 API (handle-relative reparse creation needs
+//! `FSCTL_SET_REPARSE_POINT` with a hand-built reparse record; documented
+//! audit residual, no caller uses it on Windows today).
 //!
 //! # Bounded traversal (P0-52)
 //!
@@ -81,7 +102,13 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(windows)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -94,12 +121,19 @@ use crate::FileData;
 const MAX_COMPONENTS: usize = 4096;
 
 /// An authority anchored on one directory. Cheap to clone (shares the
-/// anchored handle on unix).
+/// anchored handle on unix and on Windows).
 #[derive(Debug, Clone)]
 pub struct RootedDir {
     root: PathBuf,
     #[cfg(unix)]
     fd: Arc<OwnedFd>,
+    /// Windows: the root opened ONCE, reparse-aware, with the caller's
+    /// maximum granted rights (`MAXIMUM_ALLOWED`). Every mutation resolves
+    /// its parent chain and acts strictly relative to this handle, so no
+    /// absolute pathname selects the mutated object after an operation
+    /// begins.
+    #[cfg(windows)]
+    handle: Arc<OwnedHandle>,
 }
 
 impl RootedDir {
@@ -117,12 +151,15 @@ impl RootedDir {
         }
         #[cfg(windows)]
         {
-            // The reparse-aware walk validates the root handle (including
-            // reparse/identity checks); it is re-opened per operation, so
-            // nothing is retained here.
-            crate::platform::open_no_follow_walk(root, Path::new(""), OpenKind::Directory)?;
+            // Audits 1/47 (P1-B): the root is opened ONCE, reparse-aware,
+            // with the caller's maximum granted rights; the retained handle
+            // is the anchor for every later relative open. The reads
+            // (`read`/`list_entries`/`walk_bounded`) keep their per-walk
+            // reparse-aware walk, which starts at this same root path.
+            let handle = crate::platform::open_root_anchor(root)?;
             Ok(Self {
                 root: root.to_path_buf(),
+                handle: Arc::new(handle),
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -192,7 +229,41 @@ impl RootedDir {
             }
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Anchored create (audit 1/P1-B): each component is created with
+            // a relative `NtCreateFile(FILE_CREATE)` under the verified
+            // parent HANDLE and an existing component is opened relative to
+            // that same handle — a pathname is never the selector.
+            let units = crate::platform::validated_relative_units(rel)?;
+            if units.len() > MAX_COMPONENTS {
+                return Err(Error::oversized(format!(
+                    "{rel:?} exceeds the {MAX_COMPONENTS}-component bound"
+                )));
+            }
+            let mut owned: Option<OwnedHandle> = None;
+            let mut prefix = PathBuf::new();
+            for comp in &units {
+                prefix.push(OsString::from_wide(comp));
+                mutation_seam(&prefix);
+                let parent = match &owned {
+                    Some(handle) => handle,
+                    None => self.handle.as_ref(),
+                };
+                match crate::platform::anchored_create_dir(parent, comp, &prefix)? {
+                    crate::platform::AnchoredCreateOutcome::Created(handle) => {
+                        owned = Some(handle);
+                    }
+                    crate::platform::AnchoredCreateOutcome::AlreadyExists => {
+                        owned = Some(crate::platform::windows_open_child_dir_anchored(
+                            parent, comp, &prefix,
+                        )?);
+                    }
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let mut prefix = PathBuf::new();
             for comp in comps {
@@ -229,29 +300,44 @@ impl RootedDir {
             })?;
             Ok(std::fs::File::from(file))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Anchored exclusive create (audit 1/P1-B): the parent chain is
+            // opened as HANDLES from the retained root handle with strict
+            // no-follow semantics and the final name is created with a
+            // relative `NtCreateFile(FILE_CREATE)`; the returned handle is
+            // the created entry itself.
+            let _ = (parent, name);
+            let units = crate::platform::validated_relative_units(rel)?;
+            let Some((last, parent_units)) = units.split_last() else {
+                return Err(Error::malformed(format!(
+                    "operation requires a final path component: {rel:?}"
+                )));
+            };
+            if units.len() > MAX_COMPONENTS {
+                return Err(Error::oversized(format!(
+                    "{rel:?} exceeds the {MAX_COMPONENTS}-component bound"
+                )));
+            }
+            let dir = self.windows_anchor_dir(parent_units, rel)?;
+            let parent_handle = match &dir {
+                Some(handle) => handle,
+                None => self.handle.as_ref(),
+            };
+            mutation_seam(rel);
+            let handle = crate::platform::anchored_create_file(parent_handle, last, rel)?;
+            Ok(std::fs::File::from(handle))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (parent, name);
             self.require_parent_dir(rel)?;
             let path = self.root.join(rel);
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt as _;
-                options.custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT);
-            }
-            let file = options
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
                 .open(&path)
                 .map_err(|e| Error::internal(format!("cannot create {rel:?}: {e}")))?;
-            #[cfg(windows)]
-            {
-                if !crate::platform::opened_is_path(&file, &path) {
-                    return Err(Error::permission(format!(
-                        "{rel:?}: created entry failed the identity check"
-                    )));
-                }
-            }
             Ok(file)
         }
     }
@@ -280,7 +366,54 @@ impl RootedDir {
                 .map_err(|e| Error::internal(format!("cannot remove {rel:?}: {e}")))?;
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Anchored recursive delete (audit 1/P1-B): the target is opened
+            // relative to its verified parent HANDLE (reparse-aware, never
+            // followed) and removed by marking THAT handle for disposition;
+            // children are unlinked the same way. Nothing is re-resolved by
+            // pathname, so a parent or target swapped for a junction cannot
+            // redirect the delete.
+            let _ = (parent, name);
+            let units = crate::platform::validated_relative_units(rel)?;
+            let Some((last, parent_units)) = units.split_last() else {
+                return Err(Error::malformed(format!(
+                    "operation requires a final path component: {rel:?}"
+                )));
+            };
+            if units.len() > MAX_COMPONENTS {
+                return Err(Error::oversized(format!(
+                    "{rel:?} exceeds the {MAX_COMPONENTS}-component bound"
+                )));
+            }
+            let dir = self.windows_anchor_dir(parent_units, rel)?;
+            let parent_handle = match &dir {
+                Some(handle) => handle,
+                None => self.handle.as_ref(),
+            };
+            mutation_seam(rel);
+            let entry: crate::platform::AnchoredEntry =
+                match crate::platform::anchored_open_entry(parent_handle, last, rel) {
+                    Ok(entry) => entry,
+                    Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e),
+                };
+            if entry.attributes & crate::platform::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(Error::permission(format!(
+                    "refusing to remove {}: the entry is a link",
+                    rel.display()
+                )));
+            }
+            if entry.attributes & crate::platform::FILE_ATTRIBUTE_DIRECTORY == 0 {
+                return Err(Error::permission(format!(
+                    "refusing to remove {}: the entry is not a directory",
+                    rel.display()
+                )));
+            }
+            windows_remove_tree_children(&entry.handle, rel, 0)?;
+            crate::platform::anchored_delete_entry(&entry.handle, rel)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (parent, name);
             let resolved = canonicalize_rooted(&self.root, rel)?;
@@ -308,7 +441,46 @@ impl RootedDir {
                 ))),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Anchored unlink (audit 1/P1-B): like `remove_tree`, but the
+            // target must not be a real directory; a link entry is unlinked
+            // in place, never followed.
+            let _ = (parent, name);
+            let units = crate::platform::validated_relative_units(rel)?;
+            let Some((last, parent_units)) = units.split_last() else {
+                return Err(Error::malformed(format!(
+                    "operation requires a final path component: {rel:?}"
+                )));
+            };
+            if units.len() > MAX_COMPONENTS {
+                return Err(Error::oversized(format!(
+                    "{rel:?} exceeds the {MAX_COMPONENTS}-component bound"
+                )));
+            }
+            let dir = self.windows_anchor_dir(parent_units, rel)?;
+            let parent_handle = match &dir {
+                Some(handle) => handle,
+                None => self.handle.as_ref(),
+            };
+            mutation_seam(rel);
+            let entry: crate::platform::AnchoredEntry =
+                match crate::platform::anchored_open_entry(parent_handle, last, rel) {
+                    Ok(entry) => entry,
+                    Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e),
+                };
+            if entry.attributes & crate::platform::FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && entry.attributes & crate::platform::FILE_ATTRIBUTE_DIRECTORY != 0
+            {
+                return Err(Error::permission(format!(
+                    "refusing to remove {}: the entry is a directory",
+                    rel.display()
+                )));
+            }
+            crate::platform::anchored_delete_entry(&entry.handle, rel)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (parent, name);
             let resolved = canonicalize_rooted(&self.root, rel)?;
@@ -482,19 +654,16 @@ impl RootedDir {
 
 #[cfg(windows)]
 use crate::platform::OpenKind;
+#[cfg(windows)]
+use faktor_core::error::ErrorKind;
 
-/// Canonical location of `rel` under `root` on non-unix platforms, via the
-/// reparse-aware handle walk on Windows.
-#[cfg(not(unix))]
+/// Canonical location of `rel` under `root` on platforms without a
+/// handle-relative open. Windows no longer uses this fallback: every
+/// mutation and publish resolves (and acts) through the retained root
+/// HANDLE.
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn canonicalize_rooted(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
-    #[cfg(windows)]
-    {
-        crate::platform::canonicalize_within(root, rel)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(root.join(rel))
-    }
+    Ok(root.join(rel))
 }
 
 /// Split a caller path into validated relative components. `..`, absolute
@@ -796,9 +965,6 @@ fn unix_remove_children(dir: &OwnedFd, rel: &Path) -> Result<(), Error> {
     }
 }
 
-#[cfg(windows)]
-const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
 // ---------------------------------------------------------------------------
 // Bounded handle-relative traversal (P0-52)
 // ---------------------------------------------------------------------------
@@ -889,6 +1055,17 @@ impl RootedEntry {
             None
         }
     }
+}
+
+/// No-follow metadata of one entry, resolved through the anchored walk: the
+/// literal entry kind plus its size. A symlink/reparse entry is reported as
+/// [`RootedEntryKind::Symlink`] and NEVER followed; a special file (FIFO,
+/// device, socket) is reported as [`RootedEntryKind::Other`] and NEVER
+/// opened, so a hostile named pipe cannot block a metadata query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootedEntryMeta {
+    pub kind: RootedEntryKind,
+    pub size: u64,
 }
 
 /// The result of one directory enumeration. `overflowed` means the
@@ -1086,6 +1263,50 @@ impl RootedDir {
             let _ = (parent, name);
             Err(Error::internal(format!(
                 "handle-relative read is unsupported on {}: no directory-relative open",
+                std::env::consts::OS
+            )))
+        }
+    }
+
+    /// No-follow metadata of `rel` under the anchored root: the parent chain
+    /// is opened component-by-component (never following a link), and the
+    /// final entry is inspected through that parent — unix
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)`, Windows a handle-relative
+    /// reparse-aware open — never by re-resolving a path string. `Ok(None)`
+    /// when the entry does not exist. A symlink/reparse point is classified,
+    /// never followed; a special file is classified, never opened.
+    pub fn entry_meta(&self, rel: &Path) -> Result<Option<RootedEntryMeta>, Error> {
+        if relative_components(rel)?.is_empty() {
+            return Err(Error::malformed(format!(
+                "entry metadata requires a final path component: {rel:?}"
+            )));
+        }
+        #[cfg(unix)]
+        {
+            let (parent, name) = split_final(rel)?;
+            let dir = self.walk_dirs(&parent)?;
+            match unix_lstat_at(&dir, &name) {
+                Ok(st) => Ok(Some(RootedEntryMeta {
+                    kind: entry_kind_from_mode(st.st_mode),
+                    size: st.st_size.max(0) as u64,
+                })),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Error::internal(format!(
+                    "cannot stat {} under {}: {e}",
+                    rel.display(),
+                    self.root.display()
+                ))),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let rel = normalize_rel(rel)?;
+            crate::platform::entry_meta(&self.root, &rel)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(Error::internal(format!(
+                "no-follow entry metadata is unsupported on {}: no directory-relative stat",
                 std::env::consts::OS
             )))
         }
@@ -1653,6 +1874,146 @@ fn get_errno() -> libc::c_int {
 }
 
 // ---------------------------------------------------------------------------
+// windows anchored mutation implementation (audit 1 / P1-B)
+// ---------------------------------------------------------------------------
+
+/// Test seam: fired with the operation's relative path immediately before the
+/// anchored mutation syscall, so adversarial tests can swap the entry in the
+/// handle-anchored window deterministically.
+#[cfg(all(test, windows))]
+type MutationSeam = Box<dyn Fn(&Path) + Send>;
+#[cfg(all(test, windows))]
+static MUTATION_SEAM: OnceLock<Mutex<Option<MutationSeam>>> = OnceLock::new();
+#[cfg(all(test, windows))]
+pub(crate) fn install_mutation_seam(hook: MutationSeam) {
+    let m = MUTATION_SEAM.get_or_init(|| Mutex::new(None));
+    *m.lock().expect("mutation seam poisoned") = Some(hook);
+}
+#[cfg(all(test, windows))]
+pub(crate) fn clear_mutation_seam() {
+    if let Some(lock) = MUTATION_SEAM.get() {
+        *lock.lock().expect("mutation seam poisoned") = None;
+    }
+}
+#[cfg(all(test, windows))]
+fn mutation_seam(rel: &Path) {
+    if let Some(lock) = MUTATION_SEAM.get() {
+        if let Some(hook) = lock.lock().expect("mutation seam poisoned").as_ref() {
+            hook(rel);
+        }
+    }
+}
+#[cfg(all(windows, not(test)))]
+fn mutation_seam(_rel: &Path) {}
+
+#[cfg(windows)]
+impl RootedDir {
+    /// Open every directory component of `comps` RELATIVE to the retained
+    /// root handle with strict no-follow semantics and return the deepest
+    /// handle. `None` means the root itself is the parent.
+    fn windows_anchor_dir(
+        &self,
+        comps: &[Vec<u16>],
+        rel: &Path,
+    ) -> Result<Option<OwnedHandle>, Error> {
+        let mut owned: Option<OwnedHandle> = None;
+        for comp in comps {
+            let parent = match &owned {
+                Some(handle) => handle,
+                None => self.handle.as_ref(),
+            };
+            owned = Some(crate::platform::windows_open_child_dir_anchored(
+                parent, comp, rel,
+            )?);
+        }
+        Ok(owned)
+    }
+
+    /// The Windows anchored publish used by
+    /// [`crate::atomic::atomic_publish_at`]: the shared parent directory is
+    /// reached as a HANDLE chain from the retained root (strict no-follow),
+    /// the staged temp is opened RELATIVE to that parent with DELETE access
+    /// and renamed through `FileRenameInfoEx`, which names the SAME parent
+    /// handle as the destination root. No pathname selects either object
+    /// after the call begins.
+    pub(crate) fn windows_publish(&self, tmp_rel: &Path, dest_rel: &Path) -> Result<(), Error> {
+        let tmp_units = crate::platform::validated_relative_units(tmp_rel)?;
+        let dest_units = crate::platform::validated_relative_units(dest_rel)?;
+        let Some((tmp_name, parent_units)) = tmp_units.split_last() else {
+            return Err(Error::malformed(format!(
+                "atomic publish requires a final path component: {tmp_rel:?}"
+            )));
+        };
+        let Some((dest_name, dest_parent_units)) = dest_units.split_last() else {
+            return Err(Error::malformed(format!(
+                "atomic publish requires a final path component: {dest_rel:?}"
+            )));
+        };
+        if parent_units != dest_parent_units {
+            return Err(Error::malformed(format!(
+                "atomic publish requires one directory: {tmp_rel:?} -> {dest_rel:?}"
+            )));
+        }
+        if tmp_units.len() > MAX_COMPONENTS {
+            return Err(Error::oversized(format!(
+                "{tmp_rel:?} exceeds the {MAX_COMPONENTS}-component bound"
+            )));
+        }
+        let dir = self.windows_anchor_dir(parent_units, tmp_rel)?;
+        let parent_handle = match &dir {
+            Some(handle) => handle,
+            None => self.handle.as_ref(),
+        };
+        mutation_seam(tmp_rel);
+        let source: crate::platform::AnchoredEntry =
+            crate::platform::anchored_open_entry(parent_handle, tmp_name, tmp_rel)?;
+        crate::platform::anchored_rename(&source.handle, parent_handle, dest_name, dest_rel)
+    }
+}
+
+/// Remove every child of the open directory handle `dir` (the caller then
+/// removes `dir` itself): each child is opened relative to its parent
+/// (reparse-aware, never followed) and unlinked by marking its own handle
+/// for disposition; a real directory is recursed into; a link entry is
+/// unlinked in place. The listing is re-taken after every batch, so entries
+/// created during the walk are still removed (the operation ends when the
+/// directory is empty) and memory stays bounded by the batch.
+#[cfg(windows)]
+fn windows_remove_tree_children(dir: &OwnedHandle, rel: &Path, depth: usize) -> Result<(), Error> {
+    if depth > MAX_COMPONENTS {
+        return Err(Error::oversized(format!(
+            "{}: directory depth exceeds the {MAX_COMPONENTS}-component bound",
+            display_rel(rel)
+        )));
+    }
+    const REMOVE_BATCH: usize = 4096;
+    loop {
+        let (entries, _) = crate::platform::windows_list_dir_raw(dir, REMOVE_BATCH)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for item in entries {
+            let child_rel = join_rel(rel, &OsString::from_wide(&item.name));
+            let entry: crate::platform::AnchoredEntry =
+                match crate::platform::anchored_open_entry(dir, &item.name, &child_rel) {
+                    Ok(entry) => entry,
+                    Err(e) if e.kind == ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+            if entry.attributes & crate::platform::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                // A nested link is unlinked in place, never traversed.
+                crate::platform::anchored_delete_entry(&entry.handle, &child_rel)?;
+                continue;
+            }
+            if entry.attributes & crate::platform::FILE_ATTRIBUTE_DIRECTORY != 0 {
+                windows_remove_tree_children(&entry.handle, &child_rel, depth + 1)?;
+            }
+            crate::platform::anchored_delete_entry(&entry.handle, &child_rel)?;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // windows walker implementation (handle-relative descent)
 // ---------------------------------------------------------------------------
 
@@ -1663,7 +2024,8 @@ fn windows_list_dir(
     rel: &Path,
     max: usize,
 ) -> Result<DirListing, Error> {
-    let (raw, overflowed) = crate::platform::windows_list_dir_raw(handle, max)?;
+    let (raw, overflowed): (Vec<crate::platform::RawDirEntry>, bool) =
+        crate::platform::windows_list_dir_raw(handle, max)?;
     let mut entries = Vec::with_capacity(raw.len());
     for item in raw {
         use std::os::windows::ffi::OsStringExt as _;

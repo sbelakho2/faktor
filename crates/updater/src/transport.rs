@@ -11,9 +11,7 @@
 //! checked up front and the stream aborts the moment the limit is crossed
 //! (never an unbounded read into memory or disk).
 
-use faktor_provider::egress::{
-    BudgetComponent, BudgetedBody, CheckedHttpClient, EgressError, ResponseBudget,
-};
+use faktor_provider::egress::{BudgetComponent, CheckedHttpClient, EgressError, ResponseBudget};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::UpdateError;
@@ -129,7 +127,7 @@ impl CheckedHttpFetcher {
             max_bytes,
             None,
         );
-        let mut body = BudgetedBody::new(response, budget);
+        let mut body = response.into_budgeted(budget);
         let mut streamed: u64 = 0;
         loop {
             match body.next_chunk().await {

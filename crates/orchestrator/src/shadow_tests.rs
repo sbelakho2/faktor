@@ -710,21 +710,73 @@ fn oversize_base_refused_before_any_mutation() {
     assert_no_shadow(&fix2);
 }
 
+/// Invalid caps refuse TYPED at construction (never a panic): a zero cap
+/// cannot bound anything and an entries cap above the base-map cap could
+/// never be enforced. Defaults and explicit in-range caps stay accepted.
 #[test]
-#[should_panic(expected = "shadow copy caps must be >= 1")]
-fn zero_caps_refused_at_construction() {
+fn invalid_caps_refuse_typed_at_construction() {
     let dir = tempfile::tempdir().unwrap();
     let manager =
         SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
-    let _ = ShadowRoots::new_with_limits(
+    let cases = [
+        (
+            ShadowCopyLimits {
+                max_entries: 0,
+                max_total_bytes: 1,
+            },
+            "max_entries",
+            0u128,
+        ),
+        (
+            ShadowCopyLimits {
+                max_entries: 1,
+                max_total_bytes: 0,
+            },
+            "max_total_bytes",
+            0u128,
+        ),
+        (
+            ShadowCopyLimits {
+                max_entries: SHADOW_MAX_BASE_ENTRIES + 1,
+                max_total_bytes: 1,
+            },
+            "max_entries",
+            (SHADOW_MAX_BASE_ENTRIES + 1) as u128,
+        ),
+    ];
+    for (limits, field, value) in cases {
+        match ShadowRoots::new_with_limits(manager.clone(), dir.path().join("shadows"), limits) {
+            Err(ShadowRootError::InvalidLimits {
+                field: actual_field,
+                value: actual_value,
+                constraint,
+            }) => {
+                assert_eq!(actual_field, field, "{limits:?}");
+                assert_eq!(actual_value, value, "{limits:?}");
+                assert!(!constraint.is_empty(), "the constraint is named");
+            }
+            other => panic!(
+                "invalid caps {limits:?} must refuse typed, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+    // Defaults are unchanged, and an explicit in-range cap stays accepted.
+    assert!(ShadowRoots::new_with_limits(
+        manager.clone(),
+        dir.path().join("shadows-default"),
+        ShadowCopyLimits::default(),
+    )
+    .is_ok());
+    assert!(ShadowRoots::new_with_limits(
         manager,
-        dir.path().join("s"),
+        dir.path().join("shadows-small"),
         ShadowCopyLimits {
-            max_entries: 0,
+            max_entries: 1,
             max_total_bytes: 1,
         },
     )
-    .unwrap();
+    .is_ok());
 }
 
 #[test]
@@ -1107,6 +1159,9 @@ fn degenerate_shadow_roots_refuse_typed_and_anchored_relative_roots_are_accepted
     ] {
         match ShadowRoots::new(manager.clone(), degenerate.clone()) {
             Err(ShadowRootError::DegenerateRoot { root, .. }) => assert_eq!(root, degenerate),
+            Err(other) => {
+                panic!("degenerate root {degenerate:?} must refuse DegenerateRoot (not {other:?})")
+            }
             Ok(_) => panic!("degenerate root {degenerate:?} must refuse typed, never fall back"),
         }
     }

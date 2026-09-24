@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -64,18 +65,28 @@ pub struct PendingPermission {
 /// One live waiter: the UI-visible view plus the ONLY channel through which
 /// its decision can be delivered. Removing the entry from the map is the
 /// resolution authority; the sender is useless once removed.
+///
+/// `generation` identifies THIS entry among every entry that ever lived
+/// under the same permission id: guards remove only the entry whose
+/// generation they were minted with, so a stale guard can never delete a
+/// NEWER waiter that reused the id (P2-A).
 struct PendingEntry {
     view: PendingPermission,
     sender: oneshot::Sender<PermissionDecision>,
+    generation: u64,
 }
 
 /// RAII ownership of one authority-map entry: the request future owns its
 /// entry, so dropping the future (timeout, cancellation, panic) removes it.
 /// A successful delivery disarms the guard — the resolver already removed the
 /// entry, and a stale guard must never touch a later request with the same id.
+/// Ownership is `(id, generation)`: a resolver may remove+sent and a NEW
+/// waiter for the same id may be inserted before this guard drops, and the
+/// generation mismatch then keeps the guard from deleting the new waiter.
 struct PendingGuard {
     pending: Arc<Mutex<HashMap<i64, PendingEntry>>>,
     id: i64,
+    generation: u64,
     armed: bool,
 }
 
@@ -94,7 +105,11 @@ impl Drop for PendingGuard {
             self.pending.clear_poison();
             poisoned.into_inner()
         });
-        pending.remove(&self.id);
+        // Remove-to-own, scoped to the generation this guard was minted
+        // with: the id alone is not ownership (a newer waiter may hold it).
+        if pending.get(&self.id).map(|entry| entry.generation) == Some(self.generation) {
+            pending.remove(&self.id);
+        }
     }
 }
 
@@ -102,6 +117,10 @@ impl Drop for PendingGuard {
 pub struct ChannelPermissionRequester {
     /// THE authority map (view + delivery channel per live request).
     pending: Arc<Mutex<HashMap<i64, PendingEntry>>>,
+    /// Monotonic generation source: every inserted waiter gets a fresh value,
+    /// so a guard can tell the entry it owns from a later entry under the
+    /// same id (generations are process-lifetime unique, never reused).
+    next_generation: Arc<AtomicU64>,
     /// Upper bound of one live wait. The durable `expires_ms` can only cut it
     /// shorter, never extend it — the durable clock is the outer authority.
     timeout: Duration,
@@ -111,6 +130,7 @@ impl ChannelPermissionRequester {
     pub fn new(timeout: Duration) -> Arc<Self> {
         Arc::new(Self {
             pending: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: Arc::new(AtomicU64::new(1)),
             timeout,
         })
     }
@@ -218,6 +238,7 @@ impl PermissionRequester for ChannelPermissionRequester {
             detail,
         };
         let (sender, receiver) = oneshot::channel();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         {
             let mut pending = self.lock_pending();
             if pending.contains_key(&id) {
@@ -227,11 +248,19 @@ impl PermissionRequester for ChannelPermissionRequester {
                     )))
                 });
             }
-            pending.insert(id, PendingEntry { view, sender });
+            pending.insert(
+                id,
+                PendingEntry {
+                    view,
+                    sender,
+                    generation,
+                },
+            );
         }
         let guard = PendingGuard {
             pending: Arc::clone(&self.pending),
             id,
+            generation,
             armed: true,
         };
         let wait = self.timeout.min(Duration::from_millis(remaining_ms as u64));
@@ -479,6 +508,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(r.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_guard_cannot_remove_a_newer_waiter_with_the_same_id() {
+        // P2-A regression: the resolver removes-to-own and sends, then a NEW
+        // waiter for the SAME id is inserted, then the OLD future (its guard
+        // never polled, so still armed) drops. Removing by id alone deleted
+        // the new waiter; ownership must be (id, generation).
+        let r = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let sid = SessionId::new(1);
+        // The synchronous half of `request` inserts the entry; the future
+        // owns the armed guard and is never polled before it is dropped.
+        let first = r.request(sid, &permission(7));
+        assert_eq!(r.pending_ids(), vec![7]);
+        // A resolver takes and answers the first waiter...
+        assert!(r.resolve(sid, 7, PermissionDecision::Allow).unwrap());
+        // ...and BEFORE the stale guard drops, a new waiter reuses the id.
+        let second = r.request(sid, &permission(7));
+        assert_eq!(r.pending_ids(), vec![7], "the new waiter owns the id");
+        drop(first);
+        assert_eq!(
+            r.pending_ids(),
+            vec![7],
+            "the stale guard must not delete the newer waiter"
+        );
+        // The survivor is the NEW waiter: its own resolution delivers to it.
+        assert!(r.resolve(sid, 7, PermissionDecision::Deny).unwrap());
+        assert_eq!(second.await.unwrap(), PermissionDecision::Deny);
+        assert_eq!(r.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn generations_isolate_a_thousand_reused_ids() {
+        // Adversarial stress of the same defect: every generation leaves a
+        // stale armed guard behind while the id is immediately reused; after
+        // 1000 cycles the live waiter must still own the id.
+        let r = ChannelPermissionRequester::new(Duration::from_secs(5));
+        let sid = SessionId::new(1);
+        let mut stale = Vec::new();
+        for _ in 0..1000 {
+            stale.push(r.request(sid, &permission(7)));
+            assert!(r.resolve(sid, 7, PermissionDecision::Allow).unwrap());
+        }
+        let survivor = r.request(sid, &permission(7));
+        assert_eq!(r.pending_ids(), vec![7]);
+        drop(stale);
+        assert_eq!(
+            r.pending_ids(),
+            vec![7],
+            "1000 stale guards must not touch the live waiter"
+        );
+        assert!(r.resolve(sid, 7, PermissionDecision::Allow).unwrap());
+        assert_eq!(survivor.await.unwrap(), PermissionDecision::Allow);
         assert_eq!(r.pending_count(), 0);
     }
 

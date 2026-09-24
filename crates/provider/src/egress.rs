@@ -86,16 +86,24 @@
 //!
 //! # Every response body is budgeted
 //!
-//! No production consumer reads a response body directly. [`BudgetedBody`]
-//! enforces a caller-supplied [`ResponseBudget`] (head/idle/total deadlines
-//! plus byte and frame caps) on every chunk; a stalled, dripping, oversized
-//! or over-framed body is the typed
+//! No production consumer reads a response body directly, and no production
+//! consumer ever receives a naked `reqwest::Response`: the checked transport
+//! hands back a [`CheckedResponse`] — a [`ResponseHead`] (status, headers,
+//! final URL) plus a body that can only be consumed through budget-taking
+//! APIs ([`CheckedResponse::read_bytes`], [`CheckedResponse::read_json`],
+//! [`CheckedResponse::stream_frames`], the free [`read_json_bounded`]
+//! helper, or an explicit [`BudgetedBody`]). [`BudgetedBody`] enforces the
+//! caller-supplied [`ResponseBudget`] (head/idle/total deadlines plus byte
+//! and frame caps) on every chunk; a stalled, dripping, oversized or
+//! over-framed body is the typed
 //! [`EgressError::ResponseBudgetExceeded`] naming the component that fired,
 //! and [`execute_raw`] materializes only under a budget (its byte cap is
 //! never above [`MAX_RAW_RESPONSE_BYTES`]). The provider streaming path, the
 //! wire adapters, SCM, cloud OIDC, the updater, semantic and the commerce
 //! connectors all pass one; the `static-authority` scan refuses direct
-//! `.bytes()`/`.text()`/`.chunk()`/`bytes_stream()` reads in those trees.
+//! `.json()`/`.bytes()`/`.text()`/`.chunk(`/`bytes_stream()`/`.body_mut()`
+//! reads, `.copy_to(`/`.copy_to_bytes(`/`read_to_end(` calls and raw
+//! `reqwest::Response` consumption in those trees.
 //!
 //! # Error size
 //!
@@ -456,6 +464,11 @@ impl From<EgressError> for ProviderError {
                 component: BudgetComponent::Head | BudgetComponent::Idle | BudgetComponent::Total,
                 ..
             } => ProviderError::new(ProviderErrorKind::Network, message),
+            // A body that decoded as bytes but not as JSON is a hostile or
+            // broken response shape: typed Malformed, never retried.
+            EgressError::MalformedResponse { .. } => {
+                ProviderError::new(ProviderErrorKind::Malformed, message)
+            }
             _ => ProviderError::new(ProviderErrorKind::BadRequest, message),
         }
     }
@@ -464,10 +477,11 @@ impl From<EgressError> for ProviderError {
 /// The single outbound-HTTP seam every adapter must execute through.
 ///
 /// An implementation takes an already-built [`reqwest::Request`] and runs it
-/// (usually through the parsed-destination gate first) and hands back the
-/// response *with its body still streaming* — adapters then consume the
-/// response body exactly as they consumed a `reqwest::Client::execute`
-/// response before, so SSE/NDJSON streaming behavior is unchanged.
+/// (usually through the parsed-destination gate first) and hands back a
+/// [`CheckedResponse`] — head plus a budget-consumable body. Adapters can no
+/// longer name a raw response at all: every body read takes a
+/// [`ResponseBudget`] through [`CheckedResponse`]/[`BudgetedBody`], so the
+/// `resp.json().await` class of unbounded read is a type error.
 ///
 /// Implementations MUST be `Send + Sync` (providers are shared across
 /// runtime tasks). `reqwest::Client` construction, request building and raw
@@ -475,9 +489,10 @@ impl From<EgressError> for ProviderError {
 /// names a `reqwest::Client` (certified by the source-level test
 /// `no_raw_client_execute_outside_egress`).
 pub trait HttpTransport: Send + Sync {
-    /// Execute one built request. The response body is a live stream; call
-    ///ers consume it (never buffer it here).
-    fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>>;
+    /// Execute one built request. The body inside the [`CheckedResponse`]
+    /// is a live stream that can only be read under a budget; the transport
+    /// never buffers it here.
+    fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>>;
 }
 
 /// The policy-checked production transport: [`CheckedHttpClient`] behind the
@@ -583,17 +598,17 @@ impl PolicyCheckedHttpTransport {
 }
 
 impl HttpTransport for PolicyCheckedHttpTransport {
-    fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         let inner = self.inner.clone();
         Box::pin(async move { inner.execute(req).await })
     }
 }
 
 /// `CheckedHttpClient` itself is a valid transport (it already encapsulates
-/// policy + client and can yield streaming responses) — callers that hold
-/// one can hand it to adapters directly.
+/// policy + client and can yield checked streaming responses) — callers that
+/// hold one can hand it to adapters directly.
 impl HttpTransport for CheckedHttpClient {
-    fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         let inner = self.clone();
         Box::pin(async move { inner.execute(req).await })
     }
@@ -628,26 +643,26 @@ fn try_default_timeout_client(resolver: EgressResolver) -> Result<reqwest::Clien
 
 /// Execute a GET through a transport. Request building and the raw
 /// `Client::execute` call happen only here (adapter code never constructs a
-/// `reqwest::Client`). The returned response is a stream: every production
-/// consumer reads it through [`BudgetedBody`] under a [`ResponseBudget`]
+/// `reqwest::Client`). The returned [`CheckedResponse`] is a stream: every
+/// production consumer reads its body through one of the budget-taking APIs
 /// (the static-authority scan refuses direct body reads).
 pub async fn execute_get(
     transport: &dyn HttpTransport,
     url: &str,
-) -> Result<Response, EgressError> {
+) -> Result<CheckedResponse, EgressError> {
     let parsed = parse_fetch_url(url)?;
     transport.execute(Request::new(Method::GET, parsed)).await
 }
 
 /// Execute a JSON POST through a transport (no extra headers). The returned
-/// response is a stream: read it through [`BudgetedBody`] under a
+/// [`CheckedResponse`] is a stream: read its body under a
 /// [`ResponseBudget`].
 pub async fn execute_post_json(
     transport: &dyn HttpTransport,
     url: &str,
     headers: HeaderMap,
     body: &serde_json::Value,
-) -> Result<Response, EgressError> {
+) -> Result<CheckedResponse, EgressError> {
     execute_post_json_with_extras(
         transport,
         url,
@@ -671,7 +686,7 @@ pub async fn execute_post_json_with_extras(
     headers: HeaderMap,
     extra_headers: &crate::config::ExtraHeaders,
     body: &serde_json::Value,
-) -> Result<Response, EgressError> {
+) -> Result<CheckedResponse, EgressError> {
     let parsed = parse_fetch_url(url)?;
     let mut request = Request::new(Method::POST, parsed);
     *request.headers_mut() = headers;
@@ -789,8 +804,174 @@ impl ResponseBudget {
     }
 }
 
-/// A response body wrapper that enforces its [`ResponseBudget`] on every
+/// The credential-free-ish HEAD of one checked response: status, HTTP
+/// version, headers and the final parsed URL. This is all an ordinary
+/// consumer ever sees of the transport's raw response; the body rides
+/// [`CheckedResponse`]'s budget-only read APIs.
+#[derive(Debug, Clone)]
+pub struct ResponseHead {
+    status: reqwest::StatusCode,
+    version: reqwest::Version,
+    headers: HeaderMap,
+    url: Url,
+}
+
+impl ResponseHead {
+    fn from_response(response: &Response) -> Self {
+        Self {
+            status: response.status(),
+            version: response.version(),
+            headers: response.headers().clone(),
+            url: response.url().clone(),
+        }
+    }
+
+    /// The HTTP status.
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    /// True for 2xx statuses.
+    pub fn is_success(&self) -> bool {
+        self.status.is_success()
+    }
+
+    /// The HTTP version the response arrived on.
+    pub fn version(&self) -> reqwest::Version {
+        self.version
+    }
+
+    /// The response headers.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// The FINAL parsed URL the response came from (after any checked
+    /// redirect hops).
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+}
+
+/// The only response type ordinary consumers of the checked transport
+/// receive: a [`ResponseHead`] plus a body that is consumable exclusively
+/// through budget-taking APIs. A raw `reqwest::Response` never crosses the
+/// seam, so `resp.json().await` — the audit's budget bypass — cannot be
+/// written against a transport result at all.
+///
+/// | API | shape |
+/// |-----|-------|
+/// | [`CheckedResponse::read_bytes`] | materialize under a budget |
+/// | [`CheckedResponse::read_json`] | bounded bytes + typed JSON parse |
+/// | [`CheckedResponse::stream_frames`] | budget-checked chunk stream |
+/// | [`CheckedResponse::into_budgeted`] | explicit [`BudgetedBody`] for multi-step reads |
+pub struct CheckedResponse {
+    head: ResponseHead,
+    body: BudgetedBody,
+}
+
+impl std::fmt::Debug for CheckedResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedResponse")
+            .field("head", &self.head)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CheckedResponse {
+    /// Wrap one raw response into the checked shape. The checked transport
+    /// (and test mocks) call this after the response passed the
+    /// destination/scan gate; the body starts UNBOUND and every read API
+    /// binds a budget first.
+    pub fn from_response(response: Response) -> Self {
+        let head = ResponseHead::from_response(&response);
+        let body = BudgetedBody::unbudgeted(response);
+        Self { head, body }
+    }
+
+    /// The response head (status, headers, final URL).
+    pub fn head(&self) -> &ResponseHead {
+        &self.head
+    }
+
+    /// The HTTP status.
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.head.status
+    }
+
+    /// True for 2xx statuses.
+    pub fn is_success(&self) -> bool {
+        self.head.is_success()
+    }
+
+    /// The response headers.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.head.headers
+    }
+
+    /// The final parsed URL.
+    pub fn url(&self) -> &Url {
+        &self.head.url
+    }
+
+    /// Bind `budget` to the body and read it in full (the materializing
+    /// helper). The returned bytes are bounded by `budget.max_bytes`.
+    pub async fn read_bytes(self, budget: &ResponseBudget) -> Result<Vec<u8>, EgressError> {
+        self.into_budgeted(*budget).read_all().await
+    }
+
+    /// Bind `budget` to the body, read it in full and parse the bytes as
+    /// JSON. A budget breach is the typed
+    /// [`EgressError::ResponseBudgetExceeded`]; malformed JSON is the typed
+    /// [`EgressError::MalformedResponse`].
+    pub async fn read_json<T: serde::de::DeserializeOwned>(
+        self,
+        budget: &ResponseBudget,
+    ) -> Result<T, EgressError> {
+        read_json_bounded(self, budget).await
+    }
+
+    /// Bind `budget` to the body and turn it into a budget-checked chunk
+    /// stream (exactly one terminal error, then the stream ends).
+    pub fn stream_frames(
+        self,
+        budget: &ResponseBudget,
+    ) -> impl Stream<Item = Result<Vec<u8>, EgressError>> + Send + 'static {
+        self.into_budgeted(*budget).into_stream()
+    }
+
+    /// Bind `budget` to the body and hand back the explicit
+    /// [`BudgetedBody`] reader (for multi-step consumers that need
+    /// `next_chunk` decisions per frame).
+    pub fn into_budgeted(mut self, budget: ResponseBudget) -> BudgetedBody {
+        self.body.bind(budget);
+        self.body
+    }
+}
+
+/// Read one [`CheckedResponse`] body in full under `budget` and parse it as
+/// JSON. This is the ONLY JSON-from-the-wire helper: it reads through
+/// [`BudgetedBody`] (`max_bytes`/head/idle/total/frames all enforced) and
+/// then runs `serde_json::from_slice`. A budget breach is the typed
+/// [`EgressError::ResponseBudgetExceeded`]; a parse failure is the typed
+/// [`EgressError::MalformedResponse`] (never a partial or defaulted value).
+pub async fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    response: CheckedResponse,
+    budget: &ResponseBudget,
+) -> Result<T, EgressError> {
+    let bytes = response.read_bytes(budget).await?;
+    serde_json::from_slice(&bytes).map_err(|e| EgressError::MalformedResponse {
+        detail: e.to_string(),
+    })
+}
+
+/// A response body wrapper that enforces a [`ResponseBudget`] on every
 /// chunk: the ONE way production consumers read a body.
+///
+/// The budget is bound when the reader is constructed ([`BudgetedBody::new`])
+/// or by [`CheckedResponse::into_budgeted`]; a read attempted before a
+/// budget is bound is the typed [`EgressError::UnboundResponseBody`] (an
+/// invariant only reachable by naming the unchecked internal constructor).
 ///
 /// `next_chunk` is the choke point: it bounds the wait for each chunk by the
 /// head/idle and remaining-total budgets (a `tokio::time::timeout` per
@@ -802,7 +983,7 @@ impl ResponseBudget {
 /// emitted.
 pub struct BudgetedBody {
     response: Response,
-    budget: ResponseBudget,
+    budget: Option<ResponseBudget>,
     started: Instant,
     last_activity: Option<Instant>,
     bytes: u64,
@@ -813,9 +994,18 @@ pub struct BudgetedBody {
 impl BudgetedBody {
     /// Wrap a streaming response under `budget`.
     pub fn new(response: Response, budget: ResponseBudget) -> Self {
+        let mut body = Self::unbudgeted(response);
+        body.bind(budget);
+        body
+    }
+
+    /// Wrap a streaming response with NO budget bound yet: every read is a
+    /// typed refusal until [`BudgetedBody::bind`] runs. Only the checked
+    /// transport's [`CheckedResponse`] uses this shape.
+    pub(crate) fn unbudgeted(response: Response) -> Self {
         Self {
             response,
-            budget,
+            budget: None,
             started: Instant::now(),
             last_activity: None,
             bytes: 0,
@@ -824,13 +1014,18 @@ impl BudgetedBody {
         }
     }
 
+    /// Bind the budget this reader enforces (idempotent for `new`).
+    pub(crate) fn bind(&mut self, budget: ResponseBudget) {
+        self.budget = Some(budget);
+    }
+
     /// The response's parsed URL (for diagnostics).
     pub fn url(&self) -> &Url {
         self.response.url()
     }
 
-    /// The installed budget.
-    pub fn budget(&self) -> ResponseBudget {
+    /// The bound budget (`None` only for an unbound internal reader).
+    pub fn budget(&self) -> Option<ResponseBudget> {
         self.budget
     }
 
@@ -858,18 +1053,19 @@ impl BudgetedBody {
         if self.finished {
             return Ok(None);
         }
-        let remaining = self
-            .budget
-            .total_deadline
-            .saturating_sub(self.started.elapsed());
-        let total_limit_ms = self.budget.total_deadline.as_millis() as u64;
+        let Some(budget) = self.budget else {
+            self.finished = true;
+            return Err(EgressError::UnboundResponseBody);
+        };
+        let remaining = budget.total_deadline.saturating_sub(self.started.elapsed());
+        let total_limit_ms = budget.total_deadline.as_millis() as u64;
         if remaining.is_zero() {
             self.finished = true;
             return Err(self.exceeded(BudgetComponent::Total, total_limit_ms));
         }
         let (phase, component) = match self.last_activity {
-            Some(_) => (self.budget.idle_timeout, BudgetComponent::Idle),
-            None => (self.budget.head_timeout, BudgetComponent::Head),
+            Some(_) => (budget.idle_timeout, BudgetComponent::Idle),
+            None => (budget.head_timeout, BudgetComponent::Head),
         };
         let wait = phase.min(remaining);
         match tokio::time::timeout(wait, self.response.chunk()).await {
@@ -891,12 +1087,12 @@ impl BudgetedBody {
             }
             Ok(Ok(Some(chunk))) => {
                 let len = chunk.len() as u64;
-                if self.bytes.saturating_add(len) > self.budget.max_bytes {
+                if self.bytes.saturating_add(len) > budget.max_bytes {
                     self.finished = true;
-                    return Err(self.exceeded(BudgetComponent::Bytes, self.budget.max_bytes));
+                    return Err(self.exceeded(BudgetComponent::Bytes, budget.max_bytes));
                 }
                 self.frames = self.frames.saturating_add(1);
-                if let Some(max_frames) = self.budget.max_frames {
+                if let Some(max_frames) = budget.max_frames {
                     if self.frames > max_frames {
                         self.finished = true;
                         return Err(self.exceeded(BudgetComponent::Frames, max_frames));
@@ -1134,7 +1330,7 @@ pub async fn execute_raw(
         max_bytes: budget.max_bytes.min(MAX_RAW_RESPONSE_BYTES as u64),
         ..*budget
     };
-    let body = BudgetedBody::new(response, effective).read_all().await?;
+    let body = response.read_bytes(&effective).await?;
     Ok(RawResponse {
         status,
         headers,
@@ -1189,7 +1385,7 @@ impl MockHttpTransport {
 }
 
 impl HttpTransport for MockHttpTransport {
-    fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         self.requests
             .lock()
             .unwrap()
@@ -1207,7 +1403,7 @@ impl HttpTransport for MockHttpTransport {
                 .url(url)
                 .body(Body::from(body))
                 .map_err(|e| EgressError::Build(e.to_string()))?;
-            Ok(Response::from(response))
+            Ok(CheckedResponse::from_response(Response::from(response)))
         })
     }
 }
@@ -1271,6 +1467,16 @@ pub enum EgressError {
     /// rather than fall back to a degraded client that could skip the
     /// redirect or resolver gate. URL-free by construction.
     ClientBuild { detail: String },
+    /// A [`CheckedResponse`] body was read in full under its budget but did
+    /// not decode as JSON (the typed refusal of [`read_json_bounded`] and
+    /// [`CheckedResponse::read_json`]). `detail` is the serde message only —
+    /// never a body byte.
+    MalformedResponse { detail: String },
+    /// A body read ran before its [`ResponseBudget`] was bound on the
+    /// [`BudgetedBody`] reader. Unreachable through [`CheckedResponse`]
+    /// (every read API binds a budget first); reachable only by naming the
+    /// crate-internal unbound constructor.
+    UnboundResponseBody,
     /// One response body read exceeded its [`ResponseBudget`]. The typed
     /// component distinguishes a stalled head (`Head`), a stalled body
     /// (`Idle`), an overall deadline (`Total`), a byte cap (`Bytes`) and a
@@ -1362,6 +1568,13 @@ impl std::fmt::Display for EgressError {
             EgressError::ClientBuild { detail } => {
                 write!(f, "egress client construction failed: {detail}")
             }
+            EgressError::MalformedResponse { detail } => {
+                write!(f, "response body did not parse as JSON: {detail}")
+            }
+            EgressError::UnboundResponseBody => write!(
+                f,
+                "response body read attempted before a ResponseBudget was bound"
+            ),
             EgressError::ResponseBudgetExceeded {
                 url,
                 component,
@@ -1733,7 +1946,10 @@ impl CheckedHttpClient {
     /// request's OWN parsed URL immediately before `Client::execute`, and
     /// that same request object is what gets sent (no resolve-then-connect
     /// split, no re-parsing of strings anywhere).
-    pub async fn send_checked(&self, builder: RequestBuilder) -> Result<Response, EgressError> {
+    pub async fn send_checked(
+        &self,
+        builder: RequestBuilder,
+    ) -> Result<CheckedResponse, EgressError> {
         let request = builder
             .build()
             .map_err(|e| EgressError::Build(e.without_url().to_string()))?;
@@ -1749,8 +1965,10 @@ impl CheckedHttpClient {
     /// [`MAX_REDIRECT_HOPS`]: every hop re-runs the destination gate and
     /// the outbound secret scan on its own URL/body BEFORE the hop is
     /// sent, credentials never cross an origin change, and the wrapped
-    /// client must not follow redirects itself (detected and refused).
-    pub async fn execute(&self, request: Request) -> Result<Response, EgressError> {
+    /// client must not follow redirects itself (detected and refused). The
+    /// final hop is wrapped into a [`CheckedResponse`] — the raw
+    /// `reqwest::Response` never leaves this method.
+    pub async fn execute(&self, request: Request) -> Result<CheckedResponse, EgressError> {
         let mut request = request;
         let mut hops: usize = 0;
         loop {
@@ -1785,12 +2003,12 @@ impl CheckedHttpClient {
             }
 
             let Some((next_method, drop_body)) = next_hop(response.status(), &hop_method) else {
-                return Ok(response);
+                return Ok(CheckedResponse::from_response(response));
             };
             // A redirect status without a Location is not a redirect: the
             // response is surfaced exactly as the previous follower did.
             let Some(location) = response.headers().get(LOCATION) else {
-                return Ok(response);
+                return Ok(CheckedResponse::from_response(response));
             };
             if hops >= MAX_REDIRECT_HOPS {
                 return Err(EgressError::TooManyRedirects {
@@ -1987,6 +2205,18 @@ pub fn validate_provider_base_url(raw: &str) -> Result<Url, EgressError> {
     parse_fetch_url(raw)
 }
 
+/// A test-only budget for materializing small mock bodies.
+#[cfg(test)]
+fn test_budget() -> ResponseBudget {
+    ResponseBudget::for_timeout(Duration::from_secs(10), 1 << 20)
+}
+
+/// Read a checked response body as text under the test budget.
+#[cfg(test)]
+async fn body_text(resp: CheckedResponse) -> String {
+    String::from_utf8_lossy(&resp.read_bytes(&test_budget()).await.unwrap()).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2017,7 +2247,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "ok");
+        assert_eq!(body_text(resp).await, "ok");
         assert_eq!(server.request_count(), 1);
 
         // 2. http://127.0.0.1:<wrong port>: port mismatch denied BEFORE
@@ -2447,7 +2677,7 @@ mod tests {
         transport: &dyn HttpTransport,
         url: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<reqwest::Response, EgressError> {
+    ) -> Result<CheckedResponse, EgressError> {
         match body {
             Some(json) => {
                 execute_post_json(transport, url, reqwest::header::HeaderMap::new(), json).await
@@ -2480,7 +2710,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "ok");
+        assert_eq!(body_text(resp).await, "ok");
         assert_eq!(server.request_count(), 1);
 
         // Denied (installed policy, wrong port): refused BEFORE any network
@@ -2538,8 +2768,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), 200);
-        // The body must stream: text() reads it after execute returned.
-        assert_eq!(resp.text().await.unwrap(), "data: {\"ok\":true}\n\n");
+        // The body must still stream: it is read after execute returned.
+        assert_eq!(body_text(resp).await, "data: {\"ok\":true}\n\n");
         let (_, path, body) = server.last_request().unwrap();
         assert_eq!(path, "/json");
         let sent: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -2559,17 +2789,14 @@ mod tests {
         assert_eq!(get("content-type").as_deref(), Some("application/json"));
     }
 
-    #[test]
-    fn mock_transport_serves_canned_bodies_and_deny_mode_without_http() {
+    #[tokio::test]
+    async fn mock_transport_serves_canned_bodies_and_deny_mode_without_http() {
         let transport = MockHttpTransport::new(200, "canned body");
         let url = reqwest::Url::parse("http://example.invalid/p").unwrap();
         let req = reqwest::Request::new(reqwest::Method::GET, url);
-        let resp = futures::executor::block_on(transport.execute(req)).unwrap();
+        let resp = transport.execute(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(
-            futures::executor::block_on(resp.text()).unwrap(),
-            "canned body"
-        );
+        assert_eq!(body_text(resp).await, "canned body");
         assert_eq!(
             transport.requests(),
             vec![("GET".to_string(), "http://example.invalid/p".to_string())]
@@ -2583,7 +2810,7 @@ mod tests {
         });
         let url = reqwest::Url::parse("http://example.invalid/p").unwrap();
         let req = reqwest::Request::new(reqwest::Method::POST, url);
-        let err = futures::executor::block_on(transport.execute(req)).unwrap_err();
+        let err = transport.execute(req).await.unwrap_err();
         assert!(matches!(err, EgressError::Denied { .. }), "{err:?}");
         assert_eq!(transport.request_count(), 1);
     }
@@ -4043,7 +4270,7 @@ mod redirect_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "done");
+        assert_eq!(body_text(resp).await, "done");
         let paths: Vec<String> = server.seen().into_iter().map(|r| r.path).collect();
         assert_eq!(paths, ["/a", "/b", "/c"]);
     }
@@ -4316,7 +4543,7 @@ mod redirect_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 302);
-        assert_eq!(resp.text().await.unwrap(), "moved but nowhere");
+        assert_eq!(body_text(resp).await, "moved but nowhere");
         assert_eq!(server.count(), 1);
     }
 
@@ -5133,7 +5360,7 @@ mod budget_tests {
     }
 
     impl HttpTransport for ScriptedBodyTransport {
-        fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+        fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
             let body = self
                 .body
                 .lock()
@@ -5147,7 +5374,7 @@ mod budget_tests {
                     .url(url)
                     .body(Body::wrap_stream(body))
                     .map_err(|e| EgressError::Build(e.to_string()))?;
-                Ok(Response::from(response))
+                Ok(CheckedResponse::from_response(Response::from(response)))
             })
         }
     }
@@ -5282,7 +5509,7 @@ mod budget_tests {
             .await
             .unwrap();
         let budget = ResponseBudget::from_millis(50, 50, 5_000, 1024, None);
-        let mut stream = Box::pin(BudgetedBody::new(response, budget).into_stream());
+        let mut stream = Box::pin(response.into_budgeted(budget).into_stream());
         let first = stream.next().await.expect("one error item").unwrap_err();
         assert!(
             matches!(
@@ -5295,6 +5522,119 @@ mod budget_tests {
             "{first:?}"
         );
         assert!(stream.next().await.is_none(), "stream ends after the error");
+    }
+
+    /// `read_json_bounded` parses a normal JSON body and types a malformed
+    /// one WITHOUT ever echoing the hostile bytes.
+    #[tokio::test]
+    async fn read_json_bounded_parses_normal_json_and_never_echoes_a_malformed_body() {
+        #[derive(serde::Deserialize, PartialEq, Eq, Debug)]
+        struct Row {
+            models: Vec<String>,
+        }
+        let budget = ResponseBudget::from_millis(2_000, 2_000, 5_000, 4096, None);
+        let transport = MockHttpTransport::new(200, r#"{"models":["qwen3.8"]}"#);
+        let resp = execute_get(&transport, "https://allowed.example/api/tags")
+            .await
+            .unwrap();
+        let row: Row = read_json_bounded(resp, &budget).await.unwrap();
+        assert_eq!(row.models, vec!["qwen3.8"]);
+
+        // The typed parse refusal never carries a body byte (a planted
+        // secret in the malformed body must not render through any path).
+        const SECRET: &str = "MALFORMED-BODY-SECRET-9f2a";
+        let transport = MockHttpTransport::new(200, format!("not json {SECRET}"));
+        let resp = execute_get(&transport, "https://allowed.example/api/tags")
+            .await
+            .unwrap();
+        let err = read_json_bounded::<serde_json::Value>(resp, &budget)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EgressError::MalformedResponse { .. }),
+            "{err:?}"
+        );
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains(SECRET), "body bytes leaked: {rendered}");
+        }
+    }
+
+    /// A HOSTILE giant JSON body is cut at `max_bytes` BEFORE the crossing
+    /// chunk is handed out: bounded allocation by construction, typed error,
+    /// and the (unparseable) prefix is never parsed into a value.
+    #[tokio::test]
+    async fn read_json_bounded_cuts_a_giant_json_body_by_max_bytes() {
+        let budget = ResponseBudget::from_millis(2_000, 2_000, 5_000, 128, None);
+        let giant = format!(r#"{{"models":["{}"]}}"#, "x".repeat(64 * 1024));
+        let transport = MockHttpTransport::new(200, giant);
+        let resp = execute_get(&transport, "https://allowed.example/api/ps")
+            .await
+            .unwrap();
+        let err = read_json_bounded::<serde_json::Value>(resp, &budget)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Bytes,
+                    limit: 128,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // The same body inside its budget parses: the cut is the budget, not
+        // the content.
+        let transport = MockHttpTransport::new(200, r#"{"models":[]}"#);
+        let resp = execute_get(&transport, "https://allowed.example/api/ps")
+            .await
+            .unwrap();
+        let value: serde_json::Value = read_json_bounded(resp, &budget).await.unwrap();
+        assert_eq!(value["models"], serde_json::json!([]));
+    }
+
+    /// A STREAMING JSON body that drips a prefix and then goes silent is cut
+    /// by the idle window, typed, with no unbounded wait.
+    #[tokio::test]
+    async fn read_json_bounded_cuts_a_streaming_json_body_by_idle() {
+        let body = chunks_then_pending(vec![(0, br#"{"models":[{"name":"q"#.to_vec())]);
+        let transport = ScriptedBodyTransport::new(body);
+        let resp = execute_get(&transport, "https://allowed.example/api/show")
+            .await
+            .unwrap();
+        let budget = ResponseBudget::from_millis(2_000, 60, 5_000, 4096, None);
+        let err = read_json_bounded::<serde_json::Value>(resp, &budget)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EgressError::ResponseBudgetExceeded {
+                    component: BudgetComponent::Idle,
+                    limit: 60,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An unbound reader (the crate-internal unbound constructor only) is a
+    /// typed refusal, never an unbudgeted read.
+    #[tokio::test]
+    async fn unbound_body_read_is_a_typed_refusal() {
+        let raw = Response::from(
+            http::Response::builder()
+                .status(200u16)
+                .url(Url::parse("https://allowed.example/data").unwrap())
+                .body(Body::from("payload"))
+                .unwrap(),
+        );
+        let mut body = BudgetedBody::unbudgeted(raw);
+        let err = body.next_chunk().await.unwrap_err();
+        assert!(matches!(err, EgressError::UnboundResponseBody), "{err:?}");
+        assert!(body.next_chunk().await.unwrap().is_none());
     }
 
     /// The fallible-construction contract (item 9): production constructors

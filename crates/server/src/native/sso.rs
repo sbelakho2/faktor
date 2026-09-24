@@ -165,12 +165,17 @@ pub(crate) async fn native_sso_start(
         .start(&organization, &sso, &body.redirect_uri)
         .await
     {
-        Ok(start) => Json(serde_json::json!({
-            "ok": true,
-            "authorizationUrl": start.authorization_url,
-            "state": start.state,
-        }))
-        .into_response(),
+        Ok(start) => {
+            // The wire projection is the ONLY way the plaintext state leaves
+            // the authority (P2-B); the domain type itself is redacted.
+            let wire = start.into_wire_response();
+            Json(serde_json::json!({
+                "ok": true,
+                "authorizationUrl": wire.authorization_url(),
+                "state": wire.state(),
+            }))
+            .into_response()
+        }
         Err(e) => wire_status(oidc_err(e)),
     }
 }

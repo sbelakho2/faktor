@@ -173,3 +173,52 @@ Workflow YAML is validated with `woodpecker-cli lint .woodpecker/` (or the
 container fallback in `scripts/woodpecker/setup.md` §13) plus the
 dependency-light PyYAML parse gate in the same section; both run before any
 CI change is pushed.
+
+## 5. Trusted-build attestation and the CI-image residual
+
+- **Attestation (P1-J).** The trusted workflow's `attestation` step (after
+  `certificate`, `linux/amd64` only, `when.status: [success]`) writes a
+  `faktor-build-attestation/v1` object and prints its base64 block into the
+  step log: source/tree SHA, workflow, event, pipeline id/number, the
+  attestation step's CI image digest (`build_environment_digest`), the
+  `rust-toolchain.toml` channel, and `artifacts{name: sha256}` collected
+  from the lane markers (VSIX, JetBrains zip) with every digest re-hashed at
+  attestation time. `scripts/certify.sh` fetches that block for the EXACT
+  trusted pipeline and refuses release certification on any mismatch.
+  Signing: register an ed25519 key on the trusted project and add
+  `FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret: faktor_attest_signing_key}`
+  to the step (a `from_secret` to a missing secret is a Woodpecker config
+  error, so it is documented, not hardcoded). Generate the pair with
+  `node scripts/certification/attestation.mjs keygen --out-key release.pem
+  --out-keys release-keys.json --key-id faktor-ci-release` and give
+  operators `release-keys.json` as `FAKTOR_ATTEST_KEYS`. Without the secret
+  the attestation is emitted UNSIGNED (loud) and is never release-grade.
+  Preferred release model: distribute the CI-built artifacts the
+  attestation covers, not local rebuilds.
+- **CI-image/apt residual (P2-D).** No Faktor CI image or Debian
+  snapshot+exact-version pin exists yet, so six `apt-get` command items run
+  against live Debian repositories. `scripts/check-ci-image-pins.sh` now
+  audits apt usage: every item needs `# apt-residual: <reason>` (current
+  state; printed on every run) or `# apt-pinned: <image@sha256:...>`, and an
+  item with neither (or a bare annotation) fails the `image-pins` step. The
+  target state is one Faktor CI image whose digest feeds the attestation's
+  `build_environment_digest`; see `docs/certification.md` §2.14.
+
+## 6. Context registry for release certification
+
+`scripts/certify.sh` accepts only these contexts (immutable registry;
+`--context` selects, never invents):
+
+| Context | Event | Workflow | Class |
+| --- | --- | --- | --- |
+| `ci/woodpecker/pr/pr` | `pull_request` | `pr` | untrusted |
+| `ci/woodpecker/push/trusted` | `push` | `trusted` | trusted |
+| `ci/woodpecker/tag/trusted` | `tag` | `trusted` | trusted |
+
+The verifier observes repository/config-file/trusted-class, exact SHA,
+actual event, actual workflow state, pipeline status and pipeline
+id/number from the Woodpecker API; the certificate records those observed
+values. `--verify-ci-evidence` (renamed from `--ci-only`, which is now
+rejected) always terminates with `CI EVIDENCE: PASS — NOT A RELEASE
+CERTIFICATE`; a release certificate additionally requires the full local
+  gates plus a trusted context or a verified signed attestation.

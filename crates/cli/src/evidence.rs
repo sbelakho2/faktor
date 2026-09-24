@@ -20,19 +20,27 @@ use std::sync::{Arc, Mutex};
 
 use faktor_agent::{EvidenceProvider, EvidenceQuery};
 use faktor_context::assembler::Evidence;
-use faktor_core::error::Error;
+use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::{SessionId, WorkspaceId};
+use faktor_fs::rooted::{WalkBudget, WalkStep};
+use faktor_fs::{WorkspaceFileService, WorkspaceHandle};
 use faktor_index::{tokenize, WorkspaceIndex};
 use faktor_search::SearchService;
 use faktor_session::SessionManager;
 
 /// Scan bounds (architecture §13 budgets): a workspace larger than this is
 /// PARTIALLY indexed (deterministic walk order) — evidence stays bounded
-/// even for hostile repos.
+/// even for hostile repos. The walk charges every entry against the
+/// [`WalkBudget`]: entry/directory/depth ceilings and both byte ceilings
+/// (file bytes seen, bytes actually read). Exhaustion is a typed
+/// `Oversized` refusal the provider treats as a partial scan.
 const SCAN_MAX_FILES: usize = 4_000;
 const SCAN_MAX_DIRS: usize = 16_000;
 const SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SCAN_MAX_FILE_BYTES: usize = 1_000_000;
+/// Hard depth bound of the evidence walk (the root is depth 0): a hostile
+/// tree that nests deeper is a partial scan, never an unbounded descent.
+const SCAN_MAX_DEPTH: usize = 64;
 const EVIDENCE_MAX_HITS: usize = 8;
 const CONCEPT_MAX: usize = 16;
 const CONCEPT_MIN_CHARS: usize = 4;
@@ -54,8 +62,17 @@ struct ScanState {
     failed: HashSet<WorkspaceId>,
 }
 
+/// Test-only scan seam hook type: fired with an entry's relative path after
+/// the walker enumerated it and before the scan descends or reads it.
+#[cfg(test)]
+type ScanSeam = Arc<dyn Fn(&Path) + Send + Sync>;
+
 pub struct RepoEvidence {
     session: Arc<SessionManager>,
+    /// The anchored file authority the scan runs through: one
+    /// [`WorkspaceHandle`] per scan, its rooted-directory walk and reads
+    /// the ONLY path to workspace bytes. Never re-opened by absolute path.
+    fs: Arc<WorkspaceFileService>,
     index: Arc<Mutex<WorkspaceIndex>>,
     search: SearchService,
     /// The CONFIGURED semantic embedder (`[embeddings]` resolution); `None`
@@ -71,6 +88,11 @@ pub struct RepoEvidence {
     scan_max_dirs: usize,
     scan_max_bytes: usize,
     scan_max_file_bytes: usize,
+    /// Test seam: fired with an entry's relative path after the walker has
+    /// enumerated (stat'ed) it and before the scan descends or reads it, so
+    /// adversarial tests can swap the entry inside that exact window.
+    #[cfg(test)]
+    scan_seam: Option<ScanSeam>,
 }
 
 impl RepoEvidence {
@@ -119,6 +141,7 @@ impl RepoEvidence {
         let search = SearchService::new(index.clone(), embedder.clone());
         Self {
             session,
+            fs: WorkspaceFileService::new(),
             index,
             search,
             index_embedding: embedder.clone().and_then(index_source_for_embedder),
@@ -131,6 +154,8 @@ impl RepoEvidence {
             scan_max_dirs,
             scan_max_bytes,
             scan_max_file_bytes,
+            #[cfg(test)]
+            scan_seam: None,
         }
     }
 
@@ -145,74 +170,78 @@ impl RepoEvidence {
         Some((row.workspace_id, root))
     }
 
-    /// Deterministic bounded walk; skips vcs/dependency directories, binary
-    /// and oversized files. A cap hit stops the walk early (partial index).
-    fn scan_workspace(&self, ws: WorkspaceId, root: &Path) {
-        let mut files_scanned = 0usize;
-        let mut dirs_visited = 0usize;
-        let mut bytes_indexed = 0usize;
-        let mut stack = vec![PathBuf::from(root)];
+    /// Deterministic bounded scan through the workspace's anchored
+    /// authority ([`WorkspaceHandle::walk_bounded`]): the walker enumerates
+    /// every directory through the fd anchored at open time and descends
+    /// child-relative with strict no-follow semantics, so a directory entry
+    /// swapped for an outside symlink mid-walk is a typed refusal and the
+    /// walk never follows it out of the workspace. Every entry, directory,
+    /// depth level, file byte seen and byte read is charged to the
+    /// [`WalkBudget`]; exhaustion is the typed `Oversized` refusal the
+    /// provider treats as a partial scan. Content is read through the SAME
+    /// handle ([`WorkspaceHandle::read`]): no absolute path is ever used as
+    /// authority, so an entry swapped after enumeration cannot inject an
+    /// external file into the index. Skips vcs/dependency directories,
+    /// binary and oversized files.
+    fn scan_workspace(&self, ws: WorkspaceId, workspace: &WorkspaceHandle) -> Result<(), Error> {
+        let mut budget = WalkBudget::new(
+            self.scan_max_files,
+            self.scan_max_dirs,
+            SCAN_MAX_DEPTH,
+            self.scan_max_bytes as u64,
+            self.scan_max_bytes as u64,
+        );
         let mut index = self.index.lock().unwrap();
-        while let Some(dir) = stack.pop() {
-            dirs_visited += 1;
-            if dirs_visited > self.scan_max_dirs {
-                break;
-            }
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                match entry.file_type() {
-                    Ok(t) if t.is_dir() => {
-                        if !SKIP_DIRS.contains(&name.as_str()) {
-                            stack.push(path);
-                        }
-                    }
-                    Ok(t) if t.is_file() => {
-                        if files_scanned >= self.scan_max_files {
-                            return;
-                        }
-                        let meta = match std::fs::metadata(&path) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        if meta.len() > self.scan_max_file_bytes as u64 {
-                            continue;
-                        }
-                        if bytes_indexed >= self.scan_max_bytes {
-                            return;
-                        }
-                        let bytes = match std::fs::read(&path) {
-                            Ok(b) => b,
-                            Err(_) => continue,
-                        };
-                        // Binary sniff: NUL in the first 8 KiB → not text.
-                        let head = bytes.iter().take(8192).any(|b| *b == 0);
-                        if head {
-                            continue;
-                        }
-                        let rel = match path.strip_prefix(root) {
-                            Ok(r) => r.to_path_buf(),
-                            Err(_) => continue,
-                        };
-                        let modified_ms = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        let _ = index.index_file(ws, &rel, &bytes, modified_ms);
-                        files_scanned += 1;
-                        bytes_indexed = bytes_indexed.saturating_add(bytes.len());
-                    }
-                    // Symlinks and special files are never indexed.
-                    _ => {}
+        workspace.walk_bounded(
+            Path::new(""),
+            &mut budget,
+            SKIP_DIRS,
+            &mut |entry, _depth, budget| {
+                // The test seam fires for EVERY enumerated entry (files and
+                // directories) after the walker stat'ed it and before the
+                // scan descends or reads it.
+                #[cfg(test)]
+                self.fire_scan_seam(&entry.rel);
+                // Files only: symlinks (whatever they point at) and special
+                // files are never read or indexed; directories are descended
+                // by the walker (a swapped directory is refused there).
+                if !entry.is_file() {
+                    return Ok(WalkStep::Continue);
                 }
-            }
+                if entry.size > self.scan_max_file_bytes as u64 {
+                    return Ok(WalkStep::Continue);
+                }
+                // The same-handle read: resolved from the open directory fd
+                // with no-follow, so the pre-read `lstat` is never trusted
+                // as authority. A vanished or swapped entry is skipped —
+                // never read through a path string.
+                let data = match workspace.read(&entry.rel, self.scan_max_file_bytes) {
+                    Ok(data) => data,
+                    Err(_) => return Ok(WalkStep::Continue),
+                };
+                budget.charge_read_bytes(data.bytes.len() as u64)?;
+                // Binary sniff: NUL in the first 8 KiB → not text.
+                if data.bytes.iter().take(8192).any(|b| *b == 0) {
+                    return Ok(WalkStep::Continue);
+                }
+                let _ = index.index_file(ws, &entry.rel, &data.bytes, entry.modified_ms);
+                Ok(WalkStep::Continue)
+            },
+        )
+    }
+
+    /// Fire the test-only scan seam for one enumerated entry (no-op outside
+    /// `#[cfg(test)]` builds).
+    #[cfg(test)]
+    fn fire_scan_seam(&self, rel: &Path) {
+        if let Some(seam) = &self.scan_seam {
+            seam(rel);
         }
+    }
+
+    #[cfg(test)]
+    fn set_scan_seam(&mut self, seam: ScanSeam) {
+        self.scan_seam = Some(seam);
     }
 
     /// Concepts from the retrieval signal (spec §20): the prompt's own
@@ -251,9 +280,11 @@ impl RepoEvidence {
 
 impl RepoEvidence {
     /// The session ended: drop this workspace's scan state AND index
-    /// postings so memory stays bounded across session churn.
+    /// postings so memory stays bounded across session churn. Any transient
+    /// scan handle registered for the workspace is closed too.
     pub fn forget_workspace(&self, ws: WorkspaceId) {
         self.index.lock().unwrap().remove_workspace(ws);
+        self.fs.close(ws);
         let mut scan = self.scan.lock().unwrap();
         scan.scanned.remove(&ws);
         scan.failed.remove(&ws);
@@ -289,12 +320,33 @@ impl RepoEvidence {
                 return self.evidence_package(ws, query);
             }
         }
-        if root.is_dir() {
-            self.scan_workspace(ws, &root);
-        }
+        // The scan runs through one anchored WorkspaceHandle; the handle is
+        // closed once the scan is done (its watcher is scan-scoped here).
+        let result = match self.fs.open(ws, root) {
+            Ok(workspace) => {
+                let outcome = self.scan_workspace(ws, &workspace);
+                self.fs.close(ws);
+                outcome
+            }
+            Err(e) => Err(e),
+        };
         let mut scan = self.scan.lock().unwrap();
-        if !scan.scanned.insert(ws) {
-            scan.failed.insert(ws);
+        match result {
+            // Budget exhaustion is a PARTIAL scan: the entries verified
+            // before the cap stay indexed (deterministic walk order) and
+            // the workspace reads as scanned.
+            Err(e) if e.kind == ErrorKind::Oversized => {
+                scan.scanned.insert(ws);
+            }
+            // Infrastructure failure (unknown root, hostile swap, workspace
+            // re-pointed mid-scan): advisory empty package, never a broken
+            // turn and never a rescan storm.
+            Err(_) => {
+                scan.failed.insert(ws);
+            }
+            Ok(()) => {
+                scan.scanned.insert(ws);
+            }
         }
         drop(scan);
         self.evidence_package(ws, query)
@@ -392,6 +444,7 @@ impl faktor_index::EmbeddingSource for SearchEmbedderIndexSource {
 mod tests {
     use super::*;
     use faktor_session::{ShadowRow, ShadowRowState};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -853,5 +906,209 @@ mod tests {
             evidence.iter().any(|e| e.path.ends_with("two.rs")),
             "the rescanned index must see the new file: {evidence:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // P1-D adversarial containment: a swap inside the walker's
+    // enumeration -> descent / stat -> read windows must never let an
+    // external planted secret reach the index or the evidence package.
+    // ------------------------------------------------------------------
+
+    /// The seam fires once per enumerated entry; only the first firing on
+    /// `rel` performs the swap, so the hook is idempotent under a walk that
+    /// re-enumerates.
+    #[cfg(unix)]
+    fn once_seam(
+        rel: &'static str,
+        swap: impl Fn() + Send + Sync + 'static,
+    ) -> (Arc<AtomicBool>, ScanSeam) {
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_seam = fired.clone();
+        let hook: ScanSeam = Arc::new(move |seen: &Path| {
+            if seen == Path::new(rel) && !fired_seam.swap(true, Ordering::SeqCst) {
+                swap();
+            }
+        });
+        (fired, hook)
+    }
+
+    /// P1-D: a directory SWAPPED for an outside symlink after the walker
+    /// enumerated (stat'ed) it and before the descent must abort the walk
+    /// loudly — the outside tree is never entered, and its planted secret
+    /// never enters the index or the evidence output. (The old private
+    /// walker queued the absolute path and `read_dir`'d it later; the swap
+    /// would have descended into the external directory.)
+    #[cfg(unix)]
+    #[test]
+    fn dir_swap_after_enumeration_never_indexes_outside_secret() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "a/keep.rs", b"pub fn keep_symbol() {}\n");
+        let outside = TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            b"pub fn zebrasecret_marker() {}\n",
+        )
+        .unwrap();
+        let m = manager();
+        let mut ev = RepoEvidence::new(m.clone(), None);
+        let sid = registered_session(&m, root.path());
+        let root_path = root.path().to_path_buf();
+        let outside_path = outside.path().to_path_buf();
+        let (fired, seam) = once_seam("a", move || {
+            std::fs::remove_dir_all(root_path.join("a")).unwrap();
+            std::os::unix::fs::symlink(&outside_path, root_path.join("a")).unwrap();
+        });
+        ev.set_scan_seam(seam);
+
+        let out = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "zebrasecret_marker".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the seam must fire on the enumerated directory"
+        );
+        assert!(
+            out.is_empty(),
+            "the outside secret must never be evidence: {out:?}"
+        );
+        let ws = ev.resolve_root(sid).unwrap().0;
+        let index = ev.index.lock().unwrap();
+        assert!(
+            index.file_paths(ws).iter().all(|p| !p.contains("secret")),
+            "the outside path must never enter the index: {:?}",
+            index.file_paths(ws)
+        );
+        assert!(
+            index.files_for_token(ws, "zebrasecret", 8).is_empty(),
+            "the outside secret token must never enter the index"
+        );
+        assert!(
+            outside.path().join("secret.rs").exists(),
+            "the outside tree is untouched"
+        );
+    }
+
+    /// P1-D: a file SWAPPED for an outside symlink after the walker stat'ed
+    /// it and before the read must never be read through the planted path:
+    /// the handle-relative no-follow read refuses, the entry is skipped, and
+    /// the secret never enters the index or the evidence output.
+    #[cfg(unix)]
+    #[test]
+    fn file_swap_after_stat_before_read_never_indexes_outside_secret() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "note.rs", b"pub fn inside_symbol() {}\n");
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("secret.rs");
+        std::fs::write(&outside_file, b"pub fn zebrasecret_marker() {}\n").unwrap();
+        let m = manager();
+        let mut ev = RepoEvidence::new(m.clone(), None);
+        let sid = registered_session(&m, root.path());
+        let root_path = root.path().to_path_buf();
+        let link_target = outside_file.clone();
+        let (fired, seam) = once_seam("note.rs", move || {
+            std::fs::remove_file(root_path.join("note.rs")).unwrap();
+            std::os::unix::fs::symlink(&link_target, root_path.join("note.rs")).unwrap();
+        });
+        ev.set_scan_seam(seam);
+
+        let out = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "zebrasecret_marker".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the seam must fire on the enumerated file"
+        );
+        assert!(
+            out.is_empty(),
+            "the outside secret must never be evidence: {out:?}"
+        );
+        let ws = ev.resolve_root(sid).unwrap().0;
+        let index = ev.index.lock().unwrap();
+        assert!(
+            index.files_for_token(ws, "zebrasecret", 8).is_empty(),
+            "the swapped-in external content must never be indexed"
+        );
+        assert!(
+            index.files_for_token(ws, "inside", 8).is_empty(),
+            "the swapped-away original must not be indexed either: {:?}",
+            index.file_paths(ws)
+        );
+        assert!(outside_file.exists(), "the outside file is untouched");
+    }
+
+    /// P1-D: the evidence caps map onto the typed [`WalkBudget`] — entry,
+    /// file-byte and depth exhaustion are `Oversized` refusals naming the
+    /// budget (never a silent truncation), and the turn-level path degrades
+    /// them to the documented PARTIAL scan (bounded output).
+    #[test]
+    fn scan_budget_exhaustion_is_typed_and_partial() {
+        let root = TempDir::new().unwrap();
+        for i in 0..50 {
+            write(
+                root.path(),
+                &format!("f{i:02}.rs"),
+                b"pub fn budget_probe() {}\n",
+            );
+        }
+        let m = manager();
+        let sid = registered_session(&m, root.path());
+
+        // Entry budget: 5 entries for 50 files.
+        let ev = RepoEvidence::with_caps(m.clone(), 5, 10_000, 64 * 1024 * 1024, 1_000_000, None);
+        let (ws, root_path) = ev.resolve_root(sid).unwrap();
+        let handle = ev.fs.open(ws, root_path).unwrap();
+        let err = ev.scan_workspace(ws, &handle).unwrap_err();
+        ev.fs.close(ws);
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        assert!(err.message.contains("walk budget"), "{err}");
+        // The provider treats exhaustion as a partial scan: no turn error.
+        let out = ev
+            .evidence_sync(
+                sid,
+                &EvidenceQuery {
+                    prompt: "budget_probe".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.len() <= EVIDENCE_MAX_HITS);
+
+        // File-byte budget: 10 bytes total while each file is 24 bytes.
+        let ev = RepoEvidence::with_caps(m.clone(), 4_000, 10_000, 10, 1_000_000, None);
+        let (ws, root_path) = ev.resolve_root(sid).unwrap();
+        let handle = ev.fs.open(ws, root_path).unwrap();
+        let err = ev.scan_workspace(ws, &handle).unwrap_err();
+        ev.fs.close(ws);
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        assert!(err.message.contains("file budget"), "{err}");
+
+        // Depth budget: a tree nested past SCAN_MAX_DEPTH is refused typed.
+        let deep = TempDir::new().unwrap();
+        let deep_rel: String = (0..SCAN_MAX_DEPTH + 2).map(|i| format!("d{i}/")).collect();
+        write(
+            deep.path(),
+            &format!("{deep_rel}x.rs"),
+            b"pub fn deep_probe() {}\n",
+        );
+        let sid2 = registered_session(&m, deep.path());
+        let ev = RepoEvidence::new(m.clone(), None);
+        let (ws2, root2) = ev.resolve_root(sid2).unwrap();
+        let handle = ev.fs.open(ws2, root2).unwrap();
+        let err = ev.scan_workspace(ws2, &handle).unwrap_err();
+        ev.fs.close(ws2);
+        assert_eq!(err.kind, ErrorKind::Oversized, "{err:?}");
+        assert!(err.message.contains("depth budget"), "{err}");
     }
 }

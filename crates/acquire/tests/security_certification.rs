@@ -14,7 +14,7 @@ use faktor_acquire::http::{fetch_direct_http, resolve_redirect, DirectHttpPolicy
 use faktor_acquire::{AcquireCtx, AcquisitionError};
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::SystemClock;
-use faktor_provider::egress::{EgressError, HttpTransport};
+use faktor_provider::egress::{CheckedResponse, EgressError, HttpTransport};
 use faktor_security::destination::{Decision, DestinationPolicy, RequestTarget};
 use futures::future::BoxFuture;
 use reqwest::{Body, Request, Response};
@@ -45,7 +45,7 @@ impl ScriptedTransport {
 }
 
 impl HttpTransport for ScriptedTransport {
-    fn execute(&self, req: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, req: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         self.requests
             .lock()
             .expect("requests lock")
@@ -62,7 +62,7 @@ impl HttpTransport for ScriptedTransport {
             let response = builder
                 .body(Body::from(canned.body))
                 .map_err(|e| EgressError::Build(e.to_string()))?;
-            Ok(Response::from(response))
+            Ok(CheckedResponse::from_response(Response::from(response)))
         })
     }
 }

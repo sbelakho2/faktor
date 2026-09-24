@@ -169,6 +169,44 @@ pub enum NetworkIsolation {
     /// with no backend (macOS/windows) refuse a DenyAll request BEFORE
     /// spawn.
     DenyAll,
+    /// The child may reach EXACTLY the given broker endpoint and nothing
+    /// else (audit item 8: the Chromium process must not be able to open
+    /// raw sockets that bypass the broker). The endpoint must be a
+    /// non-zero loopback literal; the browser authority passes the live
+    /// broker's address.
+    ///
+    /// On Linux the child is placed in a dedicated network namespace
+    /// before exec: loopback is brought UP and a namespace-side listener on
+    /// the endpoint relays every connection across the namespace boundary
+    /// to the real broker (and back, for the host-initiated DevTools
+    /// control channel). The namespace has no interface and no route other
+    /// than loopback, so:
+    ///
+    /// * `bind()`/`connect()` on `127.0.0.0/8`/`::1` inside the sandbox
+    ///   work normally (bind/connect semantics are namespace-local);
+    /// * the broker endpoint is reachable because the relay bridge answers
+    ///   it and forwards to the daemon-side broker;
+    /// * every other destination — including the daemon's own loopback —
+    ///   is unreachable, and a raw socket cannot leave the namespace.
+    ///
+    /// If the namespace cannot be created (EPERM without `CAP_SYS_ADMIN`,
+    /// no unprivileged user namespaces, ...), the spawn FAILS typed BEFORE
+    /// exec: the child is never run proxy-only-but-unconfined. Platforms
+    /// with no BrokerOnly backend (macOS/windows) refuse the request typed
+    /// BEFORE spawn; those platforms keep proxy flags as application
+    /// configuration only and report the honest app-level state.
+    BrokerOnly {
+        /// The broker endpoint (loopback literal) the confined child may
+        /// reach.
+        endpoint: std::net::SocketAddr,
+    },
+}
+
+impl NetworkIsolation {
+    /// True when this is the broker-only confinement mode.
+    pub const fn is_broker_only(self) -> bool {
+        matches!(self, NetworkIsolation::BrokerOnly { .. })
+    }
 }
 
 impl From<NetworkIsolationRequirement> for NetworkIsolation {
@@ -192,17 +230,36 @@ impl From<NetworkIsolationRequirement> for NetworkIsolation {
 pub enum NetworkEnforcement {
     /// Only app-level gates exist in practice: a permitted shell could
     /// still open its own sockets. Linux reports this until the
-    /// `unshare(CLONE_NEWNET)` DenyAll path has proven itself active at
-    /// spawn.
+    /// `unshare(CLONE_NEWNET)` DenyAll or BrokerOnly path has proven itself
+    /// active at spawn.
     #[default]
     AppLevel,
     /// The DenyAll backend has PROVEN itself active at spawn: at least one
     /// `NetworkIsolation::DenyAll` spawn succeeded in this process, so the
     /// pre-exec netns path demonstrably works here.
     OsLevel,
+    /// The BrokerOnly backend has PROVEN itself active at spawn (at least
+    /// one `NetworkIsolation::BrokerOnly` spawn succeeded) and the
+    /// stronger full DenyAll path has not: the sandbox namespace confines
+    /// the child to the relayed broker endpoint with no external route.
+    OsLevelBrokerOnly,
     /// No per-process network-isolation backend exists on this platform
-    /// (macOS/windows); a DenyAll request fails closed before spawn.
+    /// (macOS/windows); a DenyAll or BrokerOnly request fails closed before
+    /// spawn.
     Unavailable,
+}
+
+impl NetworkEnforcement {
+    /// The stable snake_case tag of this enforcement verdict (doctor/health
+    /// surfaces print this exact spelling).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            NetworkEnforcement::AppLevel => "app_level",
+            NetworkEnforcement::OsLevel => "os_level",
+            NetworkEnforcement::OsLevelBrokerOnly => "os_level_broker_only",
+            NetworkEnforcement::Unavailable => "unavailable",
+        }
+    }
 }
 
 impl std::fmt::Display for NetworkEnforcement {
@@ -217,6 +274,12 @@ impl std::fmt::Display for NetworkEnforcement {
                 f,
                 "OS-level: the unshare(CLONE_NEWNET) DenyAll backend proved itself active \
                  at spawn"
+            ),
+            NetworkEnforcement::OsLevelBrokerOnly => write!(
+                f,
+                "OS-level (broker-only): the BrokerOnly sandbox namespace proved itself \
+                 active at spawn — the child reaches only the relayed broker endpoint and \
+                 has no external route"
             ),
             NetworkEnforcement::Unavailable => write!(
                 f,
@@ -233,6 +296,24 @@ impl std::fmt::Display for NetworkEnforcement {
 /// report off [`NetworkEnforcement::AppLevel`].
 #[cfg(target_os = "linux")]
 static DENY_ALL_PROVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once a `NetworkIsolation::BrokerOnly` spawn has succeeded: the
+/// sandbox namespace + relay bridge demonstrably work here. Reported as
+/// [`NetworkEnforcement::OsLevelBrokerOnly`] only while the stronger full
+/// DenyAll path has not proven itself.
+#[cfg(target_os = "linux")]
+static BROKER_ONLY_PROVEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True when this BUILD has a BrokerOnly backend at all (Linux). This is a
+/// compile-time platform fact only, never an enforcement claim: the
+/// runtime can still refuse a BrokerOnly spawn typed (e.g. no
+/// `CAP_SYS_ADMIN`), and that refusal is never converted into a silent
+/// proxy-only downgrade. Callers use it to SELECT the mode; only the spawn
+/// layer decides whether it is actually applied.
+pub const fn broker_only_supported() -> bool {
+    cfg!(target_os = "linux")
+}
 
 /// Probe override used by adversarial tests to force the enforcement
 /// verdict (the real probe is otherwise read-only; forcing NEVER changes
@@ -255,6 +336,7 @@ pub fn platform_network_enforcement() -> NetworkEnforcement {
             1 => return NetworkEnforcement::AppLevel,
             2 => return NetworkEnforcement::OsLevel,
             3 => return NetworkEnforcement::Unavailable,
+            4 => return NetworkEnforcement::OsLevelBrokerOnly,
             _ => {}
         }
     }
@@ -265,6 +347,8 @@ pub fn platform_network_enforcement() -> NetworkEnforcement {
 fn real_platform_network_enforcement() -> NetworkEnforcement {
     if DENY_ALL_PROVEN.load(std::sync::atomic::Ordering::SeqCst) {
         NetworkEnforcement::OsLevel
+    } else if BROKER_ONLY_PROVEN.load(std::sync::atomic::Ordering::SeqCst) {
+        NetworkEnforcement::OsLevelBrokerOnly
     } else {
         NetworkEnforcement::AppLevel
     }
@@ -288,6 +372,7 @@ fn override_network_probe(v: Option<NetworkEnforcement>) {
             Some(NetworkEnforcement::AppLevel) => 1,
             Some(NetworkEnforcement::OsLevel) => 2,
             Some(NetworkEnforcement::Unavailable) => 3,
+            Some(NetworkEnforcement::OsLevelBrokerOnly) => 4,
         },
         Ordering::SeqCst,
     );
@@ -295,10 +380,76 @@ fn override_network_probe(v: Option<NetworkEnforcement>) {
 
 /// The linux unshare backend lives behind this module
 /// (`crates/terminal/src/sandbox/linux.rs`); every other platform has no
-/// backend module at all (DenyAll is refused before spawn there).
+/// backend module at all (DenyAll and BrokerOnly are refused before spawn
+/// there).
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]
 mod sandbox;
+
+/// The live sandbox bridge of one BrokerOnly spawn: the child's dedicated
+/// network namespace plus the relay that makes exactly the broker endpoint
+/// reachable through it (see [`NetworkIsolation::BrokerOnly`]).
+///
+/// The bridge is created BEFORE the child exists and is owned by the
+/// supervisor's registry row; dropping it releases the namespace and every
+/// relay. `expose_loopback_port` additionally opens a host-side loopback
+/// listener that relays INTO the namespace, which is how the browser
+/// authority reaches Chromium's announced DevTools endpoint without
+/// opening the sandbox.
+pub struct BrokerOnlyBridge {
+    endpoint: std::net::SocketAddr,
+    #[cfg(target_os = "linux")]
+    inner: sandbox::Inner,
+}
+
+impl std::fmt::Debug for BrokerOnlyBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerOnlyBridge")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl BrokerOnlyBridge {
+    /// The broker endpoint the confined child may reach (and nothing else).
+    pub fn endpoint(&self) -> std::net::SocketAddr {
+        self.endpoint
+    }
+
+    /// Expose one in-sandbox loopback port on the host's loopback. Returns
+    /// the host port the daemon dials; every connection to it is relayed to
+    /// `127.0.0.1:<in_sandbox_port>` INSIDE the sandbox namespace. Used for
+    /// the Chromium DevTools control channel (never for egress: the relayed
+    /// port is chosen by the confined child and the direction is
+    /// host-initiated).
+    pub fn expose_loopback_port(&self, in_sandbox_port: u16) -> Result<u16, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .expose_loopback_port(in_sandbox_port)
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "BrokerOnly DevTools exposure of in-sandbox port {in_sandbox_port} \
+                         failed: {e}"
+                    ))
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = in_sandbox_port;
+            Err(Error::permission(format!(
+                "{BROKER_ONLY_REFUSAL_PREFIX}: this platform has no BrokerOnly backend"
+            )))
+        }
+    }
+
+    /// The namespace fd the pre-exec `setns` hook captures (Linux only; the
+    /// bridge keeps the fd open for its whole lifetime).
+    #[cfg(target_os = "linux")]
+    fn ns_fd(&self) -> i32 {
+        self.inner.ns_fd()
+    }
+}
 
 /// Process-tree resource budgets: the authorization side of the terminal
 /// authority's `TerminalBudgets`. Linux cgroup v2 (with `prlimit`
@@ -357,6 +508,11 @@ pub struct SpawnedProcess {
     pub stdin: std::process::ChildStdin,
     pub stdout: std::process::ChildStdout,
     pub stderr: std::process::ChildStderr,
+    /// The live sandbox bridge when the child was spawned under
+    /// [`NetworkIsolation::BrokerOnly`] (Linux); `None` for every other
+    /// mode. The supervisor's registry row also owns it — this handle only
+    /// adds the reverse exposure API (DevTools control channel).
+    pub network_bridge: Option<Arc<BrokerOnlyBridge>>,
 }
 
 /// Bounded-head result of one synchronous supervised run
@@ -509,6 +665,12 @@ struct ChildState {
     /// off Windows it is deliberately inert.
     #[cfg_attr(not(windows), allow(dead_code))]
     containment: ChildContainment,
+    /// The live BrokerOnly sandbox bridge of this child (None for every
+    /// other isolation mode). The row owns it: dropping the row (reap,
+    /// supervisor teardown) releases the sandbox namespace and every relay,
+    /// so the bridge can never outlive its child's registry entry.
+    #[allow(dead_code)] // ownership is the point; there is no read path
+    broker_bridge: Option<Arc<BrokerOnlyBridge>>,
 }
 
 /// Per-child containment: on Windows its OWN `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
@@ -843,8 +1005,13 @@ fn sweep_stale_spill_files() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
+    // The scan bound must be far above the candidate cap: a temp dir full
+    // of unrelated entries must not starve residue cleanup, so the entry
+    // cap counts matched candidates, not foreign files.
+    const SCAN_ENTRY_CAP: usize = 262_144;
+    let mut candidates = 0usize;
     for (scanned, entry) in entries.flatten().enumerate() {
-        if scanned >= MAX_ENTRIES {
+        if scanned >= SCAN_ENTRY_CAP {
             break;
         }
         let Ok(name) = entry.file_name().into_string() else {
@@ -852,6 +1019,10 @@ fn sweep_stale_spill_files() {
         };
         if !is_internal_spill_name(&name) {
             continue;
+        }
+        candidates += 1;
+        if candidates > MAX_ENTRIES {
+            break;
         }
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
             continue;
@@ -881,8 +1052,13 @@ fn sweep_stale_supervisor_roots() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
+    // The scan bound must be far above the candidate cap: a temp dir full
+    // of unrelated entries must not starve residue cleanup, so the entry
+    // cap counts matched candidates, not foreign files.
+    const SCAN_ENTRY_CAP: usize = 262_144;
+    let mut candidates = 0usize;
     for (scanned, entry) in entries.flatten().enumerate() {
-        if scanned >= MAX_ENTRIES {
+        if scanned >= SCAN_ENTRY_CAP {
             break;
         }
         let Ok(name) = entry.file_name().into_string() else {
@@ -891,6 +1067,10 @@ fn sweep_stale_supervisor_roots() {
         let Some(pid) = supervisor_root_pid(&name) else {
             continue;
         };
+        candidates += 1;
+        if candidates > MAX_ENTRIES {
+            break;
+        }
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
@@ -1304,6 +1484,7 @@ impl ProcessSupervisor {
         started_ms: i64,
         containment: ChildContainment,
         reap: Arc<ReapState>,
+        broker_bridge: Option<Arc<BrokerOnlyBridge>>,
     ) -> u64 {
         let id = self.alloc_id();
         self.registry.lock().unwrap().insert(
@@ -1315,6 +1496,7 @@ impl ProcessSupervisor {
                 exited: None,
                 reap,
                 containment,
+                broker_bridge,
             },
         );
         id
@@ -1482,6 +1664,7 @@ impl ProcessSupervisor {
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
+        let bridge = prepare_network_isolation(&cfg)?;
         use tokio::io::AsyncReadExt;
         use tokio::process::Command as TokioCommand;
 
@@ -1489,6 +1672,7 @@ impl ProcessSupervisor {
             .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
             .unwrap_or(deadline);
         let mut std_cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()));
+        install_network_isolation(&mut std_cmd, bridge.as_ref());
         if cfg.capture {
             std_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
@@ -1525,13 +1709,14 @@ impl ProcessSupervisor {
         #[cfg(windows)]
         win_spawn::assign_and_resume_tokio(&containment.job, &mut child).await?;
         #[cfg(target_os = "linux")]
-        mark_deny_all_proven(&cfg);
+        mark_network_isolation_proven(&cfg);
         let id = self.register(
             pid,
             cfg.owner.clone(),
             started_ms,
             containment,
             reap.clone(),
+            bridge.clone(),
         );
         self.timeline_spawn(
             id,
@@ -1876,6 +2061,7 @@ impl ProcessSupervisor {
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
+        let bridge = prepare_network_isolation(&cfg)?;
         let effective_deadline = budgets
             .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
             .unwrap_or(deadline);
@@ -1884,6 +2070,7 @@ impl ProcessSupervisor {
             .take(300)
             .collect();
         let mut cmd = contain_on_create(self.command_with_budgets(&cfg, budgets.as_ref()));
+        install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1900,7 +2087,7 @@ impl ProcessSupervisor {
             #[cfg(windows)]
             win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
             #[cfg(target_os = "linux")]
-            mark_deny_all_proven(&cfg);
+            mark_network_isolation_proven(&cfg);
             let pid = child.id();
             let reap = ReapState::new();
             let id = self.register(
@@ -1909,6 +2096,7 @@ impl ProcessSupervisor {
                 started_ms,
                 containment,
                 reap.clone(),
+                bridge.clone(),
             );
             self.timeline_spawn(id, pid, argv, &cfg.owner);
             (child, pid, id, reap)
@@ -1997,8 +2185,10 @@ impl ProcessSupervisor {
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
+        let bridge = prepare_network_isolation(&cfg)?;
         cfg.capture = false;
         let mut cmd = contain_on_create(self.command(&cfg));
+        install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2008,7 +2198,7 @@ impl ProcessSupervisor {
         #[cfg(windows)]
         win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
         #[cfg(target_os = "linux")]
-        mark_deny_all_proven(&cfg);
+        mark_network_isolation_proven(&cfg);
         let pid = child.id();
         let stdin = child
             .stdin
@@ -2029,6 +2219,7 @@ impl ProcessSupervisor {
             started_ms,
             containment,
             reap.clone(),
+            bridge.clone(),
         );
         self.timeline_spawn(
             id,
@@ -2061,6 +2252,7 @@ impl ProcessSupervisor {
             stdin,
             stdout,
             stderr,
+            network_bridge: bridge.clone(),
         })
     }
 
@@ -2073,7 +2265,9 @@ impl ProcessSupervisor {
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
+        let bridge = prepare_network_isolation(&cfg)?;
         let mut cmd = contain_on_create(self.command(&cfg));
+        install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
         let (child, pid, id, reap) = {
@@ -2085,7 +2279,7 @@ impl ProcessSupervisor {
             #[cfg(windows)]
             win_spawn::assign_and_resume_std(&containment.job, &mut child)?;
             #[cfg(target_os = "linux")]
-            mark_deny_all_proven(&cfg);
+            mark_network_isolation_proven(&cfg);
             let pid = child.id();
             let reap = ReapState::new();
             let id = self.register(
@@ -2094,6 +2288,7 @@ impl ProcessSupervisor {
                 started_ms,
                 containment,
                 reap.clone(),
+                bridge.clone(),
             );
             self.timeline_spawn(
                 id,
@@ -2291,6 +2486,80 @@ fn now_ms() -> i64 {
 const DENY_ALL_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
                                        NetworkIsolation::DenyAll";
 
+/// Canonical refusal wording for BrokerOnly isolation failures (same
+/// "sandbox unavailable" phrasing, the mode named explicitly). A BrokerOnly
+/// request NEVER degrades to a proxy-only child: either the sandbox
+/// namespace exists and the child is `setns`'d into it, or the spawn is
+/// refused typed.
+const BROKER_ONLY_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
+                                         NetworkIsolation::BrokerOnly";
+
+/// Prepare the requested per-spawn network isolation BEFORE any process
+/// exists. `Inherit`/`DenyAll` need nothing here (DenyAll's pre-exec hook is
+/// installed at command build; its failure is classified by
+/// [`spawn_failure`]); `BrokerOnly` creates the sandbox namespace + relay
+/// bridge, and any failure — no backend on this platform, a non-loopback
+/// endpoint, or a refused `unshare` — is a typed permission refusal with no
+/// process forked and no downgrade to proxy-only.
+fn prepare_network_isolation(
+    cfg: &SpawnConfig,
+) -> Result<Option<std::sync::Arc<BrokerOnlyBridge>>, Error> {
+    match cfg.network_isolation {
+        NetworkIsolation::BrokerOnly { endpoint } => {
+            #[cfg(target_os = "linux")]
+            {
+                sandbox::validate_endpoint(endpoint).map_err(|e| {
+                    Error::permission(format!(
+                        "{BROKER_ONLY_REFUSAL_PREFIX} of `{}` BEFORE spawn: {e}; never running \
+                         it unconfined",
+                        cfg.cmd
+                    ))
+                })?;
+                let inner = sandbox::Inner::start(endpoint).map_err(|e| {
+                    Error::permission(format!(
+                        "{BROKER_ONLY_REFUSAL_PREFIX} of `{}` BEFORE spawn: the sandbox \
+                         network namespace could not be created ({e}); the BrokerOnly backend \
+                         needs CAP_SYS_ADMIN and an empty-network-namespace capable kernel — \
+                         never running it unconfined",
+                        cfg.cmd
+                    ))
+                })?;
+                Ok(Some(std::sync::Arc::new(BrokerOnlyBridge {
+                    endpoint,
+                    inner,
+                })))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = endpoint;
+                Err(Error::permission(format!(
+                    "{BROKER_ONLY_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform \
+                     provides no BrokerOnly per-process network-isolation backend (the proxy \
+                     flags are application configuration, not confinement); never running it \
+                     unconfined",
+                    cfg.cmd
+                )))
+            }
+        }
+        NetworkIsolation::Inherit | NetworkIsolation::DenyAll => Ok(None),
+    }
+}
+
+/// Install the BrokerOnly pre-exec `setns` hook on a built command. Called on
+/// every spawn entry point; a `None` bridge is the `Inherit`/`DenyAll` path
+/// and installs nothing (DenyAll's hook is installed by `command_base`).
+fn install_network_isolation(
+    cmd: &mut std::process::Command,
+    bridge: Option<&std::sync::Arc<BrokerOnlyBridge>>,
+) {
+    #[cfg(target_os = "linux")]
+    if let Some(bridge) = bridge {
+        sandbox::install_broker_only_isolation(cmd, bridge.ns_fd());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (cmd, bridge);
+}
+
 /// Pre-spawn fail-closed gate for a DenyAll request. On linux the real
 /// backend exists (pre-exec `unshare(CLONE_NEWNET)`) and is ALWAYS
 /// attempted — capability heuristics never pre-judge it, only the actual
@@ -2318,24 +2587,34 @@ fn isolation_gate(cfg: &SpawnConfig) -> Result<(), Error> {
 /// names the kernel/user-namespace denial. All other configs keep the
 /// historic not_found mapping.
 fn spawn_failure(cfg: &SpawnConfig, e: std::io::Error) -> Error {
-    if cfg.network_isolation == NetworkIsolation::DenyAll {
-        Error::permission(format!(
+    match cfg.network_isolation {
+        NetworkIsolation::DenyAll => Error::permission(format!(
             "{DENY_ALL_REFUSAL_PREFIX} of `{}`: the isolated child could not be created \
              ({e}); never running it unenforced",
             cfg.cmd
-        ))
-    } else {
-        Error::not_found(format!("spawn {}: {e}", cfg.cmd))
+        )),
+        NetworkIsolation::BrokerOnly { .. } => Error::permission(format!(
+            "{BROKER_ONLY_REFUSAL_PREFIX} of `{}`: the confined child could not enter its \
+             sandbox network namespace ({e}); never running it unconfined",
+            cfg.cmd
+        )),
+        NetworkIsolation::Inherit => Error::not_found(format!("spawn {}: {e}", cfg.cmd)),
     }
 }
 
-/// A successful DenyAll spawn proves the unshare pre-exec path active at
-/// spawn: the enforcement report may then claim OsLevel (see
-/// [`platform_network_enforcement`]).
+/// A successful isolated spawn proves its backend active at spawn: the
+/// enforcement report may then claim OsLevel (DenyAll) or OsLevelBrokerOnly
+/// (BrokerOnly) — see [`platform_network_enforcement`].
 #[cfg(target_os = "linux")]
-fn mark_deny_all_proven(cfg: &SpawnConfig) {
-    if cfg.network_isolation == NetworkIsolation::DenyAll {
-        DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+fn mark_network_isolation_proven(cfg: &SpawnConfig) {
+    match cfg.network_isolation {
+        NetworkIsolation::DenyAll => {
+            DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        NetworkIsolation::BrokerOnly { .. } => {
+            BROKER_ONLY_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        NetworkIsolation::Inherit => {}
     }
 }
 
@@ -4873,6 +5152,95 @@ mod tests {
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
     }
 
+    // ------------- BrokerOnly (audit item 8) mode semantics --------------
+
+    #[test]
+    fn broker_only_is_a_distinct_copyable_mode_with_a_loopback_endpoint() {
+        let endpoint: std::net::SocketAddr = "127.0.0.1:43123".parse().unwrap();
+        let mode = NetworkIsolation::BrokerOnly { endpoint };
+        assert!(mode.is_broker_only());
+        assert_eq!(mode, NetworkIsolation::BrokerOnly { endpoint });
+        assert_ne!(mode, NetworkIsolation::Inherit);
+        assert_ne!(mode, NetworkIsolation::DenyAll);
+        // The isolation field still defaults to Inherit.
+        assert_eq!(
+            SpawnConfig::default().network_isolation,
+            NetworkIsolation::Inherit
+        );
+        // The compile-time backend presence matches the platform (the
+        // RUNTIME may still refuse typed — never a silent downgrade).
+        assert_eq!(broker_only_supported(), cfg!(target_os = "linux"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn broker_only(sh_cmd: &str) -> SpawnConfig {
+        SpawnConfig {
+            cmd: "/bin/sh".into(),
+            args: vec!["-c".into(), sh_cmd.into()],
+            cwd: std::env::temp_dir(),
+            network_isolation: NetworkIsolation::BrokerOnly {
+                endpoint: "127.0.0.1:43123".parse().unwrap(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn broker_only_is_refused_before_spawn_without_a_backend() {
+        // macOS/windows: the proxy flags stay application configuration;
+        // an OS-confinement request is refused typed on every entry point
+        // and no child is ever forked. This is the honest app-level state:
+        // the daemon must report it, never claim confinement.
+        let (_d, sup) = supervisor();
+        assert!(!broker_only_supported());
+        let err = sup.spawn(broker_only("true")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(
+            err.message.contains("NetworkIsolation::BrokerOnly")
+                && err.message.contains("no BrokerOnly"),
+            "the refusal must name the mode and the platform reason: {err:?}"
+        );
+        assert!(sup.alive().is_empty(), "the refused spawn never existed");
+        let err = sup
+            .run_sync(broker_only("true"), Duration::from_secs(10), 4096, 4096)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        let err = sup
+            .spawn_detached_with_pipes(broker_only("true"))
+            .err()
+            .expect("BrokerOnly must be refused before spawn without a backend");
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(sup.alive().is_empty());
+        // The same supervisor still runs ordinary computation: the refusal
+        // is isolation-specific.
+        let out = sup
+            .run_sync(sh("echo control-ok"), Duration::from_secs(10), 4096, 4096)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        assert!(out.stdout_head.contains("control-ok"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_only_is_refused_before_spawn_on_the_async_path() {
+        let (_d, sup) = supervisor();
+        let err = sup
+            .run(
+                broker_only("true"),
+                Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(
+            err.message.contains("NetworkIsolation::BrokerOnly"),
+            "{err:?}"
+        );
+        assert!(sup.alive().is_empty());
+    }
+
     // --------------------------- test env names (Phase F item 24) -------
 
     /// Test env readers accept BOTH the current `FAKTOR_TEST_*` spelling and
@@ -4969,6 +5337,40 @@ mod tests {
             "tcp={}",
             if tcp.is_ok() { "connected" } else { "failed" }
         ));
+        // Optional BrokerOnly probes: a second parent-side loopback port
+        // (must be unreachable through the sandbox loopback relay) and a
+        // non-loopback destination (must be unreachable for lack of any
+        // route).
+        if let Some(other) = net_probe_env("OTHER_TCP_PORT").and_then(|p| p.parse::<u16>().ok()) {
+            let connect = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], other)),
+                Duration::from_secs(1),
+            );
+            lines.push(format!(
+                "other_tcp={}",
+                if connect.is_ok() {
+                    "connected"
+                } else {
+                    "failed"
+                }
+            ));
+        }
+        if let Some(external) = net_probe_env("EXTERNAL") {
+            let connect = external
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .and_then(|addr| {
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()
+                });
+            lines.push(format!(
+                "external={}",
+                if connect.is_some() {
+                    "connected"
+                } else {
+                    "failed"
+                }
+            ));
+        }
         let udp = (|| -> std::io::Result<usize> {
             let s = std::net::UdpSocket::bind("127.0.0.1:0")?;
             s.send_to(
@@ -5110,13 +5512,15 @@ mod tests {
         let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
         let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
         let self_exe = std::env::current_exe().unwrap();
-        // Pre-spawn proof state: no DenyAll spawn has succeeded in this
-        // process, so the honest report is AppLevel — capability existence
-        // (this test may even run as root) proves nothing by itself.
-        assert_eq!(
+        // Pre-spawn proof state: no DENY-ALL spawn has succeeded in this
+        // process, so the report must not claim OsLevel — capability
+        // existence (this test may even run as root) proves nothing by
+        // itself. A proven BrokerOnly backend is legitimate here: it is a
+        // different (weaker) proof that never implies the unshare path.
+        assert_ne!(
             platform_network_enforcement(),
-            NetworkEnforcement::AppLevel,
-            "the unshare path has not proven itself active at spawn yet"
+            NetworkEnforcement::OsLevel,
+            "the DenyAll unshare path has not proven itself active at spawn yet"
         );
         // CONTROL under Inherit: the same probe must reach every endpoint
         // and report the PARENT netns inode — when it fails under DenyAll
@@ -5222,10 +5626,11 @@ mod tests {
                     sup.alive().is_empty(),
                     "no process may exist after the typed refusal: {err:?}"
                 );
-                assert_eq!(
+                assert_ne!(
                     platform_network_enforcement(),
-                    NetworkEnforcement::AppLevel,
-                    "a refused unshare proves nothing; Required must keep failing closed: {err:?}"
+                    NetworkEnforcement::OsLevel,
+                    "a refused unshare must not prove the DenyAll backend; Required keeps \
+                     failing closed: {err:?}"
                 );
             }
         }
@@ -5266,6 +5671,346 @@ mod tests {
             .unwrap();
         assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
         assert!(out.stdout_head.contains("recovered"));
+    }
+
+    // ------------------------- linux: the real BrokerOnly backend --------
+
+    /// Child-mode marker for the BrokerOnly confinement probe. Deliberately
+    /// NOT set process-wide by the parent (unlike the DenyAll probe env):
+    /// it rides only the explicit child `EnvSpec`, so parallel tests can
+    /// never mistake themselves for the probe child.
+    #[cfg(target_os = "linux")]
+    const BROKER_ONLY_PROBE_ENV: &str = "FAKTOR_TEST_BROKER_ONLY_PROBE";
+
+    /// Child-mode marker for the BrokerOnly DevTools-exposure probe.
+    #[cfg(target_os = "linux")]
+    const BROKER_ONLY_EXPOSE_ENV: &str = "FAKTOR_TEST_BROKER_ONLY_EXPOSE";
+
+    /// True when a BrokerOnly refusal is the documented unprivileged-host
+    /// outcome (no CAP_SYS_ADMIN / no unprivileged network namespaces). The
+    /// test then SKIPS with an explicit typed line — never a silent pass —
+    /// and never falls back to running the child unconfined.
+    #[cfg(target_os = "linux")]
+    fn broker_only_skip_if_unprivileged(err: &Error) -> bool {
+        let unprivileged = err.kind == ErrorKind::Permission
+            && (err.message.contains("CAP_SYS_ADMIN")
+                || err.message.contains("Operation not permitted")
+                || err.message.contains("Permission denied"));
+        if unprivileged {
+            eprintln!(
+                "SKIP (typed, unprivileged host): BrokerOnly namespace backend refused \
+                 fail-closed and no child ran: {err}"
+            );
+        }
+        unprivileged
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_broker_only_probe_child(
+        sup: &Arc<ProcessSupervisor>,
+        self_exe: &std::path::Path,
+        endpoint: std::net::SocketAddr,
+        tcp_port: u16,
+        udp_port: u16,
+        other_tcp_port: u16,
+        uds: &std::path::Path,
+        report: &std::path::Path,
+        compute: &std::path::Path,
+    ) -> Result<SyncRunOutput, Error> {
+        let probe_env = EnvSpec::Explicit(vec![
+            (BROKER_ONLY_PROBE_ENV.into(), "1".into()),
+            (
+                "FAKTOR_TEST_NET_TCP_PORT".into(),
+                tcp_port.to_string().into(),
+            ),
+            (
+                "FAKTOR_TEST_NET_UDP_PORT".into(),
+                udp_port.to_string().into(),
+            ),
+            (
+                "FAKTOR_TEST_NET_OTHER_TCP_PORT".into(),
+                other_tcp_port.to_string().into(),
+            ),
+            // TEST-NET-3: routed nowhere, unreachable without an external
+            // route (the sandbox namespace has none).
+            ("FAKTOR_TEST_NET_EXTERNAL".into(), "203.0.113.7:9".into()),
+            (
+                "FAKTOR_TEST_NET_UDS".into(),
+                uds.to_string_lossy().into_owned().into(),
+            ),
+            (
+                "FAKTOR_TEST_NET_REPORT".into(),
+                report.to_string_lossy().into_owned().into(),
+            ),
+            (
+                "FAKTOR_TEST_NET_COMPUTE".into(),
+                compute.to_string_lossy().into_owned().into(),
+            ),
+        ]);
+        let cfg = SpawnConfig {
+            cmd: self_exe.to_string_lossy().into_owned(),
+            args: vec![
+                "--exact".into(),
+                "tests::broker_only_spawn_reaches_only_the_broker_endpoint".into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: probe_env,
+            owner: ProcessOwner::Daemon,
+            capture: true,
+            artifact_max: 1024 * 1024,
+            network_isolation: NetworkIsolation::BrokerOnly { endpoint },
+        };
+        sup.run_sync(cfg, Duration::from_secs(60), 64 * 1024, 64 * 1024)
+    }
+
+    /// The audit item 8 scenario: a child under `BrokerOnly` reaches the
+    /// broker endpoint through the sandbox relay, cannot reach a DIFFERENT
+    /// parent-side loopback port, cannot reach any external destination, and
+    /// sits in a fresh network namespace. A host that cannot create the
+    /// namespace refuses typed (skipped loudly here, never silently passed
+    /// and never run unconfined).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_only_spawn_reaches_only_the_broker_endpoint() {
+        // Child mode: the parent re-executed THIS test binary under
+        // BrokerOnly with the probe env; report and exit.
+        if std::env::var_os(BROKER_ONLY_PROBE_ENV).is_some() {
+            net_probe_child_main();
+        }
+        let (_d, sup) = supervisor();
+        // The "real broker": a parent-side loopback listener at the exact
+        // endpoint the child may reach.
+        let broker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = broker.local_addr().unwrap();
+        // A second parent-side loopback listener: must stay unreachable —
+        // the sandbox loopback is private, only the relayed endpoint works.
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        let uds_path = _d.path().join("broker-only-probe.sock");
+        let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
+        let report = _d.path().join("report-broker-only.txt");
+        let compute = _d.path().join("compute-broker-only.txt");
+        let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
+        let self_exe = std::env::current_exe().unwrap();
+        let out = match spawn_broker_only_probe_child(
+            &sup,
+            &self_exe,
+            endpoint,
+            endpoint.port(),
+            udp_port,
+            other_port,
+            &uds_path,
+            &report,
+            &compute,
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                if broker_only_skip_if_unprivileged(&err) {
+                    return;
+                }
+                panic!("BrokerOnly spawn must either confine or refuse typed: {err:?}");
+            }
+        };
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+        let report = std::fs::read_to_string(&report).expect("broker-only probe report");
+        let child_netns: u64 = report
+            .lines()
+            .find_map(|l| l.strip_prefix("netns="))
+            .expect("netns line")
+            .parse()
+            .expect("netns inode parses");
+        assert_ne!(
+            child_netns, parent_netns,
+            "a BrokerOnly child must sit in its own network namespace: {report}"
+        );
+        assert!(
+            report.contains("tcp=connected"),
+            "the broker endpoint must be reachable through the sandbox relay: {report}"
+        );
+        assert!(
+            report.contains("other_tcp=failed"),
+            "a second parent-side loopback port must NOT be reachable: {report}"
+        );
+        assert!(
+            report.contains("external=failed"),
+            "no external destination may be reachable from the sandbox: {report}"
+        );
+        assert!(
+            report.contains("unix=connected"),
+            "AF_UNIX is not network-namespaced; the denial must be network-scoped: {report}"
+        );
+        assert!(
+            report.contains("compute=ok"),
+            "ordinary computation must succeed in the confined child: {report}"
+        );
+        assert_eq!(std::fs::read_to_string(&compute).unwrap(), "computed-42");
+        // The host broker really received the relayed connection.
+        broker.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut accepted = false;
+        while std::time::Instant::now() < deadline && !accepted {
+            match broker.accept() {
+                Ok(_) => accepted = true,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("broker accept failed: {e}"),
+            }
+        }
+        assert!(
+            accepted,
+            "the confined child's broker connection must reach the host broker"
+        );
+        // A successful BrokerOnly spawn proves its backend active at spawn
+        // (the stronger DenyAll proof may already have been recorded by a
+        // parallel test in this process).
+        let probe = platform_network_enforcement();
+        assert!(
+            matches!(
+                probe,
+                NetworkEnforcement::OsLevel | NetworkEnforcement::OsLevelBrokerOnly
+            ),
+            "a successful BrokerOnly spawn is the proof: {probe:?}"
+        );
+        let out = sup
+            .run_sync(sh("echo tail-ok"), Duration::from_secs(10), 4096, 4096)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+    }
+
+    /// Child mode of the DevTools-exposure probe: bind an in-sandbox
+    /// loopback listener, report its port to a FILE (libtest captures
+    /// stdout), accept exactly one relayed connection and answer `PONG`.
+    #[cfg(target_os = "linux")]
+    fn broker_only_expose_child_main() -> ! {
+        use std::io::{BufRead, BufReader, Write};
+        let report = std::env::var("FAKTOR_TEST_BROKER_ONLY_EXPOSE_REPORT").expect("report path");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("in-sandbox bind");
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(&report, format!("PORT={port}\n")).expect("port report");
+        let (mut conn, _) = listener.accept().expect("relayed connection");
+        let mut line = String::new();
+        let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+        let ok = line.trim() == "PING" && conn.write_all(b"PONG\n").is_ok();
+        std::process::exit(if ok { 0 } else { 4 });
+    }
+
+    /// The reverse direction of the bridge (the browser DevTools control
+    /// channel): a host-side loopback listener exposed for one in-sandbox
+    /// port relays INTO the namespace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_only_devtools_exposure_relays_into_the_sandbox() {
+        use std::io::{BufRead, BufReader, Write};
+        if std::env::var_os(BROKER_ONLY_EXPOSE_ENV).is_some() {
+            broker_only_expose_child_main();
+        }
+        let (_d, sup) = supervisor();
+        let report = _d.path().join("expose-port.txt");
+        let self_exe = std::env::current_exe().unwrap();
+        let cfg = SpawnConfig {
+            cmd: self_exe.to_string_lossy().into_owned(),
+            args: vec![
+                "--exact".into(),
+                "tests::broker_only_devtools_exposure_relays_into_the_sandbox".into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: EnvSpec::Explicit(vec![
+                (BROKER_ONLY_EXPOSE_ENV.into(), "1".into()),
+                (
+                    "FAKTOR_TEST_BROKER_ONLY_EXPOSE_REPORT".into(),
+                    report.to_string_lossy().into_owned().into(),
+                ),
+            ]),
+            owner: ProcessOwner::Daemon,
+            capture: false,
+            artifact_max: 1024,
+            // The broker endpoint is irrelevant here (the child never dials
+            // it); a high loopback port is required so the unprivileged
+            // namespace thread can bind it.
+            network_isolation: NetworkIsolation::BrokerOnly {
+                endpoint: "127.0.0.1:45999".parse().unwrap(),
+            },
+        };
+        let spawned = match sup.spawn_detached_with_pipes(cfg) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                if broker_only_skip_if_unprivileged(&err) {
+                    return;
+                }
+                panic!("BrokerOnly spawn must either confine or refuse typed: {err:?}");
+            }
+        };
+        let pid = spawned.child_pid;
+        // Wait for the child's in-sandbox listener to report its port.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !report.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = std::fs::read_to_string(&report).expect("child port report");
+        let port: u16 = text
+            .trim()
+            .strip_prefix("PORT=")
+            .expect("PORT= line")
+            .parse()
+            .expect("port parses");
+        let bridge = spawned
+            .network_bridge
+            .clone()
+            .expect("a BrokerOnly spawn carries its bridge");
+        let host_port = bridge
+            .expose_loopback_port(port)
+            .expect("exposure of the in-sandbox port");
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", host_port))
+            .expect("host-side exposed port accepts");
+        conn.write_all(b"PING\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(conn).read_line(&mut reply).unwrap();
+        assert_eq!(
+            reply.trim(),
+            "PONG",
+            "the exposed port must relay into the sandbox"
+        );
+        let _ = sup.kill_child_pid(pid, 500);
+        let _ = sup.reap();
+        assert!(
+            !sup.alive().iter().any(|child| child.pid == pid),
+            "the exposure probe child must be reaped"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_only_non_loopback_endpoint_is_refused_typed() {
+        // Endpoint validation happens BEFORE the namespace is created, so
+        // this is testable without privileges and must never fork.
+        let (_d, sup) = supervisor();
+        for endpoint in ["192.0.2.1:9999", "127.0.0.1:0"] {
+            let mut cfg = sh("echo body-must-not-run");
+            cfg.network_isolation = NetworkIsolation::BrokerOnly {
+                endpoint: endpoint.parse().unwrap(),
+            };
+            let err = sup
+                .run_sync(cfg, Duration::from_secs(10), 4096, 4096)
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{endpoint}: {err:?}");
+            assert!(
+                err.message.contains("NetworkIsolation::BrokerOnly"),
+                "{endpoint}: {err:?}"
+            );
+            assert!(
+                !err.message.contains("body-must-not-run"),
+                "the refusal must be typed before exec: {err:?}"
+            );
+            assert!(sup.alive().is_empty(), "no process may exist: {err:?}");
+        }
+        assert!(
+            broker_only_supported(),
+            "this test module only exists on the BrokerOnly platform"
+        );
     }
 }
 

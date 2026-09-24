@@ -3,9 +3,11 @@
 
 Serves only the routes the certification gate queries:
 
-    GET /api/repos/lookup/acme/widgets
-    GET /api/repos/7/pipelines[?query...]
-    GET /api/repos/7/pipelines/<number>
+    GET /api/repos/lookup/acme/widgets[?project=trusted]
+    GET /api/repos/<id>                              (repo detail: trusted.volumes, config_file)
+    GET /api/repos/<id>/pipelines[?query...]
+    GET /api/repos/<id>/pipelines/<number>
+    GET /api/repos/<id>/pipelines/<number>/logs/<step>
 
 The response state is (re)read from `<state_dir>/state.json` on every
 request, so the selftest can rewrite it between cases without restarting the
@@ -17,7 +19,7 @@ a general Woodpecker emulator.
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 def main() -> int:
@@ -27,6 +29,23 @@ def main() -> int:
     def load():
         with open(f"{state_dir}/state.json") as fh:
             return json.load(fh)
+
+    def default_repo(repo_id):
+        if repo_id == 7:
+            return {
+                "id": 7,
+                "full_name": "acme/widgets",
+                "config_file": ".woodpecker/untrusted/",
+                "trusted": {"volumes": False},
+            }
+        if repo_id == 8:
+            return {
+                "id": 8,
+                "full_name": "acme/widgets",
+                "config_file": ".woodpecker/trusted/",
+                "trusted": {"volumes": True},
+            }
+        return None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep the selftest output clean
@@ -44,21 +63,52 @@ def main() -> int:
             if self.headers.get("Authorization") != "Bearer selftest-token":
                 self.reply(401, {"message": "unauthorized"})
                 return
-            path = urlsplit(self.path).path
+            parts = urlsplit(self.path)
+            path = parts.path
+            query = parse_qs(parts.query)
             state = load()
             if path == "/api/repos/lookup/acme/widgets":
-                self.reply(200, {"id": 7, "full_name": "acme/widgets"})
-            elif path == "/api/repos/7/pipelines":
-                self.reply(200, state["pipelines"])
-            elif path.startswith("/api/repos/7/pipelines/"):
-                number = path.rsplit("/", 1)[1]
-                detail = state["detail"]
-                if str(detail.get("number")) != number:
-                    self.reply(404, {"message": "pipeline not found"})
+                if query.get("project") == ["trusted"]:
+                    self.reply(200, state.get("lookup_trusted") or default_repo(8))
                 else:
-                    self.reply(200, detail)
-            else:
-                self.reply(404, {"message": "not found"})
+                    self.reply(200, state.get("lookup") or default_repo(7))
+                return
+            if path.startswith("/api/repos/"):
+                segments = path[len("/api/repos/") :].split("/")
+                if len(segments) == 1 and segments[0].isdigit():
+                    repo_id = int(segments[0])
+                    repo = state.get(f"repo{repo_id}") or default_repo(repo_id)
+                    if repo is None:
+                        self.reply(404, {"message": "repo not found"})
+                    else:
+                        self.reply(200, repo)
+                    return
+                if len(segments) >= 2 and segments[1] == "pipelines":
+                    if len(segments) == 2:
+                        self.reply(200, state.get("pipelines") or [])
+                        return
+                    number = segments[2]
+                    if len(segments) == 3:
+                        details = state.get("details") or {}
+                        detail = details.get(str(number)) or details.get(number)
+                        if detail is None:
+                            candidate = state.get("detail")
+                            if isinstance(candidate, dict) and str(candidate.get("number")) == number:
+                                detail = candidate
+                        if not isinstance(detail, dict):
+                            self.reply(404, {"message": "pipeline not found"})
+                        else:
+                            self.reply(200, detail)
+                        return
+                    if len(segments) == 5 and segments[3] == "logs":
+                        step = segments[4]
+                        logs = state.get("logs") or {}
+                        if step in logs:
+                            self.reply(200, logs[step])
+                        else:
+                            self.reply(404, {"message": "log not found"})
+                        return
+            self.reply(404, {"message": "not found"})
 
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()
     return 0

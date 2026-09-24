@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::time::TestClock;
-use faktor_provider::egress::{EgressError, HttpTransport};
+use faktor_provider::egress::{CheckedResponse, EgressError, HttpTransport};
 use futures::future::BoxFuture;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Request, Response, ResponseBuilderExt};
@@ -219,7 +219,7 @@ impl ScriptedTransport {
 }
 
 impl HttpTransport for ScriptedTransport {
-    fn execute(&self, request: Request) -> BoxFuture<'_, Result<Response, EgressError>> {
+    fn execute(&self, request: Request) -> BoxFuture<'_, Result<CheckedResponse, EgressError>> {
         self.record(&request);
         let scripted = self
             .responses
@@ -257,7 +257,7 @@ impl HttpTransport for ScriptedTransport {
             let response = builder
                 .body(reqwest::Body::from(scripted.body))
                 .map_err(|e| EgressError::Build(e.to_string()))?;
-            Ok(Response::from(response))
+            Ok(CheckedResponse::from_response(Response::from(response)))
         })
     }
 }

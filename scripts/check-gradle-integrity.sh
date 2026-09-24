@@ -35,6 +35,21 @@ ROOT_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 GRADLE_ROOT="$ROOT_REPO/apps/jetbrains"
 SELFTEST=0
 
+# P3: this script mints `faktor-*` temp dirs; stale `kp-gradle-selftest.*`
+# dirs left by the pre-migration version are still swept (older than a day).
+cleanup_legacy_tmpdirs() {
+    local dir
+    for dir in "${TMPDIR:-/tmp}"/kp-gradle-selftest.*; do
+        [ -d "$dir" ] || continue
+        [ -L "$dir" ] && continue
+        if [ -n "$(find "$dir" -maxdepth 0 -mtime +0 2>/dev/null)" ]; then
+            rm -rf "$dir"
+        fi
+    done
+    return 0
+}
+cleanup_legacy_tmpdirs
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --root)
@@ -220,7 +235,7 @@ copy_into() { # src_root dest_root
 selftest() {
     local tmp base rc failures=0
     command -v mktemp >/dev/null 2>&1 || exit 2
-    tmp="$(mktemp -d "${TMPDIR:-/tmp}/kp-gradle-selftest.XXXXXX")"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-gradle-selftest.XXXXXX")"
     base="$tmp/root"
     copy_into "$GRADLE_ROOT" "$base"
 
@@ -275,6 +290,32 @@ selftest() {
         failures=$((failures + 1))
     else
         echo "selftest ok: missing subproject lockfile is rejected"
+    fi
+
+    # P3 temp-name migration: no kp-* minting, legacy dirs still swept.
+    local legacy
+    if grep -qE 'mktemp -d "[^"]*kp-' "$0"; then
+        echo "selftest FAIL: script still mints a kp-* temp name" >&2
+        failures=$((failures + 1))
+    fi
+    if grep -qF 'faktor-gradle-selftest.XXXXXX' "$0"; then
+        :
+    else
+        echo "selftest FAIL: script does not mint a faktor-* temp name" >&2
+        failures=$((failures + 1))
+    fi
+    legacy="$tmp/legacy-tmp"
+    mkdir -p "$legacy/kp-gradle-selftest.dead" "$legacy/faktor-gradle.keep"
+    touch -t 202001010000 "$legacy/kp-gradle-selftest.dead" "$legacy/faktor-gradle.keep"
+    (
+        TMPDIR="$legacy"
+        cleanup_legacy_tmpdirs
+    )
+    if [ ! -e "$legacy/kp-gradle-selftest.dead" ] && [ -d "$legacy/faktor-gradle.keep" ]; then
+        echo "selftest ok: legacy kp-* temp dirs are swept, faktor-* dirs survive"
+    else
+        echo "selftest FAIL: legacy kp-* sweep did not behave" >&2
+        failures=$((failures + 1))
     fi
 
     rm -rf "$tmp"

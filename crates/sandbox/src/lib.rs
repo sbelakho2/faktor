@@ -27,6 +27,15 @@
 //!
 //! There is deliberately no `platform_network_enforcement` probe in this
 //! crate anymore: enforcement detection belongs where enforcement happens.
+//!
+//! BrokerOnly isolation (audit item 8) is deliberately NOT a guarantee here:
+//! the browser authority (`faktor-browser`) selects
+//! `NetworkIsolation::BrokerOnly { endpoint }` for its own spawns at the
+//! live egress broker endpoint, and the spawn layer (`faktor-terminal`)
+//! produces the confined child or refuses typed. Sandbox policy never names
+//! a broker endpoint and no shell guarantee maps to it: `Required` stays
+//! DenyAll (a broker-less confinement), so a shell can never be handed the
+//! weaker broker-mediated mode.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

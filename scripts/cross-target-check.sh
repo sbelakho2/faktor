@@ -35,6 +35,21 @@ set -o pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 2
 
+# P3: this script mints `faktor-*` temp dirs; stale `kp-cross-selftest.*`
+# dirs left by the pre-migration version are still swept (older than a day).
+cleanup_legacy_tmpdirs() {
+    local dir
+    for dir in "${TMPDIR:-/tmp}"/kp-cross-selftest.*; do
+        [ -d "$dir" ] || continue
+        [ -L "$dir" ] && continue
+        if [ -n "$(find "$dir" -maxdepth 0 -mtime +0 2>/dev/null)" ]; then
+            rm -rf "$dir"
+        fi
+    done
+    return 0
+}
+cleanup_legacy_tmpdirs
+
 TARGET="${CROSS_TARGET:-x86_64-pc-windows-msvc}"
 OUT_DIR="${CERTIFY_OUT_DIR:-target/certification}"
 LOG_DIR="${CROSS_TARGET_LOG_DIR:-$OUT_DIR/logs}"
@@ -98,7 +113,7 @@ json_escape() {
 # limits skip.
 # ---------------------------------------------------------------------------
 if [ "${CROSS_TARGET_SELFTEST:-}" = "classify" ]; then
-    tmp="$(mktemp -d "${TMPDIR:-/tmp}/kp-cross-selftest.XXXXXX")" || exit 2
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-cross-selftest.XXXXXX")" || exit 2
     failures=0
     expect_status() {
         local want="$1" rc="$2" body="$3" got
@@ -115,6 +130,30 @@ error: could not compile `faktor-x` (lib) due to 1 previous error'
     expect_status skip 1 'error occurred in cc-rs: failed to find tool "ml64.exe": No such file or directory'
     expect_status skip 1 "fatal error: 'string.h' file not found"
     expect_status skip 1 "error[E0463]: can't find crate for \`std\` target may not be installed"
+    # P3 temp-name migration: no kp-* minting, legacy dirs still swept.
+    if grep -qE 'mktemp -d "[^"]*kp-' "$0"; then
+        printf 'cross-target selftest: FAIL: script still mints a kp-* temp name\n' >&2
+        failures=$((failures + 1))
+    fi
+    if grep -qF 'faktor-cross-selftest.XXXXXX' "$0"; then
+        :
+    else
+        printf 'cross-target selftest: FAIL: script does not mint a faktor-* temp name\n' >&2
+        failures=$((failures + 1))
+    fi
+    legacy="$tmp/legacy-tmp"
+    mkdir -p "$legacy/kp-cross-selftest.dead" "$legacy/faktor-cross.keep"
+    touch -t 202001010000 "$legacy/kp-cross-selftest.dead" "$legacy/faktor-cross.keep"
+    (
+        TMPDIR="$legacy"
+        cleanup_legacy_tmpdirs
+    )
+    if [ ! -e "$legacy/kp-cross-selftest.dead" ] && [ -d "$legacy/faktor-cross.keep" ]; then
+        :
+    else
+        printf 'cross-target selftest: FAIL: legacy kp-* sweep did not behave\n' >&2
+        failures=$((failures + 1))
+    fi
     rm -rf "$tmp"
     if [ "$failures" -eq 0 ]; then
         printf 'cross-target selftest: PASS (pass/skip/fail classification)\n'

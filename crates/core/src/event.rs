@@ -28,6 +28,11 @@ pub enum EventKind {
     TurnCompleted,
     PermissionGranted,
     PermissionDenied,
+    /// A durable pending permission whose deadline elapsed while no live
+    /// waiter owned it was terminalized by reconciliation (crash recovery):
+    /// decision `expired`, landed through the same sibling-batch rule an
+    /// explicit `PermissionDenied` uses. Never a fake Deny.
+    PermissionExpired,
     /// A durably queued prompt was admitted as the active logical turn
     /// (atomic claim + message materialization; audit round 7).
     PromptAdmitted,

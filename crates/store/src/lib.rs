@@ -2075,6 +2075,28 @@ pub struct CommandEvent {
     pub payload_ver: i64,
 }
 
+/// The outcome of one durable permission-expiry reconciliation sweep
+/// (crash recovery): the pending rows that were terminalized (`decision =
+/// 'expired'`, `resolved_ms` stamped) and the single journal event that
+/// explains them. An empty sweep is the idempotent no-op: no row touched,
+/// no event appended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExpiredPermissionResolution {
+    /// Expired rows this sweep moved from `pending` to `expired`, as
+    /// `(permission_id, op_id)`, ascending by permission id.
+    pub expired: Vec<(i64, OpId)>,
+    /// Sequence of the journaled `PermissionExpired` event; `None` when
+    /// nothing was expired (a second sweep, or a deadline still ahead).
+    pub event_seq: Option<EventSeq>,
+}
+
+impl ExpiredPermissionResolution {
+    /// True when nothing was expired and nothing was journaled.
+    pub fn is_empty(&self) -> bool {
+        self.expired.is_empty()
+    }
+}
+
 /// One logical session command inside ONE SQLite transaction
 /// (`BEGIN IMMEDIATE`). The session must exist and be exactly in the
 /// caller's `expected_state` or the command refuses with `Conflict`
@@ -2281,6 +2303,108 @@ impl Store {
         txn.precommit();
         txn.commit()?;
         Ok(seq)
+    }
+
+    /// Reconcile a session's EXPIRED pending permissions as ONE transaction
+    /// (crash recovery; P1-E): SELECT every still-`pending` row of the
+    /// session whose durable `expires_ms <= now_ms`, terminalize ALL of them
+    /// (`decision = 'expired'`, `resolved_ms = now_ms`) and append exactly
+    /// ONE `PermissionExpired` journal event describing them — never a fake
+    /// `PermissionDenied`. The caller supplies the pre-state it observed
+    /// (re-verified inside the transaction before any write) and the landing
+    /// state it computed with the SAME sibling-batch rule an explicit Deny
+    /// uses; the event kind must be `PermissionExpired`, so an expiry can
+    /// never be laundered through another kind.
+    ///
+    /// `now_ms` is the caller's clock (the session layer's injectable one),
+    /// never the store wall clock, so recovery tests can drive it manually.
+    ///
+    /// Zero expired rows is a clean no-op: the transaction is rolled back,
+    /// no row is touched, no event is appended and `event_seq` is `None` —
+    /// a second recovery sweep is byte-for-byte invisible.
+    pub fn expire_pending_permissions_for_session(
+        &self,
+        session_id: SessionId,
+        now_ms: i64,
+        expected_state: AgentState,
+        mut event: CommandEvent,
+    ) -> StoreResult<ExpiredPermissionResolution> {
+        if event.kind != EventKind::PermissionExpired {
+            return Err(StoreError::Migration(format!(
+                "expire_pending_permissions_for_session requires a PermissionExpired \
+                 event, got {:?}",
+                event.kind
+            )));
+        }
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let expired: Vec<(i64, OpId)> = {
+            let mut stmt = txn.tx.prepare(
+                "SELECT id, op_id FROM permission
+                 WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id.raw() as i64, now_ms], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(id, op_raw)| Ok((id, id_field(&format!("permission {id} op_id"), op_raw)?)))
+                .collect::<StoreResult<Vec<_>>>()?
+        };
+        if expired.is_empty() {
+            // Drop without commit: the durable world is untouched.
+            return Ok(ExpiredPermissionResolution::default());
+        }
+        let changed = txn.tx.execute(
+            "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+             WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
+            params![session_id.raw() as i64, now_ms],
+        )?;
+        if changed != expired.len() {
+            return Err(StoreError::Migration(format!(
+                "expire_pending_permissions: expected {} terminalized rows, updated {changed}",
+                expired.len()
+            )));
+        }
+        // The journal names the rows this transaction actually terminalized;
+        // the caller cannot know them before the SELECT under the same lock.
+        let ids: Vec<i64> = expired.iter().map(|(id, _)| *id).collect();
+        let ops: Vec<i64> = expired.iter().map(|(_, op)| op.raw() as i64).collect();
+        match &mut event.payload {
+            Some(serde_json::Value::Object(obj)) => {
+                obj.insert("permission_ids".into(), serde_json::json!(ids));
+                obj.insert("op_ids".into(), serde_json::json!(ops));
+            }
+            Some(_) => {}
+            None => {
+                event.payload = Some(serde_json::json!({
+                    "permission_ids": ids,
+                    "op_ids": ops,
+                }));
+            }
+        }
+        if event.op_id.is_none() && expired.len() == 1 {
+            event.op_id = Some(expired[0].1);
+        }
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            event.op_id,
+            event.kind,
+            event.state,
+            event.ts_ms,
+            event.payload,
+            event.payload_ver,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok(ExpiredPermissionResolution {
+            expired,
+            event_seq: Some(seq),
+        })
     }
 
     /// `start_tool_run` as ONE transaction: insert the running tool_run row
@@ -5637,6 +5761,33 @@ impl Store {
             )));
         }
         Ok(())
+    }
+
+    /// Every still-`pending` permission row of `session_id` whose durable
+    /// `expires_ms <= now_ms`, ascending by id — the recovery sweep's
+    /// read-side view (the atomic
+    /// [`Self::expire_pending_permissions_for_session`] re-derives the same
+    /// set inside its transaction). Unknown sessions and sessions without
+    /// expired rows both read as an empty vector.
+    pub fn expired_pending_permissions(
+        &self,
+        session_id: SessionId,
+        now_ms: i64,
+    ) -> StoreResult<Vec<(i64, OpId)>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, op_id FROM permission
+             WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id.raw() as i64, now_ms], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, op_raw)| Ok((id, id_field(&format!("permission {id} op_id"), op_raw)?)))
+            .collect()
     }
 
     /// A still-resolvable pending permission: `None` for unknown, already
@@ -10258,6 +10409,7 @@ fn kind_name(k: EventKind) -> &'static str {
         EventKind::TurnCompleted => "turn_completed",
         EventKind::PermissionGranted => "permission_granted",
         EventKind::PermissionDenied => "permission_denied",
+        EventKind::PermissionExpired => "permission_expired",
         EventKind::PhaseChanged => "phase_changed",
         EventKind::ReplayStarted => "replay_started",
         EventKind::PromptAdmitted => "prompt_admitted",
@@ -10290,6 +10442,7 @@ fn kind_from_name(name: &str) -> Option<EventKind> {
         "turn_completed" => EventKind::TurnCompleted,
         "permission_granted" => EventKind::PermissionGranted,
         "permission_denied" => EventKind::PermissionDenied,
+        "permission_expired" => EventKind::PermissionExpired,
         "phase_changed" => EventKind::PhaseChanged,
         "replay_started" => EventKind::ReplayStarted,
         "prompt_admitted" => EventKind::PromptAdmitted,
@@ -12113,6 +12266,284 @@ mod tests {
             store.permission_decision(pid).unwrap().as_deref(),
             Some("expired")
         );
+    }
+
+    fn permission_expiry_event() -> CommandEvent {
+        CommandEvent {
+            kind: EventKind::PermissionExpired,
+            state: AgentState::ReadyForNextTurn,
+            op_id: None,
+            ts_ms: now_ms(),
+            payload: Some(serde_json::json!({
+                "reason": "durable deadline elapsed while no live waiter owned the request",
+                "expired_count": 1,
+            })),
+            payload_ver: 1,
+        }
+    }
+
+    /// Push one permission row's durable deadline far into the past without
+    /// sleeping (the row stays `pending`: only reconciliation terminalizes it).
+    fn force_permission_deadline_past(store: &Store, pid: i64) {
+        store
+            .write()
+            .execute(
+                "UPDATE permission SET expires_ms = expires_ms - 1000000000 WHERE id = ?1",
+                params![pid],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn expire_pending_permissions_terminalizes_in_one_transaction_and_is_idempotent() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let other = store.create_session(ws, "t2", "p", "m").unwrap();
+        let (a, _) = store
+            .insert_permission(s.id, OpId::new(11), "execute_shell")
+            .unwrap();
+        let (b, _) = store
+            .insert_permission(s.id, OpId::new(12), "fs.write")
+            .unwrap();
+        let (live, _) = store
+            .insert_permission(s.id, OpId::new(13), "fs.read")
+            .unwrap();
+        let (foreign, _) = store
+            .insert_permission(other.id, OpId::new(14), "execute_shell")
+            .unwrap();
+        force_permission_deadline_past(&store, a);
+        force_permission_deadline_past(&store, b);
+        force_permission_deadline_past(&store, foreign);
+        assert!(
+            store
+                .expired_pending_permissions(s.id, now_ms())
+                .unwrap()
+                .len()
+                == 2
+        );
+        assert!(
+            store
+                .expired_pending_permissions(other.id, now_ms())
+                .unwrap()
+                .len()
+                == 1
+        );
+
+        // Manual clock: the caller's now_ms is the expiry stamp.
+        let now = now_ms() + 5;
+        let resolution = store
+            .expire_pending_permissions_for_session(
+                s.id,
+                now,
+                AgentState::Idle,
+                permission_expiry_event(),
+            )
+            .unwrap();
+        assert_eq!(
+            resolution.expired,
+            vec![(a, OpId::new(11)), (b, OpId::new(12))],
+            "ascending id order, both terminalized in one sweep"
+        );
+        assert!(resolution.event_seq.is_some());
+        assert!(!resolution.is_empty());
+        for (pid, want_op) in [(a, 11i64), (b, 12)] {
+            let (decision, resolved_ms, op_raw): (String, Option<i64>, i64) = store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT decision, resolved_ms, op_id FROM permission WHERE id = ?1",
+                    params![pid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(decision, "expired");
+            assert_eq!(
+                resolved_ms,
+                Some(now),
+                "resolved_ms is the caller's manual clock, not the wall clock"
+            );
+            assert_eq!(op_raw, want_op);
+            assert!(store.pending_permission(pid).unwrap().is_none());
+        }
+        // An unexpired row and a foreign session's expired row are untouched.
+        assert_eq!(
+            store.permission_decision(live).unwrap().as_deref(),
+            Some("pending")
+        );
+        assert!(store.pending_permission(live).unwrap().is_some());
+        assert_eq!(
+            store.permission_decision(foreign).unwrap().as_deref(),
+            Some("pending"),
+            "a foreign session's deadline is never swept here"
+        );
+        // The journal explains the sweep and names the exact rows it changed.
+        let events = store.events_range(s.id, 1, None).unwrap();
+        let expiry: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::PermissionExpired)
+            .collect();
+        assert_eq!(expiry.len(), 1, "one sweep, one event");
+        assert_eq!(expiry[0].state, AgentState::ReadyForNextTurn);
+        let payload = expiry[0].payload.as_ref().unwrap();
+        assert_eq!(payload["permission_ids"], serde_json::json!([a, b]));
+        assert_eq!(payload["op_ids"], serde_json::json!([11, 12]));
+        assert!(payload["reason"].as_str().unwrap().contains("deadline"));
+        // The committed event moved the session row with it.
+        let state: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM session WHERE id = ?1",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(state.contains("ready_for_next_turn"), "{state}");
+
+        // IDEMPOTENT second sweep: no rows, no event, no durable change.
+        let seq_before = store.last_event_seq(s.id).unwrap().unwrap();
+        let second = store
+            .expire_pending_permissions_for_session(
+                s.id,
+                now,
+                AgentState::ReadyForNextTurn,
+                permission_expiry_event(),
+            )
+            .unwrap();
+        assert!(second.is_empty());
+        assert_eq!(second.event_seq, None);
+        assert_eq!(store.last_event_seq(s.id).unwrap().unwrap(), seq_before);
+        assert_eq!(
+            store.permission_decision(a).unwrap().as_deref(),
+            Some("expired"),
+            "terminal stays terminal across sweeps"
+        );
+    }
+
+    #[test]
+    fn expire_pending_permissions_refuses_wrong_kind_and_wrong_state_without_writes() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let (pid, _) = store
+            .insert_permission(s.id, OpId::new(21), "execute_shell")
+            .unwrap();
+        force_permission_deadline_past(&store, pid);
+        let before = store.last_event_seq(s.id).unwrap().unwrap();
+
+        // A fake Deny (or any other kind) is refused: expiry is only ever
+        // journaled as PermissionExpired.
+        let mut wrong_kind = permission_expiry_event();
+        wrong_kind.kind = EventKind::PermissionDenied;
+        let err = store
+            .expire_pending_permissions_for_session(s.id, now_ms(), AgentState::Idle, wrong_kind)
+            .expect_err("a non-PermissionExpired event is refused");
+        assert!(matches!(err, StoreError::Migration(_)), "{err:?}");
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("pending"),
+            "the refused kind changed nothing"
+        );
+
+        // A stale pre-state is refused BEFORE any write (the whole command
+        // rolls back: no terminalization, no event).
+        let err = store
+            .expire_pending_permissions_for_session(
+                s.id,
+                now_ms(),
+                AgentState::Suspended,
+                permission_expiry_event(),
+            )
+            .expect_err("a mismatched pre-state refuses");
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("pending")
+        );
+        assert_eq!(store.last_event_seq(s.id).unwrap().unwrap(), before);
+
+        // The correct command still succeeds afterwards.
+        let ok = store
+            .expire_pending_permissions_for_session(
+                s.id,
+                now_ms(),
+                AgentState::Idle,
+                permission_expiry_event(),
+            )
+            .unwrap();
+        assert_eq!(ok.expired, vec![(pid, OpId::new(21))]);
+        assert_eq!(
+            store.permission_decision(pid).unwrap().as_deref(),
+            Some("expired")
+        );
+    }
+
+    #[test]
+    fn expire_pending_permissions_seams_reopen_old_or_new_only() {
+        const SEAMS: [&str; 3] = [
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ];
+        for seam in SEAMS {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            let (pid, _) = store
+                .insert_permission(s.id, OpId::new(31), "execute_shell")
+                .unwrap();
+            force_permission_deadline_past(&store, pid);
+            store.crash_arm(CrashArm {
+                point: seam,
+                ordinal: 0,
+            });
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.expire_pending_permissions_for_session(
+                    s.id,
+                    now_ms(),
+                    AgentState::Idle,
+                    permission_expiry_event(),
+                );
+            }));
+            assert!(caught.is_err(), "seam {seam} must fire");
+            drop(store);
+            // Reopen from disk: exactly the old world or exactly the new one.
+            let store = Store::open(dir.path(), true).unwrap();
+            let decision = store.permission_decision(pid).unwrap();
+            let expiry_events = store
+                .events_range(s.id, 1, None)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == EventKind::PermissionExpired)
+                .count();
+            let state: String = store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM session WHERE id = ?1",
+                    params![s.id.raw() as i64],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(decision.as_deref(), Some("expired"), "seam {seam}");
+                    assert_eq!(expiry_events, 1, "seam {seam}");
+                    assert!(state.contains("ready_for_next_turn"), "{seam}: {state}");
+                }
+                _ => {
+                    assert_eq!(
+                        decision.as_deref(),
+                        Some("pending"),
+                        "seam {seam}: the whole command must roll back"
+                    );
+                    assert_eq!(expiry_events, 0, "seam {seam}");
+                    assert!(state.contains("idle"), "{seam}: {state}");
+                }
+            }
+        }
     }
 
     #[test]
