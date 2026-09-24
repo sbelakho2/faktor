@@ -435,8 +435,18 @@ class FaktorFrontendService(
     fun permissions(): List<NativePermissionEntry> =
         clientOrThrow().permissions(requireSession())
 
-    fun replyPermission(permissionId: String, decision: String): NativePermissionAck =
-        clientOrThrow().replyPermission(permissionId, decision)
+    /**
+     * Resolve one live pending permission; [sessionId] must be the session
+     * that OWNS the request (carried by [NativePermissionEntry.sessionId],
+     * which may be a child session). The daemon's typed 409 refusals
+     * (unknown/expired/already resolved vs a live waiter of another session)
+     * propagate as [NativeApiException]; callers surface them, never retry.
+     */
+    fun replyPermission(
+        sessionId: String,
+        permissionId: String,
+        decision: String
+    ): NativePermissionAck = clientOrThrow().replyPermission(sessionId, permissionId, decision)
 
     // ------------------------------------------------------- provider registry
 

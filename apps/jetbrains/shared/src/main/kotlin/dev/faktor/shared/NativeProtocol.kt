@@ -1116,6 +1116,12 @@ data class NativePresentationAck(
 )
 
 // ------------------------------------------------- permissions (SDK reply path)
+//
+// Resolution is CONTEXTUAL: the reply body is
+// `{session_id, permission_id, decision}` and the named session must own the
+// request. An unknown/expired/already-resolved id is a typed 409 `conflict`,
+// a live waiter owned by a DIFFERENT session a typed 409
+// `permission_session_mismatch`; neither is ever retried blindly.
 
 data class NativePermissionEntry(
     val id: String,
@@ -1125,6 +1131,34 @@ data class NativePermissionEntry(
 )
 
 data class NativePermissionAck(val ok: Boolean)
+
+/** The daemon's two typed permission-reply refusals (HTTP 409). */
+object NativePermissionReplyRefusal {
+    const val CONFLICT = "conflict"
+    const val SESSION_MISMATCH = "permission_session_mismatch"
+
+    /** True for the unknown/expired/already-resolved refusal. */
+    fun isUnknownOrResolved(e: NativeApiException): Boolean =
+        e.status == 409 && e.code == CONFLICT
+
+    /** True for the live-waiter-owned-by-another-session refusal. */
+    fun isSessionMismatch(e: NativeApiException): Boolean =
+        e.status == 409 && e.code == SESSION_MISMATCH
+
+    /**
+     * Operator-facing text for one typed refusal; null when [e] is anything
+     * else (a transport/401/5xx error keeps its own surface).
+     */
+    fun describe(e: NativeApiException, permissionId: String): String? = when {
+        isUnknownOrResolved(e) ->
+            "permission $permissionId is unknown, expired or already resolved " +
+                "(409 conflict); refresh the pending list"
+        isSessionMismatch(e) ->
+            "permission $permissionId is owned by a different session " +
+                "(409 permission_session_mismatch); refresh the pending list"
+        else -> null
+    }
+}
 
 // ------------------------------------------- provider registry (native P0-64)
 //
@@ -2431,8 +2465,9 @@ object NativeRequests {
             .put("max_hits", maxHits)
             .toJson()
 
-    fun permissionReply(permissionId: String, decision: String): String =
+    fun permissionReply(sessionId: String, permissionId: String, decision: String): String =
         JsonObjectBuilder()
+            .put("session_id", sessionId)
             .put("permission_id", permissionId)
             .put("decision", decision)
             .toJson()

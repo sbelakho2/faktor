@@ -7,10 +7,11 @@ use std::sync::Mutex;
 
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::capability::Capability;
+use faktor_core::event::EventKind;
 use faktor_core::id::OpId;
 use faktor_core::op::{EffectStatus, ModelCallAttempt, OpMeta};
 use faktor_core::state::AgentState;
-use faktor_store::ToolRunRow;
+use faktor_store::{CommandEvent, ToolRunRow};
 
 use crate::handle::SessionHandle;
 use crate::{effect_str, json_bytes, SessionError, MAX_TOOL_ARGS_BYTES};
@@ -103,6 +104,27 @@ fn capability_tag(cap: &Capability) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Build the journal half of an atomic session command. The typed payload
+/// schema is decoded BEFORE any write, so an undecodable payload refuses the
+/// whole command — never a side row without its journal event.
+pub(crate) fn command_event(
+    kind: EventKind,
+    state: AgentState,
+    op_id: Option<OpId>,
+    ts_ms: i64,
+    payload: Option<serde_json::Value>,
+) -> Result<CommandEvent, SessionError> {
+    crate::payload::decode_payload(kind, crate::payload::PAYLOAD_SCHEMA_V, payload.as_ref())?;
+    Ok(CommandEvent {
+        kind,
+        state,
+        op_id,
+        ts_ms,
+        payload,
+        payload_ver: crate::payload::PAYLOAD_SCHEMA_V,
+    })
+}
+
 impl SessionHandle {
     /// Start a tool run. The op envelope is the caller's (it owns the
     /// deadline/retry/cancellation/recovery); this command journals
@@ -143,16 +165,27 @@ impl SessionHandle {
             }
             _ => None,
         };
-        // Validate the transition before any durable write.
+        // Validate the transition before any durable write, and read the
+        // pre-state ONCE: the atomic store command re-verifies it inside the
+        // transaction, so a concurrent transition refuses loudly instead of
+        // leaving a tool_run row without its journal event.
+        let current = self.state()?;
         crate::journal::validate_transition(
-            self.state()?,
-            faktor_core::event::EventKind::ToolStarted,
+            current,
+            EventKind::ToolStarted,
             AgentState::ExecutingTool,
         )?;
-        let row_id = self
+        let event = command_event(
+            EventKind::ToolStarted,
+            AgentState::ExecutingTool,
+            Some(op.operation_id),
+            self.now_ms(),
+            Some(serde_json::json!({ "tool": tool })),
+        )?;
+        let (row_id, _seq) = self
             .manager
             .store()
-            .start_tool_run(
+            .start_tool_run_and_event(
                 self.id,
                 op.operation_id,
                 tool,
@@ -160,14 +193,10 @@ impl SessionHandle {
                 recovery,
                 expected_hash,
                 op.replay.clone(),
+                current,
+                event,
             )
             .map_err(crate::map_store_err)?;
-        self.transition_locked(
-            faktor_core::event::EventKind::ToolStarted,
-            AgentState::ExecutingTool,
-            Some(op.operation_id),
-            Some(serde_json::json!({ "tool": tool })),
-        )?;
         self.ops()
             .register(op.operation_id, OpKind::Tool, op.cancellation.clone());
         Ok(ToolRunHandle {
@@ -197,31 +226,27 @@ impl SessionHandle {
         if !pending.iter().any(|r| r.op_id == op) {
             return Err(SessionError::NotFound(format!("tool run {op} is not running")).into());
         }
-        self.manager
-            .store()
-            .finish_tool_run(self.id, op, status, effect_str(effect))
-            .map_err(crate::map_store_err)?;
         let (kind, state) = match status {
-            "completed" => (
-                faktor_core::event::EventKind::ToolCompleted,
-                AgentState::Validating,
-            ),
-            "failed" => (
-                faktor_core::event::EventKind::ToolCompleted,
-                AgentState::FailedRecoverable,
-            ),
-            "cancelled" => (
-                faktor_core::event::EventKind::ToolCancelled,
-                AgentState::Cancelled,
-            ),
+            "completed" => (EventKind::ToolCompleted, AgentState::Validating),
+            "failed" => (EventKind::ToolCompleted, AgentState::FailedRecoverable),
+            "cancelled" => (EventKind::ToolCancelled, AgentState::Cancelled),
             _ => unreachable!("validated above"),
         };
-        self.transition_locked(
+        // Validate against the pre-state read ONCE; the atomic store command
+        // re-verifies it inside the same transaction as the row update.
+        let current = self.state()?;
+        crate::journal::validate_transition(current, kind, state)?;
+        let event = command_event(
             kind,
             state,
             Some(op),
+            self.now_ms(),
             Some(serde_json::json!({ "status": status, "effect": effect_str(effect) })),
         )?;
+        self.manager
+            .store()
+            .finish_tool_run_and_event(self.id, op, status, effect_str(effect), current, event)
+            .map_err(crate::map_store_err)?;
         self.ops().unregister(op);
         Ok(())
     }
@@ -630,21 +655,32 @@ impl SessionHandle {
         if cap_json.len() > 4096 {
             return Err(SessionError::Oversized("capability too large".into()).into());
         }
-        let (id, expires_ms) = self
-            .manager
-            .store()
-            .insert_permission(self.id, op, &cap_json)
-            .map_err(crate::map_store_err)?;
-        let event_seq = self.transition_locked(
-            faktor_core::event::EventKind::ToolRequested,
+        // Validate the ToolRequested hop against the pre-state read ONCE; the
+        // atomic store command re-verifies it inside the transaction, so an
+        // illegal hop can never leave an orphan pending permission row. The
+        // event payload's `permission_id` is stamped by the store from the id
+        // it actually allocated (same transaction), never guessed here.
+        let current = self.state()?;
+        crate::journal::validate_transition(
+            current,
+            EventKind::ToolRequested,
+            AgentState::WaitingForPermission,
+        )?;
+        let event = command_event(
+            EventKind::ToolRequested,
             AgentState::WaitingForPermission,
             Some(op),
+            self.now_ms(),
             Some(serde_json::json!({
-                "permission_id": id,
                 "capability": capability_tag(capability),
                 "detail": capability,
             })),
         )?;
+        let (id, expires_ms, event_seq) = self
+            .manager
+            .store()
+            .insert_permission_and_event(self.id, op, &cap_json, current, event)
+            .map_err(crate::map_store_err)?;
         Ok(PermissionRequest {
             id,
             op_id: op,
@@ -727,10 +763,11 @@ impl SessionHandle {
         // honest landing while the batch continues is `ExecutingTool`
         // (`WaitingForPermission -> ExecutingTool` is the legal edge); the
         // deny-only batch keeps the documented `ReadyForNextTurn` landing.
-        // Resolved BEFORE the durable row: a read failure must never leave a
-        // half-resolved permission behind.
-        let target = if kind == faktor_core::event::EventKind::PermissionDenied {
-            let current = self.state()?;
+        // The pre-state is read ONCE here and re-verified by the atomic store
+        // command inside its transaction: the landing decision, the durable
+        // row change and the journal event can never disagree.
+        let current = self.state()?;
+        let target = if kind == EventKind::PermissionDenied {
             let preferred = if self.open_batch_has_pending_siblings()? {
                 AgentState::ExecutingTool
             } else {
@@ -754,28 +791,23 @@ impl SessionHandle {
         } else {
             target
         };
-        // The atomic update is the arbiter: exactly one row (this session,
-        // still pending, still unexpired) must transition; zero is the typed
-        // conflict (unknown, already terminal, wrong session, expired). There
-        // is no post-check race window to lose in.
-        self.manager
-            .store()
-            .resolve_permission(id, self.id, decision_str)
-            .map_err(crate::map_store_err)?;
-        let Some((_, op, _)) = pending else {
-            // Unreachable: a successful update implies the live pending row
-            // read above. Kept as a typed refusal, never a panic.
-            return Err(SessionError::Conflict(format!(
-                "permission {id} was resolved concurrently"
-            ))
-            .into());
-        };
-        self.transition_locked(
+        crate::journal::validate_transition(current, kind, target)?;
+        let event = command_event(
             kind,
             target,
-            Some(op),
+            pending.as_ref().map(|(_, op, _)| *op),
+            self.now_ms(),
             Some(serde_json::json!({ "permission_id": id, "decision": decision_str })),
-        )
+        )?;
+        // The atomic update is the arbiter: exactly one row (this session,
+        // still pending, still unexpired) must transition; zero is the typed
+        // conflict (unknown, already terminal, wrong session, expired). The
+        // row change and its journal event commit together (or not at all).
+        self.manager
+            .store()
+            .resolve_permission_and_event(id, self.id, decision_str, current, event)
+            .map_err(crate::map_store_err)
+            .map_err(Into::into)
     }
 
     /// Durable sibling evidence for a permission DENIAL: is another tool
@@ -2313,5 +2345,269 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("too long"));
+    }
+
+    // ------------------------------------------------ atomic command seams
+    //
+    // One logical session command = one SQLite transaction, so a crash at any
+    // of its durability boundaries must reopen on EXACTLY the old world or
+    // EXACTLY the new one — never a side row without its journal transition.
+
+    const COMMAND_SEAMS: [&str; 3] = [
+        "session_command_side_row",
+        "session_command_precommit",
+        "session_command_committed",
+    ];
+
+    fn reopen(dir: &tempfile::TempDir) -> std::sync::Arc<crate::SessionManager> {
+        crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap()
+    }
+
+    /// Arm `seam`, run the command (it must panic at the boundary), drop the
+    /// crashed daemon and reopen from disk; the handle for the same session
+    /// comes back for the old/new assertions.
+    fn crash_and_reopen(
+        dir: &tempfile::TempDir,
+        m: std::sync::Arc<crate::SessionManager>,
+        s: SessionHandle,
+        seam: &'static str,
+        run: impl FnOnce(&SessionHandle),
+    ) -> SessionHandle {
+        let sid = s.id();
+        m.store().crash_arm(faktor_store::CrashArm {
+            point: seam,
+            ordinal: 0,
+        });
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&s)));
+        assert!(caught.is_err(), "seam {seam} must fire");
+        drop(s);
+        drop(m);
+        reopen(dir).get_session(sid).unwrap().unwrap()
+    }
+
+    fn event_kinds(s: &SessionHandle) -> Vec<EventKind> {
+        s.events_range(1, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    #[test]
+    fn request_permission_seams_reopen_old_or_new_only() {
+        for seam in COMMAND_SEAMS {
+            let (dir, m) = test_manager();
+            let s = session(&m);
+            to_streaming(&s);
+            let op = s.ops().all()[0];
+            let after = crash_and_reopen(&dir, m, s, seam, |s| {
+                let _ = s.request_permission(
+                    op,
+                    &Capability::ReadWorkspace {
+                        path: "/w/a".into(),
+                    },
+                );
+            });
+            let requested = event_kinds(&after)
+                .iter()
+                .filter(|k| **k == EventKind::ToolRequested)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(requested, 1, "committed request journals once");
+                    assert_eq!(after.state().unwrap(), AgentState::WaitingForPermission);
+                    // The journaled id names the durable pending row.
+                    let ev = after
+                        .events_range(1, None)
+                        .unwrap()
+                        .into_iter()
+                        .find(|e| e.kind == EventKind::ToolRequested)
+                        .unwrap();
+                    let pid = ev.payload.as_ref().unwrap()["permission_id"]
+                        .as_i64()
+                        .expect("permission_id");
+                    assert!(after.pending_permission(pid).unwrap().is_some());
+                }
+                _ => {
+                    assert_eq!(requested, 0, "rolled-back request leaves no event");
+                    assert_eq!(after.state().unwrap(), AgentState::Streaming);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_permission_seams_reopen_old_or_new_only() {
+        for seam in COMMAND_SEAMS {
+            let (dir, m) = test_manager();
+            let s = session(&m);
+            to_streaming(&s);
+            let op = s.ops().all()[0];
+            let req = s
+                .request_permission(
+                    op,
+                    &Capability::ReadWorkspace {
+                        path: "/w/a".into(),
+                    },
+                )
+                .unwrap();
+            let id = req.id;
+            let after = crash_and_reopen(&dir, m, s, seam, |s| {
+                let _ =
+                    s.resolve_permission(id, faktor_core::capability::PermissionDecision::Allow);
+            });
+            let granted = event_kinds(&after)
+                .iter()
+                .filter(|k| **k == EventKind::PermissionGranted)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(granted, 1, "committed resolution journals once");
+                    assert_eq!(after.state().unwrap(), AgentState::ExecutingTool);
+                    assert_eq!(
+                        after
+                            .manager()
+                            .store()
+                            .permission_decision(id)
+                            .unwrap()
+                            .as_deref(),
+                        Some("allow")
+                    );
+                }
+                _ => {
+                    assert_eq!(granted, 0, "rolled-back resolution leaves no event");
+                    assert_eq!(after.state().unwrap(), AgentState::WaitingForPermission);
+                    assert!(
+                        after.pending_permission(id).unwrap().is_some(),
+                        "the permission stays pending"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn start_tool_run_seams_reopen_old_or_new_only() {
+        for seam in COMMAND_SEAMS {
+            let (dir, m) = test_manager();
+            let s = session(&m);
+            to_waiting(&s);
+            let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
+            let op = meta.operation_id;
+            let after = crash_and_reopen(&dir, m, s, seam, |s| {
+                let _ = s.start_tool_run(meta, "read_file", serde_json::json!({}));
+            });
+            let started = event_kinds(&after)
+                .iter()
+                .filter(|k| **k == EventKind::ToolStarted)
+                .count();
+            let running = after.pending_tool_runs().unwrap();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(started, 1, "committed start journals once");
+                    assert_eq!(running.len(), 1);
+                    assert_eq!(running[0].op_id, op);
+                    assert_eq!(after.state().unwrap(), AgentState::ExecutingTool);
+                }
+                _ => {
+                    assert_eq!(started, 0, "rolled-back start leaves no event");
+                    assert!(running.is_empty(), "no tool_run row without its event");
+                    assert_eq!(after.state().unwrap(), AgentState::WaitingForPermission);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finish_tool_run_seams_reopen_old_or_new_only() {
+        for seam in COMMAND_SEAMS {
+            let (dir, m) = test_manager();
+            let s = session(&m);
+            to_waiting(&s);
+            let meta = op_meta(&m, s.id(), faktor_core::op::RecoveryStrategy::None);
+            let op = meta.operation_id;
+            s.start_tool_run(meta, "read_file", serde_json::json!({}))
+                .unwrap();
+            let after = crash_and_reopen(&dir, m, s, seam, |s| {
+                let _ = s.finish_tool_run(op, "completed", EffectStatus::Verified);
+            });
+            let completed = event_kinds(&after)
+                .iter()
+                .filter(|k| **k == EventKind::ToolCompleted)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(completed, 1, "committed finish journals once");
+                    assert!(after.pending_tool_runs().unwrap().is_empty());
+                    assert_eq!(after.state().unwrap(), AgentState::Validating);
+                }
+                _ => {
+                    assert_eq!(completed, 0, "rolled-back finish leaves no event");
+                    let running = after.pending_tool_runs().unwrap();
+                    assert_eq!(running.len(), 1, "the row is still running");
+                    assert_eq!(running[0].op_id, op);
+                    assert_eq!(after.state().unwrap(), AgentState::ExecutingTool);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn barrier_concurrent_duplicate_resolution_has_one_winner() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        to_streaming(&s);
+        let op = s.ops().all()[0];
+        let req = s
+            .request_permission(
+                op,
+                &Capability::ExecuteShell {
+                    command: "cargo test".into(),
+                },
+            )
+            .unwrap();
+        let s = std::sync::Arc::new(s);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn = |decision: faktor_core::capability::PermissionDecision| {
+            let s = s.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                s.resolve_permission(req.id, decision)
+            })
+        };
+        let t1 = spawn(faktor_core::capability::PermissionDecision::Allow);
+        let t2 = spawn(faktor_core::capability::PermissionDecision::Deny);
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        assert!(
+            r1.is_ok() != r2.is_ok(),
+            "exactly one resolver must win; got {r1:?} / {r2:?}"
+        );
+        let resolutions: Vec<_> = event_kinds(&s)
+            .into_iter()
+            .filter(|k| {
+                matches!(
+                    k,
+                    EventKind::PermissionGranted | EventKind::PermissionDenied
+                )
+            })
+            .collect();
+        assert_eq!(resolutions.len(), 1, "one resolution, one event");
+        let expected = if r1.is_ok() {
+            EventKind::PermissionGranted
+        } else {
+            EventKind::PermissionDenied
+        };
+        assert_eq!(resolutions[0], expected);
+        let decision = s.manager().store().permission_decision(req.id).unwrap();
+        assert_eq!(
+            decision.as_deref(),
+            Some(if expected == EventKind::PermissionGranted {
+                "allow"
+            } else {
+                "deny"
+            })
+        );
     }
 }

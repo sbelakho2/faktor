@@ -39,12 +39,27 @@ impl SessionHandle {
             .into());
         }
         let _guard = self.command_guard();
+        // Validate against the pre-state read ONCE; the atomic store command
+        // re-verifies it inside the same transaction as the row insert, so a
+        // checkpoint row can never exist without its CheckpointCreated event.
         let current = self.state()?;
         crate::journal::validate_transition(current, EventKind::CheckpointCreated, current)?;
-        let id = self
+        let event = crate::ops::command_event(
+            EventKind::CheckpointCreated,
+            current,
+            None,
+            self.now_ms(),
+            Some(serde_json::json!({
+                "sequence": sequence,
+                "path": path,
+                "before_hash": before_hash.to_hex(),
+                "after_hash": after_hash.to_hex(),
+            })),
+        )?;
+        let (id, _seq) = self
             .manager
             .store()
-            .put_checkpoint(
+            .put_checkpoint_and_event(
                 self.id,
                 sequence,
                 path,
@@ -55,19 +70,10 @@ impl SessionHandle {
                 // honestly. The content-aware path is faktor-snapshot's
                 // after_write, which stores the after blob in the CAS.
                 None,
+                current,
+                event,
             )
             .map_err(crate::map_store_err)?;
-        self.transition_locked(
-            EventKind::CheckpointCreated,
-            current,
-            None,
-            Some(serde_json::json!({
-                "sequence": sequence,
-                "path": path,
-                "before_hash": before_hash.to_hex(),
-                "after_hash": after_hash.to_hex(),
-            })),
-        )?;
         Ok(id)
     }
 
@@ -165,5 +171,58 @@ mod tests {
         // we verify the restored_ms is durable on the known row.
         let rows = s.checkpoints_of().unwrap();
         assert!(rows[0].restored_ms.is_some());
+    }
+
+    #[test]
+    fn checkpoint_seams_reopen_old_or_new_only() {
+        // One checkpoint command = ONE transaction: a crash at any durability
+        // boundary reopens on exactly the old world (no row, no event) or
+        // exactly the new one (row AND event), never a row without its event.
+        for seam in [
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = session(&m);
+            let sid = s.id();
+            let (before, after) = hashes(1, 2);
+            m.store().crash_arm(faktor_store::CrashArm {
+                point: seam,
+                ordinal: 0,
+            });
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.put_checkpoint(0, "a.rs", before, after);
+            }));
+            assert!(caught.is_err(), "seam {seam} must fire");
+            drop(s);
+            drop(m);
+            let m =
+                crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let s = m.get_session(sid).unwrap().unwrap();
+            let rows = s.checkpoints_of().unwrap();
+            let created = s
+                .events_range(1, None)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == EventKind::CheckpointCreated)
+                .count();
+            match seam {
+                "session_command_committed" => {
+                    assert_eq!(rows.len(), 1, "committed checkpoint row is durable");
+                    assert_eq!(rows[0].sequence, 0);
+                    assert_eq!(rows[0].after_hash, after.to_hex());
+                    assert_eq!(created, 1, "committed checkpoint event is durable");
+                }
+                _ => {
+                    assert!(rows.is_empty(), "rolled-back checkpoint leaves no row");
+                    assert_eq!(created, 0, "rolled-back checkpoint leaves no event");
+                }
+            }
+        }
     }
 }

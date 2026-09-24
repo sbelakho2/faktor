@@ -20,6 +20,7 @@ package dev.faktor.backend
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeRequests
@@ -236,6 +237,25 @@ private const val BILLING_DISABLED_JSON =
         "\"message\":\"commercial billing is disabled (enable the [billing] section to use it)\"," +
         "\"retryable\":false}}"
 
+private const val PERMISSIONS_JSON = "{" +
+    "\"permissions\":[" +
+    "{\"id\":\"7\",\"session_id\":\"9\",\"capability\":\"shell\"," +
+    "\"detail\":{\"tool\":\"bash\"}}," +
+    "{\"id\":\"8\",\"session_id\":\"7\",\"capability\":\"write_file\"," +
+    "\"detail\":\"write a.rs\"}" +
+    "]}"
+
+private const val PERMISSION_ACK_JSON = "{\"ok\":true}"
+
+private const val PERMISSION_CONFLICT_JSON =
+    "{\"error\":{\"code\":\"conflict\",\"message\":\"permission 7 unknown or already resolved\"," +
+        "\"retryable\":false}}"
+
+private const val PERMISSION_SESSION_MISMATCH_JSON =
+    "{\"error\":{\"code\":\"permission_session_mismatch\"," +
+        "\"message\":\"permission 7 is owned by session 8, not session 9\"," +
+        "\"retryable\":false}}"
+
 private const val SESSION_USAGE_JSON = "{" +
     "\"sessionId\":\"7\",\"providerCalls\":{\"tokens\":10,\"prefixObservations\":[]}," +
     "\"prefixStability\":null,\"tasks\":[{\"taskId\":\"3\"," +
@@ -361,6 +381,16 @@ private fun assertRequestBodies() {
     assertEquals(
         "{\"amount_micro\":5,\"account_id\":\"acct-1\"}",
         NativeRequests.grantCredits(BigInteger.valueOf(5L), accountId = "acct-1")
+    )
+    // Permission resolution is CONTEXTUAL: the reply names the owning
+    // session alongside the permission id and the decision.
+    assertEquals(
+        "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
+        NativeRequests.permissionReply("9", "7", "allow")
+    )
+    assertEquals(
+        "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"deny\"}",
+        NativeRequests.permissionReply("9", "7", "deny")
     )
 }
 
@@ -967,6 +997,12 @@ private fun assertClientRoutes() {
     daemon.on("POST", "/native/evidence/9/retrieve") { _, response ->
         response.json(200, EVIDENCE_RETRIEVAL_JSON)
     }
+    daemon.on("GET", "/native/permissions") { _, response ->
+        response.json(200, PERMISSIONS_JSON)
+    }
+    daemon.on("POST", "/native/permission/reply") { _, response ->
+        response.json(200, PERMISSION_ACK_JSON)
+    }
     daemon.start()
     try {
         val client = NativeClient(daemon.baseUrl, "tok")
@@ -1011,6 +1047,17 @@ private fun assertClientRoutes() {
         assertEquals(9L, client.evidence("7", 9).id)
         assertEquals("hello", String(client.retrieveEvidence("7", 9, "{\"selector\":\"all\"}").bytes))
 
+        // Permissions: the pending list carries the OWNING session per entry;
+        // the reply body is the strict session-scoped DTO.
+        val pending = client.permissions("9")
+        assertEquals(2, pending.size)
+        assertEquals("7", pending[0].id)
+        assertEquals("9", pending[0].sessionId)
+        assertEquals("shell", pending[0].capability)
+        assertEquals("{\"tool\":\"bash\"}", pending[0].detail)
+        assertEquals("write a.rs", pending[1].detail)
+        assertEquals(true, client.replyPermission("9", "7", "allow").ok)
+
         val first = daemon.requests[0]
         assertEquals("Bearer tok", first.headers["authorization"])
         val create = daemon.requests.first { it.method == "POST" && it.path == "/native/session" }
@@ -1049,6 +1096,18 @@ private fun assertClientRoutes() {
             "{\"amount_micro\":1000000,\"reason\":\"top up\"}",
             grant.body
         )
+        val permissionsRead = daemon.requests.first {
+            it.method == "GET" && it.path == "/native/permissions"
+        }
+        assertEquals("9", permissionsRead.query["session"])
+        val permissionReply = daemon.requests.first {
+            it.method == "POST" && it.path == "/native/permission/reply"
+        }
+        assertEquals(
+            "{\"session_id\":\"9\",\"permission_id\":\"7\",\"decision\":\"allow\"}",
+            permissionReply.body
+        )
+        assertEquals(1, daemon.requestCount("POST", "/native/permission/reply"))
         // The control-plane credential rides the identity/billing reads only
         // when the operator configured one: absent by default, exact when set.
         assertEquals(null, daemon.requests.first {
@@ -1105,6 +1164,15 @@ private fun assertErrorMapping() {
     daemon.on("GET", "/native/entitlements") { _, response ->
         response.json(409, BILLING_DISABLED_JSON)
     }
+    var permissionReplies = 0
+    daemon.on("POST", "/native/permission/reply") { _, response ->
+        permissionReplies += 1
+        if (permissionReplies == 1) {
+            response.json(409, PERMISSION_CONFLICT_JSON)
+        } else {
+            response.json(409, PERMISSION_SESSION_MISMATCH_JSON)
+        }
+    }
     daemon.start()
     try {
         val client = NativeClient(daemon.baseUrl, "wrong")
@@ -1131,6 +1199,49 @@ private fun assertErrorMapping() {
             assertEquals("billing_disabled", e.code)
             assertEquals(false, e.retryable)
         }
+        // Typed permission-reply refusals: unknown/expired/already resolved
+        // is `conflict`, a live waiter of another session is
+        // `permission_session_mismatch`; both stay typed (no blind retry).
+        try {
+            client.replyPermission("9", "7", "allow")
+            fail("409 conflict must throw")
+        } catch (e: NativeApiException) {
+            assertEquals(409, e.status)
+            assertEquals("conflict", e.code)
+            assertEquals(false, e.retryable)
+            assertEquals(true, NativePermissionReplyRefusal.isUnknownOrResolved(e))
+            val text = NativePermissionReplyRefusal.describe(e, "7")
+            assertTrue(
+                text != null && text.contains("already resolved"),
+                "the refusal text must name the resolution authority: $text"
+            )
+        }
+        try {
+            client.replyPermission("9", "7", "allow")
+            fail("409 permission_session_mismatch must throw")
+        } catch (e: NativeApiException) {
+            assertEquals(409, e.status)
+            assertEquals("permission_session_mismatch", e.code)
+            assertEquals(false, e.retryable)
+            assertEquals(true, NativePermissionReplyRefusal.isSessionMismatch(e))
+            val text = NativePermissionReplyRefusal.describe(e, "7")
+            assertTrue(
+                text != null && text.contains("different session"),
+                "the refusal text must name the ownership conflict: $text"
+            )
+        }
+        assertEquals(
+            2,
+            daemon.requestCount("POST", "/native/permission/reply"),
+            "a typed permission refusal is never retried by the client"
+        )
+        // An unrelated 409 is never classified as a permission refusal.
+        assertEquals(
+            null,
+            NativePermissionReplyRefusal.describe(
+                NativeApiException(409, "shadow_unregistered", "no shadow", false), "7"
+            )
+        )
     } finally {
         daemon.stop()
     }

@@ -8,9 +8,10 @@
 //   - webview.ts       the chat panel (strict CSP, nonce, no remote code)
 //
 // Commands: start/stop the daemon, open the chat, start a task, cancel the
-// active run. The status bar mirrors daemon + task state. Every daemon
-// string that reaches the UI passes through the strict native validators
-// first; nothing is rendered from an unvalidated response.
+// active run, reply to a pending permission. The status bar mirrors daemon +
+// task state. Every daemon string that reaches the UI passes through the
+// strict native validators first; nothing is rendered from an unvalidated
+// response.
 
 import * as vscode from 'vscode';
 import { resolve } from 'node:path';
@@ -27,6 +28,7 @@ import {
   NativeIdentity,
   NativeMessagePage,
   NativeModelInfo,
+  NativePermissionEntry,
   NativeSessionUsage,
   NativeTaskRun,
   NativeTaskProof,
@@ -36,6 +38,8 @@ import {
   NativeTournamentSummary,
   NativeVerificationView,
   ResponseLike,
+  classifyPermissionReplyFailure,
+  permissionReplyFailureMessage,
 } from './nativeClient';
 import {
   EventStream,
@@ -1575,6 +1579,80 @@ async function cancelActiveRun(): Promise<void> {
 }
 
 /**
+ * Reply to ONE live pending permission of the active session
+ * (`faktor.replyPermission`). The picker lists exactly the daemon's pending
+ * set, and the strict reply body carries the OWNING session id from the
+ * selected entry — never a guessed session. Typed 409 refusals surface as an
+ * explicit notice/UI state (`unknown_or_resolved` vs `session_mismatch`) and
+ * are NEVER retried blindly; the pending list is refreshed either way so the
+ * operator works from the daemon's current truth.
+ */
+async function replyPermissionFromCommand(): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  if (!client || !sessionId) {
+    chatProvider?.postNotice('info', 'start the daemon and open a session first');
+    return;
+  }
+  let permissions: NativePermissionEntry[];
+  try {
+    permissions = await client.permissions(sessionId);
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  if (permissions.length === 0) {
+    chatProvider?.postNotice('info', 'no pending permission requests for this session');
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    permissions.map((permission) => ({
+      label: `#${permission.id} ${permission.capability}`,
+      description: `session ${permission.sessionId}`,
+      detail: permission.detail.length > 200 ? `${permission.detail.slice(0, 200)}…` : permission.detail,
+      permission,
+    })),
+    {
+      title: 'Faktor: reply to a pending permission',
+      placeHolder: 'Select the request to resolve',
+      ignoreFocusOut: true,
+    },
+  );
+  if (picked === undefined) {
+    return;
+  }
+  const decision = await vscode.window.showQuickPick(
+    [
+      { label: 'Allow', value: 'allow' as const },
+      { label: 'Deny', value: 'deny' as const },
+    ],
+    {
+      title: `Faktor: permission #${picked.permission.id} (${picked.permission.capability})`,
+      placeHolder: 'Decision sent to the owning session',
+      ignoreFocusOut: true,
+    },
+  );
+  if (decision === undefined) {
+    return;
+  }
+  try {
+    await client.replyPermission(picked.permission.sessionId, picked.permission.id, decision.value);
+    chatProvider?.postNotice('info', `permission #${picked.permission.id}: ${decision.value}`);
+    scheduleRefresh(0);
+  } catch (error) {
+    const failure = classifyPermissionReplyFailure(error);
+    if (failure === null) {
+      reportError(error);
+      return;
+    }
+    const text = permissionReplyFailureMessage(failure, picked.permission.id);
+    chatProvider?.postNotice('error', text);
+    void vscode.window.showErrorMessage(`Faktor: ${text}`);
+    scheduleRefresh(0);
+  }
+}
+
+/**
  * Decide/abort of the tracked durable tournament, state-gated by the SAME
  * cockpit rule the UI renders (`canDecide` / `open`). The server remains the
  * authority: a non-open tournament or no eligible winner surfaces as a typed
@@ -2041,6 +2119,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await newTaskFromCommand(context);
     }),
     vscode.commands.registerCommand('faktor.cancelTask', () => cancelActiveRun()),
+    vscode.commands.registerCommand('faktor.replyPermission', () => replyPermissionFromCommand()),
     vscode.commands.registerCommand('faktor.refresh', () => refresh()),
     vscode.commands.registerCommand('faktor.controlPlaneSignIn', async () => {
       await controlPlaneSignIn(context);

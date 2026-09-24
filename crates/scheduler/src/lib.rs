@@ -8,6 +8,17 @@
 //! permit (permit-before-spawn). Completion of any task immediately frees its
 //! permit and decrements its dependents, so a long task never gates short
 //! tasks that became ready after it.
+//!
+//! Resource-class permits are owned by RAII leases: a [`GaugeLease`] for a
+//! standalone [`Scheduler::execute`], a [`RunningLease`] for a DAG task.
+//! Dropping or aborting the future that owns the lease always releases the
+//! permit; a [`RunningLease`] additionally removes the `running` ownership
+//! entry and terminalizes its task exactly once under one lock, so an
+//! aborted `run_to_completion` cannot leak a permit, strand the ownership
+//! map, or leave a task `Running`. Retry backoff RELEASES the permit for
+//! the sleep (a retrying task never monopolizes its class) and reacquires
+//! through a Notify-based admission wait that observes cancellation and the
+//! operation deadline instead of sleeping blind.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -227,6 +238,15 @@ impl From<Error> for ExecuteError {
     }
 }
 
+/// Outcome of a retry wait (`wait_for_backoff` / `wait_for_permit`): the
+/// wait elapsed / a permit was acquired, or the op's cancellation token /
+/// deadline ended it early.
+enum WaitOutcome {
+    Ready,
+    Cancelled,
+    DeadlineExceeded,
+}
+
 impl std::fmt::Display for ExecuteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -306,6 +326,16 @@ fn status_is_terminal(status: TaskStatus) -> bool {
 /// never produces a terminal event of its own, so this rebuild is the only
 /// release path for it).
 fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) {
+    // Terminal exactly-once: dependent notification and the ownership
+    // release that accompanies it happen once per op. A second terminal
+    // event is refused loudly — never a silent re-notification of
+    // already-released dependents (audit 79-80).
+    if let Some(attempts) = guard.terminalized.get_mut(&upstream_id) {
+        *attempts = attempts.saturating_add(1);
+        tracing::warn!(op = %upstream_id, "refusing duplicate terminalization");
+        return;
+    }
+    guard.terminalized.insert(upstream_id, 1);
     // Ownership is released the moment the op reaches any terminal outcome.
     guard.running.remove(&upstream_id);
     let upstream = guard.tasks[&upstream_id].status;
@@ -707,6 +737,136 @@ struct Inner {
     /// a ready op whose writes overlap a running op's reads/writes is
     /// deferred until that op completes (audit round 5).
     running: HashMap<OpId, (OwnershipSet, OwnershipSet)>,
+    /// Terminalization ledger (terminal exactly-once): an op enters on its
+    /// FIRST terminal event. The value counts attempted terminalizations —
+    /// always 1 for a healthy op; a larger value means a second terminal
+    /// event was refused loudly instead of re-notifying released dependents.
+    terminalized: HashMap<OpId, u32>,
+}
+
+/// RAII ownership of one resource-class permit. The gauge is decremented
+/// exactly when the lease is dropped (while armed) or explicitly finished;
+/// an aborted `execute`/spawned future therefore can never leak a class
+/// slot. A retry backoff calls [`GaugeLease::release`] to give the slot back
+/// while it sleeps and [`GaugeLease::rearm`]s after the Notify-based
+/// admission wait re-acquired it.
+struct GaugeLease {
+    scheduler: Scheduler,
+    class: ResourceClass,
+    armed: bool,
+}
+
+impl GaugeLease {
+    /// Take a permit for `class`, or `None` when the class budget is full.
+    fn acquire(scheduler: &Scheduler, class: ResourceClass) -> Option<Self> {
+        let mut guard = scheduler.inner.lock().unwrap();
+        if guard.gauge.try_acquire(class, &scheduler.limits).is_err() {
+            return None;
+        }
+        Some(Self {
+            scheduler: scheduler.clone(),
+            class,
+            armed: true,
+        })
+    }
+
+    /// Give the permit back now (idempotent); `Drop` becomes a no-op.
+    fn release(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.scheduler.release(self.class);
+        }
+    }
+
+    /// Disarm WITHOUT releasing: the permit was already returned by the
+    /// owner (a `RunningLease` releases it under the scheduler lock).
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Re-arm after the admission wait acquired a fresh permit.
+    fn rearm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Normal completion: return the permit now and disarm.
+    fn finish(mut self) {
+        self.release();
+    }
+}
+
+impl Drop for GaugeLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// RAII ownership of one RUNNING DAG task: the class permit, the `running`
+/// ownership-map entry, and exactly-once terminalization of the task.
+///
+/// Drop runs the whole completion transition under ONE scheduler lock —
+/// release the permit (if still held), remove `running[id]`, mark a
+/// still-`Running` task `Cancelled` with its end time, and terminalize its
+/// dependents exactly once. Dropping/aborting the future that owns the run
+/// (a dropped `run_to_completion`, an aborted `JoinSet`) therefore cannot
+/// leak a permit, strand the ownership map, or leave a task `Running`.
+/// Normal completion calls [`RunningLease::finish`]: the same transition,
+/// then disarmed.
+struct RunningLease {
+    scheduler: Scheduler,
+    id: OpId,
+    class: ResourceClass,
+    permit: GaugeLease,
+    armed: bool,
+}
+
+impl RunningLease {
+    fn new(scheduler: &Scheduler, id: OpId, class: ResourceClass, permit: GaugeLease) -> Self {
+        Self {
+            scheduler: scheduler.clone(),
+            id,
+            class,
+            permit,
+            armed: true,
+        }
+    }
+
+    /// The completion transition. Idempotent: only the first call does work.
+    fn settle(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let mut guard = self.scheduler.inner.lock().unwrap();
+        let released = self.permit.armed;
+        if released {
+            self.permit.disarm();
+            guard.gauge.release(self.class);
+        }
+        if let Some(t) = guard.tasks.get_mut(&self.id) {
+            if t.status == TaskStatus::Running {
+                t.status = TaskStatus::Cancelled;
+                t.end_ms = Some(self.scheduler.clock.now_ms());
+            }
+        }
+        terminalize(&mut guard, self.id);
+        drop(guard);
+        if released {
+            self.scheduler.permit_notify.notify_waiters();
+        }
+    }
+
+    /// Normal completion: run the completion transition (the executor has
+    /// already recorded the outcome) and disarm.
+    fn finish(mut self) {
+        self.settle();
+    }
+}
+
+impl Drop for RunningLease {
+    fn drop(&mut self) {
+        self.settle();
+    }
 }
 
 /// A scheduler for one session. Clonable handle; all execution goes through
@@ -727,6 +887,11 @@ pub struct Scheduler {
     /// `ResourceLimits`/`ResourceGauge` machinery, untouched by breakers.
     circuits: CircuitBoard,
     clock: Arc<dyn faktor_core::time::Clock>,
+    /// Wakes retry admission waiters whenever a class permit is released
+    /// (completion, abort, or backoff). Waiters register with
+    /// `Notified::enable` BEFORE checking the gauge, so no release can be
+    /// missed and admission never polls.
+    permit_notify: Arc<tokio::sync::Notify>,
     /// Bounded record of registrations rejected through the legacy
     /// [`Scheduler::submit`] compat entry point, so a rejection is
     /// observable even by callers that cannot propagate the error.
@@ -745,6 +910,7 @@ impl Scheduler {
             inner: Arc::new(Mutex::new(Inner::default())),
             circuits: CircuitBoard::new(),
             clock,
+            permit_notify: Arc::new(tokio::sync::Notify::new()),
             rejections: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -939,12 +1105,23 @@ impl Scheduler {
     /// ready queue is drained as permits free, and dependents are scheduled
     /// the instant their last dependency completes. Returns the ids that
     /// finished Done.
+    ///
+    /// Ownership: each spawned task owns a [`RunningLease`], so this future
+    /// holds no cleanup obligation — dropping/aborting it aborts the
+    /// `JoinSet` and every child's `Drop` reclaims its permit, ownership
+    /// entry, and terminal state. `join_next` is observation only.
     pub async fn run_to_completion(&self) -> Result<Vec<OpId>, Error> {
         self.validate()?;
         self.rebuild_graph();
         let mut set: tokio::task::JoinSet<OpId> = tokio::task::JoinSet::new();
         let mut rebuilt_once = false;
         loop {
+            // Register for permit releases BEFORE draining the ready queue:
+            // a retry backoff that gives its permit back while we scan can
+            // then never be missed (enable-before-check; no polling).
+            let permit_released = self.permit_notify.notified();
+            tokio::pin!(permit_released);
+            permit_released.as_mut().enable();
             self.schedule_ready(&mut set);
             if set.is_empty() {
                 let any_pending = self
@@ -982,19 +1159,25 @@ impl Scheduler {
                     "no ready tasks and work remains; cycle or unscheduled dependency",
                 ));
             }
-            // Wait for ANY task to finish, then re-drain the ready queue:
-            // short tasks that became ready meanwhile start before long ones
-            // that are still running.
-            let joined = set.join_next().await;
-            match joined {
-                Some(Ok(id)) => self.on_complete(id),
-                Some(Err(_)) => {
-                    return Err(Error::new(
-                        ErrorKind::Internal,
-                        "scheduler task failed unexpectedly",
-                    ))
-                }
-                None => unreachable!("JoinSet was non-empty"),
+            // Wait for ANY task to finish OR a class permit to free (a
+            // retry in backoff gives its slot back for the sleep), then
+            // re-drain the ready queue: short tasks that became ready
+            // meanwhile start before long ones that are still running.
+            // `join_next` is observation only — the winning task's lease
+            // already released the permit and terminalized it before the
+            // task resolved.
+            tokio::select! {
+                joined = set.join_next() => match joined {
+                    Some(Ok(_id)) => {}
+                    Some(Err(_)) => {
+                        return Err(Error::new(
+                            ErrorKind::Internal,
+                            "scheduler task failed unexpectedly",
+                        ))
+                    }
+                    None => unreachable!("JoinSet was non-empty"),
+                },
+                _ = &mut permit_released => {}
             }
         }
         let mut done: Vec<OpId> = {
@@ -1011,11 +1194,13 @@ impl Scheduler {
     }
 
     /// Drain the ready queue: tasks whose dependencies are satisfied and
-    /// that can acquire a resource permit are spawned into `set`; the permit
-    /// is held BEFORE spawn and released only after the task completes.
+    /// that can acquire a resource permit are spawned into `set` as a
+    /// [`RunningLease`] owner. The permit, the Running mark, and the
+    /// `running` ownership entry are established under ONE lock BEFORE the
+    /// spawn, so the spawned future's `Drop` alone can reclaim them.
     fn schedule_ready(&self, set: &mut tokio::task::JoinSet<OpId>) {
         loop {
-            let mut to_spawn: Vec<(OpId, ScheduledOp)> = Vec::new();
+            let mut to_spawn: Vec<(OpId, ScheduledOp, RunningLease)> = Vec::new();
             {
                 let mut guard = self.inner.lock().unwrap();
                 let n = guard.ready.len();
@@ -1064,41 +1249,44 @@ impl Scheduler {
                         writes = t.op.writes.clone();
                     }
                     guard.running.insert(id, (reads, writes));
-                    to_spawn.push((id, guard.tasks[&id].op.clone()));
+                    let permit = GaugeLease {
+                        scheduler: self.clone(),
+                        class,
+                        armed: true,
+                    };
+                    let lease = RunningLease::new(self, id, class, permit);
+                    to_spawn.push((id, guard.tasks[&id].op.clone(), lease));
                 }
             }
             if to_spawn.is_empty() {
                 return;
             }
-            for (id, op) in to_spawn {
+            for (id, op, lease) in to_spawn {
                 let sched = self.clone();
+                // The lease is built OUTSIDE the spawned future and moved
+                // in, so even a future dropped before its first poll drops
+                // the lease (and its permit) with it.
+                let mut lease = lease;
                 set.spawn(async move {
                     // A panicking runnable must not wedge the budget: catch
                     // it here, mark the task failed, and still release.
                     // DAG tasks carry no ResourceKey, so they run without a
                     // circuit breaker (see `execute_inner`).
-                    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                        sched.execute_inner(id, op, None),
-                    ))
-                    .await;
+                    let result = {
+                        let permit = &mut lease.permit;
+                        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                            sched.execute_inner(id, op, None, permit),
+                        ))
+                        .await
+                    };
                     if result.is_err() {
                         sched.mark(id, TaskStatus::Failed, Some("runnable panicked".into()));
                     }
+                    lease.finish();
                     id
                 });
             }
         }
-    }
-
-    /// A task completed (any outcome): free its permit and notify every
-    /// dependent — satisfied edges decrement the pending-count (dependents
-    /// that reach zero join the ready queue immediately), dead `Success`
-    /// edges block the dependent transitively.
-    fn on_complete(&self, id: OpId) {
-        let mut guard = self.inner.lock().unwrap();
-        let class = guard.tasks[&id].op.resources.class;
-        guard.gauge.release(class);
-        terminalize(&mut guard, id);
     }
 
     /// Recompute the dependency graph from live state (dependents, unmet
@@ -1196,31 +1384,36 @@ impl Scheduler {
             return Err(ExecuteError::Err(Error::conflict(msg)));
         }
         let class = op.resources.class;
-        let acquired = {
-            let mut guard = self.inner.lock().unwrap();
-            guard.gauge.try_acquire(class, &self.limits).is_ok()
-        };
-        if !acquired {
+        // The lease owns the permit for the whole logical operation: aborting
+        // this future drops it and returns the slot (defect: a bare
+        // acquire/`release` pair leaked the permit on drop mid-await), and
+        // `execute_inner` releases it explicitly across retry backoff.
+        let Some(mut permit) = GaugeLease::acquire(self, class) else {
             return Err(ExecuteError::Busy(BudgetBusy(class)));
-        }
+        };
         let breaker = self.circuits.breaker(resource);
-        let result = self.execute_inner(id, op, Some(breaker.as_ref())).await;
-        self.release(class);
+        let result = self
+            .execute_inner(id, op, Some(breaker.as_ref()), &mut permit)
+            .await;
+        permit.finish();
         result
     }
 
-    /// The actual execution loop. Assumes the budget slot is already held.
-    /// Circuit breaking (when `breaker` is supplied) is scoped to the
-    /// caller-declared [`ResourceKey`] of the failing resource — the SAME
-    /// breaker every session with the shared daemon board consults. DAG
-    /// executions pass `None`: a DAG task carries no resource identity, so
-    /// it can neither claim a key nor poison one (the runtime gates DAG
-    /// tool calls through the board directly, before submitting them).
+    /// The actual execution loop. Assumes the permit is held via `permit`;
+    /// the slot is RELEASED for the duration of every retry backoff and
+    /// reacquired through a Notify-based admission wait. Circuit breaking
+    /// (when `breaker` is supplied) is scoped to the caller-declared
+    /// [`ResourceKey`] of the failing resource — the SAME breaker every
+    /// session with the shared daemon board consults. DAG executions pass
+    /// `None`: a DAG task carries no resource identity, so it can neither
+    /// claim a key nor poison one (the runtime gates DAG tool calls through
+    /// the board directly, before submitting them).
     async fn execute_inner(
         &self,
         id: OpId,
         op: ScheduledOp,
         breaker: Option<&CircuitBreaker>,
+        permit: &mut GaugeLease,
     ) -> Result<(), ExecuteError> {
         let mut attempt = 0u32;
         loop {
@@ -1276,7 +1469,37 @@ impl Scheduler {
                         return Err(ExecuteError::Err(e));
                     }
                     let delay = op.meta.retry_policy.next_delay(attempt - 1);
-                    tokio::time::sleep(delay).await;
+                    // Backoff must NOT hold the resource-class slot: with a
+                    // limit of 1 a sleeping retry would monopolize the class.
+                    // The permit is returned for the sleep and reacquired
+                    // through a Notify-based admission wait afterwards. Both
+                    // waits observe the cancellation token and the operation
+                    // deadline instead of sleeping blind.
+                    permit.release();
+                    match self.wait_for_backoff(&op, delay).await {
+                        WaitOutcome::Ready => {}
+                        WaitOutcome::Cancelled => {
+                            self.mark(id, TaskStatus::Cancelled, None);
+                            return Ok(());
+                        }
+                        WaitOutcome::DeadlineExceeded => {
+                            let msg = format!("op {id} deadline exceeded");
+                            self.mark(id, TaskStatus::Failed, Some(msg.clone()));
+                            return Err(ExecuteError::Err(Error::timeout(msg)));
+                        }
+                    }
+                    match self.wait_for_permit(&op, permit).await {
+                        WaitOutcome::Ready => {}
+                        WaitOutcome::Cancelled => {
+                            self.mark(id, TaskStatus::Cancelled, None);
+                            return Ok(());
+                        }
+                        WaitOutcome::DeadlineExceeded => {
+                            let msg = format!("op {id} deadline exceeded");
+                            self.mark(id, TaskStatus::Failed, Some(msg.clone()));
+                            return Err(ExecuteError::Err(Error::timeout(msg)));
+                        }
+                    }
                 }
                 Err(_elapsed) => {
                     if let Some(breaker) = breaker {
@@ -1285,6 +1508,55 @@ impl Scheduler {
                     let msg = format!("op {id} deadline exceeded");
                     self.mark(id, TaskStatus::Failed, Some(msg.clone()));
                     return Err(ExecuteError::Err(Error::timeout(msg)));
+                }
+            }
+        }
+    }
+
+    /// Sleep `delay`, waking early on cancellation or the op deadline.
+    async fn wait_for_backoff(&self, op: &ScheduledOp, delay: Duration) -> WaitOutcome {
+        let now = self.clock.now_ms();
+        let remaining_ms = (op.meta.deadline.at_ms() - now).max(0) as u64;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => WaitOutcome::Ready,
+            _ = op.meta.cancellation.cancelled() => WaitOutcome::Cancelled,
+            _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => {
+                WaitOutcome::DeadlineExceeded
+            }
+        }
+    }
+
+    /// Wait until the class budget admits a permit, without polling: every
+    /// release wakes the waiters. Registration (`Notified::enable`) happens
+    /// BEFORE the gauge check, so a permit freed between the check and the
+    /// wait can never be missed. The wait also observes cancellation and
+    /// the op deadline; on success the lease is re-armed.
+    async fn wait_for_permit(&self, op: &ScheduledOp, permit: &mut GaugeLease) -> WaitOutcome {
+        loop {
+            if op.meta.cancellation.is_cancelled() {
+                return WaitOutcome::Cancelled;
+            }
+            let now = self.clock.now_ms();
+            if op.meta.deadline.is_expired(now) {
+                return WaitOutcome::DeadlineExceeded;
+            }
+            let notified = self.permit_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let acquired = {
+                let mut guard = self.inner.lock().unwrap();
+                guard.gauge.try_acquire(permit.class, &self.limits).is_ok()
+            };
+            if acquired {
+                permit.rearm();
+                return WaitOutcome::Ready;
+            }
+            let remaining_ms = (op.meta.deadline.at_ms() - now).max(0) as u64;
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = op.meta.cancellation.cancelled() => return WaitOutcome::Cancelled,
+                _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => {
+                    return WaitOutcome::DeadlineExceeded
                 }
             }
         }
@@ -1380,6 +1652,21 @@ impl Scheduler {
     fn release(&self, class: ResourceClass) {
         let mut guard = self.inner.lock().unwrap();
         guard.gauge.release(class);
+        drop(guard);
+        self.permit_notify.notify_waiters();
+    }
+
+    /// Test evidence for the terminal exactly-once invariant: how many
+    /// terminalization attempts `id` has received (1 = healthy).
+    #[cfg(test)]
+    fn terminalize_count(&self, id: OpId) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .terminalized
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -3507,6 +3794,377 @@ mod tests {
         s2.try_submit(task(2, vec![1], ResourceClass::Cpu, 0, counter.clone()))
             .unwrap();
         assert_eq!(s2.validate().unwrap_err().kind, ErrorKind::Deadlock);
+    }
+
+    // ---- RAII leases: abort-safe permits, cancellation-aware backoff ----
+
+    /// Permit usage for one class (test evidence for lease release).
+    fn gauge_used(s: &Scheduler, class: ResourceClass) -> usize {
+        s.inner.lock().unwrap().gauge.usage(class)
+    }
+
+    /// Number of live `running` ownership entries.
+    fn running_count(s: &Scheduler) -> usize {
+        s.inner.lock().unwrap().running.len()
+    }
+
+    fn all_terminal(s: &Scheduler) -> bool {
+        s.statuses().iter().all(|(_, st)| {
+            matches!(
+                st,
+                TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+            )
+        })
+    }
+
+    /// Yield to the runtime until `cond` holds, with a hard bound.
+    async fn wait_until<F: Fn() -> bool>(what: &str, cond: F) {
+        for _ in 0..2000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("condition never held: {what}");
+    }
+
+    /// A Network-class op that fails retryably on every attempt with a LONG
+    /// base delay, for backoff/cancellation/deadline tests.
+    fn long_backoff_op(id: u64, deadline: Deadline, base_delay_ms: u64) -> ScheduledOp {
+        ScheduledOp {
+            meta: OpMeta::new(
+                OpId::new(id),
+                SessionId::new(1),
+                deadline,
+                RetryPolicy {
+                    max_attempts: 100,
+                    base_delay_ms,
+                    max_delay_ms: base_delay_ms,
+                    jitter: 0.0,
+                    class: RetryClass::Always,
+                },
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                0,
+            ),
+            resources: ResourceRequest {
+                class: ResourceClass::Network,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![],
+            run: Arc::new(move || {
+                Box::pin(async move { Err(Error::new(ErrorKind::Network, "flaky")) })
+            }),
+        }
+    }
+
+    /// DEFECT (1): aborting a standalone `execute` at its await used to skip
+    /// `release`, leaking the class permit forever. The lease's Drop returns
+    /// the slot, so the SAME class is immediately acquirable again.
+    #[tokio::test]
+    async fn aborted_execute_releases_the_class_immediately() {
+        let mut limits = ResourceLimits::default();
+        limits.limits.insert(ResourceClass::Indexing, 1);
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_limits(limits);
+        let slow = task(
+            1,
+            vec![],
+            ResourceClass::Indexing,
+            30_000,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        submit(&s, slow.clone());
+        // Abort the execute future mid-await (the timeout drops it).
+        let aborted = tokio::time::timeout(
+            Duration::from_millis(50),
+            s.execute(OpId::new(1), slow, &test_key()),
+        )
+        .await;
+        assert!(
+            aborted.is_err(),
+            "the 30s op must still be in flight when the future is dropped"
+        );
+        assert_eq!(
+            gauge_used(&s, ResourceClass::Indexing),
+            0,
+            "an aborted execute must not leak its class permit"
+        );
+        let fast = task(
+            2,
+            vec![],
+            ResourceClass::Indexing,
+            1,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        submit(&s, fast.clone());
+        s.execute(OpId::new(2), fast, &test_key())
+            .await
+            .expect("the same class must be immediately acquirable after the abort");
+        assert_eq!(gauge_used(&s, ResourceClass::Indexing), 0);
+    }
+
+    /// DEFECT (2): aborting `run_to_completion` with active children used to
+    /// leave the gauge occupied, `running` entries stranded, and tasks stuck
+    /// `Running` (the parent's `on_complete` never ran). The children's
+    /// `RunningLease` Drop now performs the whole completion transition under
+    /// one lock — including a child whose permit was RELEASED for a backoff —
+    /// and terminalization fires exactly once per op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborted_run_to_completion_reclaims_children_and_their_permits() {
+        let mut limits = ResourceLimits::default();
+        limits.limits.insert(ResourceClass::DiskWrite, 2);
+        limits.limits.insert(ResourceClass::Network, 1);
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_limits(limits);
+        // Two long writers hold DiskWrite permits.
+        submit(
+            &s,
+            task(
+                1,
+                vec![],
+                ResourceClass::DiskWrite,
+                30_000,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
+        submit(
+            &s,
+            task(
+                2,
+                vec![],
+                ResourceClass::DiskWrite,
+                30_000,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
+        // A retryer has failed once and is in a 30s backoff with its Network
+        // permit RELEASED (permit.armed == false in its lease).
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut retryer = long_backoff_op(3, Deadline::at(FAR), 30_000);
+        let a = attempts.clone();
+        retryer.run = Arc::new(move || {
+            let a = a.clone();
+            Box::pin(async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err(Error::new(ErrorKind::Network, "flaky"))
+            })
+        });
+        submit(&s, retryer);
+        let s_run = s.clone();
+        let handle = tokio::spawn(async move { s_run.run_to_completion().await });
+        wait_until("all three children admitted, retryer backing off", || {
+            running_count(&s) == 3
+                && gauge_used(&s, ResourceClass::DiskWrite) == 2
+                && gauge_used(&s, ResourceClass::Network) == 0
+        })
+        .await;
+        assert!(attempts.load(Ordering::SeqCst) >= 1);
+        handle.abort();
+        let _ = handle.await;
+        wait_until("aborted children reclaimed", || {
+            running_count(&s) == 0
+                && gauge_used(&s, ResourceClass::DiskWrite) == 0
+                && gauge_used(&s, ResourceClass::Network) == 0
+                && all_terminal(&s)
+        })
+        .await;
+        for i in 1..=3u64 {
+            assert_eq!(
+                s.status(OpId::new(i)),
+                Some(TaskStatus::Cancelled),
+                "aborted running child {i} must be terminal"
+            );
+            assert_eq!(
+                s.terminalize_count(OpId::new(i)),
+                1,
+                "op {i} must be terminalized exactly once"
+            );
+        }
+    }
+
+    /// DEFECT (3a): cancelling during a 30s retry backoff must return
+    /// promptly — the backoff observes the cancellation token instead of
+    /// sleeping blind while holding the class.
+    #[tokio::test]
+    async fn cancel_during_long_backoff_returns_promptly() {
+        let mut limits = ResourceLimits::default();
+        limits.limits.insert(ResourceClass::Network, 1);
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_limits(limits);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut spec = long_backoff_op(1, Deadline::at(FAR), 30_000);
+        let a = attempts.clone();
+        spec.run = Arc::new(move || {
+            let a = a.clone();
+            Box::pin(async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err(Error::new(ErrorKind::Network, "flaky"))
+            })
+        });
+        submit(&s, spec.clone());
+        let s_run = s.clone();
+        let handle =
+            tokio::spawn(async move { s_run.execute(OpId::new(1), spec, &test_key()).await });
+        wait_until("first attempt failed and backoff started", || {
+            attempts.load(Ordering::SeqCst) >= 1 && gauge_used(&s, ResourceClass::Network) == 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t0 = std::time::Instant::now();
+        s.cancel(OpId::new(1));
+        let joined = tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("cancel must end the 30s backoff promptly, not after the sleep");
+        assert!(joined.unwrap().is_ok());
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "cancel took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Cancelled));
+        assert_eq!(gauge_used(&s, ResourceClass::Network), 0);
+    }
+
+    /// DEFECT (3b): the backoff observes the operation deadline. A 30s
+    /// backoff under a ~150ms deadline must fail as a Timeout promptly,
+    /// never overshoot to the end of the sleep.
+    #[tokio::test]
+    async fn deadline_during_long_backoff_does_not_overshoot() {
+        let mut limits = ResourceLimits::default();
+        limits.limits.insert(ResourceClass::Network, 1);
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_limits(limits);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut spec = long_backoff_op(1, Deadline::at(SystemClock.now_ms() + 150), 30_000);
+        let a = attempts.clone();
+        spec.run = Arc::new(move || {
+            let a = a.clone();
+            Box::pin(async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err(Error::new(ErrorKind::Network, "flaky"))
+            })
+        });
+        submit(&s, spec.clone());
+        let t0 = std::time::Instant::now();
+        let err = s
+            .execute(OpId::new(1), spec, &test_key())
+            .await
+            .expect_err("deadline must fail the op");
+        let elapsed = t0.elapsed();
+        assert!(matches!(err, ExecuteError::Err(e) if e.kind == ErrorKind::Timeout));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "no overshoot past the deadline: took {elapsed:?}"
+        );
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no attempt may start after the deadline"
+        );
+        assert_eq!(gauge_used(&s, ResourceClass::Network), 0);
+    }
+
+    /// DEFECT (3c): with a class limit of 1, a task A backing off has given
+    /// its permit back, so an unrelated ready task B runs BETWEEN A's
+    /// attempts (the old code let A monopolize the class through its sleep).
+    ///
+    /// B waits on a fast gate task G of another class, so B can only become
+    /// ready after A already holds the only permit — B's first admission
+    /// therefore requires A's backoff release, making the ordering
+    /// independent of the ready-queue rebuild order.
+    #[tokio::test]
+    async fn backoff_frees_the_only_permit_for_other_work() {
+        let mut limits = ResourceLimits::default();
+        limits.limits.insert(ResourceClass::Network, 1);
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock)).with_limits(limits);
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut a = long_backoff_op(1, Deadline::at(FAR), 300);
+        a.meta.retry_policy.max_attempts = 2;
+        let al = log.clone();
+        a.run = Arc::new(move || {
+            let log = al.clone();
+            let attempts = attempts.clone();
+            Box::pin(async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                log.lock().unwrap().push(format!("A{n}"));
+                Err(Error::new(ErrorKind::Network, "flaky"))
+            })
+        });
+        // Gate task G: a fast Cpu task B depends on (Success edge).
+        submit(
+            &s,
+            task(
+                3,
+                vec![],
+                ResourceClass::Cpu,
+                1,
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        );
+        let bl = log.clone();
+        let b = ScheduledOp {
+            meta: OpMeta::new(
+                OpId::new(2),
+                SessionId::new(1),
+                Deadline::at(FAR),
+                RetryPolicy::default(),
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                0,
+            ),
+            resources: ResourceRequest {
+                class: ResourceClass::Network,
+            },
+            reads: OwnershipSet::new([]),
+            writes: OwnershipSet::new([]),
+            dependencies: vec![(OpId::new(3), DependencyPolicy::Success)],
+            run: Arc::new(move || {
+                let log = bl.clone();
+                Box::pin(async move {
+                    log.lock().unwrap().push("B".into());
+                    Ok(())
+                })
+            }),
+        };
+        submit(&s, a);
+        submit(&s, b);
+        let done = s.run_to_completion().await.unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["A1".to_string(), "B".to_string(), "A2".to_string()],
+            "B must run while A is backing off (permit released)"
+        );
+        assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
+        assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Done));
+        assert!(done.contains(&OpId::new(2)));
+        assert_eq!(gauge_used(&s, ResourceClass::Network), 0);
+    }
+
+    /// Terminalization is exactly-once: a normal completion, a re-run over an
+    /// already-terminal graph, and a rejected cancel all leave the ledger at
+    /// exactly one terminal event per op.
+    #[tokio::test]
+    async fn terminalize_runs_exactly_once_per_op() {
+        let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
+        let counter = Arc::new(AtomicUsize::new(0));
+        submit(&s, task(1, vec![], ResourceClass::Cpu, 1, counter.clone()));
+        submit(&s, task(2, vec![1], ResourceClass::Cpu, 1, counter.clone()));
+        s.run_to_completion().await.unwrap();
+        s.run_to_completion()
+            .await
+            .expect("a re-run over a terminal graph is a no-op");
+        assert_eq!(s.terminalize_count(OpId::new(1)), 1);
+        assert_eq!(s.terminalize_count(OpId::new(2)), 1);
+        assert_eq!(
+            s.try_cancel(OpId::new(1)).unwrap_err().kind,
+            ErrorKind::Conflict
+        );
+        assert_eq!(
+            s.terminalize_count(OpId::new(1)),
+            1,
+            "a rejected cancel must add no terminal event"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 }
 
