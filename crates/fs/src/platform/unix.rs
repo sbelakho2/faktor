@@ -17,6 +17,14 @@
 //!   with `O_NOFOLLOW`: a plain entry is descended (intermediates with
 //!   `O_DIRECTORY`, the final component with the caller's `final_flags`);
 //!   a symlink entry yields `ELOOP`, never a kernel follow.
+//! * A READ final open (`OpenKind::Read`) additionally carries `O_NONBLOCK`,
+//!   so a FIFO swapped in between classification and open cannot block the
+//!   walk. The opened fd is then `fstat(2)`ed — the object actually opened,
+//!   never a pathname: a regular file or directory has `O_NONBLOCK` cleared
+//!   again (callers observe exactly the historical blocking fd); a
+//!   FIFO/socket/device is a typed refusal and is never read. Directory
+//!   walks are unaffected: `O_DIRECTORY` already refuses a FIFO with
+//!   `ENOTDIR` and keeps their flags unchanged.
 //! * On `ELOOP` the component is followed MANUALLY and with bounds: the link
 //!   target is read with `readlinkat`, then the walk is rebased onto the
 //!   target. Absolute targets must stay under `root` (component-wise prefix
@@ -114,6 +122,12 @@ pub(crate) fn open_no_follow_walk(
         match openat_comp(&dir, &comp, flags) {
             Ok(fd) => {
                 if last {
+                    // A READ open ran with O_NONBLOCK (see `finalize_read_open`):
+                    // classify the fd that was really opened before handing it
+                    // to the caller.
+                    if flags & libc::O_NONBLOCK != 0 {
+                        finalize_read_open(&fd, rel)?;
+                    }
                     return Ok(fd);
                 }
                 pos.push(comp);
@@ -289,6 +303,60 @@ fn open_root(root: &Path) -> Result<OwnedFd, Error> {
     // and is not owned by any other object, so `OwnedFd` takes sole
     // ownership of a live descriptor and closes it exactly once.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Validate a READ fd opened with `O_NONBLOCK` and restore blocking
+/// semantics for ordinary entries: `fstat(2)` the OPENED descriptor (never a
+/// pathname, so the classification is about the object the caller really
+/// got) and clear `O_NONBLOCK` for a regular file or directory. A
+/// FIFO/socket/device entry is a typed refusal — the anchored walk never
+/// reads a special file, and the `O_NONBLOCK` open guarantees this decision
+/// is reached without blocking even when the entry was swapped in after the
+/// caller's classification.
+pub(crate) fn finalize_read_open(fd: &OwnedFd, rel: &Path) -> Result<(), Error> {
+    // SAFETY: `fd` is a live descriptor owned by the caller and `st` is a
+    // valid output buffer; fstat takes no ownership and only writes `st`.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat writes only into the live `st` buffer and its return
+    // value is checked immediately.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(Error::internal(format!(
+            "{rel:?}: cannot classify the opened read fd: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG | libc::S_IFDIR => clear_nonblock(fd, rel),
+        _ => Err(Error::permission(format!(
+            "{rel:?}: refusing to read a special file (FIFO/socket/device) opened through the anchored walk"
+        ))),
+    }
+}
+
+/// Clear `O_NONBLOCK` on a live fd so read callers see ordinary blocking
+/// descriptor semantics again. The flag lives in the file status word and is
+/// updated with `F_SETFL`.
+fn clear_nonblock(fd: &OwnedFd, rel: &Path) -> Result<(), Error> {
+    // SAFETY: `fd` is a live descriptor; F_GETFL reads its status flags.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(Error::internal(format!(
+            "{rel:?}: F_GETFL failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        return Ok(());
+    }
+    // SAFETY: `fd` is live; F_SETFL only updates the status flags and its
+    // return value is checked.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(Error::internal(format!(
+            "{rel:?}: cannot clear O_NONBLOCK: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn openat_comp(dir: &OwnedFd, name: &OsStr, flags: i32) -> Result<OwnedFd, io::Error> {

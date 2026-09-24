@@ -41,13 +41,14 @@
 //! runtime awaits the ladder off the turn thread — this module owns no
 //! private child lifecycle and no polling sleep.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use faktor_fs::rooted::RootedEntryKind;
-use faktor_fs::RootedDir;
+use faktor_fs::{ContentDigest, RootedDir};
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 use crate::generation::GenerationFile;
@@ -74,6 +75,11 @@ const COLD_COMMAND_TIMEOUT: Duration = Duration::from_millis(900);
 const COLD_MAX_TRACKED_PATHS: usize = 20_000;
 /// Tracked-file list cap (bytes).
 const COLD_MAX_TRACKED_BYTES: u64 = 512 * 1024;
+/// Generation-directory entries enumerated per call. Two generations are the
+/// steady state (wave-11 keeps two); the cap bounds a hostile directory, and
+/// an overflowing listing is NEVER trusted as complete (the newest file may
+/// be beyond the truncation).
+const COLD_MAX_GENERATION_ENTRIES: usize = 256;
 /// Concept cap (mirrors every other evidence path's bound).
 const COLD_MAX_CONCEPTS: usize = 16;
 
@@ -490,39 +496,42 @@ impl ColdEvidenceProvider {
         read_head_rooted(rooted, rel, &mut ColdStats::default())
     }
 
-    /// The newest persisted generation whose file is cheap to decode.
+    /// The newest persisted generation whose file is cheap to decode, read
+    /// through ONE no-follow [`RootedDir`] anchored on the generation
+    /// directory: the enumeration and the read share that single handle, so
+    /// a symlink/reparse entry — including one swapped in between the
+    /// enumeration and the read — is refused typed and never followed. The
+    /// stale-but-cheap semantics are unchanged; every refusal (missing or
+    /// symlinked directory, link entry, oversized file) is the documented
+    /// degrade.
     fn load_stale_generation(&self, stats: &mut ColdStats) -> Option<(u64, WorkspaceIndex)> {
         let dir = self.generations_dir.join(self.workspace.raw().to_string());
         stats.dirs_listed += 1;
-        let entries = std::fs::read_dir(&dir).ok()?;
-        let mut newest: Option<(u64, PathBuf)> = None;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let g = name
-                .strip_prefix("gen-")
-                .and_then(|n| n.strip_suffix(".json"))
-                .and_then(|n| n.parse::<u64>().ok());
-            if let Some(g) = g {
-                if newest.as_ref().map(|(ng, _)| g > *ng).unwrap_or(true) {
-                    newest = Some((g, entry.path()));
-                }
+        // ONE anchored authority for the whole call. A missing, symlinked or
+        // otherwise unopenable generation directory refuses typed here.
+        let rooted = RootedDir::open(&dir).ok()?;
+        let listing = rooted
+            .list_entries(Path::new(""), COLD_MAX_GENERATION_ENTRIES)
+            .ok()?;
+        if listing.overflowed {
+            // The listing is truncated: the newest generation may be beyond
+            // the cut, so the truncated set is never trusted as complete.
+            return None;
+        }
+        let mut newest: Option<(u64, OsString)> = None;
+        for entry in listing.entries {
+            if entry.kind != RootedEntryKind::File {
+                continue;
+            }
+            let Some(g) = generation_of_name(&entry.name.to_string_lossy()) else {
+                continue;
+            };
+            if newest.as_ref().map(|(ng, _)| g > *ng).unwrap_or(true) {
+                newest = Some((g, entry.name));
             }
         }
-        let (generation, path) = newest?;
-        let meta = std::fs::metadata(&path).ok()?;
-        if meta.len() > COLD_MAX_GENERATION_LOAD_BYTES {
-            // Too big to be cheap: degrade (documented).
-            return None;
-        }
-        stats.files_read += 1;
-        let bytes = std::fs::read(&path).ok()?;
-        let file = GenerationFile::from_bytes(&bytes).ok()?;
-        if file.workspace != self.workspace.raw() || file.generation != generation {
-            // Hostile/mismatched fixture: never serve someone else's tree.
-            return None;
-        }
-        let index = file.materialize().ok()?;
-        Some((generation, index))
+        let (generation, name) = newest?;
+        read_generation_file(&rooted, &name, generation, self.workspace, stats).ok()
     }
 
     /// Git tracked set + ONE targeted ripgrep for the turn's concepts,
@@ -652,6 +661,66 @@ fn refusal_of(e: &faktor_core::error::Error) -> ColdReadRefusal {
         faktor_core::error::ErrorKind::Oversized => ColdReadRefusal::Oversized,
         _ => ColdReadRefusal::Io,
     }
+}
+
+/// Parse the `gen-<u64>.json` generation-file name.
+fn generation_of_name(name: &str) -> Option<u64> {
+    name.strip_prefix("gen-")
+        .and_then(|n| n.strip_suffix(".json"))
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
+/// Read and validate ONE generation file through the anchored handle:
+/// no-follow classification first ([`RootedDir::entry_meta`] — a
+/// symlink/reparse entry, directory or special file refuses TYPED before any
+/// open, so a hostile link is never followed and its target bytes are never
+/// read), then a bounded [`RootedDir::read`] whose full-file digest and
+/// classified size are the post-open identity net: a swap that changed the
+/// file between the classification and the open reads as a `Slice` digest or
+/// a size mismatch and is refused, never decoded as someone else's file.
+fn read_generation_file(
+    rooted: &RootedDir,
+    name: &OsStr,
+    generation: u64,
+    workspace: WorkspaceId,
+    stats: &mut ColdStats,
+) -> Result<(u64, WorkspaceIndex), ColdReadRefusal> {
+    let rel = Path::new(name);
+    let meta = rooted
+        .entry_meta(rel)
+        .map_err(|e| refusal_of(&e))?
+        .ok_or(ColdReadRefusal::Missing)?;
+    match meta.kind {
+        RootedEntryKind::File => {}
+        RootedEntryKind::Symlink => return Err(ColdReadRefusal::Symlink),
+        RootedEntryKind::Directory | RootedEntryKind::Other => {
+            return Err(ColdReadRefusal::NotRegularFile)
+        }
+    }
+    if meta.size > COLD_MAX_GENERATION_LOAD_BYTES {
+        // Too big to be cheap: degrade (documented), and never read it.
+        return Err(ColdReadRefusal::Oversized);
+    }
+    stats.files_read += 1;
+    let data = rooted
+        .read(rel, COLD_MAX_GENERATION_LOAD_BYTES as usize)
+        .map_err(|e| refusal_of(&e))?;
+    // Post-open identity net: trust only the opened fd's own verified read —
+    // a file that grew past the bound (Slice digest) or changed size after
+    // the classification is refused, never partially decoded.
+    let ContentDigest::Full(_) = data.digest else {
+        return Err(ColdReadRefusal::Oversized);
+    };
+    if data.size as u64 != meta.size {
+        return Err(ColdReadRefusal::Io);
+    }
+    let file = GenerationFile::from_bytes(&data.bytes).map_err(|_| ColdReadRefusal::Io)?;
+    if file.workspace != workspace.raw() || file.generation != generation {
+        // Hostile/mismatched fixture: never serve someone else's tree.
+        return Err(ColdReadRefusal::Io);
+    }
+    let index = file.materialize().map_err(|_| ColdReadRefusal::Io)?;
+    Ok((generation, index))
 }
 
 /// Head read of one file through the anchored root (bounded, text-only),
@@ -1664,5 +1733,176 @@ mod tests {
             );
         }
         assert!(src.contains("entry_meta") && src.contains("open_read"));
+        // The generation read is anchored too (audit residual): the
+        // production region must not read the generations directory by
+        // pathname anywhere — no read_dir, no raw read, no raw metadata.
+        let production = &src[..src.find("mod tests {").expect("test module boundary")];
+        for token in [
+            "std::fs::read_".to_string() + "dir",
+            "std::fs::read(".to_string(),
+            "std::fs::metadata".to_string(),
+        ] {
+            assert!(
+                !production.contains(&token),
+                "generation reads must resolve through the anchored RootedDir ({token})"
+            );
+        }
+    }
+
+    /// The generation read is anchored: a symlinked `gen-*.json` entry is
+    /// refused TYPED before any open (never followed), its outside target
+    /// bytes never surface, and the provider degrades instead of serving.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_generation_file_is_refused_typed_and_never_read() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = ws_of(41);
+        let gdir = gen_dir(dir.path(), ws);
+        std::fs::create_dir_all(&gdir).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("gen-1.json"),
+            b"OUTSIDE_GENERATION_MARKER_5522",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.join("gen-1.json"), gdir.join("gen-1.json")).unwrap();
+
+        let rooted = RootedDir::open(&gdir).unwrap();
+        let mut stats = ColdStats::default();
+        assert_eq!(
+            read_generation_file(&rooted, OsStr::new("gen-1.json"), 1, ws, &mut stats).unwrap_err(),
+            ColdReadRefusal::Symlink,
+            "the anchored classification owns the refusal"
+        );
+        assert_eq!(
+            stats.files_read, 0,
+            "the link target is never opened or read"
+        );
+
+        let provider = provider(root, ws, dir.path());
+        let evidence = provider.evidence(&query("fix balance_account", &[]));
+        assert!(
+            !matches!(evidence.origin, ColdOrigin::StaleGeneration { .. }),
+            "a symlinked generation never serves: {:?}",
+            evidence.origin
+        );
+        assert!(evidence
+            .hits
+            .iter()
+            .all(|h| !h.snippet.contains("OUTSIDE_GENERATION_MARKER_5522")));
+    }
+
+    /// An honest generation still opens through the same anchored read.
+    #[test]
+    fn anchored_generation_read_serves_honest_files() {
+        let dir = TempDir::new().unwrap();
+        let ws = ws_of(43);
+        let mut index = WorkspaceIndex::new();
+        index
+            .index_file(
+                ws,
+                Path::new("src/lib.rs"),
+                b"pub fn anchored_ok() -> i64 { 7 }\n",
+                1,
+            )
+            .unwrap();
+        publish_generation(dir.path(), ws, 1, &index);
+        let gdir = gen_dir(dir.path(), ws);
+        let rooted = RootedDir::open(&gdir).unwrap();
+        let mut stats = ColdStats::default();
+        let (generation, loaded) =
+            read_generation_file(&rooted, OsStr::new("gen-1.json"), 1, ws, &mut stats).unwrap();
+        assert_eq!(generation, 1);
+        assert!(
+            !loaded.files_for_token(ws, "anchored", 4).is_empty(),
+            "the honest generation's index must materialize"
+        );
+        assert_eq!(stats.files_read, 1);
+    }
+
+    /// A generation file larger than the cheap-decode bound is refused
+    /// before any byte is read (bounded; no allocation, no partial decode).
+    #[test]
+    fn oversized_generation_is_refused_before_any_read() {
+        let dir = TempDir::new().unwrap();
+        let ws = ws_of(45);
+        let gdir = gen_dir(dir.path(), ws);
+        std::fs::create_dir_all(&gdir).unwrap();
+        let big = std::fs::File::create(gdir.join("gen-1.json")).unwrap();
+        big.set_len(COLD_MAX_GENERATION_LOAD_BYTES + 1).unwrap();
+        drop(big);
+        let rooted = RootedDir::open(&gdir).unwrap();
+        let mut stats = ColdStats::default();
+        assert_eq!(
+            read_generation_file(&rooted, OsStr::new("gen-1.json"), 1, ws, &mut stats).unwrap_err(),
+            ColdReadRefusal::Oversized
+        );
+        assert_eq!(stats.files_read, 0, "an oversized file is never read");
+
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let provider = provider(root, ws, dir.path());
+        let evidence = provider.evidence(&query("balance", &[]));
+        assert!(
+            !matches!(evidence.origin, ColdOrigin::StaleGeneration { .. }),
+            "an oversized generation degrades instead of serving: {:?}",
+            evidence.origin
+        );
+    }
+
+    /// A swap between the enumeration and the read cannot redirect the read:
+    /// the entry enumerated as a regular file is replaced by an outside
+    /// symlink before the anchored read, the no-follow walk refuses it typed,
+    /// and the outside marker never reaches the package.
+    #[cfg(unix)]
+    #[test]
+    fn generation_swapped_between_enumeration_and_read_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = ws_of(47);
+        let mut index = WorkspaceIndex::new();
+        index
+            .index_file(ws, Path::new("src/lib.rs"), b"pub fn swap_anchor() {}\n", 1)
+            .unwrap();
+        publish_generation(dir.path(), ws, 2, &index);
+        let gdir = gen_dir(dir.path(), ws);
+        let rooted = RootedDir::open(&gdir).unwrap();
+        // Enumeration through the SAME anchored handle sees an honest file…
+        let listing = rooted
+            .list_entries(Path::new(""), COLD_MAX_GENERATION_ENTRIES)
+            .unwrap();
+        assert!(listing
+            .entries
+            .iter()
+            .any(|e| e.name.to_string_lossy() == "gen-2.json" && e.kind == RootedEntryKind::File));
+        // …then the hostile swap lands before the read.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("gen-2.json"), b"SWAP_GENERATION_MARKER_8844").unwrap();
+        std::fs::remove_file(gdir.join("gen-2.json")).unwrap();
+        std::os::unix::fs::symlink(outside.join("gen-2.json"), gdir.join("gen-2.json")).unwrap();
+        let mut stats = ColdStats::default();
+        assert_eq!(
+            read_generation_file(&rooted, OsStr::new("gen-2.json"), 2, ws, &mut stats).unwrap_err(),
+            ColdReadRefusal::Symlink,
+            "the swapped entry is refused at read time"
+        );
+        assert_eq!(stats.files_read, 0, "the swapped link is never opened");
+
+        let provider = provider(root, ws, dir.path());
+        let evidence = provider.evidence(&query("swap_anchor", &[]));
+        assert!(
+            !matches!(evidence.origin, ColdOrigin::StaleGeneration { .. }),
+            "{:?}",
+            evidence.origin
+        );
+        assert!(evidence
+            .hits
+            .iter()
+            .all(|h| !h.snippet.contains("SWAP_GENERATION_MARKER_8844")));
     }
 }

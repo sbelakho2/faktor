@@ -70,7 +70,7 @@ use faktor_winjob::JobGuard;
 use crate::ring::{lock_ring, Ring};
 use crate::validation::validate_spawn_config;
 use crate::win_common;
-use crate::PtyConfig;
+use crate::{PtyConfig, SpawnConfinement};
 
 /// `ERROR_FILE_NOT_FOUND` (winerror.h, frozen ABI value): SearchPathW's
 /// "module not found" result.
@@ -317,6 +317,20 @@ impl fmt::Debug for Pty {
 }
 
 impl Pty {
+    /// Always refuses this platform's confined variant typed: the Windows
+    /// process API has no pre-exec hook, so an authority-supplied
+    /// confinement can never be enforced on a ConPTY child. The confinement
+    /// is NEVER silently dropped — a DenyAll spawn is refused by the
+    /// authority before this call, and a direct caller gets this typed
+    /// refusal instead of an unconfined child (audit P0-39 platform truth).
+    pub fn spawn_confined(cfg: &PtyConfig, confinement: SpawnConfinement) -> Result<Self, Error> {
+        let _ = (cfg, confinement);
+        Err(Error::permission(
+            "spawn confinement refused: this platform provides no OS-level pre-exec confinement \
+             backend; never spawning the child unconfined",
+        ))
+    }
+
     /// Create the pseudoconsole and spawn the child attached to it.
     pub fn spawn(cfg: &PtyConfig) -> Result<Self, Error> {
         validate_spawn_config(cfg)?;
@@ -1020,6 +1034,26 @@ mod tests {
         cfg.command = "cmd.exe\0owned".into();
         let err = Pty::spawn(&cfg).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Malformed);
+    }
+
+    #[test]
+    fn spawn_confined_refuses_typed_instead_of_dropping_the_confinement() {
+        // An authority-supplied confinement can never be enforced with the
+        // Windows process API (no pre-exec hook): the spawn is refused typed
+        // BEFORE any pipe/pseudoconsole/job exists — never silently ignored
+        // and never an unconfined child.
+        let cfg = PtyConfig {
+            command: "cmd.exe".into(),
+            ..Default::default()
+        };
+        let confinement = SpawnConfinement::new(Arc::new(|_cmd: &mut std::process::Command| {}));
+        let err = Pty::spawn_confined(&cfg, confinement).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(
+            err.message.contains("confinement"),
+            "the refusal names the confinement contract: {}",
+            err.message
+        );
     }
 
     #[test]

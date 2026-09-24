@@ -1,0 +1,9 @@
+# Fixture: apt usage in a step that runs on the digest-pinned Faktor CI
+# image. No exact versions are needed there because the image digest pins the
+# whole package set. `scripts/check-ci-image-pins.sh --dir` must accept this.
+steps:
+  - name: linux
+    image: faktor-ci@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # faktor-ci @ fixture
+    commands:
+      # apt-pinned: faktor-ci@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959
+      - apt-get install -y --no-install-recommends ca-certificates

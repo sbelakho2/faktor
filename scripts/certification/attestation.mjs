@@ -20,7 +20,7 @@
 //           [--rust-toolchain V | --rust-toolchain-file FILE] \
 //           [--artifact PATH]... [--optional-artifact PATH]... \
 //           [--from-lanes DIR] [--emit-log-block] \
-//           (--sign-key PEM | --sign-key-env VAR | unsigned)
+//           (--sign-key PEM | --sign-key-env VAR)
 //   verify  --attestation FILE --source-sha SHA --tree-sha SHA \
 //           --workflow WORKFLOW --keys KEYS.json [--require-signed] \
 //           [--event EVENT] [--pipeline-number N] [--pipeline-id ID] \
@@ -31,8 +31,17 @@
 // signed payload is the canonical JSON (object keys sorted recursively) of
 // the attestation WITHOUT its `signature` field; `keys.json` is
 // {"identities":{"<identity>":{"ed25519_public_key":"<base64 raw 32B>"}}}.
-// Unsigned attestations are written with a loud warning and are never
-// release-grade evidence (certify.sh refuses them with --require-signed).
+//
+// FAIL-CLOSED SIGNING: `create` NEVER writes an unsigned attestation. When
+// neither --sign-key nor the --sign-key-env variable (default
+// FAKTOR_ATTEST_SIGN_KEY_PEM) holds a key it exits 3 with the typed
+// `signing-key-missing` error and leaves no artifact behind. `verify` still
+// understands unsigned historical/foreign objects and refuses them with
+// --require-signed (certify.sh uses that). The documented alternative path
+// is Sigstore/keyless signing of the same `faktor-build-attestation/v1`
+// payload: the workflow attests through cosign with its OIDC identity and
+// the operator verifies the bundle against that identity instead of the
+// ed25519 allowlist (see docs/certification.md §2.12).
 
 import {
   createHash,
@@ -61,6 +70,20 @@ const SCHEMA = 'faktor-build-attestation/v1';
 const MARKER_BEGIN = '-----BEGIN FAKTOR ATTESTATION-----';
 const MARKER_END = '-----END FAKTOR ATTESTATION-----';
 const ED25519_SPKI_PREFIX = '302a300506032b6570032100';
+
+// Typed refusal codes surfaced on stderr as
+// `attestation: <code>: <message>`; `signing-key-missing` additionally exits 3.
+const ERROR_CODES = {
+  SIGNING_KEY_MISSING: 'signing-key-missing',
+};
+
+class AttestationError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'AttestationError';
+    this.code = code;
+  }
+}
 
 // Workflow registry: which events may produce an attestation for a workflow.
 const WORKFLOW_EVENTS = {
@@ -303,7 +326,43 @@ function collectArtifacts(options) {
 
 // ---------------------------------------------------------------- create
 
+// Fail closed: there is no unsigned code path. A missing (or unreadable)
+// signing key is a typed refusal and no attestation file is written, so a
+// pipeline without the signing secret cannot publish non-release-grade bytes.
+function resolveSigningKey(options) {
+  if (options.signKey) {
+    try {
+      return { key: createPrivateKey(readFileSync(options.signKey)), source: `--sign-key ${options.signKey}` };
+    } catch (error) {
+      throw new AttestationError(
+        ERROR_CODES.SIGNING_KEY_MISSING,
+        `--sign-key ${options.signKey} is not a readable ed25519 private key: ${error.message}`,
+      );
+    }
+  }
+  const envName = options.signKeyEnv || 'FAKTOR_ATTEST_SIGN_KEY_PEM';
+  if (process.env[envName]) {
+    try {
+      return { key: createPrivateKey(process.env[envName]), source: `$${envName}` };
+    } catch (error) {
+      throw new AttestationError(
+        ERROR_CODES.SIGNING_KEY_MISSING,
+        `$${envName} is not a valid ed25519 private key PEM: ${error.message}`,
+      );
+    }
+  }
+  throw new AttestationError(
+    ERROR_CODES.SIGNING_KEY_MISSING,
+    'refusing to write an unsigned attestation: no signing key present. ' +
+      `Set the ${envName} secret (Woodpecker: environment: ${envName}: { from_secret: faktor_attest_signing_key }) ` +
+      'or pass --sign-key; generate a keypair with `node scripts/certification/attestation.mjs keygen`. ' +
+      'The documented alternative is Sigstore/keyless signing of the same payload ' +
+      '(docs/certification.md §2.12); certify.sh refuses unsigned attestations, so no artifact was emitted.',
+  );
+}
+
 function createAttestation(options) {
+  const signing = resolveSigningKey(options);
   const {
     workflow,
     event,
@@ -361,28 +420,14 @@ function createAttestation(options) {
     created_at: isoNow(),
     signature: null,
   };
-  if (options.signKey) {
-    attestation = signAttestation(attestation, createPrivateKey(readFileSync(options.signKey)), options.keyId || 'faktor-ci');
-  } else if (options.signKeyEnv && process.env[options.signKeyEnv]) {
-    attestation = signAttestation(
-      attestation,
-      createPrivateKey(process.env[options.signKeyEnv]),
-      options.keyId || 'faktor-ci',
-    );
-  }
+  attestation = signAttestation(attestation, signing.key, options.keyId || 'faktor-ci');
   mkdirSync(resolve(dirname(options.out)), { recursive: true });
   writeFileSync(options.out, `${JSON.stringify(attestation, null, 2)}\n`);
   console.log(`attestation written: ${options.out}`);
   console.log(
     `  workflow=${workflow} event=${event} source=${sourceSha} tree=${treeSha} pipeline=${pipelineNumber} ` +
-      `artifacts=${Object.keys(artifactMap).length} signed=${Boolean(attestation.signature)}`,
+      `artifacts=${Object.keys(artifactMap).length} signed=true signer=${signing.source}`,
   );
-  if (!attestation.signature) {
-    console.error(
-      'attestation: UNSIGNED — set FAKTOR_ATTEST_SIGN_KEY_PEM (or --sign-key) to make this release-grade evidence; ' +
-        'certify.sh refuses unsigned attestations.',
-    );
-  }
   if (options.emitLogBlock) {
     const encoded = readFileSync(options.out).toString('base64');
     console.log(MARKER_BEGIN);
@@ -691,7 +736,7 @@ function runSelftest() {
         fn();
         expect(name, false);
       } catch (error) {
-        expect(name, error.message.includes(code));
+        expect(name, error.code === code || error.message.includes(code));
       }
     };
     refusal(
@@ -724,6 +769,53 @@ function runSelftest() {
         createAttestation({ ...base, out, artifacts: [], fromLanes: lanes });
       },
       'marker says',
+    );
+
+    // Fail-closed signing: no key -> typed refusal, exit-3 class, NO artifact.
+    const failClosedOut = join(temp, 'fail-closed.json');
+    refusal(
+      'absent signing key is refused fail-closed',
+      () =>
+        createAttestation({
+          ...base,
+          out: failClosedOut,
+          signKey: '',
+          signKeyEnv: 'FAKTOR_ATTEST_SELFTEST_ABSENT',
+        }),
+      'signing-key-missing',
+    );
+    expect('fail-closed refusal leaves no attestation artifact', !existsSync(failClosedOut));
+    refusal(
+      'unreadable --sign-key path is refused fail-closed',
+      () => createAttestation({ ...base, out: failClosedOut, signKey: join(temp, 'no-such-key.pem') }),
+      'signing-key-missing',
+    );
+    expect('unreadable key refusal leaves no attestation artifact', !existsSync(failClosedOut));
+    const envSignedOut = join(temp, 'env-signed.json');
+    process.env.FAKTOR_ATTEST_SELFTEST_KEY = readFileSync(keyPath, 'utf8');
+    let envSigned;
+    try {
+      envSigned = createAttestation({
+        ...base,
+        out: envSignedOut,
+        signKey: '',
+        signKeyEnv: 'FAKTOR_ATTEST_SELFTEST_KEY',
+      });
+    } finally {
+      delete process.env.FAKTOR_ATTEST_SELFTEST_KEY;
+    }
+    expect('--sign-key-env variable signs the attestation', Boolean(envSigned.signature));
+    expect(
+      'env-signed attestation verifies with --require-signed',
+      verifyAttestation(envSigned, {
+        sourceSha: sha,
+        treeSha: tree,
+        workflow: 'trusted',
+        event: 'push',
+        pipelineNumber: '21',
+        keys: keysPath,
+        requireSigned: true,
+      }).length === 0,
     );
 
     // Step-image extraction from a workflow file (the real CI path).
@@ -778,7 +870,9 @@ commands:
           (--ci-image-ref IMAGE | --workflow-file FILE --step-name NAME)
           [--rust-toolchain V | --rust-toolchain-file FILE]
           [--artifact PATH]... [--optional-artifact PATH]... [--from-lanes DIR]
-          [--emit-log-block] [--sign-key PEM | --sign-key-env VAR] [--key-id ID]
+          [--emit-log-block]
+          (--sign-key PEM | --sign-key-env VAR) [--key-id ID]
+          (signing is FAIL-CLOSED: no key -> typed refusal, no artifact)
   verify  --attestation FILE --source-sha SHA --tree-sha SHA --workflow W
           [--event E] [--pipeline-number N] [--pipeline-id ID]
           --keys KEYS.json [--require-signed] [--artifact PATH]...
@@ -858,8 +952,9 @@ function main(argv) {
       });
     }
   } catch (error) {
-    console.error(`attestation: ${error.message}`);
-    return 2;
+    const prefix = error && error.code ? `${error.code}: ` : '';
+    console.error(`attestation: ${prefix}${error.message}`);
+    return error && error.code === ERROR_CODES.SIGNING_KEY_MISSING ? 3 : 2;
   }
   console.error(`unknown command '${command}'`);
   usage();

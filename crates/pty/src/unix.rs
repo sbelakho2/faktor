@@ -55,7 +55,7 @@ use faktor_core::error::Error;
 use crate::guardian::{GuardianHandle, ProcessIdentity, TerminalLedger};
 use crate::ring::{lock_ring, Ring};
 use crate::validation::validate_spawn_config;
-use crate::PtyConfig;
+use crate::{PtyConfig, SpawnConfinement};
 
 /// One live PTY. Sync API (the master side is O_NONBLOCK, reads are
 /// non-blocking snapshots); a background thread owns the child (reads,
@@ -138,7 +138,17 @@ impl Pty {
     /// process dies without reaping the child, the guardian SIGKILLs the
     /// whole group.
     pub fn spawn(cfg: &PtyConfig) -> Result<Self, Error> {
-        Self::spawn_inner(cfg, None)
+        Self::spawn_inner(cfg, None, None)
+    }
+
+    /// Like [`Pty::spawn`], with the spawn authority's OS-level confinement
+    /// installed on the child command before it is spawned (audit P0-39).
+    /// The confinement hook runs on the spawning thread and installs its
+    /// platform enforcement (e.g. a pre-exec network-namespace hook) on the
+    /// SAME command this pty spawns; any failure it causes fails the spawn
+    /// before exec, so no child ever runs unconfined.
+    pub fn spawn_confined(cfg: &PtyConfig, confinement: SpawnConfinement) -> Result<Self, Error> {
+        Self::spawn_inner(cfg, None, Some(confinement))
     }
 
     /// Like [`Pty::spawn`], plus a durable [`TerminalLedger`] row carrying
@@ -157,10 +167,15 @@ impl Pty {
                 ledger: ledger.clone(),
                 owner: owner.to_string(),
             }),
+            None,
         )
     }
 
-    fn spawn_inner(cfg: &PtyConfig, ledger_plan: Option<LedgerPlan>) -> Result<Self, Error> {
+    fn spawn_inner(
+        cfg: &PtyConfig,
+        ledger_plan: Option<LedgerPlan>,
+        confinement: Option<SpawnConfinement>,
+    ) -> Result<Self, Error> {
         validate_spawn_config(cfg)?;
         // 1. Open the master; grant + unlock + resolve the slave path.
         // SAFETY: `posix_openpt` takes only flag scalars and returns a fresh pty master fd (or -1, checked immediately).
@@ -259,7 +274,7 @@ impl Pty {
             let reap_serial = reap_serial.clone();
             let cfg = cfg.clone();
             std::thread::spawn(move || {
-                let spawned = match spawn_child(&cfg, slave_fd, ledger_plan) {
+                let spawned = match spawn_child(&cfg, slave_fd, ledger_plan, confinement) {
                     Ok(spawned) => spawned,
                     Err(e) => {
                         let _ = tx.send(Err(e));
@@ -557,11 +572,14 @@ impl Drop for Pty {
 /// Spawn the child (stdio on the slave) and its guardian. Runs ON the
 /// reader thread: it is the child's parent and stays alive until the child
 /// is reaped, so Linux `PR_SET_PDEATHSIG` (armed in the pre-exec hook) is a
-/// DAEMON-death signal, never a spawn-thread-exit signal.
+/// DAEMON-death signal, never a spawn-thread-exit signal. The optional
+/// [`SpawnConfinement`] is installed on the command before spawn — the
+/// authority's OS-level enforcement, never this layer's policy.
 fn spawn_child(
     cfg: &PtyConfig,
     slave: OwnedFd,
     ledger_plan: Option<LedgerPlan>,
+    confinement: Option<SpawnConfinement>,
 ) -> Result<ChildSpawn, Error> {
     use std::os::unix::process::CommandExt;
 
@@ -575,6 +593,12 @@ fn spawn_child(
     // GIT_TERMINAL_PROMPT safety default). PTY children never inherit the
     // daemon environment implicitly.
     cfg.env.apply(&mut cmd);
+    // The authority's confinement (if any) installs on THIS command before
+    // spawn: its pre-exec hook runs in the forked child after the pty's own
+    // setup hooks and before exec, and its failure refuses the spawn.
+    if let Some(confinement) = confinement {
+        confinement.install(&mut cmd);
+    }
     let slave_fd = slave.into_raw_fd();
     // SAFETY: the fd/handle was just produced by the preceding call on this path and its ownership transfers here exactly once (failure paths close it explicitly).
     cmd.stdin(unsafe { std::process::Stdio::from_raw_fd(slave_fd) });
@@ -1396,6 +1420,53 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn spawn_confined_installs_the_authority_hook_on_the_child_command() {
+        // The authority's confinement hook is installed on the SAME command
+        // the pty spawns: a hook that marks the command proves the child saw
+        // it — the real terminal authority installs its pre-exec
+        // network-namespace hook through this exact seam.
+        let confinement = SpawnConfinement::new(Arc::new(|cmd: &mut std::process::Command| {
+            cmd.env("FAKTOR_PTY_TEST_CONFINEMENT", "applied");
+        }));
+        let mut pty = Pty::spawn_confined(
+            &sh_cfg("echo confinement:$FAKTOR_PTY_TEST_CONFINEMENT"),
+            confinement,
+        )
+        .unwrap();
+        assert!(
+            pty.wait_for_contains("confinement:applied", std::time::Duration::from_secs(10)),
+            "the authority hook must reach the spawned child: {:?}",
+            String::from_utf8_lossy(&pty.snapshot())
+        );
+        pty.kill();
+    }
+
+    #[test]
+    fn spawn_confined_refuses_the_spawn_when_the_hook_fails_before_exec() {
+        // Adversarial: the authority's confinement fails in the forked child
+        // (the real-world case: a refused unshare). The spawn MUST fail typed
+        // and the child must never exec its body.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("confined-body-ran.txt");
+        let confinement = SpawnConfinement::new(Arc::new(|cmd: &mut std::process::Command| {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: the closure only returns a raw EPERM before exec and
+            // performs no allocation or locking; the pty spawn surfaces it as
+            // a failed spawn.
+            unsafe {
+                cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+            }
+        }));
+        let cfg = sh_cfg(&format!("echo ran > {}", marker.display()));
+        let error = Pty::spawn_confined(&cfg, confinement).unwrap_err();
+        assert!(!error.message.is_empty(), "a typed refusal names the cause");
+        assert!(
+            !marker.exists(),
+            "a refused confinement must never exec the child body"
+        );
     }
 
     #[test]

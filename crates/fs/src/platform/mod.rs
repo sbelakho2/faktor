@@ -25,6 +25,8 @@ use faktor_core::error::Error;
 
 #[cfg(unix)]
 mod unix;
+#[cfg(unix)]
+pub(crate) use unix::finalize_read_open;
 #[cfg(all(unix, test))]
 pub(crate) use unix::{clear_walk_seam, install_walk_seam};
 
@@ -32,12 +34,12 @@ pub(crate) use unix::{clear_walk_seam, install_walk_seam};
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::{
-    anchored_create_dir, anchored_create_file, anchored_delete_entry, anchored_open_entry,
-    anchored_rename, canonicalize_within, entry_meta, lexical_check, open_no_follow_walk,
-    open_root_anchor, opened_is_path, read_reparse_link, validated_relative_units,
-    windows_list_dir_raw, windows_open_child_dir, windows_open_child_dir_anchored,
-    windows_reparse_class, AnchoredCreateOutcome, AnchoredEntry, RawDirEntry, ReparseClass,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    anchored_create_dir, anchored_create_file, anchored_create_symlink, anchored_delete_entry,
+    anchored_open_entry, anchored_rename, canonicalize_within, entry_meta, lexical_check,
+    open_no_follow_walk, open_root_anchor, opened_is_path, read_reparse_link,
+    validated_relative_units, windows_list_dir_raw, windows_open_child_dir,
+    windows_open_child_dir_anchored, windows_reparse_class, AnchoredCreateOutcome, AnchoredEntry,
+    RawDirEntry, ReparseClass, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
 };
 
 /// What the final component of a walk must be openable as. Intermediate
@@ -46,6 +48,10 @@ pub(crate) use windows::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenKind {
     /// The final entry may be a file or a directory (both are openable).
+    /// On unix the final open carries `O_NONBLOCK` and is classified by
+    /// `fstat(2)` afterwards: regular files/directories get the flag
+    /// cleared, a FIFO/socket/device is a typed refusal, so a special file
+    /// swapped in between classification and open can never block the read.
     Read,
     /// The final entry must be a directory (parent re-verification before a
     /// rename).
@@ -72,7 +78,11 @@ pub(crate) fn open_no_follow_walk(
     kind: OpenKind,
 ) -> Result<std::os::unix::io::OwnedFd, Error> {
     let final_flags = match kind {
-        OpenKind::Read => libc::O_RDONLY,
+        // O_NONBLOCK: a FIFO swapped in between classification and open
+        // must never block the walk (the unix walk fstat(2)s the opened fd,
+        // clears the flag for regular files/directories and refuses a
+        // special file typed).
+        OpenKind::Read => libc::O_RDONLY | libc::O_NONBLOCK,
         OpenKind::Directory => libc::O_RDONLY | libc::O_DIRECTORY,
     };
     unix::open_no_follow_walk(root, rel, final_flags)

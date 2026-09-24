@@ -114,7 +114,7 @@ when CI migrated (historical note only, no workflow files remain under
 | `jetbrains-smoke` | linux/amd64 | kotlinc split-mode compile + wire/native smokes against a real daemon |
 | `perf` | linux/amd64 | release `[perf]` gates; serialized after the other Rust lanes so budgets do not race a loaded agent |
 | `darwin-check` / `darwin-test` / `darwin-doctor` | self-hosted macOS (`local` backend) | `check`/`test --workspace` + `doctor`; `push` to `main` only |
-| `windows-check` / `windows-test` | self-hosted Windows (`local` backend) | `cargo check --workspace`; workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts; `push` to `main` only |
+| `windows-check` / `windows-test` | self-hosted Windows (`local` backend) | `cargo check --workspace`; `cargo test -p faktor-fs --all-targets`, then the explicit rooted/atomic groups (`cargo test -p faktor-fs rooted`, `cargo test -p faktor-fs atomic`) and the `cfg(windows)` anchored-IO seam suite (`cargo test -p faktor-fs platform::windows`), then workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts; `push` to `main` only |
 | `certificate` | linux/amd64 | aggregate gate over every linux lane: verifies each lane's marker and the workflow status, writes `target/certification/ci-certification.json` |
 | `certificate-darwin` / `certificate-windows` | self-hosted platform agent | per-platform aggregate marker/status gate |
 
@@ -574,13 +574,21 @@ step (after `certificate`) publishes a signed
 block: `{source_sha, tree_sha, workflow, event, pipeline_id,
 pipeline_number, build_environment_digest (the CI image digest),
 rust_toolchain, repository_tree_verified, artifacts{name: sha256}}`, signed
-with an ed25519 key from the trusted project's allowlist (Sigstore bundles
-are the documented upgrade path; without a key the object is emitted
-UNSIGNED and loudly marked). `scripts/certify.sh` fetches the block
-belonging to the exact trusted pipeline, verifies the signature against
-`FAKTOR_ATTEST_KEYS` / `--attestation-keys`, verifies source SHA, tree,
-workflow, event and pipeline number/id, and re-hashes **every
-local/shipped artifact** against the attested digests. Any mismatch
+with an ed25519 key from the trusted project's allowlist. Signing is
+**fail-closed**: `node scripts/certification/attestation.mjs create` refuses
+to write anything when the signing key (the `faktor_attest_signing_key`
+secret, surfaced as `FAKTOR_ATTEST_SIGN_KEY_PEM`) is absent or unreadable —
+it exits 3 with the typed `signing-key-missing` error and leaves no
+artifact, so the workflow step can never emit an unsigned attestation. The
+verifier still rejects unsigned/foreign legacy objects
+(`--require-signed`). The documented alternative to the ed25519 allowlist is
+Sigstore/keyless verification of the same payload against the pipeline's
+OIDC identity: the workflow attests through `cosign attest` (keyless) and
+the operator verifies the bundle against that identity. `scripts/certify.sh`
+fetches the block belonging to the exact trusted pipeline, verifies the
+signature against `FAKTOR_ATTEST_KEYS` / `--attestation-keys`, verifies
+source SHA, tree, workflow, event and pipeline number/id, and re-hashes
+**every local/shipped artifact** against the attested digests. Any mismatch
 (`attestation-invalid`), a missing attestation on a trusted context
 (`attestation-absent`), or a missing allowlist when a signed attestation
 exists (`attestation-keys-missing`) fails the run. Distributing the
@@ -676,18 +684,34 @@ fails with `unassigned`; an unconventional tag fails with
   workflow's `attestation` step records its own image digest as the
   attestation's `build_environment_digest`, so certified bytes name the
   build environment they came from.
-- **CI-image residual (P2-D; loud, never silent):** the CI jobs still run
-  `apt-get update && apt-get install` against live Debian repositories — no
-  single Faktor CI image has been built, and no Debian snapshot + exact
-  package-version pin exists yet. Every apt command item therefore carries
-  an explicit `# apt-residual: <reason>` annotation; the `image-pins` check
-  audits this, prints every residual line on every run and fails an apt
-  usage with no annotation (or a bare `apt-residual:`). The pinned-CI-image
-  requirement is the target state: build one Faktor CI image (or pin the
-  Debian snapshot + exact versions), replace the residual annotations with
-  `# apt-pinned: <image@sha256:...>`, and the image digest then flows into
-  the attestation's `build_environment_digest`. Until then the residual is
-  documented here and surfaced by every certification run.
+- **apt reproducibility (P2-D, closed):** the CI jobs install nothing from
+  live distribution repositories. Every apt-bearing step sources a fixed
+  snapshot — `snapshot.debian.org/archive/debian/<ts>` (and
+  `debian-security` for security pockets) or `snapshot.ubuntu.com/ubuntu/<ts>`
+  with `ts = 20260923T000000Z` — and installs exact `pkg=version` pins
+  (e.g. `python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419` on the
+  `rust:1.98.0`/trixie lane). The `image-pins` check audits this: an
+  apt-bearing step needs `# apt-snapshot: <ts> <reason>` with the matching
+  snapshot URL present in the same step and only exact-version installs, or
+  `# apt-pinned: <image@sha256:...>` when the step runs on the dedicated
+  Faktor CI image. The legacy `apt-residual` annotation is a violation — no
+  unjustified residual exists. The Ubuntu `24.04` smoke lane (no
+  ca-certificates in the base image) scopes an explicit TLS-verification
+  bypass to the single `ca-certificates` bootstrap install; APT's InRelease
+  signature (ubuntu-keyring ships in the base) remains the trust anchor for
+  that one fetch, and every later fetch verifies TLS again.
+- **Dedicated Faktor CI image (P2-D, publish path):**
+  `docker/faktor-ci/Dockerfile` pins the `ubuntu:24.04` base by multi-arch
+  index digest, pins the same noble snapshot, and installs the full CI apt
+  toolchain at exact versions (`build-essential`, `curl`, `pkg-config`,
+  `libssl-dev`, `kotlin`, `openjdk-11-jre-headless`, `unzip`, `python3`,
+  `procps`, `ca-certificates`). `bash scripts/build-ci-image.sh` builds it
+  (default `linux/amd64`), prints the image digest, verifies the pinned
+  package set inside the built image, and pushes the digest when a registry
+  is provided (`FAKTOR_CI_IMAGE_REGISTRY` / `--push`). Once the digest is
+  published, a lane switches from the snapshot-pinned apt steps to
+  `image: <ref>@sha256:<digest>` with `# apt-pinned: <ref@sha256:...>`; that
+  digest is what flows into the attestation's `build_environment_digest`.
 - `apps/jetbrains/gradle/wrapper/gradle-wrapper.properties` pins
   `distributionSha256Sum` for `gradle-9.7.1-bin.zip`
   (`acd53f1e…f804d20a`, cross-checked against

@@ -13,7 +13,8 @@
 //! skipped empty-file creation entirely and rolled a missing→content write
 //! back to an empty file instead of deleting it.
 
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use faktor_cas::Cas;
@@ -21,7 +22,8 @@ use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
 use faktor_core::id::SessionId;
 use faktor_core::WorkspaceIdentity;
-use faktor_fs::WorkspaceHandle;
+use faktor_fs::rooted::RootedEntryKind;
+use faktor_fs::{RootedDir, WorkspaceHandle};
 use faktor_store::Store;
 
 /// The existence-bearing state of one file at checkpoint time. `exists=true`
@@ -32,21 +34,6 @@ use faktor_store::Store;
 pub struct FileState {
     pub exists: bool,
     pub hash: Option<FileHash>,
-}
-
-/// Raw join of `rel` under `root` (absolute `rel` replaces the root,
-/// mirroring the resolver's path assembly). Used ONLY as a lexical liveness
-/// probe for the P0-51 genuine-ENOENT carve-out when the anchored walk
-/// refuses the path (see [`FileState::probe`]): it decides "the raw path is
-/// genuinely gone" vs "the raw path is present but refused", and NEVER
-/// classifies an entry as existing, opens it, or hashes through it — the
-/// classification that matters runs through the anchored handle walk.
-fn joined_raw(root: &Path, rel: &Path) -> PathBuf {
-    if rel.is_absolute() {
-        rel.to_path_buf()
-    } else {
-        root.join(rel)
-    }
 }
 
 impl FileState {
@@ -65,29 +52,36 @@ impl FileState {
     }
 
     /// Disk truth at `rel` inside `workspace`: a missing file is a state,
-    /// never an error. Genuine `ENOENT` (and a directory under a file path)
-    /// probe as [`FileState::missing`]; a CORRUPT or HOSTILE row — a path
-    /// the workspace cannot resolve (traversal, escape, absolute path where
+    /// never an error. Genuine absence — the anchored walk's own typed
+    /// not-found for the final entry, or for a component of a deleted
+    /// ancestor chain, proven by [`anchored_absent`] — probes as
+    /// [`FileState::missing`]; a CORRUPT or HOSTILE row — a path the
+    /// workspace cannot resolve (traversal, escape, absolute path where
     /// relative is required, NUL bytes) — is a loud TYPED error
     /// ([`ErrorKind::Permission`]/[`ErrorKind::Malformed`]) and NEVER a
     /// silent `missing` (P0-51): converting hostile checkpoint rows into
     /// "absent" would let rollback treat an unreadable file as deleted.
     ///
-    /// Metadata-first probe (audit 49): existence is decided by `stat`
-    /// BEFORE any content is read; a directory is NOT a file and probes as
-    /// missing; content is stream-hashed through a bounded 64 KiB buffer,
-    /// so probing a huge file never materializes it in RAM. The returned
-    /// hash is the whole-file BLAKE3 — results are bit-identical to the
-    /// legacy whole-buffer read for every file the legacy code could read,
-    /// so recorded checkpoints and conflict comparisons are unchanged.
+    /// Metadata-first probe (audit 49): existence is decided by `fstat` of
+    /// the OPENED fd BEFORE any content is read; a directory is NOT a file
+    /// and probes as missing; content is stream-hashed through a bounded
+    /// 64 KiB buffer, so probing a huge file never materializes it in RAM.
+    /// The returned hash is the whole-file BLAKE3 — results are
+    /// bit-identical to the legacy whole-buffer read for every file the
+    /// legacy code could read, so recorded checkpoints and conflict
+    /// comparisons are unchanged.
     ///
-    /// Anchored classification (audit bypass 3): the metadata that decides
-    /// existence comes from the OPENED entry of the handle-relative walk
-    /// ([`WorkspaceHandle::resolve_fd`], the same anchored walk
-    /// `hash_file_streaming` uses) — never from re-stat'ing a resolved
-    /// pathname. A parent directory swapped after any earlier resolution
-    /// can therefore no longer flip the classification: the walk that
-    /// classifies and the walk that hashes both refuse the swap typed.
+    /// Fully anchored (P0-51 residual closed): the walk IS the resolution —
+    /// no path string is re-resolved after it starts. The deciding metadata
+    /// is `fstat` of the fd the anchored walk
+    /// ([`WorkspaceHandle::resolve_fd`]) opened, the content is streamed
+    /// from that SAME fd, and an absence decision the walk reports as
+    /// `Permission` is re-checked component-by-component through a no-follow
+    /// [`faktor_fs::RootedDir`] on the workspace root ([`anchored_absent`]).
+    /// No raw pathname stat/metadata call ever touches the joined path: a
+    /// parent directory swapped for an outside symlink, a dangling outside
+    /// link, or any other refused shape can never flip the classification —
+    /// the anchored walk alone decides, and it refuses tersely typed.
     pub fn probe(workspace: &WorkspaceHandle, rel: &Path) -> Result<Self, Error> {
         // NUL bytes inside a stored path are ALWAYS corrupt (P0-51): POSIX
         // syscalls truncate at the first NUL, so a hostile row could alias
@@ -100,13 +94,12 @@ impl FileState {
                 rel
             )));
         }
-        // The walk IS the resolution: no path string is re-resolved after it
-        // starts, and the final entry is inspected through the fd the walk
-        // opened (fstat), so metadata and content can never disagree about
-        // which object `rel` names.
         match workspace.resolve_fd(rel) {
             Ok(handle) => {
-                let file = std::fs::File::from(handle);
+                let mut file = std::fs::File::from(handle);
+                // The final entry is inspected through the fd the walk
+                // opened (fstat): metadata and content can never disagree
+                // about which object `rel` names.
                 let meta = file
                     .metadata()
                     .map_err(|e| Error::new(ErrorKind::Internal, format!("stat {rel:?}: {e}")))?;
@@ -118,41 +111,89 @@ impl FileState {
                 if meta.is_dir() {
                     return Ok(Self::missing());
                 }
-                let (_hashed_bytes, hash) = workspace.hash_file_streaming(rel, None)?;
-                Ok(Self::existing(hash))
+                // Hash the SAME opened fd: classification and content are
+                // one anchored walk, never two looks at a mutable pathname.
+                // The bounded 64 KiB stream keeps the legacy whole-file
+                // BLAKE3 parity without materializing the file.
+                let mut hasher = blake3::Hasher::new();
+                let mut remaining = meta.len();
+                let mut buf = [0u8; 64 * 1024];
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    let n = file.read(&mut buf[..want]).map_err(|e| {
+                        Error::new(ErrorKind::Internal, format!("read {rel:?}: {e}"))
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                    remaining -= n as u64;
+                }
+                Ok(Self::existing(FileHash::from(hasher.finalize().into())))
             }
-            // A genuinely absent final entry: ENOENT is a state, not an
-            // error.
+            // The anchored walk's own typed absence: the final entry does
+            // not exist. ENOENT is a state, not an error.
             Err(walk_err) if walk_err.kind == ErrorKind::NotFound => Ok(Self::missing()),
             // The anchored walk refuses the path: traversal, absolute
-            // escape, a hostile symlink, or an intermediate component the
-            // walk could not open (which on unix is reported as Permission,
-            // including a genuinely deleted parent directory).
+            // escape, a hostile symlink, or an intermediate component it
+            // could not open (unix reports a deleted parent directory as
+            // Permission too). The anchored authority decides whether that
+            // refusal is genuine absence ([`anchored_absent`]); everything
+            // else stays a loud typed error — never a silent `missing`.
             Err(walk_err) if walk_err.kind == ErrorKind::Permission => {
-                // P0-51 genuine-ENOENT carve-out: a raw path that is
-                // genuinely GONE (deleted parent chain, dangling symlink
-                // target) stays `missing`; a path that exists on the raw
-                // filesystem but is refused by the workspace discipline is a
-                // loud TYPED error — never a silent `missing`. This lexical
-                // liveness probe is classification-only: it never yields
-                // `existing`, never opens and never hashes through the raw
-                // path; the anchored walk stays the sole authority for
-                // every workspace read.
-                match std::fs::metadata(joined_raw(workspace.root(), rel)) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::missing()),
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(
-                        Error::malformed(format!("corrupt checkpoint path {rel:?}: {e}")),
-                    ),
-                    Err(e) => Err(Error::new(
-                        ErrorKind::Internal,
-                        format!("stat {rel:?}: {e}"),
-                    )),
-                    Ok(_) => Err(walk_err),
+                if anchored_absent(workspace.root(), rel) {
+                    Ok(Self::missing())
+                } else {
+                    Err(walk_err)
                 }
             }
             Err(walk_err) => Err(walk_err),
         }
     }
+}
+
+/// Hard bound on the components the anchored absence proof may inspect. Each
+/// prefix is classified by one no-follow `entry_meta` call that re-walks its
+/// parent chain, so the proof is quadratic in the component count: a hostile
+/// multi-thousand-component path must fail the refusal (loud typed error),
+/// never spend an unbounded syscall budget.
+const MAX_ABSENCE_PROOF_COMPONENTS: usize = 64;
+
+/// Does the anchored walk itself prove `rel` absent? Walks the path's
+/// prefixes through a no-follow [`RootedDir`] anchored on the SAME canonical
+/// workspace root and classifies each component by its literal entry kind.
+/// A component the anchored walk reports absent (`Ok(None)` — its typed
+/// not-found) proves the whole path is genuinely gone: a deleted file, or a
+/// file under a deleted parent chain. A link, a non-directory ancestor, a
+/// traversal/absolute component, or any other refusal is NOT absence:
+/// `false` keeps the caller's loud typed error. No raw pathname is ever
+/// stat'ed, opened or followed — classification and the absence decision
+/// come exclusively from the anchored walk.
+fn anchored_absent(root: &Path, rel: &Path) -> bool {
+    let Ok(rooted) = RootedDir::open(root) else {
+        return false;
+    };
+    let comps: Vec<Component<'_>> = rel.components().collect();
+    if comps.len() > MAX_ABSENCE_PROOF_COMPONENTS {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    for (index, comp) in comps.iter().enumerate() {
+        prefix.push(comp.as_os_str());
+        match rooted.entry_meta(&prefix) {
+            Ok(None) => return true,
+            Ok(Some(meta)) => {
+                if index + 1 < comps.len() && meta.kind != RootedEntryKind::Directory {
+                    // A link or a non-directory ancestor: the anchored walk
+                    // refuses to pass through it; that is a refusal, never
+                    // anchored absence.
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Diff status derived from a checkpoint's before→after state transition:
@@ -1949,8 +1990,9 @@ mod tests {
             FileState::probe(&h, Path::new("nope.txt")).unwrap(),
             FileState::missing()
         );
-        // ...including a missing file under a DELETED parent directory (the
-        // raw path is genuinely gone; resolution alone cannot prove it).
+        // ...including a missing file under a DELETED parent directory: the
+        // anchored walk re-walks the prefixes and its typed not-found for the
+        // deleted parent proves absence (no raw pathname needed).
         fs::create_dir_all(h.root().join("sub")).unwrap();
         fs::write(h.root().join("sub/gone.txt"), b"x").unwrap();
         fs::remove_dir_all(h.root().join("sub")).unwrap();
@@ -1958,19 +2000,118 @@ mod tests {
             FileState::probe(&h, Path::new("sub/gone.txt")).unwrap(),
             FileState::missing()
         );
-        // A dangling symlink escape (target does not exist) is ENOENT too —
-        // absent is absent — but the write/delete side of any operation on
-        // it still fails loudly through workspace resolution.
-        let outside2 = tempdir().unwrap();
+        // A dangling symlink whose target is a missing path INSIDE the
+        // workspace: the anchored walk follows the in-root link and its
+        // typed not-found decides — absent stays absent.
         symlink(
-            outside2.path().join("ghost"),
-            h.root().join("dangling-link"),
+            h.root().join("no-such-target"),
+            h.root().join("dangling-in-root"),
         )
         .unwrap();
         assert_eq!(
-            FileState::probe(&h, Path::new("dangling-link")).unwrap(),
+            FileState::probe(&h, Path::new("dangling-in-root")).unwrap(),
             FileState::missing()
         );
+        // A symlink whose target ESCAPES the root is a typed refusal whether
+        // or not the outside target exists: under anchored classification the
+        // walk refuses to leave the workspace, so the outside world is
+        // deliberately unobservable and a raw pathname must never decide the
+        // classification (dangling outside target and existing outside target
+        // classify identically).
+        let outside2 = tempdir().unwrap();
+        symlink(
+            outside2.path().join("ghost"),
+            h.root().join("escaping-dangling"),
+        )
+        .unwrap();
+        let err = FileState::probe(&h, Path::new("escaping-dangling")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        fs::write(outside2.path().join("ghost"), b"now it exists").unwrap();
+        let err = FileState::probe(&h, Path::new("escaping-dangling")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+    }
+
+    /// P0-51 residual: the absence decision is anchored — the same workspace
+    /// tree state classifies identically no matter what raw pathname an
+    /// attacker plants around the absent name. Genuinely absent (deleted
+    /// parent chain) is `missing`; the moment the parent NAME exists as an
+    /// outside symlink the anchored walk refuses it typed — and the outside
+    /// target's contents (present or absent) never change the result.
+    #[cfg(unix)]
+    #[test]
+    fn anchored_walk_decides_absence_around_planted_raw_paths() {
+        let (_d, _cps, h, _id, _session) = fixture();
+        // (a) genuinely absent: the parent chain was deleted.
+        fs::create_dir_all(h.root().join("sub")).unwrap();
+        fs::write(h.root().join("sub/gone.txt"), b"x").unwrap();
+        fs::remove_dir_all(h.root().join("sub")).unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("sub/gone.txt")).unwrap(),
+            FileState::missing()
+        );
+        // (b) the parent NAME is planted as an outside symlink whose target
+        // holds a same-named file: the anchored walk refuses it typed, never
+        // classifying (or hashing) the outside file.
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("gone.txt"), b"outside-marker").unwrap();
+        symlink(outside.path(), h.root().join("sub")).unwrap();
+        let err = FileState::probe(&h, Path::new("sub/gone.txt")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // (c) the SAME displaced workspace tree, outside target WITHOUT the
+        // file: identical classification — the anchored walk (not the raw
+        // pathname) owns the decision.
+        let outside2 = tempdir().unwrap();
+        fs::remove_file(h.root().join("sub")).unwrap();
+        symlink(outside2.path(), h.root().join("sub")).unwrap();
+        let err = FileState::probe(&h, Path::new("sub/gone.txt")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        // (d) restoring a real in-workspace parent with the file present
+        // streams the INSIDE content hash: the walk decides, and a raw
+        // outside path never wins.
+        fs::remove_file(h.root().join("sub")).unwrap();
+        fs::create_dir_all(h.root().join("sub")).unwrap();
+        fs::write(h.root().join("sub/gone.txt"), b"inside-content").unwrap();
+        assert_eq!(
+            FileState::probe(&h, Path::new("sub/gone.txt")).unwrap(),
+            FileState::existing(CheckpointStore::hash_of(b"inside-content"))
+        );
+    }
+
+    /// Source scan (P0-51 residual): the probe path never stats, opens or
+    /// follows a raw joined pathname. Absence is decided by the anchored
+    /// walk ([`WorkspaceHandle::resolve_fd`]) plus the no-follow
+    /// [`anchored_absent`] prefix classification ([`RootedDir::entry_meta`]);
+    /// the `joined_raw` fallback helper is gone from the file entirely.
+    #[test]
+    fn probe_source_never_touches_a_raw_pathname() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+        assert!(
+            !src.contains(&("fn joined_".to_string() + "raw")),
+            "the raw-path fallback helper must not exist"
+        );
+        let start = src.find("pub fn probe(").expect("probe exists");
+        let end = src[start..]
+            .find("/// Diff status derived")
+            .map(|i| start + i)
+            .expect("probe section boundary");
+        let probe = &src[start..end];
+        assert!(
+            probe.contains("resolve_fd") && probe.contains("entry_meta"),
+            "the anchored walk must be the classification authority"
+        );
+        for banned in [
+            "std::fs::metadata",
+            "fs::metadata",
+            "symlink_metadata",
+            "canonicalize",
+            "joined_raw",
+        ] {
+            assert!(
+                !probe.contains(banned),
+                "probe must never touch a raw pathname ({banned})"
+            );
+        }
     }
 
     /// Audit bypass 3: classification must be anchored to the SAME walk that

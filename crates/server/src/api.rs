@@ -29,6 +29,7 @@ use faktor_agent::AgentRuntime;
 use faktor_session::SessionManager;
 
 use crate::auth::{AuthToken, ServerPassword};
+use crate::native::terminal_authority::TerminalAuthorityPolicy;
 use crate::permission::ChannelPermissionRequester;
 use crate::worker_plane::{WorkerPlaneHandle, WorkerPlaneStatus};
 
@@ -308,6 +309,16 @@ pub struct ServerDeps {
     /// native health payload reports an explicit `disabled` worker-plane
     /// state and no second socket exists.
     pub worker_plane_listener: Option<WorkerPlaneListener>,
+    /// The terminal execution-authority policy: the ONE admission gate every
+    /// session-owned terminal spawn passes through. The host CONSTRUCTS it
+    /// from its configured `[sandbox]` shell contract
+    /// ([`TerminalAuthorityPolicy::for_configured_sandbox`]) — the configured
+    /// `ShellExecutionMode`/isolation policy is carried verbatim and is what
+    /// the authority enforces AND records in the durable execution profile.
+    /// The field default is the fail-closed `os_isolated`/`Required` shape:
+    /// an embedded host that injects nothing refuses PTY spawns typed rather
+    /// than running an ungated shell.
+    pub terminal_policy: TerminalAuthorityPolicy,
 }
 
 impl ServerDeps {
@@ -400,7 +411,17 @@ impl ServerDeps {
             retention: None,
             sso: None,
             worker_plane_listener: None,
+            terminal_policy: TerminalAuthorityPolicy::default(),
         }
+    }
+
+    /// Wire the terminal execution-authority policy (the configured
+    /// `[sandbox]` shell contract) so every session-owned terminal spawn is
+    /// admitted, enforced and recorded under it. Additive: without it the
+    /// fail-closed `os_isolated` default governs.
+    pub fn with_terminal_policy(mut self, policy: TerminalAuthorityPolicy) -> Self {
+        self.terminal_policy = policy;
+        self
     }
 
     /// Wire the real native snapshot store so `/session/{id}/revert`,
@@ -1432,6 +1453,7 @@ mod updater_tests;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::native::terminal_authority::TerminalService;
     use faktor_core::capability::PermissionDecision;
     use faktor_core::id::{SessionId, WorkspaceId};
     use faktor_core::model::ModelCapabilities;
@@ -1623,6 +1645,19 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The EXPLICIT user-granted shell contract the test deps inject into
+    /// the terminal authority: tests that exercise real session-owned PTY
+    /// spawns must grant it exactly like an operator would — the authority
+    /// default is the fail-closed `os_isolated` shape.
+    pub(crate) fn granted_terminal_policy() -> TerminalAuthorityPolicy {
+        TerminalAuthorityPolicy::for_configured_sandbox(&faktor_sandbox::SandboxPolicy {
+            execute_shell: faktor_sandbox::Rule::Allow,
+            network_guarantee: faktor_sandbox::SandboxGuarantee::None,
+            shell_execution: faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted,
+            ..faktor_sandbox::SandboxPolicy::default()
+        })
+    }
+
     pub(crate) fn test_deps(root: &std::path::Path) -> ServerDeps {
         test_deps_with(root, vec![])
     }
@@ -1679,6 +1714,7 @@ pub(crate) mod tests {
             retention: None,
             sso: None,
             worker_plane_listener: None,
+            terminal_policy: granted_terminal_policy(),
         }
     }
 
@@ -3398,6 +3434,97 @@ pub(crate) mod tests {
         let _ = handle.request_shutdown();
     }
 
+    /// The fail-closed default: an embedded host that injects NO terminal
+    /// policy enforces the `os_isolated`/`Required` contract. On Linux the
+    /// spawn is genuinely confined by the shared network-namespace backend
+    /// and the response carries the honest `os_isolated`/`deny_all` profile;
+    /// on a platform (or host) with no usable backend it is refused typed
+    /// (403 `execution_denied`) BEFORE any PTY exists, no durable
+    /// `terminal_*` row is journaled, and the service stays at zero live
+    /// rows. NEVER an unenforced shell. Reaching an UNISOLATED
+    /// network-capable terminal requires an explicit grant (the granted test
+    /// deps, exercised by the other native terminal tests).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_terminal_spawn_is_isolated_or_refused_under_the_fail_closed_default_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = test_deps(dir.path());
+        deps.terminal_policy = TerminalAuthorityPolicy::default();
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let root = dir.path().join("nt-default-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = manager.create_workspace(root.to_str().unwrap()).unwrap();
+        let session = manager
+            .create_session(ws, "nt-default-refusal", "fake", "m")
+            .unwrap();
+        let sid = session.id().to_string();
+
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/terminal"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"command": "/bin/sleep", "args": ["30"]}))
+            .send()
+            .await
+            .unwrap();
+        match resp.status().as_u16() {
+            200 => {
+                // Linux with a usable kernel/user-namespace policy: the child
+                // really ran inside the sandbox namespace, and the response
+                // records exactly that.
+                if !cfg!(target_os = "linux") {
+                    panic!("no platform without a backend may admit an os_isolated spawn");
+                }
+                let body: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(body["executionProfile"]["shell"], "os_isolated", "{body}");
+                assert_eq!(body["executionProfile"]["network"], "required", "{body}");
+                assert_eq!(
+                    body["executionProfile"]["networkIsolation"], "deny_all",
+                    "the response records the isolation actually applied: {body}"
+                );
+                let terminal_id = body["terminalId"].as_str().unwrap();
+                assert_eq!(
+                    native_kill_terminal(&client, &base, &token, &sid, terminal_id).await,
+                    200
+                );
+            }
+            status => {
+                // Platform truth (macOS/Windows) or a refused unshare: the
+                // typed fail-closed refusal, BEFORE any child exists.
+                assert_eq!(status, 403, "the default is fail-closed");
+                let body: serde_json::Value = resp.json().await.unwrap();
+                assert_eq!(body["code"], "execution_denied", "{body}");
+                assert!(
+                    body["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("sandbox unavailable"),
+                    "{body}"
+                );
+            }
+        }
+
+        // Journal honesty: a refusal journals nothing; an isolated spawn's
+        // rows are exactly the honest os_isolated/deny_all lifecycle. No
+        // terminal is left live.
+        let session_handle = manager
+            .get_session(SessionId::new(sid.parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        for record in session_handle.ledger_terminal_rows(None).unwrap() {
+            let profile: serde_json::Value =
+                serde_json::from_str(&record.row.execution_profile).unwrap();
+            assert_eq!(profile["shell"], "os_isolated", "{profile}");
+            assert_eq!(profile["networkIsolation"], "deny_all", "{profile}");
+        }
+        let service =
+            TerminalService::for_manager_with_policy(&manager, TerminalAuthorityPolicy::default());
+        assert_eq!(service.live_rows(), 0, "no terminal may be left live");
+        let _ = handle.request_shutdown();
+    }
+
     #[tokio::test]
     async fn native_terminal_lists_live_ptys_with_id_pid_alive() {
         // A live PTY on the daemon appears in /native/session/{id}/terminal
@@ -4447,6 +4574,7 @@ pub(crate) mod tests {
             retention: None,
             sso: None,
             worker_plane_listener: None,
+            terminal_policy: granted_terminal_policy(),
         }
     }
 
@@ -5250,11 +5378,13 @@ pub(crate) mod tests {
         );
         assert_eq!(profile["filesystem"], "workspace+external:ask-ask");
         assert_eq!(profile["network"], "none");
-        // Phase D shell contract: the daemon session terminal policy carries
-        // the EXPLICIT user-granted network-capable shell (never presented
-        // as OS isolation) — a verbatim `Required`/`os_isolated` policy is
-        // refused typed before spawn instead (see the terminal_authority
-        // refusal test).
+        // Phase D shell contract (residual closed): these test deps INJECT
+        // the explicit user-granted network-capable shell (never presented as
+        // OS isolation), which is why this spawn is admitted; the
+        // authority's own default — like a default-config daemon — is the
+        // fail-closed `os_isolated` shape and either runs the child in the
+        // sandbox network namespace (Linux) or refuses typed before spawn
+        // (see the default-contract and terminal_authority tests).
         assert_eq!(profile["shell"], "network_capable_user_granted");
         assert!(profile["budgets"]["maxProcesses"].as_u64().unwrap_or(0) > 0);
 
@@ -6302,6 +6432,7 @@ pub(crate) mod tests {
             retention: None,
             sso: None,
             worker_plane_listener: None,
+            terminal_policy: granted_terminal_policy(),
         }
     }
 
@@ -7516,6 +7647,7 @@ pub(crate) mod tests {
             retention: None,
             sso: None,
             worker_plane_listener: None,
+            terminal_policy: granted_terminal_policy(),
         };
         NativeTaskRig {
             deps,

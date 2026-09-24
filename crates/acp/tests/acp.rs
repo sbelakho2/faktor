@@ -3263,7 +3263,9 @@ fn durable_kinds(handle: &faktor_session::SessionHandle) -> Vec<faktor_session::
 
 #[tokio::test]
 async fn durable_terminal_round_trip_through_acp_and_native_adapters_is_identical() {
-    use faktor_server::native::terminal_authority::{TerminalService, TerminalSpawnRequest};
+    use faktor_server::native::terminal_authority::{
+        SessionExecutionAuthority, TerminalAuthorityPolicy, TerminalService, TerminalSpawnRequest,
+    };
 
     let root = std::env::temp_dir().join(format!(
         "faktor-acp-durable-terminal-{}-{:?}",
@@ -3280,9 +3282,18 @@ async fn durable_terminal_round_trip_through_acp_and_native_adapters_is_identica
     let sid = created.id().to_string();
     let session = manager.get_session(created.id()).unwrap().unwrap();
 
-    let service = TerminalService::with_identity_probe(
+    // The EXPLICIT user-granted shell contract: this fixture exercises real
+    // PTY round trips, so it grants the network-capable shell exactly like
+    // an operator would — the authority's default is the fail-closed
+    // `os_isolated` shape and is never widened by this test seam.
+    let granted = TerminalAuthorityPolicy::explicit_user_granted_shell();
+    let service = TerminalService::with_execution_authority(
         manager.clone(),
         Arc::new(|pid: u32| (pid != 0).then_some(1_700_000_000_000)),
+        Arc::new(SessionExecutionAuthority::with_policy(
+            manager.clone(),
+            granted,
+        )),
     );
     let authority: Arc<dyn TerminalAuthority> = Arc::new(DurableAuthority {
         service: Arc::clone(&service),

@@ -207,6 +207,17 @@ impl NetworkIsolation {
     pub const fn is_broker_only(self) -> bool {
         matches!(self, NetworkIsolation::BrokerOnly { .. })
     }
+
+    /// The stable snake_case tag of this mode (`inherit` | `deny_all` |
+    /// `broker_only`): the exact spelling recorded as durable spawn
+    /// evidence (the terminal authority's effective execution profile).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            NetworkIsolation::Inherit => "inherit",
+            NetworkIsolation::DenyAll => "deny_all",
+            NetworkIsolation::BrokerOnly { .. } => "broker_only",
+        }
+    }
 }
 
 impl From<NetworkIsolationRequirement> for NetworkIsolation {
@@ -2616,6 +2627,55 @@ fn mark_network_isolation_proven(cfg: &SpawnConfig) {
         }
         NetworkIsolation::Inherit => {}
     }
+}
+
+/// A reusable OS-level spawn-confinement hook for command builders outside
+/// this crate's supervisor: it installs its confinement on the given command
+/// (post-fork, pre-exec). [`deny_all_spawn_confinement`] returns the one
+/// this crate ships.
+pub type SpawnConfinementHook = Arc<dyn Fn(&mut std::process::Command) + Send + Sync>;
+
+/// The DenyAll spawn-confinement seam for spawn authorities that build
+/// their own child command (the interactive PTY launcher): the EXACT
+/// `unshare(CLONE_NEWNET)` pre-exec hook the supervisor installs for
+/// [`NetworkIsolation::DenyAll`] — one backend, two spawn seams, never a
+/// second isolation implementation. The returned hook installs its
+/// confinement on the given command (the hook itself runs post-fork,
+/// pre-exec).
+///
+/// `Some` only where a backend exists (Linux). `None` is platform truth —
+/// never a silent no-op: a caller holding a `DenyAll` requirement must
+/// refuse the spawn typed before any child exists.
+#[allow(unsafe_code)]
+pub fn deny_all_spawn_confinement() -> Option<SpawnConfinementHook> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(Arc::new(|cmd: &mut std::process::Command| {
+            // SAFETY: `apply_deny_all_isolation` installs the documented
+            // allocation-free unshare pre-exec hook on `cmd` (post-fork,
+            // pre-exec) — the identical hook the supervisor's own DenyAll
+            // spawn path installs.
+            unsafe {
+                sandbox::apply_deny_all_isolation(cmd);
+            }
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Record that the DenyAll backend proved itself active at spawn through a
+/// seam OUTSIDE this crate's supervisor (the PTY confinement hook): the
+/// pre-exec unshare ran on a child that exec'd successfully. The
+/// supervisor's own DenyAll spawn paths record this automatically; every
+/// external seam that reused [`deny_all_spawn_confinement`] must call this
+/// after a successful spawn so [`platform_network_enforcement`] reports the
+/// honest state.
+pub fn record_deny_all_isolation_proven() {
+    #[cfg(target_os = "linux")]
+    DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 // ------------------------------------------------------------------ windows

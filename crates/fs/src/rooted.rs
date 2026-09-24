@@ -31,14 +31,17 @@
 //!   and retained as a HANDLE with the caller's maximum granted rights.
 //!   Reads (`read`/`list_entries`/`walk_bounded`) use the reparse-aware
 //!   handle-relative walk. Every MUTATION — `create_dir_all`,
-//!   `open_create_new`, `remove_tree`, `remove_file`, `atomic_publish` — is
-//!   anchored on the retained root handle: the parent chain is opened
-//!   component-by-component RELATIVE to it with strict no-follow semantics,
-//!   creation is a relative `NtCreateFile` with `FILE_CREATE`, deletion
-//!   opens the target reparse-aware relative to its parent and marks that
-//!   handle for disposition (`FileDispositionInfoEx`), and rename/publish
-//!   is `FileRenameInfoEx` naming an anchored destination parent. After an
-//!   operation begins, no absolute pathname selects the mutated object.
+//!   `open_create_new`, `remove_tree`, `remove_file`, `atomic_publish`,
+//!   `create_symlink` — is anchored on the retained root handle: the parent
+//!   chain is opened component-by-component RELATIVE to it with strict
+//!   no-follow semantics, creation is a relative `NtCreateFile` with
+//!   `FILE_CREATE`, deletion opens the target reparse-aware relative to its
+//!   parent and marks that handle for disposition (`FileDispositionInfoEx`),
+//!   rename/publish is `FileRenameInfoEx` naming an anchored destination
+//!   parent, and symlink creation sets the reparse record on the child
+//!   handle created relative to the pinned parent
+//!   (`FSCTL_SET_REPARSE_POINT`). After an operation begins, no absolute
+//!   pathname selects the mutated object.
 //!   Windows directory fsync has no equivalent, so `sync_dir` is a
 //!   documented no-op there.
 //!
@@ -61,11 +64,11 @@
 //! operation still acts on the pinned object, never on whatever now answers
 //! the old pathname. The irreducible window is the same as unix: the single
 //! rename/create/delete syscall itself (no compare-and-swap form exists).
-//! One mutation is NOT in this surface: [`RootedDir::create_symlink`] still
-//! validates its parent through the reparse-aware walk and then creates the
-//! link with the Win32 API (handle-relative reparse creation needs
-//! `FSCTL_SET_REPARSE_POINT` with a hand-built reparse record; documented
-//! audit residual, no caller uses it on Windows today).
+//! [`RootedDir::create_symlink`] is anchored like every other mutation: the
+//! link entry is created RELATIVE to the pinned parent handle and the
+//! symlink reparse record is written to that handle
+//! (`FSCTL_SET_REPARSE_POINT`); no absolute pathname selects the created
+//! object after the operation begins.
 //!
 //! # Bounded traversal (P0-52)
 //!
@@ -621,33 +624,28 @@ impl RootedDir {
         Ok(dir)
     }
 
-    /// Non-unix: verify the parent directory of `rel` through the
-    /// reparse-aware walk.
-    #[cfg(not(unix))]
+    /// Platforms without a handle-relative walk: verify the parent directory
+    /// of `rel` with a plain path check.
+    #[cfg(not(any(unix, windows)))]
     fn require_parent_dir(&self, rel: &Path) -> Result<(), Error> {
         let (parent, _) = split_final(rel)?;
         self.require_real_dir(&parent)
     }
 
-    /// Non-unix: verify `rel` is a real directory under the reparse-aware
-    /// walk, never a link/reparse escape.
-    #[cfg(not(unix))]
+    /// Platforms without a handle-relative walk: verify `rel` is a real
+    /// directory, never a link escape. Windows no longer uses this fallback:
+    /// every component is opened handle-relative and a reparse point is
+    /// refused by the walk itself.
+    #[cfg(not(any(unix, windows)))]
     fn require_real_dir(&self, rel: &Path) -> Result<(), Error> {
-        #[cfg(windows)]
-        {
-            crate::platform::open_no_follow_walk(&self.root, rel, OpenKind::Directory).map(|_| ())
-        }
-        #[cfg(not(windows))]
-        {
-            let path = self.root.join(rel);
-            if path.is_dir() {
-                Ok(())
-            } else {
-                Err(Error::permission(format!(
-                    "{}: not a directory",
-                    path.display()
-                )))
-            }
+        let path = self.root.join(rel);
+        if path.is_dir() {
+            Ok(())
+        } else {
+            Err(Error::permission(format!(
+                "{}: not a directory",
+                path.display()
+            )))
         }
     }
 }
@@ -1409,10 +1407,15 @@ impl RootedDir {
     }
 
     /// Create one literal symlink at `rel` (parent components must already be
-    /// real directories). Unix uses `symlinkat(2)` on the anchored parent fd;
-    /// Windows verifies the parent through the reparse-aware walk and then
-    /// creates the link with the platform file/dir choice (an existing entry
-    /// is refused).
+    /// real directories). Unix uses `symlinkat(2)` on the anchored parent fd.
+    /// Windows is anchored the same way as every other mutation: the parent
+    /// chain is opened as HANDLES from the retained root handle with strict
+    /// no-follow semantics, the link entry is created RELATIVE to the pinned
+    /// parent (`NtCreateFile` with `FILE_CREATE | FILE_OPEN_REPARSE_POINT`)
+    /// and the symlink reparse record is set on THAT handle
+    /// (`FSCTL_SET_REPARSE_POINT`). After the operation begins, no absolute
+    /// pathname selects the created object, so a parent swapped for a
+    /// junction cannot redirect the create. An existing entry is refused.
     pub fn create_symlink(&self, target: &Path, rel: &Path) -> Result<(), Error> {
         let (parent, name) = split_final(rel)?;
         #[cfg(unix)]
@@ -1422,19 +1425,40 @@ impl RootedDir {
         }
         #[cfg(windows)]
         {
+            // Anchored reparse creation (audit residual closed): the parent
+            // chain is opened as HANDLES from the retained root handle, the
+            // child is created relative to the pinned parent and the reparse
+            // data is written to the created handle. The file-vs-directory
+            // link kind follows the target's current metadata exactly like
+            // the historical Win32 path — it decides only the created
+            // entry's attribute, never containment (the target is stored
+            // literally and is never resolved by this call).
             let _ = (parent, name);
-            self.require_parent_dir(rel)?;
+            let units = crate::platform::validated_relative_units(rel)?;
+            let Some((last, parent_units)) = units.split_last() else {
+                return Err(Error::malformed(format!(
+                    "operation requires a final path component: {rel:?}"
+                )));
+            };
+            if units.len() > MAX_COMPONENTS {
+                return Err(Error::oversized(format!(
+                    "{rel:?} exceeds the {MAX_COMPONENTS}-component bound"
+                )));
+            }
             let link = self.root.join(rel);
             let resolved = if target.is_absolute() {
                 target.to_path_buf()
             } else {
                 link.parent().unwrap_or_else(|| Path::new(".")).join(target)
             };
-            let result = match fs::metadata(&resolved) {
-                Ok(meta) if meta.is_dir() => std::os::windows::fs::symlink_dir(target, &link),
-                _ => std::os::windows::fs::symlink_file(target, &link),
+            let directory = matches!(fs::metadata(&resolved), Ok(meta) if meta.is_dir());
+            let dir = self.windows_anchor_dir(parent_units, rel)?;
+            let parent_handle = match &dir {
+                Some(handle) => handle,
+                None => self.handle.as_ref(),
             };
-            result.map_err(|e| Error::internal(format!("symlink {rel:?}: {e}")))
+            mutation_seam(rel);
+            crate::platform::anchored_create_symlink(parent_handle, last, target, directory, rel)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1700,18 +1724,24 @@ fn unix_read_dir_names(dir: &OwnedFd, rel: &Path) -> Result<Vec<OsString>, Error
     }
 }
 
-/// Open `name` in `dir` read-only with no-follow semantics. A symlink (unix
-/// `ELOOP`, macOS `ENOTDIR` when the entry is a link) is refused typed.
+/// Open `name` in `dir` read-only with no-follow semantics. The open carries
+/// `O_NONBLOCK` so a FIFO swapped in between classification and open cannot
+/// block; the opened fd is `fstat(2)`ed and `O_NONBLOCK` is cleared for a
+/// regular file/directory (`crate::platform::finalize_read_open`), while a
+/// FIFO/socket/device is a typed refusal. A symlink (unix `ELOOP`, macOS
+/// `ENOTDIR` when the entry is a link) is refused typed.
 #[cfg(unix)]
 fn unix_open_read_at(dir: &OwnedFd, name: &OsStr, rel: &Path) -> Result<OwnedFd, Error> {
     let c = unix_cstring(name)?;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `c` is NUL-terminated and relative to the live directory fd
     // `dir`; no O_CREAT so no mode argument is required.
     let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
     if fd >= 0 {
         // SAFETY: fresh descriptor owned by this function.
-        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        crate::platform::finalize_read_open(&fd, rel)?;
+        return Ok(fd);
     }
     let e = io::Error::last_os_error();
     let is_link = matches!(e.raw_os_error(), Some(libc::ELOOP))
@@ -2587,6 +2617,121 @@ mod tests {
             let err = dir.read(Path::new("link"), 64).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Permission, "{err}");
             assert_eq!(dir.read_link(Path::new("link")).unwrap(), outside.join("t"));
+        }
+
+        // ----------------------------------------------------------------
+        // Non-blocking read opens (FIFO swapped in at the read target)
+        // ----------------------------------------------------------------
+
+        fn mkfifo_at(path: &Path) {
+            let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c` is a NUL-terminated path inside the test tempdir;
+            // mode 0600 keeps the FIFO owner-only.
+            let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+            assert_eq!(rc, 0, "mkfifo: {}", io::Error::last_os_error());
+        }
+
+        /// A FIFO swapped in at the read target must never block the open:
+        /// `RootedDir::open_read` opens with `O_NONBLOCK`, `fstat(2)`s the
+        /// opened fd and refuses the special file typed within bounded wall
+        /// time (the channel timeout is the bound; a regression hangs the
+        /// worker and fails the receive).
+        #[test]
+        fn fifo_planted_at_a_rooted_read_target_is_refused_without_blocking() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            let dir = anchored(&root);
+            dir.create_dir_all(Path::new("d")).unwrap();
+            mkfifo_at(&root.join("d/pipe"));
+
+            let probe = dir.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = probe.read(Path::new("d/pipe"), 4096).map(|_| ());
+                let _ = tx.send(result);
+            });
+            let outcome = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reading a FIFO through the anchored walk must not block");
+            let err = outcome.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+            assert!(
+                err.message.contains("special file"),
+                "the refusal must name the special-file rule: {err}"
+            );
+            worker.join().unwrap();
+
+            // Enumeration is unchanged: the FIFO is classified, never opened.
+            let listing = dir.list_entries(Path::new("d"), 10).unwrap();
+            assert_eq!(listing.entries.len(), 1);
+            assert_eq!(listing.entries[0].kind, RootedEntryKind::Other);
+            assert!(listing.entries[0].is_other());
+        }
+
+        /// The platform read walk (the `WorkspaceHandle` read/stat path) has
+        /// the same guarantee: `OpenKind::Read` refuses a FIFO typed and
+        /// promptly, without ever reading it.
+        #[test]
+        fn fifo_planted_in_the_platform_read_walk_is_refused_without_blocking() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            mkfifo_at(&root.join("pipe"));
+
+            let root_thread = root.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = crate::platform::open_no_follow_walk(
+                    &root_thread,
+                    Path::new("pipe"),
+                    crate::platform::OpenKind::Read,
+                )
+                .map(|_| ());
+                let _ = tx.send(result);
+            });
+            let outcome = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a FIFO read open must not block");
+            let err = outcome.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{err}");
+            worker.join().unwrap();
+        }
+
+        /// Regular files are unchanged: the returned fd is blocking again
+        /// (`O_NONBLOCK` cleared after the fstat classification) and the
+        /// bytes are exactly the file's.
+        #[test]
+        fn regular_file_read_fd_is_blocking_after_classification() {
+            use std::os::fd::AsRawFd;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            let dir = anchored(&root);
+            std::fs::write(root.join("note.txt"), b"regular-content").unwrap();
+
+            let f = dir.open_read(Path::new("note.txt")).unwrap();
+            // SAFETY: `f` is a live fd; F_GETFL only reads its status flags.
+            let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL: {}", io::Error::last_os_error());
+            assert_eq!(
+                flags & libc::O_NONBLOCK,
+                0,
+                "a regular-file read fd must be handed out blocking"
+            );
+            let data = dir.read(Path::new("note.txt"), 64).unwrap();
+            assert_eq!(data.bytes, b"regular-content");
+            assert!(data.digest.is_full());
+
+            // The platform walk applies the same rule.
+            let fd = crate::platform::open_no_follow_walk(
+                &root,
+                Path::new("note.txt"),
+                crate::platform::OpenKind::Read,
+            )
+            .unwrap();
+            // SAFETY: `fd` is a live descriptor; F_GETFL only reads its flags.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL: {}", io::Error::last_os_error());
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
         }
     }
 }
