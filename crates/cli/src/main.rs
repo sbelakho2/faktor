@@ -2253,23 +2253,33 @@ fn serve_config_and_semantic(
     Ok((config, semantic))
 }
 
-/// The terminal execution-authority policy for the configured `[sandbox]`
-/// shell contract: the ONE construction the daemon entry points (`serve`,
-/// `acp`) inject into the terminal authority AT CONSTRUCTION and the doctor
-/// reads back. The configured `ShellExecutionMode`/isolation policy is
-/// carried VERBATIM (no global read, no hardcoded grant, no widening); the
-/// fail-closed `os_isolated`/`Required` default applies when nothing is
-/// configured, and an invalid pairing (e.g. a user-granted shell with a
-/// `required` guarantee) is refused here, never half-honored.
+/// The interactive-terminal execution-authority policy for the configured
+/// `[sandbox] shell` setting: the ONE construction the daemon entry points
+/// (`serve`, `acp`) inject into the terminal authority AT CONSTRUCTION and
+/// the doctor reads back. Interactive session terminals are user-initiated
+/// and form their OWN trust class, distinct from the agent shell tool:
+/// an UNSET `shell` selects the honest user-granted default
+/// (`network_capable_user_granted`, no isolation claim, `inherit`), an
+/// explicit `shell = "os_isolated"` demands OS isolation for terminals too
+/// (typed refusal where no backend exists; Linux keeps the netns path), and
+/// an explicit grant carries the configured non-required guarantee. The
+/// AGENT class is resolved separately by `Config::sandbox_policy` (always
+/// the secure `os_isolated`/`required` default when unset) and can never
+/// inherit the terminal grant. The pairing is validated at this boundary —
+/// the same refusal the daemon startup applies — never half-honored.
 fn terminal_authority_policy(
     config: &config::Config,
 ) -> Result<faktor_server::native::terminal_authority::TerminalAuthorityPolicy, String> {
-    let policy = config
+    // Boundary validation: an invalid shell/guarantee pairing or an
+    // unparseable destination rule is refused here exactly as the daemon
+    // build refuses it.
+    config
         .sandbox_policy()
         .map_err(|e| format!("sandbox config: {e}"))?;
     Ok(
-        faktor_server::native::terminal_authority::TerminalAuthorityPolicy::for_configured_sandbox(
-            &policy,
+        faktor_server::native::terminal_authority::TerminalAuthorityPolicy::for_interactive_session_terminals(
+            config.sandbox.shell,
+            config.sandbox.network_guarantee,
         ),
     )
 }
@@ -2935,13 +2945,16 @@ async fn serve_impl(
         Ok(loaded) => loaded,
         Err(e) => return Err(format!("config error: {e}")),
     };
-    // The terminal execution-authority policy — the configured `[sandbox]`
-    // shell contract (`ShellExecutionMode` + its isolation guarantee) —
-    // resolved BEFORE the config is consumed and injected EXPLICITLY into
-    // the server surface below. The authority never reads a global and never
-    // widens the contract: the configured mode is what it enforces and what
-    // the durable execution profile records; the fail-closed `os_isolated`
-    // default applies when nothing is configured.
+    // The INTERACTIVE session-terminal execution-authority policy — the
+    // user-initiated trust class — resolved BEFORE the config is consumed
+    // and injected EXPLICITLY into the server surface below. An unset
+    // `[sandbox] shell` selects the honest user-granted network-capable
+    // default (no isolation claim); an EXPLICIT `shell = "os_isolated"`
+    // restores OS isolation/typed refusal for terminals. The authority
+    // never reads a global and never widens: what it enforces is what the
+    // durable execution profile records. The agent shell-tool class keeps
+    // its own secure default through `Config::sandbox_policy` and never
+    // inherits this grant.
     let terminal_policy = terminal_authority_policy(&config)?;
     // Live chunk path (audit 41): BOUNDED channel (1024 events) + sink-side
     // coalescing under backpressure — a slow SSE consumer can never grow
@@ -3607,10 +3620,11 @@ async fn run(prompt: String, provider: &str, model: &str, workspace: PathBuf, da
 /// ACP wire protocol on stdin/stdout until EOF or `shutdown`.
 async fn acp(data_dir: PathBuf) {
     let config = load_acp_config(&data_dir);
-    // The terminal execution-authority policy — the configured `[sandbox]`
-    // shell contract — resolved BEFORE the config is consumed: the ACP
-    // terminal authority receives it at construction (explicit injection;
-    // no global read, no hardcoded grant).
+    // The interactive session-terminal execution-authority policy — the
+    // user-initiated trust class, resolved BEFORE the config is consumed —
+    // so the ACP terminal authority receives it at construction (explicit
+    // injection; no global read, no hardcoded grant). Unset means the
+    // honest user-granted default; explicit `os_isolated` isolates/refuses.
     let terminal_policy = match terminal_authority_policy(&config) {
         Ok(policy) => policy,
         Err(e) => {
@@ -5358,22 +5372,23 @@ fn doctor_index_reason_fragment(reason: &str) -> String {
     fragment.trim().to_string()
 }
 
-/// The `[worker_plane]` deployment-boundary audit: records the resolved
-/// exposure decision (including the `trusted_gateway` acknowledgement) in the
-/// doctor report. A refused boundary is an ISSUE — the daemon refuses to
-/// start on it — and is surfaced, never repaired. With no `--config` named
-/// the check is skipped (the config-free doctor path is unchanged).
-///
-/// The config goes through the SAME load+validate path serve uses
-/// (`serve_config_and_semantic`: structural strictness, `[semantic]` split,
-/// semantic validation, provider/MCP/embedding/billing/worker bounds). A
-/// config the daemon would refuse is reported as `state=refused` — never as
 /// The doctor's shell-execution surface (item 10): reports the effective
-/// `[sandbox]` shell contract with its honest strength label, so an
-/// OS-isolated shell and a user-granted network-capable shell are never
-/// presented as equivalent. Uses the explicit `--config` when given and the
-/// daemon defaults otherwise; a config the daemon would refuse is reported
-/// as an issue, never silently rendered as a healthy state.
+/// shell contract of BOTH trust classes with their honest strength labels,
+/// so an OS-isolated shell and a user-granted network-capable shell are
+/// never presented as equivalent and an interactive-terminal grant is never
+/// mistaken for the agent shell-tool contract:
+///
+/// - `agent shell tool`: `Config::sandbox_policy` — the policy behind every
+///   agent-generated `run_command`/supervised shell spawn (secure
+///   `os_isolated`/`required` default when `[sandbox] shell` is unset).
+/// - `interactive session terminals`: [`terminal_authority_policy`] — the
+///   policy injected into the daemon terminal authority (the honest
+///   user-granted default when `[sandbox] shell` is unset; isolation only
+///   when the operator configures it explicitly).
+///
+/// Uses the explicit `--config` when given and the daemon defaults
+/// otherwise; a config the daemon would refuse is reported as an issue,
+/// never silently rendered as a healthy state.
 fn doctor_sandbox_shell_line(
     config_path: Option<&std::path::Path>,
     lines: &mut Vec<String>,
@@ -5389,22 +5404,40 @@ fn doctor_sandbox_shell_line(
         },
         None => config::Config::default(),
     };
-    match terminal_authority_policy(&cfg) {
-        Ok(terminal_authority) => {
-            // The effective contract is read back from the SAME construction
-            // seam the daemon injects into its terminal authority: what
-            // doctor prints is exactly the mode the daemon enforces and
-            // records.
-            let state = terminal_authority.shell_execution_state();
-            lines.push(format!(
-                "sandbox shell execution: {} (mode={}, network_guarantee={})",
-                state.strength_label(),
-                state.mode.as_tag(),
-                state.network_guarantee.as_tag(),
-            ));
-        }
+    push_shell_class_line(
+        "agent shell tool",
+        cfg.sandbox_policy()
+            .map(|policy| policy.shell_execution_state()),
+        lines,
+        issues,
+    );
+    push_shell_class_line(
+        "interactive session terminals",
+        terminal_authority_policy(&cfg).map(|authority| authority.shell_execution_state()),
+        lines,
+        issues,
+    );
+}
+
+/// One doctor line for one shell-execution trust class. The state is read
+/// back from the SAME construction seam the daemon injects, so doctor prints
+/// exactly the mode that class enforces and records; a refusal is an issue,
+/// never a silently rendered healthy state.
+fn push_shell_class_line(
+    class: &str,
+    state: Result<faktor_sandbox::ShellExecutionState, String>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    match state {
+        Ok(state) => lines.push(format!(
+            "sandbox shell execution ({class}): {} (mode={}, network_guarantee={})",
+            state.strength_label(),
+            state.mode.as_tag(),
+            state.network_guarantee.as_tag(),
+        )),
         Err(e) => {
-            lines.push(format!("sandbox shell execution: FAILED {e}"));
+            lines.push(format!("sandbox shell execution ({class}): FAILED {e}"));
             *issues += 1;
         }
     }
@@ -5440,6 +5473,16 @@ fn doctor_network_isolation_line(lines: &mut Vec<String>) {
     ));
 }
 
+/// The `[worker_plane]` deployment-boundary audit: records the resolved
+/// exposure decision (including the `trusted_gateway` acknowledgement) in the
+/// doctor report. A refused boundary is an ISSUE — the daemon refuses to
+/// start on it — and is surfaced, never repaired. With no `--config` named
+/// the check is skipped (the config-free doctor path is unchanged).
+///
+/// The config goes through the SAME load+validate path serve uses
+/// (`serve_config_and_semantic`: structural strictness, `[semantic]` split,
+/// semantic validation, provider/MCP/embedding/billing/worker bounds). A
+/// config the daemon would refuse is reported as `state=refused` — never as
 /// "enabled" — so the doctor cannot certify a daemon that would not start.
 fn doctor_worker_plane_line(
     config_path: Option<&std::path::Path>,
@@ -8898,29 +8941,40 @@ mod tests {
         assert!(report.issues >= 1, "{:?}", report.lines);
     }
 
-    /// The doctor's shell-execution surface reads the SAME source the daemon
-    /// injects into its terminal authority: the effective
-    /// `TerminalAuthorityPolicy` mode. The config default is the fail-closed
-    /// `os_isolated`; only an explicit grant config flips it to
-    /// `network_capable_user_granted`, and the printed mode equals the
-    /// authority's `shell_execution_state()`.
+    /// The doctor's shell-execution surface reads the SAME sources the
+    /// daemon injects and reports BOTH trust classes separately and
+    /// honestly: an unset `[sandbox] shell` keeps the agent shell tool on
+    /// the fail-closed `os_isolated`/`required` default while the
+    /// interactive session-terminal class carries the honest user-granted
+    /// network-capable default; explicit settings show up on both classes.
     #[test]
-    fn doctor_prints_the_terminal_authority_effective_shell_mode() {
-        // No --config: the daemon default contract (os_isolated/Required).
+    fn doctor_prints_both_shell_trust_classes_separately_and_honestly() {
+        // No --config: two DISTINCT class lines (agent secure, terminals
+        // user-granted), never merged into one implied contract.
         let mut lines = Vec::new();
         let mut issues = 0usize;
         doctor_sandbox_shell_line(None, &mut lines, &mut issues);
         assert_eq!(issues, 0);
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
-            lines[0].contains("mode=os_isolated")
-                && lines[0].contains("network_guarantee=required"),
-            "the default is the fail-closed OS-isolated contract: {}",
+            lines[0].contains("(agent shell tool)")
+                && lines[0].contains("mode=os_isolated")
+                && lines[0].contains("network_guarantee=required")
+                && lines[0].contains("OS-isolated"),
+            "the agent class default is the fail-closed OS-isolated contract: {}",
             lines[0]
         );
-        assert!(lines[0].contains("OS-isolated"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("(interactive session terminals)")
+                && lines[1].contains("mode=network_capable_user_granted")
+                && lines[1].contains("network_guarantee=none")
+                && lines[1].contains("GRANTED BY USER"),
+            "the terminal class default is the honest user grant, never isolation: {}",
+            lines[1]
+        );
 
-        // Explicit OS isolation in config: same contract, same source.
+        // Explicit OS isolation in config: BOTH classes report the
+        // isolated contract, from the same source the daemon injects.
         let dir = tempfile::tempdir().unwrap();
         let os_config = dir.path().join("os.json");
         std::fs::write(
@@ -8932,10 +8986,17 @@ mod tests {
         let mut issues = 0usize;
         doctor_sandbox_shell_line(Some(&os_config), &mut lines, &mut issues);
         assert_eq!(issues, 0, "{lines:?}");
-        assert!(lines[0].contains("mode=os_isolated"), "{}", lines[0]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.contains("mode=os_isolated") && line.contains("network_guarantee=required"),
+                "{line}"
+            );
+        }
 
         // The EXPLICIT operator grant: the doctor reports exactly the mode
-        // the authority constructed from the same config enforces.
+        // the authority constructed from the same config enforces, for both
+        // classes.
         let grant_config = dir.path().join("grant.json");
         std::fs::write(
             &grant_config,
@@ -8946,12 +9007,15 @@ mod tests {
         let mut issues = 0usize;
         doctor_sandbox_shell_line(Some(&grant_config), &mut lines, &mut issues);
         assert_eq!(issues, 0, "{lines:?}");
-        assert!(
-            lines[0].contains("mode=network_capable_user_granted")
-                && lines[0].contains("GRANTED BY USER"),
-            "the grant is surfaced as strictly weaker, never as isolation: {}",
-            lines[0]
-        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.contains("mode=network_capable_user_granted")
+                    && line.contains("network_guarantee=none")
+                    && line.contains("GRANTED BY USER"),
+                "the grant is surfaced as strictly weaker, never as isolation: {line}"
+            );
+        }
 
         // The SAME config feeds the authority the daemon injects, and the
         // authority reports the mode doctor printed.
@@ -8965,32 +9029,23 @@ mod tests {
         );
     }
 
-    /// The construction seam both daemon entry points use injects exactly
-    /// the configured contract: the default resolves the fail-closed
-    /// `os_isolated`/`Required` shape, an explicit grant config resolves the
-    /// honest user-granted mode, and an invalid pairing is refused here —
-    /// never silently reinterpreted.
+    /// The construction seam both daemon entry points use resolves the
+    /// INTERACTIVE terminal class: unset selects the honest user grant
+    /// (never the agent class's secure default), explicit `os_isolated`
+    /// selects isolation/typed refusal, an explicit grant selects the
+    /// granted shape, and an invalid pairing is refused here — never
+    /// silently reinterpreted. The planted fixture pins the invariant that
+    /// the terminal grant can NEVER widen the agent shell-tool class.
     #[test]
-    fn terminal_authority_policy_carries_the_configured_shell_contract_verbatim() {
-        let default_policy = terminal_authority_policy(&config::Config::default())
-            .expect("the default config resolves");
-        let state = default_policy.shell_execution_state();
-        assert_eq!(state.mode, faktor_sandbox::ShellExecutionMode::OsIsolated);
-        assert_eq!(
-            state.network_guarantee,
-            faktor_sandbox::SandboxGuarantee::Required
-        );
-
-        let grant = config::Config {
-            sandbox: config::SandboxCfg {
-                network_guarantee: faktor_sandbox::SandboxGuarantee::None,
-                shell: faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted,
-                ..config::SandboxCfg::default()
-            },
-            ..config::Config::default()
-        };
-        let granted = terminal_authority_policy(&grant).expect("an explicit grant resolves");
-        let state = granted.shell_execution_state();
+    fn terminal_authority_policy_resolves_the_interactive_class_and_never_widens_the_agent_class() {
+        // Unset: the interactive class default is the user grant; the agent
+        // shell-tool class keeps `os_isolated`/`required` (the PLANTED
+        // FIXTURE: an implicitly granted terminal class does not widen the
+        // agent class).
+        let default_cfg = config::Config::default();
+        let terminals =
+            terminal_authority_policy(&default_cfg).expect("the default config resolves");
+        let state = terminals.shell_execution_state();
         assert_eq!(
             state.mode,
             faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted
@@ -8999,6 +9054,72 @@ mod tests {
             state.network_guarantee,
             faktor_sandbox::SandboxGuarantee::None
         );
+        let agent = default_cfg
+            .sandbox_policy()
+            .expect("the agent policy resolves");
+        assert_eq!(
+            agent.shell_execution,
+            faktor_sandbox::ShellExecutionMode::OsIsolated,
+            "no terminal grant may widen the agent shell-tool class"
+        );
+        assert_eq!(
+            agent.network_guarantee,
+            faktor_sandbox::SandboxGuarantee::Required
+        );
+
+        // Explicit OS isolation: both classes isolate (terminals refuse
+        // typed where no OS backend exists; the isolation demand is real).
+        let os_config = config::Config {
+            sandbox: config::SandboxCfg {
+                network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
+                shell: Some(faktor_sandbox::ShellExecutionMode::OsIsolated),
+                ..config::SandboxCfg::default()
+            },
+            ..config::Config::default()
+        };
+        let terminals = terminal_authority_policy(&os_config).expect("explicit isolation resolves");
+        let state = terminals.shell_execution_state();
+        assert_eq!(state.mode, faktor_sandbox::ShellExecutionMode::OsIsolated);
+        assert_eq!(
+            state.network_guarantee,
+            faktor_sandbox::SandboxGuarantee::Required
+        );
+        assert_eq!(
+            os_config
+                .sandbox_policy()
+                .expect("the agent policy resolves")
+                .shell_execution,
+            faktor_sandbox::ShellExecutionMode::OsIsolated
+        );
+
+        // Explicit grant: both classes carry the grant and the configured
+        // non-required guarantee.
+        let grant = config::Config {
+            sandbox: config::SandboxCfg {
+                network_guarantee: faktor_sandbox::SandboxGuarantee::None,
+                shell: Some(faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted),
+                ..config::SandboxCfg::default()
+            },
+            ..config::Config::default()
+        };
+        for state in [
+            terminal_authority_policy(&grant)
+                .expect("an explicit terminal grant resolves")
+                .shell_execution_state(),
+            grant
+                .sandbox_policy()
+                .expect("the agent policy resolves")
+                .shell_execution_state(),
+        ] {
+            assert_eq!(
+                state.mode,
+                faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted
+            );
+            assert_eq!(
+                state.network_guarantee,
+                faktor_sandbox::SandboxGuarantee::None
+            );
+        }
 
         // A user-granted shell paired with the OS-isolation requirement is
         // the invalid pairing `SandboxPolicy::validate` refuses (the daemon
@@ -9006,7 +9127,7 @@ mod tests {
         let invalid = config::Config {
             sandbox: config::SandboxCfg {
                 network_guarantee: faktor_sandbox::SandboxGuarantee::Required,
-                shell: faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted,
+                shell: Some(faktor_sandbox::ShellExecutionMode::NetworkCapableUserGranted),
                 ..config::SandboxCfg::default()
             },
             ..config::Config::default()
