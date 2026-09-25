@@ -115,7 +115,7 @@ steps:
   # running image and that apt points at the fixed snapshot only
   # (scripts/build-ci-image.sh --verify-runtime).
   - name: ci-image
-    image: faktor-ci@sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:1c8391cf370c8eb7c3dda00894b4a4c5d99c05b31cfd7666207c9d13bf8e9178 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
     pull: false
     commands:
       - sh scripts/build-ci-image.sh --verify-runtime
@@ -268,7 +268,7 @@ steps:
     # Runs on the digest-pinned Faktor CI image: it carries git (the lane
     # marker's `git rev-parse 'HEAD^{tree}'` tree binding) and the JDK 17
     # that the pinned Gradle wrapper (9.7.1) requires.
-    image: faktor-ci@sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:1c8391cf370c8eb7c3dda00894b4a4c5d99c05b31cfd7666207c9d13bf8e9178 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
     depends_on: [ci-image]
     commands:
@@ -305,7 +305,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
-    image: faktor-ci@sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
+    image: ghcr.io/sbelakho2/faktor-ci@sha256:1c8391cf370c8eb7c3dda00894b4a4c5d99c05b31cfd7666207c9d13bf8e9178 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
     depends_on: [ci-image]
     environment:

@@ -2,4 +2,4 @@
 # Built from docker/faktor-ci/Dockerfile by scripts/build-ci-image.sh;
 # read by scripts/check-ci-image-pins.sh and the trusted attestation step
 # (build_environment_digest). Rebuild + re-record deliberately; do not hand-edit.
-sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b
+sha256:1c8391cf370c8eb7c3dda00894b4a4c5d99c05b31cfd7666207c9d13bf8e9178
