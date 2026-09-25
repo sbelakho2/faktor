@@ -658,7 +658,7 @@ steps:
         observed_pipeline_id="$(node - "${WOODPECKER_HOST:-}" "${WOODPECKER_TOKEN:-}" "$CI_REPO" "${CI_PIPELINE_NUMBER:?}" <<'OBSERVED_ID'
         const [host, token, repo, number] = process.argv.slice(2);
         const fail = (message) => {
-          console.error(`observed-pipeline-id-lookup-failed: ${message}`);
+          console.error("observed-pipeline-id-lookup-failed: " + message);
           process.exit(1);
         };
         if (!host || !token || !repo || !number) {
@@ -666,20 +666,20 @@ steps:
         }
         const base = host.replace(/\/+$/, "");
         const get = async (path) => {
-          const res = await fetch(`${base}/api${path}`, { headers: { Authorization: `Bearer ${token}` } });
-          if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`);
+          const res = await fetch(base + "/api" + path, { headers: { Authorization: "Bearer " + token } });
+          if (!res.ok) throw new Error("GET " + path + " -> HTTP " + res.status);
           return res.json();
         };
         (async () => {
-          const lookup = await get(`/repos/lookup/${repo}?project=trusted`);
+          const lookup = await get("/repos/lookup/" + repo + "?project=trusted");
           const repoId = lookup.id;
           if (repoId === undefined || repoId === null || repoId === "") {
-            throw new Error(`repository lookup for ${repo} returned no id`);
+            throw new Error("repository lookup for " + repo + " returned no id");
           }
-          const detail = await get(`/repos/${encodeURIComponent(repoId)}/pipelines/${encodeURIComponent(number)}`);
+          const detail = await get("/repos/" + encodeURIComponent(repoId) + "/pipelines/" + encodeURIComponent(number));
           const observedId = detail.id;
           if (observedId === undefined || observedId === null || String(observedId) === "") {
-            throw new Error(`pipeline ${number} detail returned no id`);
+            throw new Error("pipeline " + number + " detail returned no id");
           }
           process.stdout.write(String(observedId));
         })().catch((error) => fail(error.message));
