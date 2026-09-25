@@ -1,0 +1,10 @@
+{
+  "identities": {
+    "faktor-ci": {
+      "ed25519_public_key": "NLjw6YR8jxJL39avmya9ELc+mK6KLCz6bpCBa6MWLJM="
+    },
+    "faktor": {
+      "ed25519_public_key": "NLjw6YR8jxJL39avmya9ELc+mK6KLCz6bpCBa6MWLJM="
+    }
+  }
+}
