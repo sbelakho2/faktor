@@ -83,6 +83,16 @@ const CHILD_ID: &str = "shadow";
 pub const SHADOW_COPY_ATTEMPTS: usize = 3;
 /// Directories the shadow copy never materializes (VCS bookkeeping is not
 /// content; the root snapshot digest skips exactly these).
+///
+/// Generated/build directories (`target`, `node_modules`, `.gradle`, build
+/// dirs, ...) are deliberately NOT in this list: they are part of the
+/// shadowed workspace content. [`faktor_fs::tree_manifest::TREE_MANIFEST_SKIP_DIRS`]
+/// (the run-base/candidate identity the shadow mirrors) skips only VCS
+/// bookkeeping, so the preflight and the copy keep exact parity with it. An
+/// actively built checkout is therefore handled by concurrent-vanish
+/// tolerance in [`bounded_base_preflight`] plus the stable-copy retry
+/// contract — never by silently dropping a build tree from the shadowed
+/// content (a dropped tree would change what the run may observe and land).
 const SHADOW_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 
 /// A stored shadow base copy: the daemon-owned work root of a shadowed
@@ -135,6 +145,13 @@ pub enum ShadowRetireFault {
     Once,
 }
 
+/// Test seam of the bounded preflight (adversarial tests): invoked with
+/// every enumerated entry's absolute path immediately before its metadata
+/// read, so a test can delete (or otherwise mutate) the entry in the
+/// enumeration -> metadata window deterministically.
+#[cfg(test)]
+type PreflightSeam = Box<dyn FnMut(&Path) + Send>;
+
 /// Typed refusal of [`ShadowRoots::new`] (audit residual): the service is
 /// rooted at a path that cannot be trusted as a daemon-owned shadow root, or
 /// constructed with copy limits that cannot bound a base copy.
@@ -171,6 +188,8 @@ pub struct ShadowRoots {
     limits: ShadowCopyLimits,
     #[cfg(test)]
     copy_seam: Arc<Mutex<Option<ShadowCopyDrift>>>,
+    #[cfg(test)]
+    preflight_seam: Arc<Mutex<Option<PreflightSeam>>>,
     #[cfg(test)]
     retire_fault: Arc<Mutex<Option<ShadowRetireFault>>>,
 }
@@ -239,6 +258,8 @@ impl ShadowRoots {
             #[cfg(test)]
             copy_seam: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            preflight_seam: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             retire_fault: Arc::new(Mutex::new(None)),
         }))
     }
@@ -273,8 +294,11 @@ impl ShadowRoots {
     ///
     /// Copy order is deterministic and zero-orphan-safe: directory, stable
     /// bounded copy (`.git` plumbing skipped; symlink escapes, unreadable
-    /// files and trees beyond the caps fail LOUDLY with typed errors),
-    /// durable base manifest, durable run base, durable active row. A
+    /// files and trees beyond the caps fail LOUDLY with typed errors, while
+    /// an entry CONCURRENTLY DELETED between enumeration and its metadata
+    /// read is benign workspace churn and is skipped — see
+    /// [`bounded_base_preflight`]), durable base manifest, durable run
+    /// base, durable active row. A
     /// failure at any point removes the partial directory; a crash between
     /// steps leaves a row-less directory (removed by
     /// [`ShadowRoots::reconcile`]) or orphan manifest/run-base rows
@@ -322,7 +346,8 @@ impl ShadowRoots {
         // build artifacts) refuses typed here in bounded time instead of
         // hashing the whole tree — the historic unbounded phase that stalled
         // the frozen prompt.
-        bounded_base_preflight(&base, &self.limits)?;
+        let mut preflight_seam = self.preflight_observer();
+        bounded_base_preflight(&base, &self.limits, &mut preflight_seam)?;
         let shadow_id = format!(
             "sh-{:016x}",
             self.manager
@@ -887,6 +912,37 @@ impl ShadowRoots {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ShadowRetireFault::Once);
     }
 
+    /// Test-only: arm the preflight seam of THIS service instance. The hook
+    /// fires for every entry the next preflight enumerates, immediately
+    /// before its metadata read (the window a concurrent build's deletion
+    /// occupies).
+    #[cfg(test)]
+    pub fn arm_preflight_seam(&self, hook: impl FnMut(&Path) + Send + 'static) {
+        *self
+            .preflight_seam
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// The per-entry observer handed to [`bounded_base_preflight`]:
+    /// production compiles to a no-op, tests route the armed seam.
+    fn preflight_observer(&self) -> impl FnMut(&Path) + '_ {
+        #[cfg(test)]
+        {
+            let seam = Arc::clone(&self.preflight_seam);
+            move |path: &Path| {
+                let mut guard = seam.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(hook) = guard.as_mut() {
+                    hook(path);
+                }
+            }
+        }
+        #[cfg(not(test))]
+        {
+            |_path: &Path| {}
+        }
+    }
+
     #[cfg(not(test))]
     fn check_copy_seam(&self, _owner: &Path, _attempt: usize) {}
 }
@@ -947,7 +1003,32 @@ fn shadow_copy_error(what: &str, e: faktor_fs::tree_manifest::TreeManifestError)
 /// stable-copy digests ([`tree_manifest`](faktor_fs::tree_manifest::tree_manifest))
 /// could hash a possibly huge tree. Every wait in `begin_shadow` after this
 /// point is bounded by the caps it admitted.
-fn bounded_base_preflight(base: &Path, limits: &ShadowCopyLimits) -> Result<(), ExecError> {
+///
+/// # Concurrent-workspace churn
+///
+/// The base is a live user checkout and may be actively built while this
+/// runs (the JetBrains smoke shadows the repo itself). An entry that
+/// vanishes (`NotFound`) between enumeration and its metadata or link-target
+/// read — or a nested directory removed between its parent's enumeration and
+/// its descent — is BENIGN concurrent churn: it is re-checked once and, when
+/// still absent, skipped. It is no longer part of the tree the stable copy
+/// will materialize, exactly like a deletion that lands a moment later.
+///
+/// Generated/build directories are deliberately NOT skipped
+/// ([`SHADOW_SKIP_DIRS`] mirrors the canonical manifest: VCS bookkeeping
+/// only), so this vanish tolerance — plus the stable-copy retry contract —
+/// is the churn policy, never a silent drop of build content. A vanished
+/// entry can never hide a cap violation: it is still counted against the
+/// entry cap, and every entry that IS present is measured.
+///
+/// Failures that are genuine drift stay typed: the BASE ROOT itself missing
+/// or unreadable (including a root that vanishes mid-walk), a persistent
+/// metadata failure, and any permission or i/o error.
+fn bounded_base_preflight(
+    base: &Path,
+    limits: &ShadowCopyLimits,
+    on_enumerated: &mut dyn FnMut(&Path),
+) -> Result<(), ExecError> {
     use faktor_fs::tree_manifest::MAX_TREE_MANIFEST_DEPTH;
     let oversized = |what: &str| {
         ExecError::Oversized(format!(
@@ -965,8 +1046,13 @@ fn bounded_base_preflight(base: &Path, limits: &ShadowCopyLimits) -> Result<(), 
         if depth > MAX_TREE_MANIFEST_DEPTH {
             return Err(oversized("exceeds the manifest depth bound"));
         }
-        let read =
-            std::fs::read_dir(&dir).map_err(|e| io(&format!("read_dir {}", dir.display()), e))?;
+        // Only the BASE root's own unavailability is drift; a nested
+        // directory removed by a concurrent build is churn and is skipped.
+        let Some(read) = list_preflight_dir(&dir, depth == 0)
+            .map_err(|e| io(&format!("read_dir {}", dir.display()), e))?
+        else {
+            continue;
+        };
         for entry in read {
             let entry = entry.map_err(|e| io(&format!("read_dir {}", dir.display()), e))?;
             entries += 1;
@@ -977,12 +1063,23 @@ fn bounded_base_preflight(base: &Path, limits: &ShadowCopyLimits) -> Result<(), 
                 )));
             }
             let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path)
-                .map_err(|e| io(&format!("metadata {}", path.display()), e))?;
+            on_enumerated(&path);
+            // A file deleted between enumeration and metadata is benign
+            // workspace churn: re-check once, then skip — it is no longer
+            // part of the tree. Every OTHER failure (permission, i/o) stays
+            // typed.
+            let Some(meta) = preflight_symlink_metadata(&path)
+                .map_err(|e| io(&format!("metadata {}", path.display()), e))?
+            else {
+                continue;
+            };
             let file_type = meta.file_type();
             if file_type.is_symlink() {
-                let target = std::fs::read_link(&path)
-                    .map_err(|e| io(&format!("read_link {}", path.display()), e))?;
+                let Some(target) = preflight_read_link(&path)
+                    .map_err(|e| io(&format!("read_link {}", path.display()), e))?
+                else {
+                    continue;
+                };
                 bytes = bytes.saturating_add(link_target_bytes(&target));
                 if bytes > limits.max_total_bytes {
                     return Err(oversized(&format!(
@@ -1026,6 +1123,64 @@ fn bounded_base_preflight(base: &Path, limits: &ShadowCopyLimits) -> Result<(), 
         "shadow phase preflight admitted"
     );
     Ok(())
+}
+
+/// One preflight directory enumeration with concurrent-churn tolerance.
+///
+/// The BASE root (`is_base`) is the object of the whole operation: its
+/// disappearance or unreadability is genuine drift and is returned typed (a
+/// `NotFound` there means the checkout vanished after it was canonicalized).
+/// A NESTED directory's `NotFound` is re-checked once and, when still
+/// absent, reported `Ok(None)`: a concurrent build removed it between the
+/// parent's enumeration and this descent. Every other failure is typed.
+fn list_preflight_dir(
+    dir: &Path,
+    is_base: bool,
+) -> Result<Option<std::fs::ReadDir>, std::io::Error> {
+    match std::fs::read_dir(dir) {
+        Ok(read) => Ok(Some(read)),
+        Err(e) if !is_base && e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read_dir(dir) {
+                Ok(read) => Ok(Some(read)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// No-follow metadata of one enumerated preflight entry with
+/// concurrent-churn tolerance: `NotFound` is re-checked once and, when still
+/// absent, reported `Ok(None)` (the entry vanished between enumeration and
+/// this read — benign). Any other failure is returned typed.
+fn preflight_symlink_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) => Ok(Some(meta)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Literal symlink target of one enumerated preflight entry with the same
+/// churn tolerance as [`preflight_symlink_metadata`] (a link deleted between
+/// enumeration and this read is skipped, a persistent failure stays typed).
+fn preflight_read_link(path: &Path) -> Result<Option<PathBuf>, std::io::Error> {
+    match std::fs::read_link(path) {
+        Ok(target) => Ok(Some(target)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read_link(path) {
+            Ok(target) => Ok(Some(target)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// The literal byte length of one symlink target (the manifest's own
