@@ -233,6 +233,231 @@ fn poisoned_copy_seam_recovers_and_begin_still_succeeds() {
     assert_eq!(owner_digest(&fix), run_base_of(&fix).snapshot_hash);
 }
 
+// ------------------------------------------------- preflight churn
+
+/// Run the preflight directly with a deterministic enumeration->metadata
+/// vanish seam: `rel` is deleted the first time the walk observes it.
+fn preflight_with_vanish(fix: &Fix, rel: &str) -> Result<(), crate::runtime::ExecError> {
+    let target = fix.user.join(rel);
+    let mut removed = 0usize;
+    let mut seam = |path: &Path| {
+        if path == target.as_path() {
+            fs::remove_file(path).unwrap();
+            removed += 1;
+        }
+    };
+    let result = super::bounded_base_preflight(&fix.user, &default_limits(), &mut seam);
+    assert_eq!(
+        removed, 1,
+        "the vanish raced the metadata read exactly once"
+    );
+    assert!(!target.exists(), "the seam really deleted the entry");
+    result
+}
+
+#[test]
+fn preflight_skips_a_file_that_vanishes_between_enumeration_and_metadata() {
+    // (REQUIRED) A base file deleted in the enumeration -> metadata window
+    // is benign concurrent-workspace churn: the preflight skips it and
+    // succeeds instead of failing the shadow begin with a fatal drift.
+    let fix = open_fix(default_limits());
+    preflight_with_vanish(&fix, "sub/b.txt").expect("a vanished file is skipped, not drift");
+    // Symlink in the same window.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("a.txt", fix.user.join("link")).unwrap();
+        preflight_with_vanish(&fix, "link").expect("a vanished link is skipped, not drift");
+    }
+    // The surviving tree still preflights cleanly (golden unaffected).
+    assert!(super::bounded_base_preflight(&fix.user, &default_limits(), &mut |_| {}).is_ok());
+}
+
+#[test]
+fn begin_shadow_survives_a_file_vanishing_during_preflight_and_the_drive_path_proceeds() {
+    // (REQUIRED) The full prompt/begin path: a checkout file deleted between
+    // enumeration and stat while the preflight runs must not refuse the
+    // shadow; the shadow is the stable post-vanish tree and the staged
+    // candidate binds it.
+    let fix = open_fix(default_limits());
+    // begin_shadow canonicalizes the base (/var vs /private/var on macOS):
+    // compare against the SAME canonical spelling the preflight sees.
+    let vanished = fix.user.canonicalize().unwrap().join("c.txt");
+    fix.shadows.arm_preflight_seam(move |path| {
+        if path == vanished.as_path() {
+            fs::remove_file(path).unwrap();
+        }
+    });
+    let shadow = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect("a file vanishing in the preflight window is benign churn");
+    assert!(!shadow.root.join("c.txt").exists());
+    let copied = crate::runtime::task_executor::root_manifest_digest(&shadow.root).unwrap();
+    assert_eq!(copied, owner_digest(&fix), "shadow == stable owner tree");
+    assert_eq!(run_base_of(&fix).snapshot_hash, copied);
+    assert_eq!(shadow_row_of(&fix).state, ShadowRowState::Active);
+    // The drive path continues: the shadowed write stages against the run
+    // base recorded at begin.
+    drive_write(&fix, "a.txt", b"alpha v2");
+    let cs = fix.shadows.present_change_set(fix.session).unwrap();
+    assert_eq!(cs.files.len(), 1);
+    assert_eq!(cs.run_base_snapshot.as_deref(), Some(copied.as_str()));
+    // The vanish never reached the user checkout beyond the seam's delete:
+    // sub/b.txt and the surviving files are intact.
+    assert_eq!(user_bytes(&fix, "sub/b.txt"), b"beta");
+}
+
+#[test]
+fn preflight_missing_base_root_stays_typed() {
+    // A genuinely missing/unreadable BASE root is drift, never a silent
+    // empty preflight. The preflight-level failure is the typed
+    // WorkspaceDrift; begin_shadow refuses even earlier with NotFound.
+    let fix = open_fix(default_limits());
+    let missing = fix.user.join("gone-root");
+    let err = super::bounded_base_preflight(&missing, &default_limits(), &mut |_| {})
+        .expect_err("a missing base root must stay typed");
+    assert!(
+        matches!(err, crate::runtime::ExecError::WorkspaceDrift(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("gone-root"), "{err}");
+    // A base that is a FILE (not a directory) is typed too, never emptied.
+    let file = fix.user.join("a.txt");
+    let err = super::bounded_base_preflight(&file, &default_limits(), &mut |_| {})
+        .expect_err("a file base root must stay typed");
+    assert!(
+        matches!(err, crate::runtime::ExecError::WorkspaceDrift(_)),
+        "{err}"
+    );
+    fs::remove_dir_all(&fix.user).unwrap();
+    let err = fix
+        .shadows
+        .begin_shadow(fix.session, &fix.user)
+        .expect_err("a missing checkout refuses begin_shadow");
+    assert!(
+        matches!(err, crate::runtime::ExecError::NotFound(_)),
+        "{err}"
+    );
+    assert_no_shadow(&fix);
+}
+
+#[cfg(unix)]
+#[test]
+fn preflight_permission_failure_stays_typed() {
+    use std::os::unix::fs::PermissionsExt;
+    let fix = open_fix(default_limits());
+    let locked = fix.user.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("hidden.txt"), b"hidden").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let err = super::bounded_base_preflight(&fix.user, &default_limits(), &mut |_| {});
+    // Restore before asserting so the TempDir teardown always succeeds.
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+    match err {
+        Err(crate::runtime::ExecError::WorkspaceDrift(message)) => {
+            assert!(message.contains("locked"), "{message}");
+        }
+        Ok(()) => eprintln!("running with permission bypass; permission-failure case skipped"),
+        other => panic!("a permission failure must stay typed drift, got {other:?}"),
+    }
+}
+
+#[test]
+fn preflight_survives_a_concurrent_churn_loop_without_fatal_drift() {
+    // (REQUIRED) A workspace being ACTIVELY BUILT: a writer creates and
+    // deletes files under a build dir for the whole duration of the
+    // preflight. The preflight may skip entries that vanished, but must
+    // never surface a fatal drift.
+    let fix = open_fix(default_limits());
+    let churn = fix.user.join("target/debug/deps");
+    fs::create_dir_all(&churn).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_writer = Arc::clone(&stop);
+    let churn_dir = churn.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i: u64 = 0;
+        while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
+            let path = churn_dir.join(format!("obj-{i}.o"));
+            let _ = fs::write(&path, format!("object {i}"));
+            let _ = fs::remove_file(&path);
+            i += 1;
+        }
+    });
+    let mut observed = 0usize;
+    let result = super::bounded_base_preflight(&fix.user, &default_limits(), &mut |_| {
+        observed += 1;
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "concurrent churn must never be fatal drift: {result:?}"
+    );
+    assert!(observed > 0, "the walk really enumerated the churned tree");
+}
+
+#[test]
+fn preflight_golden_unchanged_and_skip_lists_match_the_copy() {
+    // (REQUIRED golden) The preflight's traversal is the copy's traversal:
+    // `.git` plumbing is skipped (its 4096 bytes are invisible to the byte
+    // cap), while generated/build dirs are INCLUDED and measured (documented
+    // policy: the shadow mirrors the canonical manifest, which skips only
+    // VCS bookkeeping), and the caps still refuse typed.
+    let fix = open_fix(default_limits());
+    // Seed tree: sub(dir), sub/b.txt, a.txt, c.txt = 4 entries, 14 bytes.
+    let seed_only = ShadowCopyLimits {
+        max_entries: 4,
+        max_total_bytes: 14,
+    };
+    assert!(super::bounded_base_preflight(&fix.user, &seed_only, &mut |_| {}).is_ok());
+    fs::create_dir_all(fix.user.join(".git/objects/aa")).unwrap();
+    fs::write(fix.user.join(".git/objects/aa/bb"), vec![0x7f; 4096]).unwrap();
+    // `.git` adds exactly its own dir entry (its descendants are never
+    // walked) and none of its 4096 bytes.
+    let git_ok = ShadowCopyLimits {
+        max_entries: 5,
+        max_total_bytes: 14,
+    };
+    assert!(super::bounded_base_preflight(&fix.user, &git_ok, &mut |_| {}).is_ok());
+    let git_over = ShadowCopyLimits {
+        max_entries: 4,
+        max_total_bytes: 14,
+    };
+    let err = super::bounded_base_preflight(&fix.user, &git_over, &mut |_| {}).unwrap_err();
+    assert!(
+        matches!(err, crate::runtime::ExecError::Oversized(_)),
+        "the .git dir entry itself stays charged to the entry cap: {err}"
+    );
+
+    // Generated dirs are content: a `target` object (+4 entries, +6 bytes)
+    // pushes both caps over (a skipped build tree could never do this).
+    fs::create_dir_all(fix.user.join("target/debug/deps")).unwrap();
+    fs::write(fix.user.join("target/debug/deps/interop-unit.o"), b"object").unwrap();
+    let bytes_ok = ShadowCopyLimits {
+        max_entries: 9,
+        max_total_bytes: 20,
+    };
+    assert!(super::bounded_base_preflight(&fix.user, &bytes_ok, &mut |_| {}).is_ok());
+    let bytes_over = ShadowCopyLimits {
+        max_entries: 9,
+        max_total_bytes: 19,
+    };
+    let err = super::bounded_base_preflight(&fix.user, &bytes_over, &mut |_| {}).unwrap_err();
+    assert!(
+        matches!(err, crate::runtime::ExecError::Oversized(_)),
+        "a `target` file must count toward the copy caps: {err}"
+    );
+    let entries_over = ShadowCopyLimits {
+        max_entries: 8,
+        max_total_bytes: 20,
+    };
+    let err = super::bounded_base_preflight(&fix.user, &entries_over, &mut |_| {}).unwrap_err();
+    assert!(
+        matches!(err, crate::runtime::ExecError::Oversized(_)),
+        "generated-dir entries stay counted: {err}"
+    );
+}
+
 // ---------------------------------------------------------------- staging
 
 #[test]

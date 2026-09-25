@@ -2521,6 +2521,9 @@ struct RealToolEnv {
     isolated_root: std::path::PathBuf,
     gate: Arc<tokio::sync::Notify>,
     fired: Arc<AtomicUsize>,
+    /// The daemon shadow service of the production-wired fixture (`None`
+    /// for the owner-direct seam), so tests can arm the preflight seam.
+    shadows: Option<Arc<ShadowRoots>>,
 }
 fn real_state_of(env: &RealToolEnv) -> faktor_core::state::AgentState {
     env.manager
@@ -2700,14 +2703,23 @@ fn open_real_tool_env_inner_with_resolver(
         .id();
     manager.adopt_identity(parent, wt, TaskId::new(1)).unwrap();
     let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
-    let executor = if service {
+    let (shadows, executor) = if service {
         let shadows = ShadowRoots::new(manager.clone(), root.join("shadows")).unwrap();
-        TaskExecutor::new(&orchestrator, manager.clone(), agent.clone(), shadows)
-    } else {
-        TaskExecutor::new_owner_direct_for_test_harness(
+        let executor = TaskExecutor::new(
             &orchestrator,
             manager.clone(),
             agent.clone(),
+            shadows.clone(),
+        );
+        (Some(shadows), executor)
+    } else {
+        (
+            None,
+            TaskExecutor::new_owner_direct_for_test_harness(
+                &orchestrator,
+                manager.clone(),
+                agent.clone(),
+            ),
         )
     };
     let isolated_root = root.join("isolated");
@@ -2721,6 +2733,7 @@ fn open_real_tool_env_inner_with_resolver(
         isolated_root,
         gate,
         fired,
+        shadows,
     })
 }
 
@@ -2878,6 +2891,81 @@ async fn real_write_drive_writes_the_shadow_and_verified_complete_integrates_it(
         env.manager.active_root(env.parent).unwrap().is_none(),
         "a retired shadow stops re-pointing"
     );
+}
+
+#[tokio::test]
+async fn real_shadowed_prompt_survives_a_base_file_vanishing_in_the_preflight_window() {
+    let _heavy = heavy_guard();
+    // (REQUIRED, end to end) The prompt path over the REAL executor: a
+    // checkout file deleted between its enumeration and metadata read while
+    // the shadow preflight runs must not fail the prompt. The drive proceeds
+    // in a shadow that is the stable post-vanish tree, and the verified
+    // integration lands it.
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env(
+        dir.path(),
+        vec![
+            vec![
+                ScriptedResponse::ToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path": "util.rs",
+                        "content": "pub fn fresh() -> u64 {\n    let seed: u64 = 7;\n    let factor: u64 = 3;\n    seed.saturating_mul(factor)\n}\n",
+                    }),
+                },
+                ScriptedResponse::Text("done".into()),
+                ScriptedResponse::End,
+            ],
+            vec![ScriptedResponse::End],
+        ],
+        faktor_agent::VerificationService::fake_ok(),
+        true,
+    );
+    seed_rust(&env);
+    let obsolete = env.owner_root.join("obsolete.txt");
+    std::fs::write(&obsolete, b"stale").unwrap();
+    let obsolete_canonical = env.owner_root.canonicalize().unwrap().join("obsolete.txt");
+    env.shadows
+        .as_ref()
+        .expect("production shadow wiring")
+        .arm_preflight_seam(move |path| {
+            if path == obsolete_canonical.as_path() {
+                std::fs::remove_file(path).unwrap();
+            }
+        });
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            real_mutating_request(&env, "implement the change"),
+        )
+        .expect("the prompt is accepted despite the concurrent vanish");
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+    // Mid-drive: the shadow exists and holds the stable post-vanish tree.
+    wait_until(|| env.fired.load(Ordering::SeqCst) >= 1, 300).await;
+    let row = env
+        .manager
+        .shadow_row(env.parent)
+        .unwrap()
+        .expect("shadow row at begin");
+    assert_eq!(row.state, ShadowRowState::Active);
+    let shadow_dir = std::path::PathBuf::from(&row.root);
+    assert!(
+        !shadow_dir.join("obsolete.txt").exists(),
+        "the shadow is the stable post-vanish tree"
+    );
+    assert!(
+        shadow_dir.join("util.rs").exists(),
+        "the drive wrote inside the shadow"
+    );
+    env.gate.notify_waiters();
+    settle_verified_integrate(&env).await;
+    assert!(
+        !obsolete.exists(),
+        "the vanish is the only change to the owner"
+    );
+    assert!(env.owner_root.join("util.rs").exists(), "verified landing");
 }
 
 #[tokio::test]
