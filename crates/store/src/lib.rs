@@ -2508,6 +2508,70 @@ impl Store {
         Ok(seq)
     }
 
+    /// Crash/abort terminalization as ONE transaction: move exactly ONE
+    /// still-running tool_run row to its terminal status/effect and append the
+    /// terminal event (`RecoveryApplied` / `ToolCancelled` by `event_kind`)
+    /// together, with the session re-verified in `state` before any write.
+    ///
+    /// `state` is both the expected pre-state and the event's landing state:
+    /// the caller has already committed the state move (recovery commits
+    /// `CrashDetected` onto the crash target; abort's first per-op command
+    /// lands `Cancelled`), and each per-row command re-affirms it — a
+    /// self-transition is lawful and idempotent. Zero changed rows (unknown
+    /// or already finished) is the typed `Conflict`; the event is never
+    /// written without the row. This is the recovery sibling of
+    /// [`Store::finish_tool_run_and_event`]: recovery's pre-fix split of a
+    /// raw `finish_tool_run` plus a much later `transition_locked` could
+    /// leave a terminal tool row with no journal event that the scanner
+    /// never revisits.
+    ///
+    /// The event is stamped with the store clock and payload schema v1
+    /// (the schema every writer in this workspace currently stamps).
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_recovered_tool_run_and_event(
+        &self,
+        session_id: SessionId,
+        op_id: OpId,
+        status: &str,
+        effect_status: &str,
+        event_kind: EventKind,
+        state: AgentState,
+        payload: Option<serde_json::Value>,
+    ) -> StoreResult<EventSeq> {
+        let mut conn = self.write();
+        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, state)?;
+        let changed = txn.tx.execute(
+            "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
+             WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
+            params![
+                session_id.raw() as i64,
+                op_id.raw() as i64,
+                status,
+                effect_status,
+                now_ms()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "recovered tool run {op_id} is not running"
+            )));
+        }
+        txn.side_row_applied();
+        let seq = self.insert_event_locked(
+            txn.conn(),
+            session_id,
+            Some(op_id),
+            event_kind,
+            state,
+            now_ms(),
+            payload,
+            1,
+        )?;
+        txn.precommit();
+        txn.commit()?;
+        Ok(seq)
+    }
+
     /// `put_checkpoint` as ONE transaction: insert the checkpoint row (with a
     /// duplicate-sequence check inside the same transaction) and append
     /// `CheckpointCreated` together. Returns `(checkpoint_row_id, event_seq)`.
@@ -20710,6 +20774,125 @@ mod session_command_txn_tests {
                 }
             }
         }
+    }
+
+    /// Crash-recovery terminalization: the tool row's terminal status/effect
+    /// and its journal event (`RecoveryApplied`) are ONE transaction. At
+    /// every durability boundary the reopened world is exactly the old or
+    /// exactly the new one: a committed command has BOTH the terminal row
+    /// and the event; a rolled-back one has NEITHER.
+    #[test]
+    fn recovered_tool_finish_seams_commit_row_and_event_together() {
+        let recovered = |store: &Store, sid: SessionId| -> StoreResult<EventSeq> {
+            store.finish_recovered_tool_run_and_event(
+                sid,
+                OpId::new(OP),
+                "interrupted",
+                "unknown",
+                EventKind::RecoveryApplied,
+                AgentState::ExecutingTool,
+                Some(serde_json::json!({ "action": "unknown_effect" })),
+            )
+        };
+        for seam in SEAMS {
+            // Old world: permission + grant + running tool row.
+            let (dir, store, sid) = setup();
+            let mut pid = None;
+            execute(&store, sid, Cmd::Permission, &mut pid);
+            execute(&store, sid, Cmd::Grant, &mut pid);
+            execute(&store, sid, Cmd::StartTool, &mut pid);
+            let old = world(&store, sid);
+            // New world: the same prefix + the committed terminalization.
+            let (dir2, store2, sid2) = setup();
+            let mut pid2 = None;
+            execute(&store2, sid2, Cmd::Permission, &mut pid2);
+            execute(&store2, sid2, Cmd::Grant, &mut pid2);
+            execute(&store2, sid2, Cmd::StartTool, &mut pid2);
+            recovered(&store2, sid2).expect("recovered finish");
+            let new = world(&store2, sid2);
+            assert_ne!(old, new, "the terminalization changes the durable world");
+            drop(store2);
+            drop(dir2);
+
+            store.crash_arm(CrashArm {
+                point: seam,
+                ordinal: 0,
+            });
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                let _ = recovered(&store, sid);
+            }));
+            assert!(caught.is_err(), "seam {seam} must fire");
+            drop(store);
+            let reopened = Store::open(dir.path().join("store"), true).unwrap();
+            let durable = world(&reopened, sid);
+            drop(reopened);
+            drop(dir);
+            match seam {
+                "session_command_committed" => assert_eq!(
+                    durable, new,
+                    "committed terminalization: row AND event durable together"
+                ),
+                _ => assert_eq!(
+                    durable, old,
+                    "crashed terminalization at {seam}: neither row nor event"
+                ),
+            }
+        }
+    }
+
+    /// The recovery terminalization refuses typed BEFORE any write on a
+    /// wrong expected state, and a second finish can never append an event
+    /// without a still-running row (no row -> no event).
+    #[test]
+    fn recovered_tool_finish_wrong_state_or_terminal_row_refuses_without_trace() {
+        let (_dir, store, sid) = setup();
+        let mut pid = None;
+        execute(&store, sid, Cmd::Permission, &mut pid);
+        execute(&store, sid, Cmd::Grant, &mut pid);
+        execute(&store, sid, Cmd::StartTool, &mut pid);
+        let before = world(&store, sid);
+        let err = store
+            .finish_recovered_tool_run_and_event(
+                sid,
+                OpId::new(OP),
+                "interrupted",
+                "unknown",
+                EventKind::RecoveryApplied,
+                AgentState::Suspended,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(world(&store, sid), before, "refused before any write");
+        store
+            .finish_recovered_tool_run_and_event(
+                sid,
+                OpId::new(OP),
+                "interrupted",
+                "unknown",
+                EventKind::RecoveryApplied,
+                AgentState::ExecutingTool,
+                None,
+            )
+            .expect("first terminalization");
+        let after = world(&store, sid);
+        let err = store
+            .finish_recovered_tool_run_and_event(
+                sid,
+                OpId::new(OP),
+                "failed",
+                "unknown",
+                EventKind::RecoveryApplied,
+                AgentState::ExecutingTool,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            world(&store, sid),
+            after,
+            "an already-terminal row can never gain a second event"
+        );
     }
 
     /// The content-aware checkpoint command (the production path of

@@ -621,12 +621,23 @@ impl SessionHandle {
     }
 
     /// Abort one operation or (with `None`) every tracked operation and the
-    /// session. Durable rows are updated first (tool runs become
-    /// `cancelled`/`unknown`), then one journal event per affected op.
+    /// session. Each affected op's durable cancellation is ONE atomic
+    /// command: a tool op's terminal `tool_run` row and its `ToolCancelled`
+    /// event commit in the SAME transaction (never a durable cancelled row
+    /// without its journal event, and never an event without its row); a
+    /// turn op journals `Failed` through the validated append path (the
+    /// event IS the state move). The batch iterates in op-id order so the
+    /// per-op command sequence is reproducible.
     ///
     /// Event-kind convention: tool ops journal `ToolCancelled`; turn ops
     /// journal `Failed` with `{"error": "aborted"}` (no dedicated kind exists
     /// in the frozen set). The state column is authoritative: `Cancelled`.
+    ///
+    /// `TurnCompleted` -> `ReadyForNextTurn` remains a SEPARATE subsequent
+    /// transition (a cancelled turn leaves the session usable). A crash
+    /// between the last per-op command and that transition therefore lands
+    /// on `Cancelled` — a legal, promptable state (see the abort crash
+    /// campaign); the turn end is never fabricated by recovery.
     pub fn abort(&self, op_id: Option<OpId>) -> faktor_core::Result<AbortReceipt> {
         let _guard = self.command_guard();
         let current = self.state()?;
@@ -666,10 +677,14 @@ impl SessionHandle {
             }
         }
 
-        let affected: Vec<OpId> = match op_id {
+        let mut affected: Vec<OpId> = match op_id {
             Some(o) => vec![o],
             None => self.ops().all(),
         };
+        // Deterministic batch order: the op registry is a HashMap, but the
+        // durable per-op commands must be reproducible (fault campaigns arm
+        // per-op seam ordinals) — iterate by op id.
+        affected.sort_by_key(|o| o.raw());
         // abort(None) also durably cancels every queued prompt of the
         // session (pending/claimed/running rows — a running row whose drive
         // was interrupted is crash residue abort must clear too).
@@ -685,33 +700,57 @@ impl SessionHandle {
         for o in &affected {
             self.ops().cancel(*o);
         }
-        // Durable rows first; events last so a failure leaves no journal trace.
-        for o in &affected {
-            if self.ops().kind(*o) == Some(crate::ops::OpKind::Tool) {
-                self.manager
-                    .store()
-                    .finish_tool_run(self.id, *o, "cancelled", "unknown")
-                    .map_err(crate::map_store_err)?;
-            }
-        }
+        // Per-op atomic command. The first command moves the session to
+        // `Cancelled`; later commands re-verify that landing state inside
+        // their transaction and self-transition (lawful and idempotent).
         let mut event_seq = None;
+        let mut expected = current;
         for o in &affected {
-            let kind = if self.ops().kind(*o) == Some(crate::ops::OpKind::Tool) {
+            let is_tool = self.ops().kind(*o) == Some(crate::ops::OpKind::Tool);
+            let kind = if is_tool {
                 EventKind::ToolCancelled
             } else {
                 EventKind::Failed
             };
-            let payload = if kind == EventKind::ToolCancelled {
+            let payload = if is_tool {
                 serde_json::json!({ "op_id": o.raw() })
             } else {
                 serde_json::json!({ "error": "aborted", "op_id": o.raw() })
             };
-            event_seq = Some(self.transition_locked(
-                kind,
-                AgentState::Cancelled,
-                Some(*o),
-                Some(payload),
-            )?);
+            if is_tool {
+                // Validate the journal legality against the same state the
+                // store command re-verifies, and reject an undecodable
+                // payload BEFORE the transaction: no row without its event.
+                crate::journal::validate_transition(expected, kind, AgentState::Cancelled)?;
+                let event = crate::ops::command_event(
+                    kind,
+                    AgentState::Cancelled,
+                    Some(*o),
+                    self.now_ms(),
+                    Some(payload),
+                )?;
+                event_seq = Some(
+                    self.manager
+                        .store()
+                        .finish_tool_run_and_event(
+                            self.id,
+                            *o,
+                            "cancelled",
+                            "unknown",
+                            expected,
+                            event,
+                        )
+                        .map_err(crate::map_store_err)?,
+                );
+            } else {
+                event_seq = Some(self.transition_locked(
+                    kind,
+                    AgentState::Cancelled,
+                    Some(*o),
+                    Some(payload),
+                )?);
+            }
+            expected = AgentState::Cancelled;
         }
         // Nothing tracked (abort with None on an idle session) still ends it.
         if affected.is_empty() {
@@ -1101,6 +1140,8 @@ impl SessionHandle {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use faktor_core::cancellation::CancellationToken;
+    use faktor_core::capability::{Capability, PermissionDecision};
     use std::sync::Arc;
     use std::thread;
 
@@ -1114,6 +1155,64 @@ pub(crate) mod tests {
     pub(crate) fn session(m: &Arc<SessionManager>) -> SessionHandle {
         let ws = m.create_workspace("/w").unwrap();
         m.create_session(ws, "t", "ollama", "qwen3.8").unwrap()
+    }
+
+    fn reopen(dir: &tempfile::TempDir) -> Arc<SessionManager> {
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap()
+    }
+
+    /// Drive a fresh session to `ExecutingTool` with TWO running tool runs
+    /// (turn op + tool ops tracked), the deterministic abort batch shape.
+    fn two_tool_batch(m: &Arc<SessionManager>, s: &SessionHandle) -> (OpId, Vec<OpId>) {
+        let turn = s.submit_prompt("x", &[]).unwrap().op_id;
+        s.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            Some(turn),
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelStarted,
+            AgentState::WaitingForModel,
+            Some(turn),
+            None,
+        )
+        .unwrap();
+        s.append_event(
+            EventKind::ModelChunkReceived,
+            AgentState::Streaming,
+            Some(turn),
+            None,
+        )
+        .unwrap();
+        let req = s
+            .request_permission(
+                turn,
+                &Capability::ReadWorkspace {
+                    path: "/w/a".into(),
+                },
+            )
+            .unwrap();
+        s.resolve_permission(req.id, PermissionDecision::Allow)
+            .unwrap();
+        let mut tools = Vec::new();
+        for i in 0..2 {
+            let op = m.try_next_op_id().unwrap();
+            let meta = OpMeta::new(
+                op,
+                s.id(),
+                Deadline::at(m.now_ms() + 60_000),
+                faktor_core::retry::RetryPolicy::default(),
+                CancellationToken::new(),
+                RecoveryStrategy::None,
+                m.now_ms(),
+            );
+            s.start_tool_run(meta, "read_file", serde_json::json!({ "i": i }))
+                .unwrap();
+            tools.push(op);
+        }
+        (turn, tools)
     }
 
     #[test]
@@ -1201,6 +1300,226 @@ pub(crate) mod tests {
         assert!(r.cancelled_all);
         // Idle abort: the session stays usable (ReadyForNextTurn).
         assert_eq!(s.state().unwrap(), AgentState::ReadyForNextTurn);
+    }
+
+    /// Every tool op's cancellation is ONE atomic command: the terminal
+    /// `tool_run` row and its `ToolCancelled` event commit together. At each
+    /// durability boundary a crash reopens on the old world (row still
+    /// running, no event) or the new one (terminal row AND event) — never a
+    /// row without its event or an event without its row. A restart's
+    /// recovery sweep converges the residue to exactly one pair per op.
+    #[test]
+    fn abort_tool_row_and_cancellation_event_commit_atomically() {
+        const SEAMS: [&str; 3] = [
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ];
+        for seam in SEAMS {
+            for ordinal in 0..2u64 {
+                let (dir, m) = test_manager();
+                let s = session(&m);
+                let (_turn, tools) = two_tool_batch(&m, &s);
+                let sid = s.id();
+                m.store().crash_arm(faktor_store::CrashArm {
+                    point: seam,
+                    ordinal,
+                });
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = s.abort(None);
+                }));
+                assert!(caught.is_err(), "seam {seam} ordinal {ordinal} must fire");
+                drop(s);
+                drop(m);
+                let after = reopen(&dir).get_session(sid).unwrap().unwrap();
+                let running: std::collections::HashSet<OpId> = after
+                    .pending_tool_runs()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.op_id)
+                    .collect();
+                let cancelled_events = |op: OpId| {
+                    after
+                        .events_range(1, None)
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.kind == EventKind::ToolCancelled && e.op_id == Some(op))
+                        .count()
+                };
+                let i = ordinal as usize;
+                for (k, op) in tools.iter().enumerate() {
+                    let committed = match seam {
+                        "session_command_committed" => k <= i,
+                        _ => k < i,
+                    };
+                    if committed {
+                        assert!(!running.contains(op), "{seam}/{ordinal}: row terminal");
+                        assert_eq!(
+                            cancelled_events(*op),
+                            1,
+                            "{seam}/{ordinal}: committed row AND event are durable together"
+                        );
+                    } else {
+                        assert!(
+                            running.contains(op),
+                            "{seam}/{ordinal}: rolled-back row stays running"
+                        );
+                        assert_eq!(
+                            cancelled_events(*op),
+                            0,
+                            "{seam}/{ordinal}: no event without its row"
+                        );
+                    }
+                }
+                // The turn op's `Failed` event committed before the per-op
+                // tool transactions: the machine is lawfully at `Cancelled`.
+                assert_eq!(after.state().unwrap(), AgentState::Cancelled);
+                assert_eq!(
+                    after.replay_journal().unwrap().state,
+                    AgentState::Cancelled,
+                    "{seam}/{ordinal}: every durable landing replays legally"
+                );
+                // Restart convergence: the sweep terminalizes each remaining
+                // running row with exactly one `RecoveryApplied`, siblings
+                // untouched (already-paired rows never gain a second event).
+                after.recover_all().unwrap();
+                assert!(after.pending_tool_runs().unwrap().is_empty());
+                for op in &tools {
+                    let recovery_applied = after
+                        .events_range(1, None)
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.kind == EventKind::RecoveryApplied && e.op_id == Some(*op))
+                        .count();
+                    assert_eq!(
+                        cancelled_events(*op) + recovery_applied,
+                        1,
+                        "{seam}/{ordinal}: exactly one terminal event for {op}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// abort(None) mid-batch: the committed sibling's row+event pair is
+    /// durable, the rolled-back sibling is still running with no event, and
+    /// the durable state machine is not left half-cancelled (journal
+    /// replays). Recovery finishes the sibling atomically; the session
+    /// stays promptable.
+    #[test]
+    fn abort_mid_batch_preserves_sibling_state_machine() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let (_turn, tools) = two_tool_batch(&m, &s);
+        let sid = s.id();
+        m.store().crash_arm(faktor_store::CrashArm {
+            point: "session_command_side_row",
+            ordinal: 1,
+        });
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = s.abort(None);
+        }));
+        assert!(caught.is_err(), "the second tool's txn must crash");
+        drop(s);
+        drop(m);
+        let after = reopen(&dir).get_session(sid).unwrap().unwrap();
+        // Sibling 0 committed as ONE pair; sibling 1 was untouched.
+        let running: Vec<OpId> = after
+            .pending_tool_runs()
+            .unwrap()
+            .iter()
+            .map(|r| r.op_id)
+            .collect();
+        assert_eq!(running, vec![tools[1]], "rolled-back sibling still running");
+        let events = after.events_range(1, None).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::ToolCancelled && e.op_id == Some(tools[0]))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::ToolCancelled && e.op_id == Some(tools[1]))
+                .count(),
+            0,
+            "no event without its row"
+        );
+        assert_eq!(after.state().unwrap(), AgentState::Cancelled);
+        assert_eq!(after.replay_journal().unwrap().state, AgentState::Cancelled);
+        // Recovery terminalizes the sibling in one row+event pair; the
+        // machine remains usable.
+        after.recover_all().unwrap();
+        assert!(after.pending_tool_runs().unwrap().is_empty());
+        assert_eq!(
+            after
+                .events_range(1, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == EventKind::RecoveryApplied && e.op_id == Some(tools[1]))
+                .count(),
+            1
+        );
+        after.submit_prompt("again", &[]).unwrap();
+        assert_eq!(after.state().unwrap(), AgentState::Preparing);
+    }
+
+    /// `TurnCompleted` -> `ReadyForNextTurn` is a SEPARATE subsequent
+    /// transition: crashed before COMMIT it rolls back (the lawful
+    /// `Cancelled` landing stands and a later Stop completes it), crashed
+    /// after COMMIT it is durable. The already-paired tool rows are never
+    /// touched by either outcome.
+    #[test]
+    fn abort_turn_completion_is_a_separate_atomic_transition() {
+        for seam in ["ev_precommit", "ev_committed"] {
+            let (dir, m) = test_manager();
+            let s = session(&m);
+            let (turn, tools) = two_tool_batch(&m, &s);
+            // Only the tool ops stay tracked, so the first `append_event_v`
+            // after arming is the TurnCompleted transition.
+            s.ops().unregister(turn);
+            let sid = s.id();
+            m.store().crash_arm(faktor_store::CrashArm {
+                point: seam,
+                ordinal: 0,
+            });
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.abort(None);
+            }));
+            assert!(caught.is_err(), "seam {seam} must fire");
+            drop(s);
+            drop(m);
+            let after = reopen(&dir).get_session(sid).unwrap().unwrap();
+            assert!(after.pending_tool_runs().unwrap().is_empty());
+            let events = after.events_range(1, None).unwrap();
+            for op in &tools {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e.kind == EventKind::ToolCancelled && e.op_id == Some(*op))
+                        .count(),
+                    1,
+                    "{seam}: per-op pairs committed before the turn end"
+                );
+            }
+            if seam == "ev_committed" {
+                assert_eq!(after.state().unwrap(), AgentState::ReadyForNextTurn);
+            } else {
+                assert_eq!(
+                    after.state().unwrap(),
+                    AgentState::Cancelled,
+                    "the rolled-back turn end leaves the lawful Cancelled landing"
+                );
+                // Recovery touches nothing (no running rows); a later Stop
+                // completes the turn end as a fresh, lawful transition.
+                assert!(!after.recover_all().unwrap().applied);
+                let receipt = after.abort(None).unwrap();
+                assert!(receipt.op_ids.is_empty());
+                assert_eq!(after.state().unwrap(), AgentState::ReadyForNextTurn);
+            }
+        }
     }
 
     #[test]

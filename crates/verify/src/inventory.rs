@@ -40,29 +40,36 @@
 //!   changed-file mapping, so a missed manifest MAY change the derived check
 //!   set, and a `Passed` verdict must never rest on it.
 //!
-//! The walk is deterministic (breadth-first, sorted per directory), bounded,
-//! and symlink-safe: a symlink entry is never followed (so cyclic/hostile
-//! links can neither loop nor hide a subtree), and its presence makes the
-//! inventory non-Complete ([`InventoryCompleteness::Unreadable`] — the tree
-//! could not be vouched for at that path).
+//! The walk is deterministic (sorted per directory), bounded, and
+//! symlink-safe: the whole native traversal resolves through ONE anchored
+//! [`faktor_fs::RootedDir`] opened for the discovery (see
+//! [`faktor_fs::rooted`]). Only workspace-relative paths are carried: children
+//! are enumerated relative to the already-open parent, each directory is
+//! opened relative to its pinned parent, and a queued directory entry swapped
+//! for a symlink/reparse point before its descent is a typed refusal — no
+//! absolute path string is ever queued, joined or reopened. A symlink entry
+//! is never followed (so cyclic/hostile links can neither loop nor hide a
+//! subtree or escape the root), and its presence makes the inventory
+//! non-Complete ([`InventoryCompleteness::Unreadable`] — the tree could not
+//! be vouched for at that path).
 //!
-//! Manifest existence probes and manifest content reads resolve through ONE
-//! anchored [`faktor_fs::RootedDir`] capability (`openat`/handle-relative,
-//! no-follow), never through pathname I/O: a parent directory entry swapped
-//! for a symlink/reparse point after enumeration — even one pointing outside
-//! the root — is a typed refusal, never a stat/read of the link target.
+//! Manifest existence probes and manifest content reads resolve through the
+//! same anchored capability shape (`openat`/handle-relative, no-follow),
+//! never through pathname I/O: a parent directory entry swapped for a
+//! symlink/reparse point after enumeration — even one pointing outside the
+//! root — is a typed refusal, never a stat/read of the link target.
 //!
 //! ANY value other than [`InventoryCompleteness::Complete`] prohibits a
 //! `Passed` verification verdict: the caller must classify the attempt
 //! `Unavailable` with the typed reason.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use faktor_core::error::ErrorKind;
-use faktor_fs::rooted::RootedEntryKind;
+use faktor_core::error::{Error, ErrorKind};
+use faktor_fs::rooted::{RootedEntryKind, WalkBudget, WalkStep};
 use faktor_fs::{FileData, RootedDir};
 use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
@@ -588,10 +595,6 @@ impl RepoInventory {
     }
 }
 
-fn posix_rel(parts: &[String]) -> String {
-    parts.join("/")
-}
-
 fn join_rel(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
@@ -929,120 +932,181 @@ fn try_git_inventory(
     GitAttempt::Complete(files)
 }
 
-/// The bounded native traversal: breadth-first, sorted per directory,
-/// symlinks never followed. Every budget hit is a typed verdict.
-fn native_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) -> RepoInventory {
-    let mut files: Vec<String> = Vec::new();
-    let mut completeness = InventoryCompleteness::Complete;
-    let mut paths_seen: usize = 0;
-    let mut bytes_seen: u64 = 0;
-    let mut queue: VecDeque<(usize, Vec<String>)> = VecDeque::new();
-    queue.push_back((0, Vec::new()));
-    'walk: while let Some((depth, dir_parts)) = queue.pop_front() {
-        if Instant::now() >= deadline {
-            completeness = InventoryCompleteness::WallBudgetExceeded {
-                max: budget.max_wall,
-            };
-            break 'walk;
+/// Workspace-relative POSIX spelling of a path the rooted walker built from
+/// components (a display/verdict projection only — never a pathname to
+/// reopen).
+fn rel_to_posix(rel: &Path) -> String {
+    let mut out = String::new();
+    for comp in rel.components() {
+        if !out.is_empty() {
+            out.push('/');
         }
-        let abs = if dir_parts.is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(posix_rel(&dir_parts))
-        };
-        let entries = match std::fs::read_dir(&abs) {
-            Ok(entries) => entries,
-            Err(_) => {
-                completeness = InventoryCompleteness::Unreadable {
-                    path: posix_rel(&dir_parts),
-                };
-                break 'walk;
-            }
-        };
-        let mut names: Vec<(String, std::fs::FileType)> = Vec::new();
-        for entry in entries {
-            paths_seen += 1;
-            if paths_seen > budget.max_paths {
-                completeness = InventoryCompleteness::PathBudgetExceeded {
-                    seen: paths_seen,
-                    max: budget.max_paths,
-                };
-                break 'walk;
-            }
-            if names.len() >= budget.max_dir_page {
-                completeness = InventoryCompleteness::DirectoryPageTruncated {
-                    limit: budget.max_dir_page,
-                };
-                break 'walk;
-            }
-            if paths_seen.is_multiple_of(4096) && Instant::now() >= deadline {
-                completeness = InventoryCompleteness::WallBudgetExceeded {
-                    max: budget.max_wall,
-                };
-                break 'walk;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    completeness = InventoryCompleteness::Unreadable {
-                        path: posix_rel(&dir_parts),
-                    };
-                    break 'walk;
-                }
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // symlink_metadata-based classification: a symlink stays a
-            // symlink (never followed), so cyclic links cannot loop and a
-            // linked subtree can never hide from the completeness verdict.
-            let meta = match std::fs::symlink_metadata(entry.path()) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    let mut path = dir_parts.clone();
-                    path.push(name);
-                    completeness = InventoryCompleteness::Unreadable {
-                        path: posix_rel(&path),
-                    };
-                    break 'walk;
-                }
-            };
-            if meta.file_type().is_file() {
-                bytes_seen = bytes_seen.saturating_add(meta.len());
-                if bytes_seen > budget.max_metadata_bytes {
-                    completeness = InventoryCompleteness::MetadataBudgetExceeded {
-                        seen_bytes: bytes_seen,
-                        max_bytes: budget.max_metadata_bytes,
-                    };
-                    break 'walk;
-                }
-            }
-            names.push((name, meta.file_type()));
-        }
-        names.sort_by(|(a, _), (b, _)| a.cmp(b));
-        for (name, file_type) in names {
-            let mut parts = dir_parts.clone();
-            parts.push(name.clone());
-            if file_type.is_symlink() {
-                completeness = InventoryCompleteness::Unreadable {
-                    path: posix_rel(&parts),
-                };
-                break 'walk;
-            }
-            if file_type.is_dir() {
-                if INVENTORY_SKIP_DIRS.contains(&name.as_str()) {
-                    continue;
-                }
-                if depth + 1 > budget.max_depth {
-                    completeness = InventoryCompleteness::DepthBudgetExceeded {
-                        max_depth: budget.max_depth,
-                    };
-                    break 'walk;
-                }
-                queue.push_back((depth + 1, parts));
-            } else {
-                files.push(posix_rel(&parts));
-            }
+        out.push_str(&comp.as_os_str().to_string_lossy());
+    }
+    out
+}
+
+/// Test seam: fired with one entry's workspace-relative POSIX path after the
+/// rooted walker classified it and BEFORE any descent/read, so adversarial
+/// tests can swap the entry deterministically in that window. Production has
+/// no hook.
+#[cfg(test)]
+pub(crate) type NativeWalkSeam = Box<dyn Fn(&str) + Send>;
+#[cfg(test)]
+pub(crate) static NATIVE_WALK_SEAM: std::sync::OnceLock<std::sync::Mutex<Option<NativeWalkSeam>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) static NATIVE_WALK_SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn native_walk_seam(rel: &str) {
+    if let Some(lock) = NATIVE_WALK_SEAM.get() {
+        if let Some(hook) = lock.lock().expect("native walk seam poisoned").as_ref() {
+            hook(rel);
         }
     }
+}
+#[cfg(not(test))]
+fn native_walk_seam(_rel: &str) {}
+
+/// The bounded native traversal. ONE [`RootedDir`] is opened for the whole
+/// discovery and every step resolves through it: children are enumerated
+/// relative to the already-open parent (never following a link), each
+/// directory is classified from literal metadata and descended by opening the
+/// child relative to its pinned parent. Only workspace-relative paths are
+/// carried — no absolute `PathBuf` is queued, joined or reopened — so a
+/// queued directory entry swapped for a symlink/reparse point before its
+/// descent is a typed refusal, never a traversal of the link target (inside
+/// or outside the admitted root). Every budget hit is a typed verdict.
+fn native_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) -> RepoInventory {
+    if Instant::now() >= deadline {
+        // Parity with the historical walk: the root frame checks the wall
+        // budget before enumerating anything.
+        return RepoInventory {
+            files: Vec::new(),
+            completeness: InventoryCompleteness::WallBudgetExceeded {
+                max: budget.max_wall,
+            },
+            source: InventorySource::Native,
+        };
+    }
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let anchored = match RootedDir::open(&canonical) {
+        Ok(anchored) => anchored,
+        Err(_) => {
+            return RepoInventory {
+                files: Vec::new(),
+                completeness: InventoryCompleteness::Unreadable {
+                    path: String::new(),
+                },
+                source: InventorySource::Native,
+            }
+        }
+    };
+    let mut files: Vec<String> = Vec::new();
+    let mut verdict: Option<InventoryCompleteness> = None;
+    let mut bytes_seen: u64 = 0;
+    let mut per_dir: HashMap<String, usize> = HashMap::new();
+    let mut visited: usize = 0;
+    // The deepest directory whose descent the walker is about to attempt (or
+    // just attempted): the path a non-budget walker refusal is attributed to.
+    let mut pending_dir: Option<String> = None;
+    // The path budget is the walker's own entry/listing cap (one authority).
+    // Depth, per-directory page and metadata budgets are enforced by the
+    // visitor, keeping their historical typed verdicts; the remaining walker
+    // caps stay inert so an `Oversized` walker error can only mean the path
+    // budget.
+    let mut walk_budget =
+        WalkBudget::new(budget.max_paths, usize::MAX, usize::MAX, u64::MAX, u64::MAX);
+    let outcome = anchored.walk_bounded(
+        Path::new(""),
+        &mut walk_budget,
+        &[],
+        &mut |entry, depth, _budget| {
+            visited += 1;
+            if visited.is_multiple_of(4096) && Instant::now() >= deadline {
+                verdict = Some(InventoryCompleteness::WallBudgetExceeded {
+                    max: budget.max_wall,
+                });
+                return Err(Error::cancelled());
+            }
+            let rel = rel_to_posix(&entry.rel);
+            native_walk_seam(&rel);
+            let parent = rel.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let count = per_dir.entry(parent.to_string()).or_insert(0);
+            *count += 1;
+            if *count > budget.max_dir_page {
+                verdict = Some(InventoryCompleteness::DirectoryPageTruncated {
+                    limit: budget.max_dir_page,
+                });
+                return Err(Error::cancelled());
+            }
+            match entry.kind {
+                RootedEntryKind::Symlink => {
+                    verdict = Some(InventoryCompleteness::Unreadable { path: rel });
+                    Err(Error::cancelled())
+                }
+                RootedEntryKind::Directory => {
+                    if INVENTORY_SKIP_DIRS.iter().any(|skip| entry.name == *skip) {
+                        return Ok(WalkStep::SkipDir);
+                    }
+                    if depth + 1 > budget.max_depth {
+                        verdict = Some(InventoryCompleteness::DepthBudgetExceeded {
+                            max_depth: budget.max_depth,
+                        });
+                        return Err(Error::cancelled());
+                    }
+                    if Instant::now() >= deadline {
+                        verdict = Some(InventoryCompleteness::WallBudgetExceeded {
+                            max: budget.max_wall,
+                        });
+                        return Err(Error::cancelled());
+                    }
+                    pending_dir = Some(rel);
+                    Ok(WalkStep::Continue)
+                }
+                RootedEntryKind::File => {
+                    bytes_seen = bytes_seen.saturating_add(entry.size);
+                    if bytes_seen > budget.max_metadata_bytes {
+                        verdict = Some(InventoryCompleteness::MetadataBudgetExceeded {
+                            seen_bytes: bytes_seen,
+                            max_bytes: budget.max_metadata_bytes,
+                        });
+                        return Err(Error::cancelled());
+                    }
+                    files.push(rel);
+                    Ok(WalkStep::Continue)
+                }
+                RootedEntryKind::Other => {
+                    // Parity with the historical walk: an entry that is not a
+                    // plain file, directory or symlink is still an inventory
+                    // path; its content is never read here.
+                    files.push(rel);
+                    Ok(WalkStep::Continue)
+                }
+            }
+        },
+    );
+    // A visitor verdict stops the WHOLE walk by returning a `Cancelled`
+    // sentinel (a visitor `Stop` only ends the current directory level, so a
+    // nested verdict would let parent levels keep walking and keep charging
+    // the budget). The sentinel is internal control flow and is consumed
+    // here; the stored verdict is the typed outcome.
+    let completeness = match (verdict, outcome) {
+        (Some(verdict), _) => verdict,
+        (None, Ok(())) => InventoryCompleteness::Complete,
+        (None, Err(e)) if e.kind == ErrorKind::Oversized => {
+            // The first entry beyond the path budget (the walker charges
+            // entries and caps each listing by the remaining budget).
+            InventoryCompleteness::PathBudgetExceeded {
+                seen: budget.max_paths.saturating_add(1),
+                max: budget.max_paths,
+            }
+        }
+        (None, Err(_)) => InventoryCompleteness::Unreadable {
+            path: pending_dir.unwrap_or_default(),
+        },
+    };
     files.sort();
     files.dedup();
     RepoInventory {
@@ -1963,6 +2027,265 @@ mod tests {
             "{probe:?}"
         );
         assert_eq!(probe.refusal().map(|r| r.kind), Some("unreadable"));
+    }
+
+    /// Golden digest of an honest non-Git native inventory: this digest was
+    /// recorded while the historical pathname walk still existed, so the
+    /// anchored walker must reproduce the byte-identical sorted path list.
+    /// The fixture exercises nested source trees, several manifests, skip
+    /// directories and an empty directory; nothing here is near a budget.
+    #[test]
+    fn golden_native_inventory_digest_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "README.md",
+            ".gitignore",
+            "src/main.rs",
+            "src/lib.rs",
+            "src/deep/a/b/c/deep.rs",
+            "pkg/package.json",
+            "pkg/src/app.ts",
+            "pkg/src/util/helper.ts",
+            "tools/build.sh",
+        ] {
+            write(dir.path(), file);
+        }
+        write(dir.path(), "skip/node_modules/ignored.js");
+        write(dir.path(), "target/debug/junk.o");
+        fs::create_dir_all(dir.path().join("empty")).unwrap();
+        let inv = native_inventory(
+            dir.path(),
+            &InventoryBudget::default(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete, "{inv:?}");
+        assert_eq!(inv.files.len(), 11, "{inv:?}");
+        let cas = faktor_cas::Cas::open(dir.path().join("cas")).unwrap();
+        let digest = cas.put(inv.files.join("\n").as_bytes()).unwrap();
+        assert_eq!(
+            digest.to_hex(),
+            "fd252e1af981e0407ecabb6fc89dab64e03fe0544b99133472821c5d8674c7ca",
+            "the honest non-Git inventory drifted from the golden listing"
+        );
+    }
+
+    // ---------------------------------------------- anchored native traversal
+
+    struct NativeSeamClear;
+    impl Drop for NativeSeamClear {
+        fn drop(&mut self) {
+            if let Some(lock) = NATIVE_WALK_SEAM.get() {
+                *lock.lock().expect("native walk seam poisoned") = None;
+            }
+        }
+    }
+
+    /// Install the native-walk swap seam and clear it on drop; the global lock
+    /// serializes every test that uses the process-global hook slot.
+    fn install_native_walk_seam(
+        f: impl Fn(&str) + Send + 'static,
+    ) -> (std::sync::MutexGuard<'static, ()>, NativeSeamClear) {
+        let guard = NATIVE_WALK_SEAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *NATIVE_WALK_SEAM
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("native walk seam poisoned") = Some(Box::new(f));
+        (guard, NativeSeamClear)
+    }
+
+    /// A queued directory entry swapped for a symlink to an OUTSIDE directory
+    /// before the walker descends: the descent must be a typed refusal and the
+    /// outside tree must never be inventoried (or, downstream, hashed).
+    #[cfg(unix)]
+    #[test]
+    fn queued_dir_swapped_to_outside_link_before_descent_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/honest.rs"), b"honest").unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("EXTERNAL.rs"), b"EXTERNAL-MARKER-7c41").unwrap();
+        let swap_root = root.clone();
+        let swap_outside = outside.clone();
+        let (_lock, _clear) = install_native_walk_seam(move |rel| {
+            if rel == "sub" {
+                fs::rename(swap_root.join("sub"), swap_root.join("sub-real")).unwrap();
+                std::os::unix::fs::symlink(&swap_outside, swap_root.join("sub")).unwrap();
+            }
+        });
+        let inv = native_inventory(
+            &root,
+            &InventoryBudget::default(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::Unreadable {
+                path: "sub".to_string()
+            },
+            "a queued dir swapped for an outside link must be a typed refusal: {inv:?}"
+        );
+        assert!(
+            !inv.files.iter().any(|path| path.contains("EXTERNAL")),
+            "the outside tree must never be inventoried: {:?}",
+            inv.files
+        );
+        assert!(root.join("sub-real/honest.rs").exists());
+        assert_eq!(
+            fs::read(outside.join("EXTERNAL.rs")).unwrap(),
+            b"EXTERNAL-MARKER-7c41"
+        );
+    }
+
+    /// A nested symlink (the unix spelling of a reparse point) is classified
+    /// and refused, and the outside target is never listed, traversed or read.
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlink_is_refused_and_outside_marker_never_listed() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("EXTERNAL.rs"), b"EXTERNAL-MARKER-2b90").unwrap();
+        std::os::unix::fs::symlink(outside.join("EXTERNAL.rs"), root.join("a/b/link.rs")).unwrap();
+        fs::write(root.join("a/ok.rs"), b"ok").unwrap();
+        let inv = native_inventory(
+            &root,
+            &InventoryBudget::default(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(
+            inv.completeness,
+            InventoryCompleteness::Unreadable {
+                path: "a/b/link.rs".to_string()
+            },
+            "a nested symlink must be a typed refusal: {inv:?}"
+        );
+        assert!(
+            !inv.files.iter().any(|path| path.contains("EXTERNAL")),
+            "the link target must never be inventoried: {:?}",
+            inv.files
+        );
+    }
+
+    /// A content-deciding manifest classified as a file by the anchored walk
+    /// and swapped for a symlink to an outside manifest before the profile
+    /// read: the read must refuse typed and the outside content must never be
+    /// imported.
+    #[cfg(unix)]
+    #[test]
+    fn file_swapped_to_outside_link_between_classification_and_read_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("Makefile"), b"all:\n\t@true\n").unwrap();
+        fs::write(
+            outside.join("Makefile"),
+            b"add_subdirectory(EXTERNAL-MARKER-5e13)\n",
+        )
+        .unwrap();
+        let swap_root = root.clone();
+        let outside_manifest = outside.join("Makefile");
+        let (_lock, _clear) = install_native_walk_seam(move |rel| {
+            if rel == "Makefile" {
+                fs::remove_file(swap_root.join("Makefile")).unwrap();
+                std::os::unix::fs::symlink(&outside_manifest, swap_root.join("Makefile")).unwrap();
+            }
+        });
+        let budget = InventoryBudget {
+            git_program: OsString::from("faktor-no-such-git-binary"),
+            ..Default::default()
+        };
+        let inv = discover_repo_inventory_with_budget(&root, &budget);
+        assert_eq!(inv.completeness, InventoryCompleteness::Complete, "{inv:?}");
+        assert_eq!(inv.files, vec!["Makefile".to_string()]);
+        // The content read is the profile probe: the swap between the walk's
+        // classification and that read must be a typed refusal, never a
+        // silent `Absent` and never the link target's content.
+        let profile = crate::derive::detect_project_profile(&root, &inv.files);
+        assert!(
+            !format!("{profile:?}").contains("EXTERNAL-MARKER-5e13"),
+            "the outside content must never be read: {profile:?}"
+        );
+        assert!(
+            profile
+                .manifest_refusals
+                .iter()
+                .any(|refusal| refusal.path == "Makefile" && refusal.kind == "unreadable"),
+            "the swap must surface as an unreadable refusal: {profile:?}"
+        );
+        assert_eq!(
+            fs::read(outside.join("Makefile")).unwrap(),
+            b"add_subdirectory(EXTERNAL-MARKER-5e13)\n"
+        );
+    }
+
+    /// Depth, path, per-directory page and metadata exhaustion each keep their
+    /// own typed verdict on the anchored native traversal.
+    #[test]
+    fn native_budget_exhaustion_verdicts_stay_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "d0/d1/f.rs");
+        write(dir.path(), "root.rs");
+        let run = |budget: &InventoryBudget| {
+            native_inventory(dir.path(), budget, Instant::now() + Duration::from_secs(30))
+        };
+        let depth = run(&InventoryBudget {
+            max_depth: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            depth.completeness,
+            InventoryCompleteness::DepthBudgetExceeded { max_depth: 0 },
+            "{depth:?}"
+        );
+        let paths = run(&InventoryBudget {
+            max_paths: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            paths.completeness,
+            InventoryCompleteness::PathBudgetExceeded { seen: 2, max: 1 },
+            "{paths:?}"
+        );
+        let page = run(&InventoryBudget {
+            max_dir_page: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            page.completeness,
+            InventoryCompleteness::DirectoryPageTruncated { limit: 1 },
+            "{page:?}"
+        );
+        let meta = run(&InventoryBudget {
+            max_metadata_bytes: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            meta.completeness,
+            InventoryCompleteness::MetadataBudgetExceeded {
+                seen_bytes: 1,
+                max_bytes: 0
+            },
+            "{meta:?}"
+        );
+        let budget = InventoryBudget::default();
+        let wall = native_inventory(dir.path(), &budget, Instant::now());
+        assert_eq!(
+            wall.completeness,
+            InventoryCompleteness::WallBudgetExceeded {
+                max: budget.max_wall
+            },
+            "an already-expired wall budget must refuse before enumeration: {wall:?}"
+        );
     }
 
     #[test]

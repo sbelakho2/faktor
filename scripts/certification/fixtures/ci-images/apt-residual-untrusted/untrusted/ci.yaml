@@ -1,0 +1,9 @@
+# Fixture: this file lives under an `untrusted/` path segment (the
+# pull_request project), so unpinned apt is tolerated there with an explicit
+# justification. `scripts/check-ci-image-pins.sh --dir` must accept this file.
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ fixture
+    commands:
+      # apt-residual: untrusted PR lane; digest-pinned stock image only, effect discarded with the pipeline workspace
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates

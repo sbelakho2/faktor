@@ -6,8 +6,9 @@
 // produced. The trusted workflow's `attestation` step writes it and prints a
 // base64 marker block into the step log; scripts/certify.sh later FETCHES
 // that block from the Woodpecker API for the exact trusted pipeline,
-// verifies the ed25519 signature against the operator key allowlist, checks
-// source/tree/workflow/event/pipeline binding, and re-hashes every
+// verifies the ed25519 signature with the allowlisted key (the embedded
+// public key must equal it), checks repository/source/tree/workflow/event/
+// pipeline-number/observed-pipeline-id binding, and re-hashes every
 // local/shipped artifact against the attested digests. A release
 // certificate is impossible without an attestation that verifies.
 //
@@ -22,9 +23,9 @@
 //           [--from-lanes DIR] [--emit-log-block] \
 //           (--sign-key PEM | --sign-key-env VAR)
 //   verify  --attestation FILE --source-sha SHA --tree-sha SHA \
-//           --workflow WORKFLOW --keys KEYS.json [--require-signed] \
-//           [--event EVENT] [--pipeline-number N] [--pipeline-id ID] \
-//           [--artifact PATH]...
+//           --workflow WORKFLOW [--repo OWNER/NAME] --keys KEYS.json \
+//           [--require-signed] [--event EVENT] [--pipeline-number N] \
+//           [--pipeline-id ID] [--artifact PATH]...
 //   selftest
 //
 // Signature model: identical to scripts/certification/evidence.mjs — the
@@ -452,6 +453,9 @@ function verifyAttestation(attestation, options) {
   if (options.treeSha && attestation.tree_sha !== options.treeSha) {
     problems.push(`${label}:tree-sha-mismatch: ${attestation.tree_sha} != ${options.treeSha}`);
   }
+  if (options.repo && attestation.repository !== options.repo) {
+    problems.push(`${label}:repository-mismatch: ${attestation.repository} != ${options.repo}`);
+  }
   if (options.workflow && attestation.workflow !== options.workflow) {
     problems.push(`${label}:workflow-mismatch: ${attestation.workflow} != ${options.workflow}`);
   }
@@ -475,17 +479,14 @@ function verifyAttestation(attestation, options) {
       `${label}:pipeline-number-mismatch: ${attestation.pipeline_number} != ${options.pipelineNumber}`,
     );
   }
-  // The runtime's pipeline id may be absent in older Woodpecker versions; when
-  // the attestation carries an id that differs from the number, the observed
-  // API id must match it.
-  if (
-    options.pipelineId &&
-    attestation.pipeline_id &&
-    String(attestation.pipeline_id) !== String(attestation.pipeline_number)
-  ) {
-    if (String(attestation.pipeline_id) !== String(options.pipelineId)) {
-      problems.push(`${label}:pipeline-id-mismatch: ${attestation.pipeline_id} != ${options.pipelineId}`);
-    }
+  // P1: UNCONDITIONAL observed-id binding. The former `pipeline_id ===
+  // pipeline_number` exemption let a signer copy the number into the id field
+  // and skip the observed API id entirely. There is no exemption now: when the
+  // caller observed an id, the attestation must carry exactly that id.
+  if (options.pipelineId && String(attestation.pipeline_id) !== String(options.pipelineId)) {
+    problems.push(
+      `${label}:pipeline-id-mismatch: ${attestation.pipeline_id === undefined ? '<missing>' : attestation.pipeline_id} != ${options.pipelineId}`,
+    );
   }
   const artifacts = attestation.artifacts;
   if (!artifacts || typeof artifacts !== 'object' || Array.isArray(artifacts)) {
@@ -533,18 +534,27 @@ function verifyAttestation(attestation, options) {
     } else if (!keys[signature.identity]) {
       problems.push(`${label}:signature-invalid: identity '${signature.identity}' is not on the allowlist`);
     } else {
-      try {
-        const ok = cryptoVerify(
-          null,
-          Buffer.from(signaturePayload(attestation)),
-          publicKeyFromRawBase64(signature.public_key),
-          Buffer.from(signature.value, 'base64'),
-        );
-        if (!ok) {
-          problems.push(`${label}:signature-invalid: signature does not verify`);
+      // P0: verify with the TRUSTED allowlist key, never the embedded one (same
+      // rule as evidence.mjs / crates/updater/src/manifest.rs). Requiring the
+      // embedded key to equal the allowlisted key stops an allowlisted identity
+      // from being claimed with an attacker-controlled keypair.
+      const trustedPublicKey = keys[signature.identity];
+      if (signature.public_key !== trustedPublicKey) {
+        problems.push(`${label}:signature-invalid: embedded public key does not match allowlist`);
+      } else {
+        try {
+          const ok = cryptoVerify(
+            null,
+            Buffer.from(signaturePayload(attestation)),
+            publicKeyFromRawBase64(trustedPublicKey),
+            Buffer.from(signature.value, 'base64'),
+          );
+          if (!ok) {
+            problems.push(`${label}:signature-invalid: signature does not verify`);
+          }
+        } catch (error) {
+          problems.push(`${label}:signature-invalid: ${error.message}`);
         }
-      } catch (error) {
-        problems.push(`${label}:signature-invalid: ${error.message}`);
       }
     }
   }
@@ -681,6 +691,32 @@ function runSelftest() {
       verifyAttestation(attestation, { pipelineNumber: '21', pipelineId: '999', keys: keysPath, requireSigned: true }),
       'pipeline-id-mismatch',
     );
+    expectProblem(
+      'wrong repository is rejected',
+      verifyAttestation(attestation, { repo: 'acme/other', keys: keysPath, requireSigned: true }),
+      'repository-mismatch',
+    );
+    const unmutated = { ...attestation };
+    delete unmutated.__matched; // verifyAttestation annotates the object it verifies
+    expect(
+      'matching --repo passes',
+      verifyAttestation(unmutated, { repo: 'acme/widgets', keys: keysPath, requireSigned: true }).length === 0,
+    );
+    // P1 (pre-fix regression): the verifier exempted the observed-id check
+    // whenever pipeline_id == pipeline_number, so this attestation (with the
+    // number copied into the id field) verified against the observed API id
+    // 211 before the fix; it must now be rejected.
+    const spoofedPipelineId = createAttestation({ ...base, out: join(temp, 'spoofed-pipeline.json'), pipelineId: '' });
+    expectProblem(
+      'spoofed pipeline_id==pipeline_number is rejected against the observed id',
+      verifyAttestation(spoofedPipelineId, {
+        pipelineNumber: '21',
+        pipelineId: '211',
+        keys: keysPath,
+        requireSigned: true,
+      }),
+      'pipeline-id-mismatch',
+    );
 
     // Artifact binding.
     const tampered = { ...attestation, artifacts: { ...attestation.artifacts } };
@@ -728,6 +764,43 @@ function runSelftest() {
       'payload edit after signing is rejected',
       verifyAttestation(crossSigned, { keys: keysPath, requireSigned: true }),
       'signature-invalid',
+    );
+
+    // P0 (pre-fix regression): an attacker keypair carrying the ALLOWLISTED
+    // identity name. The unfixed verifier checked signature.identity against
+    // the allowlist and then verified with signature.public_key from the
+    // attestation, so this fully attacker-controlled object (valid bindings,
+    // attacker signature) verified against the honest allowlist; it must now
+    // be refused on the embedded key before any crypto check.
+    keygen({ outKey: join(temp, 'attacker.pem'), outKeys: join(temp, 'attacker-keys.json'), keyId: 'faktor-selftest' });
+    const attackerAttestation = createAttestation({
+      ...base,
+      out: join(temp, 'attacker-attestation.json'),
+      signKey: join(temp, 'attacker.pem'),
+      keyId: 'faktor-selftest',
+    });
+    const allowlistedKey = readJsonStrict(keysPath).identities['faktor-selftest'].ed25519_public_key;
+    expect(
+      'substitution fixture claims the allowlisted identity with a foreign key',
+      attackerAttestation.signature.identity === 'faktor-selftest' &&
+        attackerAttestation.signature.public_key !== allowlistedKey,
+    );
+    expectProblem(
+      'allowlisted identity with a substituted key is rejected',
+      verifyAttestation(attackerAttestation, {
+        repo: 'acme/widgets',
+        sourceSha: sha,
+        treeSha: tree,
+        workflow: 'trusted',
+        event: 'push',
+        pipelineNumber: '21',
+        pipelineId: '211',
+        keys: keysPath,
+        requireSigned: true,
+        artifacts: [artifactPath],
+        cwd: ROOT,
+      }),
+      'embedded public key does not match allowlist',
     );
 
     // Create-time refusals.
@@ -874,7 +947,8 @@ commands:
           (--sign-key PEM | --sign-key-env VAR) [--key-id ID]
           (signing is FAIL-CLOSED: no key -> typed refusal, no artifact)
   verify  --attestation FILE --source-sha SHA --tree-sha SHA --workflow W
-          [--event E] [--pipeline-number N] [--pipeline-id ID]
+          [--repo OWNER/NAME] [--event E] [--pipeline-number N]
+          [--pipeline-id ID]
           --keys KEYS.json [--require-signed] [--artifact PATH]...
   selftest`);
 }
@@ -942,6 +1016,7 @@ function main(argv) {
         sourceSha: argValue(args, '--source-sha'),
         treeSha: argValue(args, '--tree-sha'),
         workflow: argValue(args, '--workflow'),
+        repo: argValue(args, '--repo'),
         event: argValue(args, '--event'),
         pipelineNumber: argValue(args, '--pipeline-number'),
         pipelineId: argValue(args, '--pipeline-id'),

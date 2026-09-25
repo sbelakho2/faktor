@@ -1,0 +1,11 @@
+# Fixture: the Faktor CI image referenced by the digest recorded by
+# `scripts/build-ci-image.sh --record-digest` (a fixture digest here, the
+# recorded-digest file is not consulted by `--selftest`). No apt runs at all:
+# the image itself carries the pinned toolchain.
+# `scripts/check-ci-image-pins.sh --dir` must accept this file.
+steps:
+  - name: jetbrains-smoke
+    image: faktor-ci@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # faktor-ci @ fixture
+    pull: false
+    commands:
+      - sh scripts/build-ci-image.sh --verify-runtime

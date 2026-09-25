@@ -33,6 +33,18 @@
 //!
 //! The sweep is idempotent: finished rows are never re-scanned, and a second
 //! `recover_all` appends nothing (including no second expiry event).
+//!
+//! Terminalization atomicity: each scanned row's terminal `tool_run` update
+//! and its `RecoveryApplied` journal event commit in ONE transaction
+//! (`Store::finish_recovered_tool_run_and_event`, with the session expected
+//! state re-verified inside it), together with the journal sequence and
+//! session state. A crash at any durability boundary of that command leaves
+//! exactly the old world (row still `running`, no event) or exactly the new
+//! one (terminal row AND its event) — never the pre-fix residue of a
+//! terminal row whose missing event no later sweep revisits. `CrashDetected`
+//! is the one preceding transition and the legacy-postcondition migration
+//! write remains a documented lawful midpoint (a crash there resumes through
+//! the modern relative identity exactly once).
 
 use std::path::Path;
 
@@ -252,14 +264,30 @@ fn migrate_legacy_verify_row(
     Ok(Some((postcondition, ws)))
 }
 
-/// One applied recovery decision: the report row plus the durable migration
-/// evidence the journal records.
+/// One applied recovery decision: the report row. The durable migration
+/// evidence (`legacy_migrated_to`) is committed inside the row's
+/// `RecoveryApplied` event by [`finish_recovered`], not carried here.
 struct AppliedRecovery {
     op: RecoveredOp,
-    legacy_migrated_to: Option<String>,
 }
 
-/// Finish one row durably and build its report entry.
+/// The stable action tag the `RecoveryApplied` payload journals.
+fn action_tag(action: &RecoveryAction) -> &'static str {
+    match action {
+        RecoveryAction::Verified { .. } => "verified",
+        RecoveryAction::NotApplied { .. } => "not_applied",
+        RecoveryAction::UnknownEffect => "unknown_effect",
+        RecoveryAction::RerunAllowed => "rerun_allowed",
+        RecoveryAction::NeedsHuman => "needs_human",
+        RecoveryAction::NoAction => "no_action",
+    }
+}
+
+/// Finish one row durably and build its report entry. The terminal
+/// `tool_run` update, the `RecoveryApplied` event and the journal
+/// sequence/session state commit in ONE store transaction with `state`
+/// re-verified inside it, so a crash can never leave a terminal row without
+/// its event (or an event without its row).
 fn finish_recovered(
     s: &SessionHandle,
     row: &ToolRunRow,
@@ -267,10 +295,40 @@ fn finish_recovered(
     effect: EffectStatus,
     action: RecoveryAction,
     legacy_migrated_to: Option<String>,
+    state: AgentState,
 ) -> Result<AppliedRecovery, SessionError> {
+    let mut payload = serde_json::json!({
+        "op_id": row.op_id.raw(),
+        "tool": &row.tool,
+        "status": status,
+        "effect": effect_str(effect),
+        "action": action_tag(&action),
+    });
+    if let Some(relative) = &legacy_migrated_to {
+        // Durable evidence of the one-time legacy migration (audit P1-F):
+        // the run was verified through this normalized workspace-relative
+        // identity, never through the recorded raw pathname.
+        payload["legacy_migrated_to"] = serde_json::json!(relative);
+    }
+    // The same typed payload gate the live append path uses: an undecodable
+    // payload refuses BEFORE the transaction, so there is never a row
+    // without its (valid) event.
+    crate::payload::decode_payload(
+        EventKind::RecoveryApplied,
+        crate::payload::PAYLOAD_SCHEMA_V,
+        Some(&payload),
+    )?;
     s.manager()
         .store()
-        .finish_tool_run(row.session_id, row.op_id, status, effect_str(effect))
+        .finish_recovered_tool_run_and_event(
+            row.session_id,
+            row.op_id,
+            status,
+            effect_str(effect),
+            EventKind::RecoveryApplied,
+            state,
+            Some(payload),
+        )
         .map_err(crate::map_store_err)?;
     Ok(AppliedRecovery {
         op: RecoveredOp {
@@ -280,7 +338,6 @@ fn finish_recovered(
             effect,
             action,
         },
-        legacy_migrated_to,
     })
 }
 
@@ -288,6 +345,7 @@ fn apply_strategy(
     s: &SessionHandle,
     row: &ToolRunRow,
     strategy: &RecoveryStrategy,
+    state: AgentState,
 ) -> Result<AppliedRecovery, SessionError> {
     // A durable postcondition is the modern recovery identity: verify it
     // through the handle FIRST — exactly like the agent runtime's sweep —
@@ -316,13 +374,14 @@ fn apply_strategy(
                 EffectStatus::Unknown,
                 RecoveryAction::NeedsHuman,
                 None,
+                state,
             );
         };
         let (status, effect, action) = classify_verification(
             pc.expected_hash,
             verify_through_handle(&ws, &pc.relative_path),
         );
-        return finish_recovered(s, row, status, effect, action, None);
+        return finish_recovered(s, row, status, effect, action, None, state);
     }
     match strategy {
         RecoveryStrategy::VerifyHash { path, expected } => {
@@ -349,6 +408,7 @@ fn apply_strategy(
                     EffectStatus::Unknown,
                     RecoveryAction::NeedsHuman,
                     None,
+                    state,
                 );
             };
             // Durable audit evidence: the run was verified through this
@@ -358,7 +418,7 @@ fn apply_strategy(
                 *expected,
                 verify_through_handle(&ws, &postcondition.relative_path),
             );
-            finish_recovered(s, row, status, effect, action, migrated)
+            finish_recovered(s, row, status, effect, action, migrated, state)
         }
         RecoveryStrategy::MarkUnknown => finish_recovered(
             s,
@@ -367,6 +427,7 @@ fn apply_strategy(
             EffectStatus::Unknown,
             RecoveryAction::UnknownEffect,
             None,
+            state,
         ),
         RecoveryStrategy::Idempotent => finish_recovered(
             s,
@@ -375,6 +436,7 @@ fn apply_strategy(
             EffectStatus::Unknown,
             RecoveryAction::RerunAllowed,
             None,
+            state,
         ),
         RecoveryStrategy::Manual => finish_recovered(
             s,
@@ -383,6 +445,7 @@ fn apply_strategy(
             EffectStatus::Unknown,
             RecoveryAction::NeedsHuman,
             None,
+            state,
         ),
         RecoveryStrategy::None => finish_recovered(
             s,
@@ -391,6 +454,7 @@ fn apply_strategy(
             EffectStatus::Unknown,
             RecoveryAction::NoAction,
             None,
+            state,
         ),
     }
 }
@@ -481,43 +545,19 @@ impl SessionHandle {
 
         for row in &pending {
             let strategy = parse_recovery(row)?;
-            let applied = apply_strategy(self, row, &strategy)?;
+            // ONE transaction per row: terminal row + `RecoveryApplied`
+            // event + session sequence/state (see the store command). The
+            // event lands as part of the SAME transaction as the terminal
+            // row — there is no later, separately crashable append.
+            let applied = apply_strategy(self, row, &strategy, crash_state)?;
             let recovered = &applied.op;
-            let action_tag = match &recovered.action {
-                RecoveryAction::Verified { .. } => "verified",
-                RecoveryAction::NotApplied { .. } => "not_applied",
-                RecoveryAction::UnknownEffect => "unknown_effect",
-                RecoveryAction::RerunAllowed => "rerun_allowed",
-                RecoveryAction::NeedsHuman => "needs_human",
-                RecoveryAction::NoAction => "no_action",
-            };
             tracing::warn!(
                 session = %session_id,
                 op = %recovered.op_id,
                 tool = %recovered.tool,
-                action = action_tag,
+                action = action_tag(&recovered.action),
                 "recovered crashed operation"
             );
-            let mut payload = serde_json::json!({
-                "op_id": recovered.op_id.raw(),
-                "tool": &recovered.tool,
-                "status": &recovered.status,
-                "effect": effect_str(recovered.effect),
-                "action": action_tag,
-            });
-            if let Some(relative) = &applied.legacy_migrated_to {
-                // Durable evidence of the one-time legacy migration (audit
-                // P1-F): the run was verified through this normalized
-                // workspace-relative identity, never through the recorded
-                // raw pathname.
-                payload["legacy_migrated_to"] = serde_json::json!(relative);
-            }
-            self.transition_locked(
-                EventKind::RecoveryApplied,
-                crash_state,
-                Some(recovered.op_id),
-                Some(payload),
-            )?;
             report.crashed_ops.push(applied.op);
         }
 
@@ -558,6 +598,10 @@ mod tests {
 
     fn recovery_events(s: &SessionHandle) -> Vec<faktor_core::event::Event> {
         s.events_range(1, None).unwrap()
+    }
+
+    fn reopen(dir: &tempfile::TempDir) -> std::sync::Arc<crate::SessionManager> {
+        crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap()
     }
 
     fn verified_effects(events: &[faktor_core::event::Event]) -> usize {
@@ -808,6 +852,120 @@ mod tests {
         );
         // Third sweep still idempotent.
         assert!(!s.recover_all().unwrap().applied);
+    }
+
+    /// Terminalization is ONE transaction per scanned row: the terminal
+    /// `tool_run` update and its `RecoveryApplied` event commit together
+    /// with the session state/sequence. Crash at each durability boundary
+    /// (`ev_precommit`/`ev_committed` = before the per-row txn starts,
+    /// `session_command_*` = inside row 0 or row 1) reopens on exactly the
+    /// old or exactly the new durable world; a restart's sweep converges
+    /// every remaining row to exactly one row+event pair, and further
+    /// sweeps append nothing.
+    #[test]
+    fn recovery_terminalizes_row_and_event_in_one_transaction() {
+        const SEAMS: [&str; 5] = [
+            "ev_precommit",
+            "ev_committed",
+            "session_command_side_row",
+            "session_command_precommit",
+            "session_command_committed",
+        ];
+        for seam in SEAMS {
+            let ordinals: &[u64] = if seam.starts_with("ev_") {
+                &[0]
+            } else {
+                &[0, 1]
+            };
+            for &ordinal in ordinals {
+                let (dir, m) = test_manager();
+                let s = session(&m);
+                to_executing(&s);
+                let mut ops = Vec::new();
+                for i in 0..2 {
+                    let (meta, op) = make_meta(&s, &m, RecoveryStrategy::None);
+                    s.start_tool_run(meta, "read_file", serde_json::json!({ "i": i }))
+                        .unwrap();
+                    ops.push(op);
+                }
+                let sid = s.id();
+                m.store().crash_arm(faktor_store::CrashArm {
+                    point: seam,
+                    ordinal,
+                });
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = s.recover_all();
+                }));
+                assert!(caught.is_err(), "seam {seam} ordinal {ordinal} must fire");
+                drop(s);
+                drop(m);
+                let m2 = reopen(&dir);
+                let after = m2.get_session(sid).unwrap().unwrap();
+                let running: std::collections::HashSet<OpId> = after
+                    .pending_tool_runs()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.op_id)
+                    .collect();
+                let applied_events = |op: OpId| {
+                    after
+                        .events_range(1, None)
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.kind == EventKind::RecoveryApplied && e.op_id == Some(op))
+                        .count()
+                };
+                let i = ordinal as usize;
+                for (k, op) in ops.iter().enumerate() {
+                    let committed = match seam {
+                        "session_command_committed" => k <= i,
+                        "session_command_side_row" | "session_command_precommit" => k < i,
+                        // CrashDetected: no per-row transaction ran at all.
+                        _ => false,
+                    };
+                    if committed {
+                        assert!(
+                            !running.contains(op),
+                            "{seam}/{ordinal}: terminal row is durable"
+                        );
+                        assert_eq!(
+                            applied_events(*op),
+                            1,
+                            "{seam}/{ordinal}: terminal row AND its event committed together"
+                        );
+                    } else {
+                        assert!(
+                            running.contains(op),
+                            "{seam}/{ordinal}: row without a committed event stays running"
+                        );
+                        assert_eq!(
+                            applied_events(*op),
+                            0,
+                            "{seam}/{ordinal}: no event without its row"
+                        );
+                    }
+                }
+                // The pre-sweep crash still lands on a replayed-legal journal.
+                after.replay_journal().unwrap();
+                // Restart convergence: the next sweep terminalizes every
+                // remaining row exactly once; already-paired rows keep
+                // exactly one event (never a duplicate).
+                let report = after.recover_all().unwrap();
+                assert!(after.pending_tool_runs().unwrap().is_empty());
+                for op in &ops {
+                    assert_eq!(
+                        applied_events(*op),
+                        1,
+                        "{seam}/{ordinal}: exactly one row+event pair for {op}"
+                    );
+                }
+                assert!(report.crashed_ops.len() <= ops.len());
+                // Further sweeps append nothing (idempotent).
+                let seq = after.last_event_seq().unwrap().unwrap();
+                assert!(!after.recover_all().unwrap().applied);
+                assert_eq!(after.last_event_seq().unwrap().unwrap(), seq);
+            }
+        }
     }
 
     #[test]

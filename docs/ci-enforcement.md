@@ -141,7 +141,7 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   | --- | --- |
   | `rust:1.98.0` | `sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959` |
   | `node:24` | `sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4` |
-  | `eclipse-temurin:17-jdk` | `sha256:bc033b57e11b773c3043babfd664e7a5ef110805548b921cbfc3e8c67a0725d6` |
+  | `faktor-ci` (local build, linux/amd64) | `sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b` (`docker/faktor-ci/image-digest.txt`) |
   | `ubuntu:24.04` | `sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3` |
   | `alpine:3.20` | `sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc` |
   | `bash:latest` | `sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f` |
@@ -185,8 +185,13 @@ CI change is pushed.
   from the lane markers (VSIX, JetBrains zip) with every digest re-hashed at
   attestation time. `scripts/certify.sh` fetches that block for the EXACT
   trusted pipeline and refuses release certification on any mismatch.
-  Signing is **fail-closed**: register an ed25519 key on the trusted project
-  and add `FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
+  The step resolves the OBSERVED pipeline id from the Woodpecker API (repo
+  lookup then `/pipelines/<CI_PIPELINE_NUMBER>`, take `id`) with the
+  `WOODPECKER_HOST`/`WOODPECKER_TOKEN` available to trusted lanes and passes
+  it as `--pipeline-id`; that lookup fails closed with the typed
+  `observed-pipeline-id-lookup-failed` error instead of copying the pipeline
+  number into the id field. Signing is **fail-closed**: register an ed25519
+  key on the trusted project and add `FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
   faktor_attest_signing_key}` to the step (a `from_secret` to a missing
   secret is a Woodpecker config error, so it is documented, not hardcoded).
   Generate the pair with `node scripts/certification/attestation.mjs keygen
@@ -208,8 +213,10 @@ CI change is pushed.
   when the step runs on the dedicated Faktor CI image. The legacy
   `apt-residual` annotation is rejected outright. `docker/faktor-ci/` +
   `scripts/build-ci-image.sh` build the dedicated image (pinned base digest
-  + snapshot + exact versions); lanes switch to `image@sha256:<digest>` once
-  the operator publishes it. See `docs/certification.md` §2.14.
+  + snapshot + exact versions, including `git` and `openjdk-17-jdk-headless`
+  for the JetBrains lanes); the PR and trusted JetBrains build/smoke lanes
+  run on the recorded `image@sha256:<digest>`. See
+  `docs/certification.md` §2.14.
 
 ## 6. Context registry for release certification
 

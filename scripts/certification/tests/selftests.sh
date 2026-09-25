@@ -12,7 +12,9 @@
 #                                           refusal, no artifact)
 #   scripts/certify.sh --selftest           immutable context registry, observed-value
 #                                           recording, attestation fetch/verification,
-#                                           certificate wording, temp-name migration
+#                                           ReleaseArtifactSet matrix, canonical-gate
+#                                           parity, fault-campaign release gate,
+#                                           certificate classes, temp-name migration
 #   scripts/cross-target-check.sh           status classifier + temp-name migration
 #   scripts/check-gradle-integrity.sh       planted tampering + temp-name migration
 #   scripts/check-ci-image-pins.sh          image pins + apt-snapshot/apt-pinned audit

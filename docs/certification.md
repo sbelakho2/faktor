@@ -586,12 +586,35 @@ Sigstore/keyless verification of the same payload against the pipeline's
 OIDC identity: the workflow attests through `cosign attest` (keyless) and
 the operator verifies the bundle against that identity. `scripts/certify.sh`
 fetches the block belonging to the exact trusted pipeline, verifies the
-signature against `FAKTOR_ATTEST_KEYS` / `--attestation-keys`, verifies
-source SHA, tree, workflow, event and pipeline number/id, and re-hashes
+signature **with the allowlisted key** (the embedded `public_key` must equal
+the `keys.json` entry for `signature.identity`; a substituted keypair under
+an allowlisted identity is refused), verifies repository full name
+(`--repo`), source SHA, tree, workflow, event, pipeline number and the
+OBSERVED API pipeline id — that id comparison is unconditional, so copying
+the pipeline number into the id field does not exempt it — and re-hashes
 **every local/shipped artifact** against the attested digests. Any mismatch
 (`attestation-invalid`), a missing attestation on a trusted context
 (`attestation-absent`), or a missing allowlist when a signed attestation
-exists (`attestation-keys-missing`) fails the run. Distributing the
+exists (`attestation-keys-missing`) fails the run. When the selected context
+is untrusted, the trusted project is looked up and **re-fetched**: the
+observed `full_name`, `config_file` and `trusted.volumes` must match the
+requested repository and the trusted registry entry before its pipelines are
+scanned, so `WOODPECKER_TRUSTED_REPO_ID` or a `?project=trusted` answer is a
+claim, never authority (`attestation-trusted-repo-mismatch`,
+`attestation-trusted-config-mismatch`,
+`attestation-trusted-class-mismatch`). Because the id binding is
+unconditional, an attestation created without the observed API id (its
+`pipeline_id` defaulting to the pipeline number) is refused by design:
+`create --pipeline-id` must carry the Woodpecker API pipeline id observed
+for the attesting run. The `attestation` step therefore resolves that
+observed id itself from the Woodpecker API
+(`/api/repos/lookup/<repo>?project=trusted`, then
+`/api/repos/<id>/pipelines/<CI_PIPELINE_NUMBER>`, take its `id`) using the
+`WOODPECKER_HOST`/`WOODPECKER_TOKEN` provided in the trusted-lane
+environment and passes it to `attestation.mjs create --pipeline-id`; the
+lookup never falls back to the pipeline number and fails closed with the
+typed `observed-pipeline-id-lookup-failed` error when the API cannot be
+reached or does not return an id. Distributing the
 CI-built artifacts covered by the attestation, rather than locally rebuilt
 ones, is the preferred release model: the attestation is the binding
 between the certified run and the shipped bytes.
@@ -629,8 +652,11 @@ against the mock API in
 absent, other-SHA, pending, failure, error, wrong-workflow, unregistered
 context (operator error), the observed-fact rejection matrix
 (repository/config-file/trusted-class/event/pipeline-id), trusted-context
-attestation success plus tampered/foreign-signature/unsigned/absent
-attestation failures, pr-context upgrade by a trusted attestation, the
+attestation success plus failures for tampered, foreign-signature,
+allowlisted-identity-with-foreign-key, other-repository, unconditional-
+pipeline-id, unsigned and absent attestations, pr-context upgrade by a
+trusted attestation plus trusted-project identity/config/class re-fetch
+spoofs, the
 `--verify-ci-evidence` wording, the `--ci-only` rejection, certificate-class
 truth-table checks, manifest field binding/determinism and the temp-name
 migration. The same suites run from
@@ -685,27 +711,35 @@ fails with `unassigned`; an unconventional tag fails with
   attestation's `build_environment_digest`, so certified bytes name the
   build environment they came from.
 - **apt reproducibility (P2-D, closed):** the CI jobs install nothing from
-  live distribution repositories. Every apt-bearing step sources a fixed
-  snapshot — `snapshot.debian.org/archive/debian/<ts>` (and
-  `debian-security` for security pockets) or `snapshot.ubuntu.com/ubuntu/<ts>`
-  with `ts = 20260923T000000Z` — and installs exact `pkg=version` pins
+  live distribution repositories. No workflow step runs apt anymore (the
+  digest-pinned Faktor CI image below is the only apt surface); any step that
+  were reintroduced must source a fixed snapshot —
+  `snapshot.debian.org/archive/debian/<ts>` (and `debian-security` for
+  security pockets) or `snapshot.ubuntu.com/ubuntu/<ts>` with
+  `ts = 20260923T000000Z` — and install exact `pkg=version` pins
   (e.g. `python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419` on the
   `rust:1.98.0`/trixie lane). The `image-pins` check audits this: an
   apt-bearing step needs `# apt-snapshot: <ts> <reason>` with the matching
   snapshot URL present in the same step and only exact-version installs, or
   `# apt-pinned: <image@sha256:...>` when the step runs on the dedicated
   Faktor CI image. The legacy `apt-residual` annotation is a violation — no
-  unjustified residual exists. The Ubuntu `24.04` smoke lane (no
-  ca-certificates in the base image) scopes an explicit TLS-verification
-  bypass to the single `ca-certificates` bootstrap install; APT's InRelease
-  signature (ubuntu-keyring ships in the base) remains the trust anchor for
-  that one fetch, and every later fetch verifies TLS again.
+  unjustified residual exists. The `docker/faktor-ci` image build
+  (`ubuntu:24.04` ships no ca-certificates) scopes an explicit
+  TLS-verification bypass to its single `ca-certificates` bootstrap install;
+  APT's InRelease signature (ubuntu-keyring ships in the base) remains the
+  trust anchor for that one fetch, and every later fetch verifies TLS again.
 - **Dedicated Faktor CI image (P2-D, publish path):**
   `docker/faktor-ci/Dockerfile` pins the `ubuntu:24.04` base by multi-arch
   index digest, pins the same noble snapshot, and installs the full CI apt
   toolchain at exact versions (`build-essential`, `curl`, `pkg-config`,
-  `libssl-dev`, `kotlin`, `openjdk-11-jre-headless`, `unzip`, `python3`,
-  `procps`, `ca-certificates`). `bash scripts/build-ci-image.sh` builds it
+  `libssl-dev`, `kotlin`, `openjdk-11-jre-headless`,
+  `openjdk-17-jdk-headless`, `git`, `unzip`, `python3`, `procps`,
+  `ca-certificates`). The JetBrains build and smoke lanes run on this one
+  digest-pinned image: `git` supplies the `git rev-parse 'HEAD^{tree}'`
+  lane-marker tree binding (the stock eclipse-temurin baseline ships no
+  git), and JDK 17 is the minimum JVM for the pinned Gradle wrapper (9.7.1)
+  while the JDK 11 JRE stays for the apt-kotlinc smoke fallback.
+  `bash scripts/build-ci-image.sh` builds it
   (default `linux/amd64`), prints the image digest, verifies the pinned
   package set inside the built image, and pushes the digest when a registry
   is provided (`FAKTOR_CI_IMAGE_REGISTRY` / `--push`). Once the digest is
