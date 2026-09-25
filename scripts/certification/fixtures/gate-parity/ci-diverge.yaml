@@ -1,0 +1,11 @@
+# Fixture: the CI linux lane has drifted from the canonical local gates
+# (missing --all-features on check/test). Parity must fail.
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    commands:
+      - cargo fmt --check
+      - cargo check --workspace
+      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - cargo test --workspace
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci

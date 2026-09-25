@@ -17,8 +17,11 @@
 
 use std::fmt;
 
+mod abort_txn;
 mod cas;
 mod edit_txn;
+mod recovery_runtime_txn;
+mod recovery_txn;
 mod scheduler_dag;
 mod session_commands;
 mod store_journal;
@@ -428,6 +431,10 @@ fn boundary_table_of_every_campaign_is_unique_and_nonempty() {
         cas::campaign(),
         edit_txn::campaign(),
         scheduler_dag::campaign(),
+        session_commands::campaign(),
+        recovery_txn::campaign(),
+        recovery_runtime_txn::campaign(),
+        abort_txn::campaign(),
     ] {
         let mut seen = std::collections::HashSet::new();
         for b in c.boundaries {

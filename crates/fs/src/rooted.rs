@@ -587,10 +587,21 @@ impl RootedDir {
         let mut dir = unix_dup(self.fd.as_raw_fd())?;
         for comp in comps {
             dir = unix_open_dir_at(&dir, &comp).map_err(|e| {
-                Error::permission(format!(
-                    "{}: component {comp:?} is a symlink or not a directory: {e}",
-                    self.root.display()
-                ))
+                if e.kind() == io::ErrorKind::NotFound {
+                    // A missing component is `NotFound`, not a symlink
+                    // refusal: `entry_meta` relies on the kind to answer
+                    // `Ok(None)` for an entry whose ancestor is absent
+                    // (parity with the Windows walk).
+                    Error::not_found(format!(
+                        "{}: component {comp:?} does not exist",
+                        self.root.display()
+                    ))
+                } else {
+                    Error::permission(format!(
+                        "{}: component {comp:?} is a symlink or not a directory: {e}",
+                        self.root.display()
+                    ))
+                }
             })?;
         }
         Ok(dir)
@@ -652,7 +663,7 @@ impl RootedDir {
 
 #[cfg(windows)]
 use crate::platform::OpenKind;
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 use faktor_core::error::ErrorKind;
 
 /// Canonical location of `rel` under `root` on platforms without a
@@ -1282,7 +1293,14 @@ impl RootedDir {
         #[cfg(unix)]
         {
             let (parent, name) = split_final(rel)?;
-            let dir = self.walk_dirs(&parent)?;
+            let dir = match self.walk_dirs(&parent) {
+                Ok(dir) => dir,
+                // A missing ancestor means the entry itself does not exist:
+                // `Ok(None)`, parity with the Windows walk whose NotFound
+                // classification covers the whole parent chain.
+                Err(e) if e.kind == ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
             match unix_lstat_at(&dir, &name) {
                 Ok(st) => Ok(Some(RootedEntryMeta {
                     kind: entry_kind_from_mode(st.st_mode),
@@ -2226,6 +2244,24 @@ mod tests {
             dir.remove_tree(Path::new("p1")).unwrap();
             assert!(!dir.join(Path::new("p1")).exists());
             dir.remove_tree(Path::new("p1")).unwrap();
+        }
+
+        #[test]
+        fn entry_meta_missing_entry_or_ancestor_is_none_not_permission() {
+            // `entry_meta` documents `Ok(None)` for an entry that does not
+            // exist; an absent ancestor is part of "does not exist" (the
+            // Windows walk already classifies the whole chain), never a
+            // symlink refusal.
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = anchored(&tmp.path().join("root"));
+            dir.create_dir_all(Path::new("a/b")).unwrap();
+            assert!(dir.entry_meta(Path::new("missing.md")).unwrap().is_none());
+            assert!(dir
+                .entry_meta(Path::new("a/b/missing.md"))
+                .unwrap()
+                .is_none());
+            assert!(dir.entry_meta(Path::new("gone/x.md")).unwrap().is_none());
+            assert!(dir.entry_meta(Path::new("a/gone/x.md")).unwrap().is_none());
         }
 
         #[test]

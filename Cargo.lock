@@ -1260,6 +1260,8 @@ name = "faktor-instructions"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "faktor-core",
+ "faktor-fs",
  "serde",
  "tempfile",
 ]

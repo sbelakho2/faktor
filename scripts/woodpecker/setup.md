@@ -224,6 +224,18 @@ to the step, and hand operators `release-keys.json` as `FAKTOR_ATTEST_KEYS`
 documented alternative when the instance can mint OIDC tokens
 (`docs/certification.md` §2.12).
 
+The same `attestation` step resolves the OBSERVED Woodpecker pipeline id
+before signing: certification binds `pipeline_id` to the API's own id for
+the run, so the step queries `/api/repos/lookup/<repo>?project=trusted` and
+then `/api/repos/<id>/pipelines/<CI_PIPELINE_NUMBER>` and fails closed with
+the typed `observed-pipeline-id-lookup-failed` error rather than copying
+the pipeline number into the id field. Provide `WOODPECKER_HOST` and a
+read-scope `WOODPECKER_TOKEN` (personal access token) in the trusted
+project's environment/step `environment:` mapping; they are not secrets
+readable by PR code (untrusted projects get no such mapping). Without them
+the attestation step fails typed by design, exactly like the missing signing
+key.
+
 Secrets are registered on the **trusted project only** (`activate.sh` targets
 it): a secret that exists for the untrusted PR project would be readable by
 unreviewed PR code. The untrusted project needs no secrets.

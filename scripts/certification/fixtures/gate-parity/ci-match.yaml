@@ -1,0 +1,17 @@
+# Fixture: the CI linux lane matches the canonical local gate list exactly.
+# The darwin lane uses a different command on purpose; parity is scoped to
+# the linux lane (the canonical local gates are the CI linux-lane gates).
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    commands:
+      - cargo fmt --check
+      - cargo check --workspace --all-features
+      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - cargo test --workspace --all-features
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
+  - name: darwin
+    image: bash@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    commands:
+      - cargo check --workspace
+      - cargo test --workspace

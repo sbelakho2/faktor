@@ -3916,6 +3916,19 @@ impl AgentRuntime {
     /// when containment cannot be proven; MarkUnknown/Manual/None and
     /// legacy descriptor-less Idempotent rows are marked failed/unknown
     /// (never blindly re-run).
+    ///
+    /// Terminalization atomicity: every terminal row commits its `tool_run`
+    /// status/effect and its `RecoveryApplied` event in ONE store transaction
+    /// (`Store::finish_recovered_tool_run_and_event`), which re-verifies the
+    /// session's landing state inside the transaction and refuses an unknown
+    /// or already-terminal row typed. There is no later, separately
+    /// crashable `journal_recovery_applied` append for a recovered row: a
+    /// crash at any durability boundary leaves either neither (row still
+    /// `running`, no event) or both. The batch's landing state is committed
+    /// FIRST by the sweep's one lawful `CrashDetected` transition (the store
+    /// command self-transitions at the state it verifies); a verification
+    /// refusal or a wrong state propagates typed BEFORE that row's
+    /// transaction, so a refused row is never left row-without-event.
     fn recover_session(
         &self,
         handle: &faktor_session::SessionHandle,
@@ -3966,38 +3979,47 @@ impl AgentRuntime {
         // journal/ledger contradiction the session sweep knows how to fix
         // (rows finished, state stands). Runtime-level finishing would
         // journal illegal transitions from Idle/Suspended/terminal states.
-        if !state_is_op_active(current) {
+        // `FailedRecoverable` is the ONE exception: it is this sweep's own
+        // failure landing state, so a restart that resumes a partially
+        // terminalized failed batch re-enters the sweep (the per-row store
+        // command re-verifies that state and lands the remaining rows there,
+        // stickily) instead of delegating to a second classifier — that is
+        // what makes every crash boundary converge to one identical durable
+        // result.
+        if !state_is_op_active(current) && current != AgentState::FailedRecoverable {
             return handle
                 .recover_all()
                 .map_err(|e| Error::new(ErrorKind::Store, format!("session recovery: {e}")));
         }
         report.applied = true;
-        // CrashDetected at the CURRENT state (self-transition): the machine
-        // stays continuable so the SAME logical turn can resume with its
-        // recorded identity — never a crash_target hop that kills it.
-        let last_kind = self.last_event_kind(handle);
-        if last_kind != Some(faktor_core::event::EventKind::CrashDetected) {
-            handle.append_event(
-                faktor_core::event::EventKind::CrashDetected,
-                current,
-                None,
-                Some(serde_json::json!({
-                    "pending_ops": pending.len(),
-                    "recovered_from": state_tag(current),
-                })),
-            )?;
-        }
         if pending.is_empty() {
             // Interrupted turn without tool rows (the crash hit the model
-            // stream): the runner / continue_turn resumes the recorded turn.
+            // stream): the ONE durable fact is the CrashDetected annotation
+            // at the CURRENT state (self-transition — the machine stays
+            // continuable so the SAME logical turn resumes with its recorded
+            // identity, never a crash_target hop that kills it); the runner /
+            // continue_turn resumes the recorded turn.
+            let last_kind = self.last_event_kind(handle);
+            if last_kind != Some(faktor_core::event::EventKind::CrashDetected) {
+                handle.append_event(
+                    faktor_core::event::EventKind::CrashDetected,
+                    current,
+                    None,
+                    Some(serde_json::json!({
+                        "pending_ops": 0,
+                        "recovered_from": state_tag(current),
+                    })),
+                )?;
+            }
             report.interrupted_turn = true;
             report.state = current;
             return Ok(report);
         }
 
-        // Classify every row BEFORE finishing anything: finish order matters
-        // (a failure finish moves the machine to FailedRecoverable, after
-        // which "completed" finishes would be illegal).
+        // Classify every row BEFORE writing anything: the classification is
+        // read-only (a malformed postcondition/recovery row aborts the whole
+        // sweep before any durable write), and the batch shape (all-replayable
+        // vs terminal) is only knowable with every verdict in hand.
         enum Verdict {
             Verify { postcondition: FilePostcondition },
             LegacyVerify { path: String, expected: FileHash },
@@ -4039,64 +4061,69 @@ impl AgentRuntime {
                 },
             }
         }
-        // Resolution passes: (1) verifications that COMPLETE, (2) honest
-        // failures (unknown effects), (3) replay deferrals only when the
-        // whole batch is replayable (a failed row ends the turn, so a
-        // replayable sibling cannot rejoin it — it is failed honestly).
+        // Resolution: an all-replayable batch keeps every row RUNNING on the
+        // SAME row — the async replay is a new physical attempt of the same
+        // logical operation, and the machine stays continuable (the
+        // interrupted turn resumes with its recorded identity). This branch
+        // makes no row transaction at all; `CrashDetected` at the CURRENT
+        // state (self-transition) is its one journal fact.
         let all_deferrable = !verdicts.is_empty()
             && verdicts
                 .iter()
                 .all(|(_, v)| matches!(v, Verdict::DeferReplay));
+        if all_deferrable {
+            let last_kind = self.last_event_kind(handle);
+            if last_kind != Some(faktor_core::event::EventKind::CrashDetected) {
+                handle.append_event(
+                    faktor_core::event::EventKind::CrashDetected,
+                    current,
+                    None,
+                    Some(serde_json::json!({
+                        "pending_ops": verdicts.len(),
+                        "recovered_from": state_tag(current),
+                    })),
+                )?;
+            }
+            for (row, _) in &verdicts {
+                report.crashed_ops.push(RecoveredOp {
+                    op_id: row.op_id,
+                    tool: row.tool.clone(),
+                    status: "running".into(),
+                    effect: EffectStatus::Unknown,
+                    action: RecoveryAction::RerunAllowed,
+                });
+            }
+            report.state = handle.state()?;
+            return Ok(report);
+        }
+
+        // Terminal batch: EVERY terminal row and its `RecoveryApplied` event
+        // commit in ONE store transaction ([`finish_recovered_row`]), which
+        // re-verifies the session's landing state and refuses an unknown or
+        // already-terminal row typed. The batch's one state move therefore
+        // happens FIRST, via the lawful `CrashDetected` transition this sweep
+        // appends: a crash after that transition and before a row
+        // transaction leaves rows `running` (never a terminal row without
+        // its event), and a restart re-enters this sweep from the landing
+        // state. A refused verification propagates BEFORE its row's
+        // transaction, so that row stays running too.
+        let pending_ops = verdicts.len();
+        let mut landing;
         for (row, verdict) in &verdicts {
             match verdict {
-                Verdict::Verify { .. } | Verdict::LegacyVerify { .. } => {
-                    let (expected, actual, legacy_migrated) = match verdict {
-                        Verdict::Verify { postcondition } => (
-                            postcondition.expected_hash,
-                            self.verify_workspace_file(handle.id(), postcondition)?,
-                            None,
-                        ),
-                        Verdict::LegacyVerify { path, expected } => {
-                            // One-time migration (audit P1-F): a legacy
-                            // absolute pathname is NEVER an execution
-                            // capability. Containment must be PROVEN against
-                            // the session's durable workspace root; only then
-                            // is the old path converted to a normalized
-                            // relative path and recorded durably on the
-                            // running row as the modern postcondition BEFORE
-                            // any read. A row whose containment cannot be
-                            // proven is classified Unknown/NeedsUserInput —
-                            // never Verified, and no raw path is ever read.
-                            let Some(postcondition) =
-                                self.migrate_legacy_verify_row(handle, row, path, *expected)?
-                            else {
-                                self.fail_unknown_effect(
-                                    handle,
-                                    row,
-                                    "legacy_unverifiable",
-                                    RecoveryAction::NeedsHuman,
-                                    &mut report,
-                                )?;
-                                continue;
-                            };
-                            let relative = postcondition.relative_path.clone();
-                            (
-                                *expected,
-                                self.verify_workspace_file(handle.id(), &postcondition)?,
-                                Some(relative),
-                            )
-                        }
-                        _ => unreachable!(),
-                    };
-                    if actual == Some(expected) {
-                        handle.finish_tool_run(row.op_id, "completed", EffectStatus::Verified)?;
-                        self.journal_recovery_applied(
+                Verdict::Verify { postcondition } => {
+                    let actual = self.verify_workspace_file(handle.id(), postcondition)?;
+                    if actual == Some(postcondition.expected_hash) {
+                        landing =
+                            self.land_recovery_batch(handle, AgentState::Validating, pending_ops)?;
+                        self.finish_recovered_row(
                             handle,
                             row,
                             "completed",
                             EffectStatus::Verified,
                             "verified",
-                            legacy_migrated.as_deref(),
+                            None,
+                            landing,
                         )?;
                         report.crashed_ops.push(RecoveredOp {
                             op_id: row.op_id,
@@ -4104,69 +4131,174 @@ impl AgentRuntime {
                             status: "completed".into(),
                             effect: EffectStatus::Verified,
                             action: RecoveryAction::Verified {
-                                expected,
-                                actual: actual.unwrap_or(expected),
+                                expected: postcondition.expected_hash,
+                                actual: actual.unwrap_or(postcondition.expected_hash),
                             },
                         });
                     } else {
                         // The file does not match the recorded postcondition:
                         // the write never landed (or was overwritten) — FAIL
                         // LOUDLY, never silently "applied".
-                        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Failed)?;
-                        self.journal_recovery_applied(
+                        landing = self.land_recovery_batch(
+                            handle,
+                            AgentState::FailedRecoverable,
+                            pending_ops,
+                        )?;
+                        self.finish_recovered_row(
                             handle,
                             row,
                             "failed",
                             EffectStatus::Failed,
                             "not_applied",
-                            legacy_migrated.as_deref(),
+                            None,
+                            landing,
                         )?;
                         report.crashed_ops.push(RecoveredOp {
                             op_id: row.op_id,
                             tool: row.tool.clone(),
                             status: "failed".into(),
                             effect: EffectStatus::Failed,
-                            action: RecoveryAction::NotApplied { expected, actual },
+                            action: RecoveryAction::NotApplied {
+                                expected: postcondition.expected_hash,
+                                actual,
+                            },
                         });
                     }
                 }
-                Verdict::FailUnknown => {
-                    self.fail_unknown_effect(
-                        handle,
-                        row,
-                        "unknown_effect",
-                        RecoveryAction::UnknownEffect,
-                        &mut report,
-                    )?;
-                }
-                Verdict::DeferReplay => {
-                    if all_deferrable {
-                        report.crashed_ops.push(RecoveredOp {
-                            op_id: row.op_id,
-                            tool: row.tool.clone(),
-                            status: "running".into(),
-                            effect: EffectStatus::Unknown,
-                            action: RecoveryAction::RerunAllowed,
-                        });
-                    } else {
-                        // A sibling ended the turn: this row cannot rejoin it.
-                        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
-                        self.journal_recovery_applied(
+                Verdict::LegacyVerify { path, expected } => {
+                    // One-time migration (audit P1-F): a legacy absolute
+                    // pathname is NEVER an execution capability. Containment
+                    // must be PROVEN against the session's durable workspace
+                    // root; only then is the old path converted to a
+                    // normalized relative path and recorded durably on the
+                    // running row as the modern postcondition BEFORE any
+                    // read. A row whose containment cannot be proven is
+                    // classified Unknown/NeedsUserInput — never Verified, and
+                    // no raw path is ever read.
+                    let Some(postcondition) =
+                        self.migrate_legacy_verify_row(handle, row, path, *expected)?
+                    else {
+                        landing = self.land_recovery_batch(
+                            handle,
+                            AgentState::FailedRecoverable,
+                            pending_ops,
+                        )?;
+                        self.finish_recovered_row(
                             handle,
                             row,
                             "failed",
                             EffectStatus::Unknown,
-                            "unknown_effect",
+                            "legacy_unverifiable",
                             None,
+                            landing,
                         )?;
                         report.crashed_ops.push(RecoveredOp {
                             op_id: row.op_id,
                             tool: row.tool.clone(),
                             status: "failed".into(),
                             effect: EffectStatus::Unknown,
-                            action: RecoveryAction::RerunAllowed,
+                            action: RecoveryAction::NeedsHuman,
+                        });
+                        continue;
+                    };
+                    let relative = postcondition.relative_path.clone();
+                    let actual = self.verify_workspace_file(handle.id(), &postcondition)?;
+                    if actual == Some(*expected) {
+                        landing =
+                            self.land_recovery_batch(handle, AgentState::Validating, pending_ops)?;
+                        self.finish_recovered_row(
+                            handle,
+                            row,
+                            "completed",
+                            EffectStatus::Verified,
+                            "verified",
+                            Some(&relative),
+                            landing,
+                        )?;
+                        report.crashed_ops.push(RecoveredOp {
+                            op_id: row.op_id,
+                            tool: row.tool.clone(),
+                            status: "completed".into(),
+                            effect: EffectStatus::Verified,
+                            action: RecoveryAction::Verified {
+                                expected: *expected,
+                                actual: actual.unwrap_or(*expected),
+                            },
+                        });
+                    } else {
+                        landing = self.land_recovery_batch(
+                            handle,
+                            AgentState::FailedRecoverable,
+                            pending_ops,
+                        )?;
+                        self.finish_recovered_row(
+                            handle,
+                            row,
+                            "failed",
+                            EffectStatus::Failed,
+                            "not_applied",
+                            Some(&relative),
+                            landing,
+                        )?;
+                        report.crashed_ops.push(RecoveredOp {
+                            op_id: row.op_id,
+                            tool: row.tool.clone(),
+                            status: "failed".into(),
+                            effect: EffectStatus::Failed,
+                            action: RecoveryAction::NotApplied {
+                                expected: *expected,
+                                actual,
+                            },
                         });
                     }
+                }
+                Verdict::FailUnknown => {
+                    landing = self.land_recovery_batch(
+                        handle,
+                        AgentState::FailedRecoverable,
+                        pending_ops,
+                    )?;
+                    self.finish_recovered_row(
+                        handle,
+                        row,
+                        "failed",
+                        EffectStatus::Unknown,
+                        "unknown_effect",
+                        None,
+                        landing,
+                    )?;
+                    report.crashed_ops.push(RecoveredOp {
+                        op_id: row.op_id,
+                        tool: row.tool.clone(),
+                        status: "failed".into(),
+                        effect: EffectStatus::Unknown,
+                        action: RecoveryAction::UnknownEffect,
+                    });
+                }
+                Verdict::DeferReplay => {
+                    // A sibling ended the turn: this replayable row cannot
+                    // rejoin it — failed honestly, never left running.
+                    landing = self.land_recovery_batch(
+                        handle,
+                        AgentState::FailedRecoverable,
+                        pending_ops,
+                    )?;
+                    self.finish_recovered_row(
+                        handle,
+                        row,
+                        "failed",
+                        EffectStatus::Unknown,
+                        "unknown_effect",
+                        None,
+                        landing,
+                    )?;
+                    report.crashed_ops.push(RecoveredOp {
+                        op_id: row.op_id,
+                        tool: row.tool.clone(),
+                        status: "failed".into(),
+                        effect: EffectStatus::Unknown,
+                        action: RecoveryAction::RerunAllowed,
+                    });
                 }
             }
         }
@@ -4188,7 +4320,48 @@ impl AgentRuntime {
         Ok(report)
     }
 
-    fn journal_recovery_applied(
+    /// Land the session on the state the transactional per-row recovery
+    /// command verifies. `finish_recovered_tool_run_and_event` self-transitions
+    /// at the state it verifies, so a terminal batch's ONE state move is a
+    /// separate lawful `CrashDetected` transition committed BEFORE the row
+    /// commands — the same shape the session sweep uses for its crash target
+    /// (`crates/session/src/recovery.rs`). A crash after this transition and
+    /// before a row command leaves rows `running`; a restart re-enters the
+    /// sweep and re-verifies. `FailedRecoverable` is sticky: the machine has
+    /// no edge back to `Validating`, so a resumed failed batch keeps landing
+    /// its remaining rows there (`to` is ignored and the current state
+    /// returned). Already being on `to` is a no-op.
+    fn land_recovery_batch(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        to: AgentState,
+        pending_ops: usize,
+    ) -> faktor_core::Result<AgentState> {
+        let current = handle.state()?;
+        if current == to || current == AgentState::FailedRecoverable {
+            return Ok(current);
+        }
+        handle.append_event(
+            faktor_core::event::EventKind::CrashDetected,
+            to,
+            None,
+            Some(serde_json::json!({
+                "pending_ops": pending_ops,
+                "recovered_from": state_tag(current),
+            })),
+        )?;
+        Ok(to)
+    }
+
+    /// Finish ONE recovered tool run through the transactional recovery
+    /// command: expected-state re-verify, the exactly-one-running-row terminal
+    /// update, the gapless journal event and the session state commit in ONE
+    /// store transaction. The event is the row's `RecoveryApplied`; there is
+    /// no later, separately crashable append. A wrong expected state or an
+    /// already-terminal row is the typed `Conflict` and leaves no trace (the
+    /// store transaction rolls back whole).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_recovered_row(
         &self,
         handle: &faktor_session::SessionHandle,
         row: &ToolRunRow,
@@ -4196,8 +4369,8 @@ impl AgentRuntime {
         effect: EffectStatus,
         action: &str,
         legacy_migrated_to: Option<&str>,
+        landing: AgentState,
     ) -> faktor_core::Result<()> {
-        let state = handle.state()?;
         let mut payload = serde_json::json!({
             "op_id": row.op_id.raw(),
             "tool": row.tool,
@@ -4212,37 +4385,31 @@ impl AgentRuntime {
             // pathname.
             payload["legacy_migrated_to"] = serde_json::json!(relative);
         }
-        handle.append_event(
-            faktor_core::event::EventKind::RecoveryApplied,
-            state,
-            Some(row.op_id),
-            Some(payload),
-        )?;
-        Ok(())
-    }
-
-    /// Terminal classification of one crashed run whose effect cannot be
-    /// established (unknown external effect, or a legacy `VerifyHash` path
-    /// whose containment cannot be proven): the row is finished
-    /// failed/Unknown — terminal, never re-scanned, never re-verified — and
-    /// the report names the required human decision.
-    fn fail_unknown_effect(
-        &self,
-        handle: &faktor_session::SessionHandle,
-        row: &ToolRunRow,
-        action: &str,
-        report_action: RecoveryAction,
-        report: &mut RecoveryReport,
-    ) -> faktor_core::Result<()> {
-        handle.finish_tool_run(row.op_id, "failed", EffectStatus::Unknown)?;
-        self.journal_recovery_applied(handle, row, "failed", EffectStatus::Unknown, action, None)?;
-        report.crashed_ops.push(RecoveredOp {
-            op_id: row.op_id,
-            tool: row.tool.clone(),
-            status: "failed".into(),
-            effect: EffectStatus::Unknown,
-            action: report_action,
-        });
+        self.deps
+            .session
+            .store()
+            .finish_recovered_tool_run_and_event(
+                handle.id(),
+                row.op_id,
+                status,
+                effect_tag(effect),
+                faktor_core::event::EventKind::RecoveryApplied,
+                landing,
+                Some(payload),
+            )
+            .map_err(|e| match e {
+                faktor_store::StoreError::Conflict(msg) => Error::conflict(format!(
+                    "recovery terminalization of tool run {} refused: {msg}",
+                    row.op_id
+                )),
+                other => Error::new(
+                    ErrorKind::Store,
+                    format!(
+                        "recovery terminalization of tool run {} failed: {other}",
+                        row.op_id
+                    ),
+                ),
+            })?;
         Ok(())
     }
 
@@ -32129,6 +32296,466 @@ mod tests {
             std::fs::read(root.join("C:").join("escape.txt")).unwrap(),
             b"pwn"
         );
+    }
+
+    // ---- transactional recovery terminalization (row+event atomicity) ----
+
+    /// Build the deterministic op-active residue the seam campaign sweeps: a
+    /// real session driven to `ExecutingTool` with two running `MarkUnknown`
+    /// tool runs. The fixture is file-free, so every row classifies as
+    /// failed/unknown and the batch lands `FailedRecoverable`.
+    fn recovery_seam_fixture(dir: &std::path::Path) -> (Arc<SessionManager>, SessionId, Vec<OpId>) {
+        let manager = SessionManager::open(dir.join("store"), dir.join("cas"), true).unwrap();
+        let ws = manager.create_workspace("/w").unwrap();
+        let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+        let session = handle.id();
+        let receipt = handle.submit_prompt("crash", &[]).unwrap();
+        chain_to_streaming(&handle, receipt.op_id);
+        let mut ops = Vec::new();
+        for i in 0..2 {
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            ops.push(meta.operation_id);
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "read_file",
+                serde_json::json!({ "row": i }),
+                &format!("call_{i}"),
+                meta,
+            );
+        }
+        (manager, session, ops)
+    }
+
+    /// Reopen the crashed fixture's store: the in-process op/turn registry is
+    /// gone, so the sweep no longer sees a live driver (the same restart
+    /// condition the daemon has). Returns the running ops in row order.
+    fn recovery_seam_reopen(
+        dir: &std::path::Path,
+        session: SessionId,
+    ) -> (Arc<SessionManager>, Vec<OpId>) {
+        let manager = SessionManager::open(dir.join("store"), dir.join("cas"), true).unwrap();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let ops = handle
+            .pending_tool_runs()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op_id)
+            .collect();
+        (manager, ops)
+    }
+
+    fn recovery_seam_runtime(
+        manager: Arc<SessionManager>,
+    ) -> (Arc<AgentRuntime>, tempfile::TempDir) {
+        let (deps, keep) =
+            deps_sharing_session(manager, Arc::new(scripted_provider(vec![])), vec![]);
+        (AgentRuntime::new(deps).unwrap(), keep)
+    }
+
+    /// The normalized durable world of the recovery scope: session state, per
+    /// row running/terminal, and each `RecoveryApplied` event's state+payload
+    /// (the store-global `op_id` is replaced by the deterministic row index;
+    /// `CrashDetected` annotations are excluded exactly like the fault
+    /// campaign's dumps).
+    fn recovery_seam_world(
+        runtime: &AgentRuntime,
+        session: SessionId,
+        ops: &[OpId],
+    ) -> Vec<String> {
+        let handle = runtime
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let mut lines = vec![format!("state:{:?}", handle.state().unwrap())];
+        let running: Vec<OpId> = handle
+            .pending_tool_runs()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op_id)
+            .collect();
+        for (i, op) in ops.iter().enumerate() {
+            lines.push(format!(
+                "row:{i}:{}",
+                if running.contains(op) {
+                    "running"
+                } else {
+                    "terminal"
+                }
+            ));
+        }
+        for e in handle.events_range(1, None).unwrap() {
+            if e.kind != faktor_core::event::EventKind::RecoveryApplied {
+                continue;
+            }
+            let idx = e
+                .op_id
+                .and_then(|o| ops.iter().position(|x| *x == o))
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into());
+            let payload = e
+                .payload
+                .map(|mut p| {
+                    if let Some(obj) = p.as_object_mut() {
+                        obj.remove("op_id");
+                    }
+                    p.to_string()
+                })
+                .unwrap_or_default();
+            lines.push(format!("ev:{idx}:{:?}:{payload}", e.state));
+        }
+        lines
+    }
+
+    /// The op-active sweep terminalizes each row through ONE store
+    /// transaction (terminal row + `RecoveryApplied` + state/seq). This
+    /// certifies every declared durability boundary — before the row
+    /// transaction, after the row, after the event, after the commit — with
+    /// a real crash: the reopened residue pairs every terminal row with
+    /// exactly one event (together or neither), and the restart sweep
+    /// converges to the EXACT uninterrupted reference world.
+    #[test]
+    fn recovery_terminalization_seams_are_row_event_atomic_and_convergent() {
+        let reference = {
+            let dir = fresh_store_dir();
+            let (manager, session, _ops) = recovery_seam_fixture(dir.path());
+            drop(manager);
+            let (manager, ops) = recovery_seam_reopen(dir.path(), session);
+            let (runtime, _keep) = recovery_seam_runtime(manager.clone());
+            runtime.recover().unwrap();
+            let world = recovery_seam_world(&runtime, session, &ops);
+            drop(runtime);
+            drop(manager);
+            world
+        };
+        assert!(
+            reference.iter().any(|l| l == "state:FailedRecoverable"),
+            "reference does not land FailedRecoverable: {reference:?}"
+        );
+        assert_eq!(
+            reference.iter().filter(|l| l.starts_with("ev:")).count(),
+            2,
+            "reference: one RecoveryApplied per terminal row: {reference:?}"
+        );
+
+        // (name, seam, ordinal, residue state, per-row (running, event count))
+        type SeamCase = (
+            &'static str,
+            &'static str,
+            u64,
+            AgentState,
+            [(bool, usize); 2],
+        );
+        let seams: &[SeamCase] = &[
+            (
+                "before_row_txn.rolled_back",
+                "ev_precommit",
+                0,
+                AgentState::ExecutingTool,
+                [(true, 0), (true, 0)],
+            ),
+            (
+                "before_row_txn.committed",
+                "ev_committed",
+                0,
+                AgentState::FailedRecoverable,
+                [(true, 0), (true, 0)],
+            ),
+            (
+                "row0.side_row",
+                "session_command_side_row",
+                0,
+                AgentState::FailedRecoverable,
+                [(true, 0), (true, 0)],
+            ),
+            (
+                "row0.precommit",
+                "session_command_precommit",
+                0,
+                AgentState::FailedRecoverable,
+                [(true, 0), (true, 0)],
+            ),
+            (
+                "row0.committed",
+                "session_command_committed",
+                0,
+                AgentState::FailedRecoverable,
+                [(false, 1), (true, 0)],
+            ),
+            (
+                "row1.side_row",
+                "session_command_side_row",
+                1,
+                AgentState::FailedRecoverable,
+                [(false, 1), (true, 0)],
+            ),
+            (
+                "row1.precommit",
+                "session_command_precommit",
+                1,
+                AgentState::FailedRecoverable,
+                [(false, 1), (true, 0)],
+            ),
+            (
+                "row1.committed",
+                "session_command_committed",
+                1,
+                AgentState::FailedRecoverable,
+                [(false, 1), (false, 1)],
+            ),
+        ];
+
+        for (name, seam, ordinal, residue_state, residue_rows) in seams {
+            let dir = fresh_store_dir();
+            let (manager, session, _ops) = recovery_seam_fixture(dir.path());
+            drop(manager);
+            let (manager, ops) = recovery_seam_reopen(dir.path(), session);
+            {
+                let (runtime, _keep) = recovery_seam_runtime(manager.clone());
+                runtime
+                    .deps()
+                    .session
+                    .store()
+                    .crash_arm(faktor_store::CrashArm {
+                        point: seam,
+                        ordinal: *ordinal,
+                    });
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = runtime.recover();
+                }));
+                assert!(caught.is_err(), "{name}: seam {seam}/{ordinal} must fire");
+                drop(runtime);
+            }
+            drop(manager);
+
+            // Residue: reopened BEFORE the restart sweep. Every row is either
+            // still running with no event or terminal with exactly one.
+            let manager2 =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let handle = manager2.get_session(session).unwrap().unwrap();
+            assert_eq!(handle.state().unwrap(), *residue_state, "{name}: residue");
+            let running: Vec<OpId> = handle
+                .pending_tool_runs()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.op_id)
+                .collect();
+            for (i, op) in ops.iter().enumerate() {
+                let (expected_running, expected_events) = residue_rows[i];
+                assert_eq!(
+                    running.contains(op),
+                    expected_running,
+                    "{name}: residue row {i} running"
+                );
+                let events = handle
+                    .events_range(1, None)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| {
+                        e.kind == faktor_core::event::EventKind::RecoveryApplied
+                            && e.op_id == Some(*op)
+                    })
+                    .count();
+                assert_eq!(events, expected_events, "{name}: residue row {i} events");
+                assert!(
+                    !(running.contains(op) && events > 0),
+                    "{name}: a running row never carries its event"
+                );
+                assert!(
+                    !(!running.contains(op) && events == 0),
+                    "{name}: a terminal row never lacks its event"
+                );
+            }
+            drop(handle);
+
+            // Restart sweep: converges to the reference, then is idempotent.
+            let (runtime2, _keep2) = recovery_seam_runtime(manager2.clone());
+            runtime2.recover().unwrap();
+            assert_eq!(
+                recovery_seam_world(&runtime2, session, &ops),
+                reference,
+                "{name}: the restart sweep must converge to the uninterrupted world"
+            );
+            let handle2 = runtime2
+                .deps()
+                .session
+                .get_session(session)
+                .unwrap()
+                .unwrap();
+            let seq = handle2.last_event_seq().unwrap();
+            // The transcript repair (crash residue with no open rows) may run
+            // once here; the TERMINALIZATION itself never re-litigates.
+            let second = runtime2.recover().unwrap();
+            assert!(
+                second.iter().all(|r| r.crashed_ops.is_empty()),
+                "{name}: the second sweep must find no crashed op"
+            );
+            assert_eq!(
+                handle2.last_event_seq().unwrap(),
+                seq,
+                "{name}: no new events"
+            );
+            let third = runtime2.recover().unwrap();
+            assert!(
+                third.iter().all(|r| !r.applied && r.crashed_ops.is_empty()),
+                "{name}: the converged world must be a fixed point"
+            );
+        }
+    }
+
+    /// The adopted terminalization refuses TYPED and traceless: a session
+    /// state the transaction cannot verify refuses before any write, an
+    /// already-terminal row can never gain a second event, and a state whose
+    /// machine has no edge to the failure landing state refuses through the
+    /// sweep's `CrashDetected` move (also before any write).
+    #[test]
+    fn recovery_terminalization_refusals_are_typed_and_traceless() {
+        // Wrong expected state at the transactional boundary.
+        let dir = fresh_store_dir();
+        let (manager, session, ops) = recovery_seam_fixture(dir.path());
+        let (runtime, _keep) = recovery_seam_runtime(manager.clone());
+        let handle = manager.get_session(session).unwrap().unwrap();
+        let row = handle
+            .pending_tool_runs()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.op_id == ops[0])
+            .unwrap();
+        let settled = |handle: &faktor_session::SessionHandle, op: OpId| {
+            handle
+                .events_range(1, None)
+                .unwrap()
+                .into_iter()
+                .filter(|e| {
+                    e.kind == faktor_core::event::EventKind::RecoveryApplied && e.op_id == Some(op)
+                })
+                .count()
+        };
+        let err = runtime
+            .finish_recovered_row(
+                &handle,
+                &row,
+                "failed",
+                EffectStatus::Unknown,
+                "unknown_effect",
+                None,
+                AgentState::Idle,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        assert_eq!(settled(&handle, row.op_id), 0, "refused before any write");
+        assert!(handle
+            .pending_tool_runs()
+            .unwrap()
+            .iter()
+            .any(|r| r.op_id == row.op_id));
+        // One committed terminalization, then the SAME row refuses typed: no
+        // second event, no row change.
+        runtime
+            .finish_recovered_row(
+                &handle,
+                &row,
+                "failed",
+                EffectStatus::Unknown,
+                "unknown_effect",
+                None,
+                AgentState::ExecutingTool,
+            )
+            .unwrap();
+        assert_eq!(settled(&handle, row.op_id), 1);
+        assert!(!handle
+            .pending_tool_runs()
+            .unwrap()
+            .iter()
+            .any(|r| r.op_id == row.op_id));
+        let err = runtime
+            .finish_recovered_row(
+                &handle,
+                &row,
+                "failed",
+                EffectStatus::Unknown,
+                "unknown_effect",
+                None,
+                AgentState::ExecutingTool,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        assert_eq!(
+            settled(&handle, row.op_id),
+            1,
+            "a terminal row never gains a second event"
+        );
+    }
+
+    /// A state whose machine has no edge to the failure landing state (here
+    /// `WaitingForPermission` with a raw running row) refuses through the
+    /// sweep's landing move — typed, before any row transaction.
+    #[test]
+    fn recovery_sweep_refuses_a_state_with_no_landing_edge() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let op: OpId;
+        {
+            let manager =
+                SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                    .unwrap();
+            let ws = manager.create_workspace("/w").unwrap();
+            let handle = manager.create_session(ws, "t", "fake", "m").unwrap();
+            session = handle.id();
+            let turn = handle.submit_prompt("crash", &[]).unwrap().op_id;
+            chain_to_streaming(&handle, turn);
+            handle
+                .request_permission(
+                    turn,
+                    &Capability::ReadWorkspace {
+                        path: "/w/a".into(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(handle.state().unwrap(), AgentState::WaitingForPermission);
+            // Bypass the typed API: a running row while the machine is parked.
+            op = manager.try_next_op_id().unwrap();
+            manager
+                .store()
+                .start_tool_run(
+                    session,
+                    op,
+                    "read_file",
+                    serde_json::json!({}),
+                    serde_json::to_value(RecoveryStrategy::MarkUnknown).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        // Restart: the in-process turn token is gone (otherwise the sweep
+        // would see a live driver and defer).
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let handle = manager.get_session(session).unwrap().unwrap();
+        assert_eq!(handle.state().unwrap(), AgentState::WaitingForPermission);
+        let (runtime, _keep) = recovery_seam_runtime(manager.clone());
+        let err = runtime.recover().unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::InvalidState {
+                from: AgentState::WaitingForPermission,
+                to: AgentState::FailedRecoverable,
+            },
+            "{err}"
+        );
+        assert_eq!(handle.state().unwrap(), AgentState::WaitingForPermission);
+        assert!(handle
+            .pending_tool_runs()
+            .unwrap()
+            .iter()
+            .any(|r| r.op_id == op));
+        assert!(!handle.events_range(1, None).unwrap().iter().any(|e| {
+            e.kind == faktor_core::event::EventKind::RecoveryApplied && e.op_id == Some(op)
+        }));
     }
 
     /// Every Windows-absolute dialect is refused by the pure host-side

@@ -16,12 +16,40 @@
 //! truncation; lower-priority optional imports that exceed the cap are
 //! skipped whole with a surfaced [`RuleSkip`] entry — no partial text ever
 //! reaches a prompt.
+//!
+//! # Rooted discovery (workspace-escape containment)
+//!
+//! Rule discovery and rule reads share ONE admitted [`RootedDir`] of the
+//! rule root: every candidate is classified through no-follow metadata
+//! (`entry_meta`/directory listings), every read goes through
+//! [`RootedDir::read`], and the discovery output is workspace-RELATIVE —
+//! an absolute path is never queued for a later pathname open. A
+//! symlink/reparse point in an authority slot (top-level AGENTS.md /
+//! FAKTOR.md / CLAUDE.md) is a loud [`RulesLoadError::Unreadable`]; a link
+//! anywhere else (an optional import or a convention directory) is a
+//! surfaced whole-entry [`RuleSkip`] and is NEVER followed, so an
+//! adversarial checkout can never ingest model instructions from outside
+//! the workspace.
+//!
+//! Skills follow the SAME discipline: [`SkillRegistry::discover`] and every
+//! on-demand [`SkillRegistry::load_skill`] body read share ONE admitted
+//! [`RootedDir`] of the workspace root, every [`SkillMeta::path`] is
+//! workspace-relative (no absolute path is ever stored or reopened), and
+//! candidates are classified with no-follow metadata. Skills are optional
+//! best-effort payloads, so — exactly like optional rule imports and unlike
+//! the authority rule files — a symlink/reparse point, special file, or
+//! unreadable skill entry is skipped WHOLE and surfaced as a [`SkillSkip`]
+//! (never followed, never partially ingested); `load_skill` answers `None`
+//! for it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use faktor_core::error::ErrorKind;
+use faktor_fs::rooted::{RootedDir, RootedEntryKind};
+use faktor_fs::ContentDigest;
 
 /// Deterministic precedence (higher wins when both are active). Faktor
 /// native rules outrank every imported convention.
@@ -243,9 +271,11 @@ fn content_hash_proj(content: &[u8]) -> u64 {
         .expect("8 bytes")
 }
 
-/// Bounded read outcome of ONE rule file. Oversized is detected by reading
-/// at most `cap + 1` bytes — a hostile multi-GiB file never enters RAM —
-/// and is reported with its size, never truncated.
+/// Bounded read outcome of ONE rule file. Oversized is decided by the
+/// at-open `fstat` size: the rooted read either returns the whole file
+/// ([`ContentDigest::Full`]) or exactly `cap` bytes
+/// ([`ContentDigest::Slice`]), so a hostile multi-GiB file never enters RAM
+/// — and is reported with its size, never truncated.
 enum RuleFileRead {
     Missing,
     Unreadable(String),
@@ -253,42 +283,132 @@ enum RuleFileRead {
     Full(String),
 }
 
-fn read_rule_file(path: &Path, cap: usize) -> RuleFileRead {
-    let file = match std::fs::File::open(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RuleFileRead::Missing,
+/// Test seam: fired with a rule's workspace-relative path immediately AFTER
+/// discovery enumerated it and BEFORE its rooted no-follow read, so
+/// adversarial tests can swap the entry in exactly the enumeration -> read
+/// window. Test-only; production builds compile a no-op.
+#[cfg(test)]
+type ReadSeam = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static READ_SEAM: Mutex<Option<ReadSeam>> = Mutex::new(None);
+/// Serializes tests that install the process-global read seam.
+#[cfg(test)]
+static READ_SEAM_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+fn read_seam(rel: &Path) {
+    if let Some(hook) = READ_SEAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        hook(rel);
+    }
+}
+#[cfg(not(test))]
+fn read_seam(_rel: &Path) {}
+
+/// Read one rule file through the admitted rooted authority: the parent
+/// chain and the final entry are resolved component-by-component with
+/// no-follow semantics, so a symlink/reparse point on any component is
+/// refused typed and never followed outside the root. `cap` is
+/// [`MAX_RULE_BYTES`]; the read is bounded by the at-open `fstat` size, so
+/// an oversized file costs at most `cap` bytes of RAM and the surfaced size
+/// comes from no-follow metadata.
+fn read_rule_file(rooted: &RootedDir, rel: &Path, cap: usize) -> RuleFileRead {
+    read_seam(rel);
+    let meta = match rooted.entry_meta(rel) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return RuleFileRead::Missing,
+        Err(e) if e.kind == ErrorKind::NotFound => return RuleFileRead::Missing,
         Err(e) => return RuleFileRead::Unreadable(e.to_string()),
-        Ok(f) => f,
     };
-    let mut buf = Vec::with_capacity(cap + 1);
-    // The reported size of an oversized file is its metadata length (the
-    // read below stops at cap + 1 bytes; the on-disk size is the honest
-    // number a skip/error entry must carry).
-    let disk_len = file.metadata().map(|m| m.len()).ok();
-    match file.take(cap as u64 + 1).read_to_end(&mut buf) {
-        Err(e) => RuleFileRead::Unreadable(e.to_string()),
-        Ok(_) if buf.len() > cap => {
-            let size = disk_len.map_or(buf.len() as u64, |l| l.max(buf.len() as u64));
-            RuleFileRead::Oversized(size)
+    match meta.kind {
+        RootedEntryKind::File => {}
+        RootedEntryKind::Symlink => {
+            return RuleFileRead::Unreadable(format!(
+                "unsafe entry: {} is a symlink/reparse point; the no-follow rooted read refuses to follow it",
+                rel.display()
+            ))
         }
-        Ok(_) => RuleFileRead::Full(String::from_utf8_lossy(&buf).into_owned()),
+        RootedEntryKind::Directory | RootedEntryKind::Other => {
+            return RuleFileRead::Unreadable(format!(
+                "unsafe entry: {} is not a regular file; refusing to open it",
+                rel.display()
+            ))
+        }
+    }
+    match rooted.read(rel, cap) {
+        Ok(data) => match data.digest {
+            ContentDigest::Full(_) => {
+                RuleFileRead::Full(String::from_utf8_lossy(&data.bytes).into_owned())
+            }
+            // The read stopped exactly at the cap: the on-disk size from the
+            // no-follow metadata is the honest number a skip/error carries.
+            ContentDigest::Slice { .. } => RuleFileRead::Oversized(meta.size.max(data.size as u64)),
+        },
+        Err(e) if e.kind == ErrorKind::NotFound => RuleFileRead::Missing,
+        Err(e) => RuleFileRead::Unreadable(e.to_string()),
     }
 }
 
 /// Authority rule files: top-level AGENTS.md / FAKTOR.md / CLAUDE.md at the
 /// repo root (P0-34). These feed the prompt unconditionally or near it, so
-/// an oversized or unreadable one is a loud error — never silently omitted
-/// or half-read. Everything else (scoped/directory rules, GEMINI.md,
-/// copilot instructions, legacy imports, ...) is a lower-priority import:
-/// oversize/unreadable files are skipped WHOLE with a surfaced entry.
-fn is_authority_policy_file(root: &Path, path: &Path) -> bool {
-    ["AGENTS.md", "FAKTOR.md", "CLAUDE.md"]
-        .iter()
-        .any(|n| path == root.join(n))
+/// an oversized, unreadable, or unsafe (link/special-file) one is a loud
+/// error — never silently omitted or half-read. Everything else
+/// (scoped/directory rules, GEMINI.md, copilot instructions, legacy
+/// imports, ...) is a lower-priority import: oversize/unreadable/unsafe
+/// entries are skipped WHOLE with a surfaced entry.
+fn is_authority_rel_path(rel: &str) -> bool {
+    matches!(rel, "AGENTS.md" | "FAKTOR.md" | "CLAUDE.md")
 }
 
-/// Top-level well-known rule files.
-fn top_level_candidates(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
-    let mut v = Vec::new();
+/// Bound on the entries ONE rule-directory listing may return; a larger
+/// directory surfaces a whole-directory skip (its returned prefix is honest
+/// but incomplete) instead of a silent truncation.
+const MAX_RULE_DIR_ENTRIES: usize = 16_384;
+
+/// One regular rule file found by rooted discovery; `rel` is
+/// workspace-relative and `/`-normalized on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveredRuleFile {
+    kind: RuleSourceKind,
+    rel: String,
+}
+
+/// One rooted discovery pass: the regular rule files plus the whole-entry
+/// refusals (links, special files, unlistable directories) surfaced as
+/// [`RuleSkip`] rows — unsafe entries are never followed and never become
+/// rules.
+struct RuleDiscovery {
+    files: Vec<DiscoveredRuleFile>,
+    skips: Vec<RuleSkip>,
+}
+
+fn unsafe_entry_skip(rel: &str, detail: String) -> RuleSkip {
+    RuleSkip {
+        path: rel.to_string(),
+        bytes: None,
+        reason: format!("unsafe entry: {detail}"),
+    }
+}
+
+fn is_rule_extension(name: &std::ffi::OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .map(|x| x == "md" || x == "mdc")
+        .unwrap_or(false)
+}
+
+/// Discovery over the admitted [`RootedDir`]: every candidate is classified
+/// through no-follow metadata, every returned path is workspace-relative
+/// (an absolute path is never queued for a later pathname open), and a
+/// symlink/reparse point or special file is surfaced as a [`RuleSkip`] and
+/// NEVER followed or descended into.
+fn discover_rooted(rooted: &RootedDir) -> RuleDiscovery {
+    let mut files = Vec::new();
+    let mut skips = Vec::new();
+
+    // Top-level well-known rule files, classified by no-follow metadata.
     for (kind, names) in [
         (RuleSourceKind::FaktorNative, &["FAKTOR.md"][..]),
         (RuleSourceKind::AgentsMd, &["AGENTS.md"][..]),
@@ -304,76 +424,144 @@ fn top_level_candidates(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
         ),
     ] {
         for n in names {
-            let p = root.join(n);
-            if p.is_file() {
-                v.push((kind, p));
+            match rooted.entry_meta(Path::new(n)) {
+                Ok(Some(meta)) if meta.kind == RootedEntryKind::File => {
+                    files.push(DiscoveredRuleFile {
+                        kind,
+                        rel: (*n).to_string(),
+                    })
+                }
+                Ok(Some(meta)) => skips.push(unsafe_entry_skip(
+                    n,
+                    format!(
+                        "{n} is not a regular file ({:?}); refusing to follow it",
+                        meta.kind
+                    ),
+                )),
+                Ok(None) => {}
+                Err(e) => skips.push(RuleSkip {
+                    path: (*n).to_string(),
+                    bytes: None,
+                    reason: format!("unreadable: {e}"),
+                }),
             }
         }
     }
-    v
-}
 
-/// Directory rule globs: every `*.md` under the dir with the dir path as
-/// its activation scope.
-fn dir_candidates(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
-    let mut v = Vec::new();
-    for (kind, rel) in [
+    // Directory rule globs: every `*.md`/`*.mdc` under the dir, with the
+    // dir path as its activation scope. Depth is tracked PER DIRECTORY as
+    // (dir, depth-below-root) pairs (audit 32): a hostile deep branch cuts
+    // itself off at MAX_WALK_DEPTH without consuming the allowance of
+    // sibling branches — a shallow file next to a 30-deep tree is still
+    // discovered.
+    for (kind, dir_rel) in [
         (RuleSourceKind::CursorRules, ".cursor/rules"),
         (RuleSourceKind::WindsurfRules, ".windsurf/rules"),
         (RuleSourceKind::ContinueRules, ".continue/rules"),
         (RuleSourceKind::FaktorNative, ".faktor/rules"),
         (RuleSourceKind::LegacyRules, ".faktor/legacy"),
     ] {
-        let dir = root.join(rel);
-        if !dir.is_dir() {
-            continue;
+        let dir_path = Path::new(dir_rel);
+        match rooted.entry_meta(dir_path) {
+            Ok(None) => continue,
+            Ok(Some(meta)) if meta.kind == RootedEntryKind::Directory => {}
+            Ok(Some(meta)) => {
+                skips.push(unsafe_entry_skip(
+                    dir_rel,
+                    format!(
+                        "{dir_rel} is not a real directory ({:?}); refusing to enter it",
+                        meta.kind
+                    ),
+                ));
+                continue;
+            }
+            Err(e) => {
+                skips.push(RuleSkip {
+                    path: dir_rel.to_string(),
+                    bytes: None,
+                    reason: format!("unreadable: {e}"),
+                });
+                continue;
+            }
         }
-        // Depth is tracked PER DIRECTORY as (dir, depth-below-root) pairs
-        // (audit 32): a hostile deep branch cuts itself off at
-        // MAX_WALK_DEPTH without consuming the allowance of sibling
-        // branches — a shallow file next to a 30-deep tree is still
-        // discovered.
-        let mut walk: VecDeque<(PathBuf, usize)> = VecDeque::from([(dir.clone(), 0usize)]);
+        let mut walk: VecDeque<(PathBuf, usize)> =
+            VecDeque::from([(dir_path.to_path_buf(), 0usize)]);
         while let Some((d, depth)) = walk.pop_front() {
             if depth > MAX_WALK_DEPTH {
                 continue;
             }
-            let Ok(entries) = std::fs::read_dir(&d) else {
-                continue;
-            };
-            let mut names: Vec<PathBuf> = Vec::new();
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk.push_back((p, depth + 1));
-                } else if p
-                    .extension()
-                    .map(|x| x == "md" || x == "mdc")
-                    .unwrap_or(false)
-                {
-                    names.push(p);
+            let listing = match rooted.list_entries(&d, MAX_RULE_DIR_ENTRIES) {
+                Ok(listing) => listing,
+                Err(e) if e.kind == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    skips.push(RuleSkip {
+                        path: path_str(&d),
+                        bytes: None,
+                        reason: format!("unreadable: {e}"),
+                    });
+                    continue;
                 }
+            };
+            if listing.overflowed {
+                skips.push(RuleSkip {
+                    path: path_str(&d),
+                    bytes: None,
+                    reason: format!(
+                        "unreadable: directory holds more than {MAX_RULE_DIR_ENTRIES} entries; its listing is refused as incomplete"
+                    ),
+                });
             }
-            names.sort();
-            for p in names {
-                v.push((kind, p));
+            for entry in listing.entries {
+                match entry.kind {
+                    RootedEntryKind::Directory => walk.push_back((entry.rel, depth + 1)),
+                    RootedEntryKind::File => {
+                        if is_rule_extension(&entry.name) {
+                            files.push(DiscoveredRuleFile {
+                                kind,
+                                rel: path_str(&entry.rel),
+                            });
+                        }
+                    }
+                    RootedEntryKind::Symlink => skips.push(unsafe_entry_skip(
+                        &path_str(&entry.rel),
+                        "symlink/reparse point under a rule directory; never followed".to_string(),
+                    )),
+                    RootedEntryKind::Other => skips.push(unsafe_entry_skip(
+                        &path_str(&entry.rel),
+                        "special file under a rule directory; never opened".to_string(),
+                    )),
+                }
             }
         }
     }
-    v
+
+    // Deterministic: by kind priority desc, then workspace-relative path
+    // asc (the epoch input order of a live load).
+    files.sort_by(|a, b| {
+        b.kind
+            .priority()
+            .cmp(&a.kind.priority())
+            .then_with(|| a.rel.cmp(&b.rel))
+    });
+    RuleDiscovery { files, skips }
 }
 
 /// Every rule file discoverable under `root` (bounded, deterministic).
+///
+/// Discovery goes through the [`RootedDir`] authority of `root`: returned
+/// paths are workspace-RELATIVE (never absolute and never queued for a
+/// later pathname open), every candidate is classified with no-follow
+/// metadata, and symlinks/reparse points or special files are never
+/// returned as rule files. An absent or unopenable root yields no files.
 pub fn discover_rule_files(root: &Path) -> Vec<(RuleSourceKind, PathBuf)> {
-    let mut all = top_level_candidates(root);
-    all.extend(dir_candidates(root));
-    // Deterministic: by kind priority desc, then path asc.
-    all.sort_by(|a, b| {
-        b.0.priority()
-            .cmp(&a.0.priority())
-            .then_with(|| a.1.cmp(&b.1))
-    });
-    all
+    let Ok(rooted) = RootedDir::open(root) else {
+        return Vec::new();
+    };
+    discover_rooted(&rooted)
+        .files
+        .into_iter()
+        .map(|f| (f.kind, PathBuf::from(f.rel)))
+        .collect()
 }
 
 /// Loaded rule tree. `active_for` returns only rules whose scope/keywords
@@ -387,11 +575,15 @@ pub struct Instructions {
 }
 
 impl Instructions {
-    /// Load the LIVE rule tree of `root` (P0-34): an authority file
+    /// Load the LIVE rule tree of `root` (P0-34) through ONE admitted
+    /// [`RootedDir`]: discovery and every read are handle-relative with
+    /// no-follow semantics, so a symlink/reparse point can never redirect
+    /// a rule read outside the root. An authority file
     /// (top-level AGENTS.md / FAKTOR.md / CLAUDE.md) beyond
-    /// [`MAX_RULE_BYTES`] — or unreadable — is a typed error, NEVER a
-    /// silent truncation or omission. Optional oversized imports are
-    /// skipped whole and surfaced via [`Instructions::skipped`].
+    /// [`MAX_RULE_BYTES`], unreadable, or an unsafe entry (link/special
+    /// file) is a typed error, NEVER a silent truncation or omission.
+    /// Optional oversized/unsafe imports are skipped whole and surfaced
+    /// via [`Instructions::skipped`].
     pub fn load(root: &Path) -> Result<Self, RulesLoadError> {
         let (rules, skipped) = load_rules(root)?;
         let epoch = Self::compute_epoch(&rules);
@@ -672,22 +864,31 @@ impl EnvSnapshot {
     /// bytes; beyond either the capture fails with a typed Oversized error
     /// and returns NOTHING (never a silently truncated snapshot). An
     /// authority rule file (top-level AGENTS.md / FAKTOR.md / CLAUDE.md)
-    /// beyond [`MAX_RULE_BYTES`] also fails loudly; an oversized optional
-    /// import is skipped whole and surfaced in `snapshot.skipped`. Returns
-    /// the snapshot plus the captured file contents keyed by the same
+    /// beyond [`MAX_RULE_BYTES`] also fails loudly, and a link/special-file
+    /// in an authority slot is refused too; an oversized optional import is
+    /// skipped whole and surfaced in `snapshot.skipped`. Returns the
+    /// snapshot plus the captured file contents keyed by the same
     /// workspace-relative paths (contents are what a pinned read serves;
     /// they are stored separately so identical content is stored once).
+    ///
+    /// Discovery and every read share ONE [`RootedDir`] of `root`: no
+    /// absolute pathname is reopened, and no symlink/reparse point is ever
+    /// followed, so a hostile checkout cannot capture instructions from
+    /// outside the workspace.
     pub fn capture(
         root: &Path,
         snapshot_id: &str,
         taken_ms: i64,
     ) -> Result<CapturedEnv, EnvSnapshotError> {
-        if !root.is_dir() {
-            return Err(EnvSnapshotError::Malformed(format!(
-                "snapshot root {:?} is not a directory",
-                root
-            )));
-        }
+        let rooted = match RootedDir::open(root) {
+            Ok(rooted) => rooted,
+            Err(e) => {
+                return Err(EnvSnapshotError::Malformed(format!(
+                    "snapshot root {:?} is not an openable directory ({e})",
+                    root
+                )))
+            }
+        };
         if snapshot_id.is_empty()
             || snapshot_id.chars().count() > MAX_SNAPSHOT_ID_CHARS
             || !snapshot_id.is_ascii()
@@ -698,17 +899,24 @@ impl EnvSnapshot {
                 "snapshot id {snapshot_id:?} must be 1..={MAX_SNAPSHOT_ID_CHARS} ASCII characters without '/' or '\\'"
             )));
         }
-        let discovered = discover_rule_files(root);
+        let discovery = discover_rooted(&rooted);
         let mut workspace_paths = BTreeMap::new();
         let mut content = BTreeMap::new();
         let mut skipped = Vec::new();
         let mut total_bytes = 0usize;
         let mut epoch = blake3::Hasher::new();
-        for (_kind, path) in discovered {
-            let Some(rel) = path.strip_prefix(root).ok() else {
-                continue;
-            };
-            let rel_str = path_str(rel);
+        for skip in discovery.skips {
+            if is_authority_rel_path(&skip.path) {
+                return Err(EnvSnapshotError::Malformed(format!(
+                    "authority rule file {} is an unsafe/unreadable entry ({}); refusing a capture that silently omits or follows it",
+                    skip.path, skip.reason
+                )));
+            }
+            skipped.push(skip);
+        }
+        for cand in discovery.files {
+            let rel_str = cand.rel;
+            let rel_path = Path::new(&rel_str);
             if rel_str.chars().count() > MAX_SNAPSHOT_PATH_CHARS {
                 return Err(EnvSnapshotError::Oversized(format!(
                     "rule path {rel_str:?} exceeds {MAX_SNAPSHOT_PATH_CHARS} characters"
@@ -720,19 +928,20 @@ impl EnvSnapshot {
                     root
                 )));
             }
-            let authority = is_authority_policy_file(root, &path);
-            match read_rule_file(&path, MAX_RULE_BYTES) {
+            let authority = is_authority_rel_path(&rel_str);
+            // The absolute join is the historic hash input (and is never
+            // opened): the read itself goes through `rooted`.
+            let hash_path = root.join(rel_path);
+            match read_rule_file(&rooted, rel_path, MAX_RULE_BYTES) {
                 RuleFileRead::Missing => {}
                 RuleFileRead::Unreadable(err) if authority => {
                     return Err(EnvSnapshotError::Malformed(format!(
-                        "authority rule file {} is unreadable ({err}); refusing a capture that silently omits it",
-                        path.display()
+                        "authority rule file {rel_str} is unreadable ({err}); refusing a capture that silently omits it"
                     )));
                 }
                 RuleFileRead::Oversized(len) if authority => {
                     return Err(EnvSnapshotError::Oversized(format!(
-                        "authority rule file {} is {len} bytes — over the {MAX_RULE_BYTES} rule bound; refusing a capture that half-reads it",
-                        path.display()
+                        "authority rule file {rel_str} is {len} bytes — over the {MAX_RULE_BYTES} rule bound; refusing a capture that half-reads it"
                     )));
                 }
                 RuleFileRead::Unreadable(err) => {
@@ -757,7 +966,7 @@ impl EnvSnapshot {
                         )));
                     }
                     total_bytes += text.len();
-                    let rules_hash = hash_of(&path, &text);
+                    let rules_hash = hash_of(&hash_path, &text);
                     // instruction_epoch must digest the same (rel path,
                     // 32-byte rules hash) pairs in the same order as
                     // compute_epoch over loaded rules.
@@ -828,51 +1037,84 @@ pub fn verify_snapshot_content(
     Ok(())
 }
 
-/// Load every rule of `root` in discovery order (the epoch input order).
-/// Authority files that are oversized or unreadable FAIL the whole load
-/// (P0-34); optional imports that are oversized or unreadable are skipped
-/// whole with a surfaced [`RuleSkip`] — partial text never reaches rules.
+/// Open the rule root as ONE admitted [`RootedDir`]. A root that does not
+/// exist is `Ok(None)` (the documented empty-tree case); any other open
+/// failure is a loud typed refusal, never a silent empty rule set.
+fn open_rule_root(root: &Path) -> Result<Option<RootedDir>, RulesLoadError> {
+    match RootedDir::open(root) {
+        Ok(rooted) => Ok(Some(rooted)),
+        Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(RulesLoadError::Unreadable(format!(
+            "rule root {} is not an openable directory ({e}); refusing to guess an empty rule tree",
+            root.display()
+        ))),
+    }
+}
+
+/// Load every rule of `root` in discovery order (the epoch input order)
+/// through ONE admitted [`RootedDir`]. Authority files that are oversized,
+/// unreadable, or unsafe (symlink/reparse point/special file in an
+/// authority slot) FAIL the whole load (P0-34); optional imports with the
+/// same conditions are skipped whole with a surfaced [`RuleSkip`] — partial
+/// text never reaches rules and a link is never followed.
 fn load_rules(root: &Path) -> Result<(Vec<Instruction>, Vec<RuleSkip>), RulesLoadError> {
+    let Some(rooted) = open_rule_root(root)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let discovery = discover_rooted(&rooted);
     let mut rules = Vec::new();
     let mut skipped = Vec::new();
-    for (kind, path) in discover_rule_files(root) {
-        let authority = is_authority_policy_file(root, &path);
-        match read_rule_file(&path, MAX_RULE_BYTES) {
+    for skip in discovery.skips {
+        if is_authority_rel_path(&skip.path) {
+            return Err(RulesLoadError::Unreadable(format!(
+                "authority rule file {} is an unsafe/unreadable entry ({}); refusing to load rules that silently omit or follow it",
+                skip.path, skip.reason
+            )));
+        }
+        skipped.push(skip);
+    }
+    for cand in discovery.files {
+        let rel_path = Path::new(&cand.rel);
+        let authority = is_authority_rel_path(&cand.rel);
+        // The absolute join is the historic hash/scope input and is NEVER
+        // opened: the read itself goes through the shared `rooted`.
+        let hash_path = root.join(rel_path);
+        match read_rule_file(&rooted, rel_path, MAX_RULE_BYTES) {
             RuleFileRead::Missing => {}
             RuleFileRead::Unreadable(err) if authority => {
                 return Err(RulesLoadError::Unreadable(format!(
                     "authority rule file {} could not be read ({err}); refusing to load rules that silently omit it",
-                    path.display()
+                    cand.rel
                 )));
             }
             RuleFileRead::Oversized(len) if authority => {
                 return Err(RulesLoadError::Oversized(format!(
                     "authority rule file {} is {len} bytes — over the {MAX_RULE_BYTES} rule bound; refusing to half-load it",
-                    path.display()
+                    cand.rel
                 )));
             }
             RuleFileRead::Unreadable(err) => {
                 skipped.push(RuleSkip {
-                    path: rel_of(root, &path),
+                    path: cand.rel.clone(),
                     bytes: None,
                     reason: format!("unreadable: {err}"),
                 });
             }
             RuleFileRead::Oversized(len) => {
                 skipped.push(RuleSkip {
-                    path: rel_of(root, &path),
+                    path: cand.rel.clone(),
                     bytes: Some(len),
                     reason: format!("oversized: {len} bytes > {MAX_RULE_BYTES}"),
                 });
             }
             RuleFileRead::Full(content) => {
                 rules.push(Instruction {
-                    source: kind,
-                    path: rel_of(root, &path),
-                    scope: scope_of(root, kind, &path),
+                    source: cand.kind,
+                    path: cand.rel.clone(),
+                    scope: scope_of(root, cand.kind, &hash_path),
                     content: content.clone(),
-                    hash: hash_of(&path, &content),
-                    priority: kind.priority(),
+                    hash: hash_of(&hash_path, &content),
+                    priority: cand.kind.priority(),
                     reason_loaded: String::new(),
                 });
             }
@@ -923,15 +1165,6 @@ fn touched_in_scope(touched: &str, scope: &str) -> bool {
         (Some(t), Some(s)) => t.starts_with(&s),
         _ => false,
     }
-}
-
-/// Workspace-relative, `/`-normalized form of `path` ([`path_str`] folds
-/// the platform separator). Used for every durable path string this crate
-/// emits (rule paths, skip entries).
-fn rel_of(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .map(path_str)
-        .unwrap_or_else(|_| path_str(path))
 }
 
 /// The activation scope of one rule file (workspace-relative subdirectory
@@ -1226,11 +1459,15 @@ impl LoadedInstructions {
 
 // ---------------------------------------------------------------- skills
 
-/// Skills: metadata only at discovery; bodies load on demand.
+/// Skills: metadata only at discovery; bodies load on demand. `path` is the
+/// skill's workspace-RELATIVE, `/`-normalized `SKILL.md` location: no
+/// absolute path is ever stored, and no read ever re-resolves a pathname
+/// outside the admitted [`RootedDir`] that discovered the skill.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillMeta {
     pub name: String,
     pub description: String,
+    /// Workspace-relative `/`-normalized path of the skill's `SKILL.md`.
     pub path: String,
     pub summary: String,
     pub keywords: Vec<String>,
@@ -1240,59 +1477,248 @@ pub const MAX_SKILL_ENTRIES: usize = 2000;
 const SKILL_SUMMARY_CAP: usize = 400;
 const SKILL_BODY_CAP: usize = 64 * 1024;
 
+/// A surfaced whole-skill refusal of the last discovery: a skills-directory
+/// entry or `SKILL.md` that could not be read honestly (symlink/reparse
+/// point, special file, unreadable entry, or an incomplete directory
+/// listing). Skills are OPTIONAL best-effort payloads — exactly like
+/// optional rule imports and unlike the authority rule files — so such an
+/// entry is skipped WHOLE, never followed, never partially ingested, and
+/// never becomes a [`SkillMeta`]; [`SkillRegistry::load_skill`] answers
+/// `None` for it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkillSkip {
+    /// Workspace-relative `/`-normalized path of the refused entry.
+    pub path: String,
+    pub reason: String,
+}
+
 pub struct SkillRegistry {
     entries: Vec<SkillMeta>,
+    skips: Vec<SkillSkip>,
+    /// The ONE admitted [`RootedDir`] shared by discovery and every
+    /// on-demand body read: retained so reads never re-resolve the root
+    /// path (a root swapped after discovery cannot redirect a read).
+    rooted: Option<RootedDir>,
+}
+
+/// Outcome of one skill-file read through the admitted [`RootedDir`]: a
+/// refusal carries the surfaced reason and is never a partial body.
+enum SkillFileRead {
+    Missing,
+    Refused(String),
+    Content(String),
+}
+
+/// Read one skill file through the admitted rooted authority, firing the
+/// same test seam as the rule surface (after enumeration, before the rooted
+/// read, so swap windows are testable). The parent chain and the final
+/// entry are classified with no-follow metadata: a symlink/reparse point on
+/// any component, a special file, or an unreadable entry is a typed
+/// [`SkillFileRead::Refused`] and is NEVER followed. The read is bounded by
+/// `cap`: a larger honest file contributes its capped prefix (skills are
+/// defined as bounded prefixes — the historical behavior), while an unsafe
+/// entry contributes nothing.
+fn read_skill_file(rooted: &RootedDir, rel: &Path, cap: usize) -> SkillFileRead {
+    read_seam(rel);
+    let meta = match rooted.entry_meta(rel) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return SkillFileRead::Missing,
+        Err(e) if e.kind == ErrorKind::NotFound => return SkillFileRead::Missing,
+        // A refused component walk (symlink/reparse point or non-directory
+        // ancestor) is an unsafe entry, never a plain read failure.
+        Err(e) if e.kind == ErrorKind::Permission => {
+            return SkillFileRead::Refused(format!("unsafe entry: {rel:?}: {e}"))
+        }
+        Err(e) => return SkillFileRead::Refused(format!("unreadable: {e}")),
+    };
+    match meta.kind {
+        RootedEntryKind::File => {}
+        RootedEntryKind::Symlink => {
+            return SkillFileRead::Refused(format!(
+                "unsafe entry: {} is a symlink/reparse point; the no-follow rooted read refuses to follow it",
+                rel.display()
+            ))
+        }
+        RootedEntryKind::Directory | RootedEntryKind::Other => {
+            return SkillFileRead::Refused(format!(
+                "unsafe entry: {} is not a regular file; refusing to open it",
+                rel.display()
+            ))
+        }
+    }
+    match rooted.read(rel, cap) {
+        Ok(data) => SkillFileRead::Content(String::from_utf8_lossy(&data.bytes).into_owned()),
+        Err(e) if e.kind == ErrorKind::NotFound => SkillFileRead::Missing,
+        Err(e) if e.kind == ErrorKind::Permission => {
+            SkillFileRead::Refused(format!("unsafe entry: {rel:?}: {e}"))
+        }
+        Err(e) => SkillFileRead::Refused(format!("unreadable: {e}")),
+    }
 }
 
 impl SkillRegistry {
+    /// Discover skills under `.faktor/skills` and `.claude/skills` through
+    /// ONE admitted [`RootedDir`] of `root`: entries are classified with
+    /// no-follow metadata (a symlink/reparse point or special file is
+    /// surfaced as a [`SkillSkip`] and never followed), every candidate is
+    /// read through THAT authority with the summary cap, and every stored
+    /// path is workspace-relative. An unopenable root is surfaced too —
+    /// never silently reported as "no skills".
     pub fn discover(root: &Path) -> Self {
-        let mut entries = Vec::new();
-        for dir in [root.join(".faktor/skills"), root.join(".claude/skills")] {
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-            names.sort();
-            for n in names {
-                if entries.len() >= MAX_SKILL_ENTRIES {
-                    break;
+        let rooted = match RootedDir::open(root) {
+            Ok(rooted) => Some(rooted),
+            Err(e) if e.kind == ErrorKind::NotFound => None,
+            Err(e) => {
+                return Self {
+                    entries: Vec::new(),
+                    skips: vec![SkillSkip {
+                        path: ".".to_string(),
+                        reason: format!("unsafe or unreadable root ({}): {e}", root.display()),
+                    }],
+                    rooted: None,
                 }
-                let meta_path = n.join("SKILL.md");
-                let Some(raw) = read_bounded(&meta_path, SKILL_SUMMARY_CAP) else {
-                    continue;
+            }
+        };
+        let mut entries = Vec::new();
+        let mut skips = Vec::new();
+        let mut capped = false;
+        if let Some(rooted) = rooted.as_ref() {
+            for dir_rel in [".faktor/skills", ".claude/skills"] {
+                let dir = Path::new(dir_rel);
+                match rooted.entry_meta(dir) {
+                    Ok(None) => continue,
+                    Ok(Some(meta)) if meta.kind == RootedEntryKind::Directory => {}
+                    Ok(Some(meta)) => {
+                        skips.push(SkillSkip {
+                            path: dir_rel.to_string(),
+                            reason: format!(
+                                "unsafe entry: {dir_rel} is not a real directory ({:?}); refusing to enter it",
+                                meta.kind
+                            ),
+                        });
+                        continue;
+                    }
+                    Err(e) if e.kind == ErrorKind::NotFound => continue,
+                    Err(e) if e.kind == ErrorKind::Permission => {
+                        skips.push(SkillSkip {
+                            path: dir_rel.to_string(),
+                            reason: format!(
+                                "unsafe entry: {dir_rel} could not be entered no-follow: {e}"
+                            ),
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        skips.push(SkillSkip {
+                            path: dir_rel.to_string(),
+                            reason: format!("unreadable: {e}"),
+                        });
+                        continue;
+                    }
+                }
+                let listing = match rooted.list_entries(dir, MAX_SKILL_ENTRIES) {
+                    Ok(listing) => listing,
+                    Err(e) if e.kind == ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        skips.push(SkillSkip {
+                            path: dir_rel.to_string(),
+                            reason: format!("unreadable: {e}"),
+                        });
+                        continue;
+                    }
                 };
-                let name = n
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                // Frontmatter-lite summary: first heading/paragraph + any
-                // keywords line. Never the full body.
-                let mut description = String::new();
-                let mut keywords = Vec::new();
-                for line in raw.lines().take(6) {
-                    if let Some(d) = line.strip_prefix("# ") {
-                        if description.is_empty() {
-                            description = d.trim().to_string();
+                if listing.overflowed {
+                    skips.push(SkillSkip {
+                        path: dir_rel.to_string(),
+                        reason: format!(
+                            "unreadable: directory holds more than {MAX_SKILL_ENTRIES} entries; its listing is refused as incomplete"
+                        ),
+                    });
+                }
+                let mut candidates = listing.entries;
+                candidates.sort_by(|a, b| a.rel.cmp(&b.rel));
+                for entry in candidates {
+                    if entries.len() >= MAX_SKILL_ENTRIES {
+                        capped = true;
+                        break;
+                    }
+                    match entry.kind {
+                        RootedEntryKind::Directory => {}
+                        RootedEntryKind::Symlink => {
+                            skips.push(SkillSkip {
+                                path: path_str(&entry.rel),
+                                reason: "unsafe entry: symlink/reparse point under a skills directory; never followed"
+                                    .to_string(),
+                            });
+                            continue;
+                        }
+                        RootedEntryKind::Other => {
+                            skips.push(SkillSkip {
+                                path: path_str(&entry.rel),
+                                reason: "unsafe entry: special file under a skills directory; never opened"
+                                    .to_string(),
+                            });
+                            continue;
+                        }
+                        // A plain file directly under the skills root has no
+                        // `SKILL.md` inside it; it is not a skill.
+                        RootedEntryKind::File => continue,
+                    }
+                    let rel = entry.rel.join("SKILL.md");
+                    let rel_str = path_str(&rel);
+                    let name = entry.name.to_string_lossy().into_owned();
+                    let raw = match read_skill_file(rooted, &rel, SKILL_SUMMARY_CAP) {
+                        SkillFileRead::Missing => continue,
+                        SkillFileRead::Refused(reason) => {
+                            skips.push(SkillSkip {
+                                path: rel_str,
+                                reason,
+                            });
+                            continue;
+                        }
+                        SkillFileRead::Content(text) => text,
+                    };
+                    // Frontmatter-lite summary: first heading/paragraph + any
+                    // keywords line. Never the full body.
+                    let mut description = String::new();
+                    let mut keywords = Vec::new();
+                    for line in raw.lines().take(6) {
+                        if let Some(d) = line.strip_prefix("# ") {
+                            if description.is_empty() {
+                                description = d.trim().to_string();
+                            }
+                        }
+                        if let Some(k) = line.strip_prefix("## Keywords:") {
+                            keywords = k
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
                         }
                     }
-                    if let Some(k) = line.strip_prefix("## Keywords:") {
-                        keywords = k
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                    }
+                    entries.push(SkillMeta {
+                        name,
+                        description,
+                        path: rel_str,
+                        summary: raw,
+                        keywords,
+                    });
                 }
-                entries.push(SkillMeta {
-                    name,
-                    description,
-                    path: meta_path.to_string_lossy().into_owned(),
-                    summary: raw,
-                    keywords,
-                });
             }
         }
-        Self { entries }
+        if capped {
+            skips.push(SkillSkip {
+                path: ".".to_string(),
+                reason: format!(
+                    "unreadable: more than {MAX_SKILL_ENTRIES} skills under the workspace; discovery refused the additional entries as incomplete"
+                ),
+            });
+        }
+        Self {
+            entries,
+            skips,
+            rooted,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1301,6 +1727,13 @@ impl SkillRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whole-entry refusals of the last discovery (unsafe links/special
+    /// files, unreadable or incomplete listings): nothing listed here was
+    /// followed or ingested.
+    pub fn skipped(&self) -> &[SkillSkip] {
+        &self.skips
     }
 
     pub fn find(&self, query: &str) -> Vec<&SkillMeta> {
@@ -1325,19 +1758,20 @@ impl SkillRegistry {
         hits.into_iter().map(|(e, _)| e).take(10).collect()
     }
 
-    /// Full body ONLY on demand (bounded). None when absent/oversized.
+    /// Full body ONLY on demand (bounded by [`SKILL_BODY_CAP`]), read
+    /// through the SAME admitted [`RootedDir`] as discovery: `None` when the
+    /// name is unknown, the file vanished, or the re-read is refused (a
+    /// symlink/reparse swap on any component is never followed). A larger
+    /// honest body contributes its capped prefix, byte-identical to the
+    /// historical pathname read.
     pub fn load_skill(&self, name: &str) -> Option<String> {
         let e = self.entries.iter().find(|e| e.name == name)?;
-        read_bounded(Path::new(&e.path), SKILL_BODY_CAP)
+        let rooted = self.rooted.as_ref()?;
+        match read_skill_file(rooted, Path::new(&e.path), SKILL_BODY_CAP) {
+            SkillFileRead::Content(text) => Some(text),
+            SkillFileRead::Missing | SkillFileRead::Refused(_) => None,
+        }
     }
-}
-
-/// Legacy bounded read for NON-rule payloads (skill metadata summaries and
-/// on-demand skill bodies): skills are never injected into a prompt
-/// wholesale, and their read is strictly best-effort.
-fn read_bounded(path: &Path, cap: usize) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    Some(String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]).into_owned())
 }
 
 #[cfg(test)]
@@ -1589,6 +2023,413 @@ mod tests {
         );
         assert!(body.len() <= SKILL_BODY_CAP);
         assert!(reg.load_skill("missing").is_none());
+    }
+
+    // ---------------------------------------- rooted skills (workspace escape)
+    // The same adversarial posture as the rule surface: skill entries
+    // pointing outside through symlinks, entries swapped after enumeration,
+    // nested link directories, and honest trees that must stay
+    // byte-identical to the historical pathname reads (the golden functions
+    // below reproduce the old pathname semantics verbatim).
+
+    #[test]
+    fn global_skill_cap_is_surfaced_not_silently_dropped() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..MAX_SKILL_ENTRIES {
+            write(
+                d.path(),
+                &format!(".faktor/skills/s-{i:05}/SKILL.md"),
+                "# S\nbody\n",
+            );
+        }
+        write(d.path(), ".claude/skills/extra/SKILL.md", "# Extra\nbody\n");
+        let reg = SkillRegistry::discover(d.path());
+        assert_eq!(reg.len(), MAX_SKILL_ENTRIES, "global cap holds");
+        let cap_skip = reg
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".")
+            .expect("global cap surfaced");
+        assert!(cap_skip.reason.contains("more than 2000"), "{cap_skip:?}");
+    }
+
+    /// The pre-rooted skill read (historical pathname semantics), reproduced
+    /// in the test as the golden reference.
+    fn legacy_read_bounded(path: &Path, cap: usize) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        Some(String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]).into_owned())
+    }
+
+    /// The pre-rooted discovery (historical pathname semantics), reproduced
+    /// as the golden reference: same roots, same order, same summary parse.
+    fn legacy_skill_entries(root: &Path) -> Vec<SkillMeta> {
+        let mut entries = Vec::new();
+        for dir in [root.join(".faktor/skills"), root.join(".claude/skills")] {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            names.sort();
+            for n in names {
+                let meta_path = n.join("SKILL.md");
+                let Some(raw) = legacy_read_bounded(&meta_path, SKILL_SUMMARY_CAP) else {
+                    continue;
+                };
+                let name = n
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut description = String::new();
+                let mut keywords = Vec::new();
+                for line in raw.lines().take(6) {
+                    if let Some(d) = line.strip_prefix("# ") {
+                        if description.is_empty() {
+                            description = d.trim().to_string();
+                        }
+                    }
+                    if let Some(k) = line.strip_prefix("## Keywords:") {
+                        keywords = k
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                }
+                entries.push(SkillMeta {
+                    name,
+                    description,
+                    path: meta_path.to_string_lossy().into_owned(),
+                    summary: raw,
+                    keywords,
+                });
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn honest_skills_load_byte_identical_to_the_legacy_pathname_reads() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            ".faktor/skills/alpha/SKILL.md",
+            "# Alpha skill\n## Keywords: alpha, one\nalpha body\n",
+        );
+        write(
+            d.path(),
+            ".claude/skills/beta/SKILL.md",
+            "# Beta skill\nbeta body\n## Keywords: two\n",
+        );
+        // A directory without a SKILL.md is not a skill.
+        write(d.path(), ".faktor/skills/not-a-skill/notes.txt", "notes\n");
+        // A summary beyond SKILL_SUMMARY_CAP and a body beyond
+        // SKILL_BODY_CAP must both come back as the historical capped
+        // prefixes, byte for byte.
+        let long_summary = format!("# Long skill\n{}\n", "summary line\n".repeat(60));
+        write(d.path(), ".faktor/skills/gamma/SKILL.md", &long_summary);
+        let huge_body = format!("# Huge skill\n{}", "x".repeat(SKILL_BODY_CAP + 5000));
+        write(d.path(), ".claude/skills/delta/SKILL.md", &huge_body);
+
+        let reg = SkillRegistry::discover(d.path());
+        let legacy = legacy_skill_entries(d.path());
+        assert_eq!(reg.len(), legacy.len(), "same skill set");
+        assert!(reg.skipped().is_empty(), "{:?}", reg.skipped());
+        for (new, old) in reg.entries.iter().zip(&legacy) {
+            assert_eq!(new.name, old.name, "same discovery order and names");
+            assert_eq!(new.description, old.description);
+            assert_eq!(new.keywords, old.keywords);
+            assert_eq!(new.summary, old.summary, "summary bytes identical");
+            assert!(new.summary.len() <= SKILL_SUMMARY_CAP);
+            assert!(
+                Path::new(&new.path).is_relative(),
+                "stored path is workspace-relative: {}",
+                new.path
+            );
+            assert_eq!(
+                d.path().join(&new.path),
+                PathBuf::from(&old.path),
+                "relative path addresses the same file"
+            );
+            let body = reg.load_skill(&new.name).unwrap();
+            assert_eq!(
+                body,
+                legacy_read_bounded(Path::new(&old.path), SKILL_BODY_CAP).unwrap(),
+                "body bytes identical to the legacy pathname read (including capped prefixes)"
+            );
+            assert!(body.len() <= SKILL_BODY_CAP);
+        }
+        assert_eq!(reg.find("alpha")[0].name, "alpha");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_file_symlinked_outside_is_refused_and_outside_bytes_never_ingested() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join(".faktor/skills/evil")).unwrap();
+        std::fs::create_dir_all(root.join(".faktor/skills/honest")).unwrap();
+        std::fs::create_dir_all(root.join(".faktor/skills/nested")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = "OUTSIDE SKILL SECRET\n";
+        std::fs::write(outside.join("SKILL.md"), secret).unwrap();
+        std::fs::write(
+            root.join(".faktor/skills/honest/SKILL.md"),
+            "# Honest\nhonest body\n",
+        )
+        .unwrap();
+        // (a) SKILL.md itself is a symlink to the outside secret.
+        std::os::unix::fs::symlink(
+            outside.join("SKILL.md"),
+            root.join(".faktor/skills/evil/SKILL.md"),
+        )
+        .unwrap();
+        // (b) a whole skill directory is a symlink to the outside directory.
+        std::os::unix::fs::symlink(&outside, root.join(".faktor/skills/link-dir")).unwrap();
+        // (c) a nested directory symlink inside a skill dir: discovery never
+        // descends past the direct skill directory, so it is never entered.
+        std::os::unix::fs::symlink(&outside, root.join(".faktor/skills/nested/deeper")).unwrap();
+
+        let reg = SkillRegistry::discover(&root);
+        assert_eq!(
+            reg.entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["honest"],
+            "only the honest skill is discovered"
+        );
+        assert!(reg.load_skill("evil").is_none());
+        assert!(reg.load_skill("link-dir").is_none());
+        assert!(reg.load_skill("nested").is_none());
+        let evil = reg
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills/evil/SKILL.md")
+            .expect("surfaced SKILL.md refusal");
+        assert!(evil.reason.contains("unsafe entry"), "{evil:?}");
+        let link = reg
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills/link-dir")
+            .expect("surfaced skill-dir refusal");
+        assert!(link.reason.contains("unsafe entry"), "{link:?}");
+        // The outside bytes were never ingested, and are intact.
+        assert!(reg.load_skill("honest").unwrap().contains("honest body"));
+        for e in &reg.entries {
+            assert!(!e.summary.contains("OUTSIDE SKILL SECRET"), "{e:?}");
+            assert!(!e.description.contains("OUTSIDE SKILL SECRET"), "{e:?}");
+        }
+        for s in reg.skipped() {
+            assert!(!Path::new(&s.path).is_absolute(), "{s:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+            secret
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_directory_swapped_for_outside_symlink_between_discovery_and_load_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join(".faktor/skills/swap")).unwrap();
+        std::fs::create_dir_all(root.join(".faktor/skills/file-swap")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            root.join(".faktor/skills/swap/SKILL.md"),
+            "# Swap\nhonest swap body\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".faktor/skills/file-swap/SKILL.md"),
+            "# File swap\nhonest file body\n",
+        )
+        .unwrap();
+        std::fs::write(outside.join("SKILL.md"), "OUTSIDE SWAP SECRET\n").unwrap();
+
+        let reg = SkillRegistry::discover(&root);
+        assert!(reg.load_skill("swap").unwrap().contains("honest swap body"));
+        // Between enumeration and the on-demand read: swap the SKILL
+        // DIRECTORY for a symlink to the outside directory.
+        std::fs::remove_dir_all(root.join(".faktor/skills/swap")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".faktor/skills/swap")).unwrap();
+        assert!(
+            reg.load_skill("swap").is_none(),
+            "a directory swapped for an outside symlink must refuse the read"
+        );
+        // And the SKILL.md itself swapped for an outside symlink.
+        std::fs::remove_file(root.join(".faktor/skills/file-swap/SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("SKILL.md"),
+            root.join(".faktor/skills/file-swap/SKILL.md"),
+        )
+        .unwrap();
+        assert!(
+            reg.load_skill("file-swap").is_none(),
+            "a SKILL.md swapped for an outside symlink must refuse the read"
+        );
+        // Re-discovery surfaces both as whole-skill refusals; outside bytes
+        // never enter the registry.
+        let reg2 = SkillRegistry::discover(&root);
+        assert!(reg2.is_empty());
+        let swapped_dir = reg2
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills/swap")
+            .expect("swapped dir surfaced");
+        assert!(
+            swapped_dir.reason.contains("unsafe entry"),
+            "{swapped_dir:?}"
+        );
+        let swapped_file = reg2
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills/file-swap/SKILL.md")
+            .expect("swapped file surfaced");
+        assert!(
+            swapped_file.reason.contains("unsafe entry"),
+            "{swapped_file:?}"
+        );
+        assert!(!reg2
+            .entries
+            .iter()
+            .any(|e| e.summary.contains("OUTSIDE SWAP SECRET")));
+        assert_eq!(
+            std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+            "OUTSIDE SWAP SECRET\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seam_swap_of_skill_directory_between_enumeration_and_read_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join(".faktor/skills/swap")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            root.join(".faktor/skills/swap/SKILL.md"),
+            "# Swap\nhonest seam body\n",
+        )
+        .unwrap();
+        std::fs::write(outside.join("SKILL.md"), "OUTSIDE SEAM SECRET\n").unwrap();
+        let swap_root = root.clone();
+        let outside_dir = outside.clone();
+        let (_lock, _clear) = install_read_seam(move |rel| {
+            if rel == Path::new(".faktor/skills/swap/SKILL.md") {
+                let _ = std::fs::remove_dir_all(swap_root.join(".faktor/skills/swap"));
+                let _ =
+                    std::os::unix::fs::symlink(&outside_dir, swap_root.join(".faktor/skills/swap"));
+            }
+        });
+        let reg = SkillRegistry::discover(&root);
+        assert!(reg.is_empty(), "the swapped skill must not be ingested");
+        let skip = reg
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills/swap/SKILL.md")
+            .expect("swap in the enumeration -> read window surfaced");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+        assert!(!reg
+            .entries
+            .iter()
+            .any(|e| e.summary.contains("OUTSIDE SEAM SECRET")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_skills_convention_dir_is_refused_and_never_entered() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join(".faktor")).unwrap();
+        std::fs::create_dir_all(outside.join("skill-x")).unwrap();
+        std::fs::write(outside.join("skill-x/SKILL.md"), "OUTSIDE DIR SECRET\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".faktor/skills")).unwrap();
+        let reg = SkillRegistry::discover(&root);
+        assert!(reg.is_empty());
+        let skip = reg
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills")
+            .expect("linked convention dir surfaced");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+        assert!(!reg
+            .entries
+            .iter()
+            .any(|e| e.summary.contains("OUTSIDE DIR SECRET")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_skill_directory_symlink_is_never_descended() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        write(
+            &root,
+            ".faktor/skills/outer/SKILL.md",
+            "# Outer\nouter body\n",
+        );
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep/SKILL.md"), "OUTSIDE NESTED SKILL\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".faktor/skills/outer/inner")).unwrap();
+        let reg = SkillRegistry::discover(&root);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.entries[0].name, "outer");
+        assert!(reg.load_skill("outer").unwrap().contains("outer body"));
+        assert!(reg.load_skill("inner").is_none());
+        assert!(reg.load_skill("deep").is_none());
+        assert!(
+            reg.skipped().is_empty(),
+            "nested directories are never enumerated: {:?}",
+            reg.skipped()
+        );
+        assert!(!reg
+            .entries
+            .iter()
+            .any(|e| e.summary.contains("OUTSIDE NESTED SKILL")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_skill_entries_are_refused_like_unix_links() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join(".faktor/skills/honest")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            root.join(".faktor/skills/honest/SKILL.md"),
+            "# Honest\nhonest body\n",
+        )
+        .unwrap();
+        std::fs::write(outside.join("SKILL.md"), "OUTSIDE WIN SECRET\n").unwrap();
+        if std::os::windows::fs::symlink_dir(&outside, root.join(".faktor/skills/link-dir"))
+            .is_err()
+        {
+            // Creating a symlink needs SeCreateSymbolicLinkPrivilege or
+            // developer mode; the fs crate's Windows seam suite covers the
+            // handle-anchored refusal on runners that grant it.
+            return;
+        }
+        let reg = SkillRegistry::discover(&root);
+        assert_eq!(reg.entries.len(), 1);
+        assert!(reg.load_skill("link-dir").is_none());
+        let skip = reg
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/skills/link-dir")
+            .expect("surfaced reparse refusal");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+        assert!(!reg
+            .entries
+            .iter()
+            .any(|e| e.summary.contains("OUTSIDE WIN SECRET")));
     }
 
     #[test]
@@ -2197,5 +3038,462 @@ mod tests {
         let again = resolver.resolve(0, None).unwrap();
         assert!(again.active_for("x", &[])[0].content.contains("rules of 0"));
         assert!(resolver.cache_len() <= resolver.cache_cap());
+    }
+
+    // ------------------------------ rooted discovery / workspace escape
+    // These tests attempt to break the loader with adversarial checkouts:
+    // rule slots pointing at outside files/dirs through symlinks, entries
+    // swapped between discovery and read, and special files. Honest trees
+    // must stay byte-identical (the golden assembly test).
+
+    struct ReadSeamClear;
+    impl Drop for ReadSeamClear {
+        fn drop(&mut self) {
+            *READ_SEAM.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    fn install_read_seam(
+        f: impl Fn(&Path) + Send + 'static,
+    ) -> (std::sync::MutexGuard<'static, ()>, ReadSeamClear) {
+        let guard = READ_SEAM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keyed to the installing thread: the seam is process-global, and
+        // unrelated tests run concurrently in this binary, so only the
+        // test's own `Instructions::load` call may fire the swap.
+        let installer = std::thread::current().id();
+        *READ_SEAM
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move |rel| {
+            if std::thread::current().id() == installer {
+                f(rel);
+            }
+        }));
+        (guard, ReadSeamClear)
+    }
+
+    #[test]
+    fn rooted_discovery_returns_workspace_relative_paths_only() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "root rule\n");
+        write(d.path(), ".cursor/rules/sub/x.mdc", "scoped rule\n");
+        let discovered = discover_rule_files(d.path());
+        assert_eq!(discovered.len(), 2);
+        for (_, p) in &discovered {
+            assert!(
+                p.is_relative(),
+                "discovery must never queue an absolute path: {p:?}"
+            );
+        }
+        let rels: Vec<String> = discovered.iter().map(|(_, p)| path_str(p)).collect();
+        assert_eq!(rels, vec!["AGENTS.md", ".cursor/rules/sub/x.mdc"]);
+    }
+
+    #[test]
+    fn honest_tree_loads_byte_identically_through_rooted_discovery() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "agents-rule\n");
+        write(d.path(), "FAKTOR.md", "faktor-rule\n");
+        write(d.path(), "CLAUDE.md", "claude-rule\n");
+        write(d.path(), "GEMINI.md", "gemini-rule\n");
+        write(
+            d.path(),
+            ".github/copilot-instructions.md",
+            "copilot-rule\n",
+        );
+        write(d.path(), ".windsurfrules", "windsurf-legacy-rule\n");
+        write(d.path(), ".windsurf/rules.md", "windsurf-rule\n");
+        write(d.path(), ".cursor/rules/top.mdc", "cursor-top\n");
+        write(d.path(), ".cursor/rules/nested/deep.md", "cursor-deep\n");
+        write(d.path(), ".faktor/rules/native.md", "native-rule\n");
+        write(d.path(), ".continue/rules/cont.md", "continue-rule\n");
+        write(
+            d.path(),
+            ".faktor/legacy/import.md",
+            "# Scope: legacy\nlegacy-rule\n",
+        );
+        let live = Instructions::load(d.path()).unwrap();
+        assert!(live.skipped().is_empty(), "{:?}", live.skipped());
+        // Byte-exact assembled material: priority, path, scope, content.
+        let assembled: String = live
+            .rules
+            .iter()
+            .map(|r| format!("{}|{}|{}|{}\n", r.priority, r.path, r.scope, r.content))
+            .collect();
+        let expected_assembled = "\
+100|.faktor/rules/native.md||native-rule\n\n\
+100|FAKTOR.md||faktor-rule\n\n\
+90|AGENTS.md||agents-rule\n\n\
+80|CLAUDE.md||claude-rule\n\n\
+70|GEMINI.md||gemini-rule\n\n\
+60|.github/copilot-instructions.md|.github|copilot-rule\n\n\
+50|.cursor/rules/nested/deep.md|nested|cursor-deep\n\n\
+50|.cursor/rules/top.mdc||cursor-top\n\n\
+40|.windsurf/rules.md|.windsurf|windsurf-rule\n\n\
+40|.windsurfrules||windsurf-legacy-rule\n\n\
+30|.continue/rules/cont.md||continue-rule\n\n\
+10|.faktor/legacy/import.md||# Scope: legacy\nlegacy-rule\n\n";
+        assert_eq!(assembled, expected_assembled);
+        // Public discovery produces the SAME ordered, relative paths.
+        let discovered: Vec<(RuleSourceKind, String)> = discover_rule_files(d.path())
+            .into_iter()
+            .map(|(k, p)| (k, path_str(&p)))
+            .collect();
+        let expected_discovered: Vec<(RuleSourceKind, String)> = live
+            .rules
+            .iter()
+            .map(|r| (r.source, r.path.clone()))
+            .collect();
+        assert_eq!(discovered, expected_discovered);
+        // Snapshot capture sees the identical environment: same epoch,
+        // same relative paths, same bytes, and the pinned tree re-derives
+        // the same epoch.
+        let captured = EnvSnapshot::capture(d.path(), "env-honest", 7).unwrap();
+        assert!(captured.snapshot.skipped.is_empty());
+        assert_eq!(captured.snapshot.instruction_epoch, live.epoch().as_u64());
+        assert_eq!(captured.content.len(), live.rules.len());
+        for r in &live.rules {
+            assert_eq!(
+                captured.content.get(&r.path).map(String::as_str),
+                Some(r.content.as_str()),
+                "captured bytes must equal live rule bytes for {}",
+                r.path
+            );
+        }
+        let pinned = Instructions::from_snapshot(&captured.snapshot, &captured.content).unwrap();
+        assert_eq!(pinned.epoch(), live.epoch());
+        assert_eq!(
+            pinned.active_for("fix the api server", &["nested/App.tsx".into()]),
+            live.active_for("fix the api server", &["nested/App.tsx".into()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_rule_symlink_is_loudly_refused_and_outside_never_ingested() {
+        for name in ["AGENTS.md", "FAKTOR.md", "CLAUDE.md"] {
+            let outside = tempfile::tempdir().unwrap();
+            let secret = format!("OUTSIDE {name} SECRET\n");
+            std::fs::write(outside.path().join("secret.md"), &secret).unwrap();
+            let d = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret.md"), d.path().join(name))
+                .unwrap();
+            let err = Instructions::load(d.path()).expect_err("authority symlink refused");
+            assert!(
+                matches!(err, RulesLoadError::Unreadable(_)),
+                "{name}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(name), "{msg}");
+            assert!(msg.contains("unsafe entry"), "{msg}");
+            // The snapshot capture refuses the same tree loudly too.
+            let err2 = EnvSnapshot::capture(d.path(), "env-a", 1)
+                .expect_err("capture refuses authority symlink");
+            assert!(matches!(err2, EnvSnapshotError::Malformed(_)), "{err2:?}");
+            assert!(err2.to_string().contains(name), "{err2}");
+            // The outside bytes are intact and were never ingested.
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("secret.md")).unwrap(),
+                secret
+            );
+        }
+        // An authority SLOT that is a directory (not just a link) is loud.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("AGENTS.md")).unwrap();
+        let err = Instructions::load(d.path()).expect_err("authority dir refused");
+        assert!(matches!(err, RulesLoadError::Unreadable(_)), "{err:?}");
+        assert!(err.to_string().contains("unsafe entry"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_is_refused_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "AGENTS.md", "OUTSIDE ROOT SECRET\n");
+        let base = tempfile::tempdir().unwrap();
+        let link = base.path().join("ws");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let err = Instructions::load(&link).expect_err("symlinked root refused");
+        assert!(matches!(err, RulesLoadError::Unreadable(_)), "{err:?}");
+        assert!(EnvSnapshot::capture(&link, "env-a", 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_rule_symlink_escaping_with_dotdot_is_surfaced_skip_never_followed() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join(".faktor/rules")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), "OUTSIDE IMPORT SECRET\n").unwrap();
+        // Literal `../../../outside/secret.md` from `.faktor/rules` resolves
+        // outside the workspace root.
+        std::os::unix::fs::symlink(
+            "../../../outside/secret.md",
+            root.join(".faktor/rules/foo.md"),
+        )
+        .unwrap();
+        let discovered = discover_rule_files(&root);
+        assert!(
+            discovered.is_empty(),
+            "a link is never a discovered rule file: {discovered:?}"
+        );
+        let ins = Instructions::load(&root).unwrap();
+        let skip = ins
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/rules/foo.md")
+            .expect("surfaced skip for the linked import");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+        assert!(ins.rules.is_empty());
+        assert!(!ins
+            .active_for("anything", &[])
+            .iter()
+            .any(|i| i.content.contains("OUTSIDE IMPORT SECRET")));
+        // The snapshot capture surfaces the same refusal and never ingests.
+        let captured = EnvSnapshot::capture(&root, "env-a", 1).unwrap();
+        assert!(captured
+            .snapshot
+            .skipped
+            .iter()
+            .any(|s| s.path == ".faktor/rules/foo.md"));
+        assert!(!captured
+            .snapshot
+            .workspace_paths
+            .contains_key(".faktor/rules/foo.md"));
+        assert!(captured.content.is_empty());
+        let pinned = Instructions::from_snapshot(&captured.snapshot, &captured.content).unwrap();
+        assert!(pinned.rules.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_convention_directory_is_refused_at_the_component_walk() {
+        for relative_target in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let root = base.path().join("ws");
+            let outside = base.path().join("outside");
+            std::fs::create_dir_all(root.join(".cursor")).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("evil.mdc"), "OUTSIDE DIR RULE\n").unwrap();
+            let target = if relative_target {
+                PathBuf::from("../../outside")
+            } else {
+                outside.clone()
+            };
+            std::os::unix::fs::symlink(&target, root.join(".cursor/rules")).unwrap();
+            let ins = Instructions::load(&root).unwrap();
+            let skip = ins
+                .skipped()
+                .iter()
+                .find(|s| s.path == ".cursor/rules")
+                .expect("surfaced refusal for the linked convention dir");
+            assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+            assert!(ins.rules.is_empty());
+            assert!(!ins
+                .active_for("anything", &[])
+                .iter()
+                .any(|i| i.content.contains("OUTSIDE DIR RULE")));
+            let captured = EnvSnapshot::capture(&root, "env-a", 1).unwrap();
+            assert!(captured
+                .snapshot
+                .skipped
+                .iter()
+                .any(|s| s.path == ".cursor/rules"));
+            assert!(captured.snapshot.workspace_paths.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlinked_directory_is_refused_and_never_descended() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("ws");
+        let outside = base.path().join("outside");
+        write(&root, ".faktor/rules/honest.md", "honest-rule\n");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("nested.mdc"), "OUTSIDE NESTED RULE\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".faktor/rules/sub")).unwrap();
+        let ins = Instructions::load(&root).unwrap();
+        assert!(ins
+            .rules
+            .iter()
+            .any(|r| r.path == ".faktor/rules/honest.md"));
+        let skip = ins
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/rules/sub")
+            .expect("nested dir refusal surfaced");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+        assert!(!ins
+            .rules
+            .iter()
+            .any(|r| r.content.contains("OUTSIDE NESTED")));
+        let captured = EnvSnapshot::capture(&root, "env-a", 1).unwrap();
+        assert!(captured
+            .snapshot
+            .workspace_paths
+            .contains_key(".faktor/rules/honest.md"));
+        assert!(captured
+            .snapshot
+            .skipped
+            .iter()
+            .any(|s| s.path == ".faktor/rules/sub"));
+        assert!(!captured
+            .snapshot
+            .workspace_paths
+            .keys()
+            .any(|k| k.contains("nested")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_in_rule_tree_is_surfaced_and_never_opened() {
+        // A UNIX socket named like a rule must never be opened (a read would
+        // block/fail): classification refuses it before the open.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".faktor/rules")).unwrap();
+        let _sock =
+            std::os::unix::net::UnixListener::bind(d.path().join(".faktor/rules/pipe.md")).unwrap();
+        let ins = Instructions::load(d.path()).unwrap();
+        assert!(ins.rules.is_empty());
+        let skip = ins
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/rules/pipe.md")
+            .expect("special file surfaced");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seam_swap_of_authority_file_between_enumeration_and_read_is_loud() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "OUTSIDE SEAM SECRET\n").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "honest authority\n");
+        let swap_root = d.path().to_path_buf();
+        let swap_target = outside.path().join("secret.md");
+        let (_lock, _clear) = install_read_seam(move |rel| {
+            if rel == Path::new("AGENTS.md") {
+                let _ = std::fs::remove_file(swap_root.join("AGENTS.md"));
+                let _ = std::os::unix::fs::symlink(&swap_target, swap_root.join("AGENTS.md"));
+            }
+        });
+        let err = Instructions::load(d.path()).expect_err("swapped authority file refused");
+        assert!(matches!(err, RulesLoadError::Unreadable(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AGENTS.md") && msg.contains("unsafe entry"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seam_swap_of_optional_rule_between_enumeration_and_read_is_surfaced_skip() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "OUTSIDE SEAM IMPORT\n").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), ".faktor/rules/note.md", "honest note\n");
+        let swap_root = d.path().to_path_buf();
+        let swap_target = outside.path().join("secret.md");
+        let (_lock, _clear) = install_read_seam(move |rel| {
+            if rel == Path::new(".faktor/rules/note.md") {
+                let _ = std::fs::remove_file(swap_root.join(".faktor/rules/note.md"));
+                let _ = std::os::unix::fs::symlink(
+                    &swap_target,
+                    swap_root.join(".faktor/rules/note.md"),
+                );
+            }
+        });
+        let ins = Instructions::load(d.path()).unwrap();
+        let skip = ins
+            .skipped()
+            .iter()
+            .find(|s| s.path == ".faktor/rules/note.md")
+            .expect("swapped optional rule surfaced");
+        assert!(skip.reason.contains("unsafe entry"), "{skip:?}");
+        assert!(!ins
+            .rules
+            .iter()
+            .any(|r| r.content.contains("OUTSIDE SEAM IMPORT")));
+        // The same window through snapshot capture is refused identically:
+        // capture re-discovers, so the swapped entry is classified unsafe.
+        let captured = EnvSnapshot::capture(d.path(), "env-a", 1).unwrap();
+        assert!(captured.content.is_empty());
+        assert!(!captured
+            .snapshot
+            .workspace_paths
+            .contains_key(".faktor/rules/note.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_after_discovery_never_reopens_the_stale_relative_path() {
+        // Enumerate first (the relative path is the ONLY thing retained),
+        // then swap the entry for an escaping symlink: the read resolves
+        // through the admitted root with no-follow semantics and refuses.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "OUTSIDE STALE SECRET\n").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), ".faktor/rules/note.md", "honest note\n");
+        let before = discover_rule_files(d.path());
+        assert_eq!(before.len(), 1);
+        assert!(before[0].1.is_relative());
+        std::fs::remove_file(d.path().join(".faktor/rules/note.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.md"),
+            d.path().join(".faktor/rules/note.md"),
+        )
+        .unwrap();
+        let rooted = RootedDir::open(d.path()).unwrap();
+        let read = match read_rule_file(&rooted, Path::new(".faktor/rules/note.md"), MAX_RULE_BYTES)
+        {
+            RuleFileRead::Unreadable(err) => err,
+            _ => panic!("stale-path swap must be refused, never followed"),
+        };
+        assert!(read.contains("unsafe entry"), "{read}");
+        let ins = Instructions::load(d.path()).unwrap();
+        assert!(!ins
+            .active_for("anything", &[])
+            .iter()
+            .any(|i| i.content.contains("OUTSIDE STALE SECRET")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_rule_entries_are_refused_like_unix_links() {
+        // Windows parity (statically reviewed; runs on the Windows lane):
+        // the same rooted classification refuses a directory reparse point
+        // (symlink/junction) at the convention directory before any descent.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("rules")).unwrap();
+        std::fs::write(outside.path().join("rules/evil.mdc"), "OUTSIDE WIN RULE\n").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".cursor")).unwrap();
+        if std::os::windows::fs::symlink_dir(
+            outside.path().join("rules"),
+            d.path().join(".cursor/rules"),
+        )
+        .is_err()
+        {
+            // Creating a symlink needs SeCreateSymbolicLinkPrivilege or
+            // developer mode; the fs crate's Windows seam suite covers the
+            // handle-anchored refusal on runners that grant it.
+            return;
+        }
+        let ins = Instructions::load(d.path()).unwrap();
+        assert!(ins.rules.is_empty());
+        assert!(ins
+            .skipped()
+            .iter()
+            .any(|s| s.path == ".cursor/rules" && s.reason.contains("unsafe entry")));
+        assert!(!ins
+            .rules
+            .iter()
+            .any(|r| r.content.contains("OUTSIDE WIN RULE")));
     }
 }

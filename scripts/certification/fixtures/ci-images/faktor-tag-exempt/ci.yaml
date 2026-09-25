@@ -1,0 +1,9 @@
+# Planted violation: the digest-exempt escape hatch is for the self-hosted
+# Windows shell image only; it cannot exempt the Faktor CI image from the
+# digest requirement. `scripts/check-ci-image-pins.sh --dir` must reject this
+# file.
+steps:
+  - name: jetbrains-smoke
+    image: faktor-ci:latest # digest-exempt: not allowed for the Faktor CI image
+    commands:
+      - sh scripts/build-ci-image.sh --verify-runtime

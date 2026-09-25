@@ -8,20 +8,33 @@
 # Usage:
 #   bash scripts/build-ci-image.sh [--platform linux/amd64] [--tag TAG]
 #                                  [--registry HOST/PATH] [--push]
+#                                  [--record-digest FILE]
+#   bash scripts/build-ci-image.sh --verify-runtime
 #   bash scripts/build-ci-image.sh --selftest
 #
 # Registry / push:
 #   * Without --registry (or FAKTOR_CI_IMAGE_REGISTRY) the image is loaded
 #     into the local docker daemon and the script prints the local digest.
-#     CI lanes keep using the inline snapshot+exact-version apt steps, since
-#     a local digest is not pullable by a remote agent.
+#     `.woodpecker/**` references that digest as
+#     `image: faktor-ci@sha256:<digest>` with `pull: false`; the required
+#     `ci-image` pre-step runs ON that digest and fails closed when the image
+#     was not produced locally (no apt fallback).
 #   * With --registry / FAKTOR_CI_IMAGE_REGISTRY (and optionally --push) the
 #     image is pushed and the printed `<ref>@sha256:<digest>` can be
-#     referenced directly by `.woodpecker/**` steps (replace the apt step and
-#     annotate it `# apt-pinned: <ref@sha256:...>`).
+#     referenced directly by `.woodpecker/**` steps.
+#   * --record-digest FILE writes the built digest to FILE (the digest record
+#     read by `scripts/check-ci-image-pins.sh` and by the trusted attestation
+#     step for `build_environment_digest`). The lanes commit the record at
+#     `docker/faktor-ci/image-digest.txt`.
 #
-# Exit codes: 0 built (or selftest passed); 2 usage error; other = docker
-# failure.
+# --verify-runtime runs INSIDE a built Faktor CI image (no docker needed): it
+# checks the platform, that every exact `pkg=version` pin in the Dockerfile is
+# satisfied by the running image, that the pinned tools (including git and the
+# JDK 17 javac the JetBrains lanes need) are on PATH and that apt is pointed
+# at the fixed snapshot only. This is the required CI pre-step's check.
+#
+# Exit codes: 0 built (or selftest/verify-runtime passed); 2 usage error;
+# other = docker failure or verification failure.
 set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -34,6 +47,8 @@ TAG="${FAKTOR_CI_IMAGE_TAG:-faktor-ci}"
 REGISTRY="${FAKTOR_CI_IMAGE_REGISTRY:-}"
 PUSH=0
 SELFTEST=0
+VERIFY_RUNTIME=0
+RECORD_DIGEST=""
 
 usage() {
     sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -61,6 +76,15 @@ while [ "$#" -gt 0 ]; do
         PUSH=1
         shift
         ;;
+    --record-digest)
+        [ "$#" -ge 2 ] || { echo "build-ci-image: --record-digest needs a file" >&2; exit 2; }
+        RECORD_DIGEST="$2"
+        shift 2
+        ;;
+    --verify-runtime)
+        VERIFY_RUNTIME=1
+        shift
+        ;;
     --selftest)
         SELFTEST=1
         shift
@@ -75,6 +99,59 @@ while [ "$#" -gt 0 ]; do
         ;;
     esac
 done
+
+# Runs inside a built Faktor CI image: re-verify every exact pkg=version pin
+# from the Dockerfile against the running image, the pinned tool set and the
+# snapshot-only apt sources. Any drift means the image is not the pinned CI
+# image and the CI pre-step fails closed.
+verify_runtime() {
+    rc=0
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    if [ "$os" != "Linux" ]; then
+        echo "build-ci-image verify-runtime: FAIL: expected Linux, running on $os" >&2
+        rc=1
+    fi
+    if [ "$arch" != "x86_64" ]; then
+        echo "build-ci-image verify-runtime: FAIL: expected linux/amd64 (x86_64), running on $arch" >&2
+        rc=1
+    fi
+    for tool in cc gcc make pkg-config python3 ps kotlinc java javac git curl unzip; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            echo "build-ci-image verify-runtime: FAIL: required tool '$tool' is not on PATH" >&2
+            rc=1
+        }
+    done
+    specs="$(grep -oE '[a-z0-9][a-z0-9+.-]*=[0-9][^ \;]*' "$DOCKERFILE" | sort -u || true)"
+    if [ -z "$specs" ]; then
+        echo "build-ci-image verify-runtime: FAIL: no exact pkg=version pins found in $DOCKERFILE" >&2
+        rc=1
+    fi
+    for spec in $specs; do
+        pkg="${spec%%=*}"
+        want="${spec#*=}"
+        got="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+        if [ "$got" != "$want" ]; then
+            echo "build-ci-image verify-runtime: FAIL: version drift: $pkg = ${got:-missing} (want $want)" >&2
+            rc=1
+        fi
+    done
+    if [ "$rc" -eq 0 ]; then
+        echo "build-ci-image verify-runtime: every pinned package/tool matches docker/faktor-ci/Dockerfile"
+    fi
+    if [ -f /etc/apt/sources.list.d/faktor-snapshot.list ] && grep -q 'snapshot.ubuntu.com/ubuntu/' /etc/apt/sources.list.d/faktor-snapshot.list; then
+        echo "build-ci-image verify-runtime: apt sources are the fixed Ubuntu snapshot"
+    else
+        echo "build-ci-image verify-runtime: FAIL: snapshot-only apt sources missing" >&2
+        rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+        echo "build-ci-image verify-runtime: PASS"
+    else
+        echo "build-ci-image verify-runtime: FAIL" >&2
+    fi
+    return "$rc"
+}
 
 selftest() {
     rc=0
@@ -116,6 +193,11 @@ selftest() {
     fi
     return "$rc"
 }
+
+if [ "$VERIFY_RUNTIME" -eq 1 ]; then
+    verify_runtime
+    exit $?
+fi
 
 if [ "$SELFTEST" -eq 1 ]; then
     selftest
@@ -167,7 +249,18 @@ fi
 
 echo "build-ci-image: image digest: $IMAGE@$DIGEST"
 if [ "$PUSH" -eq 1 ]; then
-    echo "build-ci-image: pushed; reference .woodpecker steps as image: $IMAGE@$DIGEST with '# apt-pinned: $IMAGE@$DIGEST'"
+    echo "build-ci-image: pushed; reference .woodpecker steps as image: <registry>/faktor-ci@$DIGEST WITHOUT 'pull: false' so agents pull the published digest, and re-record docker/faktor-ci/image-digest.txt"
 else
-    echo "build-ci-image: local-only digest (not pullable by CI agents); set FAKTOR_CI_IMAGE_REGISTRY (or --registry) to publish, then switch the lanes to image@sha256:<digest>"
+    echo "build-ci-image: local-only digest (not pullable by CI agents); reference the lanes as image: faktor-ci@$DIGEST with pull: false so the required ci-image pre-step fails closed when the image was not produced locally; set FAKTOR_CI_IMAGE_REGISTRY (or --registry) to publish a pullable image instead"
+fi
+
+if [ -n "$RECORD_DIGEST" ]; then
+    {
+        printf '%s\n' "# Faktor CI image digest record (linux/amd64)."
+        printf '%s\n' "# Built from docker/faktor-ci/Dockerfile by scripts/build-ci-image.sh;"
+        printf '%s\n' "# read by scripts/check-ci-image-pins.sh and the trusted attestation step"
+        printf '%s\n' "# (build_environment_digest). Rebuild + re-record deliberately; do not hand-edit."
+        printf '%s\n' "$DIGEST"
+    } >"$RECORD_DIGEST"
+    echo "build-ci-image: recorded digest in $RECORD_DIGEST"
 fi

@@ -1,0 +1,11 @@
+# Planted violation: this fixture lives under a `trusted/` path segment, so
+# the step is a certified (trusted) lane. `apt-residual:` is rejected there
+# even with a justification — trusted lanes must run the digest-pinned Faktor
+# CI image instead. `scripts/check-ci-image-pins.sh --dir` must reject this
+# file.
+steps:
+  - name: linux
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ fixture
+    commands:
+      # apt-residual: legacy escape (fixture; trusted lane, must not be accepted)
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates

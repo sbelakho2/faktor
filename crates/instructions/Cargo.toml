@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+faktor-core.workspace = true
+faktor-fs.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 blake3.workspace = true

@@ -1,26 +1,52 @@
 #!/usr/bin/env bash
-# Release certification (P0-97 / P0-74 / P0-100; P1-I/P1-J/P1-K hardened).
+# Release certification (P0-97 / P0-74 / P0-100; P1-I/P1-J/P1-K hardened;
+# P1 release-certificate completeness).
 #
 # The gate a release candidate must pass BEFORE shipping:
-#   1. the full cargo gates exactly as CI runs them (fmt/check/clippy/tests);
+#   1. the canonical cargo gate list exactly as CI runs it (fmt/check/clippy/
+#      tests, all with --all-features where CI uses it) — the list is defined
+#      ONCE in `canonical_gate_commands()` and `--check-gate-parity` proves the
+#      `.woodpecker` linux lanes still match it;
 #   2. `doctor --deep` on a FRESH data dir — every audit invariant (store,
 #      CAS, journal, cost reservations, verification records, active-turn
 #      recoverable owners, orphan children, process ownership) must pass and
 #      print zero FAIL sections;
-#   3. the fault campaign — the #[ignore]-gated `[fault]` tests, when the
-#      faktor-tests-fault crate is present in this workspace (sibling wave);
+#   3. the fault campaign — the #[ignore]-gated `[fault]` tests of the
+#      `faktor-tests-fault` crate. Release class REQUIRES the crate and at
+#      least one executed `[fault]` test; the certificate records the
+#      executed count and the sha256 digest of the executed test identities.
+#      Without `--release` a missing crate/zero tests is recorded as an
+#      informational skip and can only ever yield SOURCE CERTIFICATE;
 #   4. `doctor --deep` again on a SECOND fresh data dir AFTER the campaign:
 #      the corruption the campaign proves contained must not leak into a
 #      fresh release image (P0-97 release certification);
-#   5. a printed certificate summary.
+#   5. the declared ReleaseArtifactSet: the required kinds (daemon binary,
+#      VS Code VSIX, JetBrains plugin zip) must ALL be present locally,
+#      brand-scanned where applicable, and covered digest-for-digest by the
+#      verified signed attestation. `collect_artifacts()` returning an empty
+#      list can never satisfy this;
+#   6. a printed certificate summary.
 #
-# Gate 8 (additive, P0-70): the byte-level artifact branding scan
-# (scripts/branding-scan.sh --artifacts) over PACKAGED application outputs
-# (.vsix / plugin jars) when this workspace produced them. A bounded scan
-# of packaged outputs only — target/release binary strings are deliberately
-# not swept here (slow, and cargo test/debug outputs embed frozen fixture
-# text); when no packaged output exists the gate is recorded as skipped,
-# never silently dropped.
+# Certificate classes (P1 completeness):
+#   * `RELEASE CERTIFICATE: PASS` — requires every release precondition
+#     (canonical local gates, CI evidence release-class, complete + attested
+#     ReleaseArtifactSet with branding pass, fault campaign pass with
+#     executed>0). `--release` makes every precondition mandatory: unmet
+#     preconditions are a FAIL, never a downgrade.
+#   * `SOURCE CERTIFICATE: PASS — NOT A RELEASE CERTIFICATE` — a passing run
+#     without the release preconditions (e.g. source-only checkout, missing
+#     packaged outputs, fault crate absent). It can never print the release
+#     class.
+#   * `CI EVIDENCE` / `LOCAL PRE-FLIGHT` — never release certificates.
+#
+# Gate 8 (additive, P0-70; P1 completeness): the byte-level artifact
+# branding scan (scripts/branding-scan.sh --artifacts) over the directories
+# of REQUIRED packaged outputs (.vsix / plugin zip). A bounded scan of
+# packaged outputs only — the daemon binary is a documented exemption
+# (target/release binary strings are slow to sweep and cargo test/debug
+# outputs embed frozen fixture text). When the ReleaseArtifactSet is not
+# complete the scan is recorded as not-applicable and release class is
+# impossible — a skip can never satisfy the release precondition.
 #
 # Gate 9 (additive, Phase E item 14; P1-I/P1-J/P1-K hardened): REAL CI
 # certification for the EXACT commit being shipped. Local green gates are
@@ -48,10 +74,16 @@
 #     with the typed `signing-key-missing` error and writes no attestation,
 #     so an unsigned object can only arrive from foreign/legacy tooling.
 #     This script FETCHES the attestation belonging to the exact trusted
-#     pipeline, verifies the ed25519 signature against the operator allowlist
-#     (FAKTOR_ATTEST_KEYS / --attestation-keys), verifies source SHA, tree,
-#     workflow, event, pipeline number/id, and re-hashes EVERY local/shipped
-#     artifact against the attested digests. Any mismatch is a failure.
+#     pipeline, verifies the ed25519 signature with the ALLOWLISTED key (the
+#     embedded public key must equal it), verifies repository full name,
+#     source SHA, tree, workflow, event, pipeline number and the OBSERVED
+#     pipeline id (no number/id substitution exemption), and re-hashes EVERY
+#     local/shipped artifact against the attested digests. Any mismatch is a
+#     failure. With an untrusted selected context, the trusted project id
+#     (WOODPECKER_TRUSTED_REPO_ID or a `?project=trusted` lookup answer) is
+#     only a claim: the project record is re-fetched and its observed
+#     full_name/config_file/trusted.volumes must match before its pipelines
+#     are scanned.
 #     Distributing the CI-built artifacts (the attested bytes) rather than
 #     locally rebuilt ones is the preferred release model. The documented
 #     alternative to the ed25519 allowlist is Sigstore/keyless verification
@@ -66,11 +98,13 @@
 #     weakens checks while preserving the certificate class.
 #
 # Usage:
-#   bash scripts/certify.sh                       # local gates + required CI evidence
+#   bash scripts/certify.sh                       # local gates + required CI evidence (auto class)
 #   bash scripts/certify.sh --commit <sha>        # certify an exact shipped SHA
 #   bash scripts/certify.sh --context <registry>  # select a registered context
+#   bash scripts/certify.sh --release             # release class is MANDATORY (unmet precondition = FAIL)
 #   bash scripts/certify.sh --local-only          # local gates only (NOT a release certificate)
 #   bash scripts/certify.sh --verify-ci-evidence  # CI evidence only (NOT a release certificate)
+#   bash scripts/certify.sh --check-gate-parity   # canonical gate list vs CI lanes (drift check)
 #   bash scripts/certify.sh --selftest            # hermetic mock-API rejection matrix
 #
 # Env: WOODPECKER_HOST, WOODPECKER_TOKEN (required unless --local-only/
@@ -79,7 +113,16 @@
 # WOODPECKER_REPO_ID); CERTIFY_CI_CONTEXT (default ci/woodpecker/pr/pr);
 # FAKTOR_ATTEST_KEYS / --attestation-keys (ed25519 allowlist JSON; required
 # to verify signed attestations); --artifact PATH (repeatable; packaged
-# outputs auto-discovered when omitted).
+# outputs auto-discovered when omitted); CERTIFY_ARTIFACT_ROOT (discovery
+# root for the ReleaseArtifactSet); CERTIFY_RELEASE=1 is the env form of
+# --release.
+#
+# Release preconditions (all mandatory for RELEASE CERTIFICATE: PASS):
+#   * required_artifacts > 0 and matched == required and attested == required
+#     (every required local artifact digest-covered by the signed attestation);
+#   * every required packaged artifact passed the branding/scanner gate;
+#   * the fault campaign ran and executed > 0 `[fault]` tests without failure.
+# Any missing precondition yields SOURCE CERTIFICATE (or FAIL under --release).
 #
 # Exits non-zero on the first failing gate (exit 2 = operator/setup error:
 # missing credentials, unknown ref, rejected token). Safe to run from any
@@ -132,6 +175,76 @@ context_registry_list() {
     printf '%s\n' ci/woodpecker/pr/pr ci/woodpecker/push/trusted ci/woodpecker/tag/trusted
 }
 
+# ------------------------------------------------------- canonical gates --
+# P1 gate parity: the canonical cargo gate list is defined EXACTLY ONCE here.
+# `run_local_gates` consumes it, and `--check-gate-parity` (also exercised by
+# --selftest against fixtures and the real .woodpecker files) proves the CI
+# linux lanes still run the same commands. A local/CI drift is a failure: a
+# green local pre-flight must mean the same thing as a green CI lane.
+canonical_gate_commands() {
+    printf '%s\n' \
+        'cargo fmt --check' \
+        'cargo check --workspace --all-features' \
+        'cargo clippy --workspace --all-targets --all-features -- -D warnings' \
+        'cargo test --workspace --all-features'
+}
+
+run_canonical_gates() { # runs the canonical list; 0 all pass, 1 any fail
+    local cmd rc=0
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] || continue
+        local -a argv=()
+        read -r -a argv <<<"$cmd"
+        step "local gate: $cmd"
+        if "${argv[@]}"; then
+            ok "$cmd"
+        else
+            bad "$cmd"
+            rc=1
+        fi
+    done < <(canonical_gate_commands)
+    return "$rc"
+}
+
+extract_ci_gate_commands() { # workflow_yaml lane -> unique cargo gate commands
+    awk -v lane="$2" '
+        /^  - name: / { in_lane = ($3 == lane); next }
+        in_lane && /^      - cargo (fmt|check|clippy|test)( |$)/ { sub(/^      - /, ""); print }
+    ' "$1" 2>/dev/null | sed 's/[[:space:]]*$//' | sort -u
+}
+
+check_gate_parity() { # canonical_file ci_yaml...
+    local canonical="$1"
+    shift
+    local local_list ci_list ci_file rc=0
+    local_list="$(grep -v '^[[:space:]]*$' "$canonical" | sed 's/[[:space:]]*$//' | sort -u)"
+    if [ -z "$local_list" ]; then
+        bad "gate parity: canonical gate list '$canonical' is empty"
+        return 1
+    fi
+    for ci_file in "$@"; do
+        if [ ! -f "$ci_file" ]; then
+            bad "gate parity: CI workflow '$ci_file' is missing"
+            rc=1
+            continue
+        fi
+        ci_list="$(extract_ci_gate_commands "$ci_file" linux)"
+        if [ -z "$ci_list" ]; then
+            bad "gate parity: $ci_file has no cargo gate commands in the linux lane"
+            rc=1
+            continue
+        fi
+        if [ "$ci_list" = "$local_list" ]; then
+            ok "gate parity: $ci_file linux lane matches the canonical gate list"
+        else
+            bad "gate parity: $ci_file linux lane DIVERGES from the canonical gate list"
+            diff <(printf '%s\n' "$local_list") <(printf '%s\n' "$ci_list") || true
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 # ---------------------------------------------------------------- arguments --
 COMMIT=""
 CONTEXT="${CERTIFY_CI_CONTEXT:-ci/woodpecker/pr/pr}"
@@ -139,6 +252,13 @@ MANIFEST_OUT="target/certification/release-manifest.json"
 LOCAL_ONLY=0
 VERIFY_CI=0
 SELFTEST=0
+GATE_PARITY=0
+GATE_PARITY_CANONICAL=""
+GATE_PARITY_CI=()
+RELEASE_REQUIRED=0
+if [ "${CERTIFY_RELEASE:-0}" = "1" ]; then
+    RELEASE_REQUIRED=1
+fi
 PIPELINE=""
 REPO_FULL_NAME="${CERTIFY_REPO:-${WOODPECKER_REPO:-}}"
 ARTIFACTS=()
@@ -165,6 +285,24 @@ while [ "$#" -gt 0 ]; do
     --selftest)
         SELFTEST=1
         shift
+        ;;
+    --release)
+        RELEASE_REQUIRED=1
+        shift
+        ;;
+    --check-gate-parity)
+        GATE_PARITY=1
+        shift
+        ;;
+    --gate-parity-canonical)
+        [ "$#" -ge 2 ] || { echo "certify: --gate-parity-canonical needs a file" >&2; exit 2; }
+        GATE_PARITY_CANONICAL="$2"
+        shift 2
+        ;;
+    --gate-parity-ci)
+        [ "$#" -ge 2 ] || { echo "certify: --gate-parity-ci needs a workflow file" >&2; exit 2; }
+        GATE_PARITY_CI+=("$2")
+        shift 2
         ;;
     --commit)
         [ "$#" -ge 2 ] || { echo "certify: --commit needs a value" >&2; exit 2; }
@@ -213,7 +351,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 # The context is validated against the registry before anything else runs.
-if [ "$SELFTEST" -eq 0 ]; then
+# Gate-parity and selftest modes are pure offline checks and skip it.
+if [ "$SELFTEST" -eq 0 ] && [ "$GATE_PARITY" -eq 0 ]; then
     if ! context_registry_entry "$CONTEXT" >/dev/null; then
         printf 'certify: context %s is not registered; the immutable registry has:\n' "$CONTEXT" >&2
         context_registry_list | sed 's/^/  /' >&2
@@ -223,6 +362,37 @@ fi
 if [ -n "$ATT_KEYS" ] && [ ! -f "$ATT_KEYS" ]; then
     echo "certify: attestation key allowlist '$ATT_KEYS' does not exist" >&2
     exit 2
+fi
+if [ "$RELEASE_REQUIRED" -eq 1 ] && { [ "$LOCAL_ONLY" -eq 1 ] || [ "$VERIFY_CI" -eq 1 ]; }; then
+    echo "certify: --release requires the full local + CI path; it cannot be combined with --local-only/--verify-ci-evidence" >&2
+    exit 2
+fi
+
+# P1 gate parity: standalone drift check, no cargo/network required.
+if [ "$GATE_PARITY" -eq 1 ]; then
+    step "gate parity: canonical local gate list vs CI linux lanes"
+    parity_canonical="$GATE_PARITY_CANONICAL"
+    parity_tmp=""
+    if [ -z "$parity_canonical" ]; then
+        parity_tmp="$(mktemp "${TMPDIR:-/tmp}/faktor-cert-gates.XXXXXX")"
+        canonical_gate_commands >"$parity_tmp"
+        parity_canonical="$parity_tmp"
+    fi
+    parity_files=()
+    for f in ${GATE_PARITY_CI[@]+"${GATE_PARITY_CI[@]}"}; do
+        parity_files+=("$f")
+    done
+    if [ "${#parity_files[@]}" -eq 0 ]; then
+        parity_files=(.woodpecker/trusted/trusted.yaml .woodpecker/untrusted/pr.yaml)
+    fi
+    if check_gate_parity "$parity_canonical" "${parity_files[@]}"; then
+        [ -n "$parity_tmp" ] && rm -f "$parity_tmp"
+        printf '\nGATE PARITY: PASS\n'
+        exit 0
+    fi
+    [ -n "$parity_tmp" ] && rm -f "$parity_tmp"
+    printf '\nGATE PARITY: FAIL (local and CI gate lists diverged)\n' >&2
+    exit 1
 fi
 
 operator_error() {
@@ -242,7 +412,17 @@ if [ "$SELFTEST" -eq 0 ] && [ "$LOCAL_ONLY" -eq 0 ]; then
     [ -n "${WOODPECKER_TOKEN:-}" ] || operator_error "WOODPECKER_TOKEN is not set"
 fi
 
-gates=("fmt --check" "cargo check --workspace" "clippy -D warnings" "cargo test --workspace" "doctor --deep (fresh dir)" "fault campaign [fault]" "doctor --deep (post-campaign)" "artifact branding scan (packaged outputs)")
+gates=()
+
+build_gate_summary() {
+    gates=()
+    local cmd
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] && gates+=("$cmd")
+    done < <(canonical_gate_commands)
+    gates+=("doctor --deep (fresh dir)" "fault campaign [fault] (count+digest)" "doctor --deep (post-campaign)" "ReleaseArtifactSet complete + attested" "artifact branding scan (required outputs)" "gate parity (canonical vs CI)")
+}
+build_gate_summary
 
 run_doctor_deep() {
     local dir label rc out
@@ -266,48 +446,238 @@ run_doctor_deep() {
     return 0
 }
 
+# --------------------------------------------------- fault campaign gate --
+# P1 release-certificate completeness: a release certificate REQUIRES the
+# fault campaign — the `faktor-tests-fault` crate must exist, at least one
+# `[fault]` test must actually execute, and none may fail. The certificate
+# records the executed count and the sha256 digest of the executed test
+# identities. In non-release runs absence/zero is an informational skip that
+# can only ever yield SOURCE CERTIFICATE, never a release PASS.
+FAULT_STATUS="not-run"
+FAULT_COUNT=0
+FAULT_DIGEST=""
+FAULT_RECORD="${CERTIFY_FAULT_RECORD:-target/certification/fault-tests.txt}"
+
+fault_crate_present() {
+    cargo metadata --no-deps --format-version 1 2>/dev/null \
+        | grep -q '"name":"faktor-tests-fault"'
+}
+
+fault_record() { # status executed names_file
+    FAULT_STATUS="$1"
+    FAULT_COUNT="$2"
+    local names_file="${3:-}"
+    if [ -n "$names_file" ] && [ -s "$names_file" ]; then
+        mkdir -p "$(dirname "$FAULT_RECORD")" 2>/dev/null || true
+        sort -u "$names_file" >"$FAULT_RECORD" 2>/dev/null || true
+        if [ -s "$FAULT_RECORD" ]; then
+            FAULT_DIGEST="sha256:$(hash_file "$FAULT_RECORD")"
+        else
+            FAULT_DIGEST=""
+        fi
+    else
+        : >"$FAULT_RECORD" 2>/dev/null || true
+        FAULT_DIGEST=""
+    fi
+}
+
+fault_release_gate() {
+    [ "$FAULT_STATUS" = "pass" ] && [ "$FAULT_COUNT" -gt 0 ]
+}
+
 fault_campaign() {
-    # The [fault] ignored suite lives in the faktor-tests-fault crate of the
-    # fault-containment sibling wave; until it lands in this workspace the
-    # gate is skipped (recorded in the certificate, not silently dropped).
-    if ! cargo metadata --no-deps --format-version 1 2>/dev/null \
-        | grep -q '"name":"faktor-tests-fault"'; then
-        ok "fault campaign skipped: no faktor-tests-fault crate in this workspace"
+    local fault_tmp names_file log_file list_rc executed failed count
+    if ! fault_crate_present; then
+        fault_record "crate-absent" 0 ""
+        if [ "$RELEASE_REQUIRED" -eq 1 ]; then
+            bad "release class REQUIRES the fault campaign but faktor-tests-fault is absent from this workspace"
+            return 1
+        fi
+        ok "fault campaign informational skip: no faktor-tests-fault crate; release class impossible"
         return 0
     fi
-    if ! cargo test -p faktor-tests-fault -- --ignored > /tmp/faktor-ci-fault.log 2>&1; then
-        bad "fault campaign failed (log tail):"
-        tail -n 50 /tmp/faktor-ci-fault.log
+    fault_tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-cert-fault.XXXXXX")"
+    names_file="$fault_tmp/fault-tests.txt"
+    log_file="$fault_tmp/fault-run.log"
+    cargo test -p faktor-tests-fault -- --ignored --list >"$names_file" 2>&1
+    list_rc=$?
+    if [ "$list_rc" -ne 0 ] && ! grep -qE ': test$' "$names_file" 2>/dev/null; then
+        rm -rf "$fault_tmp"
+        fault_record "list-failed" 0 ""
+        bad "fault campaign could not enumerate its ignored tests (exit $list_rc)"
         return 1
     fi
-    ok "fault campaign passed ([fault] ignored tests)"
+    grep -E ': test$' "$names_file" 2>/dev/null | sed 's/: test$//' | sort -u >"$fault_tmp/names.txt" || true
+    mv "$fault_tmp/names.txt" "$names_file"
+    count="$(wc -l <"$names_file" | tr -d ' ')"
+    if [ "${count:-0}" -eq 0 ]; then
+        rm -rf "$fault_tmp"
+        fault_record "zero" 0 ""
+        if [ "$RELEASE_REQUIRED" -eq 1 ]; then
+            bad "release class REQUIRES the fault campaign but zero [fault] tests were enumerated"
+            return 1
+        fi
+        printf '   note: fault campaign enumerated zero [fault] tests; release class impossible\n'
+        return 0
+    fi
+    if ! cargo test -p faktor-tests-fault -- --ignored --test-threads=1 >"$log_file" 2>&1; then
+        bad "fault campaign failed (log tail):"
+        tail -n 50 "$log_file"
+        rm -rf "$fault_tmp"
+        fault_record "fail" 0 ""
+        return 1
+    fi
+    executed="$(grep -cE '^test .+ \.\.\. ok$' "$log_file" || true)"
+    failed="$(grep -cE '^test .+ \.\.\. FAILED$' "$log_file" || true)"
+    if [ "${failed:-0}" -gt 0 ]; then
+        bad "fault campaign reported $failed failed test(s) (log tail):"
+        tail -n 50 "$log_file"
+        rm -rf "$fault_tmp"
+        fault_record "fail" 0 ""
+        return 1
+    fi
+    [ "${executed:-0}" -gt 0 ] || executed="$count"
+    grep -E '^test .+ \.\.\. ok$' "$log_file" 2>/dev/null | sed -E 's/^test (.*) \.\.\. ok$/\1/' | sort -u >"$fault_tmp/executed.txt" || true
+    [ -s "$fault_tmp/executed.txt" ] || cp "$names_file" "$fault_tmp/executed.txt"
+    fault_record "pass" "$executed" "$fault_tmp/executed.txt"
+    rm -rf "$fault_tmp"
+    ok "fault campaign passed ([fault] tests executed=$executed digest=$FAULT_DIGEST)"
     return 0
 }
 
-artifact_scan() {
-    # Packaged application outputs only (.vsix, plugin jars) — scan the
-    # app tree that produced one; skip gracefully (recorded, not silent)
-    # when this workspace built none. source-mode content under those trees
-    # is already scan-clean, so the byte-level pass is bounded.
-    local pass=1 scanned=0 d found
-    for d in apps/vscode apps/jetbrains; do
-        [ -d "$d" ] || continue
-        found="$(find "$d" -type f \( -name '*.vsix' -o -name '*.jar' \) -print -quit 2>/dev/null)"
-        if [ -n "$found" ]; then
-            scanned=1
-            if bash scripts/branding-scan.sh --artifacts "$d"; then
-                ok "artifact scan clean: $d"
-            else
-                bad "artifact scan failed: $d"
-                pass=0
-            fi
+# ------------------------------------------------- ReleaseArtifactSet --
+# P1 release-certificate completeness: `collect_artifacts()` may legally
+# return an empty TSV, so a release-class certificate requires a DECLARED
+# expected set instead. Every kind below is mandatory; release PASS needs
+# matched == required, required > 0, digest coverage by the signed
+# attestation for every required artifact, and a clean branding scan where
+# the scanner applies.
+RELEASE_ARTIFACT_KINDS=(faktor-cli vscode-vsix jetbrains-plugin)
+
+release_artifact_kind() { # path -> kind ('' = not a required-set member)
+    case "$1" in
+    */faktor-cli | faktor-cli) printf 'faktor-cli' ;;
+    *.vsix) printf 'vscode-vsix' ;;
+    *jetbrains*.zip | */build/distributions/*.zip) printf 'jetbrains-plugin' ;;
+    *) printf '' ;;
+    esac
+}
+
+release_kind_index() { # kind -> index (rc 1 = unknown kind)
+    local k i=0
+    for k in ${RELEASE_ARTIFACT_KINDS[@]+"${RELEASE_ARTIFACT_KINDS[@]}"}; do
+        if [ "$k" = "$1" ]; then
+            printf '%s' "$i"
+            return 0
         fi
+        i=$((i + 1))
     done
-    if [ "$scanned" -eq 0 ]; then
-        ok "artifact scan skipped: no packaged .vsix/.jar outputs present in apps/"
+    return 1
+}
+
+RA_STATUS="not-run"
+RA_REQUIRED=0
+RA_MATCHED=0
+RA_ATTESTED=0
+RA_BRANDING="not-run"
+RA_MISSING=""
+RA_REQUIRED_TSV=""
+ARTIFACTS_TSV=""
+ARTIFACT_TMP=""
+
+evaluate_release_artifact_set() { # artifacts_tsv -> RA_* globals
+    local tsv="$1" kind i sha path
+    RA_REQUIRED_TSV="${tsv%.tsv}.required.tsv"
+    RA_REQUIRED="${#RELEASE_ARTIFACT_KINDS[@]}"
+    RA_MATCHED=0
+    RA_ATTESTED=0
+    RA_MISSING=""
+    local counts=() paths=() digests=()
+    i=0
+    while [ "$i" -lt "$RA_REQUIRED" ]; do
+        counts[$i]=0
+        paths[$i]=""
+        digests[$i]=""
+        i=$((i + 1))
+    done
+    local ambiguous=0
+    while IFS="$(printf '\t')" read -r sha path; do
+        [ -n "$path" ] || continue
+        kind="$(release_artifact_kind "$path")"
+        [ -n "$kind" ] || continue
+        i="$(release_kind_index "$kind")"
+        counts[$i]=$(( ${counts[$i]} + 1 ))
+        paths[$i]="$path"
+        digests[$i]="$sha"
+    done <"$tsv"
+    : >"$RA_REQUIRED_TSV"
+    i=0
+    while [ "$i" -lt "$RA_REQUIRED" ]; do
+        kind="${RELEASE_ARTIFACT_KINDS[$i]}"
+        case "${counts[$i]}" in
+        1)
+            RA_MATCHED=$((RA_MATCHED + 1))
+            printf '%s\t%s\t%s\n' "$kind" "${digests[$i]}" "${paths[$i]}" >>"$RA_REQUIRED_TSV"
+            ;;
+        0)
+            RA_MISSING="${RA_MISSING}${RA_MISSING:+,}$kind"
+            ;;
+        *)
+            RA_MISSING="${RA_MISSING}${RA_MISSING:+,}${kind}(duplicate)"
+            ambiguous=1
+            ;;
+        esac
+        i=$((i + 1))
+    done
+    if [ "$ambiguous" -eq 1 ]; then
+        RA_STATUS="ambiguous"
+    elif [ "$RA_MATCHED" -eq 0 ]; then
+        RA_STATUS="empty"
+    elif [ "$RA_MATCHED" -lt "$RA_REQUIRED" ]; then
+        RA_STATUS="partial"
+    else
+        RA_STATUS="complete"
+    fi
+    return 0
+}
+
+release_branding_scan() {
+    # Brand every REQUIRED packaged output. The daemon binary is the
+    # documented exemption (binary strings are not swept; see the header).
+    if [ "$RA_STATUS" != "complete" ]; then
+        RA_BRANDING="not-applicable"
+        ok "release artifact branding: not applicable (artifact set: $RA_STATUS ${RA_MATCHED}/${RA_REQUIRED})"
         return 0
     fi
-    return $((1 - pass))
+    local kind sha path dir d dirs=() seen=0
+    while IFS="$(printf '\t')" read -r kind sha path; do
+        [ -n "$kind" ] || continue
+        case "$kind" in
+        faktor-cli) continue ;;
+        esac
+        dir="$(dirname "$path")"
+        seen=0
+        for d in ${dirs[@]+"${dirs[@]}"}; do
+            [ "$d" = "$dir" ] && seen=1
+        done
+        [ "$seen" -eq 1 ] || dirs+=("$dir")
+    done <"$RA_REQUIRED_TSV"
+    if [ "${#dirs[@]}" -eq 0 ]; then
+        RA_BRANDING="pass"
+        ok "release artifact branding: only scanner-exempt artifacts in the required set"
+        return 0
+    fi
+    for d in "${dirs[@]}"; do
+        if bash scripts/branding-scan.sh --artifacts "$d"; then
+            ok "release artifact branding clean: $d"
+        else
+            RA_BRANDING="fail"
+            bad "release artifact branding FAILED: $d"
+            return 1
+        fi
+    done
+    RA_BRANDING="pass"
+    return 0
 }
 
 # ===================================================== exact-SHA CI gate =
@@ -477,14 +847,23 @@ collect_artifacts() { # out_tsv -> 0 ok, 2 operator error
     if [ "${#ARTIFACTS[@]}" -gt 0 ]; then
         paths=("${ARTIFACTS[@]}")
     else
+        # Discovery root: workspace-relative by default; CERTIFY_ARTIFACT_ROOT
+        # lets selftests point discovery at a hermetic fixture tree.
+        local art_root="${CERTIFY_ARTIFACT_ROOT:-}"
         while IFS= read -r p; do
             [ -n "$p" ] || continue
             paths+=("$p")
         done < <(
             {
-                ls apps/vscode/*.vsix 2>/dev/null
-                find apps/jetbrains -type f -path '*/build/distributions/*.zip' 2>/dev/null
-                [ -f target/release/faktor-cli ] && printf '%s\n' target/release/faktor-cli
+                if [ -n "$art_root" ]; then
+                    ls "$art_root"/apps/vscode/*.vsix 2>/dev/null
+                    find "$art_root/apps/jetbrains" -type f -path '*/build/distributions/*.zip' 2>/dev/null
+                    [ -f "$art_root/target/release/faktor-cli" ] && printf '%s\n' "$art_root/target/release/faktor-cli"
+                else
+                    ls apps/vscode/*.vsix 2>/dev/null
+                    find apps/jetbrains -type f -path '*/build/distributions/*.zip' 2>/dev/null
+                    [ -f target/release/faktor-cli ] && printf '%s\n' target/release/faktor-cli
+                fi
             } | sort -u
         )
     fi
@@ -500,6 +879,18 @@ collect_artifacts() { # out_tsv -> 0 ok, 2 operator error
         }
         printf 'sha256:%s\t%s\n' "$h" "$p" >>"$out"
     done
+    return 0
+}
+
+prepare_artifacts() { # [out_tsv] -> collects + evaluates the ReleaseArtifactSet
+    local out="${1:-}"
+    if [ -z "$out" ]; then
+        [ -n "$ARTIFACT_TMP" ] || ARTIFACT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/faktor-cert-artifacts.XXXXXX")"
+        out="$ARTIFACT_TMP/artifacts.tsv"
+    fi
+    collect_artifacts "$out" || return 2
+    ARTIFACTS_TSV="$out"
+    evaluate_release_artifact_set "$out"
     return 0
 }
 
@@ -555,6 +946,7 @@ probe_attestation() { # api repo_id number detail event workflow commit tree art
         args+=(--artifact "$art_path")
     done <"$artifacts_tsv"
     out="$(node "$ATTESTATION_JS" verify --attestation "$att_file" \
+        --repo "$REPO_FULL_NAME" \
         --source-sha "$commit" --tree-sha "$tree" --workflow "$workflow" --event "$event" \
         --pipeline-number "$number" --pipeline-id "$pipeline_id" \
         --require-signed --keys "$ATT_KEYS" ${args[@]+"${args[@]}"} 2>&1)"
@@ -575,23 +967,60 @@ probe_attestation() { # api repo_id number detail event workflow commit tree art
     ATT_PIPELINE_ID="$pipeline_id"
     ATT_MATCHED="$(printf '%s\n' "$out" | sed -n 's/.*artifacts-matched=\([0-9][0-9]*\).*/\1/p' | head -n1)"
     [ -n "$ATT_MATCHED" ] || ATT_MATCHED="0"
+    # P1 completeness: every REQUIRED artifact must appear in this signed
+    # attestation with a matching digest. This is computed from the decoded
+    # attestation itself, so an empty local artifact list can never pass.
+    RA_ATTESTED="0"
+    if [ -n "$RA_REQUIRED_TSV" ] && [ -f "$RA_REQUIRED_TSV" ]; then
+        RA_ATTESTED="$(python3 - "$att_file" "$RA_REQUIRED_TSV" <<'PY'
+import json
+import os
+import sys
+
+try:
+    artifacts = json.load(open(sys.argv[1])).get("artifacts") or {}
+except Exception:
+    artifacts = {}
+if not isinstance(artifacts, dict):
+    artifacts = {}
+count = 0
+try:
+    lines = open(sys.argv[2]).read().splitlines()
+except Exception:
+    lines = []
+for line in lines:
+    parts = line.split("\t")
+    if len(parts) != 3:
+        continue
+    _kind, sha, path = parts
+    if artifacts.get(os.path.basename(path)) == sha:
+        count += 1
+print(count)
+PY
+)"
+    fi
+    [ -n "$RA_ATTESTED" ] || RA_ATTESTED="0"
     return 0
 }
 
 # Find a trusted pipeline at the exact SHA that published an attestation and
 # verify it (used when the selected context itself is untrusted, so a signed
-# attestation is what upgrades the run to release class). Returns 0 verified,
-# 1 fetched-but-invalid, 3 absent.
+# attestation is what upgrades the run to release class). A supplied
+# WOODPECKER_TRUSTED_REPO_ID or a `?project=trusted` lookup answer is only a
+# CLAIM: the project record is re-fetched and its observed identity, config
+# file and trusted class must match before any pipeline is read from it.
+# Returns 0 verified, 1 fetched-but-invalid, 3 absent.
 find_trusted_attestation() { # api commit tree artifacts_tsv problems notes tmp
     local api="$1" commit="$2" tree="$3" artifacts_tsv="$4" problems="$5" notes="$6" tmp="$7"
-    local tctx tspec tevent twf trepo_id tbody tcand tnumber tid tdetail tcommit tevent_obs code prc
-    local number id status cand_commit cand_event
+    local tctx tspec tevent twf tconfig trepo_id tbody tcand tnumber tid tdetail tcommit tevent_obs code prc
+    local number id status cand_commit cand_event trepo_file trepo_full trepo_config trepo_trusted tobs_id
     for tctx in $(context_registry_list); do
         [ "$tctx" = "$CONTEXT" ] && continue
         tspec="$(context_registry_entry "$tctx")" || continue
         set -- $tspec
         tevent="$1"
         twf="$2"
+        tconfig="$4"
         trepo_id="${WOODPECKER_TRUSTED_REPO_ID:-${WOODPECKER_REPO_ID:-}}"
         if [ -z "$trepo_id" ]; then
             tbody="$tmp/trusted-lookup.json"
@@ -602,6 +1031,29 @@ find_trusted_attestation() { # api commit tree artifacts_tsv problems notes tmp
             fi
             trepo_id="$(py_json repo_id "$tbody")"
             [ -n "$trepo_id" ] || continue
+        fi
+        # P1: the claimed trusted project is re-fetched and must expose the
+        # observed identity/config/trust facts; the claim alone certifies nothing.
+        trepo_file="$tmp/trusted-repo.json"
+        code="$(api_get "$api" "/repos/$trepo_id" "$trepo_file")"
+        if [ "$code" != "200" ]; then
+            printf 'attestation-scan: trusted repository %s detail fetch failed (HTTP %s)\n' "$trepo_id" "$code" >>"$notes"
+            continue
+        fi
+        trepo_full="$(py_json field "$trepo_file" full_name)"
+        trepo_config="$(py_json field "$trepo_file" config_file)"
+        trepo_trusted="$(py_json field "$trepo_file" trusted.volumes)"
+        if [ "$trepo_full" != "$REPO_FULL_NAME" ]; then
+            printf 'attestation-trusted-repo-mismatch: repository %s is %s, not %s\n' "$trepo_id" "${trepo_full:-<unknown>}" "$REPO_FULL_NAME" >>"$problems"
+            continue
+        fi
+        if [ "$trepo_config" != "$tconfig" ]; then
+            printf 'attestation-trusted-config-mismatch: repository %s config_file %s is not %s\n' "$trepo_id" "${trepo_config:-<unknown>}" "$tconfig" >>"$problems"
+            continue
+        fi
+        if [ "$trepo_trusted" != "true" ]; then
+            printf 'attestation-trusted-class-mismatch: repository %s trusted.volumes=%s is not true\n' "$trepo_id" "${trepo_trusted:-<unknown>}" >>"$problems"
+            continue
         fi
         tcand="$tmp/trusted-candidates.tsv"
         tbody="$tmp/trusted-pipelines.json"
@@ -637,7 +1089,15 @@ find_trusted_attestation() { # api commit tree artifacts_tsv problems notes tmp
             printf 'attestation-scan: trusted pipeline %s does not bind the exact SHA/event (commit=%s event=%s)\n' "$tnumber" "$tcommit" "$tevent_obs" >>"$notes"
             continue
         fi
-        probe_attestation "$api" "$trepo_id" "$tnumber" "$tdetail" "$tevent" "$twf" "$commit" "$tree" "$artifacts_tsv" "$problems" "$tmp" "$tid"
+        # The verifier must see the OBSERVED detail id, never the list id: the
+        # unconditional pipeline-id binding then rejects a number/id substitution.
+        tobs_id="$(py_json field "$tdetail" id)"
+        if [ -n "$tid" ] && [ -n "$tobs_id" ] && [ "$tobs_id" != "$tid" ]; then
+            printf 'attestation-scan: trusted pipeline %s listed id %s but detail id %s\n' "$tnumber" "$tid" "$tobs_id" >>"$problems"
+            continue
+        fi
+        [ -n "$tobs_id" ] || tobs_id="$tid"
+        probe_attestation "$api" "$trepo_id" "$tnumber" "$tdetail" "$tevent" "$twf" "$commit" "$tree" "$artifacts_tsv" "$problems" "$tmp" "$tobs_id"
         prc=$?
         case "$prc" in
         0)
@@ -679,6 +1139,11 @@ write_ci_manifest() { # out_file artifacts_file problems_file notes_file
         CERTIFY_M_ATT_SOURCE="$ATT_SOURCE_SHA" CERTIFY_M_ATT_TREE="$ATT_TREE_SHA" \
         CERTIFY_M_ATT_MATCHED="$ATT_MATCHED" CERTIFY_M_ATT_ARTIFACTS="$ATT_ARTIFACTS" \
         CERTIFY_M_ATT_DIGEST="$ATT_DIGEST" \
+        CERTIFY_M_RA_STATUS="$RA_STATUS" CERTIFY_M_RA_REQUIRED="$RA_REQUIRED" \
+        CERTIFY_M_RA_MATCHED="$RA_MATCHED" CERTIFY_M_RA_ATTESTED="$RA_ATTESTED" \
+        CERTIFY_M_RA_BRANDING="$RA_BRANDING" CERTIFY_M_RA_MISSING="$RA_MISSING" \
+        CERTIFY_M_FAULT_STATUS="$FAULT_STATUS" CERTIFY_M_FAULT_COUNT="$FAULT_COUNT" \
+        CERTIFY_M_FAULT_DIGEST="$FAULT_DIGEST" CERTIFY_M_FAULT_TESTS="$FAULT_RECORD" \
         CERTIFY_M_LOCAL_STATUS="$LOCAL_STATUS" \
         python3 <<'PY'
 import hashlib
@@ -754,11 +1219,65 @@ attestation = {
     "evidence_digest": env("CERTIFY_M_ATT_DIGEST"),
 }
 local_status = env("CERTIFY_M_LOCAL_STATUS") or "not-run"
+
+
+def as_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+release_artifacts = {
+    "status": env("CERTIFY_M_RA_STATUS") or "not-run",
+    "required": as_int(env("CERTIFY_M_RA_REQUIRED")),
+    "matched": as_int(env("CERTIFY_M_RA_MATCHED")),
+    "attested": as_int(env("CERTIFY_M_RA_ATTESTED")),
+    "missing": [item for item in env("CERTIFY_M_RA_MISSING").split(",") if item],
+    "branding": env("CERTIFY_M_RA_BRANDING") or "not-run",
+}
+fault_tests = []
+fault_tests_path = env("CERTIFY_M_FAULT_TESTS")
+if fault_tests_path and os.path.exists(fault_tests_path):
+    try:
+        with open(fault_tests_path) as fh:
+            fault_tests = [line.strip() for line in fh if line.strip()][:200]
+    except Exception:
+        fault_tests = []
+fault_campaign = {
+    "status": env("CERTIFY_M_FAULT_STATUS") or "not-run",
+    "executed": as_int(env("CERTIFY_M_FAULT_COUNT")),
+    "evidence_digest": env("CERTIFY_M_FAULT_DIGEST"),
+    "tests": fault_tests,
+}
+# P1 completeness: a release certificate additionally requires the declared
+# ReleaseArtifactSet to be complete (matched == required > 0), digest-covered
+# by the signed attestation (attested == required), brand-scanned where
+# applicable, plus a passed fault campaign with executed > 0. An empty
+# artifact list or a branding skip can therefore never print the release class.
+release_preconditions = {
+    "required_artifacts": release_artifacts["required"] > 0,
+    "matched_equals_required": (
+        release_artifacts["required"] > 0
+        and release_artifacts["matched"] == release_artifacts["required"]
+    ),
+    "attested_equals_required": (
+        release_artifacts["required"] > 0
+        and release_artifacts["attested"] == release_artifacts["required"]
+    ),
+    "artifact_set_complete": release_artifacts["status"] == "complete",
+    "artifact_branding_pass": release_artifacts["branding"] == "pass",
+    "fault_campaign_pass": fault_campaign["status"] == "pass",
+    "fault_tests_executed": fault_campaign["executed"] > 0,
+}
+release_ready = all(release_preconditions.values())
 release_certificate = (
     not problems
     and local_status == "pass"
     and (context["class"] == "trusted" or attestation["status"] == "verified")
+    and release_ready
 )
+certificate_class = "release" if release_certificate else ("source" if not problems else "none")
 core = {
     "artifacts": artifacts,
     "commit": env("CERTIFY_M_COMMIT"),
@@ -771,6 +1290,8 @@ core = {
     "tree": env("CERTIFY_M_TREE"),
     "workflow_state": observed["workflow_state"],
     "attestation": attestation,
+    "release_artifacts": release_artifacts,
+    "fault_campaign": fault_campaign,
 }
 manifest = {
     "schema": "faktor-release-certification/v2",
@@ -795,11 +1316,17 @@ manifest = {
     "artifacts": artifacts,
     "artifact_digest": artifact_digest,
     "attestation": attestation,
+    "release_artifacts": release_artifacts,
+    "fault_campaign": fault_campaign,
+    "release_preconditions": release_preconditions,
+    "certificate_class": certificate_class,
     "local_gates": local_status,
     "release_certificate": release_certificate,
     "release_rule": (
         "release = full local gates pass AND (trusted context verified OR signed "
-        "build attestation verified); no flag weakens this"
+        "build attestation verified) AND ReleaseArtifactSet complete+attested "
+        "(required>0, matched==required, branding pass) AND fault campaign pass "
+        "with executed>0; no flag weakens this"
     ),
     "observed": observed,
     "evidence_digest": digest(json.dumps(core, sort_keys=True, separators=(",", ":"))),
@@ -877,6 +1404,7 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
     ATT_MATCHED="0"
     ATT_ARTIFACTS="0"
     ATT_DIGEST=""
+    RA_ATTESTED="0"
 
     local api="${WOODPECKER_HOST%/}/api"
     local tmp body repo_file candidates_file detail_file artifacts_file problems_file notes_file
@@ -1053,11 +1581,18 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
         fi
     fi
 
-    # 5. artifacts to bind into the manifest and the attestation.
-    collect_artifacts "$artifacts_file" || {
-        rm -rf "$tmp"
-        return 2
-    }
+    # 5. artifacts to bind into the manifest and the attestation. When the
+    # caller already prepared the ReleaseArtifactSet (local flow or selftest),
+    # reuse that exact list so the certificate binds the evaluated bytes.
+    if [ -n "$ARTIFACTS_TSV" ] && [ -f "$ARTIFACTS_TSV" ]; then
+        artifacts_file="$ARTIFACTS_TSV"
+    else
+        collect_artifacts "$artifacts_file" || {
+            rm -rf "$tmp"
+            return 2
+        }
+        evaluate_release_artifact_set "$artifacts_file"
+    fi
 
     # 6. trusted-build attestation (P1-J).
     local att_rc=0
@@ -1132,22 +1667,50 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
     esac
 }
 
-# P1-K: the only rule that yields a release certificate.
-certificate_class() { # local_pass ci_status ctx_class att_status -> release|evidence|none
+# P1 completeness: release preconditions beyond context/attestation. Every
+# one is mandatory for RELEASE CERTIFICATE; SOURCE CERTIFICATE can never
+# print the release class.
+release_preconditions_met() {
+    [ "$RA_STATUS" = "complete" ] || return 1
+    [ "$RA_REQUIRED" -gt 0 ] || return 1
+    [ "$RA_MATCHED" -eq "$RA_REQUIRED" ] || return 1
+    [ "$RA_ATTESTED" -eq "$RA_REQUIRED" ] || return 1
+    [ "$RA_BRANDING" = "pass" ] || return 1
+    [ "$FAULT_STATUS" = "pass" ] || return 1
+    [ "$FAULT_COUNT" -gt 0 ] || return 1
+    return 0
+}
+
+release_denial_reasons() {
+    local reasons=()
+    [ "$RA_REQUIRED" -gt 0 ] || reasons+=("ReleaseArtifactSet declares zero required artifacts")
+    [ "$RA_STATUS" = "complete" ] || reasons+=("ReleaseArtifactSet status=$RA_STATUS matched=$RA_MATCHED/$RA_REQUIRED${RA_MISSING:+ missing=$RA_MISSING}")
+    if [ "$RA_REQUIRED" -gt 0 ] && [ "$RA_ATTESTED" -ne "$RA_REQUIRED" ]; then
+        reasons+=("signed attestation covers $RA_ATTESTED/$RA_REQUIRED required artifacts")
+    fi
+    [ "$RA_BRANDING" = "pass" ] || reasons+=("required-artifact branding/scanner: $RA_BRANDING")
+    [ "$FAULT_STATUS" = "pass" ] || reasons+=("fault campaign: $FAULT_STATUS")
+    [ "$FAULT_COUNT" -gt 0 ] || reasons+=("fault campaign executed 0 [fault] tests")
+    printf '%s\n' ${reasons[@]+"${reasons[@]}"}
+}
+
+# P1-K/P1 completeness: the only rule that yields a release certificate.
+certificate_class() { # local_pass ci_status ctx_class att_status -> release|source|none
     local local_pass="$1" ci_status="$2" ctx_class="$3" att_status="$4"
     if [ "$ci_status" -ne 0 ]; then
         printf 'none'
         return
     fi
     if [ "$local_pass" -ne 1 ]; then
-        printf 'evidence'
+        printf 'none'
         return
     fi
-    if [ "$ctx_class" = "trusted" ] || [ "$att_status" = "verified" ]; then
+    if { [ "$ctx_class" = "trusted" ] || [ "$att_status" = "verified" ]; } \
+        && release_preconditions_met; then
         printf 'release'
         return
     fi
-    printf 'evidence'
+    printf 'source'
 }
 
 run_ci_selftest() {
@@ -1174,6 +1737,19 @@ run_ci_selftest() {
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-cert-selftest.XXXXXX")"
     cp -R "$fixtures/." "$tmp/"
     printf 'selftest artifact\n' >"$tmp/artifact.bin"
+    # P1 ReleaseArtifactSet fixtures: complete / subset / empty trees.
+    release_fixtures="$ROOT/scripts/certification/fixtures/release-artifacts"
+    ART_FULL=(
+        "$release_fixtures/full/bin/faktor-cli"
+        "$release_fixtures/full/extension/faktor.vsix"
+        "$release_fixtures/full/plugin/faktor-jetbrains.zip"
+    )
+    # Tamper tests operate on a private copy so repo fixtures stay pristine.
+    mkdir -p "$tmp/relfull/bin" "$tmp/relfull/extension" "$tmp/relfull/plugin"
+    cp "${ART_FULL[0]}" "$tmp/relfull/bin/faktor-cli"
+    cp "${ART_FULL[1]}" "$tmp/relfull/extension/faktor.vsix"
+    cp "${ART_FULL[2]}" "$tmp/relfull/plugin/faktor-jetbrains.zip"
+    ART_FULL=("$tmp/relfull/bin/faktor-cli" "$tmp/relfull/extension/faktor.vsix" "$tmp/relfull/plugin/faktor-jetbrains.zip")
     node "$ATTESTATION_JS" keygen --out-key "$tmp/sign.pem" --out-keys "$tmp/keys.json" --key-id faktor-selftest >/dev/null
     node "$ATTESTATION_JS" keygen --out-key "$tmp/foreign.pem" --out-keys "$tmp/foreign-keys.json" --key-id foreign >/dev/null
 
@@ -1200,9 +1776,22 @@ run_ci_selftest() {
     REPO_FULL_NAME="acme/widgets"
     CONTEXT="ci/woodpecker/pr/pr"
     PIPELINE=""
-    ARTIFACTS=("$tmp/artifact.bin")
+    ARTIFACTS=("${ART_FULL[@]}")
     ATT_KEYS="$tmp/keys.json"
     export WOODPECKER_HOST WOODPECKER_TOKEN
+
+    # P1: the mock run certifies against the complete ReleaseArtifactSet, a
+    # passing fault campaign and a clean branding scan of the required
+    # packaged outputs, so release-class facts are real (not assumed).
+    prepare_artifacts "$tmp/selftest-artifacts.tsv" || {
+        echo "certify selftest: could not prepare the ReleaseArtifactSet" >&2
+        kill "$pid" 2>/dev/null || true
+        return 1
+    }
+    release_branding_scan
+    FAULT_RECORD="$tmp/fault-tests.txt"
+    printf '%s\n' 'campaigns::a' 'campaigns::b' 'campaigns::c' >"$tmp/fault-names.txt"
+    fault_record "pass" 3 "$tmp/fault-names.txt"
 
     list_json() { # number id status commit event
         python3 -c 'import json,sys; print(json.dumps({"number":int(sys.argv[1]),"id":int(sys.argv[2]),"status":sys.argv[3],"commit":sys.argv[4],"event":sys.argv[5]}))' "$@"
@@ -1283,16 +1872,21 @@ print(json.dumps({sys.argv[2]: [{"data": block}]}))
 PY
     }
 
-    make_attestation() { # out_file [extra create args...]
+    make_attestation() { # out_file [extra create args...]; ATT_REPO/ATT_PIPELINE_ID override
         local out="$1"
         shift
+        local art_args=()
+        local art
+        for art in "${ART_FULL[@]}"; do
+            art_args+=(--artifact "$art")
+        done
         node "$ATTESTATION_JS" create \
-            --out "$out" --workflow trusted --event push --repo acme/widgets \
+            --out "$out" --workflow trusted --event push --repo "${ATT_REPO:-acme/widgets}" \
             --source-sha "$sha" --tree-sha "$tree" \
-            --pipeline-number 21 --pipeline-id 211 \
+            --pipeline-number 21 --pipeline-id "${ATT_PIPELINE_ID:-211}" \
             --ci-image-ref 'node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4' \
             --rust-toolchain 1.98.0 \
-            --artifact "$tmp/artifact.bin" \
+            "${art_args[@]}" \
             "$@"
     }
 
@@ -1371,7 +1965,12 @@ assert m["release_certificate"] is False, m
 assert m["attestation"]["status"] == "absent", m
 assert m["evidence_digest"].startswith("sha256:") and len(m["evidence_digest"]) == 71, m
 assert m["run_url"].endswith("/repos/7/pipeline/11"), m
-assert m["artifacts"] and m["artifacts"][0]["path"].endswith("artifact.bin"), m
+assert len(m["artifacts"]) == 3, m
+assert m["release_artifacts"]["status"] == "complete", m
+assert m["release_artifacts"]["required"] == 3 and m["release_artifacts"]["matched"] == 3, m
+assert m["release_artifacts"]["attested"] == 0, m
+assert m["fault_campaign"]["status"] == "pass" and m["fault_campaign"]["executed"] > 0, m
+assert m["certificate_class"] == "source", m
 '
     first_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["evidence_digest"])' "$tmp/manifest-success.json")"
     expect success-again 0
@@ -1486,13 +2085,18 @@ assert m["attestation"]["status"] == "verified", m
 assert m["attestation"]["pipeline_number"] == "21", m
 assert m["attestation"]["signature_identity"] == "faktor-selftest", m
 assert m["attestation"]["evidence_digest"].startswith("sha256:"), m
+assert m["release_artifacts"]["status"] == "complete", m
+assert m["release_artifacts"]["required"] == 3 and m["release_artifacts"]["attested"] == 3, m
+assert m["release_artifacts"]["branding"] == "pass", m
+assert m["fault_campaign"]["status"] == "pass" and m["fault_campaign"]["executed"] > 0, m
+assert m["certificate_class"] == "release", m
 assert m["release_certificate"] is True, m
 '
     # --- attestation tamper: the local artifact no longer matches the attested digest.
-    printf 'tampered artifact\n' >"$tmp/artifact.bin"
+    printf 'tampered artifact\n' >>"${ART_FULL[0]}"
     expect trusted-tampered 1
     expect_problem trusted-tampered 'attestation-invalid'
-    printf 'selftest artifact\n' >"$tmp/artifact.bin"
+    cp "$release_fixtures/full/bin/faktor-cli" "${ART_FULL[0]}"
     # --- attestation signed by a foreign identity.
     make_attestation "$tmp/foreign-att.json" --sign-key "$tmp/foreign.pem" --key-id foreign >/dev/null
     log_block "$tmp/foreign-att.json" >"$tmp/foreign-block.txt"
@@ -1502,6 +2106,35 @@ assert m["release_certificate"] is True, m
         set_state
     expect foreign-signature 1
     expect_problem foreign-signature 'attestation-invalid'
+    # --- P0 key substitution (pre-fix bypass): allowlisted identity name, the
+    # attacker's keypair. The unfixed verifier accepted signature.public_key
+    # from the attestation, so this object verified; it must now fail closed.
+    make_attestation "$tmp/subst-att.json" --sign-key "$tmp/foreign.pem" --key-id faktor-selftest >/dev/null
+    log_block "$tmp/subst-att.json" >"$tmp/subst-block.txt"
+    CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/subst-block.txt" 701)" \
+        set_state
+    expect key-substitution 1
+    expect_problem key-substitution 'attestation-invalid'
+    # --- P1 repository binding: attestation claims another repository.
+    ATT_REPO=acme/other make_attestation "$tmp/repo-spoof.json" --sign-key "$tmp/sign.pem" --key-id faktor-selftest >/dev/null
+    log_block "$tmp/repo-spoof.json" >"$tmp/repo-spoof-block.txt"
+    CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/repo-spoof-block.txt" 701)" \
+        set_state
+    expect repo-spoof 1
+    expect_problem repo-spoof 'attestation-invalid'
+    # --- P1 unconditional pipeline id: the number copied into the id field.
+    ATT_PIPELINE_ID=21 make_attestation "$tmp/id-spoof.json" --sign-key "$tmp/sign.pem" --key-id faktor-selftest >/dev/null
+    log_block "$tmp/id-spoof.json" >"$tmp/id-spoof-block.txt"
+    CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/id-spoof-block.txt" 701)" \
+        set_state
+    expect pipeline-id-spoof 1
+    expect_problem pipeline-id-spoof 'attestation-invalid'
     # --- unsigned attestation is not release-grade. The trusted workflow's
     # `create` is fail-closed (no unsigned code path), so this fixture is a
     # legacy/foreign object: a valid signed attestation with the signature
@@ -1546,8 +2179,35 @@ m = json.load(open(sys.argv[1]))
 assert m["context"]["class"] == "untrusted", m
 assert m["attestation"]["status"] == "verified", m
 assert m["attestation"]["origin_context"] == "ci/woodpecker/push/trusted", m
+assert m["release_artifacts"]["attested"] == 3, m
+assert m["certificate_class"] == "release", m
 assert m["release_certificate"] is True, m
 '
+    # --- P1: the trusted project id (WOODPECKER_TRUSTED_REPO_ID or a
+    # ?project=trusted lookup answer) is a claim, not authority: the project
+    # record is re-fetched and its observed identity/config/trust facts must
+    # match. Pre-fix, a lying record still upgraded the run to release class.
+    CERTIFY_TEST_REPO8='{"id":8,"full_name":"acme/other","config_file":".woodpecker/trusted/","trusted":{"volumes":true}}' \
+        CERTIFY_TEST_PIPELINES="[$(list_json 11 111 success "$sha" pull_request),$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAILS="$(details_json 11 "$(detail_json 11 111 success "$sha" pull_request 'pr=success,linux=success')" 21 "$(detail_json 21 211 success "$sha" push 'trusted=success' 701)")" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/upgrade-block.txt" 701)" \
+        set_state
+    expect trusted-repo-spoof 1
+    expect_problem trusted-repo-spoof 'attestation-trusted-repo-mismatch'
+    CERTIFY_TEST_REPO8='{"id":8,"full_name":"acme/widgets","config_file":".woodpecker/untrusted/","trusted":{"volumes":true}}' \
+        CERTIFY_TEST_PIPELINES="[$(list_json 11 111 success "$sha" pull_request),$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAILS="$(details_json 11 "$(detail_json 11 111 success "$sha" pull_request 'pr=success,linux=success')" 21 "$(detail_json 21 211 success "$sha" push 'trusted=success' 701)")" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/upgrade-block.txt" 701)" \
+        set_state
+    expect trusted-config-spoof 1
+    expect_problem trusted-config-spoof 'attestation-trusted-config-mismatch'
+    CERTIFY_TEST_REPO8='{"id":8,"full_name":"acme/widgets","config_file":".woodpecker/trusted/","trusted":{"volumes":false}}' \
+        CERTIFY_TEST_PIPELINES="[$(list_json 11 111 success "$sha" pull_request),$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAILS="$(details_json 11 "$(detail_json 11 111 success "$sha" pull_request 'pr=success,linux=success')" 21 "$(detail_json 21 211 success "$sha" push 'trusted=success' 701)")" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/upgrade-block.txt" 701)" \
+        set_state
+    expect trusted-class-spoof 1
+    expect_problem trusted-class-spoof 'attestation-trusted-class-mismatch'
     # --- without an allowlist the attestation is not consulted; no release class.
     ATT_KEYS=""
     expect pr-no-keys 0
@@ -1573,7 +2233,26 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         failures=$((failures + 1))
     fi
 
-    # --- certificate class rule (P1-K): only local pass AND (trusted or signed attestation).
+    # --- certificate class rule (P1-K + P1 completeness): only local pass
+    # AND (trusted or signed attestation) AND every release precondition.
+    release_facts_on() {
+        RA_STATUS="complete"
+        RA_REQUIRED=3
+        RA_MATCHED=3
+        RA_ATTESTED=3
+        RA_BRANDING="pass"
+        FAULT_STATUS="pass"
+        FAULT_COUNT=3
+    }
+    release_facts_off() {
+        RA_STATUS="empty"
+        RA_REQUIRED=3
+        RA_MATCHED=0
+        RA_ATTESTED=0
+        RA_BRANDING="not-applicable"
+        FAULT_STATUS="crate-absent"
+        FAULT_COUNT=0
+    }
     check_class() { # local ci class att want
         local got
         got="$(certificate_class "$1" "$2" "$3" "$4")"
@@ -1584,10 +2263,14 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
             failures=$((failures + 1))
         fi
     }
+    release_facts_on
     check_class 1 0 untrusted verified release
     check_class 1 0 trusted absent release
-    check_class 1 0 untrusted absent evidence
-    check_class 0 0 trusted verified evidence
+    release_facts_off
+    check_class 1 0 untrusted verified source
+    check_class 1 0 trusted absent source
+    release_facts_on
+    check_class 0 0 trusted verified none
     check_class 1 1 trusted verified none
 
     # --- CLI wording (P1-K): --verify-ci-evidence never certifies a release.
@@ -1689,12 +2372,160 @@ assert m["local_gates"] == "skipped", m
         failures=$((failures + 1))
     fi
 
+    # --- P1 ReleaseArtifactSet matrix (fixtures): empty and subset sets can
+    # never reach the release class; the full set with branding + fault passes.
+    check_release_set() { # name dir want_status want_matched
+        local name="$1" dir="$2" want_status="$3" want_matched="$4"
+        local tsv="$tmp/ras-$name.tsv" p
+        : >"$tsv"
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            printf 'sha256:%s\t%s\n' "$(hash_file "$p")" "$p" >>"$tsv"
+        done < <(find "$dir" -type f 2>/dev/null | sort)
+        evaluate_release_artifact_set "$tsv"
+        if [ "$RA_STATUS" = "$want_status" ] && [ "$RA_MATCHED" -eq "$want_matched" ]; then
+            echo "selftest ok: ReleaseArtifactSet $name -> status=$RA_STATUS matched=$RA_MATCHED/$RA_REQUIRED"
+        else
+            echo "selftest FAIL: ReleaseArtifactSet $name -> status=$RA_STATUS matched=$RA_MATCHED/$RA_REQUIRED (want $want_status matched=$want_matched)" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    check_release_set full "$release_fixtures/full" complete 3
+    check_release_set subset "$release_fixtures/subset" partial 2
+    check_release_set empty "$release_fixtures/empty" empty 0
+
+    release_facts_on
+    RA_STATUS="empty"
+    RA_MATCHED=0
+    RA_BRANDING="not-applicable"
+    if release_preconditions_met; then
+        echo "selftest FAIL: empty ReleaseArtifactSet satisfied the release preconditions" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: empty ReleaseArtifactSet fails the release class (no release certificate possible)"
+    fi
+    RA_STATUS="partial"
+    RA_MATCHED=2
+    RA_BRANDING="not-applicable"
+    if release_preconditions_met; then
+        echo "selftest FAIL: subset ReleaseArtifactSet satisfied the release preconditions" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: subset ReleaseArtifactSet fails the release class"
+    fi
+    evaluate_release_artifact_set "$tmp/ras-full.tsv"
+    release_branding_scan >/dev/null
+    release_facts_on
+    if release_preconditions_met; then
+        echo "selftest ok: complete ReleaseArtifactSet + branding pass + fault pass satisfies the release class"
+    else
+        echo "selftest FAIL: complete ReleaseArtifactSet did not satisfy the release preconditions (RA_STATUS=$RA_STATUS RA_BRANDING=$RA_BRANDING FAULT=$FAULT_STATUS/$FAULT_COUNT)" >&2
+        failures=$((failures + 1))
+    fi
+
+    # --- P1 fault campaign gate matrix (hermetic fake cargo).
+    local stub_bin saved_path saved_release saved_fault_record saved_fault_status saved_fault_count
+    stub_bin="$tmp/fakebin"
+    mkdir -p "$stub_bin"
+    cat >"$stub_bin/cargo" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *metadata*) printf '%s\n' "${FAKE_METADATA:-[]}" ;;
+  *--list*) printf '%s\n' "${FAKE_LIST:-}" ;;
+  *) printf '%s\n' "${FAKE_RUN:-}"; exit "${FAKE_RC:-0}" ;;
+esac
+STUB
+    chmod +x "$stub_bin/cargo"
+    export FAKE_METADATA FAKE_LIST FAKE_RUN FAKE_RC
+    saved_path="$PATH"
+    saved_release="$RELEASE_REQUIRED"
+    saved_fault_record="$FAULT_RECORD"
+    saved_fault_status="$FAULT_STATUS"
+    saved_fault_count="$FAULT_COUNT"
+    FAULT_RECORD="$tmp/fault-matrix.txt"
+    PATH="$stub_bin:$PATH"
+    RELEASE_REQUIRED=0
+    FAKE_METADATA='[]'
+    FAULT_STATUS="not-run"
+    fault_campaign >/dev/null 2>&1 || true
+    if [ "$FAULT_STATUS" = "crate-absent" ] && ! release_preconditions_met; then
+        echo "selftest ok: absent faktor-tests-fault -> crate-absent, release class impossible"
+    else
+        echo "selftest FAIL: absent fault crate handling (status=$FAULT_STATUS)" >&2
+        failures=$((failures + 1))
+    fi
+    RELEASE_REQUIRED=1
+    FAULT_STATUS="not-run"
+    if fault_campaign >/dev/null 2>&1; then
+        echo "selftest FAIL: --release accepted an absent fault crate" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: --release fails when faktor-tests-fault is absent"
+    fi
+    RELEASE_REQUIRED=0
+    FAKE_METADATA='[{"name":"faktor-tests-fault"}]'
+    FAKE_LIST=''
+    FAULT_STATUS="not-run"
+    fault_campaign >/dev/null 2>&1 || true
+    if [ "$FAULT_STATUS" = "zero" ]; then
+        echo "selftest ok: zero executed [fault] tests -> status=zero, release class impossible"
+    else
+        echo "selftest FAIL: zero-test fault handling (status=$FAULT_STATUS)" >&2
+        failures=$((failures + 1))
+    fi
+    RELEASE_REQUIRED=1
+    FAULT_STATUS="not-run"
+    if fault_campaign >/dev/null 2>&1; then
+        echo "selftest FAIL: --release accepted zero executed [fault] tests" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: --release fails when zero [fault] tests execute"
+    fi
+    RELEASE_REQUIRED=1
+    FAKE_LIST="$(printf 'campaigns::a: test\ncampaigns::b: test\ncampaigns::c: test\n')"
+    FAKE_RUN="$(printf 'test campaigns::a ... ok\ntest campaigns::b ... ok\ntest campaigns::c ... ok\n')"
+    if fault_campaign >/dev/null 2>&1 && [ "$FAULT_STATUS" = "pass" ] && [ "$FAULT_COUNT" -eq 3 ] \
+        && [ -n "$FAULT_DIGEST" ] && fault_release_gate; then
+        echo "selftest ok: fault campaign pass records executed=3 digest=$FAULT_DIGEST"
+    else
+        echo "selftest FAIL: fault campaign pass recording (status=$FAULT_STATUS count=$FAULT_COUNT digest=$FAULT_DIGEST)" >&2
+        failures=$((failures + 1))
+    fi
+    PATH="$saved_path"
+    RELEASE_REQUIRED="$saved_release"
+    FAULT_RECORD="$saved_fault_record"
+    FAULT_STATUS="$saved_fault_status"
+    FAULT_COUNT="$saved_fault_count"
+    release_facts_on
+
+    # --- P1 gate parity: fixture divergence must fail; the real workflow
+    # linux lanes must match the canonical list exactly.
+    local parity_fixtures
+    parity_fixtures="$ROOT/scripts/certification/fixtures/gate-parity"
+    check_parity() { # name want canonical ci...
+        local name="$1" want="$2"
+        shift 2
+        local rc=0
+        check_gate_parity "$@" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -eq "$want" ]; then
+            echo "selftest ok: gate parity $name -> exit $rc"
+        else
+            echo "selftest FAIL: gate parity $name -> exit $rc (want $want)" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    check_parity matching 0 "$parity_fixtures/canonical.txt" "$parity_fixtures/ci-match.yaml"
+    check_parity ci-diverge 1 "$parity_fixtures/canonical.txt" "$parity_fixtures/ci-diverge.yaml"
+    check_parity canonical-diverge 1 "$parity_fixtures/canonical-diverge.txt" "$parity_fixtures/ci-match.yaml"
+    canonical_gate_commands >"$tmp/canonical-gates.txt"
+    check_parity real-workflows 0 "$tmp/canonical-gates.txt" "$ROOT/.woodpecker/trusted/trusted.yaml" "$ROOT/.woodpecker/untrusted/pr.yaml"
+
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     rm -rf "$tmp"
 
     if [ "$failures" -eq 0 ]; then
-        echo "certify selftest: PASS (context registry + observed-value matrix, attestation fetch/verification matrix, certificate wording, temp-name migration)"
+        echo "certify selftest: PASS (context registry + observed-value matrix, attestation fetch/verification matrix, ReleaseArtifactSet matrix, gate parity, fault-campaign gate, certificate classes, temp-name migration)"
     else
         echo "certify selftest: FAIL ($failures case(s))" >&2
         return 1
@@ -1720,34 +2551,46 @@ fi
 if [ "$VERIFY_CI" -eq 0 ]; then
     local_ran=1
 
-    step "gate 1/8: cargo fmt --check"
-    if cargo fmt --check; then ok "formatting clean"; else status=1; bad "formatting drift"; fi
-
-    step "gate 2/8: cargo check --workspace"
-    if cargo check --workspace; then ok "workspace check clean"; else status=1; bad "workspace check failed"; fi
-
-    step "gate 3/8: cargo clippy --workspace --all-targets -- -D warnings"
-    if cargo clippy --workspace --all-targets -- -D warnings; then
-        ok "clippy clean (-D warnings)"
+    step "gates 1-4/9: canonical local cargo gates (single source: canonical_gate_commands)"
+    if run_canonical_gates; then
+        ok "canonical cargo gates pass"
     else
         status=1
-        bad "clippy warnings"
+        bad "canonical cargo gates failed"
     fi
 
-    step "gate 4/8: cargo test --workspace"
-    if cargo test --workspace; then ok "workspace tests pass"; else status=1; bad "workspace tests failed"; fi
+    step "gate 5/9: gate parity (canonical list vs CI linux lanes)"
+    parity_file="$(mktemp "${TMPDIR:-/tmp}/faktor-cert-gates.XXXXXX")"
+    canonical_gate_commands >"$parity_file"
+    if [ -f .woodpecker/trusted/trusted.yaml ] && [ -f .woodpecker/untrusted/pr.yaml ]; then
+        if check_gate_parity "$parity_file" .woodpecker/trusted/trusted.yaml .woodpecker/untrusted/pr.yaml; then
+            ok "gate parity clean: local gates are the CI linux-lane gates"
+        else
+            status=1
+            bad "gate parity failed: local and CI gate lists diverged"
+        fi
+    else
+        ok "gate parity not applicable: CI workflow files absent from this checkout"
+    fi
+    rm -f "$parity_file"
 
-    step "gate 5/8: doctor --deep on a fresh data dir"
+    step "gate 6/9: doctor --deep on a fresh data dir"
     if run_doctor_deep "pre-campaign doctor --deep"; then ok "pre-campaign doctor --deep clean"; else status=1; fi
 
-    step "gate 6/8: fault campaign ([fault] ignored tests)"
-    if fault_campaign; then ok "fault campaign complete"; else status=1; fi
+    step "gate 7/9: fault campaign ([fault] ignored tests; count+digest recorded)"
+    if fault_campaign; then ok "fault campaign gate complete (status=$FAULT_STATUS executed=$FAULT_COUNT)"; else status=1; fi
 
-    step "gate 7/8: doctor --deep after the fault campaign (release certification)"
+    step "gate 8/9: doctor --deep after the fault campaign (release certification)"
     if run_doctor_deep "post-campaign doctor --deep"; then ok "post-campaign doctor --deep clean"; else status=1; fi
 
-    step "gate 8/8: artifact branding scan (packaged outputs)"
-    if artifact_scan; then ok "artifact branding gate complete"; else status=1; fi
+    step "gate 9/9: ReleaseArtifactSet + required-artifact branding scan"
+    if prepare_artifacts; then
+        ok "ReleaseArtifactSet: status=$RA_STATUS matched=$RA_MATCHED/$RA_REQUIRED${RA_MISSING:+ missing=$RA_MISSING}"
+        if release_branding_scan; then ok "release artifact branding gate complete"; else status=1; fi
+    else
+        status=2
+        bad "artifact collection failed (operator action required)"
+    fi
 
     if [ "$status" -eq 0 ]; then
         LOCAL_STATUS="pass"
@@ -1797,10 +2640,18 @@ final="$status"
 if [ "$ci_ran" -eq 1 ] && [ "$ci_status" -gt "$final" ]; then
     final="$ci_status"
 fi
+# --release makes every precondition mandatory: an unmet precondition is a
+# FAIL, never a silent downgrade to the source class.
+if [ "$RELEASE_REQUIRED" -eq 1 ] && [ "$final" -eq 0 ] && [ "$release_class" != "release" ]; then
+    final=1
+    bad "release class required (--release) but a release precondition is unmet"
+fi
 
 summary_gates=()
 if [ "$VERIFY_CI" -eq 0 ] && [ "$local_ran" -eq 1 ]; then
     summary_gates=("${gates[@]}")
+    summary_gates+=("ReleaseArtifactSet: status=$RA_STATUS matched=$RA_MATCHED/$RA_REQUIRED attested=$RA_ATTESTED/$RA_REQUIRED branding=$RA_BRANDING")
+    summary_gates+=("fault campaign: $FAULT_STATUS executed=$FAULT_COUNT digest=${FAULT_DIGEST:-none}")
 fi
 if [ "$LOCAL_ONLY" -eq 0 ]; then
     summary_gates+=("Woodpecker context $CONTEXT at the exact shipped commit")
@@ -1842,24 +2693,32 @@ elif [ "$LOCAL_ONLY" -eq 1 ]; then
         for g in "${summary_gates[@]}"; do printf '  [ ] %s\n' "$g"; done
         ;;
     esac
-elif [ "$final" -eq 0 ]; then
-    if [ "$release_class" = "release" ]; then
-        printf 'RELEASE CERTIFICATE: PASS\n'
-        for g in "${summary_gates[@]}"; do printf '  [x] %s\n' "$g"; done
-        printf '  commit %s, tree %s\n' "$commit_sha" "$tree_sha"
-        printf 'Exact-SHA CI evidence verified; manifest at %s.\n' "$MANIFEST_OUT"
-    else
-        printf 'CERTIFICATION: PASS — NOT A RELEASE CERTIFICATE\n'
-        for g in "${summary_gates[@]}"; do printf '  [x] %s\n' "$g"; done
-        printf '  commit %s, tree %s\n' "$commit_sha" "$tree_sha"
-        printf 'Reason: release class requires a trusted context (push/trusted or tag/trusted)\n'
-        printf 'or a verified signed build attestation at this exact commit.\n'
-        printf 'Manifest at %s.\n' "$MANIFEST_OUT"
-    fi
 elif [ "$final" -eq 2 ]; then
     printf 'CERTIFICATION: INCOMPLETE (operator action required)\n'
     for g in "${summary_gates[@]}"; do printf '  [ ] %s\n' "$g"; done
     printf 'Certification could not run to completion — do not ship.\n'
+elif [ "$final" -eq 0 ] && [ "$release_class" = "release" ]; then
+    printf 'RELEASE CERTIFICATE: PASS\n'
+    for g in "${summary_gates[@]}"; do printf '  [x] %s\n' "$g"; done
+    printf '  commit %s, tree %s\n' "$commit_sha" "$tree_sha"
+    printf '  ReleaseArtifactSet: required=%s matched=%s attested=%s branding=%s\n' \
+        "$RA_REQUIRED" "$RA_MATCHED" "$RA_ATTESTED" "$RA_BRANDING"
+    printf '  fault campaign: executed=%s digest=%s\n' "$FAULT_COUNT" "${FAULT_DIGEST:-none}"
+    printf '  fault test identities: %s\n' "$FAULT_RECORD"
+    printf 'Exact-SHA CI evidence verified; manifest at %s.\n' "$MANIFEST_OUT"
+elif [ "$RELEASE_REQUIRED" -eq 1 ]; then
+    printf 'RELEASE CERTIFICATE: FAIL (release class required, preconditions unmet)\n'
+    for g in "${summary_gates[@]}"; do printf '  [ ] %s\n' "$g"; done
+    printf 'Unmet release preconditions:\n'
+    release_denial_reasons | sed 's/^/  - /'
+    printf 'Manifest at %s. Do not ship.\n' "$MANIFEST_OUT"
+elif [ "$final" -eq 0 ]; then
+    printf 'SOURCE CERTIFICATE: PASS — NOT A RELEASE CERTIFICATE\n'
+    for g in "${summary_gates[@]}"; do printf '  [x] %s\n' "$g"; done
+    printf '  commit %s, tree %s\n' "$commit_sha" "$tree_sha"
+    printf 'Release-class preconditions not met:\n'
+    release_denial_reasons | sed 's/^/  - /'
+    printf 'Manifest at %s.\n' "$MANIFEST_OUT"
 else
     printf 'CERTIFICATION: FAIL\n'
     for g in "${summary_gates[@]}"; do printf '  [ ] %s\n' "$g"; done
@@ -1875,6 +2734,7 @@ if [ "$SELFTEST" -eq 1 ]; then
     printf 'NOTE: --selftest is a hermetic fixture run, never a release certificate.\n'
 fi
 printf '=====================\n'
+[ -n "$ARTIFACT_TMP" ] && rm -rf "$ARTIFACT_TMP"
 exit "$final"
 
 

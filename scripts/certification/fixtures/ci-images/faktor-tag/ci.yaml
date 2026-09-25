@@ -1,0 +1,8 @@
+# Planted violation: the Faktor CI image referenced by a mutable tag with no
+# @sha256: digest. `scripts/check-ci-image-pins.sh --dir` must reject this
+# file even though the tag looks like a dedicated CI image.
+steps:
+  - name: jetbrains-smoke
+    image: faktor-ci:latest
+    commands:
+      - sh scripts/build-ci-image.sh --verify-runtime

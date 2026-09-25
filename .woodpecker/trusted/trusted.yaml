@@ -72,6 +72,19 @@
 # image is the only exemption). The toolchain file, not the image, remains
 # the Rust channel authority.
 #
+# Hermetic toolchain (P1): trusted lanes run NO apt at all. The rust/node
+# stock baselines already ship the tools their old apt steps installed
+# (python3, ps, unzip and ca-certificates are present in the pinned images),
+# and the JetBrains build and smoke lanes run on the dedicated Faktor CI
+# image from `docker/faktor-ci/Dockerfile` (git + JDK 17 included),
+# referenced by the digest recorded in
+# `docker/faktor-ci/image-digest.txt` (built by `scripts/build-ci-image.sh`).
+# The required `ci-image` pre-step runs ON that exact digest with
+# `pull: false`; if the image was not produced on the agent the container
+# cannot start and the pipeline fails closed — there is no live-apt fallback.
+# The same digest is recorded as `build_environment_digest` in the
+# attestation step.
+#
 # Commit-status contexts (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
 #   push: ci/woodpecker/push/trusted   tag: ci/woodpecker/tag/trusted
 
@@ -105,6 +118,23 @@ steps:
     commands:
       - sh scripts/check-ci-image-pins.sh
 
+  # ------------------------------------------------------------- ci-image --
+  # Required pre-step (P1 hermetic CI): every lane that used to run apt on
+  # the stock ubuntu image now runs on the digest-pinned Faktor CI image.
+  # This step runs ON that exact digest with pull disabled, so the pipeline
+  # fails closed when the image cannot be produced/pulled — no lane falls
+  # back to live apt. It re-verifies every exact package pin from the
+  # Dockerfile against the running image and that apt points at the fixed
+  # snapshot only (scripts/build-ci-image.sh --verify-runtime).
+  - name: ci-image
+    image: faktor-ci@sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt
+    pull: false
+    when:
+      matrix:
+        platform: linux/amd64
+    commands:
+      - sh scripts/build-ci-image.sh --verify-runtime
+
   # ---------------------------------------------------------------- linux --
   # The default lane (hosted linux/amd64 runners). Same commands the CI
   # gates always ran: fmt + clippy -D warnings + check/test --all-features +
@@ -123,17 +153,10 @@ steps:
       - faktor-trusted-cargo-git:/usr/local/cargo/git
       - faktor-trusted-target-linux:/woodpecker-cache/target
     commands:
-      # apt-snapshot: 20260923T000000Z Debian trixie snapshot + exact versions; no live repos (docs/certification.md §2.14)
-      - |
-        set -eu
-        SNAPSHOT=https://snapshot.debian.org/archive/debian/20260923T000000Z
-        SNAPSHOT_SECURITY=https://snapshot.debian.org/archive/debian-security/20260923T000000Z
-        printf 'deb [check-valid-until=no] %s trixie main\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s trixie-updates main\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s trixie-security main\n' "$SNAPSHOT_SECURITY" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
-        apt-get update
-        apt-get install -y --no-install-recommends python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419
+      # No apt: the digest-pinned rust:1.98.0 baseline already ships python3,
+      # procps and ca-certificates (verified: `python3`, `ps`, unzip, curl and
+      # /etc/ssl/certs/ca-certificates.crt are present). Toolchain authority
+      # stays rust-toolchain.toml.
       # rust-toolchain.toml is authoritative; fail loudly if the shim does not resolve it.
       - rustup show active-toolchain
       - rustup component add rustfmt clippy
@@ -146,15 +169,6 @@ steps:
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        set -eu
-        SNAPSHOT=https://snapshot.debian.org/archive/debian/20260923T000000Z
-        SNAPSHOT_SECURITY=https://snapshot.debian.org/archive/debian-security/20260923T000000Z
-        printf 'deb [check-valid-until=no] %s trixie main\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s trixie-updates main\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s trixie-security main\n' "$SNAPSHOT_SECURITY" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
-        apt-get update
-        apt-get install -y --no-install-recommends python3=3.13.5-1 procps=2:4.0.4-9 ca-certificates=20250419
         rustup show active-toolchain
         rustup component add rustfmt clippy
         cargo fmt --check
@@ -254,17 +268,9 @@ steps:
     volumes:
       - faktor-trusted-npm-cache:/root/.npm
     commands:
-      # apt-snapshot: 20260923T000000Z Debian bookworm snapshot + exact versions; no live repos (docs/certification.md §2.14)
-      - |
-        set -eu
-        SNAPSHOT=https://snapshot.debian.org/archive/debian/20260923T000000Z
-        SNAPSHOT_SECURITY=https://snapshot.debian.org/archive/debian-security/20260923T000000Z
-        printf 'deb [check-valid-until=no] %s bookworm main\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s bookworm-updates main\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s bookworm-security main\n' "$SNAPSHOT_SECURITY" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
-        apt-get update
-        apt-get install -y --no-install-recommends unzip=6.0-28+deb12u1 ca-certificates=20250419~deb12u1
+      # No apt: the digest-pinned node:24 baseline already ships unzip and
+      # ca-certificates (verified: `unzip`, `python3`, curl and
+      # /etc/ssl/certs/ca-certificates.crt are present).
       - cd apps/vscode
       - npm ci
       - npm run build
@@ -280,15 +286,6 @@ steps:
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        set -eu
-        SNAPSHOT=https://snapshot.debian.org/archive/debian/20260923T000000Z
-        SNAPSHOT_SECURITY=https://snapshot.debian.org/archive/debian-security/20260923T000000Z
-        printf 'deb [check-valid-until=no] %s bookworm main\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s bookworm-updates main\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s bookworm-security main\n' "$SNAPSHOT_SECURITY" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
-        apt-get update
-        apt-get install -y --no-install-recommends unzip=6.0-28+deb12u1 ca-certificates=20250419~deb12u1
         cd apps/vscode
         npm ci
         npm run build
@@ -315,7 +312,12 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
   - name: jetbrains-build
-    image: eclipse-temurin:17-jdk@sha256:bc033b57e11b773c3043babfd664e7a5ef110805548b921cbfc3e8c67a0725d6 # eclipse-temurin:17-jdk @ 2026-09-23
+    # Runs on the digest-pinned Faktor CI image: it carries git (the lane
+    # marker's `git rev-parse 'HEAD^{tree}'` tree binding) and the JDK 17
+    # that the pinned Gradle wrapper (9.7.1) requires.
+    image: faktor-ci@sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
+    pull: false
+    depends_on: [ci-image]
     when:
       matrix:
         platform: linux/amd64
@@ -355,34 +357,23 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
-    image: ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 # ubuntu:24.04 @ 2026-09-23
+    image: faktor-ci@sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
+    pull: false
+    depends_on: [ci-image]
     when:
       matrix:
         platform: linux/amd64
     environment:
       RUST_BACKTRACE: "1"
-      DEBIAN_FRONTEND: noninteractive
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
     commands:
-      # apt-snapshot: 20260923T000000Z Ubuntu noble snapshot (main+universe) + exact versions; no live repos (docs/certification.md §2.14)
-      # ubuntu:24.04 ships no ca-certificates: the single ca-certificates
-      # bootstrap fetch below trusts APT's InRelease signature (ubuntu-keyring
-      # is in the base image); TLS verification is restored right after.
-      - |
-        set -eu
-        SNAPSHOT=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z
-        printf 'deb [check-valid-until=no] %s noble main universe\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s noble-updates main universe\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s noble-security main universe\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources
-        printf 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";\n' > /etc/apt/apt.conf.d/99faktor-ca-bootstrap
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates=20260601~24.04.1
-        rm -f /etc/apt/apt.conf.d/99faktor-ca-bootstrap
-        apt-get update
-        apt-get install -y --no-install-recommends build-essential=12.10ubuntu1 curl=8.5.0-2ubuntu10.13 pkg-config=1.8.1-2build1 libssl-dev=3.0.13-0ubuntu3.15 kotlin=1.3.31+ds1-1ubuntu1 openjdk-11-jre-headless=11.0.32.1+1-1ubuntu1~24.04
+      # No apt: the digest-pinned Faktor CI image already carries the pinned
+      # toolchain (kotlin, openjdk-11-jre-headless, openjdk-17-jdk-headless,
+      # git, build-essential, curl, pkg-config, libssl-dev). The `ci-image`
+      # pre-step fails the pipeline closed when the image was not
+      # produced/pulled.
       - |
         set -eu
         curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
@@ -397,18 +388,6 @@ steps:
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        set -eu
-        SNAPSHOT=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z
-        printf 'deb [check-valid-until=no] %s noble main universe\n' "$SNAPSHOT" > /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s noble-updates main universe\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        printf 'deb [check-valid-until=no] %s noble-security main universe\n' "$SNAPSHOT" >> /etc/apt/sources.list.d/faktor-snapshot.list
-        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources
-        printf 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";\n' > /etc/apt/apt.conf.d/99faktor-ca-bootstrap
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates=20260601~24.04.1
-        rm -f /etc/apt/apt.conf.d/99faktor-ca-bootstrap
-        apt-get update
-        apt-get install -y --no-install-recommends build-essential=12.10ubuntu1 curl=8.5.0-2ubuntu10.13 pkg-config=1.8.1-2build1 libssl-dev=3.0.13-0ubuntu3.15 kotlin=1.3.31+ds1-1ubuntu1 openjdk-11-jre-headless=11.0.32.1+1-1ubuntu1~24.04
         set -eu
         curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
         printf '%s  %s\n' 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c /tmp/rustup-init | sha256sum -c -
@@ -635,6 +614,15 @@ steps:
   # the block from the Woodpecker API for the exact trusted pipeline and
   # refuses release certification on any mismatch.
   #
+  # OBSERVED PIPELINE ID: verification binds `pipeline_id` unconditionally
+  # whenever the certifier observed the API's own id for this run, so the
+  # producer resolves that observed id here (GET
+  # /api/repos/lookup/<repo>?project=trusted, then
+  # /api/repos/<id>/pipelines/<CI_PIPELINE_NUMBER>, take `id`) using
+  # WOODPECKER_HOST/WOODPECKER_TOKEN from the trusted-lane environment. The
+  # lookup FAILS CLOSED with the typed `observed-pipeline-id-lookup-failed`
+  # error — the pipeline number is never copied into the id field.
+  #
   # FAIL-CLOSED SIGNING (operator): register an ed25519 private key on the
   # TRUSTED project and map it into this step's environment. Without the
   # secret the step FAILS with the typed `signing-key-missing` error and
@@ -664,13 +652,46 @@ steps:
         set -eu
         event=push
         if [ -n "${CI_COMMIT_TAG:-}" ]; then event=tag; fi
+        observed_pipeline_id="$(node - "${WOODPECKER_HOST:-}" "${WOODPECKER_TOKEN:-}" "$CI_REPO" "${CI_PIPELINE_NUMBER:?}" <<'OBSERVED_ID'
+        const [host, token, repo, number] = process.argv.slice(2);
+        const fail = (message) => {
+          console.error(`observed-pipeline-id-lookup-failed: ${message}`);
+          process.exit(1);
+        };
+        if (!host || !token || !repo || !number) {
+          fail("WOODPECKER_HOST, WOODPECKER_TOKEN, CI_REPO and CI_PIPELINE_NUMBER are required");
+        }
+        const base = host.replace(/\/+$/, "");
+        const get = async (path) => {
+          const res = await fetch(`${base}/api${path}`, { headers: { Authorization: `Bearer ${token}` } });
+          if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`);
+          return res.json();
+        };
+        (async () => {
+          const lookup = await get(`/repos/lookup/${repo}?project=trusted`);
+          const repoId = lookup.id;
+          if (repoId === undefined || repoId === null || repoId === "") {
+            throw new Error(`repository lookup for ${repo} returned no id`);
+          }
+          const detail = await get(`/repos/${encodeURIComponent(repoId)}/pipelines/${encodeURIComponent(number)}`);
+          const observedId = detail.id;
+          if (observedId === undefined || observedId === null || String(observedId) === "") {
+            throw new Error(`pipeline ${number} detail returned no id`);
+          }
+          process.stdout.write(String(observedId));
+        })().catch((error) => fail(error.message));
+        OBSERVED_ID
+        )"
+        [ -n "$observed_pipeline_id" ] || { echo "observed-pipeline-id-lookup-failed: empty pipeline id" >&2; exit 1; }
         node scripts/certification/attestation.mjs create \
           --out target/certification/attestation/trusted-build-attestation.json \
           --workflow trusted --event "$event" --repo "$CI_REPO" \
           --source-sha "$CI_COMMIT_SHA" --tree-sha "$(git rev-parse 'HEAD^{tree}')" \
           --pipeline-number "${CI_PIPELINE_NUMBER:?}" \
+          --pipeline-id "$observed_pipeline_id" \
           --workflow-file .woodpecker/trusted/trusted.yaml --step-name attestation \
           --rust-toolchain-file rust-toolchain.toml \
+          --ci-image-ref "faktor-ci@$(grep -oE 'sha256:[0-9a-f]{64}' docker/faktor-ci/image-digest.txt | head -n 1)" \
           --from-lanes target/certification/lanes \
           --key-id "${FAKTOR_ATTEST_SIGN_KEY_ID:-faktor-ci}" \
           --emit-log-block
