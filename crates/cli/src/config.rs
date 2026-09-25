@@ -2833,13 +2833,33 @@ impl Default for VerificationCfg {
 /// explicit list — even an empty one (deny-all) — replaces it. The
 /// `network_guarantee` (`required` default, `best_effort`, `none`) declares
 /// what the policy requires of OS-level network isolation for shell
-/// commands; the `shell` mode (`os_isolated` default,
-/// `network_capable_user_granted`) distinguishes an OS-isolated shell from
-/// the strictly weaker, EXPLICITLY user-granted network-capable shell.
+/// commands, and `shell` is the OPTIONAL explicit shell-execution contract
+/// over TWO distinct trust classes:
+///
+/// - **Unset (`None`, the default)**: the agent-generated shell tool
+///   (`run_command` and every supervised agent shell spawn) keeps the
+///   sandbox crate's SECURE default — `os_isolated` + `required`: isolate or
+///   refuse typed, never an unenforced shell. INTERACTIVE session terminals
+///   (IDE user-initiated, not agent-generated) get the user-initiated
+///   default instead: `network_capable_user_granted` with NO isolation
+///   claim, so the terminal child inherits the daemon namespace and the
+///   durable profile records the grant honestly
+///   (`network_isolation=inherit`), never a fabricated OS-isolation claim.
+///   The agent class never inherits this grant.
+/// - `"os_isolated"`: the operator EXPLICITLY demands OS-level isolation
+///   for BOTH classes (requires `network_guarantee = "required"`): agent
+///   shells and interactive terminals are confined identically and refused
+///   typed where no OS backend exists. The unset default is distinguishable
+///   from this explicit choice, so selecting it is what turns terminal
+///   refusal on.
+/// - `"network_capable_user_granted"`: the explicit network-capable grant
+///   for both classes (requires a non-`required` `network_guarantee`).
+///
 /// Choosing `network_guarantee` other than `required` REQUIRES setting
 /// `shell = "network_capable_user_granted"`: full functionality is an
-/// explicit grant, never a silent default, and the two are never presented
-/// as equivalent strength. Unknown keys inside the section are parse errors.
+/// explicit grant, never a silent default, and the two modes are never
+/// presented as equivalent strength. Unknown keys inside the section are
+/// parse errors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCfg {
@@ -2848,7 +2868,7 @@ pub struct SandboxCfg {
     #[serde(default)]
     pub network_guarantee: SandboxGuarantee,
     #[serde(default)]
-    pub shell: faktor_sandbox::ShellExecutionMode,
+    pub shell: Option<faktor_sandbox::ShellExecutionMode>,
 }
 
 /// The config FILE shape: `Config` plus `config_version` (default 1 when
@@ -3057,7 +3077,12 @@ impl Config {
     /// section overrides the sandbox crate's defaults: an explicit
     /// `network` row list replaces the network gate (parsed strictly — one
     /// unparseable rule fails the whole policy), and the configured
-    /// guarantee rides into `SandboxPolicy::network_guarantee`.
+    /// guarantee rides into `SandboxPolicy::network_guarantee`. This policy
+    /// is the AGENT shell-tool trust class: an unset `shell` keeps the
+    /// crate's secure `os_isolated` default (which requires `required`), so
+    /// nothing here can widen the agent shell tool. The interactive
+    /// terminal class is resolved separately by the terminal authority and
+    /// never feeds back into this policy.
     pub fn sandbox_policy(&self) -> Result<SandboxPolicy, String> {
         let mut policy = SandboxPolicy::default();
         if let Some(rows) = &self.sandbox.network {
@@ -3065,7 +3090,10 @@ impl Config {
                 NetworkGate::parse(rows).map_err(|e| format!("network rule error: {e}"))?;
         }
         policy.network_guarantee = self.sandbox.network_guarantee;
-        policy.shell_execution = self.sandbox.shell;
+        policy.shell_execution = self
+            .sandbox
+            .shell
+            .unwrap_or(faktor_sandbox::ShellExecutionMode::OsIsolated);
         policy.validate()?;
         Ok(policy)
     }
@@ -5955,6 +5983,65 @@ mod tests {
         let e = cfg.sandbox_policy().expect_err("unparseable rule fails");
         assert!(!e.is_empty());
         assert!(Config::load_strict(&path).is_err());
+    }
+
+    /// The `[sandbox] shell` setting is an OPTION over two trust classes:
+    /// UNSET (`None`) is distinguishable from an explicit `os_isolated`, so
+    /// the agent shell-tool class keeps its secure default when nothing is
+    /// configured while the interactive-terminal class can select its own
+    /// user-initiated default (resolved by the terminal authority; the
+    /// server crate unit-tests that constructor). Parse strictness and the
+    /// unset round-trip are pinned here.
+    #[test]
+    fn sandbox_shell_option_distinguishes_unset_from_explicit_os_isolation() {
+        use faktor_sandbox::{SandboxGuarantee, SandboxPolicy, ShellExecutionMode};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+
+        // Unset: `None`; the agent policy is the crate's secure default.
+        let cfg = Config::default();
+        assert_eq!(cfg.sandbox.shell, None, "an absent shell key is UNSET");
+        assert_eq!(cfg.sandbox_policy().unwrap(), SandboxPolicy::default());
+
+        // Explicit os_isolated: `Some(OsIsolated)` with the required
+        // guarantee — the same agent contract, but an EXPLICIT choice the
+        // terminal class can tell apart from the unset default.
+        std::fs::write(&path, r#"{"sandbox": {"shell": "os_isolated"}}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.sandbox.shell, Some(ShellExecutionMode::OsIsolated));
+        assert_eq!(cfg.sandbox.network_guarantee, SandboxGuarantee::Required);
+        assert_eq!(
+            cfg.sandbox_policy().unwrap().shell_execution,
+            ShellExecutionMode::OsIsolated
+        );
+
+        // Explicit grant: `Some(...)` with a non-required guarantee.
+        std::fs::write(
+            &path,
+            r#"{"sandbox": {"network_guarantee": "none", "shell": "network_capable_user_granted"}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.sandbox.shell,
+            Some(ShellExecutionMode::NetworkCapableUserGranted)
+        );
+        assert_eq!(cfg.sandbox.network_guarantee, SandboxGuarantee::None);
+        assert_eq!(
+            cfg.sandbox_policy().unwrap().shell_execution,
+            ShellExecutionMode::NetworkCapableUserGranted
+        );
+
+        // The unset state round-trips (`null`), never silently becoming an
+        // explicit os_isolated.
+        let cfg = Config::default();
+        cfg.save(&path).unwrap();
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.sandbox.shell, None);
+        assert_eq!(
+            cfg.sandbox_policy().unwrap(),
+            reloaded.sandbox_policy().unwrap()
+        );
     }
 
     #[test]

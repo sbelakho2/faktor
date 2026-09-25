@@ -536,16 +536,73 @@ pub struct TerminalAuthorityPolicy {
 }
 
 impl TerminalAuthorityPolicy {
-    /// The terminal authority policy over the HOST's configured sandbox
-    /// policy: the shell-execution contract (`shell_execution` mode and its
-    /// backing `network_guarantee`) is carried VERBATIM from the operator's
-    /// configuration — this layer never widens it. `execute_shell` stays
-    /// allowed (an already-proven session-owned terminal, not an untrusted
-    /// tool request); everything else is this authority's own default. An
-    /// operator who wants the strictly weaker network-capable shell must
-    /// configure it EXPLICITLY (`[sandbox] shell = "network_capable_user_granted"`
-    /// with a non-`required` guarantee); the configured policy is validated
-    /// at the config boundary before it reaches here.
+    /// The INTERACTIVE session-terminal trust class over the operator's
+    /// `[sandbox] shell` setting — the ONE production construction of an
+    /// interactive-terminal authority. Interactive terminals are
+    /// USER-INITIATED (IDE terminals), not agent-generated, so their
+    /// contract is decided by trust class and never inherits the
+    /// agent-shell class default by accident:
+    ///
+    /// - `None` (unset — distinguishable from an explicit choice): the
+    ///   user-initiated default. `network_capable_user_granted` with NO
+    ///   isolation claim (`network_guarantee = none` → the child inherits
+    ///   the daemon network namespace; the durable profile records
+    ///   `network_isolation=inherit`). Strictly weaker than OS isolation
+    ///   and recorded as such — never fabricated as isolated. IDE terminals
+    ///   therefore work on every platform, including ones with no
+    ///   per-process network-isolation backend.
+    /// - `Some(OsIsolated)` (an EXPLICIT operator choice): `os_isolated` +
+    ///   `Required`, the same isolation-or-typed-refusal contract as the
+    ///   agent shell class (Linux: the shared netns backend; platforms with
+    ///   no backend: typed refusal before any child exists).
+    /// - `Some(NetworkCapableUserGranted)`: the explicit grant, carrying
+    ///   the configured non-`Required` guarantee.
+    ///
+    /// The AGENT shell-tool class never consults this constructor: it keeps
+    /// its own secure `os_isolated`/`Required` default, so no terminal
+    /// grant can silently widen it. A contradictory pairing (`os_isolated`
+    /// without `Required`, or a grant with `Required`) is refused at the
+    /// config boundary; this constructor stays total by keeping each mode's
+    /// own pairing invariant.
+    pub fn for_interactive_session_terminals(
+        configured: Option<ShellExecutionMode>,
+        configured_guarantee: SandboxGuarantee,
+    ) -> Self {
+        let mut policy = Self::default();
+        let (mode, guarantee) = match configured {
+            Some(ShellExecutionMode::OsIsolated) => {
+                (ShellExecutionMode::OsIsolated, SandboxGuarantee::Required)
+            }
+            Some(ShellExecutionMode::NetworkCapableUserGranted) => (
+                ShellExecutionMode::NetworkCapableUserGranted,
+                match configured_guarantee {
+                    // The config boundary refuses this pairing; keep the
+                    // mode's own invariant here rather than recording a
+                    // fabricated OS-isolation demand under a grant.
+                    SandboxGuarantee::Required => SandboxGuarantee::None,
+                    other => other,
+                },
+            ),
+            None => (
+                ShellExecutionMode::NetworkCapableUserGranted,
+                SandboxGuarantee::None,
+            ),
+        };
+        policy.sandbox.shell_execution = mode;
+        policy.sandbox.network_guarantee = guarantee;
+        policy
+    }
+
+    /// The terminal authority policy over an ALREADY-RESOLVED sandbox
+    /// contract: the shell-execution contract (`shell_execution` mode and
+    /// its backing `network_guarantee`) is carried VERBATIM — the caller
+    /// resolved its own trust class (production interactive terminals go
+    /// through [`Self::for_interactive_session_terminals`]) and this layer
+    /// never widens what it is handed. `execute_shell` stays allowed (an
+    /// already-proven session-owned terminal, not an untrusted tool
+    /// request); everything else is this authority's own default. The
+    /// configured policy is validated at the config boundary before it
+    /// reaches here.
     pub fn for_configured_sandbox(configured: &SandboxPolicy) -> Self {
         let mut policy = Self::default();
         policy.sandbox.shell_execution = configured.shell_execution;
@@ -555,10 +612,12 @@ impl TerminalAuthorityPolicy {
 
     /// The EXPLICIT user-granted shell contract: a network-capable shell
     /// (`NetworkCapableUserGranted` with a non-`Required` guarantee) — the
-    /// strictly weaker shape an operator selects ON PURPOSE. Hosts and tests
+    /// strictly weaker shape an operator selects ON PURPOSE, and the shape
+    /// the unset interactive-terminal class defaults to. Hosts and tests
     /// that define the grant directly construct it through this; production
-    /// config reaches the authority through [`Self::for_configured_sandbox`].
-    /// Nothing else in this crate ever mints it.
+    /// config reaches the authority through
+    /// [`Self::for_interactive_session_terminals`]. Nothing else in this
+    /// crate ever mints it.
     pub fn explicit_user_granted_shell() -> Self {
         let mut policy = Self::default();
         policy.sandbox.network_guarantee = SandboxGuarantee::None;
@@ -586,22 +645,26 @@ impl Default for TerminalAuthorityPolicy {
             // rule of the tool path does not apply to an already-proven
             // session-owned terminal).
             //
-            // Phase D shell contract (residual closed): the authority DEFAULT
-            // is the crate's SECURE shape — `Required` + `OsIsolated` — never
-            // a hardcoded user-granted network-capable shell. The host's
-            // configured `[sandbox] shell` contract enters EXPLICITLY through
-            // [`Self::for_configured_sandbox`] at construction (dependency
-            // injection; no global read anywhere on this path). The secure
-            // default fails closed: on Linux the PTY child is placed in the
-            // shared sandbox network namespace before exec (the same
-            // `unshare(CLONE_NEWNET)` backend the supervised shell path uses),
-            // and a host whose kernel/user-namespace policy refuses that
-            // unshare refuses the spawn TYPED before any child exists. On
-            // platforms with no backend (macOS/Windows) the typed refusal IS
-            // the platform truth. Either way the durable profile records the
-            // honest `os_isolated`/`required` demand plus the isolation
-            // actually applied. Only an explicit operator grant selects the
-            // strictly weaker `network_capable_user_granted` shell.
+            // Phase D shell contract (residual closed) + the trust-class
+            // split: THIS default is the AGENT-shell-class SECURE shape —
+            // `Required` + `OsIsolated` — never a hardcoded user-granted
+            // network-capable shell. The secure default fails closed: on
+            // Linux the PTY child is placed in the shared sandbox network
+            // namespace before exec (the same `unshare(CLONE_NEWNET)`
+            // backend the supervised shell path uses), and a host whose
+            // kernel/user-namespace policy refuses that unshare refuses the
+            // spawn TYPED before any child exists. On platforms with no
+            // backend (macOS/Windows) the typed refusal IS the platform
+            // truth. Only an explicit operator grant selects the strictly
+            // weaker `network_capable_user_granted` shell.
+            //
+            // Interactive session terminals are a DIFFERENT trust class
+            // (user-initiated, not agent-generated): the daemon injects
+            // their resolved contract explicitly through
+            // [`TerminalAuthorityPolicy::for_interactive_session_terminals`].
+            // The unset default there is the honest user grant; an explicit
+            // `[sandbox] shell = "os_isolated"` restores THIS shape. This
+            // default is never silently widened for the agent class.
             sandbox: SandboxPolicy {
                 execute_shell: Rule::Allow,
                 ..SandboxPolicy::default()
@@ -3731,6 +3794,131 @@ mod tests {
             "grant mode spawns inside the daemon namespace and records it honestly"
         );
         let _ = service.kill(&sid, creation.handle.terminal_id(), "grant cleanup");
+    }
+
+    #[test]
+    fn interactive_terminal_class_defaults_to_the_honest_grant_and_explicit_isolation_is_honored() {
+        // The TRUST-CLASS split: interactive session terminals are
+        // user-initiated. UNSET (`None`) is the user-granted default — NOT
+        // the agent class's `os_isolated`/`Required` secure default, which
+        // is what broke every IDE terminal on backend-less platforms. An
+        // EXPLICIT `Some(OsIsolated)` restores the isolation/typed-refusal
+        // contract for terminals too.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        let (manager, sid) = manager_at(dir.path(), &root, "interactive-trust-class");
+        let principal = principal_of(&manager, &sid);
+
+        // UNSET: the agent-class `Required` guarantee passed alongside is
+        // ignored for terminals (distinct trust class); the admitted
+        // profile records the grant honestly.
+        let default_terminal = TerminalAuthorityPolicy::for_interactive_session_terminals(
+            None,
+            SandboxGuarantee::Required,
+        );
+        let state = default_terminal.shell_execution_state();
+        assert_eq!(state.mode, ShellExecutionMode::NetworkCapableUserGranted);
+        assert_eq!(state.network_guarantee, SandboxGuarantee::None);
+        assert!(default_terminal.sandbox.validate().is_ok());
+        let authority =
+            SessionExecutionAuthority::with_policy(manager.clone(), default_terminal.clone());
+        let admitted = authority
+            .authorize_terminal_spawn(&principal, &sid, &spawn_request("/bin/sh", &["-c", "true"]))
+            .expect("the interactive default admits");
+        assert_eq!(
+            admitted.network_isolation(),
+            NetworkIsolation::Inherit,
+            "the interactive default must never demand a backend-less isolation"
+        );
+        assert_eq!(admitted.profile().shell, "network_capable_user_granted");
+        assert_eq!(admitted.profile().network, "none");
+        assert_eq!(admitted.profile().network_isolation, "inherit");
+
+        let service = service_with_policy(&manager, default_terminal);
+        if let Some(creation) = spawn_or_skip(&service, &sid, &spawn_request("/bin/sleep", &["30"]))
+        {
+            let profile =
+                ExecutionProfile::parse(&creation.view.execution_profile).expect("profile");
+            assert_eq!(profile.shell, "network_capable_user_granted");
+            assert_eq!(profile.network, "none");
+            assert_eq!(profile.network_isolation, "inherit");
+            let _ = service.kill(
+                &sid,
+                creation.handle.terminal_id(),
+                "interactive default cleanup",
+            );
+        }
+
+        // EXPLICIT isolation on a FRESH session (the earlier spawn's rows
+        // would otherwise trip the helper's no-journal-on-refusal check).
+        let dir_iso = tempfile::tempdir().unwrap();
+        let root_iso = dir_iso.path().join("candidate");
+        std::fs::create_dir_all(&root_iso).unwrap();
+        let (manager_iso, sid_iso) = manager_at(dir_iso.path(), &root_iso, "interactive-isolated");
+        let isolated = TerminalAuthorityPolicy::for_interactive_session_terminals(
+            Some(ShellExecutionMode::OsIsolated),
+            SandboxGuarantee::Required,
+        );
+        assert_eq!(
+            isolated.sandbox.shell_execution,
+            ShellExecutionMode::OsIsolated
+        );
+        assert_eq!(
+            isolated.sandbox.network_guarantee,
+            SandboxGuarantee::Required
+        );
+        assert!(isolated.sandbox.validate().is_ok());
+        let authority =
+            SessionExecutionAuthority::with_policy(manager_iso.clone(), isolated.clone());
+        let admitted = authority
+            .authorize_terminal_spawn(
+                &principal_of(&manager_iso, &sid_iso),
+                &sid_iso,
+                &spawn_request("/bin/sh", &["-c", "true"]),
+            )
+            .expect("explicit isolation admits with the demand recorded");
+        assert_eq!(admitted.network_isolation(), NetworkIsolation::DenyAll);
+        assert_eq!(admitted.profile().shell, "os_isolated");
+        assert_eq!(admitted.profile().network, "required");
+        let marker = root_iso.join("explicit-terminal-isolation-ran.txt");
+        let program = format!("echo ran > {}", marker.display());
+        let service = service_with_policy(&manager_iso, isolated);
+        let creation = expect_os_isolated_outcome(
+            &service,
+            &manager_iso,
+            &sid_iso,
+            &spawn_request("/bin/sh", &["-c", program.as_str()]),
+            &marker,
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            creation.is_none(),
+            "explicit terminal isolation must refuse typed where no backend exists"
+        );
+        if let Some(creation) = creation {
+            let _ = service.kill(&sid_iso, creation.handle.terminal_id(), "isolation cleanup");
+        }
+
+        // EXPLICIT grant: the same honest contract as the default, now
+        // chosen; the configured non-required guarantee is carried. A
+        // contradictory pairing (grant + `Required`) is refused at the
+        // config boundary, so this constructor stays total by keeping the
+        // grant's invariant instead of fabricating an isolation demand.
+        let explicit_grant = TerminalAuthorityPolicy::for_interactive_session_terminals(
+            Some(ShellExecutionMode::NetworkCapableUserGranted),
+            SandboxGuarantee::None,
+        );
+        assert_eq!(
+            explicit_grant.shell_execution_state(),
+            TerminalAuthorityPolicy::explicit_user_granted_shell().shell_execution_state()
+        );
+        let normalized = TerminalAuthorityPolicy::for_interactive_session_terminals(
+            Some(ShellExecutionMode::NetworkCapableUserGranted),
+            SandboxGuarantee::Required,
+        );
+        assert_eq!(normalized.sandbox.network_guarantee, SandboxGuarantee::None);
+        assert!(normalized.sandbox.validate().is_ok());
     }
 
     #[test]
