@@ -3485,14 +3485,14 @@ mod tests {
         );
         let (iso_creation, iso_out) =
             match isolated.spawn(&sid, &spawn_request("/bin/sh", &["-c", script.as_str()])) {
-                Ok(creation) => (
-                    creation,
-                    drain_until(
+                Ok(creation) => {
+                    let out = drain_until(
                         &creation.handle,
                         "PROBE_DONE",
                         std::time::Duration::from_secs(30),
-                    ),
-                ),
+                    );
+                    (creation, out)
+                }
                 Err(TerminalServiceError::Denied(message)) => {
                     assert!(message.contains("sandbox unavailable"), "{message}");
                     assert_eq!(isolated.live_rows(), 0);
@@ -3537,14 +3537,14 @@ mod tests {
         let granted = service_with_policy(&manager, granted_policy());
         let (grant_creation, grant_out) =
             match granted.spawn(&sid, &spawn_request("/bin/sh", &["-c", script.as_str()])) {
-                Ok(creation) => (
-                    creation,
-                    drain_until(
+                Ok(creation) => {
+                    let out = drain_until(
                         &creation.handle,
                         "PROBE_DONE",
                         std::time::Duration::from_secs(30),
-                    ),
-                ),
+                    );
+                    (creation, out)
+                }
                 other => panic!("the grant must admit the PTY: {:?}", other.err()),
             };
         assert!(
