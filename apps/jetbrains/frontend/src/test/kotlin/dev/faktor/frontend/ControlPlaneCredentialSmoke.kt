@@ -271,7 +271,7 @@ object ControlPlaneCredentialSmoke {
             server.start()
             val java = Paths.get(
                 System.getProperty("java.home"), "bin",
-                if (System.getProperty("os.name", "").lowercase().contains("win")) "java.exe" else "java"
+                if (System.getProperty("os.name", "").toLowerCase().contains("win")) "java.exe" else "java"
             ).toString()
             val process = ProcessBuilder(java, "-version").start()
             println("  fake control-plane daemon on ${server.address.port}")

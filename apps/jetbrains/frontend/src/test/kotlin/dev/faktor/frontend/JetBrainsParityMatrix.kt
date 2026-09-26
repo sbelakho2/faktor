@@ -112,7 +112,7 @@ internal object ParityMatrix {
         daemonDriven = true
         val covered = LinkedHashMap<String, Boolean>()
         val consumed = LinkedHashMap<String, Boolean>()
-        val driver = ParityFakeDriver { surface, observable, body ->
+        val driver: ParityFakeDriver = { surface, observable, body ->
             covered[surface] = true
             consumed[observable] = true
             try {
@@ -716,10 +716,10 @@ internal object ParityMatrix {
     }
 }
 
-/** The fake-daemon row driver: the suite submits one check per surface. */
-internal fun interface ParityFakeDriver {
-    fun check(surface: String, observable: String, body: () -> Unit)
-}
+/** The fake-daemon row driver: the suite submits one check per surface.
+ * A function type (not `fun interface`) so the pinned kotlinc 1.3.31 in the
+ * hermetic CI image can compile it. */
+internal typealias ParityFakeDriver = (surface: String, observable: String, body: () -> Unit) -> Unit
 
 /**
  * Submits the fake-daemon observable one surface row names. The suite owns
@@ -730,7 +730,7 @@ internal fun fakeDaemonCheck(surface: String, observable: String) {
         ?: fail("the fake-daemon suite is not running (row $surface)")
     val body = ParityMatrixRegistry.observables[observable]
         ?: fail("no fake-daemon observable named '$observable' for row $surface")
-    driver.check(surface, observable, body)
+    driver(surface, observable, body)
 }
 
 /** The daemon-suite observables, keyed by name, for the current run. */

@@ -396,7 +396,7 @@ private fun verifyAnnouncementDigest(
 // --------------------------------------------------------- process probes
 
 private fun isWindows(): Boolean =
-    System.getProperty("os.name", "").lowercase().contains("win")
+    System.getProperty("os.name", "").toLowerCase().contains("win")
 
 /** True while `pid` names a live process (a zombie still owns its pid). */
 internal fun pidAlive(pid: Long): Boolean {
