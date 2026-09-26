@@ -42,6 +42,10 @@ struct Scenario {
     download_will_begin: Option<Value>,
     /// Methods that must answer with an injected CDP error.
     fail_methods: Vec<String>,
+    /// Methods that receive NO reply at all (the caller must hit its own
+    /// deadline). Used to keep a page's event pump parked in a handler while
+    /// the critical-stream overflow path is exercised.
+    hang_methods: Vec<String>,
     /// Result fields to omit from a successful reply (`method -> [field]`),
     /// so malformed-reply paths can be exercised.
     omit_result_fields: HashMap<String, Vec<String>>,
@@ -94,6 +98,17 @@ impl Scenario {
                 .get("body_text")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            hang_methods: value
+                .get("hang_methods")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             exit_on_method: value
                 .get("exit_on_method")
                 .and_then(Value::as_str)
@@ -328,6 +343,10 @@ async fn serve_connection(stream: TcpStream, server: Arc<Server>, journal: Arc<J
         }));
         if server.scenario.exit_on_method.as_deref() == Some(method.as_str()) {
             std::process::exit(9);
+        }
+        if server.scenario.hang_methods.iter().any(|m| m == &method) {
+            // Deliberately no reply: the caller must hit its own deadline.
+            continue;
         }
         if server.scenario.fail_methods.iter().any(|m| m == &method) {
             let payload = error_reply(

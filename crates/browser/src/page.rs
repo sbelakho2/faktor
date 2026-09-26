@@ -237,6 +237,17 @@ impl Page {
         // the task races the first navigation, and events with no subscriber
         // are dropped.
         let events = inner.client.subscribe_session(&inner.session_id);
+        // Overflow must fail THIS page immediately. The pump handles events
+        // serially and can be parked in a per-event handler deadline (an
+        // interception or download round-trip), so its next `recv()` is not a
+        // bounded-time event: without the hook, a lagged stream would leave
+        // navigate waiting for the pump instead of failing typed.
+        let hook_page = Arc::downgrade(&inner);
+        events.critical.set_overflow_hook(Arc::new(move |skipped| {
+            if let Some(inner) = hook_page.upgrade() {
+                inner.fail_stream(skipped);
+            }
+        }));
         let handle = tokio::spawn(pump_events(pump_inner, events));
         *inner.pump.lock().unwrap() = Some(handle);
         Self { inner }
@@ -728,21 +739,24 @@ impl PageInner {
             if let Some(host) = self.host.upgrade() {
                 host.release_page(&self.target_id);
             }
-        }
-        let client = self.client.clone();
-        let target_id = self.target_id.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = client
-                    .send(
-                        None,
-                        "Target.closeTarget",
-                        json!({ "targetId": target_id }),
-                        deadline_in(2_000),
-                        &CancellationToken::new(),
-                    )
-                    .await;
-            });
+            // Teardown belongs to the FIRST failure only: the overflow hook
+            // and the pump can both observe the same lag, and a second
+            // closeTarget would be a duplicate effect, not a repair.
+            let client = self.client.clone();
+            let target_id = self.target_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = client
+                        .send(
+                            None,
+                            "Target.closeTarget",
+                            json!({ "targetId": target_id }),
+                            deadline_in(2_000),
+                            &CancellationToken::new(),
+                        )
+                        .await;
+                });
+            }
         }
     }
 }

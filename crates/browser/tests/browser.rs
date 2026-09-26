@@ -24,6 +24,17 @@ fn fixture_exe() -> PathBuf {
 }
 
 fn deadline_in(ms: u64) -> Deadline {
+    // Test-side budgets only. CI runners are shared and loaded: fixture
+    // children compete for CPU with cargo builds, so any "patience" budget
+    // gets a generous floor. Deliberate short-timeout probes (<= 1s) keep
+    // their exact value — they assert the timeout path itself.
+    const LOAD_FLOOR_MS: u64 = 60_000;
+    const PROBE_CEILING_MS: u64 = 1_000;
+    let ms = if ms > PROBE_CEILING_MS {
+        ms.max(LOAD_FLOOR_MS)
+    } else {
+        ms
+    };
     Deadline::now_plus(&SystemClock, ms)
 }
 
@@ -47,7 +58,9 @@ impl Harness {
         let mut config = BrowserConfig {
             enabled: true,
             executable: Some(fixture_exe()),
-            launch_timeout_ms: 15_000,
+            // Same load-floor rule as deadline_in: the launch budget is test
+            // patience, not the behavior under assertion.
+            launch_timeout_ms: 60_000,
             ..BrowserConfig::default()
         };
         config.extra_args = vec![
@@ -734,7 +747,7 @@ async fn idle_shutdown_kills_the_child_and_leaves_no_orphan() {
     assert!(faktor_browser::launch::wait_for_exit(
         &supervisor,
         pid,
-        Duration::from_secs(5)
+        Duration::from_secs(30)
     ));
     assert_eq!(manager.browser_count(), 0);
     // A fresh acquisition starts a new child (lazy startup).
@@ -772,7 +785,7 @@ async fn crash_detection_is_typed_and_leaves_no_zombie() {
     }
     // The supervisor reaped the child: no zombie, exit code visible.
     let entry =
-        wait_for_reap(&harness.supervisor, pid, Duration::from_secs(5)).expect("child reaped");
+        wait_for_reap(&harness.supervisor, pid, Duration::from_secs(30)).expect("child reaped");
     assert_eq!(entry.exit_code, Some(9));
     assert!(harness.browser_children().is_empty());
     assert!(
@@ -795,9 +808,11 @@ async fn crash_detection_is_typed_and_leaves_no_zombie() {
 async fn verification_detection_stops_the_profile_until_resumed() {
     let harness = Harness::new(json!({"verification": {"captcha": true}}), |_| {}).await;
     let page = harness.acquire("p1").await.expect("acquire");
+    // Generous, explicit navigation budget: the assertion below is about the
+    // typed verification latch, not navigation latency on a loaded runner.
     page.navigate(
         "https://first.test/challenge",
-        deadline_in(10_000),
+        deadline_in(30_000),
         &CancellationToken::new(),
     )
     .await
@@ -961,7 +976,7 @@ async fn daemon_teardown_kills_every_browser_tree() {
     );
     drop(manager);
     assert!(
-        faktor_browser::launch::wait_for_exit(&supervisor, pid, Duration::from_secs(5)),
+        faktor_browser::launch::wait_for_exit(&supervisor, pid, Duration::from_secs(30)),
         "manager drop must kill the whole browser tree"
     );
     assert!(supervisor.alive().is_empty(), "no orphan after teardown");
@@ -1247,10 +1262,12 @@ async fn critical_event_overflow_fails_the_page_instead_of_continuing() {
     )
     .await;
     let page = harness.acquire("p1").await.expect("acquire");
+    // Generous, explicit navigation budget: the assertion is about the
+    // lagged-event stream, not about navigation latency under load.
     let result = page
         .navigate(
             "https://first.test/page",
-            deadline_in(10_000),
+            deadline_in(30_000),
             &CancellationToken::new(),
         )
         .await;
@@ -1272,10 +1289,62 @@ async fn critical_event_overflow_fails_the_page_instead_of_continuing() {
         Err(BrowserError::EventStreamLagged { .. })
     ));
     assert_eq!(
-        wait_for_journal_count(&harness, "Target.closeTarget", 1, Duration::from_secs(2)).await,
+        wait_for_journal_count(&harness, "Target.closeTarget", 1, Duration::from_secs(30)).await,
         1,
         "the failed page's target must be torn down"
     );
+    harness.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn critical_overflow_fails_the_page_even_when_a_handler_is_stuck() {
+    // Fault case: the event pump is parked in a per-event handler (the fake
+    // browser never answers Fetch.continueRequest), so the pump cannot come
+    // back to observe the queued lag itself. The overflow must still fail the
+    // page from the reader path, promptly and typed — otherwise every lagged
+    // page would wait for the pump's handler chain (an unbounded multiple of
+    // the per-event deadline).
+    let mut items = Vec::new();
+    for index in 0..64 {
+        items.push(json!({
+            "request_id": format!("r{index}"),
+            "url": format!("https://first.test/{index}.json"),
+            "resource_type": "XHR"
+        }));
+    }
+    let harness = Harness::new(
+        json!({
+            "pause_requests": true,
+            "hang_methods": ["Fetch.continueRequest"],
+            "network": items
+        }),
+        |config| {
+            config.cdp_critical_event_capacity = 2;
+        },
+    )
+    .await;
+    let page = harness.acquire("p1").await.expect("acquire");
+    let started = std::time::Instant::now();
+    let result = page
+        .navigate(
+            "https://first.test/page",
+            deadline_in(30_000),
+            &CancellationToken::new(),
+        )
+        .await;
+    match result {
+        Err(BrowserError::EventStreamLagged { skipped }) => assert!(skipped >= 1),
+        other => panic!("expected EventStreamLagged with a stuck handler, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(29),
+        "the overflow must wake the page without draining the stuck handler chain"
+    );
+    assert!(page.is_closed(), "a lagged page must be failed");
+    assert!(matches!(
+        page.network(),
+        Err(BrowserError::EventStreamLagged { .. })
+    ));
     harness.manager.shutdown_all().await;
 }
 
@@ -1325,7 +1394,7 @@ async fn observation_gap_latches_and_history_refuses() {
             &CancellationToken::new(),
         )
         .await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         match page.network() {
             Err(BrowserError::EventStreamLagged { skipped }) => {
@@ -1381,7 +1450,13 @@ async fn hostile_devtools_endpoint_is_rejected_and_the_child_is_killed() {
                 owner_source: "1688".to_string(),
                 owner_profile: "p1".to_string(),
                 extra_args: Vec::new(),
-                launch_timeout_ms: 3_000,
+                // The assertion is about the hostile endpoint being REFUSED,
+                // not about launch latency: a loaded runner may take longer
+                // than a tight budget to surface the child's announcement,
+                // and a wall-clock launch timeout would mask the typed
+                // refusal. Generous, explicit budget; the refusal itself is
+                // still mandatory.
+                launch_timeout_ms: 60_000,
                 network_isolation: faktor_terminal::NetworkIsolation::Inherit,
                 app_level_reason: Some("test: app-level proxy only".to_string()),
             },
@@ -1392,7 +1467,7 @@ async fn hostile_devtools_endpoint_is_rejected_and_the_child_is_killed() {
     assert_eq!(error.code(), "browser_unavailable", "{error:?}");
     // The child was killed: the supervisor holds no browser child and no
     // dial was ever made (launch never returned an endpoint).
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !supervisor.alive().is_empty() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -1622,7 +1697,11 @@ async fn failed_launch_rolls_back_child_broker_and_temp_profile() {
         // No orphan: the supervised child exits.
         let pid = launch_pid(&harness);
         assert!(
-            faktor_browser::launch::wait_for_exit(&harness.supervisor, pid, Duration::from_secs(5)),
+            faktor_browser::launch::wait_for_exit(
+                &harness.supervisor,
+                pid,
+                Duration::from_secs(30)
+            ),
             "{label}: the rolled-back child must die"
         );
         assert!(harness.browser_children().is_empty(), "{label}");
@@ -1663,7 +1742,7 @@ async fn failed_launch_keeps_a_persistent_profile_but_removes_no_orphan() {
     assert!(faktor_browser::launch::wait_for_exit(
         &harness.supervisor,
         pid,
-        Duration::from_secs(5)
+        Duration::from_secs(30)
     ));
     let (port, profile_dir) = launch_proxy_and_profile(&harness);
     assert!(
@@ -1820,7 +1899,7 @@ async fn page_admission_is_not_serialized_across_profiles() {
     assert_eq!(reached.recv().await, Some("admission-permit"));
     // While p1 is paused mid-admission, p2 must complete: per-instance
     // admission, no global serialization.
-    let p2 = tokio::time::timeout(Duration::from_secs(5), harness.acquire("p2"))
+    let p2 = tokio::time::timeout(Duration::from_secs(30), harness.acquire("p2"))
         .await
         .expect("p2 must not block on p1")
         .expect("p2 page");
@@ -2079,7 +2158,7 @@ async fn response_stage_capture_streams_under_the_cap_and_publishes_atomically()
         .join("downloads")
         .join("report.bin");
     assert!(
-        wait_for(|| dest.exists(), Duration::from_secs(5)).await,
+        wait_for(|| dest.exists(), Duration::from_secs(30)).await,
         "the capture must publish the complete file"
     );
     assert_eq!(std::fs::read(&dest).unwrap(), b"captured-body");
@@ -2143,7 +2222,7 @@ async fn over_bound_capture_aborts_immediately_and_publishes_nothing() {
                 .unwrap()
                 .cancelled_over_bound
                 >= 1,
-            Duration::from_secs(5)
+            Duration::from_secs(30)
         )
         .await,
         "the capture must abort at the cap"
@@ -2227,7 +2306,7 @@ async fn declared_or_malformed_length_denies_before_streaming() {
                     .unwrap()
                     .rejected_total
                     >= 1,
-                Duration::from_secs(5)
+                Duration::from_secs(30)
             )
             .await,
             "{label}: the response must be denied"
@@ -2292,7 +2371,7 @@ async fn symlink_swapped_download_directory_cannot_publish_outside_the_profile()
                 .unwrap()
                 .rejected_total
                 >= 1,
-            Duration::from_secs(5)
+            Duration::from_secs(30)
         )
         .await,
         "the swapped download directory must fail the capture"

@@ -80,6 +80,37 @@ pub struct FileMeta {
 
 const DEFAULT_READ_MAX: usize = 4 * 1024 * 1024;
 
+/// Wall deadline for recursive watcher registration. `notify` walks the whole
+/// tree inside its event-loop thread (one `inotify_add_watch` per directory on
+/// Linux), so a pathological root — the filesystem root, a tree with hundreds
+/// of thousands of directories — makes registration unbounded and wedges EVERY
+/// later watcher message (and the caller that is attaching the workspace).
+/// Registration therefore runs on a helper thread and `open` proceeds with an
+/// explicit, loud degradation (no watcher: fingerprint reconciliation only)
+/// once this deadline passes.
+const DEFAULT_WATCH_REGISTRATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `f` on a named helper thread and wait at most `deadline` for its
+/// result. `None` means the deadline elapsed: the helper keeps running and its
+/// result is discarded when it returns (callers must treat that as an
+/// explicit degraded outcome, never as success).
+fn bounded_join<T: Send + 'static>(
+    name: &str,
+    deadline: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    rx.recv_timeout(deadline).ok()
+}
+
 /// Identity of a read: whether the digest covers the WHOLE file or only a
 /// bounded prefix/slice (audit 48). A truncated hash must never be compared
 /// with a whole-file identity: [`ContentDigest::Full`] values may be matched
@@ -128,14 +159,36 @@ fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Registry of open workspaces; `open` is idempotent per root.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkspaceFileService {
     workspaces: Mutex<HashMap<WorkspaceId, WorkspaceHandle>>,
+    /// Bounded recursive-watcher registration deadline (see
+    /// [`DEFAULT_WATCH_REGISTRATION_DEADLINE`]).
+    watch_registration_deadline: std::time::Duration,
+}
+
+impl Default for WorkspaceFileService {
+    fn default() -> Self {
+        Self {
+            workspaces: Mutex::new(HashMap::new()),
+            watch_registration_deadline: DEFAULT_WATCH_REGISTRATION_DEADLINE,
+        }
+    }
 }
 
 impl WorkspaceFileService {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// A service with an explicit watcher-registration deadline: tests (and
+    /// callers whose roots must never pay more than a short bound) can force
+    /// the degraded path deterministically.
+    pub fn with_watch_registration_deadline(deadline: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            watch_registration_deadline: deadline,
+            ..Self::default()
+        })
     }
 
     pub fn open(&self, workspace_id: WorkspaceId, root: PathBuf) -> Result<WorkspaceHandle, Error> {
@@ -162,7 +215,7 @@ impl WorkspaceFileService {
             )));
         }
         let (tx, rx) = mpsc::channel(1024);
-        let mut watcher = RecommendedWatcher::new(
+        let watcher = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(ev) = res {
                     for p in ev.paths {
@@ -188,15 +241,50 @@ impl WorkspaceFileService {
             notify::Config::default(),
         )
         .map_err(|e| Error::internal(format!("watcher: {e}")))?;
-        watcher
-            .watch(&root, RecursiveMode::Recursive)
-            .map_err(|e| Error::internal(format!("watch {}: {e}", root.display())))?;
+        // The filesystem root can never be walked to completion: refuse the
+        // recursive registration up front (explicit degradation) instead of
+        // paying the deadline and leaking a walker thread over `/proc`,
+        // `/sys`, mount points, and every other unbounded tree below it.
+        let watcher = if root.parent().is_none() {
+            tracing::warn!(
+                workspace = workspace_id.raw(),
+                root = %root.display(),
+                "workspace root is the filesystem root: recursive watch registration is unbounded; opening WITHOUT a watcher (fingerprint reconciliation only)"
+            );
+            None
+        } else {
+            let watch_root = root.clone();
+            let registration = bounded_join(
+                "faktor-fs-watch-reg",
+                self.watch_registration_deadline,
+                move || {
+                    let mut watcher = watcher;
+                    let res = watcher.watch(&watch_root, RecursiveMode::Recursive);
+                    (watcher, res)
+                },
+            );
+            match registration {
+                Some((watcher, Ok(()))) => Some(watcher),
+                Some((_watcher, Err(e))) => {
+                    return Err(Error::internal(format!("watch {}: {e}", root.display())));
+                }
+                None => {
+                    tracing::warn!(
+                        workspace = workspace_id.raw(),
+                        root = %root.display(),
+                        deadline_ms = self.watch_registration_deadline.as_millis() as u64,
+                        "watcher registration exceeded its wall deadline; opening WITHOUT a watcher (fingerprint reconciliation only)"
+                    );
+                    None
+                }
+            }
+        };
         let rooted = Arc::new(RootedDir::open(&root)?);
         let handle = WorkspaceHandle {
             workspace_id,
             root,
             rooted,
-            _watcher: Some(Arc::new(Mutex::new(watcher))),
+            _watcher: watcher.map(|w| Arc::new(Mutex::new(w))),
             events: Arc::new(Mutex::new(rx)),
         };
         recover_lock(&self.workspaces).insert(workspace_id, handle.clone());
@@ -267,6 +355,14 @@ impl WorkspaceHandle {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// True when a recursive filesystem watcher was registered at open. An
+    /// explicit degraded open (filesystem root, or registration that exceeded
+    /// its wall deadline) returns `false`: the handle is fully usable, but
+    /// change detection relies on fingerprint reconciliation, never silently.
+    pub fn watcher_attached(&self) -> bool {
+        self._watcher.is_some()
     }
 
     /// Open a one-shot, watcher-less handle whose whole lifetime is ONE
@@ -1831,6 +1927,56 @@ mod tests {
         let service = WorkspaceFileService::new();
         let handle = service.open(WorkspaceId::new(1), root.clone()).unwrap();
         (dir, service, handle)
+    }
+
+    #[test]
+    fn filesystem_root_opens_degraded_instead_of_walking_the_world() {
+        // Fault case that wedged the trusted linux lane: a session whose
+        // workspace defaults to `/` used to start an unbounded recursive
+        // inotify walk and never answer the attach. The root must open
+        // immediately, loudly watcher-less.
+        let service = WorkspaceFileService::new();
+        let handle = service
+            .open(WorkspaceId::new(9), PathBuf::from("/"))
+            .expect("the filesystem root opens in degraded mode");
+        assert!(
+            !handle.watcher_attached(),
+            "the filesystem root must never get a recursive watcher"
+        );
+        service.close(WorkspaceId::new(9));
+    }
+
+    #[test]
+    fn ordinary_workspace_keeps_its_watcher() {
+        let (_d, _service, handle) = fixture();
+        assert!(
+            handle.watcher_attached(),
+            "a normal workspace root must register its watcher"
+        );
+    }
+
+    #[test]
+    fn bounded_join_degrades_once_the_deadline_elapses() {
+        let started = std::time::Instant::now();
+        let slow = bounded_join(
+            "faktor-test-slow-registration",
+            std::time::Duration::from_millis(40),
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                7u8
+            },
+        );
+        assert!(slow.is_none(), "a slow producer must time out, not block");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the wait must end at the deadline, not at the producer"
+        );
+        let fast = bounded_join(
+            "faktor-test-fast-registration",
+            std::time::Duration::from_secs(5),
+            || 9u8,
+        );
+        assert_eq!(fast, Some(9));
     }
 
     #[test]

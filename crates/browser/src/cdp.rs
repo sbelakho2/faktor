@@ -129,6 +129,12 @@ pub(crate) struct CriticalQueue {
     capacity: usize,
     state: Mutex<CriticalState>,
     notify: Notify,
+    /// Immediate overflow consumer (the owning page's `fail_stream`). Called
+    /// from the reader task the moment an overflow latches, so the page fails
+    /// with the typed lag WITHOUT waiting for the event pump to come back to
+    /// `recv()` (a pump can be parked in a per-event handler deadline for
+    /// seconds; lag latency must not be a multiple of that).
+    overflow_hook: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
 }
 
 impl CriticalQueue {
@@ -142,25 +148,45 @@ impl CriticalQueue {
                 closed: false,
             }),
             notify: Notify::new(),
+            overflow_hook: Mutex::new(None),
         }
     }
 
+    /// Register the immediate overflow consumer. One page owns one session's
+    /// queue; the last registration wins by design.
+    pub(crate) fn set_overflow_hook(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+        *self.overflow_hook.lock().unwrap() = Some(hook);
+    }
+
     fn push(&self, event: CdpEvent) {
-        let mut state = self.state.lock().unwrap();
-        if state.failed {
-            return;
+        let mut overflowed = None;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.failed {
+                return;
+            }
+            if state.queue.len() >= self.capacity {
+                // Abandon every queued event plus this one: the session state
+                // is unknowable from here on.
+                state.skipped = state.queue.len() as u64 + 1;
+                state.queue.clear();
+                state.failed = true;
+                overflowed = Some(state.skipped);
+            } else {
+                state.queue.push_back(event);
+            }
         }
-        if state.queue.len() >= self.capacity {
-            // Abandon every queued event plus this one: the session state is
-            // unknowable from here on.
-            state.skipped = state.queue.len() as u64 + 1;
-            state.queue.clear();
-            state.failed = true;
-        } else {
-            state.queue.push_back(event);
-        }
-        drop(state);
         self.notify.notify_one();
+        if let Some(skipped) = overflowed {
+            let hook = self
+                .overflow_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook(skipped);
+            }
+        }
     }
 
     fn close(&self) {
@@ -605,6 +631,39 @@ mod tests {
             reader: AsyncMutex::new(None),
             config,
         })
+    }
+
+    #[test]
+    fn overflow_hook_fires_from_push_without_a_consumer() {
+        // The page's fail_stream must be reachable the moment overflow
+        // latches: a pump parked in a per-event handler must never delay the
+        // typed lag. The hook is called with the exact skipped count, once.
+        let queue = CriticalQueue::new(2);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<u64>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        queue.set_overflow_hook(std::sync::Arc::new(move |skipped| {
+            sink.lock().unwrap().push(skipped);
+        }));
+        for index in 0..5u64 {
+            queue.push(CdpEvent {
+                session_id: Some("s1".into()),
+                method: "Fetch.requestPaused".into(),
+                params: serde_json::json!({ "requestId": format!("r{index}") }),
+            });
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![3],
+            "overflow on the 3rd push (capacity 2) must call the hook exactly once"
+        );
+        // Later pushes are already failed: no additional hook call.
+        queue.push(CdpEvent {
+            session_id: Some("s1".into()),
+            method: "Fetch.requestPaused".into(),
+            params: serde_json::json!({ "requestId": "late" }),
+        });
+        assert_eq!(*seen.lock().unwrap(), vec![3]);
     }
 
     #[test]
