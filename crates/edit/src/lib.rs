@@ -1308,38 +1308,58 @@ fn first_parse_error(_lang: &str, language: &tree_sitter::Language, src: &str) -
 /// Test seam: fired between the stage phase (all validation, zero writes)
 /// and the commit phase of `apply_many`. Deterministic multi-file race tests
 /// modify a middle file in this gap so the commit-time CAS must detect it.
+///
+/// THREAD-LOCAL by design: the hook belongs to the test thread that installed
+/// it. A process-global seam is visible to every sibling test running in the
+/// same binary, so a concurrent rollback/commit could fire another test's
+/// hook and flip its expected outcome (observed as a stage-CAS conflict where
+/// a rollback conflict was expected).
 #[cfg(test)]
 type CommitGapHook = Box<dyn Fn() + Send>;
 #[cfg(test)]
-static COMMIT_GAP: std::sync::OnceLock<std::sync::Mutex<Option<CommitGapHook>>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static COMMIT_GAP: std::cell::RefCell<Option<CommitGapHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn set_commit_gap_hook(hook: Option<CommitGapHook>) {
+    COMMIT_GAP.with(|slot| *slot.borrow_mut() = hook);
+}
 #[cfg(test)]
 fn commit_gap_hook() {
-    if let Some(lock) = COMMIT_GAP.get() {
-        if let Some(hook) = lock.lock().expect("seam poisoned").as_ref() {
+    COMMIT_GAP.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
             hook();
         }
-    }
+    });
 }
 #[cfg(not(test))]
 fn commit_gap_hook() {}
 
 /// Test seam: fired between the engine's own write of a committed file and
 /// its roll-back restore (the rollback CAS must detect the adversary). Used
-/// by the roll-back conflict tests; sibling tests that touch this seam
-/// serialize through `ROLLBACK_GAP_LOCK`.
+/// by the roll-back conflict tests. THREAD-LOCAL for the same reason as
+/// [`COMMIT_GAP`]: a sibling test's concurrent rollback must never fire this
+/// test's hook early (it would move the adversary before the engine's own
+/// write and turn the expected rollback conflict into a stage conflict).
 #[cfg(test)]
 type RollbackGapHook = Box<dyn Fn() + Send>;
 #[cfg(test)]
-static ROLLBACK_GAP: std::sync::OnceLock<std::sync::Mutex<Option<RollbackGapHook>>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static ROLLBACK_GAP: std::cell::RefCell<Option<RollbackGapHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn set_rollback_gap_hook(hook: Option<RollbackGapHook>) {
+    ROLLBACK_GAP.with(|slot| *slot.borrow_mut() = hook);
+}
 #[cfg(test)]
 pub(crate) fn rollback_gap_hook() {
-    if let Some(lock) = ROLLBACK_GAP.get() {
-        if let Some(hook) = lock.lock().expect("seam poisoned").as_ref() {
+    ROLLBACK_GAP.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
             hook();
         }
-    }
+    });
 }
 #[cfg(not(test))]
 fn rollback_gap_hook() {}
@@ -1967,18 +1987,12 @@ mod tests {
         let hook = Box::new(move || {
             fs::write(&f2abs, b"external-writer-content").unwrap();
         });
-        *COMMIT_GAP
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("seam poisoned") = Some(hook);
+        set_commit_gap_hook(Some(hook));
         let outcome = engine
             .apply_many(&h, &id, &reqs, RepairMode::Rollback, None)
             .unwrap();
-        // Cleanup the global seam for sibling tests.
-        *COMMIT_GAP
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("seam poisoned") = None;
+        // Cleanup the thread-local seam for later tests on this thread.
+        set_commit_gap_hook(None);
         assert_eq!(outcome.committed.len(), 1, "{outcome:?}");
         assert_eq!(outcome.committed[0].path, "f1.txt");
         assert_eq!(outcome.conflicted.len(), 1, "{outcome:?}");
@@ -2675,15 +2689,9 @@ mod tests {
         let hook = Box::new(move || {
             fs::write(&f1, b"external-again").unwrap();
         });
-        *ROLLBACK_GAP
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("seam poisoned") = Some(hook);
+        set_rollback_gap_hook(Some(hook));
         let result = engine.commit_prepared(&h, &id, txn).unwrap();
-        *ROLLBACK_GAP
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("seam poisoned") = None;
+        set_rollback_gap_hook(None);
         assert!(result.rolled_back.is_empty(), "{result:?}");
         assert_eq!(
             result.rollback_conflicts,
