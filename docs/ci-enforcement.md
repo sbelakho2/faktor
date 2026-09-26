@@ -151,9 +151,10 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   `rust:1.98.0` is a rustup baseline only — `rust-toolchain.toml` remains the
   Rust channel authority. `sh scripts/check-ci-image-pins.sh` enforces the
   pin in CI (the `image-pins` step in the PR and trusted workflows); the
-  Windows self-hosted `powershell` line is the only documented
-  `digest-exempt:` exception (no `docker.io` library image exists to record
-  a digest from). Bump a digest deliberately with
+  self-hosted shell pseudo-images (`powershell` on Windows, `bash` on the
+  local-backend darwin agent) are the only documented `digest-exempt:`
+  exceptions (no container image is pulled for either). Bump a digest
+  deliberately with
   `docker buildx imagetools inspect <image:tag>`.
 - Gradle: `apps/jetbrains/gradle/wrapper/gradle-wrapper.properties` pins
   `distributionSha256Sum` (published

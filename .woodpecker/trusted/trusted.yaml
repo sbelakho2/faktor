@@ -68,8 +68,9 @@
 # the date the digest was recorded), including the Rust baseline image.
 # `scripts/check-ci-image-pins.sh` enforces this in the `image-pins` step: an
 # image line without `@sha256:` fails the pipeline unless it is explicitly
-# annotated `digest-exempt: <reason>` (the Windows self-hosted `powershell`
-# image is the only exemption). The toolchain file, not the image, remains
+# annotated `digest-exempt: <reason>` (the self-hosted Windows `powershell`
+# and the local-backend darwin `bash` shell pseudo-images are the documented
+# exemptions). The toolchain file, not the image, remains
 # the Rust channel authority.
 #
 # Hermetic toolchain (P1): trusted lanes run NO apt at all. The rust/node
@@ -108,8 +109,9 @@ when:
 
 steps:
   # ---------------------------------------------------------- image pins --
-  # Every image in every workflow must be digest-pinned (the Windows
-  # self-hosted powershell line is the only documented digest-exempt case).
+  # Every image in every workflow must be digest-pinned (the self-hosted
+  # Windows powershell and the local-backend darwin bash shell lines are the
+  # documented digest-exempt cases).
   - name: image-pins
     image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc # alpine:3.20 @ 2026-09-23
     when:
@@ -443,7 +445,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"perf","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/perf.json
   - name: darwin-check
-    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
+    image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     when:
       matrix:
         platform: darwin/arm64
@@ -467,7 +469,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-check","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-check.json
   - name: darwin-test
-    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
+    image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     when:
       matrix:
         platform: darwin/arm64
@@ -491,7 +493,7 @@ steps:
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-test","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-test.json
   - name: darwin-doctor
-    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
+    image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     when:
       matrix:
         platform: darwin/arm64
@@ -699,7 +701,7 @@ steps:
           --key-id "${FAKTOR_ATTEST_SIGN_KEY_ID:-faktor-ci}" \
           --emit-log-block
   - name: certificate-darwin
-    image: bash@sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f # bash:latest @ 2026-09-23
+    image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     depends_on: [darwin-check, darwin-test, darwin-doctor]
     when:
       matrix:

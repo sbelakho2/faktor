@@ -7,11 +7,13 @@
 # tag is mutable, so a compromised or retagged upstream image would silently
 # change what CI runs.
 #
-# The one documented exemption is the Windows self-hosted shell image
-# (`image: powershell`): Woodpecker's Windows backend does not pull it as a
-# container and no `docker.io` library image exists to record a digest from.
-# Such a line MUST carry an explicit inline annotation:
+# The documented exemptions are the self-hosted shell pseudo-images: the
+# Windows backend runs `image: powershell` natively (no container, no
+# `docker.io` library image to record a digest from) and the local-backend
+# darwin agent runs `image: bash` as the host shell (no container image is
+# pulled). Such a line MUST carry an explicit inline annotation:
 #
+#   image: bash # digest-exempt: <reason>
 #   image: powershell # digest-exempt: <reason>
 #
 # Anything else missing `@sha256:` is a violation.
@@ -23,8 +25,8 @@
 #
 #   * a reference to the Faktor CI image MUST use `@sha256:<64 hex>`; a tag
 #     reference (`faktor-ci:latest`, `registry/faktor-ci:<tag>`) is rejected
-#     even when annotated `digest-exempt:` (that exemption is for the Windows
-#     shell image only);
+#     even when annotated `digest-exempt:` (that exemption is for the
+#     local-backend shell pseudo-images only);
 #   * the referenced digest MUST match the recorded digest (when the digest
 #     record exists / is supplied via `--digest-file`).
 #
@@ -115,7 +117,7 @@ scan_file() {
         # The Faktor CI image is only valid by digest, and the digest must be
         # the one recorded by scripts/build-ci-image.sh. Tag references are
         # rejected even with digest-exempt: that exemption exists only for the
-        # self-hosted Windows shell image.
+        # self-hosted shell pseudo-images (Windows powershell, darwin bash).
         if printf '%s' "$value" | grep -qE '(^|[/:])faktor-ci([:@]|$)'; then
             if ! printf '%s' "$value" | grep -qE '@sha256:[0-9a-f]{64}$'; then
                 echo "check-ci-image-pins: VIOLATION: $file:$lineno: Faktor CI image '$value' must be pinned by digest (image: <ref>@sha256:<64 hex>); tag references are rejected" >&2
@@ -154,7 +156,7 @@ scan_file() {
             echo "check-ci-image-pins: exempt: $file:$lineno: '$value' ($reason)"
             continue
         fi
-        echo "check-ci-image-pins: VIOLATION: $file:$lineno: image '$value' lacks @sha256:<64 hex> (pin the multi-arch index digest; use 'digest-exempt: <reason>' only for the Windows self-hosted shell image)" >&2
+        echo "check-ci-image-pins: VIOLATION: $file:$lineno: image '$value' lacks @sha256:<64 hex> (pin the multi-arch index digest; use 'digest-exempt: <reason>' only for the self-hosted shell pseudo-images)" >&2
         echo "x" >>"$FAILLOG"
     done
 }
