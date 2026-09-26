@@ -203,7 +203,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
   - name: static
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -245,7 +245,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/static.json
   - name: docs
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -285,7 +285,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/docs.json
   - name: vscode
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
@@ -336,7 +336,7 @@ steps:
         artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
         artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
         artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
   - name: jetbrains-build
     # Runs on the digest-pinned Faktor CI image: it carries git (the lane
@@ -381,7 +381,7 @@ steps:
           artifacts="[]"
           artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         fi
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
     image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
@@ -434,7 +434,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
   - name: perf
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -472,7 +472,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"perf","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"perf","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/perf.json
   - name: darwin-check
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
@@ -502,7 +502,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-check","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-check","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-check.json
   - name: darwin-test
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
@@ -532,7 +532,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-test","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-test","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-test.json
   - name: darwin-doctor
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
@@ -562,7 +562,7 @@ steps:
         tree="$(git rev-parse 'HEAD^{tree}')"
         artifacts="[]"
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-doctor","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"darwin-doctor","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-doctor.json
   - name: windows-check
     image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
