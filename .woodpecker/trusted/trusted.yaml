@@ -705,7 +705,7 @@ steps:
         set -eu
         event=push
         if [ -n "${CI_COMMIT_TAG:-}" ]; then event=tag; fi
-        observed_pipeline_id="$(node - "${WOODPECKER_HOST:-}" "${WOODPECKER_TOKEN:-}" "$CI_REPO" "${CI_PIPELINE_NUMBER:?}" <<'OBSERVED_ID'
+        observed_pipeline_id="$(node - "$WOODPECKER_HOST" "$WOODPECKER_TOKEN" "$CI_REPO" "$CI_PIPELINE_NUMBER" <<'OBSERVED_ID'
         const [host, token, repo, number] = process.argv.slice(2);
         const fail = (message) => {
           console.error("observed-pipeline-id-lookup-failed: " + message);
@@ -714,7 +714,7 @@ steps:
         if (!host || !token || !repo || !number) {
           fail("WOODPECKER_HOST, WOODPECKER_TOKEN, CI_REPO and CI_PIPELINE_NUMBER are required");
         }
-        const base = host.replace(/\/+$/, "");
+        const base = host.replace(/[/]+$/, "");
         const get = async (path) => {
           const res = await fetch(base + "/api" + path, { headers: { Authorization: "Bearer " + token } });
           if (!res.ok) throw new Error("GET " + path + " -> HTTP " + res.status);
@@ -746,7 +746,7 @@ steps:
           --rust-toolchain-file rust-toolchain.toml \
           --ci-image-ref "ghcr.io/sbelakho2/faktor-ci@$(grep -oE 'sha256:[0-9a-f]{64}' docker/faktor-ci/image-digest.txt | head -n 1)" \
           --from-lanes target/certification/lanes \
-          --key-id "${FAKTOR_ATTEST_SIGN_KEY_ID:-faktor-ci}" \
+          --key-id "$FAKTOR_ATTEST_SIGN_KEY_ID" \
           --emit-log-block
   - name: certificate-darwin
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
