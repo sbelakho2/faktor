@@ -144,6 +144,12 @@ steps:
   # Long lanes stay #[ignore]-gated.
   - name: linux
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    # The workspace test run includes crates/browser's BrokerOnly confinement
+    # tests, whose spawn layer needs unshare(CLONE_NEWNET); Docker's default
+    # capability set refuses it, so the step runs privileged. That is allowed
+    # only because the TRUSTED project carries trusted.security=true
+    # (admin-granted); pull_request events never reach this file/project.
+    privileged: true
     when:
       matrix:
         platform: linux/amd64

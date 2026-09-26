@@ -1453,6 +1453,22 @@ fn broker_port_refuses_connections(port: u16) -> bool {
     .is_err()
 }
 
+/// The rollback tear-down is asynchronous: the broker's listener closes on the
+/// broker task, so a loaded host can observe the port still accepting for a
+/// moment after the failure surfaced. Poll bounded; the invariant asserted by
+/// callers stays "the broker is shut down", not "it was shut down before the
+/// check ran".
+fn wait_for_broker_shutdown(port: u16, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if broker_port_refuses_connections(port) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    broker_port_refuses_connections(port)
+}
+
 // ---------------------------------------------------- 1. transactional open
 
 #[tokio::test]
@@ -1613,7 +1629,7 @@ async fn failed_launch_rolls_back_child_broker_and_temp_profile() {
         // The broker is stopped: its loopback port refuses connections.
         let (port, profile_dir) = launch_proxy_and_profile(&harness);
         assert!(
-            broker_port_refuses_connections(port),
+            wait_for_broker_shutdown(port, Duration::from_secs(10)),
             "{label}: the egress broker must be shut down"
         );
         // The temporary incognito profile is gone.
