@@ -125,6 +125,10 @@ struct CriticalState {
 /// A bounded, per-session queue for critical events. Overflow latches the
 /// queue failed (all pending events are abandoned) and wakes the consumer
 /// with an explicit lag; the stream never silently continues.
+/// Immediate overflow consumer (the owning page's `fail_stream`), invoked by
+/// [`CriticalQueue::push`] from the reader path.
+pub(crate) type OverflowHook = Arc<dyn Fn(u64) + Send + Sync>;
+
 pub(crate) struct CriticalQueue {
     capacity: usize,
     state: Mutex<CriticalState>,
@@ -134,7 +138,7 @@ pub(crate) struct CriticalQueue {
     /// with the typed lag WITHOUT waiting for the event pump to come back to
     /// `recv()` (a pump can be parked in a per-event handler deadline for
     /// seconds; lag latency must not be a multiple of that).
-    overflow_hook: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+    overflow_hook: Mutex<Option<OverflowHook>>,
 }
 
 impl CriticalQueue {
@@ -154,7 +158,7 @@ impl CriticalQueue {
 
     /// Register the immediate overflow consumer. One page owns one session's
     /// queue; the last registration wins by design.
-    pub(crate) fn set_overflow_hook(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+    pub(crate) fn set_overflow_hook(&self, hook: OverflowHook) {
         *self.overflow_hook.lock().unwrap() = Some(hook);
     }
 
