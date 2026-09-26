@@ -3781,8 +3781,38 @@ async fn mutating_runs_always_isolate_and_only_the_test_seam_drives_the_owner() 
     );
     // Everything else is byte-parity: same message stream and turn-record
     // envelope on both wirings.
+    //
+    // The session reaches ReadyForNextTurn while its record is still
+    // `active`: the record is finalized only AFTER the end-of-turn content
+    // sync and the final gate write. Wait on the observable this section
+    // actually needs — a non-`active` record on BOTH wirings — with a
+    // generous deadline; a shadow record that never finalizes still fails
+    // loudly here (the same convention as the direct/shadow parity test).
     let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
     let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
+    {
+        let finished =
+            |s: &Option<String>| matches!(s.as_deref(), Some(status) if status != "active");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        loop {
+            let a = ha
+                .turn_record(receipt_a.op_id.unwrap())
+                .unwrap()
+                .map(|r| r.status);
+            let b = hb
+                .turn_record(receipt_b.op_id.unwrap())
+                .unwrap()
+                .map(|r| r.status);
+            if finished(&a) && finished(&b) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "turn records never reached terminal status: a={a:?} b={b:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
     assert_eq!(
         ha.message_count().unwrap(),
         hb.message_count().unwrap(),
