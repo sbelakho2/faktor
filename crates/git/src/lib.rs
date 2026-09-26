@@ -681,6 +681,12 @@ impl WorktreeManager {
         }
     }
 
+    /// NOTE: keys are the CALLER's path, while `acquire_mutation_guard`
+    /// canonicalizes before locking. A symlinked path therefore aliases a
+    /// different lock (macOS `/var` -> `/private/var`), which historically
+    /// hid contract violations: a locked read taken while holding the guard
+    /// deadlocks on a canonical path but silently passed under a symlink.
+    /// Callers holding the guard must use the `*_unlocked` family.
     fn lock_for(&self, repo: &Path) -> Arc<tokio::sync::RwLock<()>> {
         // Classified: the per-repo lock map is a DERIVED ownership cache
         // (each entry is a live tokio RwLock guard object). A poisoned guard
@@ -1340,6 +1346,16 @@ impl WorktreeManager {
     pub async fn is_clean(&self, repo: &Path, owner: ProcessOwner) -> Result<bool, Error> {
         let out = self
             .git_read(repo, &["status", "--porcelain"], owner)
+            .await?;
+        Ok(out.trim().is_empty())
+    }
+
+    /// [`Self::is_clean`] while the CALLER holds the repository mutation
+    /// guard: the guard IS the lock, so the locked read path would
+    /// self-deadlock on the same repository.
+    pub async fn is_clean_unlocked(&self, repo: &Path, owner: ProcessOwner) -> Result<bool, Error> {
+        let out = self
+            .git_unlocked(repo, &["status", "--porcelain"], owner)
             .await?;
         Ok(out.trim().is_empty())
     }
@@ -3421,8 +3437,12 @@ mod tests {
             );
             // The parent is the previous HEAD (the branch ref moved under the
             // old-value CAS).
+            // The caller holds the mutation guard: the guard IS the lock, so
+            // the locked read path would self-deadlock (tokio RwLock write
+            // then read in the same task). On macOS the temp root's /var
+            // symlink aliased the lock keys and hid it; Linux does not.
             let parent = mgr
-                .git_read(&repo, &["rev-parse", "HEAD^"], ProcessOwner::Daemon)
+                .git_unlocked(&repo, &["rev-parse", "HEAD^"], ProcessOwner::Daemon)
                 .await
                 .unwrap()
                 .trim()
@@ -3430,7 +3450,7 @@ mod tests {
             assert_eq!(Some(parent), before_head);
             // HEAD's tree lists EXACTLY the manifest (path/mode/oid).
             let listing = mgr
-                .git_read(
+                .git_unlocked(
                     &repo,
                     &["ls-tree", "-r", "--full-tree", "HEAD"],
                     ProcessOwner::Daemon,
@@ -3447,7 +3467,10 @@ mod tests {
             assert_eq!(paths, expected);
             // The real index is refreshed to the committed tree: the working
             // tree is clean after the verified publication.
-            assert!(mgr.is_clean(&repo, ProcessOwner::Daemon).await.unwrap());
+            assert!(mgr
+                .is_clean_unlocked(&repo, ProcessOwner::Daemon)
+                .await
+                .unwrap());
             drop(guard);
 
             // A chmod-only manifest change is a DIFFERENT tree, and the
@@ -3614,7 +3637,7 @@ mod tests {
             );
             // The remote still holds the first verified commit.
             assert_eq!(
-                mgr.remote_branch_oid(&repo, "origin", "main", ProcessOwner::Daemon)
+                mgr.remote_branch_oid_unlocked(&repo, "origin", "main", ProcessOwner::Daemon)
                     .await
                     .unwrap()
                     .as_deref(),
