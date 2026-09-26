@@ -156,6 +156,13 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
+      # Heavy daemon tests each spawn a db actor thread plus tokio workers;
+      # the default nproc-way libtest parallelism livelocked
+      # tests::prompt_runs_a_real_turn_and_reports_the_final_state (futex
+      # ping-pong between the prompt thread and the actor, no I/O, 30+ min)
+      # on the shared runner while the same test passes in isolation. Two
+      # workers keeps each actor's timing loop live.
+      RUST_TEST_THREADS: "2"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
