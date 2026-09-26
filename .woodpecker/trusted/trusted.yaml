@@ -635,6 +635,55 @@ steps:
           artifact_digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         } | ConvertTo-Json -Compress -Depth 6
         Set-Content -Path target/certification/lanes/windows-test.json -Value $marker
+  - name: release-artifacts
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    depends_on: [static, vscode, jetbrains-build]
+    when:
+      matrix:
+        platform: linux/amd64
+      status: [success]
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+      CARGO_BUILD_JOBS: "4"
+    volumes:
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
+      # The static lane's supply-chain build already compiled the release
+      # CLI into this cache; the build below is at most incremental.
+      - faktor-trusted-target-static:/woodpecker-cache/target
+      # Host-extractable copy of the EXACT bytes the attestation hashes:
+      # the trusted release artifact set (faktor-cli, VSIX, JetBrains zip).
+      - faktor-trusted-release-artifacts:/release-artifacts
+    commands:
+      - cargo build --release -p faktor-cli
+      - mkdir -p target/release && cp "$CARGO_TARGET_DIR/release/faktor-cli" target/release/faktor-cli
+      - |
+        set -eu
+        mkdir -p target/certification/lanes /release-artifacts
+        cli_sha="$(sha256sum target/release/faktor-cli | cut -d' ' -f1)"
+        vsix_path="$(ls apps/vscode/*.vsix | head -n 1)"
+        zip_path="$(find apps/jetbrains -type f -path '*/build/distributions/*.zip' | head -n 1)"
+        [ -n "$vsix_path" ] && [ -n "$zip_path" ] || { echo "release-artifacts: packaged outputs missing" >&2; exit 1; }
+        for rel in target/release/faktor-cli "$vsix_path" "$zip_path"; do
+          mkdir -p "/release-artifacts/$(dirname "$rel")"
+          cp "$rel" "/release-artifacts/$rel"
+        done
+        CMDS="$(cat <<'CMDS'
+        cargo build --release -p faktor-cli
+        mkdir -p target/release && cp "$CARGO_TARGET_DIR/release/faktor-cli" target/release/faktor-cli
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        artifacts="[{\"path\":\"target/release/faktor-cli\",\"sha256\":\"sha256:$cli_sha\"}]"
+        artifact_digest="$(printf 'sha256:%s\t%s\n' "$cli_sha" "target/release/faktor-cli" | sha256sum | cut -d' ' -f1)"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"release-artifacts","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/release-artifacts.json
   - name: certificate
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -645,6 +694,7 @@ steps:
       - jetbrains-build
       - jetbrains-smoke
       - perf
+      - release-artifacts
     when:
       matrix:
         platform: linux/amd64
