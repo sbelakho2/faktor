@@ -2950,7 +2950,6 @@ fn process_alive(pid: u32) -> bool {
 /// members are consumed by the single reaper; the wait observes extinction,
 /// it does not force it.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 pub fn wait_for_group_gone(pgid: u32, timeout: std::time::Duration) -> bool {
     let started = std::time::Instant::now();
     loop {
