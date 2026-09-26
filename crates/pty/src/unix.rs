@@ -755,6 +755,39 @@ pub(crate) mod reap_injection {
 /// reaped]` pair runs under the shared reap serial so a teardown's `[check
 /// reaped → signal]` can never interleave between the reap and the state
 /// observation: once `reaped` is set, no signal is ever sent again.
+/// Idle window (ms) between master reads before the single reaper probes
+/// with `waitpid(WNOHANG)`. Linux keeps the master open while a detached
+/// descendant (or the guardian's slave fd) holds the pty, so EOF can never
+/// arrive and the leader must be consumed from the idle path; a poll timeout
+/// also proves no output is pending at that instant, so nothing is dropped.
+const READ_IDLE_POLL_MS: libc::c_int = 50;
+
+/// Reap the child if it exited while the master stayed open. Returns true
+/// once the child is consumed (pid or ECHILD). Runs under the reap serial,
+/// the one-reaping-authority discipline.
+fn reap_if_exited(
+    pid: libc::pid_t,
+    reaped: &Arc<AtomicBool>,
+    reap_serial: &Arc<Mutex<()>>,
+) -> bool {
+    let _serial = reap_serial
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reaped.load(Ordering::SeqCst) {
+        return true;
+    }
+    let mut status = 0;
+    // SAFETY: the pid is this module's own child and `status` is a live stack local.
+    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if r == pid || (r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
+        #[cfg(test)]
+        reap_injection::fire(pid);
+        reaped.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
 fn reader_loop(
     mfd: OwnedFd,
     pid: libc::pid_t,
@@ -766,6 +799,31 @@ fn reader_loop(
     let mfd_raw = mfd.as_raw_fd();
     let mut buf = [0u8; 8192];
     loop {
+        // Bounded idle poll before the read: with a detached descendant (or
+        // the guardian's slave) holding the pty open, the master never
+        // reaches EOF, so the leader's exit is only observable through
+        // `waitpid`. A poll timeout also proves no output is pending, so
+        // consuming the leader then cannot drop buffered bytes.
+        {
+            let mut pfd = libc::pollfd {
+                fd: mfd_raw,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd pointing at the live owned master fd.
+            let pr = unsafe { libc::poll(&mut pfd, 1, READ_IDLE_POLL_MS) };
+            if pr < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            } else if pr == 0 {
+                if reap_if_exited(pid, &reaped, &reap_serial) {
+                    break;
+                }
+                continue;
+            }
+        }
         // SAFETY: the fd is owned/open on this path and the buffer is a live bounded slice whose length is passed exactly.
         let n = unsafe { libc::read(mfd_raw, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
@@ -798,8 +856,13 @@ fn reader_loop(
             if r == pid
                 || (r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
             {
-                #[cfg(test)]
-                reap_injection::fire(pid);
+                // The idle path may already have consumed (and fired for)
+                // the child; the publication is idempotent and the injection
+                // seam must fire exactly once per pid.
+                if !reaped.load(Ordering::SeqCst) {
+                    #[cfg(test)]
+                    reap_injection::fire(pid);
+                }
                 // The child is consumed (or provably not ours): its pid may
                 // now be recycled, so every subsequent teardown signal must
                 // be suppressed. Published inside the serial so a teardown
@@ -862,6 +925,7 @@ mod tests {
 
     #[test]
     fn interactive_round_trip_through_a_real_tty() {
+        let _serial = crate::test_serial();
         // read a line, echo it back; echo disabled so we assert OUR bytes.
         let cfg = sh_cfg("stty -echo; read x; echo out:$x; exit 0");
         let mut pty = Pty::spawn(&cfg).unwrap();
@@ -876,6 +940,7 @@ mod tests {
 
     #[test]
     fn resize_reaches_the_kernel_and_the_shell() {
+        let _serial = crate::test_serial();
         // `stty size` prints the live rows/cols AFTER we resize: the child
         // waits on a line of input first, so the test is not a startup race
         // (Linux CI exposed the child winning it).
@@ -894,6 +959,7 @@ mod tests {
 
     #[test]
     fn huge_output_stays_bounded_and_never_deadlocks() {
+        let _serial = crate::test_serial();
         // seq 1..200000 through a pty: the reader drains continuously (the
         // child never blocks) and RAM stays bounded by the ring.
         let cfg = sh_cfg("seq 1 200000; exit 0");
@@ -914,6 +980,7 @@ mod tests {
 
     #[test]
     fn drop_is_emergency_sigkill_and_fast() {
+        let _serial = crate::test_serial();
         let cfg = sh_cfg("sleep 300");
         let (pid, elapsed) = {
             let pty = Pty::spawn(&cfg).unwrap();
@@ -931,6 +998,7 @@ mod tests {
 
     #[test]
     fn drop_kills_the_process_group() {
+        let _serial = crate::test_serial();
         let cfg = sh_cfg("sleep 300");
         let pid = {
             let pty = Pty::spawn(&cfg).unwrap();
@@ -953,6 +1021,7 @@ mod tests {
 
     #[test]
     fn naturally_exited_child_is_reaped_by_the_reader_thread() {
+        let _serial = crate::test_serial();
         // The reader thread is the single reaper: after a natural exit the
         // child must be reaped (no zombie) — is_alive() turns false.
         let cfg = sh_cfg("echo done; exit 0");
@@ -1016,6 +1085,7 @@ mod tests {
     /// `signal_group(SIGKILL)` Drop calls) must be no-ops after the reap.
     #[test]
     fn teardown_after_reap_never_signals_the_stale_pid() {
+        let _serial = crate::test_serial();
         let mut pty = Pty::spawn(&sh_cfg("exit 0")).unwrap();
         let pid = pty.pid() as libc::pid_t;
         wait_reaped(pid, "teardown-after-reap fixture");
@@ -1042,6 +1112,7 @@ mod tests {
     /// its whole group is taken by the teardown.
     #[test]
     fn teardown_before_reap_still_signals_and_kills_the_group() {
+        let _serial = crate::test_serial();
         let mut pty = Pty::spawn(&sh_cfg("sleep 300")).unwrap();
         let pid = pty.pid() as libc::pid_t;
         assert!(pty.is_alive(), "fixture child must be live");
@@ -1062,6 +1133,7 @@ mod tests {
     /// surviving group after the reap.
     #[test]
     fn reaped_leader_with_surviving_descendants_is_cleaned_without_a_stale_signal() {
+        let _serial = crate::test_serial();
         // `nohup` (with a grace delay so its SIG_IGN lands before the leader
         // exits) keeps the detached descendant alive across the session
         // leader's exit, which otherwise HUPs the foreground group.
@@ -1091,6 +1163,7 @@ mod tests {
     /// published.
     #[test]
     fn teardown_cannot_signal_inside_the_reap_publication_window() {
+        let _serial = crate::test_serial();
         // The child lives until we let it exit; the hook fires in the reader
         // after waitpid consumed it.
         let pty = Arc::new(Mutex::new(
@@ -1152,6 +1225,7 @@ mod tests {
 
     #[test]
     fn sigterm_resisting_child_is_escalated_and_reaped() {
+        let _serial = crate::test_serial();
         // The child traps SIGTERM: shutdown() must escalate to SIGKILL and
         // the single reaper must reap it (no zombie, join succeeds).
         let cfg = sh_cfg("trap '' TERM; echo armed; sleep 30");
@@ -1175,6 +1249,7 @@ mod tests {
 
     #[test]
     fn idle_pty_reader_does_not_busy_poll_and_wakes_on_output() {
+        let _serial = crate::test_serial();
         // The reader blocks in read(2): an idle pty performs no periodic
         // wakeups. The child sleeps 1s then writes; the output must arrive
         // promptly after the write (a 2 ms-polling reader would also pass,
@@ -1204,6 +1279,7 @@ mod tests {
 
     #[test]
     fn spawn_errors_are_loud() {
+        let _serial = crate::test_serial();
         let mut cfg = sh_cfg("true");
         cfg.command = "/nonexistent-binary".into();
         assert!(Pty::spawn(&cfg).is_err());
@@ -1247,6 +1323,7 @@ mod tests {
 
     #[test]
     fn pty_env_uses_the_identical_authority_and_no_daemon_var_leaks() {
+        let _serial = crate::test_serial();
         // The exact terminal-side assertion, repeated through a REAL PTY:
         // PATH + the approved toolchain vars arrive; configured secret
         // names set in the parent never cross (even allowlisted explicitly);
@@ -1332,6 +1409,7 @@ mod tests {
 
     #[test]
     fn hostile_environment_variables_do_not_break_spawn() {
+        let _serial = crate::test_serial();
         // Hostile env specs never panic the spawn path: NUL-bearing explicit
         // entries are rejected pre-spawn as Malformed; a huge allowlist name
         // is dropped by resolve (no daemon value exists).
@@ -1355,6 +1433,7 @@ mod tests {
 
     #[test]
     fn resize_with_zero_dimensions_is_rejected_before_any_ioctl() {
+        let _serial = crate::test_serial();
         let cfg = sh_cfg("true");
         let mut pty = Pty::spawn(&cfg).unwrap();
         assert_eq!(
@@ -1371,6 +1450,7 @@ mod tests {
 
     #[test]
     fn nul_bytes_in_args_fail_validation_before_spawn() {
+        let _serial = crate::test_serial();
         // Previously this surfaced as a late io::Error mapped to NotFound;
         // pre-spawn validation must reject it as Malformed.
         let mut cfg = sh_cfg("true");
@@ -1381,6 +1461,7 @@ mod tests {
 
     #[test]
     fn pty_child_outlives_a_transient_spawning_thread() {
+        let _serial = crate::test_serial();
         // Regression guard for Linux PR_SET_PDEATHSIG: the child is spawned
         // by the reader thread, which outlives it, so a short-lived CALLER
         // (a pooled spawn_blocking thread) exiting must never be mistaken
@@ -1399,6 +1480,7 @@ mod tests {
 
     #[test]
     fn spawn_holds_a_guardian_released_only_after_teardown() {
+        let _serial = crate::test_serial();
         let cfg = sh_cfg("sleep 30");
         let mut pty = Pty::spawn(&cfg).unwrap();
         let guardian_pid = pty.guardian.as_ref().expect("guardian forked").pid();
@@ -1424,6 +1506,7 @@ mod tests {
 
     #[test]
     fn spawn_confined_installs_the_authority_hook_on_the_child_command() {
+        let _serial = crate::test_serial();
         // The authority's confinement hook is installed on the SAME command
         // the pty spawns: a hook that marks the command proves the child saw
         // it — the real terminal authority installs its pre-exec
@@ -1446,6 +1529,7 @@ mod tests {
 
     #[test]
     fn spawn_confined_refuses_the_spawn_when_the_hook_fails_before_exec() {
+        let _serial = crate::test_serial();
         // Adversarial: the authority's confinement fails in the forked child
         // (the real-world case: a refused unshare). The spawn MUST fail typed
         // and the child must never exec its body.
@@ -1471,6 +1555,7 @@ mod tests {
 
     #[test]
     fn spawn_recorded_settles_the_durable_row_on_normal_shutdown() {
+        let _serial = crate::test_serial();
         let dir = tempfile::tempdir().unwrap();
         let ledger = Arc::new(TerminalLedger::open(dir.path()).unwrap());
         let cfg = sh_cfg("echo recorded; exit 0");
@@ -1487,6 +1572,7 @@ mod tests {
 
     #[test]
     fn lost_reap_marker_from_teardown_is_consumed_by_reconcile() {
+        let _serial = crate::test_serial();
         // Adversarial (injected append failure): teardown's `mark_reaped`
         // fails, so the transition must live in the durable retry marker
         // until the next reconcile consumes it — never a silent discard and

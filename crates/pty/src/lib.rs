@@ -53,6 +53,20 @@ pub use faktor_core::command::EnvSpec;
 #[cfg(any(windows, test))]
 mod win_common;
 
+/// Test-only process-wide serial. The pty tests fork children, kill them,
+/// and then assert on pid/pgid extinction and start-time identity markers.
+/// Concurrent tests recycle just-freed pids inside the same binary (and can
+/// collide on the clock-tick start marker), which makes those assertions
+/// observation-dependent. One test at a time removes the interference; the
+/// invariants under test are unchanged.
+#[cfg(test)]
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(unix)]
 mod unix;
 
