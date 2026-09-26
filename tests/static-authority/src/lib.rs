@@ -1779,8 +1779,9 @@ mod scans {
     /// - `SemanticProviderRegistry::new`: the agent fallback constructor
     ///   (embedded/test hosts) and the CLI graph builder; the native
     ///   introspection surface inspects `deps.semantic` only.
-    /// - `ProcessSupervisor::new`: the two daemon entries
-    ///   (`build_daemon`, `build_daemon_with_mcp_inner`), each handing the
+    /// - `ProcessSupervisor::new`: the two daemon entries (the sync
+    ///   `build_daemon_with_acquisition_planner` path that `build_daemon`
+    ///   delegates to, and `build_daemon_with_mcp_inner`), each handing the
     ///   ONE supervisor into the core builder, plus the local Acquire login
     ///   command's short-lived supervisor (its own CAS).
     /// - `ProcessSupervisor::try_shared`: the documented STANDALONE entries

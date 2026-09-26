@@ -88,6 +88,7 @@ import {
   boundedWebviewFiles,
   hasCompletionSteps,
   parseCompletionContract,
+  parsePendingSubmission,
 } from './taskStart';
 import {
   SessionBindings,
@@ -2013,17 +2014,36 @@ async function handleWebviewMessage(
         chatProvider?.postStartResult(goal, false);
         return;
       }
-      // The composer carries no binary refs: only workspace-relative file
-      // paths reach the native run. Unknown binary-shaped members are noted
-      // (never forwarded, never silently dropped).
-      const binaryRefs = Array.isArray(message.attachments) ? message.attachments.length : 0;
-      if (binaryRefs > 0) {
-        chatProvider?.postNotice(
-          'info',
-          `${binaryRefs} binary attachment reference(s) noted; only workspace-relative file paths reach the native run`,
-        );
+      // Binary attachments (pasted/attached images and screenshots) ride the
+      // strict pending-submission envelope: each entry is re-validated at the
+      // host boundary, uploaded to the durable artifact store, and only the
+      // typed artifact ids reach the task start. A malformed envelope refuses
+      // the START loudly (the composer draft is kept) rather than silently
+      // dropping bytes the user attached.
+      const binaryAttachments = message.attachments;
+      let pending: PendingSubmission;
+      if (binaryAttachments === undefined || binaryAttachments === null) {
+        pending = pendingEnvelope(goal);
+      } else {
+        const parsed = parsePendingSubmission({
+          text: goal,
+          sessionId: message.sessionId,
+          draftId: message.draftId,
+          messageId: message.messageId,
+          files: message.files,
+          attachments: binaryAttachments,
+        });
+        if (parsed === null) {
+          chatProvider?.postNotice(
+            'error',
+            'task start refused: malformed binary attachment envelope; the draft was kept',
+          );
+          chatProvider?.postStartResult(goal, false);
+          return;
+        }
+        pending = parsed;
       }
-      await startTask(goal, files, contract.contract, context, pendingEnvelope(goal));
+      await startTask(goal, files, contract.contract, context, pending);
       return;
     }
     case 'newTask':

@@ -16,8 +16,8 @@ use faktor_commerce::connector::{
 };
 use faktor_commerce::error::SourceError;
 use faktor_commerce::jobs::{
-    advance_job, bom_line_key, job_digest, submit_job, CommerceJobRequest, ItemOutcome,
-    JobItemExecutor, JobItemState, JobLine, JobState, JobWork, MAX_JOB_ITEM_ATTEMPTS,
+    advance_job, bom_line_key, job_digest, submit_job, CommerceJobRequest, CommercePrincipal,
+    ItemOutcome, JobItemExecutor, JobItemState, JobLine, JobState, JobWork, MAX_JOB_ITEM_ATTEMPTS,
 };
 use faktor_commerce::offer::{
     CommercialOffer, LifecycleStatus, ObservationOrigin, OfferProvenance, PriceBreak,
@@ -50,6 +50,18 @@ fn source(id: &str) -> SourceId {
 
 fn account(id: &str) -> AccountScope {
     AccountScope::new(id).expect("account")
+}
+
+fn principal() -> CommercePrincipal {
+    principal_for(1, 1, None)
+}
+
+fn principal_for(workspace: u64, session: u64, scope: Option<&str>) -> CommercePrincipal {
+    CommercePrincipal::new(
+        faktor_core::WorkspaceId::new(workspace),
+        faktor_core::SessionId::new(session),
+        scope.map(account),
+    )
 }
 
 fn temp_dir() -> tempfile::TempDir {
@@ -180,6 +192,19 @@ fn cache_identity(
 
 fn bom(lines: &[(&str, u64)]) -> faktor_commerce::bom::Bom {
     faktor_commerce::bom::Bom::from_pairs(lines).expect("bom")
+}
+
+/// The stored `(pricing_scope, account_scope)` of the newest cache row of
+/// `class` — the observation authority a write actually recorded.
+fn last_cache_scope(dir: &tempfile::TempDir, class: &str) -> (String, Option<String>) {
+    let conn = raw_conn(dir);
+    conn.query_row(
+        "SELECT pricing_scope, account_scope FROM search_cache WHERE class = ?1
+         ORDER BY rowid DESC LIMIT 1",
+        rusqlite::params![class],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .expect("a cache row was written")
 }
 
 fn bom_request(bom: faktor_commerce::bom::Bom) -> CommerceJobRequest {
@@ -797,37 +822,53 @@ fn job_digest_identity_attach_and_new_after_terminal() {
     let request = bom_request(bom(&[("TPS5430DDAR", 100), ("STM32F407VGT6", 50)]));
     let enabled = vec![source("mouser"), source("lcsc")];
     let profile = ProfileIdentity::new(source("1688"), "procurement-cn").expect("profile");
-    let digest = faktor_commerce::jobs::job_digest(&request, &enabled, None);
+    let digest = faktor_commerce::jobs::job_digest(&request, &enabled, None, &principal());
     assert_eq!(digest.len(), 64);
     // Enabled sources and profile identity are part of the identity.
     assert_ne!(
         digest,
-        faktor_commerce::jobs::job_digest(&request, &enabled, Some(&profile))
+        faktor_commerce::jobs::job_digest(&request, &enabled, Some(&profile), &principal())
     );
     assert_ne!(
         digest,
-        faktor_commerce::jobs::job_digest(&request, &[source("mouser")], None)
+        faktor_commerce::jobs::job_digest(&request, &[source("mouser")], None, &principal())
     );
     let mut live = request.clone();
     live.freshness = FreshnessMode::Live;
     assert_ne!(
         digest,
-        faktor_commerce::jobs::job_digest(&live, &enabled, None)
+        faktor_commerce::jobs::job_digest(&live, &enabled, None, &principal())
     );
     let mut other = request.clone();
     other.account = Some(account("acct-a"));
     assert_ne!(
         digest,
-        faktor_commerce::jobs::job_digest(&other, &enabled, None)
+        faktor_commerce::jobs::job_digest(&other, &enabled, None, &principal())
+    );
+    // The OWNER is part of the identity: another session or another account
+    // can never mint the same digest (and therefore never attach) for the
+    // same request.
+    assert_ne!(
+        digest,
+        faktor_commerce::jobs::job_digest(&request, &enabled, None, &principal_for(1, 2, None))
+    );
+    assert_ne!(
+        digest,
+        faktor_commerce::jobs::job_digest(
+            &request,
+            &enabled,
+            None,
+            &principal_for(1, 1, Some("acct-a"))
+        )
     );
 
     let (job, attached) =
-        submit_job(&store, request.clone(), &enabled, None, 1_000).expect("submit");
+        submit_job(&store, request.clone(), &enabled, None, &principal(), 1_000).expect("submit");
     assert!(!attached);
     assert_eq!(job.state, JobState::Queued);
     assert_eq!(store.job_item_count(&job.id).expect("items"), 2);
     let (second, attached) =
-        submit_job(&store, request.clone(), &enabled, None, 1_001).expect("submit");
+        submit_job(&store, request.clone(), &enabled, None, &principal(), 1_001).expect("submit");
     assert!(attached, "identical active request attaches");
     assert_eq!(second.id, job.id);
     assert_eq!(store.job_count(None).expect("jobs"), 1);
@@ -848,7 +889,8 @@ fn job_digest_identity_attach_and_new_after_terminal() {
         .expect("advance");
     assert_eq!(outcome.job.state, JobState::Completed);
     assert_eq!(outcome.compact.matched, 2);
-    let (third, attached) = submit_job(&store, request, &enabled, None, 2_001).expect("submit");
+    let (third, attached) =
+        submit_job(&store, request, &enabled, None, &principal(), 2_001).expect("submit");
     assert!(!attached, "a terminal job does not absorb a new request");
     assert_ne!(third.id, job.id);
     assert_eq!(store.job_count(None).expect("jobs"), 2);
@@ -866,7 +908,7 @@ fn job_restart_recovery_does_not_repeat_settled_lines() {
         ("PART-0004", 10),
     ];
     let request = bom_request(bom(&lines));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
 
     // First pass: the first two lines settle, then the acquisition "crashes"
     // (a transient failure) on line 3. The durable state must show 2 settled
@@ -973,7 +1015,7 @@ fn job_item_attempts_round_trip_and_honor_the_caller_count() {
     let dir = temp_dir();
     let store = open_store(&dir);
     let request = bom_request(bom(&[("PART-A", 10)]));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
     let key = bom_line_key(0, &BomItem::new("PART-A", 10).expect("line"));
     let row = |attempts: u64, label: &str| JobItemRow {
         job_id: job.id.clone(),
@@ -1015,7 +1057,7 @@ fn transient_failures_are_capped_and_never_requeued_forever() {
     let dir = temp_dir();
     let store = open_store(&dir);
     let request = bom_request(bom(&[("FLAKY", 1)]));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
     let key = bom_line_key(0, &BomItem::new("FLAKY", 1).expect("line"));
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let artifacts = FakeArtifacts::default();
@@ -1099,7 +1141,7 @@ fn terminal_job_without_compact_json_reports_the_true_state() {
         (JobState::Cancelled, CompactStatus::Cancelled),
     ] {
         let request = bom_request(bom(&[(&format!("T{terminal:?}"), 1)]));
-        let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+        let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
         store
             .update_job_state(&job.id, JobState::Running, 1_001)
             .expect("running");
@@ -1140,10 +1182,14 @@ fn terminal_job_without_compact_json_reports_the_true_state() {
         Arc::new(FakeArtifacts::default()),
     )
     .expect("service");
-    let failed = service.job_status(&job_ids[0]).expect("failed status");
+    let failed = service
+        .job_status(&principal(), &job_ids[0])
+        .expect("failed status");
     assert_eq!(failed.state, JobState::Failed);
     assert_eq!(failed.compact.status, CompactStatus::Failed);
-    let cancelled = service.job_status(&job_ids[1]).expect("cancelled status");
+    let cancelled = service
+        .job_status(&principal(), &job_ids[1])
+        .expect("cancelled status");
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert_eq!(cancelled.compact.status, CompactStatus::Cancelled);
 }
@@ -1155,7 +1201,7 @@ fn duplicate_bom_lines_each_execute_and_count() {
     // Three identically-normalizing lines requested; each is a real line
     // (the user asked to buy it three times).
     let request = bom_request(bom(&[("DUP", 10), ("DUP", 10), ("dup", 10), ("OTHER", 10)]));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
     assert_eq!(
         store.job_item_count(&job.id).expect("items"),
         4,
@@ -1197,15 +1243,16 @@ fn job_digest_is_source_order_insensitive_and_punctuation_exact() {
     let mut permuted = request.clone();
     permuted.sources = SourceSet::named(vec![source("lcsc"), source("mouser")]).expect("sources");
     assert_eq!(
-        job_digest(&request, &[], None),
-        job_digest(&permuted, &[], None),
+        job_digest(&request, &[], None, &principal()),
+        job_digest(&permuted, &[], None, &principal()),
         "a permuted source set is the same request"
     );
 
     let dir = temp_dir();
     let store = open_store(&dir);
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
-    let (attached_job, attached) = submit_job(&store, permuted, &[], None, 1_001).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
+    let (attached_job, attached) =
+        submit_job(&store, permuted, &[], None, &principal(), 1_001).expect("submit");
     assert!(attached, "the permuted request attaches to the same job");
     assert_eq!(attached_job.id, job.id);
 
@@ -1221,21 +1268,22 @@ fn job_digest_is_source_order_insensitive_and_punctuation_exact() {
         reference: ProductRef::parse("AB123", None).expect("ref"),
     };
     assert_ne!(
-        job_digest(&with_hash, &[], None),
-        job_digest(&plain, &[], None)
+        job_digest(&with_hash, &[], None, &principal()),
+        job_digest(&plain, &[], None, &principal())
     );
 
     // ...and a single-line BOM is no exception.
     let hash_bom = bom_request(bom(&[("AB#123", 1)]));
     let plain_bom = bom_request(bom(&[("AB123", 1)]));
     assert_ne!(
-        job_digest(&hash_bom, &[], None),
-        job_digest(&plain_bom, &[], None)
+        job_digest(&hash_bom, &[], None, &principal()),
+        job_digest(&plain_bom, &[], None, &principal())
     );
-    let (hash_job, hash_attached) = submit_job(&store, hash_bom, &[], None, 2_000).expect("submit");
+    let (hash_job, hash_attached) =
+        submit_job(&store, hash_bom, &[], None, &principal(), 2_000).expect("submit");
     assert!(!hash_attached);
     let (plain_job, plain_attached) =
-        submit_job(&store, plain_bom, &[], None, 2_001).expect("submit");
+        submit_job(&store, plain_bom, &[], None, &principal(), 2_001).expect("submit");
     assert!(
         !plain_attached,
         "punctuation-distinct BOMs are distinct jobs"
@@ -1255,7 +1303,7 @@ fn bom_job_artifact_and_compact_contract() {
     let lines: Vec<(String, u64)> = (0..500).map(|i| (format!("PART-{i:04}"), 100)).collect();
     let pairs: Vec<(&str, u64)> = lines.iter().map(|(q, n)| (q.as_str(), *n)).collect();
     let request = bom_request(bom(&pairs));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
     let outcome = runtime
         .block_on(advance_job(
             &store,
@@ -1283,7 +1331,7 @@ fn bom_job_artifact_and_compact_contract() {
     let lines: Vec<(String, u64)> = (0..300).map(|i| (format!("AMB-{i:04}"), 1)).collect();
     let pairs: Vec<(&str, u64)> = lines.iter().map(|(q, n)| (q.as_str(), *n)).collect();
     let request = bom_request(bom(&pairs));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
     let outcome = runtime
         .block_on(advance_job(
             &store,
@@ -1314,7 +1362,7 @@ fn planted_secret_never_reaches_an_artifact() {
     let dir = temp_dir();
     let store = open_store(&dir);
     let request = bom_request(bom(&[("SECRETIVE", 5)]));
-    let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+    let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let artifacts = FakeArtifacts::default();
     let executor = SecretExecutor;
@@ -1655,6 +1703,7 @@ struct FakeConnector {
     product_calls: AtomicU64,
     quote_calls: AtomicU64,
     quote_requests: Mutex<Vec<QuoteRequest>>,
+    seen_mechanisms: Mutex<Vec<Option<faktor_commerce::connector::AcquisitionMechanism>>>,
 }
 
 struct Behavior {
@@ -1674,6 +1723,7 @@ impl FakeConnector {
             product_calls: AtomicU64::new(0),
             quote_calls: AtomicU64::new(0),
             quote_requests: Mutex::new(Vec::new()),
+            seen_mechanisms: Mutex::new(Vec::new()),
         })
     }
 
@@ -1700,6 +1750,17 @@ impl FakeConnector {
             self.product_calls.load(Ordering::SeqCst),
             self.quote_calls.load(Ordering::SeqCst),
         )
+    }
+
+    fn mechanisms(&self) -> Vec<Option<faktor_commerce::connector::AcquisitionMechanism>> {
+        self.seen_mechanisms.lock().expect("mechanisms").clone()
+    }
+
+    fn record_mechanism(&self, ctx: &faktor_commerce::connector::AcquireCtx) {
+        self.seen_mechanisms
+            .lock()
+            .expect("mechanisms")
+            .push(ctx.mechanism());
     }
 }
 
@@ -1729,6 +1790,7 @@ impl CommerceConnector for FakeConnector {
         _req: SearchRequest,
     ) -> Result<Vec<Discovery>, SourceError> {
         self.discover_calls.fetch_add(1, Ordering::SeqCst);
+        self.record_mechanism(_ctx);
         let (delay_ms, fail, discoveries) = {
             let behavior = self.behavior.lock().expect("behavior");
             (
@@ -1752,6 +1814,7 @@ impl CommerceConnector for FakeConnector {
         _req: ProductRequest,
     ) -> Result<CommercialOffer, SourceError> {
         self.product_calls.fetch_add(1, Ordering::SeqCst);
+        self.record_mechanism(_ctx);
         let behavior = self.behavior.lock().expect("behavior");
         if behavior.fail {
             return Err(SourceError::ApiUnavailable);
@@ -1765,6 +1828,7 @@ impl CommerceConnector for FakeConnector {
         req: QuoteRequest,
     ) -> Result<Vec<QuoteCandidate>, SourceError> {
         self.quote_calls.fetch_add(1, Ordering::SeqCst);
+        self.record_mechanism(_ctx);
         self.quote_requests
             .lock()
             .expect("quote requests")
@@ -1880,6 +1944,7 @@ fn disabled_service_creates_nothing_and_calls_nothing() {
                 .await,
             service
                 .bom(
+                    &principal(),
                     &ctx,
                     SourceSet::auto(),
                     FreshnessMode::PreferCache,
@@ -2220,7 +2285,7 @@ async fn quote_job_passes_the_requested_variant_and_packaging_through() {
         account: None,
     };
     let outcome = service
-        .submit_and_advance(&test_ctx(), request)
+        .submit_and_advance(&principal(), &test_ctx(), request)
         .await
         .expect("quote job");
     assert_eq!(outcome.job.state, JobState::Completed);
@@ -2235,6 +2300,312 @@ async fn quote_job_passes_the_requested_variant_and_packaging_through() {
     assert_eq!(recorded.variant.as_ref().map(|v| v.as_str()), Some("v1"));
     assert_eq!(recorded.packaging, Some(PackagingType::TapeAndReel));
     assert_eq!(recorded.quantity.get(), 100);
+}
+
+/// The observation's own visibility decides the cache scope: an
+/// authenticated offer observed through an ANONYMOUS ctx is stored under
+/// `Authenticated`, never `Public`; an account-scoped offer under `Account`
+/// with its own account scope; a public offer under `Public`.
+#[tokio::test(start_paused = true)]
+async fn observed_price_visibility_decides_the_cache_scope_never_the_ctx() {
+    let dir = temp_dir();
+
+    // 1. Authenticated observation + anonymous ctx => Authenticated.
+    let mut authenticated = offer("mouser", "TPS5430DDAR", 1_000_000);
+    authenticated.price_visibility = PriceVisibility::Authenticated;
+    for price_break in &mut authenticated.price_breaks {
+        price_break.visibility = PriceVisibility::Authenticated;
+    }
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: Vec::new(),
+            product: Some(authenticated),
+            candidates: Vec::new(),
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    let (service, _artifacts) = enabled_service(&dir, connector.clone());
+    let ctx = test_ctx();
+    service
+        .product(
+            &ctx,
+            ProductRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                FreshnessMode::Live,
+                DetailLevel::Compact,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect("authenticated product");
+    let (scope, account) = last_cache_scope(&dir, "product");
+    assert_eq!(scope, "authenticated", "authenticated is never weakened");
+    assert_ne!(scope, "public");
+    assert_eq!(account, None);
+    service
+        .quote(
+            &ctx,
+            QuoteRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                100,
+                None,
+                None,
+                None,
+                FreshnessMode::Live,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect("authenticated quote");
+    let (scope, account) = last_cache_scope(&dir, "price");
+    assert_eq!(scope, "authenticated");
+    assert_ne!(scope, "public");
+    assert_eq!(account, None);
+    // The anonymous lookup scope never admits the authenticated row.
+    connector.set_fail(true);
+    assert_eq!(
+        service
+            .quote(
+                &ctx,
+                QuoteRequest::new(
+                    ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                    100,
+                    None,
+                    None,
+                    None,
+                    FreshnessMode::PreferCache,
+                )
+                .expect("request"),
+            )
+            .await
+            .expect_err("anonymous ctx must not read the authenticated row"),
+        ServiceError::Source(SourceError::ApiUnavailable)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn account_specific_observations_are_keyed_by_their_own_account_scope() {
+    let dir = temp_dir();
+    let observed_account = account("acct-b");
+    let mut scoped = offer("mouser", "TPS5430DDAR", 1_000_000);
+    scoped.price_visibility = PriceVisibility::AccountSpecific;
+    for price_break in &mut scoped.price_breaks {
+        price_break.visibility = PriceVisibility::AccountSpecific;
+        price_break.account_scope = Some(observed_account.clone());
+    }
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: Vec::new(),
+            product: Some(scoped),
+            candidates: Vec::new(),
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    let (service, _artifacts) = enabled_service(&dir, connector.clone());
+    let anonymous = test_ctx();
+    service
+        .quote(
+            &anonymous,
+            QuoteRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                100,
+                None,
+                None,
+                None,
+                FreshnessMode::Live,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect("account-specific quote with an anonymous ctx");
+    let (scope, stored) = last_cache_scope(&dir, "price");
+    assert_eq!(scope, "account");
+    assert_ne!(scope, "public");
+    assert_eq!(
+        stored.as_deref(),
+        Some(observed_account.as_str()),
+        "the observation's own account keys the row"
+    );
+    // A public lookup (an anonymous ctx) can never serve the account row.
+    connector.set_fail(true);
+    assert_eq!(
+        service
+            .quote(
+                &anonymous,
+                QuoteRequest::new(
+                    ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                    100,
+                    None,
+                    None,
+                    None,
+                    FreshnessMode::PreferCache,
+                )
+                .expect("request"),
+            )
+            .await
+            .expect_err("account data must not cross into an anonymous lookup"),
+        ServiceError::Source(SourceError::ApiUnavailable)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn public_observation_is_public_and_an_account_specific_offer_without_a_scope_is_refused() {
+    let dir = temp_dir();
+    // A plain public offer stays Public under an anonymous ctx.
+    let connector = FakeConnector::healthy("mouser");
+    let (service, _artifacts) = enabled_service(&dir, connector.clone());
+    let ctx = test_ctx();
+    service
+        .product(
+            &ctx,
+            ProductRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                FreshnessMode::Live,
+                DetailLevel::Compact,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect("public product");
+    let (scope, account) = last_cache_scope(&dir, "product");
+    assert_eq!(scope, "public");
+    assert_eq!(account, None);
+
+    // An account-specific observation with no account scope to key it by is
+    // a typed refusal, never a silent widening or an unkeyed row.
+    let dir = temp_dir();
+    let mut unkeyed = offer("mouser", "TPS5430DDAR", 1_000_000);
+    unkeyed.price_visibility = PriceVisibility::AccountSpecific;
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: Vec::new(),
+            product: Some(unkeyed),
+            candidates: Vec::new(),
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    let (service, _artifacts) = enabled_service(&dir, connector);
+    let error = service
+        .product(
+            &ctx,
+            ProductRequest::new(
+                ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+                FreshnessMode::Live,
+                DetailLevel::Compact,
+            )
+            .expect("request"),
+        )
+        .await
+        .expect_err("typed refusal");
+    assert_eq!(error, ServiceError::Source(SourceError::InvalidRequest));
+    assert_eq!(
+        service
+            .store()
+            .expect("store")
+            .cache_count()
+            .expect("count"),
+        0,
+        "nothing was cached unkeyed"
+    );
+}
+
+/// BOM lines carry their own selections into the deterministic job: the
+/// executor must thread the line's variant/packaging into the quote request
+/// (through the real quote engine), and duplicate queries with different
+/// selections remain distinct lines.
+#[tokio::test(start_paused = true)]
+async fn bom_job_threads_per_line_selections_through_the_quote_engine() {
+    let dir = temp_dir();
+    let mut offer = offer("mouser", "TPS5430DDAR", 1_000_000);
+    offer.price_breaks = Vec::new();
+    offer.variants = vec![faktor_commerce::VariantOffer {
+        variant_id: VariantId::new("v1").expect("variant"),
+        attributes: Vec::new(),
+        packaging: Some(PackagingType::TapeAndReel),
+        moq: None,
+        order_multiple: None,
+        standard_pack: None,
+        stock: StockState::InStock {
+            quantity: NonZeroQuantity::new(5_000).expect("qty"),
+        },
+        price_breaks: vec![PriceBreak {
+            min_quantity: NonZeroQuantity::new(1).expect("qty"),
+            max_quantity: None,
+            unit_price: Money::from_micros(Currency::USD, 17_500),
+            visibility: PriceVisibility::Public,
+            account_scope: None,
+            promotion: None,
+        }],
+        lead_time: None,
+    }];
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: Vec::new(),
+            product: Some(offer),
+            candidates: Vec::new(),
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    let (service, _artifacts) = enabled_service(&dir, connector.clone());
+    let selected = BomItem::new("TPS5430DDAR", 100)
+        .expect("line")
+        .with_variant(VariantId::new("v1").expect("variant"))
+        .with_packaging(PackagingType::TapeAndReel);
+    let unselected = BomItem::new("TPS5430DDAR", 100).expect("line");
+    assert_ne!(
+        selected.key(),
+        unselected.key(),
+        "duplicate queries with different selections are distinct lines"
+    );
+    let bom = faktor_commerce::bom::Bom::new(vec![selected, unselected]).expect("bom");
+    let request = CommerceJobRequest {
+        work: JobWork::Bom { bom },
+        sources: SourceSet::named(vec![source("mouser")]).expect("sources"),
+        freshness: FreshnessMode::Live,
+        detail: DetailLevel::Compact,
+        account: None,
+    };
+    let outcome = service
+        .submit_and_advance(&principal(), &test_ctx(), request)
+        .await
+        .expect("bom job");
+    assert_eq!(outcome.job.state, JobState::Completed);
+    assert_eq!(outcome.compact.lines, 2, "two distinct durable lines");
+    assert_eq!(
+        outcome.compact.matched, 1,
+        "the selected variant line resolves through the quote engine"
+    );
+    assert_eq!(
+        outcome.compact.ambiguous, 1,
+        "the unselected duplicate is ambiguous, never silently resolved"
+    );
+    let requests = connector.quote_requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2, "one quote per line, in request order");
+    assert_eq!(requests[0].variant.as_ref().map(|v| v.as_str()), Some("v1"));
+    assert_eq!(requests[0].packaging, Some(PackagingType::TapeAndReel));
+    assert_eq!(requests[0].quantity.get(), 100);
+    assert_eq!(requests[1].variant.as_ref().map(|v| v.as_str()), None);
+    assert_eq!(requests[1].packaging, None);
+    drop(requests);
+    // The durable job request carries the selections (a restart resumes the
+    // exact same lines).
+    let row = service
+        .store()
+        .expect("store")
+        .job(&outcome.job.id)
+        .expect("read")
+        .expect("row");
+    let durable = row.request.as_str();
+    assert!(durable.contains("v1"), "{durable}");
+    assert!(durable.contains("tape_and_reel"), "{durable}");
 }
 
 const PLANTED_KEY: &str = "ghp_0123456789abcdefghijklmnopqrstuvwx";
@@ -2342,7 +2713,8 @@ async fn extracted_secrets_are_scrubbed_before_results_and_artifacts() {
     // A job whose executor echoes the key in its detail payload: the CAS
     // artifact never carries it.
     let request = bom_request(bom(&[("KEYECHO", 1)]));
-    let (job, _) = submit_job(&store_of(&service), request, &[], None, 1_000).expect("submit");
+    let (job, _) =
+        submit_job(&store_of(&service), request, &[], None, &principal(), 1_000).expect("submit");
     let outcome = advance_job(
         &store_of(&service),
         &test_ctx(),
@@ -2395,6 +2767,7 @@ async fn service_bom_job_flows_through_connectors_and_artifacts() {
     let ctx = test_ctx();
     let outcome = service
         .bom(
+            &principal(),
             &ctx,
             SourceSet::auto(),
             FreshnessMode::PreferCache,
@@ -2410,7 +2783,9 @@ async fn service_bom_job_flows_through_connectors_and_artifacts() {
     assert_eq!(artifacts.puts.load(Ordering::SeqCst), 1);
 
     // The deterministic `job` operation returns the stored compact result.
-    let status = service.job_status(&outcome.job.id).expect("status");
+    let status = service
+        .job_status(&principal(), &outcome.job.id)
+        .expect("status");
     assert_eq!(status.state, JobState::Completed);
     assert_eq!(status.compact.matched, 2);
     assert_eq!(status.compact.lines, 2);
@@ -2445,6 +2820,7 @@ async fn service_rejects_out_of_bounds_requests() {
         serde_json::from_value(serde_json::Value::Array(items)).expect("hostile bom");
     let error = service
         .bom(
+            &principal(),
             &ctx,
             SourceSet::auto(),
             FreshnessMode::PreferCache,
@@ -2492,7 +2868,7 @@ fn service_restart_resumes_pending_jobs() {
         // process dies.
         let request = bom_request(bom(&[("TPS5430DDAR", 100)]));
         let store = service.store().expect("store").clone();
-        let (job, _) = submit_job(&store, request, &[], None, 1_000).expect("submit");
+        let (job, _) = submit_job(&store, request, &[], None, &principal(), 1_000).expect("submit");
         job.id
     };
     // "Restart": a fresh service over the same data dir resumes the job.
@@ -2509,7 +2885,7 @@ fn service_restart_resumes_pending_jobs() {
     assert_eq!(outcomes[0].job.id, job_id);
     assert_eq!(outcomes[0].job.state, JobState::Completed);
     assert_eq!(outcomes[0].compact.matched, 1);
-    let status = service.job_status(&job_id).expect("status");
+    let status = service.job_status(&principal(), &job_id).expect("status");
     assert_eq!(status.state, JobState::Completed);
     assert!(runtime
         .block_on(service.resume_pending(&test_ctx()))
@@ -2557,4 +2933,593 @@ fn service_gc_and_clear_cache_are_admin_safe() {
     let disabled = CommerceSourceService::disabled();
     assert_eq!(disabled.gc(now_ms()), Err(ServiceError::Disabled));
     assert_eq!(disabled.clear_cache(), Err(ServiceError::Disabled));
+}
+
+// ------------------------------------------------- job ownership tests
+
+#[test]
+fn active_job_dedup_never_cross_attaches_owners() {
+    let dir = temp_dir();
+    let store = open_store(&dir);
+    let request = bom_request(bom(&[("TPS5430DDAR", 100)]));
+    let enabled: Vec<SourceId> = Vec::new();
+    let owner = principal_for(1, 1, None);
+    let other_session = principal_for(1, 2, None);
+    let other_workspace = principal_for(2, 1, None);
+    let other_account = principal_for(1, 1, Some("acct-a"));
+
+    let (job, attached) =
+        submit_job(&store, request.clone(), &enabled, None, &owner, 1_000).expect("submit");
+    assert!(!attached);
+    let (again, attached) =
+        submit_job(&store, request.clone(), &enabled, None, &owner, 1_001).expect("resubmit");
+    assert!(attached, "the same owner attaches to its own active job");
+    assert_eq!(again.id, job.id);
+
+    for (label, other) in [
+        ("another session", &other_session),
+        ("another workspace", &other_workspace),
+        ("another account", &other_account),
+    ] {
+        let (foreign, attached) =
+            submit_job(&store, request.clone(), &enabled, None, other, 2_000).expect("submit");
+        assert!(
+            !attached,
+            "{label} must never attach to another owner's active job"
+        );
+        assert_ne!(foreign.id, job.id);
+        let row = store.job(&foreign.id).expect("read").expect("row");
+        assert_eq!(
+            row.owner_key.as_deref(),
+            Some(other.owner_key().as_str()),
+            "{label} owns its own durable row"
+        );
+    }
+    let row = store.job(&job.id).expect("read").expect("row");
+    assert_eq!(row.owner_key.as_deref(), Some(owner.owner_key().as_str()));
+    assert_eq!(store.job_count(None).expect("jobs"), 4);
+}
+
+#[test]
+fn job_status_is_scoped_to_the_owning_principal() {
+    let dir = temp_dir();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (service, _artifacts) = enabled_service(&dir, FakeConnector::healthy("mouser"));
+    let owner = principal();
+    let outcome = runtime
+        .block_on(service.bom(
+            &owner,
+            &test_ctx(),
+            SourceSet::auto(),
+            FreshnessMode::PreferCache,
+            DetailLevel::Compact,
+            bom(&[("TPS5430DDAR", 100)]),
+        ))
+        .expect("bom");
+    let status = service
+        .job_status(&owner, &outcome.job.id)
+        .expect("the owner reads its own job");
+    assert_eq!(status.state, JobState::Completed);
+    assert_eq!(status.job_id, outcome.job.id);
+
+    for (label, foreign) in [
+        ("different session, same account", principal_for(1, 2, None)),
+        ("different workspace", principal_for(2, 1, None)),
+        ("different account", principal_for(1, 1, Some("acct-a"))),
+    ] {
+        assert_eq!(
+            service.job_status(&foreign, &outcome.job.id).unwrap_err(),
+            ServiceError::Source(SourceError::ProductNotFound),
+            "{label} must see a foreign job as missing, never forbidden"
+        );
+    }
+    // A foreign id and a missing id are indistinguishable.
+    assert_eq!(
+        service.job_status(&owner, "job_00000000000000000000000000000000"),
+        Err(ServiceError::Source(SourceError::ProductNotFound))
+    );
+}
+
+#[test]
+fn anonymous_and_account_scoped_principals_are_isolated() {
+    let dir = temp_dir();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let (service, _artifacts) = enabled_service(&dir, FakeConnector::healthy("mouser"));
+    let anonymous = principal_for(1, 1, None);
+    let scoped = principal_for(1, 1, Some("acct-a"));
+    let scoped_ctx = test_ctx().with_account(account("acct-a"));
+
+    let anonymous_job = runtime
+        .block_on(service.bom(
+            &anonymous,
+            &test_ctx(),
+            SourceSet::auto(),
+            FreshnessMode::PreferCache,
+            DetailLevel::Compact,
+            bom(&[("TPS5430DDAR", 100)]),
+        ))
+        .expect("anonymous bom");
+    let scoped_job = runtime
+        .block_on(service.bom(
+            &scoped,
+            &scoped_ctx,
+            SourceSet::auto(),
+            FreshnessMode::PreferCache,
+            DetailLevel::Compact,
+            bom(&[("TPS5430DDAR", 100)]),
+        ))
+        .expect("scoped bom");
+    assert_ne!(
+        anonymous_job.job.id, scoped_job.job.id,
+        "the account scope is part of the job identity"
+    );
+    service
+        .job_status(&anonymous, &anonymous_job.job.id)
+        .expect("anonymous owner reads");
+    service
+        .job_status(&scoped, &scoped_job.job.id)
+        .expect("scoped owner reads");
+    for (reader, job) in [
+        (&scoped, &anonymous_job.job.id),
+        (&anonymous, &scoped_job.job.id),
+    ] {
+        assert_eq!(
+            service.job_status(reader, job).unwrap_err(),
+            ServiceError::Source(SourceError::ProductNotFound)
+        );
+    }
+    assert_eq!(
+        service
+            .job_status(&principal_for(1, 1, Some("acct-b")), &scoped_job.job.id)
+            .unwrap_err(),
+        ServiceError::Source(SourceError::ProductNotFound)
+    );
+
+    // A request whose account scope disagrees with the principal's is
+    // refused typed: a job never executes under a mismatched identity.
+    let mut mismatched = bom_request(bom(&[("TPS5430DDAR", 100)]));
+    mismatched.account = None;
+    assert_eq!(
+        runtime
+            .block_on(service.submit_and_advance(&scoped, &scoped_ctx, mismatched))
+            .expect_err("mismatched account scope"),
+        ServiceError::Source(SourceError::InvalidRequest)
+    );
+}
+
+#[test]
+fn legacy_ownerless_jobs_are_typed_migrated_and_refused() {
+    let dir = temp_dir();
+    std::fs::create_dir_all(dir.path().join("commerce")).expect("commerce dir");
+    let request = bom_request(bom(&[("LEGACY", 1)]));
+    let request_json = serde_json::to_string(&request).expect("request json");
+    let active_id = "job_legacy_active";
+    let terminal_id = "job_legacy_terminal";
+    {
+        // Build the exact v2 predecessor state: jobs existed, ownership did
+        // not.
+        let conn = raw_conn(&dir);
+        conn.execute_batch(COMMERCE_MIGRATIONS[0])
+            .expect("v1 schema");
+        conn.execute_batch(COMMERCE_MIGRATIONS[1])
+            .expect("v2 schema");
+        conn.execute_batch("PRAGMA user_version = 2")
+            .expect("cursor");
+        for (id, state) in [(active_id, "queued"), (terminal_id, "completed")] {
+            conn.execute(
+                "INSERT INTO job(job_id, digest, kind, state, request_json, created_ms,
+                    updated_ms, matched, ambiguous, unmatched)
+                 VALUES (?1, 'legacy-digest', 'bom', ?2, ?3, 10, 10, 0, 0, 0)",
+                rusqlite::params![id, state, request_json],
+            )
+            .expect("seed legacy job");
+        }
+        conn.execute(
+            "INSERT INTO job_item(job_id, item_key, ordinal, state, attempts, updated_ms)
+             VALUES (?1, 'legacy-item', 0, 'pending', 0, 10)",
+            rusqlite::params![active_id],
+        )
+        .expect("seed legacy item");
+    }
+
+    let store = open_store(&dir);
+    assert_eq!(
+        store.schema_version().expect("version"),
+        COMMERCE_SCHEMA_VERSION
+    );
+    // Active legacy work is terminalized by the migration with a typed
+    // diagnostic: it can never resume without an owner.
+    let active = store.job(active_id).expect("read").expect("row");
+    assert_eq!(active.owner_key, None);
+    assert_eq!(active.state, JobState::Cancelled);
+    assert_eq!(active.finished_ms, Some(10));
+    assert_eq!(
+        active.last_error.as_deref(),
+        Some("owner_scope_missing"),
+        "the migration leaves a typed reason"
+    );
+    // Terminal legacy rows keep their state but stay ownerless.
+    let terminal = store.job(terminal_id).expect("read").expect("row");
+    assert_eq!(terminal.owner_key, None);
+    assert_eq!(terminal.state, JobState::Completed);
+    assert!(store.pending_jobs().expect("pending").is_empty());
+
+    // No principal can read an ownerless row; recovery refuses it typed.
+    let service = CommerceSourceService::open(
+        dir.path(),
+        ServiceConfig::default(),
+        Arc::new(FakeArtifacts::default()),
+    )
+    .expect("service");
+    for id in [active_id, terminal_id] {
+        assert_eq!(
+            service.job_status(&principal(), id).unwrap_err(),
+            ServiceError::Source(SourceError::ProductNotFound),
+            "a legacy ownerless row is never globally readable"
+        );
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    for id in [active_id, terminal_id] {
+        assert_eq!(
+            runtime
+                .block_on(advance_job(
+                    &store,
+                    &test_ctx(),
+                    id,
+                    &ScriptedExecutor::matched(),
+                    &FakeArtifacts::default(),
+                    20,
+                ))
+                .expect_err("ownerless job refused"),
+            SourceError::Store
+        );
+    }
+    // The owner index exists and legacy rows still carry no owner.
+    let conn = raw_conn(&dir);
+    let owners: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM job WHERE owner_key IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("owner count");
+    assert_eq!(owners, 2);
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_job_owner_digest'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index");
+    assert_eq!(index, 1);
+}
+
+// ------------------------------------------- planner-authority certificates
+
+/// A spy planner: counts `plan()` calls and delegates to the real planner.
+struct CountingPlanner {
+    calls: AtomicU64,
+    inner: faktor_acquire::AcquisitionPlanner,
+}
+
+impl faktor_acquire::AcquisitionPlanning for CountingPlanner {
+    fn plan(
+        &self,
+        state: &faktor_acquire::RuntimeAcquisitionState,
+    ) -> faktor_acquire::AcquisitionPlan {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        faktor_acquire::RuntimeAcquisitionState::plan(state, &self.inner)
+    }
+}
+
+/// A scripted planner: returns the decision it is told to, so tests can prove
+/// the service executes exactly what the planner decided.
+struct ScriptedPlanner {
+    decision: Mutex<faktor_acquire::PlanDecision>,
+}
+
+impl ScriptedPlanner {
+    fn new(decision: faktor_acquire::PlanDecision) -> Self {
+        Self {
+            decision: Mutex::new(decision),
+        }
+    }
+
+    fn set(&self, decision: faktor_acquire::PlanDecision) {
+        *self.decision.lock().expect("decision") = decision;
+    }
+}
+
+impl faktor_acquire::AcquisitionPlanning for ScriptedPlanner {
+    fn plan(
+        &self,
+        _state: &faktor_acquire::RuntimeAcquisitionState,
+    ) -> faktor_acquire::AcquisitionPlan {
+        faktor_acquire::AcquisitionPlan {
+            decision: self.decision.lock().expect("decision").clone(),
+            cache: Default::default(),
+            fields: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+}
+
+fn acquire_decision(
+    mechanism: faktor_acquire::AcquisitionMechanism,
+) -> faktor_acquire::PlanDecision {
+    faktor_acquire::PlanDecision::Acquire {
+        mechanism,
+        conditional: None,
+        substituted: false,
+        degraded: false,
+        coverage: faktor_acquire::CapabilityLevel::Full,
+    }
+}
+
+fn service_with_planner(
+    dir: &tempfile::TempDir,
+    connector: Arc<dyn CommerceConnector>,
+    planner: Arc<dyn faktor_acquire::AcquisitionPlanning>,
+) -> Arc<CommerceSourceService> {
+    let artifacts = Arc::new(FakeArtifacts::default());
+    let service = CommerceSourceService::open_with_planner(
+        dir.path(),
+        ServiceConfig::default(),
+        artifacts,
+        planner,
+    )
+    .expect("service");
+    service
+        .register(connector, ConnectorPolicy::default())
+        .expect("register");
+    service
+}
+
+#[tokio::test]
+async fn production_path_invokes_the_planner() {
+    let dir = temp_dir();
+    let connector = FakeConnector::healthy("mouser");
+    let spy = Arc::new(CountingPlanner {
+        calls: AtomicU64::new(0),
+        inner: faktor_acquire::AcquisitionPlanner::default(),
+    });
+    let service = service_with_planner(&dir, connector.clone(), spy.clone());
+    let outcome = service
+        .search(&test_ctx(), search_request("TPS5430"))
+        .await
+        .expect("search");
+    assert_eq!(outcome.discoveries.len(), 1);
+    assert_eq!(
+        spy.calls.load(Ordering::SeqCst),
+        1,
+        "the production path must call plan() once per consulted source"
+    );
+    assert_eq!(connector.calls().0, 1);
+}
+
+#[tokio::test]
+async fn api_quota_exhaustion_with_fallback_disabled_refuses_without_browsing() {
+    let dir = temp_dir();
+    let connector = FakeConnector::new(
+        "1688",
+        Behavior {
+            discoveries: vec![discovery("1688", "TPS5430DDAR")],
+            product: None,
+            candidates: Vec::new(),
+            fail: false,
+            delay_ms: 0,
+        },
+    );
+    // The connector advertises an API and a browser mechanism: the ordinary
+    // escape hatch the service must NOT take on its own.
+    let browser_capable = Arc::new(BrowserCapableFake {
+        inner: connector.clone(),
+    });
+    let service = service_with_planner(
+        &dir,
+        browser_capable,
+        Arc::new(faktor_acquire::AcquisitionPlanner::default()),
+    );
+    let mut ctx = test_ctx();
+    ctx.quota = Some(faktor_commerce::connector::QuotaState {
+        source: source("1688"),
+        remaining: Some(0),
+        reset_ms: Some(now_ms() + 600_000),
+    });
+    let error = service
+        .search(&ctx, search_request("TPS5430"))
+        .await
+        .expect_err("exhausted API quota must refuse");
+    match error {
+        ServiceError::Source(SourceError::QuotaExhausted { reset_ms }) => {
+            assert!(reset_ms > now_ms());
+        }
+        other => panic!("expected QuotaExhausted, got {other:?}"),
+    }
+    assert_eq!(
+        connector.calls(),
+        (0, 0, 0),
+        "fallback-disabled quota exhaustion must not silently browse"
+    );
+}
+
+/// A thin wrapper delegating to the fake connector but advertising the
+/// browser mechanism too (an ordinary API-first connector).
+struct BrowserCapableFake {
+    inner: Arc<FakeConnector>,
+}
+
+#[async_trait::async_trait]
+impl CommerceConnector for BrowserCapableFake {
+    fn source(&self) -> SourceId {
+        self.inner.source()
+    }
+
+    fn capabilities(&self) -> faktor_commerce::connector::ConnectorCapabilities {
+        faktor_commerce::connector::ConnectorCapabilities {
+            mechanisms: vec![
+                faktor_commerce::connector::AcquisitionMechanism::OfficialApi,
+                faktor_commerce::connector::AcquisitionMechanism::BrowserNetwork,
+            ],
+            ..self.inner.capabilities()
+        }
+    }
+
+    async fn discover(
+        &self,
+        ctx: &faktor_commerce::connector::AcquireCtx,
+        req: SearchRequest,
+    ) -> Result<Vec<Discovery>, SourceError> {
+        self.inner.discover(ctx, req).await
+    }
+
+    async fn product(
+        &self,
+        ctx: &faktor_commerce::connector::AcquireCtx,
+        req: ProductRequest,
+    ) -> Result<CommercialOffer, SourceError> {
+        self.inner.product(ctx, req).await
+    }
+
+    async fn quote(
+        &self,
+        ctx: &faktor_commerce::connector::AcquireCtx,
+        req: QuoteRequest,
+    ) -> Result<Vec<QuoteCandidate>, SourceError> {
+        self.inner.quote(ctx, req).await
+    }
+}
+
+#[tokio::test]
+async fn connector_receives_and_executes_the_planner_chosen_mechanism() {
+    let dir = temp_dir();
+    let connector = FakeConnector::healthy("mouser");
+    let scripted = Arc::new(ScriptedPlanner::new(acquire_decision(
+        faktor_acquire::AcquisitionMechanism::Dom,
+    )));
+    let service = service_with_planner(&dir, connector.clone(), scripted);
+    let outcome = service
+        .search(&test_ctx(), search_request("TPS5430"))
+        .await
+        .expect("search");
+    assert_eq!(outcome.discoveries.len(), 1);
+    assert_eq!(
+        connector.mechanisms(),
+        vec![Some(faktor_commerce::connector::AcquisitionMechanism::Dom)],
+        "the connector must receive exactly the planned mechanism"
+    );
+}
+
+#[tokio::test]
+async fn breaker_state_tracks_the_mechanism_actually_used() {
+    let dir = temp_dir();
+    let connector = FakeConnector::new(
+        "mouser",
+        Behavior {
+            discoveries: vec![discovery("mouser", "TPS5430DDAR")],
+            product: None,
+            candidates: Vec::new(),
+            fail: true,
+            delay_ms: 0,
+        },
+    );
+    let scripted = Arc::new(ScriptedPlanner::new(acquire_decision(
+        faktor_acquire::AcquisitionMechanism::OfficialApi,
+    )));
+    let browser_capable = Arc::new(BrowserCapableFake {
+        inner: connector.clone(),
+    });
+    let service = service_with_planner(&dir, browser_capable, scripted.clone());
+    let now = now_ms();
+
+    // Three API-mechanism failures open the API breaker and nothing else.
+    for index in 0..3 {
+        let _ = service
+            .search(&test_ctx(), search_request(&format!("api-failure-{index}")))
+            .await;
+    }
+    let (api_open, browser_open) = service.breaker_state(&source("mouser"), now);
+    assert!(api_open.is_some(), "the api breaker opened");
+    assert!(browser_open.is_none(), "the browser path was never used");
+
+    // A browser-mechanism success must close only the browser path: if the
+    // service reported it as API health, the API breaker would close too.
+    scripted.set(acquire_decision(
+        faktor_acquire::AcquisitionMechanism::BrowserNetwork,
+    ));
+    connector.set_fail(false);
+    service
+        .search(&test_ctx(), search_request("browser-success"))
+        .await
+        .expect("browser success");
+    let (api_open, browser_open) = service.breaker_state(&source("mouser"), now);
+    assert!(
+        api_open.is_some(),
+        "a browser success must not be reported as API health"
+    );
+    assert!(browser_open.is_none());
+    let mechanisms = connector.mechanisms();
+    assert_eq!(mechanisms.len(), 4);
+    assert!(mechanisms[..3]
+        .iter()
+        .all(|m| *m == Some(faktor_commerce::connector::AcquisitionMechanism::OfficialApi)));
+    assert_eq!(
+        mechanisms[3],
+        Some(faktor_commerce::connector::AcquisitionMechanism::BrowserNetwork)
+    );
+
+    // Browser failures move only the browser path.
+    connector.set_fail(true);
+    for index in 0..3 {
+        let _ = service
+            .search(
+                &test_ctx(),
+                search_request(&format!("browser-failure-{index}")),
+            )
+            .await;
+    }
+    let (api_open, browser_open) = service.breaker_state(&source("mouser"), now);
+    assert!(api_open.is_some(), "the api breaker is independent");
+    assert!(browser_open.is_some(), "three browser failures open it");
+}
+
+#[tokio::test]
+async fn cache_serve_decision_skips_connectors_entirely() {
+    let dir = temp_dir();
+    let connector = FakeConnector::healthy("mouser");
+    let spy = Arc::new(CountingPlanner {
+        calls: AtomicU64::new(0),
+        inner: faktor_acquire::AcquisitionPlanner::default(),
+    });
+    let service = service_with_planner(&dir, connector.clone(), spy.clone());
+    let live_ctx = test_ctx().with_freshness(FreshnessMode::Live);
+    service
+        .search(
+            &live_ctx,
+            search_request_mode("TPS5430", FreshnessMode::Live),
+        )
+        .await
+        .expect("live");
+    assert_eq!(connector.calls().0, 1);
+    assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
+
+    let outcome = service
+        .search(&test_ctx(), search_request("TPS5430"))
+        .await
+        .expect("cache");
+    assert!(matches!(
+        outcome.freshness,
+        Some(Freshness::FreshCache { .. })
+    ));
+    assert_eq!(
+        connector.calls().0,
+        1,
+        "a ServeFromCache decision must skip the connector entirely"
+    );
+    assert_eq!(
+        spy.calls.load(Ordering::SeqCst),
+        2,
+        "the planner made the cache decision"
+    );
 }

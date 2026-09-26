@@ -13,7 +13,8 @@ use crate::error::{AcquisitionError, VerificationKind};
 use crate::health::{ConnectorHealth, ExtractionHealth, ExtractionOutcome};
 use crate::mechanism::AcquisitionMechanism;
 use crate::planner::{
-    AcquisitionPlan, AcquisitionPlanner, PlanDecision, PlanNote, PlannerInputs, SubstitutionPolicy,
+    AcquisitionPlan, AcquisitionPlanner, AcquisitionPlanning, PlanDecision, PlanNote,
+    PlannerInputs, RuntimeAcquisitionState, SubstitutionPolicy,
 };
 use crate::quota::{QuotaState, QuotaWindow};
 use crate::request::{AcquisitionRequest, RequestedField, RequestedFields, RequestedFreshness};
@@ -584,4 +585,104 @@ fn partial_coverage_is_selected_but_flagged() {
     assert!(plan.notes.contains(&PlanNote::PartialCoverage {
         mechanism: AcquisitionMechanism::Dom
     }));
+}
+
+struct CountingPlanner {
+    calls: std::sync::atomic::AtomicUsize,
+    inner: AcquisitionPlanner,
+}
+
+impl AcquisitionPlanning for CountingPlanner {
+    fn plan(&self, state: &RuntimeAcquisitionState) -> AcquisitionPlan {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RuntimeAcquisitionState::plan(state, &self.inner)
+    }
+}
+
+fn runtime_state(mechanisms: Vec<AcquisitionMechanism>) -> RuntimeAcquisitionState {
+    RuntimeAcquisitionState {
+        identity: IDENTITY.to_string(),
+        fields: RequestedFields::of([RequestedField::Identity, RequestedField::Availability]),
+        freshness: RequestedFreshness::Live,
+        account_scope: None,
+        capability: ConnectorCapabilities::none()
+            .with_full(AcquisitionMechanism::OfficialApi)
+            .with_full(AcquisitionMechanism::Dom),
+        credential: CredentialAvailability::none(),
+        quota: QuotaState::new(QuotaWindow::per_minute(1_000), NOW),
+        cache: CacheState::new(),
+        health: ConnectorHealth::Healthy,
+        mechanisms,
+        ttl: FreshnessClassTtl::default(),
+        field_health: ExtractionHealth::new(),
+        now_ms: NOW,
+    }
+}
+
+#[test]
+fn runtime_state_adapter_produces_the_same_plan_as_the_raw_inputs() {
+    let state = runtime_state(vec![
+        AcquisitionMechanism::OfficialApi,
+        AcquisitionMechanism::Dom,
+    ]);
+    let adapted = state.plan(&AcquisitionPlanner::default());
+    let request = state.request();
+    let direct = AcquisitionPlanner::default().plan(&PlannerInputs {
+        request: &request,
+        capabilities: &state.capability,
+        health: &state.health,
+        credentials: &state.credential,
+        quota: &state.quota,
+        cache: &state.cache,
+        ttl: &state.ttl,
+        field_health: &state.field_health,
+        now_ms: state.now_ms,
+    });
+    assert_eq!(adapted, direct);
+    assert!(matches!(
+        adapted.decision,
+        PlanDecision::Acquire {
+            mechanism: AcquisitionMechanism::OfficialApi,
+            ..
+        }
+    ));
+}
+
+/// The advertised mechanism list is authoritative: a capability entry for a
+/// mechanism the connector did not advertise is demoted, so a stale or
+/// hostile capability map cannot widen the plan.
+#[test]
+fn runtime_state_adapter_restricts_capabilities_to_advertised_mechanisms() {
+    let state = runtime_state(vec![AcquisitionMechanism::Dom]);
+    assert_eq!(
+        state
+            .restricted_capabilities()
+            .mechanism_level(AcquisitionMechanism::OfficialApi),
+        CapabilityLevel::None
+    );
+    let plan = state.plan(&AcquisitionPlanner::default());
+    assert!(matches!(
+        plan.decision,
+        PlanDecision::Acquire {
+            mechanism: AcquisitionMechanism::Dom,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn planner_port_is_countable_and_used_by_runtime_callers() {
+    let counter = CountingPlanner {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        inner: AcquisitionPlanner::default(),
+    };
+    let port: &dyn AcquisitionPlanning = &counter;
+    let state = runtime_state(vec![AcquisitionMechanism::OfficialApi]);
+    let plan = port.plan(&state);
+    assert_eq!(
+        counter.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the port must route through the planner exactly once"
+    );
+    assert!(matches!(plan.decision, PlanDecision::Acquire { .. }));
 }

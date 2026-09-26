@@ -667,6 +667,13 @@ fn block_on<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// The caller principal the certification tool calls run under: the
+/// runtime-derived workspace/session identity, never tool arguments.
+fn certification_principal() -> faktor_commerce::jobs::CommercePrincipal {
+    let ctx = certification_ctx();
+    faktor_commerce::jobs::CommercePrincipal::new(ctx.identity.workspace_id, ctx.session_id, None)
+}
+
 fn run_tool(certified: &Certified, args: Value) -> Result<ToolOutcome, Error> {
     certified
         .counters
@@ -947,6 +954,7 @@ fn bom_500_lines_is_one_interaction_deterministic_job_and_cas_artifact() {
     // digest-keyed; a duplicate request can never produce a second job
     // identity), and the service never consulted a model.
     let bom = super::parse_bom(&args).expect("bom parse");
+    let principal = certification_principal();
     let request = bom_request(
         bom,
         faktor_commerce::SourceSet::named(vec![SourceId::new("mouser").expect("source")])
@@ -955,8 +963,8 @@ fn bom_500_lines_is_one_interaction_deterministic_job_and_cas_artifact() {
         DetailLevel::Compact,
         None,
     );
-    let digest_a = certified.service.digest_for(&request, None);
-    let digest_b = certified.service.digest_for(&request, None);
+    let digest_a = certified.service.digest_for(&principal, &request, None);
+    let digest_b = certified.service.digest_for(&principal, &request, None);
     assert_eq!(digest_a, digest_b, "job digest must be deterministic");
     assert_eq!(certified.counters.model_calls(), 0, "no hidden summarizer");
     assert_eq!(certified.counters.browser_captures(), 0);
@@ -1587,6 +1595,7 @@ async fn fault_acquire_restart_recovers_pending_jobs() {
         request,
         &[SourceId::new("mouser").unwrap()],
         None,
+        &certification_principal(),
         faktor_commerce::service::now_ms(),
     )
     .expect("submit");
@@ -1622,6 +1631,8 @@ async fn fault_acquire_restart_recovers_pending_jobs() {
         outcome.compact.artifact.is_some(),
         "the recovered job writes its full result to CAS"
     );
-    let status = restarted.job_status(&job.id).expect("status");
+    let status = restarted
+        .job_status(&certification_principal(), &job.id)
+        .expect("status");
     assert_eq!(status.state, faktor_commerce::JobState::Completed);
 }

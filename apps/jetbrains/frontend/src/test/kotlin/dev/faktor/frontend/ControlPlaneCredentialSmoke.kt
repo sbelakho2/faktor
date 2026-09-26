@@ -7,6 +7,7 @@ package dev.faktor.frontend
 
 import dev.faktor.backend.NativeClient
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.asciiLowerCase
 import java.nio.file.Files
 import java.nio.file.Paths
 
@@ -271,7 +272,7 @@ object ControlPlaneCredentialSmoke {
             server.start()
             val java = Paths.get(
                 System.getProperty("java.home"), "bin",
-                if (System.getProperty("os.name", "").toLowerCase().contains("win")) "java.exe" else "java"
+                if (asciiLowerCase(System.getProperty("os.name", "")).contains("win")) "java.exe" else "java"
             ).toString()
             val process = ProcessBuilder(java, "-version").start()
             println("  fake control-plane daemon on ${server.address.port}")

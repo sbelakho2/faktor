@@ -524,8 +524,15 @@ async fn single_item_task_matches_the_direct_prompt_path_byte_for_byte() {
     {
         let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
         let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
-        let finished =
-            |s: &Option<String>| matches!(s.as_deref(), Some(status) if status != "active");
+        // `is_terminal_turn_record_status` is the store's ONE terminal-status
+        // vocabulary (completed | cancelled | failed), never a local
+        // re-spelling of `!= "active"`.
+        let finished = |s: &Option<String>| {
+            matches!(
+                s.as_deref(),
+                Some(status) if faktor_store::is_terminal_turn_record_status(status)
+            )
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
             let a = ha.turn_record(op_a).unwrap().map(|r| r.status);
@@ -3791,8 +3798,12 @@ async fn mutating_runs_always_isolate_and_only_the_test_seam_drives_the_owner() 
     let ha = env_a.manager.get_session(env_a.parent).unwrap().unwrap();
     let hb = env_b.manager.get_session(env_b.parent).unwrap().unwrap();
     {
-        let finished =
-            |s: &Option<String>| matches!(s.as_deref(), Some(status) if status != "active");
+        let finished = |s: &Option<String>| {
+            matches!(
+                s.as_deref(),
+                Some(status) if faktor_store::is_terminal_turn_record_status(status)
+            )
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
             let a = ha

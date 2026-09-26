@@ -37,8 +37,7 @@ use faktor_commerce::query::{
 use faktor_commerce::text::{CanonicalUrl, Text};
 use faktor_commerce::{SourceError, SourceId};
 
-use crate::browser::FallbackPolicy;
-use crate::context::{AcquireCtx, Cancellation, Clock, Diagnostics};
+use crate::context::{AcquireCtx, Cancellation, Clock, ConnectorIdentity, Diagnostics};
 use crate::contract::capture::SharedBrowserExtraction;
 use crate::contract::{
     CapabilityLevel, ConnectorCapabilities, Discovery, Mechanism, ProductReference, ProductRequest,
@@ -65,12 +64,15 @@ pub struct ConnectorRuntime {
     pub browser: Option<Arc<dyn crate::browser::BrowserFallback>>,
     /// The browser-acquisition authority, when one is available.
     pub browser_extraction: Option<SharedBrowserExtraction>,
-    /// The browser-fallback policy.
-    pub fallback_policy: FallbackPolicy,
     /// The market, when the runtime scopes acquisition to one.
     pub market: Option<Text<32>>,
     /// The locale, when the runtime scopes acquisition to one.
     pub locale: Option<Text<32>>,
+    /// The immutable configured connector identity (P0 item 2). The daemon
+    /// configuration owns it; the tool/model request can never manufacture
+    /// it. When an explicit account scope is configured here it wins over
+    /// whatever the commerce request carried.
+    pub identity: ConnectorIdentity,
 }
 
 impl ConnectorRuntime {
@@ -90,10 +92,18 @@ impl ConnectorRuntime {
             clock,
             browser: None,
             browser_extraction: None,
-            fallback_policy: FallbackPolicy::default(),
             market: None,
             locale: None,
+            identity: ConnectorIdentity::anonymous(),
         }
+    }
+
+    /// Inject the immutable configured connector identity (P0 item 2). The
+    /// registration site resolves it from daemon configuration; the tool
+    /// request never supplies it.
+    pub fn with_identity(mut self, identity: ConnectorIdentity) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Inject the browser fallback authority.
@@ -108,14 +118,12 @@ impl ConnectorRuntime {
         self
     }
 
-    /// Set the browser-fallback policy.
-    pub fn with_fallback_policy(mut self, policy: FallbackPolicy) -> Self {
-        self.fallback_policy = policy;
-        self
-    }
-
-    /// Set the market/locale scope.
+    /// Set the market/locale scope (also folded into the injected identity).
     pub fn with_market(mut self, market: Text<32>, locale: Option<Text<32>>) -> Self {
+        self.identity = self.identity.with_market(market.clone());
+        if let Some(locale) = &locale {
+            self.identity = self.identity.with_locale(locale.clone());
+        }
         self.market = Some(market);
         self.locale = locale;
         self
@@ -162,10 +170,21 @@ impl<C: SiteConnector + 'static> Registered<C> {
         // commerce token lazily.
         .cancellation(Cancellation::observed(move || {
             commerce_cancel.is_cancelled()
-        }))
-        .fallback_policy(self.runtime.fallback_policy);
+        }));
         if let Some(remaining) = ctx.remaining() {
             builder = builder.deadline_ms(now.saturating_add(duration_ms(remaining)));
+        }
+        // The runtime planner already chose the mechanism; the connector
+        // executes it. Without a choice the adapter refuses rather than
+        // selecting one itself.
+        if let Some(mechanism) = ctx.mechanism() {
+            builder = builder.mechanism(match mechanism {
+                AcquisitionMechanism::OfficialApi => Mechanism::OfficialApi,
+                AcquisitionMechanism::DirectHttp => Mechanism::DirectHttp,
+                AcquisitionMechanism::BrowserNetwork => Mechanism::BrowserNetwork,
+                AcquisitionMechanism::EmbeddedState => Mechanism::EmbeddedState,
+                AcquisitionMechanism::Dom => Mechanism::Dom,
+            });
         }
         if let Some(browser) = &self.runtime.browser {
             builder = builder.browser(browser.clone());
@@ -173,15 +192,29 @@ impl<C: SiteConnector + 'static> Registered<C> {
         if let Some(extraction) = &self.runtime.browser_extraction {
             builder = builder.browser_extraction(extraction.clone());
         }
-        if let Some(account) = &ctx.account_scope {
-            builder = builder.account_scope(account.clone());
+        // The configured identity is the authority (P0 item 2): a configured
+        // account scope always wins over whatever the commerce request
+        // carried. The request is only a fallback when the daemon
+        // configured no account scope at all, which keeps embedded callers
+        // working without letting a tool request override configured
+        // identity.
+        let mut identity = self.runtime.identity.clone();
+        if identity.account_scope().is_none() {
+            if let Some(account) = &ctx.account_scope {
+                identity = identity.with_account_scope(account.clone());
+            }
         }
-        if let Some(market) = &self.runtime.market {
-            builder = builder.market(market.clone());
+        if identity.market().is_none() {
+            if let Some(market) = &self.runtime.market {
+                identity = identity.with_market(market.clone());
+            }
         }
-        if let Some(locale) = &self.runtime.locale {
-            builder = builder.locale(locale.clone());
+        if identity.locale().is_none() {
+            if let Some(locale) = &self.runtime.locale {
+                identity = identity.with_locale(locale.clone());
+            }
         }
+        builder = builder.identity(identity);
         builder.build()
     }
 }
@@ -378,7 +411,6 @@ pub fn is_first_party(url: &CanonicalUrl, suffixes: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::FallbackPolicy;
     use crate::context::ManualClock;
     use crate::contract::extract::Strategy;
     use crate::contract::{Discovery, RequestedFreshness};
@@ -399,7 +431,6 @@ mod tests {
             Arc::new(crate::context::NoopDiagnostics),
             Arc::new(ManualClock::new(1_700_000_000_000)),
         )
-        .with_fallback_policy(FallbackPolicy::disabled())
     }
 
     struct FakeSite {
@@ -527,6 +558,88 @@ mod tests {
                 .to_decimal_string(),
             "36.000000"
         );
+    }
+
+    #[test]
+    fn rich_ctx_reads_the_configured_identity_not_the_request() {
+        use faktor_commerce::text::AccountScope;
+
+        let configured = AccountScope::new("buyer-configured").expect("scope");
+        let requested = AccountScope::new("buyer-requested").expect("scope");
+        let profile = faktor_commerce::connector::ProfileIdentity::new(source(), "procurement-cn")
+            .expect("profile");
+        let runtime = runtime().with_identity(
+            ConnectorIdentity::anonymous()
+                .with_profile(profile)
+                .with_account_scope(configured.clone())
+                .with_market(Text::<32>::new("CN").expect("market"))
+                .with_locale(Text::<32>::new("zh-CN").expect("locale")),
+        );
+        let registered = Registered::new(
+            FakeSite {
+                calls: std::sync::Mutex::new(0),
+            },
+            runtime,
+        );
+        // A request that tries to manufacture a different account scope must
+        // not override the configured identity.
+        let mut commerce = CommerceCtx::new();
+        commerce.account_scope = Some(requested);
+        let site = registered.rich_ctx(&commerce);
+        assert_eq!(site.account_scope(), Some(&configured));
+        assert_eq!(site.market().map(Text::as_str), Some("CN"));
+        assert_eq!(site.locale().map(Text::as_str), Some("zh-CN"));
+        assert_eq!(
+            site.identity()
+                .profile()
+                .map(|profile| profile.profile.as_str()),
+            Some("procurement-cn")
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_identity_keeps_the_embedded_caller_scope() {
+        use faktor_commerce::text::AccountScope;
+
+        let requested = AccountScope::new("buyer-requested").expect("scope");
+        let registered = Registered::new(
+            FakeSite {
+                calls: std::sync::Mutex::new(0),
+            },
+            runtime(),
+        );
+        let mut commerce = CommerceCtx::new();
+        commerce.account_scope = Some(requested.clone());
+        let site = registered.rich_ctx(&commerce);
+        assert_eq!(site.account_scope(), Some(&requested));
+        assert!(site.identity().profile().is_none());
+    }
+
+    /// The planner's mechanism reaches the site adapter verbatim; the bridge
+    /// adds no selection and no default.
+    #[test]
+    fn rich_ctx_carries_the_planned_mechanism_verbatim() {
+        let registered = Registered::new(
+            FakeSite {
+                calls: std::sync::Mutex::new(0),
+            },
+            runtime(),
+        );
+        let mut commerce = CommerceCtx::new();
+        commerce.mechanism = Some(AcquisitionMechanism::BrowserNetwork);
+        let site = registered.rich_ctx(&commerce);
+        assert_eq!(site.mechanism(), Some(Mechanism::BrowserNetwork));
+
+        let mut commerce = CommerceCtx::new();
+        commerce.mechanism = Some(AcquisitionMechanism::Dom);
+        assert_eq!(
+            registered.rich_ctx(&commerce).mechanism(),
+            Some(Mechanism::Dom)
+        );
+
+        // No planned mechanism means no mechanism: the adapter must refuse
+        // rather than pick one.
+        assert_eq!(registered.rich_ctx(&CommerceCtx::new()).mechanism(), None);
     }
 
     #[tokio::test]

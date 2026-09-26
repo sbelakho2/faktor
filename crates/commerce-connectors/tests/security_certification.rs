@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use faktor_commerce::offer::ObservationOrigin;
 use faktor_commerce_connectors::config::{LcscConnectorConfig, MouserConnectorConfig};
-use faktor_commerce_connectors::contract::{SearchRequest, SiteConnector};
+use faktor_commerce_connectors::contract::{Mechanism, SearchRequest, SiteConnector};
 use faktor_commerce_connectors::testing::{
     CannedResponse, FixtureTransport, MapCredentials, RecordingBrowser,
 };
 use faktor_commerce_connectors::{
-    AcquireCtx, FallbackPolicy, LcscConnector, ManualClock, MemoryDiagnostics, MouserConnector,
-    QuotaState, SecretGuard, SourceError, Text,
+    AcquireCtx, LcscConnector, ManualClock, MemoryDiagnostics, MouserConnector, QuotaState,
+    SecretGuard, SourceError, Text,
 };
 
 const MOUSER_KEY: &str = "mouser-sanitized-key-0123456789abcdef";
@@ -55,7 +55,9 @@ impl Harness {
         .clock(Arc::new(ManualClock::new(1_700_000_000_000)))
         .diagnostics(self.diagnostics.clone())
         .browser(self.browser.clone())
-        .fallback_policy(FallbackPolicy::default())
+        // The runtime planner chose the API mechanism for these API-only
+        // connectors; the adapter executes it and never selects one.
+        .mechanism(Mechanism::OfficialApi)
         .build()
     }
 

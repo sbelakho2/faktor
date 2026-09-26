@@ -52,6 +52,27 @@ export interface PendingSubmission {
 /** Decoded-byte ceiling of one upload (mirrors the daemon's 7 MiB bound). */
 export const MAX_PENDING_ATTACHMENT_BYTES = 7 * 1024 * 1024;
 
+/**
+ * Image media types the daemon accepts for model delivery (mirror of
+ * `faktor_provider::SUPPORTED_IMAGE_MIMES`). Deliberately a closed
+ * allowlist: `image/*`-shaped junk (SVG, BMP, TIFF) is refused BEFORE any
+ * upload, exactly like the daemon's own admission.
+ */
+export const SUPPORTED_PENDING_IMAGE_MIMES = [
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+] as const;
+
+/**
+ * Decoded-byte ceiling of one image attachment (mirror of the daemon-wide
+ * per-image model bound, `faktor_provider::MAX_MODEL_IMAGE_BYTES`; a
+ * provider's documented API limit can only be tighter). A larger image is
+ * refused before any upload.
+ */
+export const MAX_PENDING_IMAGE_BYTES = 5 * 1024 * 1024;
+
 const MAX_PENDING_FILES = 64;
 const MAX_PENDING_ID_CHARS = 4096;
 const MAX_PENDING_BASE64_CHARS = Math.ceil(MAX_PENDING_ATTACHMENT_BYTES / 3) * 4 + 8;
@@ -503,9 +524,10 @@ export type AdmitFailureStage = 'upload' | 'start';
 
 /**
  * One admission failure. `kind` `image_unsupported` is the LOUD refusal of
- * an image submission while provider media/content parts are not wired;
- * `upload` covers a refused/failed byte upload; the remaining kinds are the
- * task-start classifications ([`StartFailureKind`]).
+ * an image the daemon can never deliver to a model (a mime outside the
+ * closed allowlist or an image over the per-image bound); `upload` covers a
+ * refused/failed byte upload; the remaining kinds are the task-start
+ * classifications ([`StartFailureKind`]).
  */
 export interface AdmitFailure {
   readonly kind: StartFailureKind | 'upload' | 'image_unsupported';
@@ -544,15 +566,61 @@ function uploadFailureOf(error: unknown, sessionId: string): AdmitFailure {
 }
 
 /**
- * Admit ONE pending submission through the daemon: upload every binary
- * attachment FIRST (images are refused loudly without uploading — provider
- * media/content parts are not wired), then start ONE task run carrying the
- * durable typed ids. The pending envelope is retained by the caller for the
- * entire call; `restore` is invoked EXACTLY ONCE on any failure (upload,
- * image refusal, validation/model/conflict/transport start failure) and
- * never on success — the draft is restored through the composer contract,
- * never silently lost. A failure before the start request leaves no
- * daemon-side admission at all.
+ * The typed refusal for attachments that can never reach a model as an
+ * image part: a mime outside [`SUPPORTED_PENDING_IMAGE_MIMES`] or an image
+ * over [`MAX_PENDING_IMAGE_BYTES`]. Returns `null` when every attachment is
+ * deliverable — a supported image is NOT refused (it uploads to the durable
+ * artifact store like any other attachment, and the daemon's own admission
+ * validates it against the chosen model's vision capability). Document and
+ * text-only submissions are untouched.
+ */
+export function pendingImageRefusal(
+  attachments: readonly PendingBinaryAttachment[],
+): AdmitFailure | null {
+  for (const attachment of attachments) {
+    if (!attachment.isImage && !attachment.mime.startsWith('image/')) {
+      continue;
+    }
+    const name = attachment.filename ?? '(unnamed)';
+    if (!(SUPPORTED_PENDING_IMAGE_MIMES as readonly string[]).includes(attachment.mime)) {
+      return {
+        kind: 'image_unsupported',
+        stage: 'upload',
+        status: 400,
+        code: 'unsupported_image_type',
+        message:
+          `image attachment ${name} has unsupported mime ${JSON.stringify(attachment.mime)}; ` +
+          `deliverable types: ${SUPPORTED_PENDING_IMAGE_MIMES.join(', ')}`,
+      };
+    }
+    if (attachment.bytes > MAX_PENDING_IMAGE_BYTES) {
+      return {
+        kind: 'image_unsupported',
+        stage: 'upload',
+        status: 413,
+        code: 'oversized_image',
+        message:
+          `image attachment ${name} of ${attachment.bytes} bytes exceeds the ` +
+          `${MAX_PENDING_IMAGE_BYTES} byte per-image bound`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Admit ONE pending submission through the daemon: gate every image against
+ * the bounded mime/size allowlist FIRST (an undeliverable image refuses the
+ * whole submission before any upload, so it leaves no partial bytes in the
+ * durable store), then upload every binary attachment — images included —
+ * and start ONE task run carrying the durable typed ids. The bytes live in
+ * the daemon's content-addressed attachment store; the run carries artifact
+ * ids only, never base64 through the model/tool layer. The pending envelope
+ * is retained by the caller for the entire call; `restore` is invoked
+ * EXACTLY ONCE on any failure (allowlist refusal, upload,
+ * validation/model/conflict/transport start failure) and never on success —
+ * the draft is restored through the composer contract, never silently lost.
+ * A failure before the start request leaves no daemon-side admission at all.
  */
 export async function admitPendingSubmission(input: {
   readonly client: StartRunClient & AttachmentUploadClient;
@@ -564,24 +632,11 @@ export async function admitPendingSubmission(input: {
   readonly restore: (failure: AdmitFailure) => void;
 }): Promise<AdmitOutcome> {
   const uploaded: TaskAttachmentId[] = [];
-  // Pre-scan: one image refuses the WHOLE submission BEFORE any upload, so
-  // a submission that can never reach a model leaves no partial bytes in
-  // the durable store.
-  const image = input.pending.attachments.find(
-    (attachment) => attachment.isImage || attachment.mime.startsWith('image/'),
-  );
-  if (image !== undefined) {
-    const failure: AdmitFailure = {
-      kind: 'image_unsupported',
-      stage: 'upload',
-      status: 400,
-      code: 'unsupported',
-      message:
-        'image attachments cannot be submitted: provider media/content parts are not wired, so the bytes can never reach a model; the draft and images were kept — retry without the image',
-    };
-    input.onFailure(failure);
-    input.restore(failure);
-    return { ok: false, runId: null, attachmentIds: [], failure };
+  const refusal = pendingImageRefusal(input.pending.attachments);
+  if (refusal !== null) {
+    input.onFailure(refusal);
+    input.restore(refusal);
+    return { ok: false, runId: null, attachmentIds: [], failure: refusal };
   }
   for (const attachment of input.pending.attachments) {
     try {

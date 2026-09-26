@@ -27,20 +27,36 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use faktor_acquire::cache::{freshness_class, CacheEntry, CacheKey, CacheState, FreshnessClassTtl};
+use faktor_acquire::capability::{
+    CapabilityLevel as AcquireCapabilityLevel, ConnectorCapabilities as AcquireCapabilities,
+    CredentialAvailability,
+};
+use faktor_acquire::health::{ConnectorHealth as AcquireHealth, ExtractionHealth};
+/// Re-exported so the daemon construction seam can name the planner port
+/// without a direct `faktor-acquire` dependency (the service already owns the
+/// port; this only widens its path, never the behavior).
+pub use faktor_acquire::planner::AcquisitionPlanning;
+use faktor_acquire::planner::{
+    AcquisitionPlan, AcquisitionPlanner, PlanDecision, RuntimeAcquisitionState,
+};
+use faktor_acquire::quota::{QuotaState as AcquireQuotaState, QuotaWindow};
+use faktor_acquire::request::{RequestedField, RequestedFields, RequestedFreshness};
+
 use crate::cache::{
     combine_freshness, CacheClass, CacheDecision, CacheIdentity, CacheTtls, PricingScope,
     SingleFlight,
 };
 use crate::connector::{
-    AcquireCtx, Capability, CommerceConnector, ConnectorPolicy, ConnectorRegistry, Discovery,
-    ProfileIdentity, QuoteCandidate, RegistryError,
+    AcquireCtx, AcquisitionMechanism, AcquisitionPath, Capability, CommerceConnector,
+    ConnectorPolicy, ConnectorRegistry, Discovery, ProfileIdentity, QuoteCandidate, RegistryError,
 };
-use crate::error::{ConnectorHealth, SourceError};
+use crate::error::{ConnectorHealth, SourceError, VerificationKind};
 use crate::jobs::{
     advance_job, bom_request, job_digest, running_outcome, terminal_outcome, CommerceJobRequest,
-    ItemOutcome, JobItemExecutor, JobItemState, JobLine, JobOutcome, JobState,
+    CommercePrincipal, ItemOutcome, JobItemExecutor, JobItemState, JobLine, JobOutcome, JobState,
 };
-use crate::offer::{CommercialOffer, Freshness};
+use crate::offer::{CommercialOffer, Freshness, PriceVisibility};
 use crate::query::{
     normalize_query, DetailLevel, FreshnessMode, ProductRef, ProductRequest, QuoteRequest,
     SearchRequest, SourceSet, MAX_REF_BYTES,
@@ -209,12 +225,18 @@ pub struct CommerceSourceService {
     ttls: CacheTtls,
     gc: GcPolicy,
     coalescer: SingleFlight<String, Acquired>,
+    planner: Arc<dyn AcquisitionPlanning>,
 }
 
 impl CommerceSourceService {
     /// A disabled service: no store, no connectors, no browser, no clients.
     /// Constructing it touches nothing.
     pub fn disabled() -> Arc<Self> {
+        Self::disabled_with_planner(Arc::new(AcquisitionPlanner::default()))
+    }
+
+    /// A disabled service with an explicit planner seam (diagnostics/tests).
+    pub fn disabled_with_planner(planner: Arc<dyn AcquisitionPlanning>) -> Arc<Self> {
         Arc::new(Self {
             enabled: false,
             data_dir: None,
@@ -224,6 +246,7 @@ impl CommerceSourceService {
             ttls: CacheTtls::default(),
             gc: GcPolicy::default(),
             coalescer: SingleFlight::new(),
+            planner,
         })
     }
 
@@ -235,8 +258,25 @@ impl CommerceSourceService {
         config: ServiceConfig,
         artifacts: Arc<dyn ArtifactStore>,
     ) -> Result<Arc<Self>, CommerceStoreError> {
+        Self::open_with_planner(
+            data_dir,
+            config,
+            artifacts,
+            Arc::new(AcquisitionPlanner::default()),
+        )
+    }
+
+    /// Construct the service with an explicit planner seam. Production uses
+    /// the default [`AcquisitionPlanner`]; tests inject a spy to observe the
+    /// production path without changing it.
+    pub fn open_with_planner(
+        data_dir: impl AsRef<Path>,
+        config: ServiceConfig,
+        artifacts: Arc<dyn ArtifactStore>,
+        planner: Arc<dyn AcquisitionPlanning>,
+    ) -> Result<Arc<Self>, CommerceStoreError> {
         if !config.enabled {
-            return Ok(Self::disabled());
+            return Ok(Self::disabled_with_planner(planner));
         }
         let commerce_dir = data_dir.as_ref().join(COMMERCE_DIR_NAME);
         let db_path = commerce_dir.join(COMMERCE_DB_NAME);
@@ -250,6 +290,7 @@ impl CommerceSourceService {
             ttls: config.ttls,
             gc: config.gc,
             coalescer: SingleFlight::new(),
+            planner,
         }))
     }
 
@@ -424,6 +465,142 @@ impl CommerceSourceService {
         })
     }
 
+    /// The pricing scope the caller context implies for LOOKUPS (`Account`
+    /// when it carries an account scope, else `Public`). This never decides
+    /// what a row is written under: that is the observation's own scope (see
+    /// [`Self::admit_cache_scope`]).
+    fn ctx_pricing_scope(ctx: &AcquireCtx) -> PricingScope {
+        if ctx.account_scope.is_some() {
+            PricingScope::Account
+        } else {
+            PricingScope::Public
+        }
+    }
+
+    /// Admit the cache pricing scope and account key of one observation.
+    ///
+    /// The scope comes from the offer's own `price_visibility`, NEVER from
+    /// the commerce ctx: an authenticated or account-scoped observation is
+    /// admitted as `Authenticated`/`Account` even when the ctx is anonymous,
+    /// so it can never be cached under `Public`. An account-specific
+    /// observation with no account scope to key it by is the typed refusal
+    /// ([`SourceError::InvalidRequest`]), never a silent widening.
+    ///
+    /// The ctx can only strengthen the scope, never weaken it: an
+    /// account-scoped ctx stores a public/promotional/unknown observation
+    /// under its own account scope, preserving account isolation.
+    fn admit_cache_scope(
+        ctx: &AcquireCtx,
+        offer: &CommercialOffer,
+    ) -> Result<(PricingScope, Option<AccountScope>), SourceError> {
+        let (observed, observed_account) = match offer.price_visibility {
+            PriceVisibility::Public => (PricingScope::Public, None),
+            PriceVisibility::Promotional => (PricingScope::Promotional, None),
+            PriceVisibility::Authenticated => (PricingScope::Authenticated, None),
+            PriceVisibility::InquiryRequired | PriceVisibility::Unknown => {
+                (PricingScope::Unknown, None)
+            }
+            PriceVisibility::AccountSpecific => (
+                PricingScope::Account,
+                Some(Self::observed_account_scope(offer).ok_or(SourceError::InvalidRequest)?),
+            ),
+        };
+        if observed == PricingScope::Account {
+            // The observation's own account keys the row; the ctx never
+            // republishes account data under a different account.
+            return Ok((observed, observed_account));
+        }
+        match &ctx.account_scope {
+            Some(account) if observed != PricingScope::Authenticated => {
+                Ok((PricingScope::Account, Some(account.clone())))
+            }
+            _ => Ok((
+                observed,
+                observed_account.or_else(|| ctx.account_scope.clone()),
+            )),
+        }
+    }
+
+    /// Admit the scope of a whole candidate set: the strongest observation
+    /// wins, so a public sibling can never mask an authenticated or
+    /// account-scoped candidate, and two different account scopes under one
+    /// cache key are a typed refusal (never a mixed row).
+    fn admit_candidates_cache_scope(
+        ctx: &AcquireCtx,
+        candidates: &[QuoteCandidate],
+    ) -> Result<(PricingScope, Option<AccountScope>), SourceError> {
+        let mut admitted: Option<(PricingScope, Option<AccountScope>)> = None;
+        for candidate in candidates {
+            let scope = Self::admit_cache_scope(ctx, &candidate.offer)?;
+            admitted = Some(match admitted {
+                None => scope,
+                Some(current) => {
+                    if scope.0 == PricingScope::Account
+                        && current.0 == PricingScope::Account
+                        && scope.1 != current.1
+                    {
+                        return Err(SourceError::InvalidRequest);
+                    }
+                    if scope_strength(scope.0) > scope_strength(current.0) {
+                        scope
+                    } else {
+                        current
+                    }
+                }
+            });
+        }
+        Ok(admitted.unwrap_or((PricingScope::Public, None)))
+    }
+
+    /// The account scope an account-specific observation is keyed by: the
+    /// first account-specific tier's scope, else the acquisition provenance
+    /// scope.
+    fn observed_account_scope(offer: &CommercialOffer) -> Option<AccountScope> {
+        fn first_break(breaks: &[crate::offer::PriceBreak]) -> Option<AccountScope> {
+            breaks
+                .iter()
+                .find_map(|price_break| price_break.account_scope.clone())
+        }
+        first_break(&offer.price_breaks)
+            .or_else(|| {
+                offer
+                    .variants
+                    .iter()
+                    .find_map(|variant| first_break(&variant.price_breaks))
+            })
+            .or_else(|| {
+                offer
+                    .packaging
+                    .iter()
+                    .find_map(|option| first_break(&option.price_breaks))
+            })
+            .or_else(|| offer.provenance.account_scope.clone())
+    }
+
+    /// The cache identity one observation set is WRITTEN under. The scope
+    /// and account key are the admitted observation values, never the ctx
+    /// (see [`Self::admit_cache_scope`]); quantity/packaging/variant remain
+    /// part of the key.
+    #[allow(clippy::too_many_arguments)]
+    fn observation_identity(
+        &self,
+        class: CacheClass,
+        source: &SourceId,
+        product: &str,
+        ctx: &AcquireCtx,
+        admitted: (PricingScope, Option<AccountScope>),
+        quantity: Option<crate::quantity::NonZeroQuantity>,
+        packaging: Option<crate::packaging::PackagingType>,
+        variant: Option<crate::text::VariantId>,
+    ) -> Result<CacheIdentity, ServiceError> {
+        let (scope, account_scope) = admitted;
+        let mut identity = self.cache_identity(
+            class, source, product, ctx, scope, quantity, packaging, variant,
+        )?;
+        identity.account_scope = account_scope;
+        Ok(identity)
+    }
+
     /// Consult the cache for one identity under the requested mode.
     fn consult_cache(
         &self,
@@ -474,6 +651,289 @@ impl CommerceSourceService {
         reference.source().cloned()
     }
 
+    // ------------------------------------------------------------- planning
+
+    /// The planner learns the fields each operation actually promises, never
+    /// a kitchen sink: discovery returns identity/description, exact product
+    /// the same, a quote quantity tiers. A mechanism is only eligible when it
+    /// covers all of them.
+    fn requested_fields(capability: Capability) -> RequestedFields {
+        match capability {
+            Capability::Discovery | Capability::ExactProduct => {
+                RequestedFields::of([RequestedField::Identity, RequestedField::Descriptive])
+            }
+            Capability::QuantityPricing => {
+                RequestedFields::of([RequestedField::Identity, RequestedField::QuantityTiers])
+            }
+            Capability::Stock => RequestedFields::of([RequestedField::Availability]),
+            Capability::Packaging => RequestedFields::of([RequestedField::Packaging]),
+            Capability::AccountPricing => RequestedFields::of([RequestedField::AccountTerms]),
+            Capability::SupplierData => RequestedFields::of([RequestedField::Descriptive]),
+            Capability::Bulk => RequestedFields::of([RequestedField::BulkSet]),
+        }
+    }
+
+    /// The acquire field a service capability covers, when they differ.
+    fn field_capability(field: RequestedField) -> Option<Capability> {
+        match field {
+            RequestedField::Availability => Some(Capability::Stock),
+            RequestedField::QuantityTiers => Some(Capability::QuantityPricing),
+            RequestedField::Packaging => Some(Capability::Packaging),
+            RequestedField::AccountTerms => Some(Capability::AccountPricing),
+            RequestedField::BulkSet => Some(Capability::Bulk),
+            RequestedField::Identity | RequestedField::Descriptive | RequestedField::Provenance => {
+                None
+            }
+        }
+    }
+
+    /// Translate the registry's advertised capabilities into the planner's
+    /// per-mechanism/per-field levels. A mechanism the connector advertises
+    /// covers the requested fields the connector's capability booleans allow;
+    /// everything else is demoted to `None` so the planner refuses instead of
+    /// handing the connector a mechanism it never advertised.
+    fn acquire_capabilities(
+        capabilities: &crate::connector::ConnectorCapabilities,
+        fields: &RequestedFields,
+    ) -> AcquireCapabilities {
+        let mut acquire = AcquireCapabilities::none();
+        for mechanism in &capabilities.mechanisms {
+            let mechanism = Self::acquire_mechanism(*mechanism);
+            acquire = acquire.with_mechanism(mechanism, AcquireCapabilityLevel::Full);
+            for field in fields.iter() {
+                if let Some(capability) = Self::field_capability(field) {
+                    if !capabilities.has(capability) {
+                        acquire =
+                            acquire.with_field(mechanism, field, AcquireCapabilityLevel::None);
+                    }
+                }
+            }
+        }
+        acquire
+    }
+
+    fn acquire_mechanism(mechanism: AcquisitionMechanism) -> faktor_acquire::AcquisitionMechanism {
+        match mechanism {
+            AcquisitionMechanism::OfficialApi => faktor_acquire::AcquisitionMechanism::OfficialApi,
+            AcquisitionMechanism::DirectHttp => faktor_acquire::AcquisitionMechanism::DirectHttp,
+            AcquisitionMechanism::BrowserNetwork => {
+                faktor_acquire::AcquisitionMechanism::BrowserNetwork
+            }
+            AcquisitionMechanism::EmbeddedState => {
+                faktor_acquire::AcquisitionMechanism::EmbeddedState
+            }
+            AcquisitionMechanism::Dom => faktor_acquire::AcquisitionMechanism::Dom,
+        }
+    }
+
+    fn commerce_mechanism(mechanism: faktor_acquire::AcquisitionMechanism) -> AcquisitionMechanism {
+        match mechanism {
+            faktor_acquire::AcquisitionMechanism::OfficialApi => AcquisitionMechanism::OfficialApi,
+            faktor_acquire::AcquisitionMechanism::DirectHttp => AcquisitionMechanism::DirectHttp,
+            faktor_acquire::AcquisitionMechanism::BrowserNetwork => {
+                AcquisitionMechanism::BrowserNetwork
+            }
+            faktor_acquire::AcquisitionMechanism::EmbeddedState => {
+                AcquisitionMechanism::EmbeddedState
+            }
+            faktor_acquire::AcquisitionMechanism::Dom => AcquisitionMechanism::Dom,
+        }
+    }
+
+    fn acquire_freshness(freshness: FreshnessMode) -> RequestedFreshness {
+        match freshness {
+            FreshnessMode::PreferCache => RequestedFreshness::PreferCache,
+            FreshnessMode::Live => RequestedFreshness::Live,
+            FreshnessMode::CacheOnly => RequestedFreshness::CacheOnly,
+        }
+    }
+
+    fn acquire_verification(kind: faktor_acquire::VerificationKind) -> VerificationKind {
+        match kind {
+            faktor_acquire::VerificationKind::Challenge => VerificationKind::Captcha,
+            faktor_acquire::VerificationKind::Consent => VerificationKind::Manual,
+            faktor_acquire::VerificationKind::Unknown => VerificationKind::Unknown,
+        }
+    }
+
+    /// Map a planner refusal onto the typed domain failure. `NotFound` has no
+    /// acquire spelling, so it maps back to `ProductNotFound`; the bound
+    /// errors map onto extraction failures.
+    fn acquire_error(error: &faktor_acquire::AcquisitionError) -> SourceError {
+        use faktor_acquire::AcquisitionError::*;
+        match error {
+            Disabled => SourceError::Disabled,
+            InvalidRequest { .. } => SourceError::InvalidRequest,
+            AuthenticationRequired => SourceError::AuthenticationRequired,
+            VerificationRequired { kind } => SourceError::VerificationRequired {
+                kind: Self::acquire_verification(*kind),
+            },
+            RateLimited { retry_after_ms } => SourceError::RateLimited {
+                retry_after_ms: *retry_after_ms,
+            },
+            QuotaExhausted { reset_ms } => SourceError::QuotaExhausted {
+                reset_ms: *reset_ms,
+            },
+            CoolingDown { until_ms } => SourceError::CoolingDown {
+                until_ms: *until_ms,
+            },
+            EgressUnavailable => SourceError::EgressUnavailable,
+            NetworkTimeout => SourceError::NetworkTimeout,
+            ApiUnavailable => SourceError::ApiUnavailable,
+            BrowserUnavailable => SourceError::BrowserUnavailable,
+            BrowserCrashed => SourceError::BrowserCrashed,
+            NotFound => SourceError::ProductNotFound,
+            ExtractionIncomplete | NestingTooDeep { .. } | TooManyRedirects { .. } => {
+                SourceError::ExtractionIncomplete
+            }
+            ExtractionConflict => SourceError::ExtractionConflict,
+            ResponseTooLarge { .. } => SourceError::ResponseTooLarge,
+            Cancelled => SourceError::Cancelled,
+            Deadline => SourceError::Deadline,
+            Store => SourceError::Store,
+        }
+    }
+
+    /// The planner-facing quota state. The context snapshot is bounded: an
+    /// exhausted snapshot becomes an exhausted window whose reset is the
+    /// snapshot's reset (never an unbounded bypass), everything else is a
+    /// fresh window.
+    fn acquire_quota(
+        quota: Option<&crate::connector::QuotaState>,
+        now_ms: u64,
+    ) -> AcquireQuotaState {
+        let mut state = AcquireQuotaState::new(
+            QuotaWindow {
+                window_ms: 60_000,
+                limit: u32::MAX,
+            },
+            now_ms,
+        );
+        let Some(snapshot) = quota else {
+            return state;
+        };
+        match (snapshot.remaining, snapshot.reset_ms) {
+            (Some(0), Some(reset_ms)) if reset_ms > now_ms => {
+                state.window.window_ms = reset_ms - now_ms;
+                state.window.limit = 1;
+                state.used = 1;
+                state.exhausted_until_ms = Some(reset_ms);
+            }
+            (Some(remaining), _) => {
+                state.window.limit = u32::try_from(remaining.max(1)).unwrap_or(u32::MAX);
+                state.used = 0;
+            }
+            _ => {}
+        }
+        state
+    }
+
+    /// The planner-facing health: the path that could execute the connector's
+    /// strongest advertised mechanism. A browser-only connector is planned
+    /// against its browser state; an API-capable connector against its API
+    /// state, so a browser outcome can never masquerade as API health.
+    fn planner_health(
+        registry: &ConnectorRegistry,
+        source: &SourceId,
+        mechanisms: &[AcquisitionMechanism],
+        now_ms: u64,
+    ) -> AcquireHealth {
+        let api = mechanisms
+            .iter()
+            .find(|mechanism| AcquisitionPath::of_mechanism(**mechanism) == AcquisitionPath::Api);
+        match api.or_else(|| mechanisms.first()) {
+            Some(mechanism) => registry.mechanism_health(source, *mechanism, now_ms),
+            None => AcquireHealth::Healthy,
+        }
+    }
+
+    /// Build the acquire cache state for one identity from the service's own
+    /// cache lookup, so the planner (not the connector) owns the
+    /// serve-cache/acquire decision.
+    fn acquire_cache_state(
+        key: &str,
+        ctx: &AcquireCtx,
+        fields: &RequestedFields,
+        lookup: &CacheLookup,
+    ) -> CacheState {
+        let mut cache = CacheState::new();
+        let row = match lookup {
+            CacheLookup::Fresh(row, _) | CacheLookup::Stale(row, _) => row,
+            CacheLookup::Miss => return cache,
+        };
+        let account_scope = ctx.account_scope.as_ref().map(|a| a.as_str().to_string());
+        for field in fields.iter() {
+            cache.insert(
+                CacheKey::new(key, account_scope.clone(), field),
+                CacheEntry {
+                    observed_at_ms: row.observed_at_ms,
+                    class: freshness_class(field),
+                    etag: row.etag.clone(),
+                    last_modified: row.last_modified_ms.map(|ms| ms.to_string()),
+                    content_digest: None,
+                    content: None,
+                },
+            );
+        }
+        cache
+    }
+
+    /// Run the production planner for one source and request.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_source(
+        &self,
+        source: &SourceId,
+        class: CacheClass,
+        fields: RequestedFields,
+        freshness: FreshnessMode,
+        ctx: &AcquireCtx,
+        key: &str,
+        cache: &CacheLookup,
+        now_ms: u64,
+    ) -> Result<AcquisitionPlan, ServiceError> {
+        let (capabilities, mechanisms, health) = {
+            let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
+            let capabilities = registry
+                .capabilities(source)
+                .ok_or(ServiceError::Source(SourceError::Disabled))?;
+            let mechanisms: Vec<AcquisitionMechanism> = capabilities.mechanisms.clone();
+            let health = Self::planner_health(&registry, source, &mechanisms, now_ms);
+            (capabilities, mechanisms, health)
+        };
+        let ttl_ms = self.ttls.ttl_ms(class);
+        let state = RuntimeAcquisitionState {
+            identity: key.to_string(),
+            fields: fields.clone(),
+            freshness: Self::acquire_freshness(freshness),
+            account_scope: ctx.account_scope.as_ref().map(|a| a.as_str().to_string()),
+            capability: Self::acquire_capabilities(&capabilities, &fields),
+            credential: CredentialAvailability::none(),
+            quota: Self::acquire_quota(ctx.quota.as_ref(), now_ms),
+            cache: Self::acquire_cache_state(key, ctx, &fields, cache),
+            health,
+            mechanisms: mechanisms
+                .iter()
+                .map(|m| Self::acquire_mechanism(*m))
+                .collect(),
+            ttl: FreshnessClassTtl {
+                slow_ms: ttl_ms,
+                moderate_ms: ttl_ms,
+                fast_ms: ttl_ms,
+            },
+            field_health: ExtractionHealth::new(),
+            now_ms,
+        };
+        Ok(self.planner.plan(&state))
+    }
+
+    /// The independent API/browser breaker states, for diagnostics/tests.
+    pub fn breaker_state(&self, source: &SourceId, now_ms: u64) -> (Option<u64>, Option<u64>) {
+        match self.registry.lock() {
+            Ok(registry) => registry.breaker_state(source, now_ms),
+            Err(_) => (None, None),
+        }
+    }
+
     // ------------------------------------------------------------- operations
 
     /// Discovery (`search`): discovery only, never a quote.
@@ -506,62 +966,118 @@ impl CommerceSourceService {
                 None,
                 None,
             )?;
+            let mut lookup = CacheLookup::Miss;
             let mut stale_fallback: Option<(CachedRow, Freshness)> = None;
             if req.freshness != FreshnessMode::Live {
                 match self.consult_cache(&identity, ttl, req.freshness, now)? {
                     CacheLookup::Fresh(row, freshness) => {
+                        lookup = CacheLookup::Fresh(row, freshness);
+                    }
+                    CacheLookup::Stale(row, freshness) => {
+                        if req.freshness == FreshnessMode::CacheOnly {
+                            lookup = CacheLookup::Fresh(row, freshness);
+                        } else {
+                            stale_fallback = Some((row.clone(), freshness));
+                            lookup = CacheLookup::Stale(row, freshness);
+                        }
+                    }
+                    CacheLookup::Miss => {}
+                }
+            }
+
+            let key = identity.digest();
+            let plan = self.plan_source(
+                &source,
+                CacheClass::Discovery,
+                Self::requested_fields(Capability::Discovery),
+                req.freshness,
+                ctx,
+                &key,
+                &lookup,
+                now,
+            )?;
+            let planned = match plan.decision {
+                PlanDecision::ServeFromCache { .. } => {
+                    let (row, freshness) = match lookup {
+                        CacheLookup::Fresh(row, freshness) | CacheLookup::Stale(row, freshness) => {
+                            (row, freshness)
+                        }
+                        CacheLookup::Miss => return Err(ServiceError::Source(SourceError::Store)),
+                    };
+                    let cached: Vec<Discovery> =
+                        row.payload.parse().map_err(ServiceError::Store)?;
+                    marks.push(freshness);
+                    discoveries.extend(cached);
+                    continue;
+                }
+                PlanDecision::Acquire { mechanism, .. } => {
+                    let mechanism = Self::commerce_mechanism(mechanism);
+                    let path = AcquisitionPath::of_mechanism(mechanism);
+                    let call_ctx = ctx
+                        .clone()
+                        .with_freshness(req.freshness)
+                        .with_mechanism(mechanism);
+                    let connector = {
+                        let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
+                        registry
+                            .connector(&source)
+                            .ok_or(ServiceError::Source(SourceError::Disabled))?
+                    };
+                    let coalesce_key =
+                        format!("discovery:{}:{}:{}", source, identity.digest(), req.limit);
+                    let request = req.clone();
+                    (
+                        path,
+                        self.coalescer
+                            .run(coalesce_key, || {
+                                let connector = connector.clone();
+                                let call_ctx = call_ctx.clone();
+                                async move {
+                                    call_ctx
+                                        .run_bounded(connector.discover(&call_ctx, request))
+                                        .await
+                                        .map(Acquired::Discoveries)
+                                }
+                            })
+                            .await,
+                    )
+                }
+                PlanDecision::RequireVerification { kind } => {
+                    let error = SourceError::VerificationRequired {
+                        kind: Self::acquire_verification(kind),
+                    };
+                    match stale_fallback {
+                        Some((row, freshness)) => {
+                            let cached: Vec<Discovery> =
+                                row.payload.parse().map_err(ServiceError::Store)?;
+                            marks.push(freshness);
+                            discoveries.extend(cached);
+                        }
+                        None => return Err(ServiceError::Source(error)),
+                    }
+                    continue;
+                }
+                PlanDecision::Refuse { error } => {
+                    if let Some((row, freshness)) = stale_fallback {
                         let cached: Vec<Discovery> =
                             row.payload.parse().map_err(ServiceError::Store)?;
                         marks.push(freshness);
                         discoveries.extend(cached);
                         continue;
                     }
-                    CacheLookup::Stale(row, freshness) => {
-                        if req.freshness == FreshnessMode::CacheOnly {
-                            let cached: Vec<Discovery> =
-                                row.payload.parse().map_err(ServiceError::Store)?;
-                            marks.push(freshness);
-                            discoveries.extend(cached);
-                            continue;
-                        }
-                        stale_fallback = Some((row, freshness));
+                    if req.freshness == FreshnessMode::CacheOnly {
+                        return Err(ServiceError::CacheMiss {
+                            class: CacheClass::Discovery,
+                        });
                     }
-                    CacheLookup::Miss => {}
+                    return Err(ServiceError::Source(Self::acquire_error(&error)));
                 }
-            }
-            if req.freshness == FreshnessMode::CacheOnly {
-                return Err(ServiceError::CacheMiss {
-                    class: CacheClass::Discovery,
-                });
-            }
-
-            let key = format!("discovery:{}:{}:{}", source, identity.digest(), req.limit);
-            let call_ctx = ctx.clone().with_freshness(req.freshness);
-            let connector = {
-                let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
-                registry.path_allowed(&source, crate::connector::AcquisitionPath::Api, now)?;
-                registry
-                    .connector(&source)
-                    .ok_or(ServiceError::Source(SourceError::Disabled))?
             };
-            let request = req.clone();
-            let acquired = self
-                .coalescer
-                .run(key, || {
-                    let connector = connector.clone();
-                    let call_ctx = call_ctx.clone();
-                    async move {
-                        call_ctx
-                            .run_bounded(connector.discover(&call_ctx, request))
-                            .await
-                            .map(Acquired::Discoveries)
-                    }
-                })
-                .await;
+            let (path, acquired) = planned;
             match acquired {
                 Ok(Acquired::Discoveries(rows)) => {
                     if let Ok(registry) = self.registry.lock() {
-                        registry.note_success(&source, crate::connector::AcquisitionPath::Api);
+                        registry.note_success(&source, path);
                     }
                     // Extracted text is scrubbed before it can reach a cache
                     // payload or a tool outcome.
@@ -575,12 +1091,7 @@ impl CommerceSourceService {
                 Ok(_) => return Err(ServiceError::Source(SourceError::Store)),
                 Err(error) => {
                     if let Ok(registry) = self.registry.lock() {
-                        registry.note_failure(
-                            &source,
-                            crate::connector::AcquisitionPath::Api,
-                            &error,
-                            now,
-                        );
+                        registry.note_failure(&source, path, &error, now);
                     }
                     match stale_fallback {
                         Some((row, freshness)) if req.freshness == FreshnessMode::PreferCache => {
@@ -633,68 +1144,130 @@ impl CommerceSourceService {
                 source,
                 &product_key,
                 ctx,
-                PricingScope::Public,
+                Self::ctx_pricing_scope(ctx),
                 None,
                 None,
                 None,
             )?;
+            let mut lookup = CacheLookup::Miss;
             let mut stale_fallback: Option<(CachedRow, Freshness)> = None;
             if req.freshness != FreshnessMode::Live {
                 match self.consult_cache(&identity, ttl, req.freshness, now)? {
                     CacheLookup::Fresh(row, freshness) => {
-                        let offer: CommercialOffer =
-                            row.payload.parse().map_err(ServiceError::Store)?;
-                        return Ok(ProductOutcome { offer, freshness });
+                        lookup = CacheLookup::Fresh(row, freshness);
                     }
                     CacheLookup::Stale(row, freshness) => {
                         if req.freshness == FreshnessMode::CacheOnly {
-                            let offer: CommercialOffer =
-                                row.payload.parse().map_err(ServiceError::Store)?;
-                            return Ok(ProductOutcome { offer, freshness });
+                            lookup = CacheLookup::Fresh(row, freshness);
+                        } else {
+                            stale_fallback = Some((row.clone(), freshness));
+                            lookup = CacheLookup::Stale(row, freshness);
                         }
-                        stale_fallback = Some((row, freshness));
                     }
                     CacheLookup::Miss => {}
                 }
             }
-            if req.freshness == FreshnessMode::CacheOnly {
-                return Err(ServiceError::CacheMiss {
-                    class: CacheClass::Product,
-                });
-            }
-
-            let key = format!("product:{}:{}", source, identity.digest());
-            let call_ctx = ctx.clone().with_freshness(req.freshness);
-            let connector = {
-                let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
-                registry.path_allowed(source, crate::connector::AcquisitionPath::Api, now)?;
-                registry
-                    .connector(source)
-                    .ok_or(ServiceError::Source(SourceError::Disabled))?
-            };
-            let request = req.clone();
-            let acquired = self
-                .coalescer
-                .run(key, || {
-                    let connector = connector.clone();
-                    let call_ctx = call_ctx.clone();
-                    async move {
-                        call_ctx
-                            .run_bounded(connector.product(&call_ctx, request))
-                            .await
-                            .map(|offer| Acquired::Offer(Box::new(offer)))
+            let key = identity.digest();
+            let plan = self.plan_source(
+                source,
+                CacheClass::Product,
+                Self::requested_fields(Capability::ExactProduct),
+                req.freshness,
+                ctx,
+                &key,
+                &lookup,
+                now,
+            )?;
+            let planned = match plan.decision {
+                PlanDecision::ServeFromCache { .. } => {
+                    let (row, freshness) = match lookup {
+                        CacheLookup::Fresh(row, freshness) | CacheLookup::Stale(row, freshness) => {
+                            (row, freshness)
+                        }
+                        CacheLookup::Miss => return Err(ServiceError::Source(SourceError::Store)),
+                    };
+                    let offer: CommercialOffer =
+                        row.payload.parse().map_err(ServiceError::Store)?;
+                    return Ok(ProductOutcome { offer, freshness });
+                }
+                PlanDecision::Acquire { mechanism, .. } => {
+                    let mechanism = Self::commerce_mechanism(mechanism);
+                    let path = AcquisitionPath::of_mechanism(mechanism);
+                    let call_ctx = ctx
+                        .clone()
+                        .with_freshness(req.freshness)
+                        .with_mechanism(mechanism);
+                    let connector = {
+                        let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
+                        registry
+                            .connector(source)
+                            .ok_or(ServiceError::Source(SourceError::Disabled))?
+                    };
+                    let coalesce_key = format!("product:{}:{}", source, identity.digest());
+                    let request = req.clone();
+                    (
+                        path,
+                        self.coalescer
+                            .run(coalesce_key, || {
+                                let connector = connector.clone();
+                                let call_ctx = call_ctx.clone();
+                                async move {
+                                    call_ctx
+                                        .run_bounded(connector.product(&call_ctx, request))
+                                        .await
+                                        .map(|offer| Acquired::Offer(Box::new(offer)))
+                                }
+                            })
+                            .await,
+                    )
+                }
+                PlanDecision::RequireVerification { kind } => {
+                    if let Some((row, freshness)) = stale_fallback {
+                        let offer: CommercialOffer =
+                            row.payload.parse().map_err(ServiceError::Store)?;
+                        return Ok(ProductOutcome { offer, freshness });
                     }
-                })
-                .await;
+                    last_error = Some(SourceError::VerificationRequired {
+                        kind: Self::acquire_verification(kind),
+                    });
+                    continue;
+                }
+                PlanDecision::Refuse { error } => {
+                    if let Some((row, freshness)) = stale_fallback {
+                        let offer: CommercialOffer =
+                            row.payload.parse().map_err(ServiceError::Store)?;
+                        return Ok(ProductOutcome { offer, freshness });
+                    }
+                    if req.freshness == FreshnessMode::CacheOnly {
+                        return Err(ServiceError::CacheMiss {
+                            class: CacheClass::Product,
+                        });
+                    }
+                    last_error = Some(Self::acquire_error(&error));
+                    continue;
+                }
+            };
+            let (path, acquired) = planned;
             match acquired {
                 Ok(Acquired::Offer(offer)) => {
                     if let Ok(registry) = self.registry.lock() {
-                        registry.note_success(source, crate::connector::AcquisitionPath::Api);
+                        registry.note_success(source, path);
                     }
                     let mut offer = *offer;
                     crate::result::scrub_offer(&mut offer);
                     let payload = NormalizedPayload::from_serializable(&offer)?;
-                    self.write_cache(&identity, &payload, now)?;
+                    let admitted = Self::admit_cache_scope(ctx, &offer)?;
+                    let write_identity = self.observation_identity(
+                        CacheClass::Product,
+                        source,
+                        &product_key,
+                        ctx,
+                        admitted,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    self.write_cache(&write_identity, &payload, now)?;
                     self.persist_offer_snapshot(&offer, now);
                     return Ok(ProductOutcome {
                         offer,
@@ -704,19 +1277,12 @@ impl CommerceSourceService {
                 Ok(_) => return Err(ServiceError::Source(SourceError::Store)),
                 Err(error) => {
                     if let Ok(registry) = self.registry.lock() {
-                        registry.note_failure(
-                            source,
-                            crate::connector::AcquisitionPath::Api,
-                            &error,
-                            now,
-                        );
+                        registry.note_failure(source, path, &error, now);
                     }
                     if let Some((row, freshness)) = stale_fallback {
-                        if req.freshness == FreshnessMode::PreferCache {
-                            let offer: CommercialOffer =
-                                row.payload.parse().map_err(ServiceError::Store)?;
-                            return Ok(ProductOutcome { offer, freshness });
-                        }
+                        let offer: CommercialOffer =
+                            row.payload.parse().map_err(ServiceError::Store)?;
+                        return Ok(ProductOutcome { offer, freshness });
                     }
                     last_error = Some(error);
                 }
@@ -753,11 +1319,8 @@ impl CommerceSourceService {
         let sources = self.resolve_sources(&sources, Capability::QuantityPricing, now)?;
         let ttl = self.ttls.ttl_ms(CacheClass::Price);
         let product_key = req.reference.identity_key();
-        let pricing_scope = if ctx.account_scope.is_some() {
-            PricingScope::Account
-        } else {
-            PricingScope::Public
-        };
+        // LOOKUP key only: writes take their scope from the observation.
+        let pricing_scope = Self::ctx_pricing_scope(ctx);
         let mut last_error: Option<SourceError> = None;
 
         for source in &sources {
@@ -772,10 +1335,84 @@ impl CommerceSourceService {
                 req.packaging,
                 req.variant.clone(),
             )?;
+            let mut lookup = CacheLookup::Miss;
             let mut stale_fallback: Option<(CachedRow, Freshness)> = None;
             if req.freshness != FreshnessMode::Live {
                 match self.consult_cache(&identity, ttl, req.freshness, now)? {
                     CacheLookup::Fresh(row, freshness) => {
+                        lookup = CacheLookup::Fresh(row, freshness);
+                    }
+                    CacheLookup::Stale(row, freshness) => {
+                        if req.freshness == FreshnessMode::CacheOnly {
+                            lookup = CacheLookup::Fresh(row, freshness);
+                        } else {
+                            stale_fallback = Some((row.clone(), freshness));
+                            lookup = CacheLookup::Stale(row, freshness);
+                        }
+                    }
+                    CacheLookup::Miss => {}
+                }
+            }
+            let key = identity.digest();
+            let plan = self.plan_source(
+                source,
+                CacheClass::Price,
+                Self::requested_fields(Capability::QuantityPricing),
+                req.freshness,
+                ctx,
+                &key,
+                &lookup,
+                now,
+            )?;
+            let planned = match plan.decision {
+                PlanDecision::ServeFromCache { .. } => {
+                    let (row, freshness) = match lookup {
+                        CacheLookup::Fresh(row, freshness) | CacheLookup::Stale(row, freshness) => {
+                            (row, freshness)
+                        }
+                        CacheLookup::Miss => return Err(ServiceError::Source(SourceError::Store)),
+                    };
+                    let candidates: Vec<QuoteCandidate> =
+                        row.payload.parse().map_err(ServiceError::Store)?;
+                    return Ok(QuoteOutcome {
+                        candidates,
+                        freshness,
+                        account: ctx.account_scope.clone(),
+                    });
+                }
+                PlanDecision::Acquire { mechanism, .. } => {
+                    let mechanism = Self::commerce_mechanism(mechanism);
+                    let path = AcquisitionPath::of_mechanism(mechanism);
+                    let call_ctx = ctx
+                        .clone()
+                        .with_freshness(req.freshness)
+                        .with_mechanism(mechanism);
+                    let connector = {
+                        let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
+                        registry
+                            .connector(source)
+                            .ok_or(ServiceError::Source(SourceError::Disabled))?
+                    };
+                    let coalesce_key = format!("quote:{}:{}", source, identity.digest());
+                    let request = req.clone();
+                    (
+                        path,
+                        self.coalescer
+                            .run(coalesce_key, || {
+                                let connector = connector.clone();
+                                let call_ctx = call_ctx.clone();
+                                async move {
+                                    call_ctx
+                                        .run_bounded(connector.quote(&call_ctx, request))
+                                        .await
+                                        .map(Acquired::Quotes)
+                                }
+                            })
+                            .await,
+                    )
+                }
+                PlanDecision::RequireVerification { kind } => {
+                    if let Some((row, freshness)) = stale_fallback {
                         let candidates: Vec<QuoteCandidate> =
                             row.payload.parse().map_err(ServiceError::Store)?;
                         return Ok(QuoteOutcome {
@@ -784,59 +1421,51 @@ impl CommerceSourceService {
                             account: ctx.account_scope.clone(),
                         });
                     }
-                    CacheLookup::Stale(row, freshness) => {
-                        if req.freshness == FreshnessMode::CacheOnly {
-                            let candidates: Vec<QuoteCandidate> =
-                                row.payload.parse().map_err(ServiceError::Store)?;
-                            return Ok(QuoteOutcome {
-                                candidates,
-                                freshness,
-                                account: ctx.account_scope.clone(),
-                            });
-                        }
-                        stale_fallback = Some((row, freshness));
-                    }
-                    CacheLookup::Miss => {}
+                    last_error = Some(SourceError::VerificationRequired {
+                        kind: Self::acquire_verification(kind),
+                    });
+                    continue;
                 }
-            }
-            if req.freshness == FreshnessMode::CacheOnly {
-                return Err(ServiceError::CacheMiss {
-                    class: CacheClass::Price,
-                });
-            }
-
-            let key = format!("quote:{}:{}", source, identity.digest());
-            let call_ctx = ctx.clone().with_freshness(req.freshness);
-            let connector = {
-                let registry = self.registry.lock().map_err(|_| ServiceError::Poisoned)?;
-                registry.path_allowed(source, crate::connector::AcquisitionPath::Api, now)?;
-                registry
-                    .connector(source)
-                    .ok_or(ServiceError::Source(SourceError::Disabled))?
-            };
-            let request = req.clone();
-            let acquired = self
-                .coalescer
-                .run(key, || {
-                    let connector = connector.clone();
-                    let call_ctx = call_ctx.clone();
-                    async move {
-                        call_ctx
-                            .run_bounded(connector.quote(&call_ctx, request))
-                            .await
-                            .map(Acquired::Quotes)
+                PlanDecision::Refuse { error } => {
+                    if let Some((row, freshness)) = stale_fallback {
+                        let candidates: Vec<QuoteCandidate> =
+                            row.payload.parse().map_err(ServiceError::Store)?;
+                        return Ok(QuoteOutcome {
+                            candidates,
+                            freshness,
+                            account: ctx.account_scope.clone(),
+                        });
                     }
-                })
-                .await;
+                    if req.freshness == FreshnessMode::CacheOnly {
+                        return Err(ServiceError::CacheMiss {
+                            class: CacheClass::Price,
+                        });
+                    }
+                    last_error = Some(Self::acquire_error(&error));
+                    continue;
+                }
+            };
+            let (path, acquired) = planned;
             match acquired {
                 Ok(Acquired::Quotes(candidates)) => {
                     if let Ok(registry) = self.registry.lock() {
-                        registry.note_success(source, crate::connector::AcquisitionPath::Api);
+                        registry.note_success(source, path);
                     }
                     let mut candidates = candidates;
                     crate::result::scrub_quote_candidates(&mut candidates);
                     let payload = NormalizedPayload::from_serializable(&candidates)?;
-                    self.write_cache(&identity, &payload, now)?;
+                    let admitted = Self::admit_candidates_cache_scope(ctx, &candidates)?;
+                    let write_identity = self.observation_identity(
+                        CacheClass::Price,
+                        source,
+                        &product_key,
+                        ctx,
+                        admitted,
+                        Some(req.quantity),
+                        req.packaging,
+                        req.variant.clone(),
+                    )?;
+                    self.write_cache(&write_identity, &payload, now)?;
                     for candidate in candidates.iter().take(MAX_QUOTE_SNAPSHOTS) {
                         self.persist_offer_snapshot(&candidate.offer, now);
                     }
@@ -849,23 +1478,16 @@ impl CommerceSourceService {
                 Ok(_) => return Err(ServiceError::Source(SourceError::Store)),
                 Err(error) => {
                     if let Ok(registry) = self.registry.lock() {
-                        registry.note_failure(
-                            source,
-                            crate::connector::AcquisitionPath::Api,
-                            &error,
-                            now,
-                        );
+                        registry.note_failure(source, path, &error, now);
                     }
                     if let Some((row, freshness)) = stale_fallback {
-                        if req.freshness == FreshnessMode::PreferCache {
-                            let candidates: Vec<QuoteCandidate> =
-                                row.payload.parse().map_err(ServiceError::Store)?;
-                            return Ok(QuoteOutcome {
-                                candidates,
-                                freshness,
-                                account: ctx.account_scope.clone(),
-                            });
-                        }
+                        let candidates: Vec<QuoteCandidate> =
+                            row.payload.parse().map_err(ServiceError::Store)?;
+                        return Ok(QuoteOutcome {
+                            candidates,
+                            freshness,
+                            account: ctx.account_scope.clone(),
+                        });
                     }
                     last_error = Some(error);
                 }
@@ -876,9 +1498,12 @@ impl CommerceSourceService {
         ))
     }
 
-    /// Submit and run a deterministic BOM job (`bom`).
+    /// Submit and run a deterministic BOM job (`bom`) for `requester`. The
+    /// request's account scope must equal the principal's account scope: a
+    /// job can never execute under an identity other than its owner's.
     pub async fn bom(
         &self,
+        requester: &CommercePrincipal,
         ctx: &AcquireCtx,
         sources: SourceSet,
         freshness: FreshnessMode,
@@ -887,22 +1512,31 @@ impl CommerceSourceService {
     ) -> Result<JobOutcome, ServiceError> {
         self.ensure_enabled()?;
         let request = bom_request(bom, sources, freshness, detail, ctx.account_scope.clone());
-        self.submit_and_advance(ctx, request).await
+        self.submit_and_advance(requester, ctx, request).await
     }
 
-    /// Submit and run any deterministic job request.
+    /// Submit and run any deterministic job request for `requester`. The
+    /// owner key is part of the digest and the durable row, so identical
+    /// requests from different sessions/accounts never attach to one job.
     pub async fn submit_and_advance(
         &self,
+        requester: &CommercePrincipal,
         ctx: &AcquireCtx,
         request: CommerceJobRequest,
     ) -> Result<JobOutcome, ServiceError> {
         self.ensure_enabled()?;
+        if request.account != requester.account_scope {
+            // The owner identity and the requested account scope are the
+            // same fact; a divergence would execute under a mismatched
+            // identity. Refuse typed instead of guessing.
+            return Err(ServiceError::Source(SourceError::InvalidRequest));
+        }
         let store = self.store_ref()?.clone();
         let now = now_ms();
         let enabled = self.enabled_sources(Capability::QuantityPricing);
         let profile = ctx.profile.clone();
         let (job, _attached) =
-            crate::jobs::submit_job(&store, request, &enabled, profile.as_ref(), now)?;
+            crate::jobs::submit_job(&store, request, &enabled, profile.as_ref(), requester, now)?;
         let executor = ServiceJobExecutor { service: self };
         Ok(advance_job(
             &store,
@@ -915,13 +1549,24 @@ impl CommerceSourceService {
         .await?)
     }
 
-    /// The deterministic state/result of a job (`job`).
-    pub fn job_status(&self, job_id: &str) -> Result<JobStatus, ServiceError> {
+    /// The deterministic state/result of a job (`job`), visible ONLY to the
+    /// principal that owns it. A different owner — including a legacy
+    /// ownerless row that cannot be attributed at all — is indistinguishable
+    /// from a missing job: typed NotFound, never forbidden.
+    pub fn job_status(
+        &self,
+        requester: &CommercePrincipal,
+        job_id: &str,
+    ) -> Result<JobStatus, ServiceError> {
         self.ensure_enabled()?;
         let store = self.store_ref()?;
         let row = store
             .job(job_id)?
             .ok_or(ServiceError::Source(SourceError::ProductNotFound))?;
+        let owner_key = requester.owner_key();
+        if row.owner_key.as_deref() != Some(owner_key.as_str()) {
+            return Err(ServiceError::Source(SourceError::ProductNotFound));
+        }
         let job = crate::jobs::CommerceJob {
             id: row.job_id.clone(),
             digest: row.digest.clone(),
@@ -978,9 +1623,11 @@ impl CommerceSourceService {
         Ok(outcomes)
     }
 
-    /// The digest a job request would receive (diagnostics/tests).
+    /// The digest a job request would receive for `requester`
+    /// (diagnostics/tests). The owner key is part of the digest.
     pub fn digest_for(
         &self,
+        requester: &CommercePrincipal,
         request: &CommerceJobRequest,
         profile: Option<&ProfileIdentity>,
     ) -> String {
@@ -988,6 +1635,7 @@ impl CommerceSourceService {
             request,
             &self.enabled_sources(Capability::QuantityPricing),
             profile,
+            requester,
         )
     }
 
@@ -1052,17 +1700,13 @@ impl JobItemExecutor for ServiceJobExecutor<'_> {
             Some(quantity) => quantity,
             None => crate::quantity::NonZeroQuantity::new(1).map_err(|_| SourceError::Store)?,
         };
-        // A `Quote` job carries the requested packaging/variant in its work
-        // (both are bound into the job digest); they must reach the quote
-        // request, or a variant/packaging-scoped job would resolve at the
-        // offer level or report VariantAmbiguous instead of the requested
-        // price.
-        let (packaging, variant) = match &job.request.work {
-            crate::jobs::JobWork::Quote {
-                packaging, variant, ..
-            } => (*packaging, variant.clone()),
-            _ => (None, None),
-        };
+        // Every line carries its own deterministic selections (a `Quote`
+        // job's request, or one BOM line's own variant/packaging, both bound
+        // into the job digest). They must reach the quote request, or a
+        // variant/packaging-scoped line would resolve at the offer level or
+        // report VariantAmbiguous instead of the requested price.
+        let packaging = line.packaging;
+        let variant = line.variant.clone();
         let quote_request = QuoteRequest::new(
             reference.clone(),
             quantity.get(),
@@ -1226,6 +1870,18 @@ fn quote_status_label(status: crate::quote::QuoteStatus) -> &'static str {
         | QuantityTooLarge
         | AmountOverflow
         | CurrencyMismatch => "unmatched",
+    }
+}
+
+/// Rank a cache pricing scope by isolation strength, so a candidate set is
+/// admitted under its strongest observation (never weakened to `Public`).
+fn scope_strength(scope: PricingScope) -> u8 {
+    match scope {
+        PricingScope::Unknown => 0,
+        PricingScope::Public => 1,
+        PricingScope::Promotional => 2,
+        PricingScope::Authenticated => 3,
+        PricingScope::Account => 4,
     }
 }
 

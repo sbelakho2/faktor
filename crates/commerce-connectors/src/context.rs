@@ -1,15 +1,16 @@
-//! The acquisition context a connector is invoked with (spec §10).
+//! The acquisition context a site adapter is invoked with (spec §10).
 //!
-//! `AcquireCtx` is the connector-facing half of the acquire runtime: it
-//! carries the injected transport, the shared quota state, the secret guard,
-//! the diagnostics sink, the clock, the request deadline and the
-//! cancellation token, plus the per-request commercial context (account
-//! scope, market, locale) and the browser-fallback policy.
+//! `AcquireCtx` is the adapter-facing context the bridge
+//! ([`crate::contract::bridge::Registered`]) builds for one call: it carries
+//! the injected transport, the shared quota state, the secret guard, the
+//! diagnostics sink, the clock, the request deadline, the cancellation token
+//! and the per-request commercial context (account scope, market, locale).
 //!
-//! The crate root documents the seam: `faktor-acquire` (build order step 4)
-//! owns the production context and re-exports these types; today the
-//! connectors crate defines them so the adapters are complete and testable
-//! without the runtime.
+//! The runtime authority is `faktor_commerce::connector::AcquireCtx` plus the
+//! `faktor-acquire` `AcquisitionPlanner`: the service plans first and hands
+//! the chosen [`Mechanism`] in through this context. A connector executes the
+//! mechanism it was given ([`AcquireCtx::mechanism`]) and never selects one
+//! itself; mechanism selection is the planner's job alone.
 //!
 //! Every method here is bounded and panic-free; a poisoned lock degrades to
 //! the inner value rather than aborting acquisition.
@@ -18,11 +19,13 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use faktor_commerce::connector::ProfileIdentity;
 use faktor_commerce::text::{AccountScope, Text};
-use faktor_commerce::{SourceError, SourceId};
+use faktor_commerce::{PriceVisibility, PricingScope, SourceError, SourceId};
 
-use crate::browser::{BrowserFallback, FallbackPolicy};
+use crate::browser::BrowserFallback;
 use crate::contract::capture::BrowserExtraction;
+use crate::contract::Mechanism;
 use crate::http::{HttpResponse, HttpTransport};
 use crate::quota::QuotaState;
 use crate::secrets::SecretGuard;
@@ -138,7 +141,7 @@ pub enum ConnectorEventKind {
     Response,
     /// A retryable condition occurred.
     Retry,
-    /// A fallback decision was made.
+    /// A browser mechanism was executed (stable wire label: `fallback`).
     Fallback,
     /// Quota state changed.
     Quota,
@@ -274,6 +277,194 @@ impl Diagnostics for MemoryDiagnostics {
     }
 }
 
+/// The access authority one observation was made under (P0 item 8).
+///
+/// This is acquisition provenance, not site knowledge: the browser
+/// authority reports which profile/account produced a capture, and the
+/// normalizer derives the domain [`PriceVisibility`] from it. A numeric
+/// price never implies `Public` by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessVisibility {
+    /// No login or dedicated profile was involved.
+    Anonymous,
+    /// A logged-in profile observed the value; it requires authentication.
+    Authenticated,
+    /// The value was observed under one explicit account scope.
+    AccountScoped(AccountScope),
+}
+
+/// A refused cache identity: an observation authority may never be stored
+/// under a weaker pricing scope than the one it was observed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum VisibilityScopeError {
+    /// An authenticated observation must never be stored under
+    /// [`PricingScope::Public`].
+    #[error("an authenticated observation must never be stored under the public pricing scope")]
+    AuthenticatedNeverPublic,
+    /// An account-scoped observation must never be stored under
+    /// [`PricingScope::Public`].
+    #[error("an account-scoped observation must never be stored under the public pricing scope")]
+    AccountScopedNeverPublic,
+    /// The requested pricing scope contradicts the capture authority.
+    #[error("the requested cache pricing scope does not match the capture authority")]
+    AuthorityMismatch,
+}
+
+impl AccessVisibility {
+    /// The authority a configured connector identity implies when no browser
+    /// capture reported one: an account-scoped identity means account-scoped
+    /// data; everything else is anonymous.
+    pub fn from_identity(identity: &ConnectorIdentity) -> Self {
+        match identity.account_scope() {
+            Some(scope) => Self::AccountScoped(scope.clone()),
+            None => Self::Anonymous,
+        }
+    }
+
+    /// The stable label.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Authenticated => "authenticated",
+            Self::AccountScoped(_) => "account_scoped",
+        }
+    }
+
+    /// True for [`AccessVisibility::Anonymous`].
+    pub const fn is_anonymous(&self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// The account scope, when the observation is account-scoped.
+    pub fn account_scope(&self) -> Option<&AccountScope> {
+        match self {
+            Self::AccountScoped(scope) => Some(scope),
+            _ => None,
+        }
+    }
+
+    /// The offer price visibility this authority implies.
+    pub const fn price_visibility(&self) -> PriceVisibility {
+        match self {
+            Self::Anonymous => PriceVisibility::Public,
+            Self::Authenticated => PriceVisibility::Authenticated,
+            Self::AccountScoped(_) => PriceVisibility::AccountSpecific,
+        }
+    }
+
+    /// The account scope every [`PriceVisibility::AccountSpecific`] price
+    /// break must carry, and which no other visibility may carry.
+    pub fn price_account_scope(&self) -> Option<AccountScope> {
+        self.account_scope().cloned()
+    }
+
+    /// The cache pricing scope of this authority. Authenticated observations
+    /// are never `Public`.
+    pub const fn pricing_scope(&self) -> PricingScope {
+        match self {
+            Self::Anonymous => PricingScope::Public,
+            Self::Authenticated => PricingScope::Authenticated,
+            Self::AccountScoped(_) => PricingScope::Account,
+        }
+    }
+
+    /// Admit one cache pricing scope for this authority. `Public` for an
+    /// authenticated or account-scoped observation is a typed refusal, never
+    /// a silent promotion to public.
+    pub fn admit_cache_scope(
+        &self,
+        requested: PricingScope,
+    ) -> Result<PricingScope, VisibilityScopeError> {
+        let implied = self.pricing_scope();
+        if requested == implied {
+            return Ok(implied);
+        }
+        Err(match self {
+            Self::Authenticated => VisibilityScopeError::AuthenticatedNeverPublic,
+            Self::AccountScoped(_) => VisibilityScopeError::AccountScopedNeverPublic,
+            Self::Anonymous => VisibilityScopeError::AuthorityMismatch,
+        })
+    }
+}
+
+/// The immutable identity of one registered connector (P0 item 2).
+///
+/// The daemon configuration owns it and the runtime wrapper injects it into
+/// [`AcquireCtx`]; a tool/model request can never manufacture or override it.
+/// It carries the stable browser profile (source, profile name, account,
+/// egress) plus the commercial scoping the runtime acquired under.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConnectorIdentity {
+    profile: Option<ProfileIdentity>,
+    account_scope: Option<AccountScope>,
+    market: Option<Text<32>>,
+    locale: Option<Text<32>>,
+}
+
+impl ConnectorIdentity {
+    /// An empty identity (unauthenticated, unscoped).
+    pub fn anonymous() -> Self {
+        Self::default()
+    }
+
+    /// Set the stable browser/profile identity.
+    pub fn with_profile(mut self, profile: ProfileIdentity) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Set the explicit account scope.
+    pub fn with_account_scope(mut self, account_scope: AccountScope) -> Self {
+        self.account_scope = Some(account_scope);
+        self
+    }
+
+    /// Set the market.
+    pub fn with_market(mut self, market: Text<32>) -> Self {
+        self.market = Some(market);
+        self
+    }
+
+    /// Set the locale.
+    pub fn with_locale(mut self, locale: Text<32>) -> Self {
+        self.locale = Some(locale);
+        self
+    }
+
+    /// The stable browser profile, when this connector has one.
+    pub fn profile(&self) -> Option<&ProfileIdentity> {
+        self.profile.as_ref()
+    }
+
+    /// The account scope: the explicit scope when configured, otherwise the
+    /// scope carried by the profile identity.
+    pub fn account_scope(&self) -> Option<&AccountScope> {
+        self.account_scope.as_ref().or_else(|| {
+            self.profile
+                .as_ref()
+                .and_then(|profile| profile.account.as_ref())
+        })
+    }
+
+    /// The market, when configured.
+    pub fn market(&self) -> Option<&Text<32>> {
+        self.market.as_ref()
+    }
+
+    /// The locale, when configured.
+    pub fn locale(&self) -> Option<&Text<32>> {
+        self.locale.as_ref()
+    }
+
+    /// True when no component is configured.
+    pub fn is_empty(&self) -> bool {
+        self.profile.is_none()
+            && self.account_scope.is_none()
+            && self.market.is_none()
+            && self.locale.is_none()
+    }
+}
+
 /// The acquisition context one connector call runs in.
 pub struct AcquireCtx {
     operation_id: u64,
@@ -285,12 +476,10 @@ pub struct AcquireCtx {
     clock: Arc<dyn Clock>,
     cancel: Cancellation,
     deadline_ms: Option<u64>,
-    fallback_policy: FallbackPolicy,
+    mechanism: Option<Mechanism>,
     browser: Option<Arc<dyn BrowserFallback>>,
     browser_extraction: Option<Arc<dyn BrowserExtraction>>,
-    account_scope: Option<AccountScope>,
-    market: Option<Text<32>>,
-    locale: Option<Text<32>>,
+    identity: ConnectorIdentity,
 }
 
 impl fmt::Debug for AcquireCtx {
@@ -300,8 +489,9 @@ impl fmt::Debug for AcquireCtx {
             .field("operation_id", &self.operation_id)
             .field("session_id", &self.session_id)
             .field("deadline_ms", &self.deadline_ms)
-            .field("fallback_enabled", &self.fallback_policy.is_enabled())
+            .field("mechanism", &self.mechanism)
             .field("browser", &self.browser.is_some())
+            .field("account_scoped", &self.identity.account_scope().is_some())
             .field("cancelled", &self.cancel.is_cancelled())
             .finish()
     }
@@ -324,12 +514,10 @@ impl AcquireCtx {
             clock: Arc::new(SystemClock),
             cancel: Cancellation::new(),
             deadline_ms: None,
-            fallback_policy: FallbackPolicy::default(),
+            mechanism: None,
             browser: None,
             browser_extraction: None,
-            account_scope: None,
-            market: None,
-            locale: None,
+            identity: ConnectorIdentity::anonymous(),
         }
     }
 
@@ -373,24 +561,30 @@ impl AcquireCtx {
         self.browser_extraction.as_ref()
     }
 
-    /// The browser-fallback policy flag.
-    pub fn fallback_policy(&self) -> FallbackPolicy {
-        self.fallback_policy
+    /// The mechanism the runtime planner chose for this call, when the
+    /// bridge set one. Connectors execute exactly this mechanism.
+    pub fn mechanism(&self) -> Option<Mechanism> {
+        self.mechanism
+    }
+
+    /// The immutable connector identity the runtime wrapper injected.
+    pub fn identity(&self) -> &ConnectorIdentity {
+        &self.identity
     }
 
     /// The account scope of this acquisition, when any.
     pub fn account_scope(&self) -> Option<&AccountScope> {
-        self.account_scope.as_ref()
+        self.identity.account_scope()
     }
 
     /// The market of this acquisition, when known.
     pub fn market(&self) -> Option<&Text<32>> {
-        self.market.as_ref()
+        self.identity.market()
     }
 
     /// The locale of this acquisition, when known.
     pub fn locale(&self) -> Option<&Text<32>> {
-        self.locale.as_ref()
+        self.identity.locale()
     }
 
     /// The current time.
@@ -526,12 +720,10 @@ pub struct AcquireCtxBuilder {
     clock: Arc<dyn Clock>,
     cancel: Cancellation,
     deadline_ms: Option<u64>,
-    fallback_policy: FallbackPolicy,
+    mechanism: Option<Mechanism>,
     browser: Option<Arc<dyn BrowserFallback>>,
     browser_extraction: Option<Arc<dyn BrowserExtraction>>,
-    account_scope: Option<AccountScope>,
-    market: Option<Text<32>>,
-    locale: Option<Text<32>>,
+    identity: ConnectorIdentity,
 }
 
 impl AcquireCtxBuilder {
@@ -566,9 +758,9 @@ impl AcquireCtxBuilder {
         self
     }
 
-    /// The browser-fallback policy.
-    pub fn fallback_policy(mut self, policy: FallbackPolicy) -> Self {
-        self.fallback_policy = policy;
+    /// The mechanism the runtime planner chose for this call.
+    pub fn mechanism(mut self, mechanism: Mechanism) -> Self {
+        self.mechanism = Some(mechanism);
         self
     }
 
@@ -584,21 +776,28 @@ impl AcquireCtxBuilder {
         self
     }
 
-    /// The account scope.
+    /// The whole injected connector identity (the runtime wrapper's seam).
+    /// Replaces every component; later component setters still apply.
+    pub fn identity(mut self, identity: ConnectorIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// The account scope (component of the identity).
     pub fn account_scope(mut self, account_scope: AccountScope) -> Self {
-        self.account_scope = Some(account_scope);
+        self.identity.account_scope = Some(account_scope);
         self
     }
 
-    /// The market.
+    /// The market (component of the identity).
     pub fn market(mut self, market: Text<32>) -> Self {
-        self.market = Some(market);
+        self.identity.market = Some(market);
         self
     }
 
-    /// The locale.
+    /// The locale (component of the identity).
     pub fn locale(mut self, locale: Text<32>) -> Self {
-        self.locale = Some(locale);
+        self.identity.locale = Some(locale);
         self
     }
 
@@ -614,12 +813,10 @@ impl AcquireCtxBuilder {
             clock: self.clock,
             cancel: self.cancel,
             deadline_ms: self.deadline_ms,
-            fallback_policy: self.fallback_policy,
+            mechanism: self.mechanism,
             browser: self.browser,
             browser_extraction: self.browser_extraction,
-            account_scope: self.account_scope,
-            market: self.market,
-            locale: self.locale,
+            identity: self.identity,
         }
     }
 }
@@ -650,5 +847,106 @@ mod tests {
         assert!(ctx.check_alive().is_ok());
         ctx.cancellation().cancel();
         assert_eq!(ctx.check_alive(), Err(SourceError::Cancelled));
+    }
+
+    fn scope(raw: &str) -> AccountScope {
+        AccountScope::new(raw).expect("scope")
+    }
+
+    #[test]
+    fn access_authority_never_degrades_to_public() {
+        let anonymous = AccessVisibility::Anonymous;
+        assert_eq!(anonymous.price_visibility(), PriceVisibility::Public);
+        assert_eq!(anonymous.price_account_scope(), None);
+        assert_eq!(anonymous.pricing_scope(), PricingScope::Public);
+        assert_eq!(
+            anonymous.admit_cache_scope(PricingScope::Public),
+            Ok(PricingScope::Public)
+        );
+
+        let authenticated = AccessVisibility::Authenticated;
+        assert_eq!(
+            authenticated.price_visibility(),
+            PriceVisibility::Authenticated
+        );
+        assert_eq!(authenticated.price_account_scope(), None);
+        assert_eq!(authenticated.pricing_scope(), PricingScope::Authenticated);
+        assert_ne!(authenticated.pricing_scope(), PricingScope::Public);
+        for requested in [
+            PricingScope::Public,
+            PricingScope::Account,
+            PricingScope::Unknown,
+        ] {
+            assert_eq!(
+                authenticated.admit_cache_scope(requested),
+                Err(VisibilityScopeError::AuthenticatedNeverPublic),
+                "an authenticated observation must never be stored as {requested:?}"
+            );
+        }
+
+        let account = AccessVisibility::AccountScoped(scope("buyer-a"));
+        assert_eq!(account.price_visibility(), PriceVisibility::AccountSpecific);
+        assert_eq!(account.price_account_scope(), Some(scope("buyer-a")));
+        assert_eq!(account.pricing_scope(), PricingScope::Account);
+        assert_eq!(
+            account.admit_cache_scope(PricingScope::Public),
+            Err(VisibilityScopeError::AccountScopedNeverPublic)
+        );
+        assert_eq!(
+            account.admit_cache_scope(PricingScope::Account),
+            Ok(PricingScope::Account)
+        );
+        // Anonymous cannot claim a stronger cache scope either.
+        assert_eq!(
+            anonymous.admit_cache_scope(PricingScope::Account),
+            Err(VisibilityScopeError::AuthorityMismatch)
+        );
+    }
+
+    #[test]
+    fn connector_identity_is_read_from_the_injected_seam_only() {
+        let profile =
+            ProfileIdentity::new(SourceId::new("1688").expect("source"), "procurement-cn")
+                .expect("profile");
+        let identity = ConnectorIdentity::anonymous()
+            .with_profile(profile.clone())
+            .with_account_scope(scope("buyer-a"))
+            .with_market(Text::<32>::new("CN").expect("market"))
+            .with_locale(Text::<32>::new("zh-CN").expect("locale"));
+        assert_eq!(identity.profile(), Some(&profile));
+        assert_eq!(identity.account_scope(), Some(&scope("buyer-a")));
+        assert_eq!(identity.market().map(Text::as_str), Some("CN"));
+        assert_eq!(identity.locale().map(Text::as_str), Some("zh-CN"));
+        assert!(!identity.is_empty());
+        assert!(ConnectorIdentity::anonymous().is_empty());
+
+        // The profile's own account is the fallback when no explicit scope
+        // was configured; the explicit scope wins when both exist.
+        let mut profile_account = profile;
+        profile_account.account = Some(scope("profile-account"));
+        let fallback = ConnectorIdentity::anonymous().with_profile(profile_account);
+        assert_eq!(fallback.account_scope(), Some(&scope("profile-account")));
+
+        // The identity reaches the context through the builder; a caller can
+        // still address components directly.
+        let ctx = AcquireCtx::builder(
+            Arc::new(crate::testing::NoopTransport),
+            Arc::new(QuotaState::new()),
+            Arc::new(SecretGuard::new()),
+        )
+        .identity(identity.clone())
+        .build();
+        assert_eq!(ctx.identity(), &identity);
+        assert_eq!(ctx.account_scope(), Some(&scope("buyer-a")));
+        assert_eq!(ctx.market().map(Text::as_str), Some("CN"));
+        assert_eq!(ctx.locale().map(Text::as_str), Some("zh-CN"));
+        assert_eq!(
+            AccessVisibility::from_identity(ctx.identity()),
+            AccessVisibility::AccountScoped(scope("buyer-a"))
+        );
+        assert_eq!(
+            AccessVisibility::from_identity(&ConnectorIdentity::anonymous()),
+            AccessVisibility::Anonymous
+        );
     }
 }

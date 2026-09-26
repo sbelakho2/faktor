@@ -183,6 +183,9 @@ pub enum PricingScope {
     /// Public pricing.
     #[default]
     Public,
+    /// Pricing visible only to an authenticated session (no account scope
+    /// required, but never public).
+    Authenticated,
     /// Account pricing (requires an account scope).
     Account,
     /// Promotional pricing.
@@ -196,6 +199,7 @@ impl PricingScope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Public => "public",
+            Self::Authenticated => "authenticated",
             Self::Account => "account",
             Self::Promotional => "promotional",
             Self::Unknown => "unknown",

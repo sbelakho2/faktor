@@ -15,6 +15,8 @@
 //! prices and supplier profiles with Alibaba's own parsers; contact-supplier /
 //! RFQ pricing is `price: null` + [`PriceVisibility::InquiryRequired`].
 
+pub(crate) mod api;
+pub mod auth;
 pub mod dictionary;
 pub mod extract;
 pub mod normalize;
@@ -30,7 +32,7 @@ use faktor_commerce::text::{CanonicalUrl, Text, VariantId};
 use faktor_commerce::{CommercialOffer, Freshness, NonZeroQuantity, SourceError, SourceId};
 
 use crate::config::{ConfigError, ProfileConnectorConfig};
-use crate::context::{AcquireCtx, ConnectorEventKind};
+use crate::context::{AccessVisibility, AcquireCtx, ConnectorEventKind};
 use crate::contract::capture::{BrowserExtraction, CaptureBundle, CaptureKind, FirstPartyPolicy};
 use crate::contract::extract::{ExtractionHealth, Field, Fingerprint, Strategy, StrategyOutcome};
 use crate::contract::{
@@ -38,7 +40,9 @@ use crate::contract::{
     ProductReference, ProductRequest, QuoteCandidate, QuoteRequest, SearchRequest, SiteConnector,
 };
 use crate::http::{self, HttpRequest};
-use crate::secrets::{CredentialProvider, SecretGuard, SecretString};
+use crate::secrets::{CredentialProvider, SecretGuard};
+
+use auth::{AccessToken, AlibabaAuth, TokenRefresher};
 
 /// The buyer-visible product endpoint.
 pub const OPEN_API_PRODUCT_URL: &str = "https://openapi.alibaba.com/product/detail";
@@ -123,32 +127,112 @@ impl ApiScopes {
     }
 }
 
-/// An Open API credential configuration (env-var *name*, never the value).
+/// An Open API credential configuration.
+///
+/// Every field is an environment variable *name*, never a value. The app key
+/// and app secret are mandatory for any Open API call; the access-token and
+/// refresh-token names are optional (an account-scoped call without a valid
+/// unexpired token is typed [`SourceError::AuthenticationRequired`], never an
+/// anonymous request and never a silent browser fallback).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenApiConfig {
-    /// The environment variable naming the app key.
-    pub app_key_env: Text<64>,
-    /// The granted scopes.
-    pub scopes: ApiScopes,
+    app_key_env: Text<64>,
+    app_secret_env: Text<64>,
+    access_token_env: Option<Text<64>>,
+    access_token_expires_at_env: Option<Text<64>>,
+    refresh_token_env: Option<Text<64>>,
+    scopes: ApiScopes,
 }
 
 impl OpenApiConfig {
-    /// Construct from an env-var name and scopes.
-    pub fn new(app_key_env: &str, scopes: ApiScopes) -> Result<Self, ConfigError> {
-        let app_key_env =
-            Text::<64>::new(app_key_env).map_err(|_| ConfigError::MissingEnvName {
-                connector: "alibaba",
-                field: "app_key_env",
-            })?;
+    /// Construct from the mandatory env-var names and scopes.
+    pub fn new(
+        app_key_env: &str,
+        app_secret_env: &str,
+        scopes: ApiScopes,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
-            app_key_env,
+            app_key_env: env_name("alibaba", "app_key_env", app_key_env)?,
+            app_secret_env: env_name("alibaba", "app_secret_env", app_secret_env)?,
+            access_token_env: None,
+            access_token_expires_at_env: None,
+            refresh_token_env: None,
             scopes,
         })
     }
+
+    /// Name the env vars holding the access token and its absolute expiry
+    /// (unix milliseconds). Both are configured together or not at all.
+    pub fn with_access_token(
+        mut self,
+        access_token_env: &str,
+        access_token_expires_at_env: &str,
+    ) -> Result<Self, ConfigError> {
+        self.access_token_env = Some(env_name("alibaba", "access_token_env", access_token_env)?);
+        self.access_token_expires_at_env = Some(env_name(
+            "alibaba",
+            "access_token_expires_at_env",
+            access_token_expires_at_env,
+        )?);
+        Ok(self)
+    }
+
+    /// Name the env var holding the OAuth refresh token.
+    pub fn with_refresh_token(mut self, refresh_token_env: &str) -> Result<Self, ConfigError> {
+        self.refresh_token_env = Some(env_name("alibaba", "refresh_token_env", refresh_token_env)?);
+        Ok(self)
+    }
+
+    /// The granted scopes.
+    pub fn scopes(&self) -> ApiScopes {
+        self.scopes
+    }
+
+    /// The app-key env-var name.
+    pub fn app_key_env(&self) -> &str {
+        self.app_key_env.as_str()
+    }
+
+    /// The app-secret env-var name.
+    pub fn app_secret_env(&self) -> &str {
+        self.app_secret_env.as_str()
+    }
+}
+
+/// Validate one environment-variable name field.
+fn env_name(
+    connector: &'static str,
+    field: &'static str,
+    raw: &str,
+) -> Result<Text<64>, ConfigError> {
+    Text::<64>::new(raw).map_err(|_| ConfigError::MissingEnvName { connector, field })
+}
+
+/// Resolve the configured access token and its absolute expiry.
+///
+/// Both env names are configured together (see
+/// [`OpenApiConfig::with_access_token`]); a value that resolves while its
+/// expiry is unparseable installs no token, so account-scoped calls refuse
+/// typed rather than run with an unbounded credential.
+fn resolve_access_token(
+    config: &OpenApiConfig,
+    credentials: &dyn CredentialProvider,
+    secrets: &SecretGuard,
+) -> Result<Option<AccessToken>, ConfigError> {
+    let (Some(token_env), Some(expires_env)) = (
+        config.access_token_env.as_ref(),
+        config.access_token_expires_at_env.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let token = crate::config::credential(credentials, secrets, token_env.as_str())?;
+    let expires_raw = crate::config::credential(credentials, secrets, expires_env.as_str())?;
+    Ok(crate::aop::parse_expiry_ms(expires_raw.expose())
+        .map(|expires_at_ms| AccessToken::new(token, expires_at_ms)))
 }
 
 struct OpenApi {
-    app_key: SecretString,
+    auth: AlibabaAuth,
     scopes: ApiScopes,
 }
 
@@ -185,19 +269,66 @@ impl AlibabaConnector {
     }
 
     /// Attach an Open API credential.
+    ///
+    /// Every named value is resolved through the injected provider and
+    /// registered with the secret scanner. This constructor is fallible:
+    /// a missing mandatory app key/app secret, or a configured value that
+    /// cannot be resolved, is a typed [`ConfigError`] before any request
+    /// exists. `refresher` is the optional token-refresh seam (production
+    /// wiring rotates tokens via the environment and passes `None`).
     pub fn with_open_api(
         mut self,
         config: &OpenApiConfig,
         credentials: Arc<dyn CredentialProvider>,
-        secrets: &SecretGuard,
+        secrets: Arc<SecretGuard>,
+        refresher: Option<Arc<dyn TokenRefresher>>,
     ) -> Result<Self, ConfigError> {
-        let app_key =
-            crate::config::credential(credentials.as_ref(), secrets, config.app_key_env.as_str())?;
+        let app_key = crate::config::credential(
+            credentials.as_ref(),
+            secrets.as_ref(),
+            config.app_key_env.as_str(),
+        )?;
+        let app_secret = crate::config::credential(
+            credentials.as_ref(),
+            secrets.as_ref(),
+            config.app_secret_env.as_str(),
+        )?;
+        let access_token = resolve_access_token(config, credentials.as_ref(), secrets.as_ref())?;
+        let refresh_token = match config.refresh_token_env.as_ref() {
+            Some(env) => Some(crate::config::credential(
+                credentials.as_ref(),
+                secrets.as_ref(),
+                env.as_str(),
+            )?),
+            None => None,
+        };
         self.api = Some(OpenApi {
-            app_key,
+            auth: AlibabaAuth::new(
+                app_key,
+                app_secret,
+                access_token,
+                refresh_token,
+                refresher,
+                secrets,
+            ),
             scopes: config.scopes,
         });
         Ok(self)
+    }
+
+    /// The installed access token's expiry, when a token is configured.
+    pub fn access_token_expires_at_ms(&self) -> Option<u64> {
+        self.api
+            .as_ref()
+            .and_then(|api| api.auth.token_expires_at_ms())
+    }
+
+    /// True when a valid, unexpired access token is installed now (with the
+    /// documented skew).
+    pub fn has_valid_access_token(&self, now_ms: u64) -> bool {
+        self.api
+            .as_ref()
+            .is_some_and(|api| api.auth.has_valid_token(now_ms))
     }
 
     /// The granted API scopes.
@@ -226,12 +357,22 @@ impl AlibabaConnector {
             .unwrap_or_default()
     }
 
+    /// The stable profile identity of this acquisition. It comes from the
+    /// runtime wrapper's injected [`ConnectorIdentity`](crate::context::ConnectorIdentity)
+    /// (P0 item 2), never from a request field; the connector's own configured
+    /// profile name is only the fallback when the wrapper injected none.
     fn profile_identity(&self, ctx: &AcquireCtx) -> ProfileIdentity {
+        let identity = ctx.identity();
+        let configured = identity.profile();
         ProfileIdentity {
             source: self.source.clone(),
-            profile: self.profile.clone(),
-            account: ctx.account_scope().cloned(),
-            egress: Text::<64>::new(EGRESS_LABEL).ok(),
+            profile: configured
+                .map(|profile| profile.profile.clone())
+                .unwrap_or_else(|| self.profile.clone()),
+            account: identity.account_scope().cloned(),
+            egress: configured
+                .and_then(|profile| profile.egress.clone())
+                .or_else(|| Text::<64>::new(EGRESS_LABEL).ok()),
         }
     }
 
@@ -256,12 +397,24 @@ impl AlibabaConnector {
             account_pricing: CapabilityLevel::Unsupported,
             supplier_data: level(scopes.buyer_discovery && scopes.supplier_profile),
             bulk: CapabilityLevel::Unsupported,
-            mechanisms: vec![
-                Mechanism::OfficialApi,
-                Mechanism::BrowserNetwork,
-                Mechanism::EmbeddedState,
-                Mechanism::Dom,
-            ],
+            // Honest advertisement: the official API mechanism exists only
+            // when a credential is installed; a browser-only connector
+            // advertises browser mechanisms so the planner can select one
+            // without the adapter deciding to fall back.
+            mechanisms: if self.api.is_some() {
+                vec![
+                    Mechanism::OfficialApi,
+                    Mechanism::BrowserNetwork,
+                    Mechanism::EmbeddedState,
+                    Mechanism::Dom,
+                ]
+            } else {
+                vec![
+                    Mechanism::BrowserNetwork,
+                    Mechanism::EmbeddedState,
+                    Mechanism::Dom,
+                ]
+            },
         }
     }
 
@@ -282,42 +435,62 @@ impl AlibabaConnector {
             .map_err(|_| SourceError::InvalidRequest)
     }
 
-    fn api_url(
+    /// Build the signed Open API request for one lookup, when the credential
+    /// actually grants the buyer surface.
+    ///
+    /// An account-scoped request without a valid unexpired access token is
+    /// typed [`SourceError::AuthenticationRequired`] and never becomes a
+    /// browser call.
+    fn api_request(
         &self,
+        ctx: &AcquireCtx,
         product_id: Option<&str>,
         query: Option<&str>,
         buyer_surface: bool,
-    ) -> Result<Option<String>, SourceError> {
+    ) -> Result<Option<HttpRequest>, SourceError> {
         let Some(api) = self.api.as_ref() else {
             return Ok(None);
         };
         if !buyer_surface {
             return Ok(None);
         }
-        let key = http::query_escape(api.app_key.expose());
-        Ok(match (product_id, query) {
-            (Some(product_id), _) => Some(format!(
-                "{OPEN_API_PRODUCT_URL}?apiKey={key}&productId={}",
-                http::query_escape(product_id)
-            )),
-            (None, Some(query)) => Some(format!(
-                "{OPEN_API_SEARCH_URL}?apiKey={key}&keywords={}",
-                http::query_escape(&dictionary::expand_query(query))
-            )),
-            _ => None,
-        })
+        // The runtime planner owns mechanism selection: when it chose a
+        // non-API mechanism, this adapter must not build (and must not
+        // demand a token for) an API request. `None` is the legacy context
+        // that lets the connector pick its own primary mechanism.
+        if ctx.mechanism().is_some_and(|m| m != Mechanism::OfficialApi) {
+            return Ok(None);
+        }
+        let built = match (product_id, query) {
+            (Some(product_id), _) => api::product_request(&api.auth, product_id, ctx.now_ms()),
+            (None, Some(query)) => {
+                api::search_request(&api.auth, &dictionary::expand_query(query), ctx.now_ms())
+            }
+            _ => return Ok(None),
+        };
+        match built {
+            Ok(request) => Ok(Some(request)),
+            Err(error) => {
+                if error == SourceError::AuthenticationRequired {
+                    ctx.record(
+                        &self.source,
+                        "api",
+                        ConnectorEventKind::Note,
+                        None,
+                        Some("api_auth_required_no_browser_fallback"),
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn api_drafts(
         &self,
         ctx: &AcquireCtx,
-        url: &str,
+        request: HttpRequest,
         operation: &'static str,
     ) -> Result<Vec<extract::Draft>, SourceError> {
-        let Some(api) = self.api.as_ref() else {
-            return Err(SourceError::InvalidRequest);
-        };
-        let request = HttpRequest::get(url)?.with_url_credential(&api.app_key);
         let response = http::send(ctx, &self.source, operation, request).await?;
         http::map_status(&response)?;
         let body = response.body();
@@ -346,39 +519,43 @@ impl AlibabaConnector {
         &self,
         ctx: &AcquireCtx,
         url: &CanonicalUrl,
-        api_url: Option<String>,
+        api_request: Option<HttpRequest>,
         needed: &[Field],
         operation: &'static str,
-    ) -> Result<Vec<extract::Draft>, SourceError> {
+    ) -> Result<(Vec<extract::Draft>, AccessVisibility), SourceError> {
         ctx.check_alive()?;
-        let mut drafts: Vec<extract::Draft> = Vec::new();
-        let mut api_outage: Option<SourceError> = None;
-        if let (Some(api), Some(api_url)) = (self.api.as_ref(), api_url) {
-            match self.api_drafts(ctx, &api_url, operation).await {
-                Ok(mut api_drafts) => {
-                    for draft in &mut api_drafts {
-                        draft
-                            .observations
-                            .retain(|observation| api.scopes.covers(observation.field));
-                        if !api.scopes.covers(Field::Variant) {
-                            draft.variants.clear();
-                        }
-                        if !api.scopes.covers(Field::TierPrice) {
-                            draft.tiers.clear();
-                        }
+        let mechanism = ctx.mechanism().ok_or(SourceError::InvalidRequest)?;
+        match mechanism {
+            Mechanism::OfficialApi => {
+                let Some(api) = self.api.as_ref() else {
+                    return Err(SourceError::InvalidRequest);
+                };
+                let Some(api_request) = api_request else {
+                    return Err(SourceError::InvalidRequest);
+                };
+                let mut drafts = self.api_drafts(ctx, api_request, operation).await?;
+                // Honest scope: only covered fields cross; the gap is
+                // recorded, never filled by an unplanned browser call.
+                for draft in &mut drafts {
+                    draft
+                        .observations
+                        .retain(|observation| api.scopes.covers(observation.field));
+                    if !api.scopes.covers(Field::Variant) {
+                        draft.variants.clear();
                     }
-                    let uncovered: Vec<Field> = needed
-                        .iter()
-                        .copied()
-                        .filter(|field| !api.scopes.covers(*field))
-                        .collect();
-                    for draft in &api_drafts {
-                        self.record_draft(draft, ctx);
+                    if !api.scopes.covers(Field::TierPrice) {
+                        draft.tiers.clear();
                     }
-                    drafts.extend(api_drafts);
-                    if uncovered.is_empty() {
-                        return Ok(drafts);
-                    }
+                }
+                let uncovered: Vec<Field> = needed
+                    .iter()
+                    .copied()
+                    .filter(|field| !api.scopes.covers(*field))
+                    .collect();
+                for draft in &drafts {
+                    self.record_draft(draft, ctx);
+                }
+                if !uncovered.is_empty() {
                     let labels: Vec<&str> = uncovered.iter().map(|field| field.as_str()).collect();
                     ctx.record(
                         &self.source,
@@ -388,42 +565,12 @@ impl AlibabaConnector {
                         Some(&format!("api_scope_missing fields={}", labels.join(","))),
                     );
                 }
-                Err(error) if is_outage(&error) => {
-                    api_outage = Some(error);
-                    ctx.record(
-                        &self.source,
-                        "api",
-                        ConnectorEventKind::Retry,
-                        None,
-                        Some("api_outage_browser_fallback"),
-                    );
-                }
-                Err(error) => return Err(error),
+                Ok((drafts, AccessVisibility::from_identity(ctx.identity())))
             }
-        }
-        match self.browser_drafts(ctx, url).await {
-            Ok(browser) if !browser.is_empty() => {
-                drafts.extend(browser);
-                Ok(drafts)
+            Mechanism::BrowserNetwork | Mechanism::EmbeddedState | Mechanism::Dom => {
+                self.browser_drafts(ctx, url).await
             }
-            Ok(_) => match api_outage {
-                Some(error) => Err(error),
-                None => Err(SourceError::ExtractionIncomplete),
-            },
-            Err(error) => {
-                if drafts.is_empty() {
-                    Err(error)
-                } else {
-                    ctx.record(
-                        &self.source,
-                        "browser",
-                        ConnectorEventKind::Note,
-                        None,
-                        Some("browser_failed_partial_api"),
-                    );
-                    Ok(drafts)
-                }
-            }
+            Mechanism::DirectHttp => Err(SourceError::InvalidRequest),
         }
     }
 
@@ -431,7 +578,7 @@ impl AlibabaConnector {
         &self,
         ctx: &AcquireCtx,
         url: &CanonicalUrl,
-    ) -> Result<Vec<extract::Draft>, SourceError> {
+    ) -> Result<(Vec<extract::Draft>, AccessVisibility), SourceError> {
         ctx.check_alive()?;
         if !self.policy.allows(url) {
             return Err(SourceError::InvalidRequest);
@@ -442,7 +589,9 @@ impl AlibabaConnector {
             .ok_or(SourceError::BrowserUnavailable)?;
         let profile = self.profile_identity(ctx);
         let bundle = extraction.capture(ctx, &self.source, &profile, url).await?;
-        self.drafts_from_bundle(ctx, bundle)
+        let access = bundle.access_visibility.clone();
+        let drafts = self.drafts_from_bundle(ctx, bundle)?;
+        Ok((drafts, access))
     }
 
     fn drafts_from_bundle(
@@ -589,22 +738,24 @@ impl AlibabaConnector {
         operation: &'static str,
     ) -> Result<normalize::Assembly, SourceError> {
         let buyer_surface = self.scopes().buyer_discovery;
-        let (url, api_url) = match reference {
+        let (url, api_request) = match reference {
             ProductReference::OfferId(product_id) => (
                 self.detail_url(product_id.as_str())?,
-                self.api_url(Some(product_id.as_str()), None, buyer_surface)?,
+                self.api_request(ctx, Some(product_id.as_str()), None, buyer_surface)?,
             ),
             ProductReference::Url(url) => (
                 url.clone(),
                 match product_id_from_url(url) {
-                    Some(product_id) => self.api_url(Some(&product_id), None, buyer_surface)?,
+                    Some(product_id) => {
+                        self.api_request(ctx, Some(&product_id), None, buyer_surface)?
+                    }
                     None => None,
                 },
             ),
             ProductReference::SourcePartNumber(part)
             | ProductReference::ManufacturerPartNumber(part) => (
                 self.search_url(part.as_str())?,
-                self.api_url(None, Some(part.as_str()), buyer_surface)?,
+                self.api_request(ctx, None, Some(part.as_str()), buyer_surface)?,
             ),
         };
         let needed = [
@@ -627,9 +778,12 @@ impl AlibabaConnector {
                 );
             }
         }
-        let drafts = self.collect(ctx, &url, api_url, &needed, operation).await?;
+        let (drafts, access) = self
+            .collect(ctx, &url, api_request, &needed, operation)
+            .await?;
         let drafts = first_offer_drafts(drafts);
-        let assembly = normalize::assemble(&self.source, ctx, &url, &drafts, ctx.now_ms())?;
+        let assembly =
+            normalize::assemble(&self.source, ctx, &url, &drafts, ctx.now_ms(), &access)?;
         self.record_conflicts(&assembly, ctx);
         Ok(assembly)
     }
@@ -674,13 +828,6 @@ fn first_offer_drafts(drafts: Vec<extract::Draft>) -> Vec<extract::Draft> {
             })
         })
         .collect()
-}
-
-fn is_outage(error: &SourceError) -> bool {
-    matches!(
-        error,
-        SourceError::ApiUnavailable | SourceError::NetworkTimeout | SourceError::EgressUnavailable
-    )
 }
 
 fn primary_fields(strategy: Strategy) -> &'static [Field] {
@@ -729,7 +876,8 @@ impl SiteConnector for AlibabaConnector {
         ctx.check_alive()?;
         reject_cache_only(req.freshness())?;
         let url = self.search_url(req.query().as_str())?;
-        let api_url = self.api_url(
+        let api_request = self.api_request(
+            ctx,
             None,
             Some(req.query().as_str()),
             self.scopes().buyer_discovery,
@@ -745,8 +893,8 @@ impl SiteConnector for AlibabaConnector {
                 );
             }
         }
-        let drafts = self
-            .collect(ctx, &url, api_url, &[Field::Title], "search")
+        let (drafts, access) = self
+            .collect(ctx, &url, api_request, &[Field::Title], "search")
             .await?;
         let mut discoveries: Vec<Discovery> = Vec::new();
         for draft in &drafts {
@@ -756,6 +904,7 @@ impl SiteConnector for AlibabaConnector {
                 &url,
                 std::slice::from_ref(draft),
                 ctx.now_ms(),
+                &access,
             ) {
                 discoveries.push(normalize::discovery(&assembly));
                 if discoveries.len() >= usize::from(req.limit()) {
@@ -815,6 +964,9 @@ impl SiteConnector for AlibabaConnector {
                 None => faktor_commerce::quote::VariantRequest::None,
             },
             packaging: req.packaging(),
+            // Account-specific prices are only applicable to the identity the
+            // runtime configured; without it the quote resolves NoPrice.
+            account: ctx.account_scope(),
             now_ms: ctx.now_ms(),
             ..faktor_commerce::PricingContext::default()
         };
@@ -844,6 +996,7 @@ mod tests {
     use crate::contract::capture::CaptureKind as Kind;
     use crate::testing::{CannedResponse, MapCredentials};
     use crate::testsupport::{text, Rig};
+    use faktor_commerce::PriceVisibility;
 
     fn fixture(relative: &str) -> String {
         crate::testing::fixture(relative).expect("fixture")
@@ -857,7 +1010,11 @@ mod tests {
         .expect("connector")
     }
 
-    fn ctx_with(rig: &Rig, capture: Arc<ScriptedCapture>) -> AcquireCtx {
+    fn ctx_with_mechanism(
+        rig: &Rig,
+        capture: Arc<ScriptedCapture>,
+        mechanism: Mechanism,
+    ) -> AcquireCtx {
         AcquireCtx::builder(
             rig.transport.clone(),
             rig.quota.clone(),
@@ -866,7 +1023,13 @@ mod tests {
         .clock(rig.clock.clone())
         .diagnostics(rig.diagnostics.clone())
         .browser_extraction(capture)
+        .mechanism(mechanism)
         .build()
+    }
+
+    /// Browser-mechanism context (the planner chose browser extraction).
+    fn ctx_with(rig: &Rig, capture: Arc<ScriptedCapture>) -> AcquireCtx {
+        ctx_with_mechanism(rig, capture, Mechanism::BrowserNetwork)
     }
 
     fn detail_url() -> CanonicalUrl {
@@ -883,6 +1046,146 @@ mod tests {
             url,
             vec![capture_support::payload(kind, url, &fixture(fixture_path))],
         )
+    }
+
+    fn access_bundle(fixture_path: &str, access: AccessVisibility) -> CaptureBundle {
+        capture_support::bundle_with_access(
+            "https://www.alibaba.com/product-detail/_1600123456789.html",
+            vec![capture_support::payload(
+                Kind::NetworkJson,
+                "https://www.alibaba.com/api/product.json",
+                &fixture(fixture_path),
+            )],
+            access,
+        )
+    }
+
+    #[tokio::test]
+    async fn capture_authority_decides_alibaba_price_visibility_never_the_number() {
+        let rig = Rig::new();
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(access_bundle(
+            "alibaba/network_product.json",
+            AccessVisibility::Authenticated,
+        ));
+        let buyer = faktor_commerce::text::AccountScope::new("buyer-a").expect("scope");
+        capture.push(access_bundle(
+            "alibaba/network_product.json",
+            AccessVisibility::AccountScoped(buyer.clone()),
+        ));
+        let connector = browser_only();
+        let ctx = ctx_with(&rig, capture);
+
+        let authenticated = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("authenticated offer");
+        assert!(authenticated.cheapest_unit_price().is_some());
+        assert_eq!(
+            authenticated.price_visibility,
+            PriceVisibility::Authenticated,
+            "a numeric price under a logged-in capture is never Public"
+        );
+        for variant in &authenticated.variants {
+            for price_break in &variant.price_breaks {
+                assert_eq!(price_break.visibility, PriceVisibility::Authenticated);
+                assert_eq!(price_break.account_scope, None);
+            }
+        }
+
+        let scoped = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("account-scoped offer");
+        assert_eq!(scoped.price_visibility, PriceVisibility::AccountSpecific);
+        let mut breaks = 0usize;
+        for variant in &scoped.variants {
+            for price_break in &variant.price_breaks {
+                assert_eq!(price_break.visibility, PriceVisibility::AccountSpecific);
+                assert_eq!(price_break.account_scope, Some(buyer.clone()));
+                breaks += 1;
+            }
+        }
+        for price_break in &scoped.price_breaks {
+            assert_eq!(price_break.visibility, PriceVisibility::AccountSpecific);
+            assert_eq!(price_break.account_scope, Some(buyer.clone()));
+            breaks += 1;
+        }
+        assert!(breaks > 0, "the fixture must carry at least one price");
+    }
+
+    #[tokio::test]
+    async fn an_inquiry_stays_inquiry_required_under_any_capture_authority() {
+        // Page data (the RFQ-only page) wins: no capture authority may turn
+        // an inquiry into a priced offer.
+        for access in [
+            AccessVisibility::Anonymous,
+            AccessVisibility::Authenticated,
+            AccessVisibility::AccountScoped(
+                faktor_commerce::text::AccountScope::new("buyer-a").expect("scope"),
+            ),
+        ] {
+            let rig = Rig::new();
+            let capture = Arc::new(ScriptedCapture::new());
+            capture.push(access_bundle("alibaba/network_inquiry.json", access));
+            let connector = browser_only();
+            let ctx = ctx_with(&rig, capture);
+            let offer = connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect("inquiry offer");
+            assert_eq!(offer.price_visibility, PriceVisibility::InquiryRequired);
+            assert!(offer.price_breaks.is_empty());
+            assert!(offer.variants.iter().all(|v| v.price_breaks.is_empty()));
+        }
+    }
+
+    /// The adapter executes the planned mechanism and cannot switch: an API
+    /// outage surfaces typed even with a browser capture injected, and the
+    /// browser mechanism never touches the API.
+    #[tokio::test]
+    async fn planned_mechanism_is_executed_without_any_switch() {
+        let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_alibaba_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
+        let connector = browser_only()
+            .with_open_api(&buyer_config(), credentials, secrets, None)
+            .expect("api connector");
+        rig.transport.push(CannedResponse::new(500, b"{}".to_vec()));
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "alibaba/network_product.json",
+            Kind::NetworkJson,
+            "https://www.alibaba.com/product-detail/_1600123456789.html",
+        ));
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+        let error = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect_err("api outage surfaces");
+        assert_eq!(error, SourceError::ApiUnavailable);
+        assert_eq!(capture.call_count(), 0, "no unplanned browsing");
+
+        let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_alibaba_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
+        let connector = browser_only()
+            .with_open_api(&buyer_config(), credentials, secrets, None)
+            .expect("api connector");
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "alibaba/network_product.json",
+            Kind::NetworkJson,
+            "https://www.alibaba.com/product-detail/_1600123456789.html",
+        ));
+        let ctx = ctx_with(&rig, capture.clone());
+        let offer = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("browser offer");
+        assert_eq!(offer.title.as_str(), "USB 3.0 Braided Data Cable");
+        assert_eq!(capture.call_count(), 1);
+        assert_eq!(rig.transport.request_count(), 0, "no API request");
     }
 
     #[tokio::test]
@@ -1021,6 +1324,7 @@ mod tests {
             .with_open_api(
                 &OpenApiConfig::new(
                     "FAKTOR_ALIBABA_APP_KEY",
+                    "FAKTOR_ALIBABA_APP_SECRET",
                     ApiScopes {
                         seller_product: true,
                         ..ApiScopes::default()
@@ -1028,9 +1332,12 @@ mod tests {
                 )
                 .expect("config"),
                 Arc::new(
-                    MapCredentials::new().with("FAKTOR_ALIBABA_APP_KEY", "alibaba-sanitized-key"),
+                    MapCredentials::new()
+                        .with("FAKTOR_ALIBABA_APP_KEY", "alibaba-sanitized-key")
+                        .with("FAKTOR_ALIBABA_APP_SECRET", "alibaba-sanitized-app-secret"),
                 ),
-                &rig.secrets,
+                rig.secrets.clone(),
+                None,
             )
             .expect("api connector");
         assert!(connector.scopes().seller_surface_only());
@@ -1067,29 +1374,58 @@ mod tests {
             .contains("api_surface_not_buyer_discovery"));
     }
 
+    /// The credential env names and values of the golden vector fixture.
+    const ALIBABA_KEY_ENV: &str = "FAKTOR_ALIBABA_APP_KEY";
+    const ALIBABA_SECRET_ENV: &str = "FAKTOR_ALIBABA_APP_SECRET";
+    const ALIBABA_TOKEN_ENV: &str = "FAKTOR_ALIBABA_ACCESS_TOKEN";
+    const ALIBABA_EXPIRES_ENV: &str = "FAKTOR_ALIBABA_ACCESS_TOKEN_EXPIRES_AT";
+    const ALIBABA_KEY: &str = "alibaba-sanitized-key";
+    const ALIBABA_SECRET: &str = "alibaba-sanitized-app-secret";
+    const ALIBABA_TOKEN: &str = "alibaba-sanitized-access-token";
+
+    fn golden_alibaba_credentials(expires_at_ms: u64) -> (Arc<MapCredentials>, Arc<SecretGuard>) {
+        (
+            Arc::new(
+                MapCredentials::new()
+                    .with(ALIBABA_KEY_ENV, ALIBABA_KEY)
+                    .with(ALIBABA_SECRET_ENV, ALIBABA_SECRET)
+                    .with(ALIBABA_TOKEN_ENV, ALIBABA_TOKEN)
+                    .with(ALIBABA_EXPIRES_ENV, &expires_at_ms.to_string()),
+            ),
+            Arc::new(SecretGuard::new()),
+        )
+    }
+
+    fn buyer_config() -> OpenApiConfig {
+        OpenApiConfig::new(
+            ALIBABA_KEY_ENV,
+            ALIBABA_SECRET_ENV,
+            ApiScopes::buyer_visible(),
+        )
+        .expect("config")
+        .with_access_token(ALIBABA_TOKEN_ENV, ALIBABA_EXPIRES_ENV)
+        .expect("access token config")
+    }
+
     #[tokio::test]
     async fn buyer_scope_answers_alone_and_advertises_supported() {
         let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_alibaba_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
         let connector = browser_only()
-            .with_open_api(
-                &OpenApiConfig::new("FAKTOR_ALIBABA_APP_KEY", ApiScopes::buyer_visible())
-                    .expect("config"),
-                Arc::new(
-                    MapCredentials::new().with("FAKTOR_ALIBABA_APP_KEY", "alibaba-sanitized-key"),
-                ),
-                &rig.secrets,
-            )
+            .with_open_api(&buyer_config(), credentials, secrets.clone(), None)
             .expect("api connector");
         assert_eq!(
             connector.capabilities().supplier_data,
             CapabilityLevel::Supported
         );
+        assert!(connector.has_valid_access_token(crate::testsupport::TEST_NOW_MS));
         rig.transport.push(CannedResponse::new(
             200,
             fixture("alibaba/api_product.json").into_bytes(),
         ));
         let capture = Arc::new(ScriptedCapture::new());
-        let ctx = ctx_with(&rig, capture.clone());
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
         let offer = connector
             .product(&ctx, ProductRequest::new(url_reference()))
             .await
@@ -1100,6 +1436,165 @@ mod tests {
         assert_eq!(capture.call_count(), 0, "no browser when scope suffices");
         let url = rig.transport.request_url(0).expect("url");
         assert!(url.contains("openapi.alibaba.com"), "{url}");
+        // The wire signature is the independently generated golden vector
+        // for this exact product and the injected manual clock
+        // (`fixtures/alibaba/signing_golden.json`, vector `product_detail`).
+        let body = rig.transport.request_body(0).expect("body");
+        assert!(
+            body.contains("_aop_signature=BE187F2B5A0467FF9DBFD3A239BC62715F482151"),
+            "{body}"
+        );
+        assert!(
+            !url.contains(ALIBABA_TOKEN),
+            "token must not be URL-visible"
+        );
+        assert!(!url.contains(ALIBABA_SECRET));
+        assert!(
+            !body.contains(ALIBABA_SECRET),
+            "app secret never transmitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_scoped_call_without_a_token_never_falls_back_to_the_browser() {
+        let rig = Rig::new();
+        let credentials = Arc::new(
+            MapCredentials::new()
+                .with(ALIBABA_KEY_ENV, ALIBABA_KEY)
+                .with(ALIBABA_SECRET_ENV, ALIBABA_SECRET),
+        );
+        let connector = browser_only()
+            .with_open_api(
+                &OpenApiConfig::new(
+                    ALIBABA_KEY_ENV,
+                    ALIBABA_SECRET_ENV,
+                    ApiScopes::buyer_visible(),
+                )
+                .expect("config"),
+                credentials,
+                rig.secrets.clone(),
+                None,
+            )
+            .expect("api connector");
+        // A browser capture is available; it must never be consulted.
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "alibaba/network_product.json",
+            Kind::NetworkJson,
+            "https://www.alibaba.com/product-detail/_1600123456789.html",
+        ));
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+        assert_eq!(
+            connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect_err("no token"),
+            SourceError::AuthenticationRequired
+        );
+        assert_eq!(capture.call_count(), 0);
+        assert_eq!(rig.transport.request_count(), 0);
+        assert!(rig
+            .diagnostics
+            .joined()
+            .contains("api_auth_required_no_browser_fallback"));
+    }
+
+    #[tokio::test]
+    async fn a_planner_browser_mechanism_never_demands_api_auth() {
+        let rig = Rig::new();
+        let credentials = Arc::new(
+            MapCredentials::new()
+                .with(ALIBABA_KEY_ENV, ALIBABA_KEY)
+                .with(ALIBABA_SECRET_ENV, ALIBABA_SECRET),
+        );
+        let connector = browser_only()
+            .with_open_api(
+                &OpenApiConfig::new(
+                    ALIBABA_KEY_ENV,
+                    ALIBABA_SECRET_ENV,
+                    ApiScopes::buyer_visible(),
+                )
+                .expect("config"),
+                credentials,
+                rig.secrets.clone(),
+                None,
+            )
+            .expect("api connector");
+        // No access token is configured, but the planner chose browser
+        // extraction: the adapter must not demand API auth for it.
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "alibaba/network_product.json",
+            Kind::NetworkJson,
+            "https://www.alibaba.com/product-detail/_1600123456789.html",
+        ));
+        let ctx = ctx_with(&rig, capture.clone());
+        let offer = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("browser offer without an API token");
+        assert_eq!(offer.title.as_str(), "USB 3.0 Braided Data Cable");
+        assert_eq!(capture.call_count(), 1);
+        assert_eq!(rig.transport.request_count(), 0);
+        assert!(!rig.diagnostics.joined().contains("api_auth_required"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_typed_and_never_falls_back_to_the_browser() {
+        let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_alibaba_credentials(crate::testsupport::TEST_NOW_MS - 1);
+        let connector = browser_only()
+            .with_open_api(&buyer_config(), credentials, secrets, None)
+            .expect("api connector");
+        assert!(!connector.has_valid_access_token(crate::testsupport::TEST_NOW_MS));
+        assert_eq!(
+            connector.access_token_expires_at_ms(),
+            Some(crate::testsupport::TEST_NOW_MS - 1)
+        );
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "alibaba/network_product.json",
+            Kind::NetworkJson,
+            "https://www.alibaba.com/product-detail/_1600123456789.html",
+        ));
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+        assert_eq!(
+            connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect_err("expired token"),
+            SourceError::AuthenticationRequired
+        );
+        assert_eq!(capture.call_count(), 0);
+        assert_eq!(rig.transport.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_expiry_is_fail_closed() {
+        let rig = Rig::new();
+        let credentials = Arc::new(
+            MapCredentials::new()
+                .with(ALIBABA_KEY_ENV, ALIBABA_KEY)
+                .with(ALIBABA_SECRET_ENV, ALIBABA_SECRET)
+                .with(ALIBABA_TOKEN_ENV, ALIBABA_TOKEN)
+                .with(ALIBABA_EXPIRES_ENV, "not-a-timestamp"),
+        );
+        let connector = browser_only()
+            .with_open_api(&buyer_config(), credentials, rig.secrets.clone(), None)
+            .expect("api connector");
+        assert_eq!(connector.access_token_expires_at_ms(), None);
+        assert!(!connector.has_valid_access_token(crate::testsupport::TEST_NOW_MS));
+        let capture = Arc::new(ScriptedCapture::new());
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+        assert_eq!(
+            connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect_err("malformed expiry"),
+            SourceError::AuthenticationRequired
+        );
+        assert_eq!(capture.call_count(), 0);
     }
 
     #[tokio::test]

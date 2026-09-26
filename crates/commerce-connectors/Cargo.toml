@@ -13,9 +13,15 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 async-trait = "0.1"
+hmac = "0.12"
+sha1 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The contract mock recomputes the documented AOP signature from the wire
+# bytes, independently of the production signer, and refuses any mismatch.
+hmac = "0.12"
+sha1 = "0.10"
 
 [lints]
 workspace = true

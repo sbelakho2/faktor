@@ -76,6 +76,87 @@ impl CaptureLimits {
     }
 }
 
+/// The access class under which a browser capture was produced (spec §9).
+///
+/// The browser authority reports this alongside the capture so a value
+/// observed through a logged-in or account-scoped profile is never later
+/// presented as public. This crate carries no site knowledge: the account is
+/// an opaque bounded label; mapping the class into a marketplace's price
+/// visibility vocabulary belongs to the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureAccess {
+    /// No login or dedicated profile was involved.
+    Anonymous,
+    /// A logged-in profile observed the value.
+    Authenticated,
+    /// The value was observed under one named account.
+    AccountScoped {
+        /// The bounded account label (never a path, never a credential).
+        account: String,
+    },
+}
+
+impl CaptureAccess {
+    /// The anonymous capture.
+    pub const fn anonymous() -> Self {
+        Self::Anonymous
+    }
+
+    /// A logged-in capture with no declared account scope.
+    pub const fn authenticated() -> Self {
+        Self::Authenticated
+    }
+
+    /// An account-scoped capture. Empty, oversized or control-character
+    /// labels are refused typed — a capture authority is never silently
+    /// downgraded or malformed.
+    pub fn account_scoped(account: &str) -> Result<Self, crate::error::BrowserError> {
+        let capture = Self::AccountScoped {
+            account: account.to_string(),
+        };
+        capture.validate()?;
+        Ok(capture)
+    }
+
+    /// The account label, when the capture is account-scoped.
+    pub fn account(&self) -> Option<&str> {
+        match self {
+            Self::AccountScoped { account } => Some(account),
+            _ => None,
+        }
+    }
+
+    /// True for [`CaptureAccess::Anonymous`].
+    pub const fn is_anonymous(&self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// The stable label.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Authenticated => "authenticated",
+            Self::AccountScoped { .. } => "account_scoped",
+        }
+    }
+
+    /// Validate a deserialized value against the account-label grammar.
+    pub fn validate(&self) -> Result<(), crate::error::BrowserError> {
+        if let Self::AccountScoped { account } = self {
+            if account.is_empty()
+                || account.len() > crate::profile::MAX_ACCOUNT_BYTES
+                || account.chars().any(char::is_control)
+            {
+                return Err(crate::error::BrowserError::invalid_config(
+                    "capture account label must be 1..=128 bytes with no control characters",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Header names whose VALUES are always redacted before any capture/log.
 pub const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
@@ -562,6 +643,44 @@ mod tests {
             redact_url_query_values("https://x.test/p"),
             "https://x.test/p"
         );
+    }
+
+    #[test]
+    fn capture_access_is_typed_and_bounded() {
+        assert!(CaptureAccess::anonymous().is_anonymous());
+        assert!(!CaptureAccess::authenticated().is_anonymous());
+        assert_eq!(CaptureAccess::anonymous().label(), "anonymous");
+        assert_eq!(CaptureAccess::authenticated().label(), "authenticated");
+        let scoped = CaptureAccess::account_scoped("procurement-cn").expect("scope");
+        assert_eq!(scoped.label(), "account_scoped");
+        assert_eq!(scoped.account(), Some("procurement-cn"));
+        assert!(scoped.validate().is_ok());
+
+        // A malformed account label is a typed refusal, never a silent
+        // downgrade to anonymous.
+        for hostile in [
+            "",
+            "\u{0}",
+            "bad\nlabel",
+            &"x".repeat(crate::profile::MAX_ACCOUNT_BYTES + 1),
+            &format!("x{}", "y".repeat(crate::profile::MAX_ACCOUNT_BYTES)),
+        ] {
+            let error = CaptureAccess::account_scoped(hostile)
+                .expect_err("malformed account labels are refused");
+            assert_eq!(error.code(), "invalid_config");
+        }
+
+        // Deserialized authorities are validated explicitly; a hostile
+        // payload cannot smuggle a control character in unchecked.
+        let hostile: CaptureAccess =
+            serde_json::from_str("{\"account_scoped\":{\"account\":\"bad\\u0001\"}}")
+                .expect("shape parses");
+        assert!(hostile.validate().is_err());
+
+        let round_trip: CaptureAccess =
+            serde_json::from_str(&serde_json::to_string(&scoped).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_trip, scoped);
     }
 
     #[test]

@@ -7,7 +7,11 @@
 //! capture bounds. What crosses this seam is a [`CaptureBundle`]: at most
 //! [`MAX_CAPTURES`] bounded payloads (browser-network JSON, embedded
 //! application state, structural markup, rendered text), an optional typed
-//! [`Challenge`], and the stable profile it was captured under.
+//! [`Challenge`], the stable profile it was captured under, and the
+//! [`AccessVisibility`] authority the capture was made under (anonymous,
+//! authenticated, or account-scoped). The normalizer derives the domain
+//! `PriceVisibility` from that authority — a numeric price alone never
+//! implies a public price.
 //!
 //! Two rules are structural here:
 //!
@@ -29,7 +33,7 @@ use faktor_commerce::error::VerificationKind;
 use faktor_commerce::text::{CanonicalUrl, Text};
 use faktor_commerce::{SourceError, SourceId};
 
-use crate::context::AcquireCtx;
+use crate::context::{AccessVisibility, AcquireCtx};
 use crate::contract::extract::Strategy;
 use crate::quota::MINUTE_MS;
 
@@ -278,15 +282,42 @@ pub struct CaptureBundle {
     pub challenge: Option<Challenge>,
     /// When the capture was made.
     pub observed_at_ms: u64,
+    /// The access authority the capture was made under (P0 item 8). The
+    /// browser authority knows which dedicated profile was used; a capture
+    /// made through a logged-in profile must say so here, or the normalizer
+    /// cannot distinguish an authenticated price from a public one.
+    pub access_visibility: AccessVisibility,
 }
 
 impl CaptureBundle {
-    /// Validate and construct.
+    /// Validate and construct with the anonymous authority.
+    ///
+    /// A browser authority that captured through a logged-in or
+    /// account-scoped profile MUST use [`CaptureBundle::new_with_access`] (or
+    /// [`CaptureBundle::with_access`]) instead: the default is only correct
+    /// for captures that genuinely required no profile.
     pub fn new(
         url: CanonicalUrl,
         payloads: Vec<CapturedPayload>,
         challenge: Option<Challenge>,
         observed_at_ms: u64,
+    ) -> Result<Self, SourceError> {
+        Self::new_with_access(
+            url,
+            payloads,
+            challenge,
+            observed_at_ms,
+            AccessVisibility::Anonymous,
+        )
+    }
+
+    /// Validate and construct with an explicit capture authority.
+    pub fn new_with_access(
+        url: CanonicalUrl,
+        payloads: Vec<CapturedPayload>,
+        challenge: Option<Challenge>,
+        observed_at_ms: u64,
+        access_visibility: AccessVisibility,
     ) -> Result<Self, SourceError> {
         let total: usize = payloads.iter().map(CapturedPayload::len).sum();
         if payloads.len() > MAX_CAPTURES || total > MAX_CAPTURE_TOTAL_BYTES {
@@ -297,7 +328,19 @@ impl CaptureBundle {
             payloads,
             challenge,
             observed_at_ms,
+            access_visibility,
         })
+    }
+
+    /// Declare the capture authority (the browser authority's seam).
+    pub fn with_access(mut self, access_visibility: AccessVisibility) -> Self {
+        self.access_visibility = access_visibility;
+        self
+    }
+
+    /// The access authority this capture was made under.
+    pub fn access_visibility(&self) -> &AccessVisibility {
+        &self.access_visibility
     }
 
     /// True when this bundle stops the profile (a challenge was detected).
@@ -415,13 +458,29 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A minimal bundle around one payload.
+    /// A minimal bundle around one payload (anonymous authority).
     pub fn bundle(url: &str, payloads: Vec<CapturedPayload>) -> CaptureBundle {
         CaptureBundle::new(
             CanonicalUrl::parse(url).expect("test url"),
             payloads,
             None,
             1_700_000_000_000,
+        )
+        .expect("bundle")
+    }
+
+    /// A minimal bundle around one payload under an explicit authority.
+    pub fn bundle_with_access(
+        url: &str,
+        payloads: Vec<CapturedPayload>,
+        access: AccessVisibility,
+    ) -> CaptureBundle {
+        CaptureBundle::new_with_access(
+            CanonicalUrl::parse(url).expect("test url"),
+            payloads,
+            None,
+            1_700_000_000_000,
+            access,
         )
         .expect("bundle")
     }
@@ -456,7 +515,7 @@ pub type SharedBrowserExtraction = Arc<dyn BrowserExtraction>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::capture::test_support::{bundle, payload};
+    use crate::contract::capture::test_support::{bundle, bundle_with_access, payload};
 
     fn cny_url() -> CanonicalUrl {
         CanonicalUrl::parse("https://detail.1688.com/offer/678.html").expect("url")
@@ -536,6 +595,49 @@ mod tests {
             ChallengeKind::RateLimitPage.to_source_error(),
             SourceError::RateLimited { .. }
         ));
+    }
+
+    #[test]
+    fn capture_authority_is_carried_and_explicit() {
+        let scope = faktor_commerce::text::AccountScope::new("buyer-a").expect("scope");
+        let anonymous = bundle("https://detail.1688.com/offer/678.html", Vec::new());
+        assert_eq!(
+            anonymous.access_visibility(),
+            &AccessVisibility::Anonymous,
+            "the legacy constructor is anonymous, never inferred"
+        );
+
+        let authenticated = anonymous
+            .clone()
+            .with_access(AccessVisibility::Authenticated);
+        assert_eq!(
+            authenticated.access_visibility(),
+            &AccessVisibility::Authenticated
+        );
+        let scoped = bundle_with_access(
+            "https://detail.1688.com/offer/678.html",
+            Vec::new(),
+            AccessVisibility::AccountScoped(scope.clone()),
+        );
+        assert_eq!(
+            scoped.access_visibility(),
+            &AccessVisibility::AccountScoped(scope)
+        );
+        // The authority survives a challenge bundle too: a stopped profile
+        // still knows how it was stopped.
+        let challenged = CaptureBundle::new_with_access(
+            cny_url(),
+            Vec::new(),
+            Some(Challenge::new(ChallengeKind::LoginForm, "sign in")),
+            1_700_000_000_000,
+            AccessVisibility::Authenticated,
+        )
+        .expect("challenged bundle");
+        assert!(challenged.stops_profile());
+        assert_eq!(
+            challenged.access_visibility(),
+            &AccessVisibility::Authenticated
+        );
     }
 
     #[test]

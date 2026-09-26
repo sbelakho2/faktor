@@ -12,10 +12,12 @@
 // the real IntelliJ wiring lives in IntelliJPasswordSafe.kt.
 package dev.faktor.frontend
 
+import dev.faktor.shared.asciiLowerCase
+
 /** One non-secret coordinate pair; the credential value never enters it. */
 data class ControlPlaneScope(val endpoint: String, val organization: String) {
 
-    fun normalizedEndpoint(): String = endpoint.trim().trimEnd('/').toLowerCase()
+    fun normalizedEndpoint(): String = asciiLowerCase(endpoint.trim().trimEnd('/'))
 
     fun valid(): Boolean = normalizedEndpoint().isNotEmpty() && organization.trim().isNotEmpty()
 

@@ -40,8 +40,24 @@ LLM used only where reasoning is actually needed
   against `expected_hash`; parse-before-accept; atomic writes; no old patch
   applied to unexpected contents.
 - **Hybrid retrieval** — exact + lexical + symbol + optional semantic search
-  fused by rank; automatic retrieval is a TARGET (the machinery exists; the
-  production daemon wiring is in progress).
+  fused by rank; automatic retrieval is IMPLEMENTED in production: the daemon
+  graph hands the runtime the per-workspace index/evidence authorities
+  (`build_daemon_core`), an ordinary turn whose prompt references a symbol
+  absent from recent context automatically receives the matching exact +
+  symbol + lexical (+ semantic, when an embedder is configured) evidence
+  package bounded by the wire plan's context budget, and a prompt matching
+  nothing yields no evidence section. Behavioral certification today is at
+  the agent runtime
+  (`ordinary_turn_receives_repository_evidence_without_a_search_tool_call`
+  for the automatic package, the `configured_embedder_*` tests for the
+  semantic leg, `no_embedder_degrades_honestly_and_never_invents_semantic_evidence`
+  for honest absence). A daemon-core behavioral test of the same two
+  behaviors is NOT yet in `tests/production-wiring`: a fake/custom provider
+  endpoint cannot route an agent turn under the production policy (the
+  Implement/Review quality floor is a hard 60 while every non-official
+  endpoint carries the conservative prior 50), so the missing seam is a
+  routable fake-provider/quality-authority seam in `build_daemon_core`;
+  nothing here claims it.
 - **Explicit concurrency** — resource-class budgets, dependency DAG scheduling,
   state-aware retries with jitter, circuit breakers.
 - **Process supervision** — no orphans. Process groups on Unix; Windows
@@ -173,15 +189,52 @@ authoritative surface and is scan-enforced.
   compaction), `VerifiedComplete` is refused with a typed error while any
   requested step lacks a succeeding status row, and
   `crates/orchestrator/src/completion_steps.rs` executes the requested steps
-  in gate order (idempotent, policy-checked push, supervisor-issued PR
-  command). Both IDEs expose the Task-mode checkboxes and report the durable
-  step provenance; a serving daemon without the additive completion read
-  shows `unavailable`, never a fabricated success. Normative semantics and
-  the exact seams are in `docs/certification.md` §3.3.
+  in gate order (idempotent commit/push, policy-checked push). The native PR
+  step is certified ONLY through the canonical `faktor-scm` `CompletionScm`
+  adapter (`crates/scm/src/completion.rs`): it resolves the installation from
+  the synced repository rows and drives the real GitHub App adapter
+  (`faktor_scm::github::GitHubApp`) over the daemon's checked transport,
+  journaling the exact external-operation identity before the idempotent
+  branch and pull-request reconciliation. A contract that requests the PR
+  step while no provider is configured records the explicit
+  `native_pr_scm_not_configured` durable blocker (never a silent skip); the
+  legacy `pr_command`/`pr_program` expert command remains available but can
+  never certify the native PR step. Both IDEs expose the Task-mode checkboxes
+  and report the durable step provenance; a serving daemon without the
+  additive completion read shows `unavailable`, never a fabricated success.
+  Normative semantics and the exact seams are in `docs/certification.md`
+  §3.3.
+- **Production-wiring certification (`tests/production-wiring`, IMPLEMENTED
+  with stated residuals).** A workspace test crate compiles the `faktor-cli`
+  binary source as a library and every test drives the executable's own
+  `build_daemon_core` graph with fake external seams, so the daemon — not a
+  hand-built subsystem — supplies identity/config/authority. Certified:
+  `source_market` runs the production planner's mechanism/cache decisions
+  and survives variant/packaging across tool → service → bridge → adapter;
+  a configured marketplace account scope keys the authenticated cache row
+  (and an anonymous context cannot address it, while authenticated prices
+  are never public-addressable); the real Alibaba AOP signing path passes an
+  independently-verifying contract mock, and missing/expired tokens are a
+  typed `AuthenticationRequired` with zero requests and zero browser calls;
+  a contracted task's completion PR traverses the daemon `TaskExecutor` into
+  `GitHubCompletionScm`/`GitHubApp` against a fake GitHub (installation
+  token, exact ref, exact head/base/marker); durable jobs are requester-
+  scoped (`NotFound` across sessions); image turns are refused typed before
+  dispatch for non-vision models, and ordered byte-exact image parts reach a
+  loopback provider through the daemon's provider registry/transport.
+  Residuals (reported, not hidden): (a) `AcquisitionPlanner::plan` itself is
+  not seam-injectable through `build_daemon_core` — the commerce service is
+  built with the default planner inside `open_commerce_service_with`, so the
+  planner is certified through its executed mechanism and cache decisions;
+  (b) a full agent turn against a non-official provider endpoint cannot
+  route yet (hard quality floor 60 vs conservative prior 50), so the
+  positive image-dispatch half is certified at the daemon provider boundary
+  and the daemon-core retrieval behaviors above remain pending that routing
+  seam.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| PR/CI-fix completion contract | IMPLEMENTED (gate + ordered step execution) | `crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/orchestrator/src/completion_steps.rs`, §3.3 |
+| PR/CI-fix completion contract | IMPLEMENTED (gate + ordered step execution; native PR via the canonical GitHub App adapter) | `crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/orchestrator/src/completion_steps.rs`, `crates/scm/src/completion.rs`, `crates/cli/src/main.rs` (`[cloud.github_app]` wiring), §3.3 |
 | Coordination board | IMPLEMENTED (durable ledger rows + native `GET/POST /native/session/{id}/board` + both IDE board panels with truthful unavailable state) | `crates/session/src/board.rs`, `crates/server/src/native/board.rs`, `apps/vscode/src/nativeClient.ts`, `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt` |
 | Multi-candidate tournament | IMPLEMENTED | `crates/orchestrator/src/tournament.rs` + native start/state/list endpoints; integration stays an explicit approved merge |
 | Pixel agents | IMPLEMENTED | `apps/vscode/src/pixelAgents.ts` + JetBrains `PixelAgents.kt` (identical FNV-1a hashes) |

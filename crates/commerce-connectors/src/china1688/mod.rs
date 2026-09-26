@@ -24,6 +24,7 @@
 //! * The request interception policy is connector-maintained: only
 //!   first-party payloads reach the extractors.
 
+pub mod auth;
 pub mod dictionary;
 pub mod extract;
 pub mod normalize;
@@ -39,7 +40,7 @@ use faktor_commerce::text::{CanonicalUrl, Text, VariantId};
 use faktor_commerce::{CommercialOffer, Freshness, NonZeroQuantity, SourceError, SourceId};
 
 use crate::config::{ConfigError, ProfileConnectorConfig};
-use crate::context::{AcquireCtx, ConnectorEventKind};
+use crate::context::{AccessVisibility, AcquireCtx, ConnectorEventKind};
 use crate::contract::capture::{BrowserExtraction, CaptureBundle, CaptureKind, FirstPartyPolicy};
 use crate::contract::extract::{ExtractionHealth, Field, Fingerprint, Strategy, StrategyOutcome};
 use crate::contract::{
@@ -47,7 +48,9 @@ use crate::contract::{
     ProductReference, ProductRequest, QuoteCandidate, QuoteRequest, SearchRequest, SiteConnector,
 };
 use crate::http::{self, HttpRequest};
-use crate::secrets::{CredentialProvider, SecretGuard, SecretString};
+use crate::secrets::{CredentialProvider, SecretGuard};
+
+use auth::{AccessToken, China1688Auth, TokenRefresher};
 
 /// The Open Platform product-detail endpoint.
 pub const OPEN_PLATFORM_PRODUCT_URL: &str =
@@ -146,34 +149,115 @@ impl ApiScopes {
     }
 }
 
-/// An Open Platform credential configuration. The value is resolved from the
-/// named environment variable through the injected credential provider and
-/// registered with the secret scanner; it never enters the model context.
+/// An Open Platform credential configuration. Every field is an environment
+/// variable *name*, never a value; values are resolved through the injected
+/// credential provider and registered with the secret scanner, and never
+/// enter the model context.
+///
+/// The app key and app secret are mandatory for any Open Platform call; the
+/// access-token and refresh-token names are optional. An account-scoped call
+/// without a valid unexpired access token is typed
+/// [`SourceError::AuthenticationRequired`], never an anonymous request and
+/// never a silent browser fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPlatformConfig {
-    /// The environment variable naming the app key.
-    pub app_key_env: Text<64>,
-    /// The granted scopes.
-    pub scopes: ApiScopes,
+    app_key_env: Text<64>,
+    app_secret_env: Text<64>,
+    access_token_env: Option<Text<64>>,
+    access_token_expires_at_env: Option<Text<64>>,
+    refresh_token_env: Option<Text<64>>,
+    scopes: ApiScopes,
 }
 
 impl OpenPlatformConfig {
-    /// A configuration with the given env-var name and scopes.
-    pub fn new(app_key_env: &str, scopes: ApiScopes) -> Result<Self, ConfigError> {
-        let app_key_env =
-            Text::<64>::new(app_key_env).map_err(|_| ConfigError::MissingEnvName {
-                connector: "1688",
-                field: "app_key_env",
-            })?;
+    /// A configuration with the mandatory env-var names and scopes.
+    pub fn new(
+        app_key_env: &str,
+        app_secret_env: &str,
+        scopes: ApiScopes,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
-            app_key_env,
+            app_key_env: env_name("1688", "app_key_env", app_key_env)?,
+            app_secret_env: env_name("1688", "app_secret_env", app_secret_env)?,
+            access_token_env: None,
+            access_token_expires_at_env: None,
+            refresh_token_env: None,
             scopes,
         })
     }
+
+    /// Name the env vars holding the access token and its absolute expiry
+    /// (unix milliseconds). Both are configured together or not at all.
+    pub fn with_access_token(
+        mut self,
+        access_token_env: &str,
+        access_token_expires_at_env: &str,
+    ) -> Result<Self, ConfigError> {
+        self.access_token_env = Some(env_name("1688", "access_token_env", access_token_env)?);
+        self.access_token_expires_at_env = Some(env_name(
+            "1688",
+            "access_token_expires_at_env",
+            access_token_expires_at_env,
+        )?);
+        Ok(self)
+    }
+
+    /// Name the env var holding the OAuth refresh token.
+    pub fn with_refresh_token(mut self, refresh_token_env: &str) -> Result<Self, ConfigError> {
+        self.refresh_token_env = Some(env_name("1688", "refresh_token_env", refresh_token_env)?);
+        Ok(self)
+    }
+
+    /// The granted scopes.
+    pub fn scopes(&self) -> ApiScopes {
+        self.scopes
+    }
+
+    /// The app-key env-var name.
+    pub fn app_key_env(&self) -> &str {
+        self.app_key_env.as_str()
+    }
+
+    /// The app-secret env-var name.
+    pub fn app_secret_env(&self) -> &str {
+        self.app_secret_env.as_str()
+    }
+}
+
+/// Validate one environment-variable name field.
+fn env_name(
+    connector: &'static str,
+    field: &'static str,
+    raw: &str,
+) -> Result<Text<64>, ConfigError> {
+    Text::<64>::new(raw).map_err(|_| ConfigError::MissingEnvName { connector, field })
+}
+
+/// Resolve the configured access token and its absolute expiry.
+///
+/// Both env names are configured together (see
+/// [`OpenPlatformConfig::with_access_token`]); a value that resolves while
+/// its expiry is unparseable installs no token, so account-scoped calls
+/// refuse typed rather than run with an unbounded credential.
+fn resolve_access_token(
+    config: &OpenPlatformConfig,
+    credentials: &dyn CredentialProvider,
+    secrets: &SecretGuard,
+) -> Result<Option<AccessToken>, ConfigError> {
+    let (Some(token_env), Some(expires_env)) = (
+        config.access_token_env.as_ref(),
+        config.access_token_expires_at_env.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let token = crate::config::credential(credentials, secrets, token_env.as_str())?;
+    let expires_raw = crate::config::credential(credentials, secrets, expires_env.as_str())?;
+    Ok(crate::aop::parse_expiry_ms(expires_raw.expose())
+        .map(|expires_at_ms| AccessToken::new(token, expires_at_ms)))
 }
 
 struct OpenPlatform {
-    app_key: SecretString,
+    auth: China1688Auth,
     scopes: ApiScopes,
 }
 
@@ -208,21 +292,67 @@ impl China1688Connector {
         })
     }
 
-    /// Attach an Open Platform credential. The env-var *value* is resolved
-    /// through the injected provider and registered with the secret scanner.
+    /// Attach an Open Platform credential.
+    ///
+    /// Every named value is resolved through the injected provider and
+    /// registered with the secret scanner. This constructor is fallible: a
+    /// missing mandatory app key/app secret, or a configured value that
+    /// cannot be resolved, is a typed [`ConfigError`] before any request
+    /// exists. `refresher` is the optional token-refresh seam (production
+    /// wiring rotates tokens via the environment and passes `None`).
     pub fn with_open_platform(
         mut self,
         config: &OpenPlatformConfig,
         credentials: Arc<dyn CredentialProvider>,
-        secrets: &SecretGuard,
+        secrets: Arc<SecretGuard>,
+        refresher: Option<Arc<dyn TokenRefresher>>,
     ) -> Result<Self, ConfigError> {
-        let app_key =
-            crate::config::credential(credentials.as_ref(), secrets, config.app_key_env.as_str())?;
+        let app_key = crate::config::credential(
+            credentials.as_ref(),
+            secrets.as_ref(),
+            config.app_key_env.as_str(),
+        )?;
+        let app_secret = crate::config::credential(
+            credentials.as_ref(),
+            secrets.as_ref(),
+            config.app_secret_env.as_str(),
+        )?;
+        let access_token = resolve_access_token(config, credentials.as_ref(), secrets.as_ref())?;
+        let refresh_token = match config.refresh_token_env.as_ref() {
+            Some(env) => Some(crate::config::credential(
+                credentials.as_ref(),
+                secrets.as_ref(),
+                env.as_str(),
+            )?),
+            None => None,
+        };
         self.api = Some(OpenPlatform {
-            app_key,
+            auth: China1688Auth::new(
+                app_key,
+                app_secret,
+                access_token,
+                refresh_token,
+                refresher,
+                secrets,
+            ),
             scopes: config.scopes,
         });
         Ok(self)
+    }
+
+    /// The installed access token's expiry, when a token is configured.
+    pub fn access_token_expires_at_ms(&self) -> Option<u64> {
+        self.api
+            .as_ref()
+            .and_then(|api| api.auth.token_expires_at_ms())
+    }
+
+    /// True when a valid, unexpired access token is installed now (with the
+    /// documented skew).
+    pub fn has_valid_access_token(&self, now_ms: u64) -> bool {
+        self.api
+            .as_ref()
+            .is_some_and(|api| api.auth.has_valid_token(now_ms))
     }
 
     /// The advertised scope coverage (honest per-credential advertisement).
@@ -251,12 +381,22 @@ impl China1688Connector {
             .unwrap_or_default()
     }
 
+    /// The stable profile identity of this acquisition. It comes from the
+    /// runtime wrapper's injected [`ConnectorIdentity`](crate::context::ConnectorIdentity)
+    /// (P0 item 2), never from a request field; the connector's own configured
+    /// profile name is only the fallback when the wrapper injected none.
     fn profile_identity(&self, ctx: &AcquireCtx) -> ProfileIdentity {
+        let identity = ctx.identity();
+        let configured = identity.profile();
         ProfileIdentity {
             source: self.source.clone(),
-            profile: self.profile.clone(),
-            account: ctx.account_scope().cloned(),
-            egress: Text::<64>::new(EGRESS_LABEL).ok(),
+            profile: configured
+                .map(|profile| profile.profile.clone())
+                .unwrap_or_else(|| self.profile.clone()),
+            account: identity.account_scope().cloned(),
+            egress: configured
+                .and_then(|profile| profile.egress.clone())
+                .or_else(|| Text::<64>::new(EGRESS_LABEL).ok()),
         }
     }
 
@@ -281,12 +421,25 @@ impl China1688Connector {
             account_pricing: CapabilityLevel::Unsupported,
             supplier_data: level(scopes.supplier),
             bulk: CapabilityLevel::Unsupported,
-            mechanisms: vec![
-                Mechanism::OfficialApi,
-                Mechanism::BrowserNetwork,
-                Mechanism::EmbeddedState,
-                Mechanism::Dom,
-            ],
+            // Honest advertisement: the official API mechanism exists only
+            // when a credential is installed. A browser-only 1688 connector
+            // advertises browser mechanisms only, so the planner selects the
+            // browser because that is the mechanism it has, not because the
+            // adapter decided to fall back.
+            mechanisms: if self.api.is_some() {
+                vec![
+                    Mechanism::OfficialApi,
+                    Mechanism::BrowserNetwork,
+                    Mechanism::EmbeddedState,
+                    Mechanism::Dom,
+                ]
+            } else {
+                vec![
+                    Mechanism::BrowserNetwork,
+                    Mechanism::EmbeddedState,
+                    Mechanism::Dom,
+                ]
+            },
         }
     }
 
@@ -308,33 +461,58 @@ impl China1688Connector {
             .map_err(|_| SourceError::InvalidRequest)
     }
 
-    fn api_url(&self, reference: Option<&str>, query: Option<&str>) -> Result<String, SourceError> {
-        let api = self.api.as_ref().ok_or(SourceError::Disabled)?;
-        let key = http::query_escape(api.app_key.expose());
-        let url = match (reference, query) {
-            (Some(offer_id), _) => format!(
-                "{OPEN_PLATFORM_PRODUCT_URL}?apiKey={key}&offerId={}",
-                http::query_escape(offer_id)
-            ),
-            (None, Some(query)) => format!(
-                "{OPEN_PLATFORM_SEARCH_URL}?apiKey={key}&keywords={}",
-                http::query_escape(&dictionary::expand_query(query))
-            ),
-            _ => return Err(SourceError::InvalidRequest),
+    /// Build the signed Open Platform `param2` request for one lookup, when
+    /// the credential grants discovery/product on the buyer surface.
+    ///
+    /// An account-scoped request without a valid unexpired access token is
+    /// typed [`SourceError::AuthenticationRequired`] and never becomes a
+    /// browser call.
+    fn api_request(
+        &self,
+        ctx: &AcquireCtx,
+        reference: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<Option<HttpRequest>, SourceError> {
+        let Some(api) = self.api.as_ref() else {
+            return Ok(None);
         };
-        Ok(url)
+        // The runtime planner owns mechanism selection: when it chose a
+        // browser mechanism, this adapter must not build (and must not
+        // demand a token for) an API request. `None` is the legacy context
+        // that lets the connector pick its own primary mechanism.
+        if ctx.mechanism().is_some_and(|m| m != Mechanism::OfficialApi) {
+            return Ok(None);
+        }
+        let built = match (reference, query) {
+            (Some(offer_id), _) => auth::product_request(&api.auth, offer_id, ctx.now_ms()),
+            (None, Some(query)) => {
+                auth::search_request(&api.auth, &dictionary::expand_query(query), ctx.now_ms())
+            }
+            _ => return Ok(None),
+        };
+        match built {
+            Ok(request) => Ok(Some(request)),
+            Err(error) => {
+                if error == SourceError::AuthenticationRequired {
+                    ctx.record(
+                        &self.source,
+                        "api",
+                        ConnectorEventKind::Note,
+                        None,
+                        Some("api_auth_required_no_browser_fallback"),
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn api_drafts(
         &self,
         ctx: &AcquireCtx,
-        url: &str,
+        request: HttpRequest,
         operation: &'static str,
     ) -> Result<Vec<extract::Draft>, SourceError> {
-        let Some(api) = self.api.as_ref() else {
-            return Err(SourceError::InvalidRequest);
-        };
-        let request = HttpRequest::get(url)?.with_url_credential(&api.app_key);
         let response = http::send(ctx, &self.source, operation, request).await?;
         http::map_status(&response)?;
         let body = response.body();
@@ -361,45 +539,52 @@ impl China1688Connector {
             .and_then(|fingerprints| fingerprints.get(&strategy).copied())
     }
 
-    /// Collect the drafts for one page: the API when it covers every needed
-    /// field, the browser strategies otherwise (or when the API is down).
+    /// Collect the drafts for one page by executing exactly the mechanism the
+    /// runtime planner chose. The API mechanism never touches the browser and
+    /// the browser mechanisms never touch the API: no silent switch, no
+    /// outage fallback manufactured inside the adapter.
     async fn collect(
         &self,
         ctx: &AcquireCtx,
         url: &CanonicalUrl,
-        api_url: Option<String>,
+        api_request: Option<HttpRequest>,
         needed: &[Field],
         operation: &'static str,
-    ) -> Result<Vec<extract::Draft>, SourceError> {
+    ) -> Result<(Vec<extract::Draft>, AccessVisibility), SourceError> {
         ctx.check_alive()?;
-        let mut drafts: Vec<extract::Draft> = Vec::new();
-        let mut api_outage: Option<SourceError> = None;
-        if let (Some(api), Some(api_url)) = (self.api.as_ref(), api_url) {
-            match self.api_drafts(ctx, &api_url, operation).await {
-                Ok(mut api_drafts) => {
-                    // Honest scope: the API answer is only used for fields
-                    // the granted scope actually covers; the rest is said
-                    // out loud and supplied by the browser strategies.
-                    for draft in &mut api_drafts {
-                        draft
-                            .observations
-                            .retain(|observation| api.scopes.covers(observation.field));
-                        if !api.scopes.variants {
-                            draft.variants.clear();
-                        }
+        let mechanism = ctx.mechanism().ok_or(SourceError::InvalidRequest)?;
+        match mechanism {
+            Mechanism::OfficialApi => {
+                let Some(api) = self.api.as_ref() else {
+                    // The planner only chooses the API mechanism for a
+                    // connector that advertises it, which requires an
+                    // installed credential.
+                    return Err(SourceError::InvalidRequest);
+                };
+                let Some(api_request) = api_request else {
+                    return Err(SourceError::InvalidRequest);
+                };
+                let mut drafts = self.api_drafts(ctx, api_request, operation).await?;
+                // Honest scope: the API answer is only used for fields the
+                // granted scope actually covers; the gap is recorded, never
+                // filled by an unplanned browser call.
+                for draft in &mut drafts {
+                    draft
+                        .observations
+                        .retain(|observation| api.scopes.covers(observation.field));
+                    if !api.scopes.variants {
+                        draft.variants.clear();
                     }
-                    let uncovered: Vec<Field> = needed
-                        .iter()
-                        .copied()
-                        .filter(|field| !api.scopes.covers(*field))
-                        .collect();
-                    for draft in &api_drafts {
-                        self.record_draft(draft, ctx);
-                    }
-                    drafts.extend(api_drafts);
-                    if uncovered.is_empty() {
-                        return Ok(drafts);
-                    }
+                }
+                let uncovered: Vec<Field> = needed
+                    .iter()
+                    .copied()
+                    .filter(|field| !api.scopes.covers(*field))
+                    .collect();
+                for draft in &drafts {
+                    self.record_draft(draft, ctx);
+                }
+                if !uncovered.is_empty() {
                     let labels: Vec<&str> = uncovered.iter().map(|field| field.as_str()).collect();
                     ctx.record(
                         &self.source,
@@ -409,44 +594,12 @@ impl China1688Connector {
                         Some(&format!("api_scope_missing fields={}", labels.join(","))),
                     );
                 }
-                Err(error) if is_outage(&error) => {
-                    api_outage = Some(error);
-                    ctx.record(
-                        &self.source,
-                        "api",
-                        ConnectorEventKind::Retry,
-                        None,
-                        Some("api_outage_browser_fallback"),
-                    );
-                }
-                Err(error) => return Err(error),
+                Ok((drafts, AccessVisibility::from_identity(ctx.identity())))
             }
-        }
-        match self.browser_drafts(ctx, url).await {
-            Ok(browser) if !browser.is_empty() => {
-                drafts.extend(browser);
-                Ok(drafts)
+            Mechanism::BrowserNetwork | Mechanism::EmbeddedState | Mechanism::Dom => {
+                self.browser_drafts(ctx, url).await
             }
-            Ok(_) => match api_outage {
-                Some(error) => Err(error),
-                None => Err(SourceError::ExtractionIncomplete),
-            },
-            Err(error) => {
-                if drafts.is_empty() {
-                    Err(error)
-                } else {
-                    // A partial API answer is still an answer; the browser
-                    // failure is recorded but does not hide it.
-                    ctx.record(
-                        &self.source,
-                        "browser",
-                        ConnectorEventKind::Note,
-                        None,
-                        Some("browser_failed_partial_api"),
-                    );
-                    Ok(drafts)
-                }
-            }
+            Mechanism::DirectHttp => Err(SourceError::InvalidRequest),
         }
     }
 
@@ -454,7 +607,7 @@ impl China1688Connector {
         &self,
         ctx: &AcquireCtx,
         url: &CanonicalUrl,
-    ) -> Result<Vec<extract::Draft>, SourceError> {
+    ) -> Result<(Vec<extract::Draft>, AccessVisibility), SourceError> {
         ctx.check_alive()?;
         if !self.policy.allows(url) {
             return Err(SourceError::InvalidRequest);
@@ -465,7 +618,9 @@ impl China1688Connector {
             .ok_or(SourceError::BrowserUnavailable)?;
         let profile = self.profile_identity(ctx);
         let bundle = extraction.capture(ctx, &self.source, &profile, url).await?;
-        self.drafts_from_bundle(ctx, bundle)
+        let access = bundle.access_visibility.clone();
+        let drafts = self.drafts_from_bundle(ctx, bundle)?;
+        Ok((drafts, access))
     }
 
     fn drafts_from_bundle(
@@ -612,19 +767,22 @@ impl China1688Connector {
         reference: &ProductReference,
         operation: &'static str,
     ) -> Result<normalize::Assembly, SourceError> {
-        let (url, api_url) = match reference {
+        let (url, api_request) = match reference {
             ProductReference::OfferId(offer_id) => (
                 self.detail_url(offer_id.as_str())?,
-                self.api_url(Some(offer_id.as_str()), None).ok(),
+                self.api_request(ctx, Some(offer_id.as_str()), None)?,
             ),
             ProductReference::Url(url) => (
                 url.clone(),
-                offer_id_from_url(url).and_then(|id| self.api_url(Some(&id), None).ok()),
+                match offer_id_from_url(url) {
+                    Some(id) => self.api_request(ctx, Some(&id), None)?,
+                    None => None,
+                },
             ),
             ProductReference::SourcePartNumber(part)
             | ProductReference::ManufacturerPartNumber(part) => (
                 self.search_url(part.as_str())?,
-                self.api_url(None, Some(part.as_str())).ok(),
+                self.api_request(ctx, None, Some(part.as_str()))?,
             ),
         };
         let needed = [
@@ -636,9 +794,12 @@ impl China1688Connector {
             Field::MinimumOrder,
             Field::Supplier,
         ];
-        let drafts = self.collect(ctx, &url, api_url, &needed, operation).await?;
+        let (drafts, access) = self
+            .collect(ctx, &url, api_request, &needed, operation)
+            .await?;
         let drafts = first_offer_drafts(drafts);
-        let assembly = normalize::assemble(&self.source, ctx, &url, &drafts, ctx.now_ms())?;
+        let assembly =
+            normalize::assemble(&self.source, ctx, &url, &drafts, ctx.now_ms(), &access)?;
         self.record_conflicts(&assembly, ctx);
         Ok(assembly)
     }
@@ -683,18 +844,6 @@ fn first_offer_drafts(drafts: Vec<extract::Draft>) -> Vec<extract::Draft> {
             })
         })
         .collect()
-}
-
-/// True when an API failure justifies the browser path (availability, never
-/// auth/rate/quota evasion).
-fn is_outage(error: &SourceError) -> bool {
-    matches!(
-        error,
-        SourceError::ApiUnavailable
-            | SourceError::NetworkTimeout
-            | SourceError::EgressUnavailable
-            | SourceError::BrowserUnavailable
-    )
 }
 
 /// The fields a strategy is expected to produce (used for health accounting
@@ -745,13 +894,13 @@ impl SiteConnector for China1688Connector {
         ctx.check_alive()?;
         reject_cache_only(req.freshness())?;
         let url = self.search_url(req.query().as_str())?;
-        let api_url = if self.scopes().discovery {
-            Some(self.api_url(None, Some(req.query().as_str()))?)
+        let api_request = if self.scopes().discovery {
+            self.api_request(ctx, None, Some(req.query().as_str()))?
         } else {
             None
         };
-        let drafts = self
-            .collect(ctx, &url, api_url, &[Field::Title], "search")
+        let (drafts, access) = self
+            .collect(ctx, &url, api_request, &[Field::Title], "search")
             .await?;
         let mut discoveries: Vec<Discovery> = Vec::new();
         for draft in &drafts {
@@ -761,6 +910,7 @@ impl SiteConnector for China1688Connector {
                 &url,
                 std::slice::from_ref(draft),
                 ctx.now_ms(),
+                &access,
             ) {
                 discoveries.push(normalize::discovery(&assembly));
                 if discoveries.len() >= usize::from(req.limit()) {
@@ -822,6 +972,9 @@ impl SiteConnector for China1688Connector {
                 None => faktor_commerce::quote::VariantRequest::None,
             },
             packaging: req.packaging(),
+            // Account-specific prices are only applicable to the identity the
+            // runtime configured; without it the quote resolves NoPrice.
+            account: ctx.account_scope(),
             now_ms: ctx.now_ms(),
             ..faktor_commerce::PricingContext::default()
         };
@@ -864,7 +1017,11 @@ mod tests {
         .expect("connector")
     }
 
-    fn ctx_with(rig: &Rig, capture: Arc<ScriptedCapture>) -> AcquireCtx {
+    fn ctx_with_mechanism(
+        rig: &Rig,
+        capture: Arc<ScriptedCapture>,
+        mechanism: Mechanism,
+    ) -> AcquireCtx {
         AcquireCtx::builder(
             rig.transport.clone(),
             rig.quota.clone(),
@@ -873,7 +1030,13 @@ mod tests {
         .clock(rig.clock.clone())
         .diagnostics(rig.diagnostics.clone())
         .browser_extraction(capture)
+        .mechanism(mechanism)
         .build()
+    }
+
+    /// Browser-mechanism context (the planner chose browser extraction).
+    fn ctx_with(rig: &Rig, capture: Arc<ScriptedCapture>) -> AcquireCtx {
+        ctx_with_mechanism(rig, capture, Mechanism::BrowserNetwork)
     }
 
     fn bundle_with(fixture_path: &str, kind: Kind, url: &str) -> CaptureBundle {
@@ -881,6 +1044,106 @@ mod tests {
             url,
             vec![capture_support::payload(kind, url, &fixture(fixture_path))],
         )
+    }
+
+    fn access_bundle(fixture_path: &str, kind: Kind, access: AccessVisibility) -> CaptureBundle {
+        capture_support::bundle_with_access(
+            "https://detail.1688.com/offer/678901234567.html",
+            vec![capture_support::payload(
+                kind,
+                "https://detail.1688.com/offer/678901234567.html",
+                &fixture(fixture_path),
+            )],
+            access,
+        )
+    }
+
+    #[tokio::test]
+    async fn capture_authority_decides_price_visibility_never_the_number() {
+        use faktor_commerce::PriceVisibility;
+
+        let rig = Rig::new();
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(access_bundle(
+            "china1688/network_offer_detail.json",
+            Kind::NetworkJson,
+            AccessVisibility::Authenticated,
+        ));
+        let buyer = faktor_commerce::text::AccountScope::new("buyer-a").expect("scope");
+        capture.push(access_bundle(
+            "china1688/network_offer_detail.json",
+            Kind::NetworkJson,
+            AccessVisibility::AccountScoped(buyer.clone()),
+        ));
+        let connector = browser_only();
+        let ctx = ctx_with(&rig, capture);
+
+        let authenticated = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("authenticated offer");
+        assert!(authenticated.cheapest_unit_price().is_some());
+        assert_eq!(
+            authenticated.price_visibility,
+            PriceVisibility::Authenticated,
+            "a numeric price under a logged-in capture is never Public"
+        );
+        for variant in &authenticated.variants {
+            for price_break in &variant.price_breaks {
+                assert_eq!(price_break.visibility, PriceVisibility::Authenticated);
+                assert_eq!(price_break.account_scope, None);
+            }
+        }
+
+        let scoped = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("account-scoped offer");
+        assert_eq!(scoped.price_visibility, PriceVisibility::AccountSpecific);
+        let mut breaks = 0usize;
+        for variant in &scoped.variants {
+            for price_break in &variant.price_breaks {
+                assert_eq!(price_break.visibility, PriceVisibility::AccountSpecific);
+                assert_eq!(price_break.account_scope, Some(buyer.clone()));
+                breaks += 1;
+            }
+        }
+        for price_break in &scoped.price_breaks {
+            assert_eq!(price_break.visibility, PriceVisibility::AccountSpecific);
+            assert_eq!(price_break.account_scope, Some(buyer.clone()));
+            breaks += 1;
+        }
+        assert!(breaks > 0, "the fixture must carry at least one price");
+    }
+
+    #[tokio::test]
+    async fn an_inquiry_stays_inquiry_required_under_any_capture_authority() {
+        use faktor_commerce::PriceVisibility;
+
+        for access in [
+            AccessVisibility::Anonymous,
+            AccessVisibility::Authenticated,
+            AccessVisibility::AccountScoped(
+                faktor_commerce::text::AccountScope::new("buyer-a").expect("scope"),
+            ),
+        ] {
+            let rig = Rig::new();
+            let capture = Arc::new(ScriptedCapture::new());
+            capture.push(access_bundle(
+                "china1688/network_inquiry.json",
+                Kind::NetworkJson,
+                access,
+            ));
+            let connector = browser_only();
+            let ctx = ctx_with(&rig, capture);
+            let offer = connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect("inquiry offer");
+            assert_eq!(offer.price_visibility, PriceVisibility::InquiryRequired);
+            assert!(offer.price_breaks.is_empty());
+            assert!(offer.variants.iter().all(|v| v.price_breaks.is_empty()));
+        }
     }
 
     fn detail_url() -> CanonicalUrl {
@@ -1229,25 +1492,51 @@ mod tests {
         assert_eq!(candidates[0].resolution.unit_price, None);
     }
 
+    const CN_KEY_ENV: &str = "FAKTOR_1688_APP_KEY";
+    const CN_SECRET_ENV: &str = "FAKTOR_1688_APP_SECRET";
+    const CN_TOKEN_ENV: &str = "FAKTOR_1688_ACCESS_TOKEN";
+    const CN_EXPIRES_ENV: &str = "FAKTOR_1688_ACCESS_TOKEN_EXPIRES_AT";
+    const CN_KEY: &str = "1688-sanitized-key";
+    const CN_SECRET: &str = "1688-sanitized-app-secret";
+    const CN_TOKEN: &str = "1688-sanitized-access-token";
+
+    fn golden_cn_credentials(expires_at_ms: u64) -> (Arc<MapCredentials>, Arc<SecretGuard>) {
+        (
+            Arc::new(
+                MapCredentials::new()
+                    .with(CN_KEY_ENV, CN_KEY)
+                    .with(CN_SECRET_ENV, CN_SECRET)
+                    .with(CN_TOKEN_ENV, CN_TOKEN)
+                    .with(CN_EXPIRES_ENV, &expires_at_ms.to_string()),
+            ),
+            Arc::new(SecretGuard::new()),
+        )
+    }
+
+    fn cn_config(scopes: ApiScopes) -> OpenPlatformConfig {
+        OpenPlatformConfig::new(CN_KEY_ENV, CN_SECRET_ENV, scopes)
+            .expect("config")
+            .with_access_token(CN_TOKEN_ENV, CN_EXPIRES_ENV)
+            .expect("access token config")
+    }
+
     #[tokio::test]
     async fn open_platform_scope_is_advertised_honestly() {
-        let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_cn_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
         let connector = browser_only()
             .with_open_platform(
-                &OpenPlatformConfig::new(
-                    "FAKTOR_1688_APP_KEY",
-                    ApiScopes {
-                        discovery: true,
-                        product: true,
-                        price: true,
-                        variants: true,
-                        moq: true,
-                        ..ApiScopes::default()
-                    },
-                )
-                .expect("config"),
-                Arc::new(MapCredentials::new().with("FAKTOR_1688_APP_KEY", "1688-sanitized-key")),
-                &rig.secrets,
+                &cn_config(ApiScopes {
+                    discovery: true,
+                    product: true,
+                    price: true,
+                    variants: true,
+                    moq: true,
+                    ..ApiScopes::default()
+                }),
+                credentials,
+                secrets,
+                None,
             )
             .expect("api connector");
         let capabilities = connector.capabilities();
@@ -1273,19 +1562,18 @@ mod tests {
     #[tokio::test]
     async fn open_platform_with_full_scope_answers_alone() {
         let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_cn_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
         let connector = browser_only()
-            .with_open_platform(
-                &OpenPlatformConfig::new("FAKTOR_1688_APP_KEY", ApiScopes::all()).expect("config"),
-                Arc::new(MapCredentials::new().with("FAKTOR_1688_APP_KEY", "1688-sanitized-key")),
-                &rig.secrets,
-            )
+            .with_open_platform(&cn_config(ApiScopes::all()), credentials, secrets, None)
             .expect("api connector");
+        assert!(connector.has_valid_access_token(crate::testsupport::TEST_NOW_MS));
         rig.transport.push(CannedResponse::new(
             200,
             fixture("china1688/api_offer_detail.json").into_bytes(),
         ));
         let capture = Arc::new(ScriptedCapture::new());
-        let ctx = ctx_with(&rig, capture.clone());
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
         let offer = connector
             .product(&ctx, ProductRequest::new(url_reference()))
             .await
@@ -1299,26 +1587,143 @@ mod tests {
         assert_eq!(capture.call_count(), 0, "no browser when scope suffices");
         let url = rig.transport.request_url(0).expect("request url");
         assert!(url.contains("gw.open.1688.com"), "{url}");
-        assert!(url.contains("apiKey="), "{url}");
+        assert!(url.ends_with("/1688-sanitized-key"), "{url}");
+        assert!(!url.contains(CN_TOKEN), "the token must not be URL-visible");
+        assert!(!url.contains(CN_SECRET));
+        let body = rig.transport.request_body(0).expect("body");
+        assert!(
+            !body.contains(CN_SECRET),
+            "the app secret is never transmitted"
+        );
+        // The wire signature is the independently generated golden vector
+        // (`fixtures/china1688/signing_golden.json`, vector `offer_detail`).
+        assert!(
+            body.contains("_aop_signature=3F6B0600A0D4BD6E9FA45F9871FB9A757C96F578"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_scoped_call_without_a_token_never_falls_back_to_the_browser() {
+        let rig = Rig::new();
+        let credentials = Arc::new(
+            MapCredentials::new()
+                .with(CN_KEY_ENV, CN_KEY)
+                .with(CN_SECRET_ENV, CN_SECRET),
+        );
+        let connector = browser_only()
+            .with_open_platform(
+                &OpenPlatformConfig::new(CN_KEY_ENV, CN_SECRET_ENV, ApiScopes::all())
+                    .expect("config"),
+                credentials,
+                rig.secrets.clone(),
+                None,
+            )
+            .expect("api connector");
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "china1688/network_offer_detail.json",
+            Kind::NetworkJson,
+            "https://detail.1688.com/offer/678901234567.html",
+        ));
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+        assert_eq!(
+            connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect_err("no token"),
+            SourceError::AuthenticationRequired
+        );
+        assert_eq!(capture.call_count(), 0);
+        assert_eq!(rig.transport.request_count(), 0);
+        assert!(rig
+            .diagnostics
+            .joined()
+            .contains("api_auth_required_no_browser_fallback"));
+    }
+
+    #[tokio::test]
+    async fn a_planner_browser_mechanism_never_demands_api_auth() {
+        let rig = Rig::new();
+        let credentials = Arc::new(
+            MapCredentials::new()
+                .with(CN_KEY_ENV, CN_KEY)
+                .with(CN_SECRET_ENV, CN_SECRET),
+        );
+        let connector = browser_only()
+            .with_open_platform(
+                &OpenPlatformConfig::new(CN_KEY_ENV, CN_SECRET_ENV, ApiScopes::all())
+                    .expect("config"),
+                credentials,
+                rig.secrets.clone(),
+                None,
+            )
+            .expect("api connector");
+        // No access token is configured, but the planner chose browser
+        // extraction: the adapter must not demand API auth for it.
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "china1688/network_offer_detail.json",
+            Kind::NetworkJson,
+            "https://detail.1688.com/offer/678901234567.html",
+        ));
+        let ctx = ctx_with(&rig, capture.clone());
+        let offer = connector
+            .product(&ctx, ProductRequest::new(url_reference()))
+            .await
+            .expect("browser offer without an API token");
+        assert_eq!(offer.title.as_str(), "USB 3.0 数据线 编织款");
+        assert_eq!(capture.call_count(), 1);
+        assert_eq!(rig.transport.request_count(), 0);
+        assert!(!rig.diagnostics.joined().contains("api_auth_required"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_typed_and_never_falls_back_to_the_browser() {
+        let rig = Rig::new();
+        let (credentials, secrets) = golden_cn_credentials(crate::testsupport::TEST_NOW_MS - 1);
+        let connector = browser_only()
+            .with_open_platform(&cn_config(ApiScopes::all()), credentials, secrets, None)
+            .expect("api connector");
+        assert!(!connector.has_valid_access_token(crate::testsupport::TEST_NOW_MS));
+        assert_eq!(
+            connector.access_token_expires_at_ms(),
+            Some(crate::testsupport::TEST_NOW_MS - 1)
+        );
+        let capture = Arc::new(ScriptedCapture::new());
+        capture.push(bundle_with(
+            "china1688/network_offer_detail.json",
+            Kind::NetworkJson,
+            "https://detail.1688.com/offer/678901234567.html",
+        ));
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+        assert_eq!(
+            connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect_err("expired token"),
+            SourceError::AuthenticationRequired
+        );
+        assert_eq!(capture.call_count(), 0);
+        assert_eq!(rig.transport.request_count(), 0);
     }
 
     #[tokio::test]
     async fn an_uncovered_scope_field_is_not_guessed() {
         let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_cn_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
         let connector = browser_only()
             .with_open_platform(
-                &OpenPlatformConfig::new(
-                    "FAKTOR_1688_APP_KEY",
-                    ApiScopes {
-                        discovery: true,
-                        product: true,
-                        price: true,
-                        ..ApiScopes::default()
-                    },
-                )
-                .expect("config"),
-                Arc::new(MapCredentials::new().with("FAKTOR_1688_APP_KEY", "1688-sanitized-key")),
-                &rig.secrets,
+                &cn_config(ApiScopes {
+                    discovery: true,
+                    product: true,
+                    price: true,
+                    ..ApiScopes::default()
+                }),
+                credentials,
+                secrets,
+                None,
             )
             .expect("api connector");
         rig.transport.push(CannedResponse::new(
@@ -1326,7 +1731,7 @@ mod tests {
             fixture("china1688/api_offer_detail.json").into_bytes(),
         ));
         let capture = Arc::new(ScriptedCapture::new());
-        let ctx = ctx_with(&rig, capture.clone());
+        let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
         let offer = connector
             .product(&ctx, ProductRequest::new(url_reference()))
             .await
@@ -1340,16 +1745,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_outage_falls_back_to_the_browser_but_auth_does_not() {
+    async fn api_mechanism_never_falls_back_to_the_browser() {
+        // A 500 under the API mechanism surfaces typed; the browser capture
+        // is never consulted even though it is injected.
+        for status in [500u16, 401, 429] {
+            let rig = Rig::new();
+            let (credentials, secrets) =
+                golden_cn_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
+            let connector = browser_only()
+                .with_open_platform(&cn_config(ApiScopes::all()), credentials, secrets, None)
+                .expect("api connector");
+            rig.transport
+                .push(CannedResponse::new(status, b"{}".to_vec()));
+            let capture = Arc::new(ScriptedCapture::new());
+            capture.push(bundle_with(
+                "china1688/network_offer_detail.json",
+                Kind::NetworkJson,
+                "https://detail.1688.com/offer/678901234567.html",
+            ));
+            let ctx = ctx_with_mechanism(&rig, capture.clone(), Mechanism::OfficialApi);
+            let error = connector
+                .product(&ctx, ProductRequest::new(url_reference()))
+                .await
+                .expect_err("api failure surfaces");
+            assert!(
+                matches!(
+                    error,
+                    SourceError::ApiUnavailable
+                        | SourceError::AuthenticationRequired
+                        | SourceError::RateLimited { .. }
+                ),
+                "status {status}: {error:?}"
+            );
+            assert_eq!(capture.call_count(), 0, "status {status}: no browsing");
+        }
+
+        // The browser mechanism executes the browser and never the API.
         let rig = Rig::new();
+        let (credentials, secrets) =
+            golden_cn_credentials(crate::testsupport::TEST_NOW_MS + 3_600_000);
         let connector = browser_only()
-            .with_open_platform(
-                &OpenPlatformConfig::new("FAKTOR_1688_APP_KEY", ApiScopes::all()).expect("config"),
-                Arc::new(MapCredentials::new().with("FAKTOR_1688_APP_KEY", "1688-sanitized-key")),
-                &rig.secrets,
-            )
+            .with_open_platform(&cn_config(ApiScopes::all()), credentials, secrets, None)
             .expect("api connector");
-        rig.transport.push(CannedResponse::new(500, b"{}".to_vec()));
         let capture = Arc::new(ScriptedCapture::new());
         capture.push(bundle_with(
             "china1688/network_offer_detail.json",
@@ -1360,40 +1797,10 @@ mod tests {
         let offer = connector
             .product(&ctx, ProductRequest::new(url_reference()))
             .await
-            .expect("browser fallback on outage");
+            .expect("browser offer");
         assert_eq!(offer.title.as_str(), "USB 3.0 数据线 编织款");
         assert_eq!(capture.call_count(), 1);
-
-        // A 401/429 is not an outage: the browser never bypasses it.
-        for status in [401u16, 429] {
-            let rig = Rig::new();
-            let connector = browser_only()
-                .with_open_platform(
-                    &OpenPlatformConfig::new("FAKTOR_1688_APP_KEY", ApiScopes::all())
-                        .expect("config"),
-                    Arc::new(
-                        MapCredentials::new().with("FAKTOR_1688_APP_KEY", "1688-sanitized-key"),
-                    ),
-                    &rig.secrets,
-                )
-                .expect("api connector");
-            rig.transport
-                .push(CannedResponse::new(status, b"{}".to_vec()));
-            let capture = Arc::new(ScriptedCapture::new());
-            let ctx = ctx_with(&rig, capture.clone());
-            let error = connector
-                .product(&ctx, ProductRequest::new(url_reference()))
-                .await
-                .expect_err("auth/rate limit surfaces");
-            assert!(
-                matches!(
-                    error,
-                    SourceError::AuthenticationRequired | SourceError::RateLimited { .. }
-                ),
-                "{error:?}"
-            );
-            assert_eq!(capture.call_count(), 0);
-        }
+        assert_eq!(rig.transport.request_count(), 0, "no API request");
     }
 
     #[tokio::test]

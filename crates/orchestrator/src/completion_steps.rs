@@ -45,21 +45,26 @@
 //!   NO external-operation identity and therefore never certifies the native
 //!   PR step in production; see the typed path above.
 //!
-//! - **pr**: the native PR step is CERTIFIED only through the typed
-//!   [`ScmProvider`] reconciliation protocol: the exact operation identity
-//!   (installation/repository + head/base + a stable Faktor task marker) is
-//!   journaled as a durable [`ExternalOperationRow`] BEFORE the remote call,
-//!   and the remote object id + version are journaled after it. A crash
-//!   mid-operation reconciles from the RECORDED identity through
-//!   `create_or_reconcile_*` — never a blind re-create, never a duplicate
-//!   remote object; a conflicting recorded input identity and a
-//!   remote-object version drift are typed refusals. The generic
-//!   `pr_command`/`pr_program` expert command remains executable on the
-//!   legacy path but carries NO reconciliation protocol, so it can never
+//! - **pr**: the native PR step is CERTIFIED only through the canonical
+//!   [`faktor_scm::CompletionScm`] adapter and its typed reconciliation
+//!   protocol: the exact operation identity (installation/repository +
+//!   head/base + a stable Faktor task marker) is journaled as a durable
+//!   [`ExternalOperationRow`] BEFORE the remote call, and the remote object
+//!   id + version are journaled after it. A crash mid-operation reconciles
+//!   from the RECORDED identity through the adapter — never a blind
+//!   re-create, never a duplicate remote object; a conflicting recorded
+//!   input identity and a remote-object version drift are typed refusals.
+//!   The adapter maps the request onto the canonical `faktor_scm`
+//!   [`faktor_scm::ScmProvider`] types; production wiring uses the real
+//!   GitHub App adapter (`faktor_scm::github::GitHubApp`) over the daemon's
+//!   ONE checked transport, so there is no second SCM domain here. The
+//!   generic `pr_command`/`pr_program` expert command remains executable on
+//!   the legacy path but carries NO reconciliation protocol, so it can never
 //!   certify the native PR step ([`PR_REQUIRES_TYPED_RECONCILIATION`]).
-//!   The real GitHub-App adapter is the recorded follow-up: no HTTP client
-//!   lives here, only the trait and the deterministic in-process fake tests
-//!   drive.
+//!   A contract that requests the PR step while NO SCM provider is wired is
+//!   an explicit configuration blocker ([`NATIVE_PR_SCM_NOT_CONFIGURED`]):
+//!   the step is never silently skipped and never rebuilt without the
+//!   provider.
 //!
 //! Stop rule: only a `Failed` step stops the ordered execution (terminal for
 //! the contract revision). Remaining requested steps are recorded `Skipped`
@@ -77,6 +82,7 @@ use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::{CompletionStep, CompletionStepOutcome};
 use faktor_core::id::{TaskId, VerificationRecordId};
 use faktor_git::{CommitOutcome, PushOutcome, VerifiedTreeEntry, WorktreeManager};
+use faktor_scm::{CompletionPrRequest, CompletionScm};
 use faktor_session::ledger::{
     DurableRead, ExternalOperationInput, ExternalOperationRow, ExternalOperationState,
     VerifiedGitArtifact, VerifiedManifestEntry,
@@ -192,105 +198,17 @@ where
 /// typed refusal detail always carries this code).
 pub const PR_REQUIRES_TYPED_RECONCILIATION: &str = "pr_requires_typed_reconciliation_protocol";
 
+/// The stable machine code of the explicit configuration blocker recorded
+/// when a task's completion contract requests the native PR step but no SCM
+/// provider is wired: fail closed with the exact missing configuration,
+/// never a silent `Skipped` and never a rebuild without the provider.
+pub const NATIVE_PR_SCM_NOT_CONFIGURED: &str = "native_pr_scm_not_configured";
+
 /// The durable external-operation kind of the native pull-request
 /// certification.
 pub const SCM_PULL_REQUEST_KIND: &str = "pull_request";
 
 // -------------------------------------------------- typed SCM reconciliation
-
-/// The provider-neutral repository identity a reconciliation lookup is
-/// keyed by. GitHub-App-shaped: the organization/repository pair is exact,
-/// the installation id is optional metadata the adapter seam may resolve.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScmRepositoryRef {
-    pub installation_id: Option<String>,
-    pub organization: String,
-    pub repository: String,
-}
-
-/// One idempotent branch reconciliation request: the provider must return
-/// the EXISTING branch object when `branch` already resolves, never fork or
-/// duplicate it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScmBranchSpec {
-    pub repository: ScmRepositoryRef,
-    pub branch: String,
-    /// The exact local head the remote branch must carry.
-    pub head_sha: String,
-    pub marker: String,
-}
-
-/// One idempotent pull-request reconciliation request: the provider MUST
-/// look the PR up by (repository, exact head/base, marker) and return the
-/// EXISTING object when one matches — a create path that always creates
-/// would duplicate the PR after a crash.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScmPullRequestSpec {
-    pub repository: ScmRepositoryRef,
-    pub head: String,
-    pub base: String,
-    pub marker: String,
-    pub title: String,
-    pub body: String,
-}
-
-/// The identity of one remote object (branch ref or pull request) as the
-/// provider reports it. `version` is the provider's opaque version token
-/// (for a PR: the head sha + updated-at; for a branch: the head sha): a
-/// recorded version that differs from the observed one is a typed refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScmRemoteObject {
-    pub object_id: String,
-    pub version: String,
-    pub url: String,
-}
-
-/// Typed failure of one SCM provider call.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ScmError {
-    #[error("scm provider refused: {0}")]
-    Provider(String),
-    #[error("scm remote lookup failed: {0}")]
-    Lookup(String),
-}
-
-/// The minimal provider-neutral SCM seam of the native PR step. The real
-/// GitHub-App adapter (installation-token minting, REST/GraphQL calls,
-/// rate-limit handling) is the recorded FOLLOW-UP: no HTTP client is
-/// implemented here, and every reconciliation decision is a pure function
-/// of the caller's durable [`ExternalOperationRow`] identity, so the fake
-/// below and a real adapter are interchangeable.
-pub trait ScmProvider: Send + Sync {
-    /// The stable provider name folded into the durable operation key.
-    fn provider_name(&self) -> &'static str;
-    /// Resolve the provider-side repository identity of one parsed
-    /// organization/repository pair: a GitHub-App adapter overrides this to
-    /// carry its installation id, the neutral default carries none. The
-    /// resolved value is what the durable input identity records and what
-    /// the reconciliation lookup is keyed by.
-    fn repository_ref(&self, organization: &str, repository: &str) -> ScmRepositoryRef {
-        ScmRepositoryRef {
-            installation_id: None,
-            organization: organization.to_string(),
-            repository: repository.to_string(),
-        }
-    }
-    /// Create or reconcile `spec.branch` at `spec.head_sha` (idempotent).
-    fn create_or_reconcile_branch(&self, spec: &ScmBranchSpec)
-        -> Result<ScmRemoteObject, ScmError>;
-    /// Create or reconcile the pull request matching the EXACT
-    /// (repository, head, base, marker) identity (idempotent).
-    fn create_or_reconcile_pull_request(
-        &self,
-        spec: &ScmPullRequestSpec,
-    ) -> Result<ScmRemoteObject, ScmError>;
-    /// Look up one remote ref without creating anything.
-    fn remote_ref(
-        &self,
-        repository: &ScmRepositoryRef,
-        reference: &str,
-    ) -> Result<Option<ScmRemoteObject>, ScmError>;
-}
 
 /// Typed refusal of the durable external-operation protocol. Every variant
 /// carries a stable machine code into the durable step detail, so a refused
@@ -355,15 +273,14 @@ pub fn native_pr_operation_key(task_id: TaskId, revision: u64, provider: &str) -
     )
 }
 
-/// Parse one git remote URL into a GitHub repository reference (`None` for
-/// anything else — the typed path refuses an unrecognizable remote instead
-/// of guessing an organization/repository pair). Accepts
+/// Parse one git remote URL into a GitHub repository reference
+/// (`organization`, `repository`; `None` for anything else — the typed path
+/// refuses an unrecognizable remote instead of guessing a pair). Accepts
 /// `https://github.com/org/repo[.git]`, `ssh://git@github.com/org/repo` and
-/// the scp-like `git@github.com:org/repo[.git]`.
-pub fn parse_scm_repository(
-    url: &str,
-    installation_id: Option<String>,
-) -> Option<ScmRepositoryRef> {
+/// the scp-like `git@github.com:org/repo[.git]`. The installation identity
+/// is resolved by the SCM adapter from the durable synced rows, never
+/// guessed from the URL.
+pub fn parse_scm_repository(url: &str) -> Option<(String, String)> {
     let url = url.trim().trim_end_matches('/');
     let (host, path) = if let Some(rest) = url.strip_prefix("git@") {
         let (host, path) = rest.split_once(':')?;
@@ -390,11 +307,7 @@ pub fn parse_scm_repository(
     if organization.is_empty() || repository.is_empty() {
         return None;
     }
-    Some(ScmRepositoryRef {
-        installation_id,
-        organization: organization.to_string(),
-        repository: repository.to_string(),
-    })
+    Some((organization.to_string(), repository.to_string()))
 }
 
 /// One task-run execution context: where the steps run and what the commit
@@ -538,9 +451,10 @@ pub struct CompletionStepRunner {
     supervisor: Arc<ProcessSupervisor>,
     egress: Arc<dyn EgressPolicy>,
     config: CompletionStepsConfig,
-    /// The wired typed SCM reconciliation seam (`None` = no native PR can be
-    /// certified; the legacy command path stays available to tests only).
-    scm_provider: Option<Arc<dyn ScmProvider>>,
+    /// The wired completion-step SCM adapter (`None` = no native PR can be
+    /// certified: a contracted PR step records an explicit configuration
+    /// blocker; the legacy command path stays available to tests only).
+    scm_provider: Option<Arc<dyn CompletionScm>>,
     /// Test-only seam: invoked immediately BEFORE the per-step proof
     /// revalidation, so adversarial tests can inject an edit at the exact
     /// verification/step boundary. Never compiled in production.
@@ -608,11 +522,20 @@ impl CompletionStepRunner {
         })
     }
 
-    /// Wire the typed SCM reconciliation seam of the native PR step. Without
-    /// it no native PR step can ever certify (fail-closed); the real GitHub
-    /// App adapter is the recorded follow-up.
-    pub fn with_scm_provider(mut self, provider: Arc<dyn ScmProvider>) -> Self {
+    /// Wire the canonical SCM reconciliation adapter of the native PR step
+    /// (`faktor_scm::GitHubCompletionScm` over the real GitHub App adapter in
+    /// production). Without it a contracted PR step can never certify: it
+    /// records the explicit [`NATIVE_PR_SCM_NOT_CONFIGURED`] blocker.
+    pub fn with_scm_provider(mut self, provider: Arc<dyn CompletionScm>) -> Self {
         self.scm_provider = Some(provider);
+        self
+    }
+
+    /// Wire the canonical SCM adapter when one is configured; `None` leaves
+    /// the fail-closed configuration blocker in place (the executor's lazy
+    /// runner path uses this directly).
+    pub fn with_scm_provider_or_none(mut self, provider: Option<Arc<dyn CompletionScm>>) -> Self {
+        self.scm_provider = provider;
         self
     }
 
@@ -1835,20 +1758,27 @@ impl CompletionStepRunner {
         artifact: Option<&ArtifactContext<'_>>,
     ) -> Result<StepExecution, CompletionStepError> {
         let Some(provider) = self.scm_provider.clone() else {
-            // Fail-closed: without the typed reconciliation seam nothing can
-            // certify the native PR step. An unconfigured PR is the historic
-            // retryable Skipped; a configured generic command is a TYPED
-            // refusal naming its missing protocol.
-            if self.config.pr_command.is_none() && self.config.pr_program.is_none() {
-                return Ok(StepExecution::Skipped {
-                    detail: "[completion] pr_command is not configured; no PR was created".into(),
+            // Fail-closed: without the canonical SCM adapter nothing can
+            // certify the native PR step. A configured generic command is a
+            // typed refusal naming its missing protocol; an otherwise
+            // unconfigured PR is an EXPLICIT configuration blocker — never
+            // the historic silent `Skipped`, so a contracted PR step can
+            // never be rebuilt without a provider.
+            if self.config.pr_command.is_some() || self.config.pr_program.is_some() {
+                return Ok(StepExecution::Failed {
+                    detail: format!(
+                        "native PR refused ({PR_REQUIRES_TYPED_RECONCILIATION}): the configured \
+                         pr_command/pr_program is an expert extension with no typed reconciliation \
+                         protocol, so it can never certify the native PR step"
+                    ),
                 });
             }
             return Ok(StepExecution::Failed {
                 detail: format!(
-                    "native PR refused ({PR_REQUIRES_TYPED_RECONCILIATION}): the configured \
-                     pr_command/pr_program is an expert extension with no typed reconciliation \
-                     protocol, so it can never certify the native PR step"
+                    "native PR refused ({NATIVE_PR_SCM_NOT_CONFIGURED}): the completion contract \
+                     requests a pull request but no SCM provider is configured; wire the GitHub \
+                     App ([cloud.github_app]) with installation credentials and a completed \
+                     repository sync, or drop include_pr"
                 ),
             });
         };
@@ -1963,7 +1893,7 @@ impl CompletionStepRunner {
                 }
             }
         }
-        let Some(parsed) = parse_scm_repository(&remote_url, None) else {
+        let Some((organization, repository)) = parse_scm_repository(&remote_url) else {
             return Ok(StepExecution::Failed {
                 detail: format!(
                     "cannot certify the native PR step: remote {remote_url} is not a recognizable \
@@ -1971,7 +1901,6 @@ impl CompletionStepRunner {
                 ),
             });
         };
-        let repository = provider.repository_ref(&parsed.organization, &parsed.repository);
         let head_sha = match self.git.head_sha(&ctx.root, owner).await {
             Ok(Some(sha)) => sha,
             Ok(None) => {
@@ -1987,14 +1916,14 @@ impl CompletionStepRunner {
         };
         let marker = native_pr_marker(op.task_id, op.revision);
         let input = ExternalOperationInput {
-            organization: repository.organization.clone(),
-            repository: repository.repository.clone(),
+            organization: organization.clone(),
+            repository: repository.clone(),
             head: branch.clone(),
             base: self.config.base_branch.clone(),
             marker: marker.clone(),
         };
-        let operation_key =
-            native_pr_operation_key(op.task_id, op.revision, provider.provider_name());
+        let provider_name = provider.provider_name();
+        let operation_key = native_pr_operation_key(op.task_id, op.revision, provider_name);
         // Read the durable identity BEFORE any remote call: a conflicting
         // input identity or a recorded terminal failure refuses WITHOUT
         // touching the provider (no branch reconciliation, no PR lookup).
@@ -2047,48 +1976,20 @@ impl CompletionStepRunner {
             recorded.as_ref().map(|row| row.state),
             Some(ExternalOperationState::Prepared)
         );
-        // The branch is an idempotent precondition of the PR. Its
-        // reconciliation is part of the same typed protocol and its recorded
-        // head must equal the exact local head (a moved branch is a typed
-        // refusal, never a silently different PR head).
-        let branch_spec = ScmBranchSpec {
-            repository: repository.clone(),
-            branch: branch.clone(),
-            head_sha: head_sha.clone(),
-            marker: marker.clone(),
-        };
-        match provider.create_or_reconcile_branch(&branch_spec) {
-            Ok(remote) if remote.version != head_sha => {
-                return Ok(StepExecution::Failed {
-                    detail: format!(
-                        "native PR refused (external_operation_remote_object_mismatch): branch \
-                         {branch} is at remote version {} but the verified head is {head_sha}",
-                        remote.version
-                    ),
-                })
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Ok(StepExecution::Failed {
-                    detail: format!(
-                        "native PR refused (scm_provider): branch reconciliation failed: {e}"
-                    ),
-                })
-            }
-        }
         // Write-before-call: the durable Prepared row names the EXACT input
-        // identity the restart will reconcile from. A write failure refuses
-        // the step here — the remote call is never made without it.
+        // identity the restart will reconcile from, BEFORE any remote call
+        // (the branch reconciliation included). A write failure refuses the
+        // step here — the adapter is never invoked without it.
         if recorded.is_none() {
             let prepared = ExternalOperationRow {
                 id: ExternalOperationRow::content_id(
                     &operation_key,
-                    provider.provider_name(),
+                    provider_name,
                     SCM_PULL_REQUEST_KIND,
                     &input,
                 ),
                 operation_key: operation_key.clone(),
-                provider: provider.provider_name().to_string(),
+                provider: provider_name.to_string(),
                 kind: SCM_PULL_REQUEST_KIND.to_string(),
                 input: input.clone(),
                 state: ExternalOperationState::Prepared,
@@ -2109,10 +2010,29 @@ impl CompletionStepRunner {
         if self.pr_crash == Some(PrOperationCrashPoint::BeforeRemoteCall) {
             return Err(CompletionStepError::InjectedCrash("before remote call"));
         }
-        let spec = ScmPullRequestSpec {
-            repository: repository.clone(),
-            head: branch.clone(),
+        let operation_id = match faktor_scm::ExternalOperationId::try_new(operation_key.clone()) {
+            Ok(operation_id) => operation_id,
+            Err(e) => {
+                return Ok(StepExecution::Failed {
+                    detail: format!(
+                        "native PR refused (scm_invalid_input): operation key {operation_key:?} is \
+                         not a valid SCM operation identity: {e}"
+                    ),
+                })
+            }
+        };
+        // The ONE adapter call reconciles the branch at the exact verified
+        // head and then create-or-reconciles the PR matching the exact
+        // (repository, head, base, marker) identity, all under the recorded
+        // operation identity. It maps onto the canonical `faktor_scm`
+        // provider types; production runs the real GitHub App adapter.
+        let request = CompletionPrRequest {
+            operation_id,
+            organization,
+            repository,
+            branch: branch.clone(),
             base: self.config.base_branch.clone(),
+            head_sha: head_sha.clone(),
             marker: marker.clone(),
             title: commit_message(&ctx.goal),
             body: format!(
@@ -2120,16 +2040,28 @@ impl CompletionStepRunner {
                 op.task_id
             ),
         };
-        let remote = match provider.create_or_reconcile_pull_request(&spec) {
+        let remote = match provider.reconcile_completion_pr(&request).await {
             Ok(remote) => remote,
             Err(e) => {
                 return Ok(StepExecution::Failed {
-                    detail: format!(
-                        "native PR refused (scm_provider): pull-request reconciliation failed: {e}"
-                    ),
+                    detail: format!("native PR refused (scm_provider): {e} [{}]", e.code()),
                 })
             }
         };
+        // The adapter reconciles the branch before the PR; the reported head
+        // must still be the exact verified head (defense in depth: a provider
+        // returning a moved branch instead of conflicting is refused).
+        if remote.branch.head_sha != head_sha {
+            return Ok(StepExecution::Failed {
+                detail: format!(
+                    "native PR refused (external_operation_remote_object_mismatch): branch \
+                     {branch} is at remote head {} but the verified head is {head_sha}",
+                    remote.branch.head_sha
+                ),
+            });
+        }
+        let remote_object_id = remote.pull_request.reference.number().to_string();
+        let remote_object_version = remote.pull_request.version.clone();
         // A recorded remote identity may only be CONFIRMED, never silently
         // replaced: id and version must match exactly.
         if let Some(row) = &recorded {
@@ -2137,13 +2069,14 @@ impl CompletionStepRunner {
                 row.remote_object_id.as_deref(),
                 row.remote_object_version.as_deref(),
             ) {
-                if recorded_id != remote.object_id || recorded_version != remote.version {
+                if recorded_id != remote_object_id.as_str()
+                    || recorded_version != remote_object_version.as_str()
+                {
                     let err = ExternalOperationError::RemoteObjectMismatch {
                         operation_key: operation_key.clone(),
                         detail: format!(
                             "recorded object {recorded_id}@{recorded_version} but the provider \
-                             reports {}@{}",
-                            remote.object_id, remote.version
+                             reports {remote_object_id}@{remote_object_version}"
                         ),
                     };
                     return Ok(step_refusal(&err));
@@ -2159,17 +2092,17 @@ impl CompletionStepRunner {
         let completed = ExternalOperationRow {
             id: ExternalOperationRow::content_id(
                 &operation_key,
-                provider.provider_name(),
+                provider_name,
                 SCM_PULL_REQUEST_KIND,
                 &input,
             ),
             operation_key: operation_key.clone(),
-            provider: provider.provider_name().to_string(),
+            provider: provider_name.to_string(),
             kind: SCM_PULL_REQUEST_KIND.to_string(),
             input,
             state: ExternalOperationState::Completed,
-            remote_object_id: Some(remote.object_id),
-            remote_object_version: Some(remote.version),
+            remote_object_id: Some(remote_object_id.clone()),
+            remote_object_version: Some(remote_object_version.clone()),
             started_at: recorded
                 .as_ref()
                 .map(|row| row.started_at)
@@ -2185,15 +2118,10 @@ impl CompletionStepRunner {
         }
         Ok(StepExecution::Succeeded {
             detail: format!(
-                "native PR {}@{} certified via {} reconciliation (marker {marker})",
-                completed.remote_object_id.as_deref().unwrap_or_default(),
-                completed
-                    .remote_object_version
-                    .as_deref()
-                    .unwrap_or_default(),
-                provider.provider_name(),
+                "native PR {remote_object_id}@{remote_object_version} certified via \
+                 {provider_name} reconciliation (marker {marker})"
             ),
-            pr_url: Some(remote.url),
+            pr_url: Some(remote.pull_request.url),
         })
     }
 }
@@ -2506,19 +2434,25 @@ fn truncate_bytes(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// The deterministic in-process [`ScmProvider`] test double: an idempotent
+/// The deterministic in-process [`CompletionScm`] test double: an idempotent
 /// remote registry keyed by the EXACT (repository, head/base, marker)
 /// identity that counts remote creations, so a duplicate-creation bug is
-/// observable. It is deliberately NOT a production adapter: the real
-/// GitHub-App adapter (installation tokens, REST/GraphQL, rate limits) is
-/// the recorded follow-up — this fake exists so the reconciliation protocol
-/// itself is provable without a network or credentials.
+/// observable, and records every request so the orchestrator's mapping
+/// (organization/repository/branch/base/head/marker/title/body/operation id)
+/// is assertable. It is deliberately NOT a production adapter: production
+/// runs `faktor_scm::GitHubCompletionScm` over the real GitHub App adapter —
+/// this fake exists so the orchestration protocol itself is provable without
+/// a network or credentials; the adapter-to-provider mapping is covered by
+/// `crates/scm/tests/completion_adapter.rs`.
 #[cfg(test)]
 pub(crate) mod scm_fake {
-    use super::{
-        ScmBranchSpec, ScmError, ScmProvider, ScmPullRequestSpec, ScmRemoteObject, ScmRepositoryRef,
+    use faktor_scm::{
+        CompletionPrRequest, CompletionPrResult, CompletionScm, PullRequestRef, RemoteRef,
+        RepositoryRef, ScmBranch, ScmError, ScmInstallationId, ScmPullRequest,
     };
     use std::sync::{Arc, Mutex};
+
+    const FAKE_INSTALLATION: u64 = 7;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PrKey {
@@ -2532,7 +2466,9 @@ pub(crate) mod scm_fake {
     #[derive(Debug, Clone)]
     struct FakePr {
         key: PrKey,
-        object: ScmRemoteObject,
+        number: u64,
+        version: String,
+        url: String,
     }
 
     #[derive(Debug, Clone)]
@@ -2540,7 +2476,8 @@ pub(crate) mod scm_fake {
         organization: String,
         repository: String,
         branch: String,
-        object: ScmRemoteObject,
+        head_sha: String,
+        url: String,
     }
 
     #[derive(Debug, Default)]
@@ -2550,12 +2487,14 @@ pub(crate) mod scm_fake {
         remote_creations: usize,
         prs: Vec<FakePr>,
         branches: Vec<FakeBranch>,
+        requests: Vec<CompletionPrRequest>,
         pr_version_override: Option<String>,
-        branch_version_override: Option<String>,
+        branch_head_override: Option<String>,
+        transport_failure: Option<String>,
     }
 
-    /// The fake provider handle (share the same `Arc` across "restarts" so
-    /// the remote state survives exactly as a real provider's would).
+    /// The fake adapter handle (share the same `Arc` across "restarts" so the
+    /// remote state survives exactly as a real provider's would).
     #[derive(Debug, Default)]
     pub(crate) struct FakeScmProvider {
         state: Mutex<FakeState>,
@@ -2584,6 +2523,11 @@ pub(crate) mod scm_fake {
             self.state.lock().expect("fake scm lock").prs.len()
         }
 
+        /// Every request the runner handed to the adapter, in order.
+        pub(crate) fn requests(&self) -> Vec<CompletionPrRequest> {
+            self.state.lock().expect("fake scm lock").requests.clone()
+        }
+
         /// Force every future PR reconciliation to report `version` — the
         /// remote moved under us (force-push/edited PR).
         pub(crate) fn force_pull_request_version(&self, version: &str) {
@@ -2593,118 +2537,161 @@ pub(crate) mod scm_fake {
                 .pr_version_override = Some(version.to_string());
         }
 
-        /// Force every future branch reconciliation to report `version`.
-        pub(crate) fn force_branch_version(&self, version: &str) {
+        /// Force every future branch reconciliation to report `head` — a
+        /// provider that returns a moved branch instead of a conflict (the
+        /// orchestrator's defense-in-depth refusal).
+        pub(crate) fn force_branch_head(&self, head: &str) {
             self.state
                 .lock()
                 .expect("fake scm lock")
-                .branch_version_override = Some(version.to_string());
+                .branch_head_override = Some(head.to_string());
+        }
+
+        /// Fail every reconciliation with a typed transport error (the
+        /// provider-seam error mapping).
+        pub(crate) fn fail_reconciliation(&self, detail: &str) {
+            self.state.lock().expect("fake scm lock").transport_failure = Some(detail.to_string());
+        }
+
+        fn repository(request: &CompletionPrRequest) -> RepositoryRef {
+            RepositoryRef::try_new(
+                ScmInstallationId::try_from_raw(FAKE_INSTALLATION).expect("fake installation"),
+                request.organization.clone(),
+                request.repository.clone(),
+            )
+            .expect("fake repository")
         }
     }
 
-    impl ScmProvider for FakeScmProvider {
+    #[async_trait::async_trait]
+    impl CompletionScm for FakeScmProvider {
         fn provider_name(&self) -> &'static str {
             "github"
         }
 
-        fn create_or_reconcile_branch(
+        async fn reconcile_completion_pr(
             &self,
-            spec: &ScmBranchSpec,
-        ) -> Result<ScmRemoteObject, ScmError> {
+            request: &CompletionPrRequest,
+        ) -> Result<CompletionPrResult, ScmError> {
             let mut state = self.state.lock().expect("fake scm lock");
+            state.requests.push(request.clone());
+            if let Some(detail) = state.transport_failure.clone() {
+                return Err(ScmError::Transport(detail));
+            }
             state.branch_calls += 1;
-            let position = state.branches.iter().position(|b| {
-                b.organization == spec.repository.organization
-                    && b.repository == spec.repository.repository
-                    && b.branch == spec.branch
+            let position = state.branches.iter().position(|branch| {
+                branch.organization == request.organization
+                    && branch.repository == request.repository
+                    && branch.branch == request.branch
             });
-            let override_version = state.branch_version_override.clone();
-            let mut object = match position {
+            let (head_sha, branch_url) = match position {
                 Some(index) => {
+                    let override_head = state.branch_head_override.clone();
                     let branch = &mut state.branches[index];
-                    if let Some(version) = &override_version {
-                        branch.object.version = version.clone();
+                    if let Some(head) = override_head {
+                        branch.head_sha = head;
                     }
-                    branch.object.clone()
+                    (branch.head_sha.clone(), branch.url.clone())
                 }
                 None => {
-                    let object = ScmRemoteObject {
-                        object_id: format!("refs/heads/{}", spec.branch),
-                        version: spec.head_sha.clone(),
-                        url: format!(
-                            "https://github.com/{}/{}/tree/{}",
-                            spec.repository.organization, spec.repository.repository, spec.branch
-                        ),
-                    };
+                    let head_sha = state
+                        .branch_head_override
+                        .clone()
+                        .unwrap_or_else(|| request.head_sha.clone());
+                    let url = format!(
+                        "https://github.com/{}/{}/tree/{}",
+                        request.organization, request.repository, request.branch
+                    );
                     state.branches.push(FakeBranch {
-                        organization: spec.repository.organization.clone(),
-                        repository: spec.repository.repository.clone(),
-                        branch: spec.branch.clone(),
-                        object: object.clone(),
+                        organization: request.organization.clone(),
+                        repository: request.repository.clone(),
+                        branch: request.branch.clone(),
+                        head_sha: head_sha.clone(),
+                        url: url.clone(),
                     });
-                    object
+                    (head_sha, url)
                 }
             };
-            if let Some(version) = override_version {
-                object.version = version;
+            let repository = Self::repository(request);
+            let branch = ScmBranch {
+                reference: RemoteRef::try_new(
+                    repository.clone(),
+                    format!("refs/heads/{}", request.branch),
+                )
+                .expect("fake ref"),
+                head_sha,
+                url: branch_url,
+                created: false,
+            };
+            // A provider that returns a moved branch instead of conflicting:
+            // the orchestrator's defense-in-depth refusal (the PR object is a
+            // placeholder the orchestrator never consumes).
+            if branch.head_sha != request.head_sha {
+                let placeholder = ScmPullRequest {
+                    reference: PullRequestRef::try_new(repository.clone(), 1)
+                        .expect("placeholder pr"),
+                    head: request.branch.clone(),
+                    base: request.base.clone(),
+                    state: "open".into(),
+                    marker: request.marker.clone(),
+                    version: "branch-mismatch".into(),
+                    url: String::new(),
+                    created: false,
+                };
+                return Ok(CompletionPrResult {
+                    repository,
+                    branch,
+                    pull_request: placeholder,
+                });
             }
-            Ok(object)
-        }
-
-        fn create_or_reconcile_pull_request(
-            &self,
-            spec: &ScmPullRequestSpec,
-        ) -> Result<ScmRemoteObject, ScmError> {
-            let mut state = self.state.lock().expect("fake scm lock");
             state.pr_calls += 1;
             let key = PrKey {
-                organization: spec.repository.organization.clone(),
-                repository: spec.repository.repository.clone(),
-                head: spec.head.clone(),
-                base: spec.base.clone(),
-                marker: spec.marker.clone(),
+                organization: request.organization.clone(),
+                repository: request.repository.clone(),
+                head: request.branch.clone(),
+                base: request.base.clone(),
+                marker: request.marker.clone(),
             };
-            let mut object = match state.prs.iter().find(|pr| pr.key == key) {
-                Some(existing) => existing.object.clone(),
+            let (number, version, url) = match state.prs.iter().find(|pr| pr.key == key) {
+                Some(existing) => (
+                    existing.number,
+                    existing.version.clone(),
+                    existing.url.clone(),
+                ),
                 None => {
                     state.remote_creations += 1;
-                    let number = state.remote_creations;
-                    let object = ScmRemoteObject {
-                        object_id: format!("pr-{number}"),
-                        version: "v1".to_string(),
-                        url: format!(
-                            "https://github.com/{}/{}/pull/{number}",
-                            spec.repository.organization, spec.repository.repository
-                        ),
-                    };
+                    let number = state.remote_creations as u64;
+                    let version = "v1".to_string();
+                    let url = format!(
+                        "https://github.com/{}/{}/pull/{number}",
+                        request.organization, request.repository
+                    );
                     state.prs.push(FakePr {
                         key,
-                        object: object.clone(),
+                        number,
+                        version: version.clone(),
+                        url: url.clone(),
                     });
-                    object
+                    (number, version, url)
                 }
             };
-            if let Some(version) = state.pr_version_override.clone() {
-                object.version = version;
-            }
-            Ok(object)
-        }
-
-        fn remote_ref(
-            &self,
-            repository: &ScmRepositoryRef,
-            reference: &str,
-        ) -> Result<Option<ScmRemoteObject>, ScmError> {
-            let state = self.state.lock().expect("fake scm lock");
-            Ok(state
-                .branches
-                .iter()
-                .find(|b| {
-                    b.organization == repository.organization
-                        && b.repository == repository.repository
-                        && b.branch == reference
-                })
-                .map(|b| b.object.clone()))
+            let version = state.pr_version_override.clone().unwrap_or(version);
+            let pull_request = ScmPullRequest {
+                reference: PullRequestRef::try_new(repository.clone(), number)
+                    .expect("fake pr ref"),
+                head: request.branch.clone(),
+                base: request.base.clone(),
+                state: "open".into(),
+                marker: request.marker.clone(),
+                version,
+                url,
+                created: false,
+            };
+            Ok(CompletionPrResult {
+                repository,
+                branch,
+                pull_request,
+            })
         }
     }
 }
@@ -4232,7 +4219,7 @@ mod tests {
             .collect();
         assert_eq!(ops.len(), 2);
         assert!(ops[1].reconciled_at.is_some());
-        assert_eq!(ops[1].remote_object_id.as_deref(), Some("pr-1"));
+        assert_eq!(ops[1].remote_object_id.as_deref(), Some("1"));
     }
 
     /// A durable row under the SAME operation key with a DIFFERENT input
@@ -4354,13 +4341,15 @@ mod tests {
     }
 
     /// A branch that moved away from the exact verified head is a typed
-    /// refusal BEFORE any PR operation is journaled.
+    /// refusal BEFORE any PR is created: the adapter's branch result is
+    /// re-asserted against the verified head (defense in depth for a
+    /// provider that returns a moved branch instead of conflicting).
     #[tokio::test]
     async fn native_pr_branch_version_drift_is_a_typed_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "branch drift");
         let provider = scm_fake::FakeScmProvider::new();
-        provider.force_branch_version("someone-elses-sha");
+        provider.force_branch_head("someone-elses-sha");
         let runner = native_pr_runner(dir.path(), provider.clone());
         let report = runner
             .run_completion_steps(
@@ -4387,7 +4376,108 @@ mod tests {
             "{detail}"
         );
         assert_eq!(provider.pr_calls(), 0, "no PR operation after branch drift");
-        assert!(pr_operation_rows(&h).is_empty());
+        // The durable Prepared row (written before the remote call) is the
+        // only row: no remote object identity was ever journaled.
+        let ops = pr_operation_rows(&h);
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!(
+            ops[0].state,
+            faktor_session::ledger::ExternalOperationState::Prepared
+        );
+        assert!(ops[0].remote_object_id.is_none());
+    }
+
+    /// The orchestrator maps the contract onto the adapter request exactly
+    /// (organization/repository from the git remote, branch/base, verified
+    /// head, task marker, derived PR title and the marker-carrying body) and
+    /// the adapter's certified PR number/version land in the durable row.
+    #[tokio::test]
+    async fn native_pr_maps_the_contract_onto_the_scm_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "map the request");
+        let provider = scm_fake::FakeScmProvider::new();
+        let runner = native_pr_runner(dir.path(), provider.clone());
+        let goal = "map the request";
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, goal),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Succeeded),
+            "{report:?}"
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let request = &requests[0];
+        let revision = contract_revision(&h, task_id);
+        assert_eq!(
+            request.operation_id.as_str(),
+            native_pr_operation_key(task_id, revision, "github")
+        );
+        assert_eq!(request.organization, "acme");
+        assert_eq!(request.repository, "widgets");
+        assert_eq!(request.branch, "main");
+        assert_eq!(request.base, "main");
+        assert_eq!(request.head_sha, git_output(&repo, &["rev-parse", "HEAD"]));
+        assert_eq!(request.marker, native_pr_marker(task_id, revision));
+        assert_eq!(request.title, commit_message(goal));
+        assert!(
+            request.body.contains(&request.marker) && request.body.contains(&task_id.to_string()),
+            "the PR body names the task and the reconciliation marker: {}",
+            request.body
+        );
+        let complete = pr_operation_rows(&h)
+            .into_iter()
+            .find(|row| {
+                row.operation_key == native_pr_operation_key(task_id, revision, "github")
+                    && row.state == faktor_session::ledger::ExternalOperationState::Completed
+            })
+            .expect("completed external-operation row");
+        assert_eq!(complete.remote_object_id.as_deref(), Some("1"));
+        assert_eq!(complete.remote_object_version.as_deref(), Some("v1"));
+        assert_eq!(
+            report.pr_url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/1")
+        );
+    }
+
+    /// A typed provider refusal on the adapter seam is a `Failed` step
+    /// carrying the stable `ScmError` code — never a silent success.
+    #[tokio::test]
+    async fn native_pr_provider_refusal_is_a_typed_step_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "provider refusal");
+        let provider = scm_fake::FakeScmProvider::new();
+        provider.fail_reconciliation("installation token minting failed");
+        let runner = native_pr_runner(dir.path(), provider.clone());
+        let report = runner
+            .run_completion_steps(
+                &h,
+                task_id,
+                passing_record_with_tree(&h, task_id, &tree),
+                &ctx(&repo, "provider refusal"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(detail.contains("scm_provider"), "{detail}");
+        assert!(detail.contains("scm_transport"), "{detail}");
     }
 
     /// The generic `pr_program` expert command implements NO typed
@@ -4452,19 +4542,58 @@ mod tests {
         ));
     }
 
-    /// An UNCONFIGURED PR on the production path stays the historic
-    /// retryable `Skipped` (no provider, no command => nothing to certify).
+    /// A contracted PR step with NO SCM provider wired is an EXPLICIT
+    /// configuration blocker: fail closed with the stable code (never the
+    /// historic silent `Skipped`, never a rebuild without the provider).
     #[tokio::test]
-    async fn unconfigured_native_pr_is_still_skipped() {
+    async fn native_pr_without_a_wired_scm_provider_is_a_configuration_blocker() {
         let dir = tempfile::tempdir().unwrap();
-        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "no pr config");
+        let (_m, h, task_id, tree, repo) = native_pr_fixture(dir.path(), "no pr provider");
         let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all());
         let report = runner
             .run_completion_steps(
                 &h,
                 task_id,
                 passing_record_with_tree(&h, task_id, &tree),
-                &ctx(&repo, "no pr config"),
+                &ctx(&repo, "no pr provider"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcome_of(CompletionStep::Pr),
+            Some(CompletionStepOutcome::Failed),
+            "{report:?}"
+        );
+        let detail = &report
+            .records
+            .iter()
+            .find(|r| r.step == CompletionStep::Pr)
+            .unwrap()
+            .detail;
+        assert!(detail.contains(NATIVE_PR_SCM_NOT_CONFIGURED), "{detail}");
+        assert!(detail.contains("no SCM provider is configured"), "{detail}");
+        assert!(
+            pr_operation_rows(&h).is_empty(),
+            "the blocker is recorded before any operation identity is minted"
+        );
+    }
+
+    /// The test-only legacy path keeps the historic unconfigured-command
+    /// `Skipped`; only the production proof path carries the hard blocker.
+    #[tokio::test]
+    async fn legacy_unconfigured_native_pr_path_stays_skipped() {
+        let (dir, m) = manager();
+        let (h, task_id) = session_with_task(
+            &m,
+            "legacy no pr config",
+            Some(contract(false, false, true)),
+        );
+        let runner = runner(dir.path(), CompletionStepsConfig::default(), allow_all());
+        let report = runner
+            .run(
+                &h,
+                task_id,
+                &ctx(&dir.path().join("nope"), "legacy no pr config"),
             )
             .await
             .unwrap();
@@ -4473,21 +4602,18 @@ mod tests {
             Some(CompletionStepOutcome::Skipped),
             "{report:?}"
         );
-        assert!(pr_operation_rows(&h).is_empty());
     }
 
     /// The repository parser is exact: only a two-segment GitHub reference
-    /// is accepted, and the installation identity rides the parsed value.
+    /// is accepted; the installation identity is resolved by the SCM adapter
+    /// from the durable synced rows, never from the URL.
     #[test]
     fn scm_repository_parsing_is_exact() {
-        let parsed = parse_scm_repository("https://github.com/acme/widgets.git", Some("42".into()))
-            .expect("https url");
-        assert_eq!(parsed.organization, "acme");
-        assert_eq!(parsed.repository, "widgets");
-        assert_eq!(parsed.installation_id.as_deref(), Some("42"));
-        let parsed = parse_scm_repository("git@github.com:acme/widgets.git", None).expect("scp");
-        assert_eq!(parsed.organization, "acme");
-        assert_eq!(parsed.repository, "widgets");
+        let parsed =
+            parse_scm_repository("https://github.com/acme/widgets.git").expect("https url");
+        assert_eq!(parsed, ("acme".to_string(), "widgets".to_string()));
+        let parsed = parse_scm_repository("git@github.com:acme/widgets.git").expect("scp");
+        assert_eq!(parsed, ("acme".to_string(), "widgets".to_string()));
         for rejected in [
             "",
             "https://gitlab.com/acme/widgets.git",
@@ -4497,7 +4623,7 @@ mod tests {
             "https://github.com/acme/widgets.git/../../evil",
         ] {
             assert!(
-                parse_scm_repository(rejected, None).is_none(),
+                parse_scm_repository(rejected).is_none(),
                 "{rejected:?} must be refused"
             );
         }

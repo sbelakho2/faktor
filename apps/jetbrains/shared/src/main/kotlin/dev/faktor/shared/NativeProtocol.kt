@@ -695,6 +695,20 @@ data class NativeTaskRunStarted(val taskId: Long, val runId: String, val state: 
 data class NativeTaskRunCancelled(val runId: String, val cancelled: Boolean)
 
 /**
+ * One durable typed binary attachment (`POST /native/session/{id}/attachments`
+ * and a task run's additive `attachments` member). `digest` is the daemon's
+ * BLAKE3 CAS address (64 hex chars), `size` the decompressed byte count.
+ * This is the ONLY identity an image attachment reaches the model through:
+ * bytes live in the daemon store, never in the request DTO.
+ */
+data class NativeAttachmentId(
+    val digest: String,
+    val mime: String,
+    val filename: String?,
+    val size: Long
+)
+
+/**
  * One durable run-family board post (`GET/POST /native/session/{id}/board`).
  * `authorChild` null means the run root posted; `revision` is the per-board
  * monotonic cursor (id == revision).
@@ -1612,6 +1626,17 @@ fun parseNativeTaskRunCancelled(json: String): NativeTaskRunCancelled {
     )
 }
 
+/** Strict parse of one durable attachment id (`POST .../attachments`). */
+fun parseNativeAttachmentId(json: String): NativeAttachmentId {
+    val v = JsonCodec.parse(json).view("POST /native/session/{id}/attachments")
+    return NativeAttachmentId(
+        digest = v.field("digest").string(),
+        mime = v.field("mime").string(),
+        filename = v.optionalField("filename")?.string(),
+        size = v.field("size").long()
+    )
+}
+
 fun parseNativeAgents(json: String): List<NativeAgent> {
     val v = JsonCodec.parse(json).view("GET /native/agents")
     return v.array().map {
@@ -2341,6 +2366,30 @@ object NativeRequests {
         .put("op_id", opId)
         .toJson()
 
+    /**
+     * One durable binary attachment upload body (`POST .../attachments`):
+     * standard base64 bytes plus the canonical mime and display filename.
+     * The server owns the byte/mime bounds; callers upload images through
+     * the SAME representation as any other binary attachment.
+     */
+    fun uploadAttachment(
+        mime: String,
+        filename: String? = null,
+        dataBase64: String
+    ): String = JsonObjectBuilder()
+        .put("mime", mime)
+        .put("filename", filename)
+        .put("data_base64", dataBase64)
+        .toJson()
+
+    /** One durable attachment id as the strict task-run DTO member. */
+    private fun attachmentJson(id: NativeAttachmentId): JsonObjectBuilder =
+        JsonObjectBuilder()
+            .put("digest", id.digest)
+            .put("mime", id.mime)
+            .put("filename", id.filename)
+            .put("size", id.size)
+
     fun startTaskRun(
         goal: String,
         criteria: List<String>? = null,
@@ -2349,6 +2398,7 @@ object NativeRequests {
         maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null,
+        attachments: List<NativeAttachmentId>? = null,
         completionContract: NativeCompletionContract? = null
     ): String {
         val builder = JsonObjectBuilder()
@@ -2359,6 +2409,10 @@ object NativeRequests {
             .put("max_cost_micro", maxCostMicro?.let { MicroMoney.wire(it) })
             .put("mutation_mode", mutationMode)
             .putStrings("files", if (files.isNullOrEmpty()) null else files)
+            .putObjects(
+                "attachments",
+                attachments.orEmpty().filterNotNull().map { attachmentJson(it) }
+            )
         // A non-default completion contract requires explicit work items (the
         // daemon refuses it on the plain-prompt path). ONE mutating `main`
         // item keeps the same in-session drive with the durable contract seam;

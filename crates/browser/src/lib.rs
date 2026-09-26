@@ -76,7 +76,9 @@ pub mod profile;
 
 pub(crate) mod timeutil;
 
-pub use capture::{bound_bytes, bound_text, redact_headers, redact_url, CaptureLimits};
+pub use capture::{
+    bound_bytes, bound_text, redact_headers, redact_url, CaptureAccess, CaptureLimits,
+};
 pub use cdp::{CdpClient, CdpConfig, CdpEvent, CdpOutcome};
 pub use download::{
     DownloadManager, DownloadOutcome, DownloadPolicy, DownloadRecord, DownloadState, DownloadStats,

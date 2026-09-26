@@ -333,6 +333,17 @@ impl Page {
         self.ensure_open()?;
         self.set_state(PageState::Navigating);
         *self.inner.last_navigation_error.lock().unwrap() = None;
+        // Reset the observable lifecycle for THIS navigation and hold a live
+        // subscription across the command. `watch::Sender::send` silently
+        // drops values whenever no receiver exists, and the browser may emit
+        // the whole lifecycle (including `loadEventFired` or a failure)
+        // immediately after the `Page.navigate` reply, before this task is
+        // rescheduled. With a pre-command subscription plus the pump's
+        // `send_replace`, the wait is order-independent: a terminal state that
+        // arrived early is observed as the channel's current value, never
+        // lost.
+        let _ = self.inner.lifecycle.send_replace(Lifecycle::Navigating);
+        let mut lifecycle = self.inner.lifecycle.subscribe();
         let result = self
             .inner
             .client
@@ -362,7 +373,6 @@ impl Page {
         if let Some(error_text) = &error_text {
             *self.inner.last_navigation_error.lock().unwrap() = Some(error_text.clone());
         }
-        let mut lifecycle = self.inner.lifecycle.subscribe();
         loop {
             match *lifecycle.borrow_and_update() {
                 Lifecycle::Loaded => break,
@@ -630,7 +640,7 @@ impl Page {
         if !self.inner.closed.swap(true, Ordering::SeqCst) {
             self.set_state(PageState::Crashed);
             self.release_permit();
-            let _ = self.inner.lifecycle.send(Lifecycle::Failed);
+            let _ = self.inner.lifecycle.send_replace(Lifecycle::Failed);
             if let Some(host) = self.inner.host.upgrade() {
                 host.release_page(&self.inner.target_id);
             }
@@ -735,7 +745,7 @@ impl PageInner {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-            let _ = self.lifecycle.send(Lifecycle::Failed);
+            let _ = self.lifecycle.send_replace(Lifecycle::Failed);
             if let Some(host) = self.host.upgrade() {
                 host.release_page(&self.target_id);
             }
@@ -903,14 +913,14 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
                 .map(Value::is_null)
                 .unwrap_or(true);
             if is_main {
-                let _ = inner.lifecycle.send(Lifecycle::Navigating);
+                let _ = inner.lifecycle.send_replace(Lifecycle::Navigating);
             }
         }
         "Page.domContentEventFired" => {
-            let _ = inner.lifecycle.send(Lifecycle::DomContentLoaded);
+            let _ = inner.lifecycle.send_replace(Lifecycle::DomContentLoaded);
         }
         "Page.loadEventFired" => {
-            let _ = inner.lifecycle.send(Lifecycle::Loaded);
+            let _ = inner.lifecycle.send_replace(Lifecycle::Loaded);
         }
         "Runtime.exceptionThrown" => {
             let text = event
@@ -999,5 +1009,181 @@ mod tests {
                 "probe must carry no site knowledge ({site})"
             );
         }
+    }
+
+    struct LifecycleHost;
+
+    impl PageHost for LifecycleHost {
+        fn release_page(&self, _target_id: &str) {}
+        fn stop_automation(&self, _signal: VerificationSignal) {}
+    }
+
+    /// The load-lifecycle race, made deterministic: the CDP reader can
+    /// deliver `frameNavigated`/`domContentEventFired`/`loadEventFired` right
+    /// after the `Page.navigate` reply, before the awaiting task subscribes.
+    /// `watch::Sender::send` drops values when no receiver exists, so the
+    /// terminal state must be stored with `send_replace`; and a fresh
+    /// `navigate` must never inherit a previous navigation's terminal state.
+    ///
+    /// The server emits the whole lifecycle with ZERO receivers alive (the
+    /// test proves `is_closed()` and never subscribes before asserting), then
+    /// answers a second `Page.navigate` WITHOUT emitting any lifecycle event:
+    /// the only way that second navigation can complete is by reading a stale
+    /// value, so a bounded short deadline must expire instead.
+    #[tokio::test]
+    async fn lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::path::Path;
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        use crate::cdp::CdpConfig;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut navigations = 0u32;
+            while let Some(Ok(message)) = ws.next().await {
+                let Ok(command) = serde_json::from_str::<Value>(message.to_text().unwrap()) else {
+                    continue;
+                };
+                let method = command
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let session = command
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if method == "Page.navigate" {
+                    navigations += 1;
+                    let mut reply = json!({
+                        "id": command["id"].clone(),
+                        "result": { "frameId": format!("f{navigations}") },
+                    });
+                    if let Some(session) = &session {
+                        reply["sessionId"] = json!(session);
+                    }
+                    ws.send(Message::text(reply.to_string())).await.unwrap();
+                    if navigations == 1 {
+                        for event in [
+                            json!({
+                                "method": "Page.frameNavigated",
+                                "params": { "frame": { "id": "f1", "url": "https://first.test/" } },
+                            }),
+                            json!({
+                                "method": "Page.domContentEventFired",
+                                "params": { "timestamp": 1.0 },
+                            }),
+                            json!({
+                                "method": "Page.loadEventFired",
+                                "params": { "timestamp": 2.0 },
+                            }),
+                        ] {
+                            let mut event = event;
+                            if let Some(session) = &session {
+                                event["sessionId"] = json!(session);
+                            }
+                            ws.send(Message::text(event.to_string())).await.unwrap();
+                        }
+                    }
+                    continue;
+                }
+                let mut reply = json!({ "id": command["id"].clone(), "result": {} });
+                if let Some(session) = &session {
+                    reply["sessionId"] = json!(session);
+                }
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+            }
+        });
+
+        let client = CdpClient::connect(
+            &format!("ws://{addr}/devtools/browser/page-lifecycle"),
+            &CancellationToken::new(),
+            deadline_in(30_000),
+            CdpConfig::default(),
+        )
+        .await
+        .expect("connect");
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = DownloadManager::new(
+            crate::download::DownloadPolicy::default(),
+            faktor_fs::RootedDir::create(dir.path()).unwrap(),
+            Path::new("p1"),
+        )
+        .unwrap();
+        let interceptor = Interceptor::new(
+            client.clone(),
+            "s1",
+            crate::interception::InterceptionPolicy::new(
+                crate::egress::DestinationPolicy::first_party_only(Vec::new()),
+            ),
+        );
+        let host: Arc<dyn PageHost> = Arc::new(LifecycleHost);
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let page = Page::attach(
+            client.clone(),
+            "t1".into(),
+            "s1".into(),
+            interceptor,
+            downloads,
+            CaptureLimits::default(),
+            NetworkLimits::default(),
+            Arc::downgrade(&host),
+            permit,
+        );
+        // The test itself must keep the zero-receiver window: attach dropped
+        // its initial receiver and nothing subscribes here.
+        assert!(page.inner.lifecycle.is_closed(), "no subscriber may exist");
+
+        // Drive the CDP command directly (not through `navigate`) so the whole
+        // lifecycle is emitted while no receiver exists.
+        client
+            .send(
+                Some("s1"),
+                "Page.navigate",
+                json!({ "url": "https://first.test/" }),
+                deadline_in(30_000),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("navigate command");
+
+        let start = std::time::Instant::now();
+        while page.lifecycle() != Lifecycle::Loaded {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the terminal lifecycle state was dropped with no subscriber: {:?}",
+                page.lifecycle()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            page.inner.lifecycle.is_closed(),
+            "the assertion must hold with zero receivers for the whole window"
+        );
+
+        // A new navigation must reset the observable lifecycle; the server
+        // emits nothing, so only a stale Loaded could make this return early.
+        // A bounded short deadline must expire instead.
+        let stale = page
+            .navigate(
+                "https://first.test/second",
+                deadline_in(500),
+                &CancellationToken::new(),
+            )
+            .await;
+        match stale {
+            Err(BrowserError::Deadline { .. }) => {}
+            other => panic!("a new navigation must not inherit Loaded, got {other:?}"),
+        }
+        assert!(page.is_closed(), "the expired navigation aborts the page");
+        server.abort();
     }
 }

@@ -14,13 +14,13 @@ use faktor_commerce::offer::{
     ObservationOrigin, OfferProvenance, PriceBreak, StockState, VariantOffer,
 };
 use faktor_commerce::quantity::NonZeroQuantity;
-use faktor_commerce::text::{CanonicalUrl, Text};
+use faktor_commerce::text::{AccountScope, CanonicalUrl, Text};
 use faktor_commerce::{
     CommercialOffer, LeadTime, PriceVisibility, ProductIdentity, SourceError, SourceId,
 };
 
 use super::extract::Draft;
-use crate::context::AcquireCtx;
+use crate::context::{AccessVisibility, AcquireCtx};
 use crate::contract::extract::{
     reconcile, Field, FieldObservation, FieldValue, ResolvedField, Strategy, VariantEntry,
 };
@@ -103,6 +103,7 @@ pub fn assemble(
     url: &CanonicalUrl,
     drafts: &[Draft],
     now_ms: u64,
+    access: &AccessVisibility,
 ) -> Result<Assembly, SourceError> {
     let mut observations: BTreeMap<Field, Vec<FieldObservation>> = BTreeMap::new();
     for draft in drafts {
@@ -161,10 +162,13 @@ pub fn assemble(
     let supplier_name = text_of(&resolve(&observations, Field::Supplier));
     let manufacturer_name = text_of(&resolve(&observations, Field::Manufacturer));
 
-    let price_visibility = if inquiry {
-        PriceVisibility::InquiryRequired
+    // Page data decides whether a price exists (an inquiry has no number);
+    // the capture authority — never the mere presence of a numeric price —
+    // decides its visibility.
+    let (price_visibility, price_account_scope) = if inquiry {
+        (PriceVisibility::InquiryRequired, None)
     } else if price.value().is_some() || !variants.is_empty() {
-        PriceVisibility::Public
+        (access.price_visibility(), access.price_account_scope())
     } else {
         return Err(SourceError::ExtractionIncomplete);
     };
@@ -172,7 +176,13 @@ pub fn assemble(
     let price_breaks = if inquiry || !variants.is_empty() {
         Vec::new()
     } else {
-        offer_price_breaks(&price, price_visibility, moq, now_ms)?
+        offer_price_breaks(
+            &price,
+            price_visibility,
+            price_account_scope.clone(),
+            moq,
+            now_ms,
+        )?
     };
 
     let variant_offers: Vec<VariantOffer> = variants
@@ -193,8 +203,8 @@ pub fn assemble(
                         .unwrap_or_else(|| NonZeroQuantity::new(1).expect("one")),
                     max_quantity: None,
                     unit_price,
-                    visibility: PriceVisibility::Public,
-                    account_scope: None,
+                    visibility: price_visibility,
+                    account_scope: price_account_scope.clone(),
                     promotion: None,
                 }],
                 _ => Vec::new(),
@@ -290,6 +300,7 @@ pub fn assemble(
 fn offer_price_breaks(
     price: &ResolvedField,
     visibility: PriceVisibility,
+    account_scope: Option<AccountScope>,
     moq: Option<NonZeroQuantity>,
     _now_ms: u64,
 ) -> Result<Vec<PriceBreak>, SourceError> {
@@ -301,7 +312,7 @@ fn offer_price_breaks(
         max_quantity: None,
         unit_price,
         visibility,
-        account_scope: None,
+        account_scope,
         promotion: None,
     }])
 }
@@ -374,8 +385,9 @@ pub fn single_offer(
     url: &CanonicalUrl,
     drafts: &[Draft],
     now_ms: u64,
+    access: &AccessVisibility,
 ) -> Result<Option<CommercialOffer>, SourceError> {
-    match assemble(source, ctx, url, drafts, now_ms) {
+    match assemble(source, ctx, url, drafts, now_ms, access) {
         Ok(assembly) => Ok(Some(assembly.offer)),
         Err(SourceError::ExtractionIncomplete) | Err(SourceError::ProductNotFound) => Ok(None),
         Err(other) => Err(other),

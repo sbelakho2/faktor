@@ -1300,7 +1300,8 @@ export interface StartTaskRunRequest {
   readonly files?: readonly string[];
   /** Durable typed binary attachments uploaded BEFORE this start. Each id
    * must resolve to a byte-identical durable row of the same session; an
-   * image id is refused loudly (provider media parts are not wired). */
+   * image id is delivered as an ordered media part and refused loudly when
+   * the chosen model has no vision capability. */
   readonly attachments?: readonly NativeAttachmentId[];
   /** A non-default PR/CI-fix completion contract. The daemon refuses it on
    * the plain-prompt path, so callers pair it with an explicit work item. */
@@ -3551,9 +3552,10 @@ export class NativeClient {
   /**
    * Upload ONE bounded binary attachment (standard base64) into the
    * session's durable CAS-backed store. The response is the typed
-   * `AttachmentId` a task start's `attachments` member accepts. The daemon
-   * refuses images loudly (code `unsupported`) while provider media/content
-   * parts are not wired; callers must restore the draft on that refusal.
+   * `AttachmentId` a task start's `attachments` member accepts; task
+   * admission later validates an image id against the chosen model's
+   * vision capability (a typed refusal, never a dropped image). Callers
+   * must restore the draft on any refusal.
    */
   uploadAttachment(
     sessionId: string,

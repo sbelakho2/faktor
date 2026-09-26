@@ -25,6 +25,7 @@ import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeRequests
+import dev.faktor.shared.asciiLowerCase
 import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativePermissionList
@@ -598,6 +599,16 @@ internal object ParityMatrix {
         }
     }
 
+    /**
+     * The pinned digests for THIS rendering environment when the baseline
+     * file records them, else the canonical `panelDigests` pin (the hermetic
+     * CI render). The component digest includes laid-out bounds, which follow
+     * the host's font metrics, so one pin can only be valid for the
+     * environment that produced it; `-Dfaktor.parity.writeBaselines=true`
+     * records the current environment alongside (never over) the canonical
+     * pin. An environment with no entry still compares against the canonical
+     * pin: drift is never silently accepted anywhere.
+     */
     private fun readVisualBaselines(file: File): Map<String, String>? {
         if (!file.isFile) return null
         val json = try {
@@ -605,13 +616,33 @@ internal object ParityMatrix {
         } catch (e: Exception) {
             return null
         }
-        val field = json.view("baseline").field("panelDigests").value as? JsonValue.Obj
+        val root = json.view("baseline")
+        val environment = root.optionalField("environmentDigests")
+            ?.objectValue()
+            ?.optionalField(visualEnvironment())
+            ?.value as? JsonValue.Obj
+        val field = environment ?: (root.field("panelDigests").value as? JsonValue.Obj)
             ?: return null
         val out = LinkedHashMap<String, String>()
         for ((key, value) in field.fields) {
             out[key] = (value as? JsonValue.Str)?.value ?: return null
         }
         return out
+    }
+
+    /** The stable fingerprint of the rendering host (OS + arch + JVM major). */
+    private fun visualEnvironment(): String {
+        fun slug(raw: String): String =
+            asciiLowerCase(raw).replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        val os = slug(System.getProperty("os.name", "unknown")).ifEmpty { "unknown" }
+        val arch = slug(System.getProperty("os.arch", "unknown")).ifEmpty { "unknown" }
+        val jvm = System.getProperty("java.version", "unknown")
+            .split('.', '-', '+')
+            .firstOrNull()
+            ?.filter { it in '0'..'9' }
+            .orEmpty()
+            .ifEmpty { "unknown" }
+        return "$os-$arch-jvm$jvm"
     }
 
     private fun writeVisualBaselines(file: File, digests: Map<String, String>) {
@@ -621,24 +652,73 @@ internal object ParityMatrix {
             "visual baselines must be written to the pinned in-tree path"
         )
         file.parentFile.mkdirs()
+        val existing = try {
+            if (file.isFile) JsonCodec.parse(file.readText(Charsets.UTF_8)) else null
+        } catch (e: Exception) {
+            null
+        }
+        val canonical = LinkedHashMap<String, String>()
+        val environments = LinkedHashMap<String, LinkedHashMap<String, String>>()
+        if (existing != null) {
+            val root = existing.view("baseline")
+            val pinned = root.field("panelDigests").value as? JsonValue.Obj
+            if (pinned != null) {
+                for ((key, value) in pinned.fields) {
+                    val text = (value as? JsonValue.Str)?.value ?: continue
+                    canonical[key] = text
+                }
+            }
+            val recorded = root.optionalField("environmentDigests")?.value as? JsonValue.Obj
+            if (recorded != null) {
+                for ((environment, value) in recorded.fields) {
+                    val map = value as? JsonValue.Obj ?: continue
+                    val entries = LinkedHashMap<String, String>()
+                    for ((panel, digest) in map.fields) {
+                        val text = (digest as? JsonValue.Str)?.value ?: continue
+                        entries[panel] = text
+                    }
+                    environments[environment] = entries
+                }
+            }
+        }
+        if (canonical.isEmpty()) {
+            // First-ever pin: this render is the canonical baseline.
+            canonical.putAll(digests)
+        }
+        environments[visualEnvironment()] = LinkedHashMap(digests)
         val out = StringBuilder()
         out.append("{\n")
-        out.append("  \"schema\": \"faktor-parity-visual-baselines/v1\",\n")
+        out.append("  \"schema\": \"faktor-parity-visual-baselines/v2\",\n")
         out.append("  \"method\": ")
         JsonCodec.writeString(out, VISUAL_METHOD)
         out.append(",\n")
         out.append("  \"panelDigests\": {\n")
-        val entries = digests.entries.toList()
-        for ((index, entry) in entries.withIndex()) {
+        appendDigestEntries(out, canonical)
+        out.append("  },\n")
+        out.append("  \"environmentDigests\": {\n")
+        val keys = environments.keys.sorted()
+        for ((index, environment) in keys.withIndex()) {
             out.append("    ")
-            JsonCodec.writeString(out, entry.key)
-            out.append(": ")
-            JsonCodec.writeString(out, entry.value)
-            out.append(if (index == entries.size - 1) "\n" else ",\n")
+            JsonCodec.writeString(out, environment)
+            out.append(": {\n")
+            appendDigestEntries(out, environments.getValue(environment))
+            out.append("    }")
+            out.append(if (index == keys.size - 1) "\n" else ",\n")
         }
         out.append("  }\n")
         out.append("}\n")
         file.writeText(out.toString(), Charsets.UTF_8)
+    }
+
+    private fun appendDigestEntries(out: StringBuilder, entries: Map<String, String>) {
+        val keys = entries.keys.toList()
+        for ((index, key) in keys.withIndex()) {
+            out.append("    ")
+            JsonCodec.writeString(out, key)
+            out.append(": ")
+            JsonCodec.writeString(out, entries.getValue(key))
+            out.append(if (index == keys.size - 1) "\n" else ",\n")
+        }
     }
 
     // ----------------------------------------------------------- artifact

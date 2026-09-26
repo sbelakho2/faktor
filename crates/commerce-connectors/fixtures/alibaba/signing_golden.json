@@ -1,0 +1,34 @@
+{
+  "family": "alibaba",
+  "scheme": "aop-param2-hmac-sha1-uppercase",
+  "contract": "contract-mocked",
+  "note": "Sanitized golden vector generated independently with Python hmac/hashlib from the documented AOP common-parameter signing; no live endpoint was called.",
+  "timestamp_ms": 1700000000000,
+  "app_key": "alibaba-sanitized-key",
+  "app_secret": "alibaba-sanitized-app-secret",
+  "access_token": "alibaba-sanitized-access-token",
+  "vectors": [
+    {
+      "name": "product_detail",
+      "api_params": [
+        [
+          "productId",
+          "1600123456789"
+        ]
+      ],
+      "canonical": "_aop_timestamp1700000000000access_tokenalibaba-sanitized-access-tokenproductId1600123456789",
+      "signature": "BE187F2B5A0467FF9DBFD3A239BC62715F482151"
+    },
+    {
+      "name": "search_space",
+      "api_params": [
+        [
+          "keywords",
+          "usb cable"
+        ]
+      ],
+      "canonical": "_aop_timestamp1700000000000access_tokenalibaba-sanitized-access-tokenkeywordsusb cable",
+      "signature": "183BEC2522860868C207C95A55C55CB93E8E3857"
+    }
+  ]
+}

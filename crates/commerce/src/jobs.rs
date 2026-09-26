@@ -11,6 +11,7 @@
 //! [`ArtifactStore`], returning a compact context result
 //! ([`crate::result::CompactResult`], 4–12 KiB target, 64 KiB hard max).
 
+use faktor_core::{SessionId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 use crate::bom::{Bom, BomItem};
@@ -31,6 +32,8 @@ use crate::text::{AccountScope, Text};
 const JOB_DIGEST_DOMAIN: &[u8] = b"faktor-commerce.job-digest/v1\0";
 /// Domain separator for job ids.
 const JOB_ID_DOMAIN: &[u8] = b"faktor-commerce.job-id/v1\0";
+/// Domain separator for job owner keys.
+const JOB_OWNER_DOMAIN: &[u8] = b"faktor-commerce.job-owner/v1\0";
 /// Domain separator for synthetic single-item job item keys.
 const JOB_ITEM_DOMAIN: &[u8] = b"faktor-commerce.job-item/v1\0";
 /// Domain separator for per-line BOM item keys.
@@ -45,6 +48,63 @@ pub const MAX_JOB_ITEM_ATTEMPTS: u64 = 5;
 
 /// A job identifier (`job_` + 32 hex characters).
 pub type JobId = String;
+
+/// The owner of a commerce job, DERIVED BY THE RUNTIME from the
+/// authenticated caller (the tool-run context's workspace/session plus the
+/// session's account scope). It is never built from model-supplied tool
+/// arguments: a tool factory cannot widen its own visibility.
+///
+/// The owner key binds three dimensions, so two sessions or two accounts in
+/// the same workspace never share a job: the job digest includes the derived
+/// key (active-job dedup can never cross-attach owners) and the durable job
+/// row persists it (a status read by a different owner is a typed NotFound,
+/// byte-identical to a missing job).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommercePrincipal {
+    /// The workspace the caller is rooted in.
+    pub workspace_id: WorkspaceId,
+    /// The session that issued the call.
+    pub session_id: SessionId,
+    /// The account scope the caller acts under, when any.
+    pub account_scope: Option<AccountScope>,
+}
+
+impl CommercePrincipal {
+    /// Construct a principal from runtime-derived identity values.
+    pub fn new(
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        account_scope: Option<AccountScope>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            session_id,
+            account_scope,
+        }
+    }
+
+    /// The canonical owner key persisted on every job row:
+    /// `BLAKE3(domain || workspace_id || session_id || account_scope)` with
+    /// length-prefixed, presence-tagged fields. 64 hex characters.
+    pub fn owner_key(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(JOB_OWNER_DOMAIN);
+        hasher.update(&self.workspace_id.raw().to_le_bytes());
+        hasher.update(&self.session_id.raw().to_le_bytes());
+        match &self.account_scope {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some(scope) => {
+                hasher.update(&[1]);
+                let value = scope.as_str();
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+}
 
 /// The deterministic state machine of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -234,6 +294,8 @@ impl JobWork {
                 query: Some(query.clone()),
                 quantity: None,
                 reference: None,
+                variant: None,
+                packaging: None,
             }],
             Self::Product { reference } => vec![JobLine {
                 item_key: synthetic_item_key(&self.canonical_identity()),
@@ -241,17 +303,22 @@ impl JobWork {
                 query: None,
                 quantity: None,
                 reference: Some(reference.clone()),
+                variant: None,
+                packaging: None,
             }],
             Self::Quote {
                 reference,
                 quantity,
-                ..
+                packaging,
+                variant,
             } => vec![JobLine {
                 item_key: synthetic_item_key(&self.canonical_identity()),
                 ordinal: 0,
                 query: None,
                 quantity: Some(*quantity),
                 reference: Some(reference.clone()),
+                variant: variant.clone(),
+                packaging: *packaging,
             }],
             Self::Bom { bom } => bom
                 .items()
@@ -263,6 +330,8 @@ impl JobWork {
                     query: Some(item.q.clone()),
                     quantity: Some(item.qty),
                     reference: None,
+                    variant: item.variant.clone(),
+                    packaging: item.packaging,
                 })
                 .collect(),
         }
@@ -329,6 +398,11 @@ pub struct JobLine {
     pub quantity: Option<NonZeroQuantity>,
     /// The product reference, when the work has one.
     pub reference: Option<ProductRef>,
+    /// The requested variant, when the work has one. For a BOM line this is
+    /// the line's own selection, folded into the item key and the BOM digest.
+    pub variant: Option<crate::text::VariantId>,
+    /// The requested packaging, when the work has one.
+    pub packaging: Option<crate::packaging::PackagingType>,
 }
 
 /// The full request of one job.
@@ -370,13 +444,16 @@ pub struct CommerceJob {
 
 /// The digest of a normalized job request:
 /// `BLAKE3(normalized request + enabled sources + profile identity +
-/// freshness policy)`. `enabled_sources` is the sorted, stable list of
-/// configured sources for the requested capability (never health-filtered:
-/// a digest must not change because a breaker opened).
+/// freshness policy + owner identity)`. `enabled_sources` is the sorted,
+/// stable list of configured sources for the requested capability (never
+/// health-filtered: a digest must not change because a breaker opened).
+/// `owner` is the runtime-derived principal: the owner key is part of the
+/// digest, so two sessions or accounts can never dedup onto one active job.
 pub fn job_digest(
     request: &CommerceJobRequest,
     enabled_sources: &[crate::text::SourceId],
     profile: Option<&ProfileIdentity>,
+    owner: &CommercePrincipal,
 ) -> String {
     fn put(hasher: &mut blake3::Hasher, tag: u8, value: Option<&str>) {
         hasher.update(&[tag]);
@@ -432,6 +509,7 @@ pub fn job_digest(
         7,
         request.account.as_ref().map(AccountScope::as_str),
     );
+    put(&mut hasher, 8, Some(&owner.owner_key()));
     hasher.finalize().to_hex().to_string()
 }
 
@@ -444,18 +522,20 @@ pub struct JobSubmitOutcome {
     pub attached: bool,
 }
 
-/// Submit a job: attach to an active identical job, else create a new one
-/// (with its pending items) in one transaction.
+/// Submit a job: attach to an active identical job OF THE SAME OWNER, else
+/// create a new owner-keyed job (with its pending items) in one transaction.
 pub fn submit_job(
     store: &CommerceStore,
     request: CommerceJobRequest,
     enabled_sources: &[crate::text::SourceId],
     profile: Option<&ProfileIdentity>,
+    owner: &CommercePrincipal,
     now_ms: u64,
 ) -> Result<(CommerceJob, bool), SourceError> {
     request.validate()?;
-    let digest = job_digest(&request, enabled_sources, profile);
-    if let Some(existing) = store.find_active_job(&digest)? {
+    let owner_key = owner.owner_key();
+    let digest = job_digest(&request, enabled_sources, profile, owner);
+    if let Some(existing) = store.find_active_job(&digest, &owner_key)? {
         return Ok((existing, true));
     }
     let seq = store.job_count(None)?;
@@ -471,7 +551,7 @@ pub fn submit_job(
         state: JobState::Queued,
         request: request.clone(),
     };
-    if !store.insert_job(&job, now_ms)? {
+    if !store.insert_job(&job, &owner_key, now_ms)? {
         // Two openers raced on the same id: converge on the durable row.
         let existing = store.job(&job_id)?.ok_or(SourceError::Store)?;
         return Ok((job_from_row(existing)?, true));
@@ -661,6 +741,16 @@ pub async fn advance_job(
     now_ms: u64,
 ) -> Result<JobOutcome, SourceError> {
     let row = store.job(job_id)?.ok_or(SourceError::Store)?;
+    // A legacy ownerless row is unusable: it cannot be attributed to any
+    // principal, so it must never execute or be reported. The v3 migration
+    // already terminalized active ownerless rows; this is defense in depth.
+    if row.owner_key.is_none() {
+        tracing::warn!(
+            job_id,
+            "commerce job refused: ownerless legacy row has no principal"
+        );
+        return Err(SourceError::Store);
+    }
     if row.state.is_terminal() {
         if let Some(compact_json) = row.compact_json.clone() {
             let compact: CompactResult =
@@ -955,5 +1045,49 @@ pub fn bom_request(
         freshness,
         detail,
         account,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn principal(workspace: u64, session: u64, scope: Option<&str>) -> CommercePrincipal {
+        CommercePrincipal::new(
+            WorkspaceId::new(workspace),
+            SessionId::new(session),
+            scope.map(|value| AccountScope::new(value).expect("scope")),
+        )
+    }
+
+    #[test]
+    fn owner_key_is_deterministic_and_separates_every_identity_axis() {
+        let base = principal(1, 1, None);
+        assert_eq!(base.owner_key(), base.owner_key());
+        assert_eq!(base.owner_key().len(), 64);
+        assert!(base.owner_key().chars().all(|c| c.is_ascii_hexdigit()));
+
+        let other_workspace = principal(2, 1, None);
+        let other_session = principal(1, 2, None);
+        let scoped = principal(1, 1, Some("acct-a"));
+        let other_scope = principal(1, 1, Some("acct-b"));
+        let keys = [
+            base.owner_key(),
+            other_workspace.owner_key(),
+            other_session.owner_key(),
+            scoped.owner_key(),
+            other_scope.owner_key(),
+        ];
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            keys.len(),
+            "workspace, session and account scope must each separate owner keys"
+        );
+        assert_eq!(
+            principal(1, 1, Some("acct-a")).owner_key(),
+            scoped.owner_key(),
+            "the same identity derives the same key"
+        );
     }
 }

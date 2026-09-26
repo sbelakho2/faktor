@@ -19,6 +19,7 @@ import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
+import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
 import dev.faktor.shared.NativeBillingUsage
@@ -382,10 +383,25 @@ class FaktorFrontendService(
         maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null,
+        attachments: List<NativeAttachmentId>? = null,
         completionContract: NativeCompletionContract? = null
     ): NativeTaskRunStarted = clientOrThrow().startTaskRun(
         requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
-        completionContract
+        attachments, completionContract
+    )
+
+    /**
+     * Upload ONE bounded binary attachment (standard base64) into the
+     * session's durable store; the returned typed id is what a later task
+     * start's `attachments` argument carries. Images use the same contract:
+     * the daemon admission validates them against the chosen model.
+     */
+    fun uploadAttachment(
+        mime: String,
+        filename: String? = null,
+        dataBase64: String
+    ): NativeAttachmentId = clientOrThrow().uploadAttachment(
+        requireSession(), mime, filename, dataBase64
     )
 
     fun cancelTaskRun(runId: String): NativeTaskRunCancelled =
