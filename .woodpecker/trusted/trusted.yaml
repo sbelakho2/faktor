@@ -161,8 +161,10 @@ steps:
       # tests::prompt_runs_a_real_turn_and_reports_the_final_state (futex
       # ping-pong between the prompt thread and the actor, no I/O, 30+ min)
       # on the shared runner while the same test passes in isolation. Two
-      # workers keeps each actor's timing loop live.
+      # workers keeps each actor's timing loop live. `CARGO_BUILD_JOBS` caps
+      # rustc fan-out for the same reason (shared host with the darwin lane).
       RUST_TEST_THREADS: "2"
+      CARGO_BUILD_JOBS: "4"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -211,6 +213,11 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
+      # Shared self-hosted runner: the darwin lane's tests run on the same
+      # host while these containers build, so cap rustc fan-out and keep the
+      # fixture children schedulable (bounded, documented resource setting —
+      # no test is excluded).
+      CARGO_BUILD_JOBS: "4"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -248,6 +255,11 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
+      # Shared self-hosted runner: the darwin lane's tests run on the same
+      # host while these containers build, so cap rustc fan-out and keep the
+      # fixture children schedulable (bounded, documented resource setting —
+      # no test is excluded).
+      CARGO_BUILD_JOBS: "4"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -434,6 +446,11 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
+      # Shared self-hosted runner: the darwin lane's tests run on the same
+      # host while these containers build, so cap rustc fan-out and keep the
+      # fixture children schedulable (bounded, documented resource setting —
+      # no test is excluded).
+      CARGO_BUILD_JOBS: "4"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
@@ -459,6 +476,12 @@ steps:
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/perf.json
   - name: darwin-check
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
+    environment:
+      # Shared self-hosted runner: the linux lane's builds run on the same
+      # host, so cap both test threads and rustc fan-out. The bounded caps
+      # keep fixture children schedulable; no test is excluded.
+      RUST_TEST_THREADS: "2"
+      CARGO_BUILD_JOBS: "4"
     when:
       matrix:
         platform: darwin/arm64
@@ -483,6 +506,12 @@ steps:
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-check.json
   - name: darwin-test
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
+    environment:
+      # Shared self-hosted runner: the linux lane's builds run on the same
+      # host, so cap both test threads and rustc fan-out. The bounded caps
+      # keep fixture children schedulable; no test is excluded.
+      RUST_TEST_THREADS: "2"
+      CARGO_BUILD_JOBS: "4"
     when:
       matrix:
         platform: darwin/arm64
@@ -507,6 +536,12 @@ steps:
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/darwin-test.json
   - name: darwin-doctor
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
+    environment:
+      # Shared self-hosted runner: the linux lane's builds run on the same
+      # host, so cap both test threads and rustc fan-out. The bounded caps
+      # keep fixture children schedulable; no test is excluded.
+      RUST_TEST_THREADS: "2"
+      CARGO_BUILD_JOBS: "4"
     when:
       matrix:
         platform: darwin/arm64
