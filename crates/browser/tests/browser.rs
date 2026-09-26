@@ -1666,7 +1666,10 @@ async fn failed_launch_keeps_a_persistent_profile_but_removes_no_orphan() {
         Duration::from_secs(5)
     ));
     let (port, profile_dir) = launch_proxy_and_profile(&harness);
-    assert!(broker_port_refuses_connections(port));
+    assert!(
+        wait_for_broker_shutdown(port, Duration::from_secs(10)),
+        "the egress broker must be shut down after a failed launch"
+    );
     assert!(
         profile_dir.exists(),
         "a persistent profile is durable state and survives a failed launch"
