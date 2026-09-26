@@ -1005,7 +1005,9 @@ mod tests {
     /// impossible, and the time bound proves it empirically.
     #[test]
     fn giant_non_git_tree_is_never_walked_and_returns_only_targeted_bits() {
-        let _serial = TEST_SERIAL.lock().unwrap();
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("giant");
         std::fs::create_dir_all(&root).unwrap();
@@ -1313,7 +1315,9 @@ mod tests {
     /// empty under the cold kill scope).
     #[test]
     fn supervised_rg_over_200k_file_tree_is_bounded_and_leaves_no_child() {
-        let _serial = TEST_SERIAL.lock().unwrap();
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
@@ -1401,7 +1405,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn slow_rg_is_killed_by_the_supervisor_deadline_and_leaves_no_orphan() {
-        let _serial = TEST_SERIAL.lock().unwrap();
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repo");
         write(&root, "src/app.rs", b"pub fn payments() {}\n");
@@ -1487,9 +1493,15 @@ mod tests {
         #[cfg(unix)]
         {
             let pid = sleeps[0].pid;
+            // A SIGKILLed process group can linger for a scheduling quantum
+            // while its members are reaped. The bounded wait (owned by the
+            // terminal process-lifecycle authority, see
+            // `faktor_terminal::wait_for_group_gone`) observes extinction
+            // instead of racing the probe right after the kill: the invariant
+            // (no survivor) is unchanged, only the sampling is.
             assert!(
-                !supervised_fixture(&sup, &root, "kill", &["-0", &format!("-{pid}")]),
-                "orphan process group {pid} still alive after the deadline kill"
+                faktor_terminal::wait_for_group_gone(pid, Duration::from_secs(10)),
+                "orphan process group {pid} still alive 10s after the deadline kill"
             );
         }
     }

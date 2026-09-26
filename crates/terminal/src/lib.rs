@@ -2943,6 +2943,28 @@ fn process_alive(pid: u32) -> bool {
     true
 }
 
+/// Wait (bounded) for process group `pgid` to be gone. The terminal crate is
+/// the process-lifecycle authority, so the bounded wait belongs here (callers
+/// like the cold-runner tests must not grow their own polling sleeps). A
+/// SIGKILLed group can stay observable for a scheduling quantum while its
+/// members are consumed by the single reaper; the wait observes extinction,
+/// it does not force it.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn wait_for_group_gone(pgid: u32, timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if group_gone(pgid) {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return group_gone(pgid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20).min(timeout - elapsed));
+    }
+}
+
 /// True when the `kill(-pgid, 0)` probe reports no member of the process
 /// group. The probe NEVER reaps (audit round 12: one reaping authority per
 /// child), so zombie members keep it reporting "not gone" until the single
