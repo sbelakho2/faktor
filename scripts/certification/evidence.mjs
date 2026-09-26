@@ -461,6 +461,7 @@ const WORKFLOWS = {
       'jetbrains-build',
       'jetbrains-smoke',
       'perf',
+      'release-artifacts',
     ],
   },
   nightly: {
