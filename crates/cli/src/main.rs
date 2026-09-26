@@ -7470,8 +7470,20 @@ mod tests {
         assert!(err.contains("no providers"), "{err}");
     }
 
+    // The daemon-turn tests each drive a real SessionManager actor from a
+    // multi-threaded runtime. Two of them running concurrently on a loaded
+    // runner has livelocked the actor handshake (test thread <-> db actor
+    // futex ping-pong with zero I/O, 30+ minutes, while each test passes in
+    // isolation). They take this process-wide guard so at most one heavy
+    // turn test runs at a time; assertions and coverage are unchanged.
+    static HEAVY_TURN_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn serial_turn_test() -> std::sync::MutexGuard<'static, ()> {
+        HEAVY_TURN_TEST.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prompt_runs_a_real_turn_and_reports_the_final_state() {
+        let _serial = serial_turn_test();
         let (_dir, session, agent) = acp_test_daemon(vec![
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
@@ -7487,6 +7499,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prompt_on_unknown_session_errors() {
+        let _serial = serial_turn_test();
         let (_dir, session, agent) = acp_test_daemon(vec![
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
@@ -7501,6 +7514,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_cancels_a_live_turn_and_keeps_the_session_usable() {
+        let _serial = serial_turn_test();
         let (_dir, session, agent) = acp_test_daemon(vec![
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
@@ -7534,6 +7548,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hostile_inputs_are_errs_never_panics() {
+        let _serial = serial_turn_test();
         let (_dir, session, agent) = acp_test_daemon(vec![
             ScriptedResponse::Text("pong".into()),
             ScriptedResponse::End,
