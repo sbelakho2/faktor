@@ -658,6 +658,7 @@ mod tests {
 
     #[test]
     fn reaped_spawn_records_are_never_reported_lost() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let (mut child, identity) = spawn_group_sleeper();
         let row = ledger.record_spawn("session:1/task:2", &identity).unwrap();
@@ -672,6 +673,7 @@ mod tests {
 
     #[test]
     fn lost_reap_transition_is_marked_and_consumed_by_reconcile() {
+        let _serial = crate::test_serial();
         // Adversarial (injected append failure): a `reaped` transition whose
         // ledger append fails is neither silently lost nor misreported as
         // `TerminalLost`. The durable retry marker stands in for it, and the
@@ -702,6 +704,7 @@ mod tests {
 
     #[test]
     fn oversized_marker_file_is_kept_not_silently_consumed() {
+        let _serial = crate::test_serial();
         // Adversarial: a marker sidecar beyond the bound must not be
         // half-read (a truncated read would drop ids) and must not be
         // consumed; the row is adjudicated by classification instead.
@@ -722,6 +725,7 @@ mod tests {
 
     #[test]
     fn reconciliation_reports_gone_without_signalling_anything() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let (mut child, identity) = spawn_group_sleeper();
         ledger.record_spawn("session:7", &identity).unwrap();
@@ -739,6 +743,7 @@ mod tests {
 
     #[test]
     fn reconciliation_reports_recycled_pid_and_leaves_the_process_alive() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let (mut child, identity) = spawn_group_sleeper();
         // Simulate a recycled pid: the recorded start-time marker is wrong.
@@ -761,6 +766,7 @@ mod tests {
 
     #[test]
     fn reconciliation_reports_still_alive_and_never_kills() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let (mut child, identity) = spawn_group_sleeper();
         ledger.record_spawn("session:11", &identity).unwrap();
@@ -774,6 +780,7 @@ mod tests {
 
     #[test]
     fn reconciliation_is_exactly_once_per_live_row() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let (mut child, identity) = spawn_group_sleeper();
         ledger.record_spawn("session:13", &identity).unwrap();
@@ -787,6 +794,7 @@ mod tests {
 
     #[test]
     fn truncated_and_hostile_lines_are_counted_not_fatal() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         // Two intact records; the second line is then corrupted by a
         // simulated crash-mid-append truncation plus hostile injected text.
@@ -816,6 +824,7 @@ mod tests {
 
     #[test]
     fn hostile_owner_labels_are_rejected() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let pid = std::process::id();
         let identity = ProcessIdentity::capture(pid, pid);
@@ -841,6 +850,7 @@ mod tests {
 
     #[test]
     fn malformed_identities_are_refused_before_any_write() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let bad = ProcessIdentity {
             pid: 0,
@@ -873,6 +883,7 @@ mod tests {
 
     #[test]
     fn hostile_on_disk_records_are_classified_never_signalled() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let mut raw = String::new();
         for (id, pid, pgid) in [("huge", u32::MAX, u32::MAX), ("zero", 1, 0)] {
@@ -899,6 +910,7 @@ mod tests {
 
     #[test]
     fn the_ledger_is_line_bounded_under_spawn_pressure() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         let pid = std::process::id();
         let identity = ProcessIdentity::capture(pid, pid);
@@ -962,6 +974,7 @@ mod tests {
 
     #[test]
     fn unknown_ids_and_double_marks_are_noops() {
+        let _serial = crate::test_serial();
         let (_dir, ledger) = ledger();
         ledger.mark_reaped("nope").unwrap();
         let pid = std::process::id();
@@ -975,6 +988,7 @@ mod tests {
 
     #[test]
     fn direct_guardian_run_leaves_no_lost_row_when_marked_reaped() {
+        let _serial = crate::test_serial();
         // The full normal path: spawn a group, record it, run the guardian,
         // kill + reap, mark reaped, then reconcile reports nothing.
         let (_dir, ledger) = ledger();

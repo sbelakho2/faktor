@@ -678,6 +678,7 @@ mod tests {
 
     #[test]
     fn probe_finds_this_process_and_recomputes_the_same_marker() {
+        let _serial = crate::test_serial();
         if !probe_supported() {
             return;
         }
@@ -691,6 +692,7 @@ mod tests {
 
     #[test]
     fn probe_of_a_reaped_process_is_gone_and_a_bogus_marker_mismatches() {
+        let _serial = crate::test_serial();
         if !probe_supported() {
             return;
         }
@@ -717,6 +719,7 @@ mod tests {
 
     #[test]
     fn decide_refuses_a_recycled_pid_record() {
+        let _serial = crate::test_serial();
         if !probe_supported() {
             return;
         }
@@ -737,6 +740,7 @@ mod tests {
 
     #[test]
     fn decide_refuses_a_record_without_a_marker_on_a_supported_platform() {
+        let _serial = crate::test_serial();
         if !probe_supported() {
             return;
         }
@@ -755,6 +759,7 @@ mod tests {
 
     #[test]
     fn decide_reports_nothing_to_do_when_the_group_is_gone() {
+        let _serial = crate::test_serial();
         if !probe_supported() {
             return;
         }
@@ -769,6 +774,7 @@ mod tests {
 
     #[test]
     fn eof_kills_the_recorded_group_and_reports_killed() {
+        let _serial = crate::test_serial();
         let (mut child, identity) = spawn_group_sleeper();
         assert_eq!(identity.verify(), IdentityVerdict::Match);
         let mut guardian = GuardianHandle::spawn(identity).expect("fork guardian");
@@ -791,6 +797,7 @@ mod tests {
 
     #[test]
     fn eof_kills_surviving_descendants_when_the_leader_is_already_reaped() {
+        let _serial = crate::test_serial();
         // The leader exits immediately; the background `sleep` stays in the
         // leader's process group. The identity says "gone" but the group is
         // alive: the guardian must kill the remaining members.
@@ -814,6 +821,7 @@ mod tests {
 
     #[test]
     fn eof_refuses_a_recycled_pid_and_leaves_the_process_alive() {
+        let _serial = crate::test_serial();
         let (mut child, identity) = spawn_group_sleeper();
         let stale = ProcessIdentity {
             pid: identity.pid,
@@ -832,6 +840,7 @@ mod tests {
 
     #[test]
     fn deliberate_release_after_reap_exits_without_killing() {
+        let _serial = crate::test_serial();
         // Normal shutdown: the daemon already killed and reaped the child,
         // THEN closes the pipe. The guardian must exit cleanly (code 0).
         let (mut child, identity) = spawn_group_sleeper();
@@ -852,6 +861,7 @@ mod tests {
 
     #[test]
     fn double_release_is_idempotent_and_never_waits_twice() {
+        let _serial = crate::test_serial();
         let (mut child, identity) = spawn_group_sleeper();
         let mut guardian = GuardianHandle::spawn(identity).expect("fork guardian");
         let first = guardian.release();
@@ -863,6 +873,7 @@ mod tests {
 
     #[test]
     fn hostile_identity_never_signals_group_zero() {
+        let _serial = crate::test_serial();
         // pgid 0 would mean "the caller's own group": a corrupt/hostile
         // record must never be able to authorize it.
         let hostile = ProcessIdentity {
