@@ -761,6 +761,7 @@ def number(value):
 mode = sys.argv[1]
 data = load(sys.argv[2])
 arg = sys.argv[3] if len(sys.argv) > 3 else ""
+arg2 = sys.argv[4] if len(sys.argv) > 4 else ""
 
 if mode == "repo_id":
     print(data.get("id", "") if isinstance(data, dict) else "")
@@ -800,20 +801,67 @@ elif mode == "attestation_step":
         steps.extend(data["steps"])
     for s in steps:
         if isinstance(s, dict) and s.get("name") == arg:
-            print(s.get("pid", s.get("id", "")))
+            # `id` is the global step id the log endpoint addresses; `pid` is
+            # only the step's ordinal inside its workflow/pipeline and fetches
+            # a different step's log (which made a published attestation look
+            # absent).
+            print(s.get("id", s.get("pid", "")))
             break
+elif mode == "context_boundaries":
+    # Classify the workflows a certified context does NOT own when the
+    # certified workflow is green but the overall pipeline is not: a pending
+    # workflow whose platform label no CONNECTED agent advertises is a typed
+    # self-hosted-absence boundary (visible, never a silent green); anything
+    # else stays a hard failure for the caller.
+    agents = load(arg2) if arg2 else []
+    platforms = set()
+    if isinstance(agents, list):
+        for a in agents:
+            if not isinstance(a, dict) or not a.get("last_contact"):
+                continue
+            labels = a.get("custom_labels") or {}
+            if isinstance(labels, dict) and labels.get("platform"):
+                platforms.add(labels["platform"])
+            elif a.get("platform"):
+                platforms.add(a["platform"])
+    for w in (data or {}).get("workflows") or []:
+        # Matrix workflows share the pipeline's name, so the certified one is
+        # identified by state: every green workflow is already proven, and
+        # anything else is classified below.
+        name = w.get("name", "")
+        state = w.get("state", "")
+        if state == "success":
+            continue
+        platform = (w.get("environ") or {}).get("platform") or ""
+        if state in ("pending", "running", "blocked", "created", "started") and platform and platform not in platforms:
+            print("BOUNDARY\tworkflow %s is %s and no connected agent advertises platform=%s (self-hosted lane absent; typed, visible, never green)" % (name, state, platform))
+        else:
+            print("PROBLEM\tworkflow %s is %s (platform=%s)" % (name, state, platform or "unknown"))
 elif mode == "attestation_extract":
-    text = ""
+    # The log endpoint returns each entry's `data` base64-encoded; older
+    # shapes may carry plain text. Search BOTH renderings so the block is
+    # found either way (never silently missing).
+    raw_parts = []
+    decoded_parts = []
     if isinstance(data, list):
-        text = "".join(
-            e.get("data", "") for e in data
-            if isinstance(e, dict) and isinstance(e.get("data"), str)
-        )
+        for e in data:
+            if not isinstance(e, dict) or not isinstance(e.get("data"), str):
+                continue
+            raw_parts.append(e["data"])
+            try:
+                decoded_parts.append(base64.b64decode(e["data"]).decode("utf-8", "replace"))
+            except Exception:
+                decoded_parts.append(e["data"])
     elif isinstance(data, dict):
         if isinstance(data.get("data"), str):
-            text = data["data"]
+            raw_parts.append(data["data"])
+            try:
+                decoded_parts.append(base64.b64decode(data["data"]).decode("utf-8", "replace"))
+            except Exception:
+                decoded_parts.append(data["data"])
         elif isinstance(data.get("lines"), list):
-            text = "".join(x if isinstance(x, str) else "" for x in data["lines"])
+            decoded_parts.extend(x for x in data["lines"] if isinstance(x, str))
+    text = "\n".join(raw_parts) + "\n" + "\n".join(decoded_parts)
     match = re.search(
         r"-----BEGIN FAKTOR ATTESTATION-----(.*?)-----END FAKTOR ATTESTATION-----",
         text, re.S,
@@ -922,7 +970,7 @@ probe_attestation() { # api repo_id number detail event workflow commit tree art
     fi
     log_file="$tmp/attestation-log.json"
     att_file="$tmp/attestation.json"
-    code="$(api_get "$api" "/repos/$repo_id/pipelines/$number/logs/$pid" "$log_file")"
+    code="$(api_get "$api" "/repos/$repo_id/logs/$number/$pid" "$log_file")"
     if [ "$code" != "200" ]; then
         printf 'attestation-log-fetch: pipeline %s step %s log fetch failed (HTTP %s)\n' "$number" "$pid" "$code" >>"$problems"
         ATT_STATUS="failed"
@@ -1562,8 +1610,25 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
             OBS_WORKFLOW="$CTX_WORKFLOW"
             case "$OBS_WORKFLOW_STATE" in
             success)
-                [ "$OBS_PIPELINE_STATUS" = "success" ] ||
-                    printf 'context-failure: pipeline status is %s while the %s workflow is success\n' "$OBS_PIPELINE_STATUS" "$CTX_WORKFLOW" >>"$problems_file"
+                if [ "$OBS_PIPELINE_STATUS" != "success" ]; then
+                    agents_file="$tmp/agents.json"
+                    agents_code="$(api_get "$api" "/agents" "$agents_file")"
+                    boundary_out=""
+                    if [ "$agents_code" = "200" ]; then
+                        boundary_out="$(py_json context_boundaries "$detail_file" "$CTX_WORKFLOW" "$agents_file" 2>/dev/null || true)"
+                    fi
+                    boundary_problems="$(printf '%s\n' "$boundary_out" | sed -n 's/^PROBLEM\t//p')"
+                    boundary_notes="$(printf '%s\n' "$boundary_out" | sed -n 's/^BOUNDARY\t//p')"
+                    if [ -n "$boundary_problems" ]; then
+                        printf '%s\n' "$boundary_problems" >>"$problems_file"
+                    fi
+                    if [ -n "$boundary_notes" ]; then
+                        printf '%s\n' "$boundary_notes"
+                        printf 'context-boundary-checked: pipeline status is %s while the %s workflow is success; listed workflow(s) are typed self-hosted-absence boundaries (no connected agent, never green)\n' "$OBS_PIPELINE_STATUS" "$CTX_WORKFLOW"
+                    elif [ -z "$boundary_problems" ]; then
+                        printf 'context-failure: pipeline status is %s while the %s workflow is success\n' "$OBS_PIPELINE_STATUS" "$CTX_WORKFLOW" >>"$problems_file"
+                    fi
+                fi
                 ;;
             pending | running | blocked | created | started)
                 printf 'context-pending: %s workflow is %s (pipeline %s)\n' "$CTX_WORKFLOW" "$OBS_WORKFLOW_STATE" "$pipeline_number" >>"$problems_file"
