@@ -1,0 +1,34 @@
+{
+  "family": "china1688",
+  "scheme": "aop-param2-hmac-sha1-uppercase",
+  "contract": "contract-mocked",
+  "note": "Sanitized golden vector generated independently with Python hmac/hashlib from the documented AOP common-parameter signing; no live endpoint was called.",
+  "timestamp_ms": 1700000000000,
+  "app_key": "1688-sanitized-key",
+  "app_secret": "1688-sanitized-app-secret",
+  "access_token": "1688-sanitized-access-token",
+  "vectors": [
+    {
+      "name": "offer_detail",
+      "api_params": [
+        [
+          "offerId",
+          "678901234567"
+        ]
+      ],
+      "canonical": "_aop_timestamp1700000000000access_token1688-sanitized-access-tokenofferId678901234567",
+      "signature": "3F6B0600A0D4BD6E9FA45F9871FB9A757C96F578"
+    },
+    {
+      "name": "search_unicode",
+      "api_params": [
+        [
+          "keywords",
+          "数据线"
+        ]
+      ],
+      "canonical": "_aop_timestamp1700000000000access_token1688-sanitized-access-tokenkeywords数据线",
+      "signature": "87A1764B840D20BBD83449477E728B5EA0C03D48"
+    }
+  ]
+}

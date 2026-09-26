@@ -1231,10 +1231,14 @@ pub struct TaskExecutor {
 }
 
 /// The completion-step wiring of one executor: the configured template
-/// values and the cached runner (rebuilt when the config changes).
+/// values, the injected canonical SCM adapter of the native PR step (the
+/// daemon wires `faktor_scm::GitHubCompletionScm` over the real GitHub App;
+/// `None` = a contracted PR step records an explicit configuration blocker)
+/// and the cached runner (rebuilt when the config or the adapter changes).
 #[derive(Default)]
 struct CompletionStepsWiring {
     config: CompletionStepsConfig,
+    scm: Option<Arc<dyn faktor_scm::CompletionScm>>,
     runner: Option<Arc<CompletionStepRunner>>,
 }
 
@@ -1544,6 +1548,22 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// Install (or clear) the canonical SCM adapter of the native PR step
+    /// (`faktor_scm::GitHubCompletionScm` over the real GitHub App adapter in
+    /// production). The cached runner is dropped so the next contracted run
+    /// rebuilds with it. Without an adapter a task whose completion contract
+    /// requests the PR step records the explicit
+    /// `faktor-orchestrator` configuration blocker instead of silently
+    /// skipping it.
+    pub fn set_completion_scm_provider(
+        &self,
+        provider: Option<Arc<dyn faktor_scm::CompletionScm>>,
+    ) {
+        let mut wiring = self.lock_completion_steps();
+        wiring.scm = provider;
+        wiring.runner = None;
+    }
+
     /// The completion-step wiring guard with classified recovery: the config
     /// is the daemon's validated POLICY (mutations refuse typed on poison,
     /// see [`Self::configure_completion_steps`]) while the cached runner is a
@@ -1588,9 +1608,9 @@ impl TaskExecutor {
             None => Ok(()),
         });
         let runner = Arc::new(
-            CompletionStepRunner::new(supervisor, egress, wiring.config.clone()).map_err(|e| {
-                ExecError::InvalidPlan(format!("completion-step runner config: {e}"))
-            })?,
+            CompletionStepRunner::new(supervisor, egress, wiring.config.clone())
+                .map_err(|e| ExecError::InvalidPlan(format!("completion-step runner config: {e}")))?
+                .with_scm_provider_or_none(wiring.scm.clone()),
         );
         wiring.runner = Some(runner.clone());
         Ok(Some(runner))

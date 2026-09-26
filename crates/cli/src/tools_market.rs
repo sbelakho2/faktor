@@ -32,6 +32,7 @@ use faktor_browser::{
 };
 use faktor_commerce::cache::CacheTtls;
 use faktor_commerce::connector::{AcquireCtx, Cancellation, Discovery, QuoteCandidate};
+use faktor_commerce::jobs::CommercePrincipal;
 use faktor_commerce::query::{
     DetailLevel, FreshnessMode, Op, ProductRef, ProductRequest, QuoteRequest, SearchRequest,
     SourceSet,
@@ -41,9 +42,9 @@ use faktor_commerce::service::{
     CommerceSourceService, JobStatus, SearchOutcome, ServiceConfig, ServiceError,
 };
 use faktor_commerce::store::GcPolicy;
-use faktor_commerce::text::{SourceId, Text};
+use faktor_commerce::text::{AccountScope, SourceId, Text, VariantId};
 use faktor_commerce::{
-    Bom, BomItem, CanonicalUrl, CommercialOffer, Money, SourceError, StockState,
+    Bom, BomItem, CanonicalUrl, CommercialOffer, Money, PackagingType, SourceError, StockState,
     MAX_ARTIFACT_BYTES, MAX_BOM_LINES, MAX_QUERY_BYTES, MAX_REF_BYTES, MAX_SOURCES,
 };
 use faktor_commerce_connectors as connectors;
@@ -60,7 +61,8 @@ use faktor_security::destination::{
 };
 
 use crate::config::{
-    CommerceCfg, CommerceProfileConnectorCfg, ConnectorCredential, COMMERCE_CONNECTOR_IDS,
+    CommerceCfg, CommerceMarketplaceConnectorEntry, ConnectorCredential, MarketplaceApiCfg,
+    COMMERCE_CONNECTOR_IDS,
 };
 
 /// The model-visible name of the single acquisition tool.
@@ -152,9 +154,10 @@ pub fn source_market_tool_with_secrets(
     }
 }
 
-/// The frozen flat schema of docs/acquire.md §5. Deliberately small: the
-/// real per-operation validation is Rust code with typed errors, never a
-/// nested `oneOf`.
+/// The frozen flat schema of docs/acquire.md §5, extended with the flat
+/// `variant`/`packaging` selections (top level and per BOM item). Deliberately
+/// small: the real per-operation validation is Rust code with typed errors,
+/// never a nested `oneOf`.
 pub fn source_market_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -170,13 +173,17 @@ pub fn source_market_schema() -> serde_json::Value {
             "limit": { "type": "integer", "minimum": 1, "maximum": 50 },
             "freshness": { "enum": ["prefer_cache", "live", "cache_only"] },
             "detail": { "enum": ["compact", "normal", "full"] },
+            "variant": { "type": "string", "maxLength": MAX_VARIANT_SELECTION_BYTES },
+            "packaging": { "enum": PACKAGING_LABELS },
             "items": {
                 "type": "array", "maxItems": MAX_BOM_LINES,
                 "items": {
                     "type": "object",
                     "properties": {
                         "q": { "type": "string", "maxLength": MAX_QUERY_BYTES },
-                        "qty": { "type": "integer", "minimum": 1 }
+                        "qty": { "type": "integer", "minimum": 1 },
+                        "variant": { "type": "string", "maxLength": MAX_VARIANT_SELECTION_BYTES },
+                        "packaging": { "enum": PACKAGING_LABELS }
                     },
                     "required": ["q", "qty"],
                     "additionalProperties": false
@@ -188,6 +195,23 @@ pub fn source_market_schema() -> serde_json::Value {
         "additionalProperties": false
     })
 }
+
+/// The `variant` selection bytes (the commerce [`VariantId`] bound; a
+/// marketplace attribute expression is itself bounded by this).
+pub const MAX_VARIANT_SELECTION_BYTES: usize = faktor_commerce::MAX_VARIANT_ID_BYTES;
+
+/// The packaging labels the flat schema accepts (the named [`PackagingType`]
+/// kinds; the source-reported `other` is never a request selection).
+pub const PACKAGING_LABELS: &[&str] = &[
+    "cut_tape",
+    "tape_and_reel",
+    "digi_reel",
+    "tray",
+    "tube",
+    "bulk",
+    "full_reel",
+    "factory_pack",
+];
 
 /// The capability permission check: the runtime resolves this tool's
 /// [`Capability::Network`] through the daemon's permission hop BEFORE the
@@ -329,13 +353,24 @@ async fn execute_source_market(
             guard_allowed(
                 &args,
                 op_raw,
-                &["op", "ref", "qty", "sources", "freshness", "detail"],
+                &[
+                    "op",
+                    "ref",
+                    "qty",
+                    "sources",
+                    "freshness",
+                    "detail",
+                    "variant",
+                    "packaging",
+                ],
             )?;
             let raw_ref = require_str(&args, "ref", MAX_REF_BYTES)?;
             let qty = require_u64(&args, "qty")?;
             let (_, named) = parse_sources(&args)?;
             let freshness = parse_freshness(&args)?;
             let _detail = parse_detail(&args)?;
+            let variant = parse_variant(&args)?;
+            let packaging = parse_packaging(&args)?;
             let hint = if named.len() == 1 {
                 named.first()
             } else {
@@ -343,7 +378,11 @@ async fn execute_source_market(
             };
             let reference = ProductRef::parse(raw_ref, hint)
                 .map_err(|e| Error::malformed(format!("source_market quote: {e}")))?;
-            let request = QuoteRequest::new(reference, qty, None, None, None, freshness)
+            // The commerce `QuoteRequest` carries the flat selections
+            // directly; its connector bridge renders them onto the site
+            // request with `.with_variant`/`.with_packaging`, so the
+            // deterministic selection reaches the marketplace adapter.
+            let request = QuoteRequest::new(reference, qty, packaging, variant, None, freshness)
                 .map_err(|e| Error::malformed(format!("source_market quote: {e}")))?;
             let acquire = acquire_context(&ctx, freshness, &commerce_cancel);
             let outcome = drive(&ctx, &commerce_cancel, service.quote(&acquire, request)).await?;
@@ -361,17 +400,29 @@ async fn execute_source_market(
             guard_allowed(
                 &args,
                 op_raw,
-                &["op", "items", "sources", "freshness", "detail"],
+                &[
+                    "op",
+                    "items",
+                    "sources",
+                    "freshness",
+                    "detail",
+                    "variant",
+                    "packaging",
+                ],
             )?;
             let bom = parse_bom(&args)?;
             let (sources, _) = parse_sources(&args)?;
             let freshness = parse_freshness(&args)?;
             let detail = parse_detail(&args)?;
             let acquire = acquire_context(&ctx, freshness, &commerce_cancel);
+            // The caller principal is DERIVED from the tool-run identity,
+            // never from model-supplied arguments: a job can only attach to
+            // or be read by the workspace/session/account that created it.
+            let principal = principal_for(&ctx, &acquire);
             let outcome = drive(
                 &ctx,
                 &commerce_cancel,
-                service.bom(&acquire, sources, freshness, detail, bom),
+                service.bom(&principal, &acquire, sources, freshness, detail, bom),
             )
             .await?;
             match outcome {
@@ -387,10 +438,14 @@ async fn execute_source_market(
                     "source_market job_id must not contain control characters",
                 ));
             }
-            // The deterministic read is synchronous and cheap (one row);
-            // the cancellation bridge still applies.
-            let status =
-                drive(&ctx, &commerce_cancel, async { service.job_status(job_id) }).await?;
+            // The deterministic read is synchronous and cheap (one row); it
+            // is scoped to the caller principal, so another session/account
+            // sees a typed NotFound exactly like a missing job.
+            let principal = CommercePrincipal::new(ctx.identity.workspace_id, ctx.session_id, None);
+            let status = drive(&ctx, &commerce_cancel, async {
+                service.job_status(&principal, job_id)
+            })
+            .await?;
             let status = status.map_err(map_service_error)?;
             compact_job_status("job", &status)
         }
@@ -507,6 +562,71 @@ fn parse_detail(args: &serde_json::Value) -> Result<DetailLevel, Error> {
     }
 }
 
+/// Parse the flat `variant` selection. The value is either a source variant
+/// id or a bounded attribute expression (`颜色=黑色;长度=1m`); the marketplace
+/// adapters resolve an expression through their deterministic
+/// `select_variant` path and never fall back to the cheapest SKU.
+fn parse_variant(args: &serde_json::Value) -> Result<Option<VariantId>, Error> {
+    let Some(value) = args.get("variant") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = value
+        .as_str()
+        .ok_or_else(|| Error::malformed("source_market variant must be a string"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::malformed("source_market variant is empty"));
+    }
+    VariantId::new(trimmed)
+        .map(Some)
+        .map_err(|e| Error::oversized(format!("source_market variant: {e}")))
+}
+
+/// Parse the flat `packaging` selection: exactly the named
+/// [`PackagingType`] kinds (the source-reported `other` is never a request).
+fn parse_packaging(args: &serde_json::Value) -> Result<Option<PackagingType>, Error> {
+    let Some(value) = args.get("packaging") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = value
+        .as_str()
+        .ok_or_else(|| Error::malformed("source_market packaging must be a string"))?;
+    let packaging = match raw {
+        "cut_tape" => PackagingType::CutTape,
+        "tape_and_reel" => PackagingType::TapeAndReel,
+        "digi_reel" => PackagingType::DigiReel,
+        "tray" => PackagingType::Tray,
+        "tube" => PackagingType::Tube,
+        "bulk" => PackagingType::Bulk,
+        "full_reel" => PackagingType::FullReel,
+        "factory_pack" => PackagingType::FactoryPack,
+        other => {
+            return Err(Error::malformed(format!(
+                "source_market packaging {other:?} is not one of {}",
+                PACKAGING_LABELS.join(", ")
+            )))
+        }
+    };
+    Ok(Some(packaging))
+}
+
+/// The caller principal of one job call, derived from the authenticated
+/// tool-run context plus the acquisition account scope. It is never built
+/// from model-supplied arguments.
+fn principal_for(ctx: &ToolRunCtx, acquire: &AcquireCtx) -> CommercePrincipal {
+    CommercePrincipal::new(
+        ctx.identity.workspace_id,
+        ctx.session_id,
+        acquire.account_scope.clone(),
+    )
+}
+
 /// Parse `sources` into a bounded [`SourceSet`]; returns the set plus the
 /// explicit source ids (empty for `auto`).
 fn parse_sources(args: &serde_json::Value) -> Result<(SourceSet, Vec<SourceId>), Error> {
@@ -557,6 +677,11 @@ fn parse_sources(args: &serde_json::Value) -> Result<(SourceSet, Vec<SourceId>),
     Ok((set, named))
 }
 
+/// Parse and validate the flat BOM argument into a commerce [`Bom`]. Every
+/// validated per-line (or top-level default) selection is folded into its
+/// [`BomItem`] via `with_variant`/`with_packaging`, so it is carried into the
+/// item key, the BOM digest and the deterministic job; a selection is never
+/// silently dropped.
 fn parse_bom(args: &serde_json::Value) -> Result<Bom, Error> {
     let items = args
         .get("items")
@@ -571,6 +696,10 @@ fn parse_bom(args: &serde_json::Value) -> Result<Bom, Error> {
             items.len()
         )));
     }
+    // Top-level selections are the default for every line; a line may carry
+    // its own selection, which wins over the top-level default.
+    let top_variant = parse_variant(args)?;
+    let top_packaging = parse_packaging(args)?;
     let mut lines = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let Some(object) = item.as_object() else {
@@ -579,7 +708,7 @@ fn parse_bom(args: &serde_json::Value) -> Result<Bom, Error> {
             )));
         };
         for key in object.keys() {
-            if key != "q" && key != "qty" {
+            if !matches!(key.as_str(), "q" | "qty" | "variant" | "packaging") {
                 return Err(Error::malformed(format!(
                     "source_market bom item {index} does not accept {key:?}"
                 )));
@@ -596,8 +725,34 @@ fn parse_bom(args: &serde_json::Value) -> Result<Bom, Error> {
                 "source_market bom item {index} qty must be at least 1"
             )));
         }
-        let line = BomItem::new(query, qty)
+        let variant = match parse_variant(item) {
+            Ok(Some(variant)) => Some(variant),
+            Ok(None) => top_variant.clone(),
+            Err(error) => {
+                return Err(Error::malformed(format!(
+                    "source_market bom item {index}: {error}"
+                )))
+            }
+        };
+        let packaging = match parse_packaging(item) {
+            Ok(Some(packaging)) => Some(packaging),
+            Ok(None) => top_packaging,
+            Err(error) => {
+                return Err(Error::malformed(format!(
+                    "source_market bom item {index}: {error}"
+                )))
+            }
+        };
+        // The line's selection is folded into the commerce line itself (and
+        // therefore into its item key and the BOM digest), never dropped.
+        let mut line = BomItem::new(query, qty)
             .map_err(|e| Error::malformed(format!("source_market bom item {index}: {e}")))?;
+        if let Some(variant) = variant {
+            line = line.with_variant(variant);
+        }
+        if let Some(packaging) = packaging {
+            line = line.with_packaging(packaging);
+        }
         lines.push(line);
     }
     Bom::new(lines).map_err(|e| Error::malformed(format!("source_market bom: {e}")))
@@ -791,6 +946,23 @@ fn offer_json(offer: &CommercialOffer) -> serde_json::Value {
             .iter()
             .map(|option| option.packaging.as_str())
             .collect::<Vec<_>>(),
+        // The variant matrix rides the product result so an ambiguous
+        // selection can be re-issued as an exact variant id (spec §7:
+        // ambiguous mappings are never resolved by picking one).
+        "variants": offer.variants.iter().map(|variant| serde_json::json!({
+            "variant_id": variant.variant_id.as_str(),
+            "attributes": variant
+                .attributes
+                .iter()
+                .map(|attribute| format!(
+                    "{}={}",
+                    attribute.name.as_str(),
+                    attribute.value.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            "packaging": variant.packaging.map(|packaging| packaging.as_str()),
+            "stock": stock_json(&variant.stock),
+        })).collect::<Vec<_>>(),
         "price_visibility": format!("{:?}", offer.price_visibility).to_ascii_lowercase(),
         "lifecycle": format!("{:?}", offer.lifecycle).to_ascii_lowercase(),
         "observed_at_ms": offer.observed_at_ms,
@@ -889,13 +1061,22 @@ pub fn source_destinations(source: &str) -> &'static [&'static str] {
 ///
 /// Fail closed: a bad rule is a startup error (never silently permissive),
 /// no configured source yields the EMPTY policy (deny everything), and a
-/// browser-gated source whose `[commerce.browser]` block is disabled is not
-/// admitted (it registers Disabled and must not be dialable).
+/// source with no usable path (`Profile` with the browser block disabled, or
+/// a marketplace entry whose browser is disabled and which carries no `api`
+/// credential) is not admitted (it registers Disabled and must not be
+/// dialable).
 pub fn commerce_destination_policy(cfg: &CommerceCfg) -> Result<EgressDestinationPolicy, String> {
     let mut rules: Vec<&'static str> = Vec::new();
     if cfg.enabled {
         for (source, credential) in cfg.connectors.enabled() {
-            if matches!(credential, ConnectorCredential::Profile(_)) && !cfg.browser.enabled {
+            let usable = match credential {
+                ConnectorCredential::Profile(_) => cfg.browser.enabled,
+                ConnectorCredential::Marketplace { api, .. } => {
+                    cfg.browser.enabled || api.is_some()
+                }
+                ConnectorCredential::ApiKey(_) | ConnectorCredential::OAuthPair(_, _) => true,
+            };
+            if !usable {
                 continue;
             }
             for rule in source_destinations(source) {
@@ -1676,6 +1857,240 @@ fn env_name<const MAX: usize>(raw: Option<&str>) -> Result<Option<Text<MAX>>, St
     .transpose()
 }
 
+/// The immutable commercial identity of one configured connector (P0 item 2):
+/// account scope, market and locale resolved from the strict
+/// `[commerce.connectors]` section ONCE at registration. It is injected into
+/// the connector runtime wrapper and every acquisition of that connector
+/// runs under it; a tool/model request can never manufacture or override it.
+pub fn connector_identity(
+    cfg: &CommerceMarketplaceConnectorEntry,
+) -> Result<connectors::ConnectorIdentity, String> {
+    let mut identity = connectors::ConnectorIdentity::anonymous();
+    if let Some(account_scope) = cfg.account_scope() {
+        let account_scope = AccountScope::new(account_scope)
+            .map_err(|e| format!("commerce connector account_scope: {e}"))?;
+        identity = identity.with_account_scope(account_scope);
+    }
+    if let Some(market) = cfg.market() {
+        let market =
+            Text::<32>::new(market).map_err(|e| format!("commerce connector market: {e}"))?;
+        identity = identity.with_market(market);
+    }
+    if let Some(locale) = cfg.locale() {
+        let locale =
+            Text::<32>::new(locale).map_err(|e| format!("commerce connector locale: {e}"))?;
+        identity = identity.with_locale(locale);
+    }
+    Ok(identity)
+}
+
+/// The site connector config of one 1688/alibaba entry: the configured
+/// browser profile, or the source's default profile when the entry only
+/// carries an API credential.
+fn marketplace_connector_config(
+    cfg: &CommerceMarketplaceConnectorEntry,
+    default_profile: &str,
+) -> Result<connectors::ProfileConnectorConfig, String> {
+    let profile = match cfg.browser_profile() {
+        Some(profile) => {
+            Text::<64>::new(profile).map_err(|e| format!("commerce connector profile: {e}"))?
+        }
+        None => Text::<64>::new(default_profile).expect("literal"),
+    };
+    Ok(connectors::ProfileConnectorConfig {
+        enabled: true,
+        profile: Some(profile),
+    })
+}
+
+/// The 1688 Open Platform credential configuration from the strict `api`
+/// block: env-var NAMES only (values are resolved through the injected
+/// credential provider at attach time).
+fn china1688_platform_config(
+    api: &MarketplaceApiCfg,
+) -> Result<connectors::OpenPlatformConfig, connectors::ConfigError> {
+    let env = |field: &'static str, value: Option<&str>| {
+        value
+            .map(str::to_string)
+            .ok_or(connectors::ConfigError::MissingEnvName {
+                connector: "1688",
+                field,
+            })
+    };
+    let mut config = connectors::OpenPlatformConfig::new(
+        &env("app_key_env", api.app_key_env.as_deref())?,
+        &env("app_secret_env", api.app_secret_env.as_deref())?,
+        china1688_scopes(&api.scopes),
+    )?;
+    if let Some(access_token_env) = api.access_token_env.as_deref() {
+        let expires_at_env = env(
+            "access_token_expires_at_env",
+            api.access_token_expires_at_env.as_deref(),
+        )?;
+        config = config.with_access_token(access_token_env, &expires_at_env)?;
+    }
+    Ok(config)
+}
+
+/// The Alibaba Open API credential configuration from the strict `api`
+/// block: env-var NAMES only.
+fn alibaba_open_api_config(
+    api: &MarketplaceApiCfg,
+) -> Result<connectors::OpenApiConfig, connectors::ConfigError> {
+    let env = |field: &'static str, value: Option<&str>| {
+        value
+            .map(str::to_string)
+            .ok_or(connectors::ConfigError::MissingEnvName {
+                connector: "alibaba",
+                field,
+            })
+    };
+    let mut config = connectors::OpenApiConfig::new(
+        &env("app_key_env", api.app_key_env.as_deref())?,
+        &env("app_secret_env", api.app_secret_env.as_deref())?,
+        alibaba_scopes(&api.scopes),
+    )?;
+    if let Some(access_token_env) = api.access_token_env.as_deref() {
+        let expires_at_env = env(
+            "access_token_expires_at_env",
+            api.access_token_expires_at_env.as_deref(),
+        )?;
+        config = config.with_access_token(access_token_env, &expires_at_env)?;
+    }
+    Ok(config)
+}
+
+/// Map the configured 1688 scope labels onto the connector's scope struct.
+fn china1688_scopes(labels: &[String]) -> connectors::China1688ApiScopes {
+    let mut scopes = connectors::China1688ApiScopes::default();
+    for label in labels {
+        match label.as_str() {
+            "discovery" => scopes.discovery = true,
+            "product" => scopes.product = true,
+            "price" => scopes.price = true,
+            "stock" => scopes.stock = true,
+            "supplier" => scopes.supplier = true,
+            "variants" => scopes.variants = true,
+            "moq" => scopes.moq = true,
+            // Startup validation refuses unknown labels.
+            _ => {}
+        }
+    }
+    scopes
+}
+
+/// Map the configured Alibaba scope labels onto the connector's scope
+/// struct.
+fn alibaba_scopes(labels: &[String]) -> connectors::AlibabaApiScopes {
+    let mut scopes = connectors::AlibabaApiScopes::default();
+    for label in labels {
+        match label.as_str() {
+            "seller_product" => scopes.seller_product = true,
+            "buyer_discovery" => scopes.buyer_discovery = true,
+            "trade_terms" => scopes.trade_terms = true,
+            "supplier_profile" => scopes.supplier_profile = true,
+            // Startup validation refuses unknown labels.
+            _ => {}
+        }
+    }
+    scopes
+}
+
+/// Register one enabled 1688/alibaba entry: build the site adapter, attach
+/// its Open Platform/Open API credential when configured, inject the
+/// registration-time identity, and register it under the per-source policy.
+/// Every failure mode registers the source typed Disabled instead of
+/// surfacing at request time.
+#[allow(clippy::too_many_arguments)]
+fn register_marketplace_source<C: connectors::SiteConnector + 'static>(
+    service: &CommerceSourceService,
+    source: &'static str,
+    entry: &CommerceMarketplaceConnectorEntry,
+    default_profile: &str,
+    build: impl FnOnce(&connectors::ProfileConnectorConfig) -> Result<C, connectors::ConfigError>,
+    attach_api: impl FnOnce(
+        C,
+        &CommerceSeams,
+        &Arc<connectors::SecretGuard>,
+    ) -> Result<(C, Option<String>), connectors::ConfigError>,
+    seams: &CommerceSeams,
+    secrets: &Arc<connectors::SecretGuard>,
+    make_runtime: impl Fn(connectors::ConnectorIdentity) -> connectors::ConnectorRuntime,
+    policy: faktor_commerce::connector::ConnectorPolicy,
+) -> Result<ConnectorRegistration, String> {
+    let site_config = match marketplace_connector_config(entry, default_profile) {
+        Ok(site_config) => site_config,
+        Err(error) => {
+            register_disabled_source(service, source, &SourceError::Disabled)?;
+            return Ok(disabled_row(source, error));
+        }
+    };
+    let connector = match build(&site_config) {
+        Ok(connector) => connector,
+        Err(error) => {
+            register_disabled_source(service, source, &SourceError::Disabled)?;
+            return Ok(disabled_row(source, error.to_string()));
+        }
+    };
+    let identity = match connector_identity(entry) {
+        Ok(identity) => identity,
+        Err(error) => {
+            register_disabled_source(service, source, &SourceError::Disabled)?;
+            return Ok(disabled_row(source, error));
+        }
+    };
+    let (connector, api_detail) = match attach_api(connector, seams, secrets) {
+        Ok(value) => value,
+        Err(error) => {
+            let typed = unconfigured_error(source, &error)?;
+            register_disabled_source(service, source, &typed)?;
+            return Ok(disabled_row(source, error.to_string()));
+        }
+    };
+    let profile = site_config
+        .profile
+        .as_ref()
+        .map(Text::as_str)
+        .unwrap_or("-");
+    let detail = match api_detail {
+        Some(api_detail) => format!("profile={profile} {api_detail}"),
+        None => format!("profile={profile}"),
+    };
+    register_serving(
+        service,
+        source,
+        connector,
+        make_runtime(identity),
+        policy,
+        detail,
+    )
+}
+
+/// Build the runtime wrapper for one connector with its immutable configured
+/// identity injected. The identity is applied here, at registration, and the
+/// connector bridge uses it as the authority for account scope/market/locale
+/// — a tool/model request can never supply or override it (P0 item 2).
+fn commerce_connector_runtime(
+    seams: &CommerceSeams,
+    quota: &Arc<connectors::QuotaState>,
+    diagnostics: &Arc<dyn connectors::Diagnostics>,
+    clock: &Arc<dyn connectors::Clock>,
+    identity: connectors::ConnectorIdentity,
+) -> connectors::ConnectorRuntime {
+    let mut runtime = connectors::ConnectorRuntime::new(
+        seams.transport.clone(),
+        quota.clone(),
+        seams.secrets.clone(),
+        diagnostics.clone(),
+        clock.clone(),
+    )
+    .with_identity(identity);
+    if let Some(browser) = &seams.browser {
+        runtime = runtime.with_browser_extraction(browser.clone());
+    }
+    runtime
+}
+
 /// Build the ONE `ConnectorRuntime` template and register every enabled site
 /// adapter through the bridge (spec §10/§14). Registration is
 /// all-or-nothing: any registration refusal fails the daemon at boot rather
@@ -1700,18 +2115,8 @@ pub fn register_commerce_connectors(
         .clone()
         .unwrap_or_else(|| Arc::new(TracingDiagnostics));
     let clock: Arc<dyn connectors::Clock> = Arc::new(connectors::SystemClock);
-    let make_runtime = || {
-        let mut runtime = connectors::ConnectorRuntime::new(
-            seams.transport.clone(),
-            quota.clone(),
-            secrets.clone(),
-            diagnostics.clone(),
-            clock.clone(),
-        );
-        if let Some(browser) = &seams.browser {
-            runtime = runtime.with_browser_extraction(browser.clone());
-        }
-        runtime
+    let make_runtime = |identity: connectors::ConnectorIdentity| {
+        commerce_connector_runtime(seams, &quota, &diagnostics, &clock, identity)
     };
     // Per-source policy: the source's OWN first-party destination allowlist
     // (spec §10) rides its policy into the registry, so the per-source
@@ -1724,75 +2129,78 @@ pub fn register_commerce_connectors(
     };
     let mut rows: Vec<ConnectorRegistration> = Vec::new();
 
-    // 1688 / Alibaba: browser-profile connectors. Without the browser block
-    // they cannot serve any operation, so they register Disabled instead of
-    // failing at request time.
-    if let Some(profile_cfg) = &cfg.connectors.china1688 {
-        if !cfg.browser.enabled {
+    // 1688 / Alibaba: browser-profile connectors with an optional Open
+    // Platform / Open API credential. Without a usable path (browser block
+    // disabled AND no api credential) they cannot serve any operation, so
+    // they register Disabled instead of failing at request time.
+    if let Some(entry) = &cfg.connectors.china1688 {
+        if !cfg.browser.enabled && entry.api().is_none() {
             register_disabled_source(service, "1688", &SourceError::Disabled)?;
-            rows.push(disabled_row("1688", "browser disabled".to_string()));
+            rows.push(disabled_row(
+                "1688",
+                "browser disabled and no api credential".to_string(),
+            ));
         } else {
-            match profile_connector_config(profile_cfg) {
-                None => {
-                    register_disabled_source(service, "1688", &SourceError::Disabled)?;
-                    rows.push(disabled_row("1688", "invalid profile".to_string()));
-                }
-                Some(site_config) => match connectors::China1688Connector::new(&site_config) {
-                    Ok(connector) => rows.push(register_serving(
-                        service,
-                        "1688",
-                        connector,
-                        make_runtime(),
-                        policy_for("1688"),
-                        format!(
-                            "profile={}",
-                            site_config
-                                .profile
-                                .as_ref()
-                                .map(Text::as_str)
-                                .unwrap_or("-")
-                        ),
-                    )?),
-                    Err(error) => {
-                        register_disabled_source(service, "1688", &SourceError::Disabled)?;
-                        rows.push(disabled_row("1688", error.to_string()));
+            rows.push(register_marketplace_source(
+                service,
+                "1688",
+                entry,
+                "procurement-cn",
+                connectors::China1688Connector::new,
+                |connector, seams, secrets| match entry.api() {
+                    None => Ok((connector, None)),
+                    Some(api) => {
+                        let platform = china1688_platform_config(api)?;
+                        let detail = format!("api=open_platform scopes={}", api.scopes.join(","));
+                        let connector = connector.with_open_platform(
+                            &platform,
+                            seams.credentials.clone(),
+                            secrets.clone(),
+                            None,
+                        )?;
+                        Ok((connector, Some(detail)))
                     }
                 },
-            }
+                seams,
+                &secrets,
+                make_runtime,
+                policy_for("1688"),
+            )?);
         }
     }
-    if let Some(profile_cfg) = &cfg.connectors.alibaba {
-        if !cfg.browser.enabled {
+    if let Some(entry) = &cfg.connectors.alibaba {
+        if !cfg.browser.enabled && entry.api().is_none() {
             register_disabled_source(service, "alibaba", &SourceError::Disabled)?;
-            rows.push(disabled_row("alibaba", "browser disabled".to_string()));
+            rows.push(disabled_row(
+                "alibaba",
+                "browser disabled and no api credential".to_string(),
+            ));
         } else {
-            match profile_connector_config(profile_cfg) {
-                None => {
-                    register_disabled_source(service, "alibaba", &SourceError::Disabled)?;
-                    rows.push(disabled_row("alibaba", "invalid profile".to_string()));
-                }
-                Some(site_config) => match connectors::AlibabaConnector::new(&site_config) {
-                    Ok(connector) => rows.push(register_serving(
-                        service,
-                        "alibaba",
-                        connector,
-                        make_runtime(),
-                        policy_for("alibaba"),
-                        format!(
-                            "profile={}",
-                            site_config
-                                .profile
-                                .as_ref()
-                                .map(Text::as_str)
-                                .unwrap_or("-")
-                        ),
-                    )?),
-                    Err(error) => {
-                        register_disabled_source(service, "alibaba", &SourceError::Disabled)?;
-                        rows.push(disabled_row("alibaba", error.to_string()));
+            rows.push(register_marketplace_source(
+                service,
+                "alibaba",
+                entry,
+                "procurement-global",
+                connectors::AlibabaConnector::new,
+                |connector, seams, secrets| match entry.api() {
+                    None => Ok((connector, None)),
+                    Some(api) => {
+                        let open_api = alibaba_open_api_config(api)?;
+                        let detail = format!("api=open_api scopes={}", api.scopes.join(","));
+                        let connector = connector.with_open_api(
+                            &open_api,
+                            seams.credentials.clone(),
+                            secrets.clone(),
+                            None,
+                        )?;
+                        Ok((connector, Some(detail)))
                     }
                 },
-            }
+                seams,
+                &secrets,
+                make_runtime,
+                policy_for("alibaba"),
+            )?);
         }
     }
     // LCSC / Mouser: API-key connectors.
@@ -1806,7 +2214,7 @@ pub fn register_commerce_connectors(
                 service,
                 "lcsc",
                 connector,
-                make_runtime(),
+                make_runtime(connectors::ConnectorIdentity::anonymous()),
                 policy_for("lcsc"),
                 "api_key".to_string(),
             )?),
@@ -1827,7 +2235,7 @@ pub fn register_commerce_connectors(
                 service,
                 "mouser",
                 connector,
-                make_runtime(),
+                make_runtime(connectors::ConnectorIdentity::anonymous()),
                 policy_for("mouser"),
                 "api_key".to_string(),
             )?),
@@ -1854,7 +2262,7 @@ pub fn register_commerce_connectors(
                 service,
                 "digikey",
                 connector,
-                make_runtime(),
+                make_runtime(connectors::ConnectorIdentity::anonymous()),
                 policy_for("digikey"),
                 "oauth".to_string(),
             )?),
@@ -1866,16 +2274,6 @@ pub fn register_commerce_connectors(
         }
     }
     Ok(CommerceRegistration { rows })
-}
-
-fn profile_connector_config(
-    cfg: &CommerceProfileConnectorCfg,
-) -> Option<connectors::ProfileConnectorConfig> {
-    let profile = Text::<64>::new(cfg.profile.as_deref()?).ok()?;
-    Some(connectors::ProfileConnectorConfig {
-        enabled: true,
-        profile: Some(profile),
-    })
 }
 
 /// The production commerce checked transport: the daemon's parsed COMMERCE
@@ -2117,8 +2515,8 @@ fn source_profile(cfg: &CommerceCfg, source: &str) -> Result<String, String> {
     }
 }
 
-fn profile_or_default(cfg: Option<&CommerceProfileConnectorCfg>, default: &str) -> String {
-    cfg.and_then(|cfg| cfg.profile.clone())
+fn profile_or_default(cfg: Option<&CommerceMarketplaceConnectorEntry>, default: &str) -> String {
+    cfg.and_then(|cfg| cfg.browser_profile().map(str::to_string))
         .unwrap_or_else(|| default.to_string())
 }
 
@@ -2270,71 +2668,164 @@ fn doctor(data_dir: &Path, cfg: &CommerceCfg) -> Result<String, String> {
     Ok(out)
 }
 
-fn doctor_source_line(data_dir: &Path, cfg: &CommerceCfg, source: &str) -> String {
-    let configured = cfg
-        .connectors
-        .enabled()
-        .iter()
-        .find(|(id, _)| *id == source)
-        .map(|(_, credential)| *credential);
-    let (configured_label, auth) = match configured {
-        None => ("false".to_string(), "auth=-".to_string()),
-        Some(ConnectorCredential::Profile(profile)) => (
-            "true".to_string(),
-            format!("auth=profile:{}", profile.unwrap_or("-")),
-        ),
-        Some(ConnectorCredential::ApiKey(env)) => {
-            let state = env_var_state(env);
-            (
-                "true".to_string(),
-                format!("auth=api_key:{}:{}", env.unwrap_or("-"), state),
-            )
-        }
-        Some(ConnectorCredential::OAuthPair(id, secret)) => {
-            let id_state = env_var_state(id);
-            let secret_state = env_var_state(secret);
-            (
-                "true".to_string(),
-                format!(
-                    "auth=oauth:{}:{}:{}:{}",
-                    id.unwrap_or("-"),
-                    id_state,
-                    secret.unwrap_or("-"),
-                    secret_state
-                ),
-            )
-        }
+/// The per-source config facts doctor renders: an explicit per-path
+/// vocabulary (browser profile, API credential/authorization, account scope,
+/// granted scopes) instead of one generic `configured=true`. Doctor never
+/// resolves a credential value and never performs a network call;
+/// `api_authorized` is the local static check "every configured env-var name
+/// resolves to a non-empty value".
+struct DoctorApiFacts<'a> {
+    kind: &'static str,
+    names: Vec<(&'static str, &'a str)>,
+    scopes: Vec<&'a str>,
+}
+
+struct DoctorSourceFacts<'a> {
+    configured: bool,
+    browser_profile: Option<&'a str>,
+    account_scope: Option<&'a str>,
+    api: Option<DoctorApiFacts<'a>>,
+}
+
+fn doctor_facts<'a>(cfg: &'a CommerceCfg, source: &str) -> DoctorSourceFacts<'a> {
+    let unconfigured = || DoctorSourceFacts {
+        configured: false,
+        browser_profile: None,
+        account_scope: None,
+        api: None,
     };
-    let profile = cfg
-        .connectors
-        .enabled()
-        .iter()
-        .find(|(id, _)| *id == source)
-        .and_then(|(_, credential)| match credential {
-            ConnectorCredential::Profile(profile) => profile.map(str::to_string),
-            _ => None,
-        });
-    let profile_label = match &profile {
+    match source {
+        "1688" | "alibaba" => {
+            let entry = if source == "1688" {
+                cfg.connectors.china1688.as_ref()
+            } else {
+                cfg.connectors.alibaba.as_ref()
+            };
+            match entry {
+                None => unconfigured(),
+                Some(entry) => DoctorSourceFacts {
+                    configured: true,
+                    browser_profile: entry.browser_profile(),
+                    account_scope: entry.account_scope(),
+                    api: entry.api().map(|api| DoctorApiFacts {
+                        kind: if source == "1688" {
+                            "open_platform"
+                        } else {
+                            "open_api"
+                        },
+                        names: [
+                            ("app_key", api.app_key_env.as_deref()),
+                            ("app_secret", api.app_secret_env.as_deref()),
+                            ("access_token", api.access_token_env.as_deref()),
+                            (
+                                "access_token_expires_at",
+                                api.access_token_expires_at_env.as_deref(),
+                            ),
+                        ]
+                        .into_iter()
+                        .filter_map(|(label, name)| name.map(|name| (label, name)))
+                        .collect(),
+                        scopes: api.scopes.iter().map(String::as_str).collect(),
+                    }),
+                },
+            }
+        }
+        "lcsc" | "mouser" => {
+            let api_key_env = if source == "lcsc" {
+                cfg.connectors
+                    .lcsc
+                    .as_ref()
+                    .and_then(|cfg| cfg.api_key_env.as_deref())
+            } else {
+                cfg.connectors
+                    .mouser
+                    .as_ref()
+                    .and_then(|cfg| cfg.api_key_env.as_deref())
+            };
+            let configured = if source == "lcsc" {
+                cfg.connectors.lcsc.is_some()
+            } else {
+                cfg.connectors.mouser.is_some()
+            };
+            DoctorSourceFacts {
+                configured,
+                browser_profile: None,
+                account_scope: None,
+                api: api_key_env.map(|name| DoctorApiFacts {
+                    kind: "api_key",
+                    names: vec![("api_key", name)],
+                    scopes: Vec::new(),
+                }),
+            }
+        }
+        "digikey" => match cfg.connectors.digikey.as_ref() {
+            None => unconfigured(),
+            Some(api) => DoctorSourceFacts {
+                configured: true,
+                browser_profile: None,
+                account_scope: None,
+                api: Some(DoctorApiFacts {
+                    kind: "oauth",
+                    names: [
+                        ("client_id", api.client_id_env.as_deref()),
+                        ("client_secret", api.client_secret_env.as_deref()),
+                    ]
+                    .into_iter()
+                    .filter_map(|(label, name)| name.map(|name| (label, name)))
+                    .collect(),
+                    scopes: Vec::new(),
+                }),
+            },
+        },
+        _ => unconfigured(),
+    }
+}
+
+fn doctor_source_line(data_dir: &Path, cfg: &CommerceCfg, source: &str) -> String {
+    let facts = doctor_facts(cfg, source);
+    let browser_profile = match facts.browser_profile {
+        None => "browser_profile=absent".to_string(),
         Some(profile) => {
             let dir = data_dir.join("commerce").join("profiles").join(profile);
             format!(
-                "profile={}:{}",
-                profile,
+                "browser_profile=configured profile={profile}:{}",
                 if dir.is_dir() { "present" } else { "absent" }
             )
         }
-        None => "profile=-".to_string(),
     };
-    let credentials_ready = match configured {
-        None => false,
-        Some(ConnectorCredential::Profile(_)) => true,
-        Some(ConnectorCredential::ApiKey(env)) => {
-            env.is_some_and(|name| env_var_state(Some(name)) == "set")
-        }
-        Some(ConnectorCredential::OAuthPair(id, secret)) => {
-            env_var_state(id) == "set" && env_var_state(secret) == "set"
+    let api_credentials = match &facts.api {
+        None => "api_credentials=absent".to_string(),
+        Some(api) => {
+            let names = api
+                .names
+                .iter()
+                .map(|(label, name)| format!("{label}={name}:{}", env_var_state(Some(name))))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("api_credentials=configured kind={} {names}", api.kind)
         }
     };
+    let api_authorized = facts.api.as_ref().is_some_and(|api| {
+        !api.names.is_empty()
+            && api
+                .names
+                .iter()
+                .all(|(_, name)| env_var_state(Some(name)) == "set")
+    });
+    let api_scopes = match &facts.api {
+        Some(api) if !api.scopes.is_empty() => api.scopes.join(","),
+        _ => "-".to_string(),
+    };
+    let account_scope = if facts.account_scope.is_some() {
+        "set"
+    } else {
+        "None"
+    };
+    let credentials_ready = match &facts.api {
+        Some(_) => api_authorized,
+        None => facts.configured && (facts.browser_profile.is_some() || cfg.browser.enabled),
+    };
+    let profile = facts.browser_profile.map(str::to_string);
     let (quota, extraction, verification, registration) = if cfg.enabled {
         let service = commerce_service_for_admin(data_dir, cfg);
         match service {
@@ -2405,7 +2896,8 @@ fn doctor_source_line(data_dir: &Path, cfg: &CommerceCfg, source: &str) -> Strin
         )
     };
     format!(
-        "  {source}: configured={configured_label} {auth} {profile_label} browser={} {quota} {extraction} {verification} {registration}",
+        "  {source}: {browser_profile} {api_credentials} api_authorized={} api_scopes={api_scopes} account_scope={account_scope} browser={} {quota} {extraction} {verification} {registration}",
+        if api_authorized { "yes" } else { "no" },
         if cfg.browser.enabled {
             "enabled"
         } else {
@@ -2499,7 +2991,7 @@ mod acquire_certification;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CommerceCfg, DEFAULT_COMMERCE_DATABASE};
+    use crate::config::{CommerceCfg, CommerceProfileConnectorCfg, DEFAULT_COMMERCE_DATABASE};
     use connectors::testing::{CannedResponse, FixtureTransport, MapCredentials};
     use connectors::HttpTransport as _;
     use faktor_agent::ToolActivationSet;
@@ -2579,12 +3071,33 @@ mod tests {
                 .len(),
             6
         );
+        // The flat variant/packaging selections are top-level and per item.
+        assert_eq!(
+            schema["properties"]["variant"]["maxLength"],
+            MAX_VARIANT_SELECTION_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["packaging"]["enum"],
+            serde_json::json!(PACKAGING_LABELS)
+        );
+        assert_eq!(
+            schema["properties"]["items"]["items"]["properties"]["variant"]["maxLength"],
+            MAX_VARIANT_SELECTION_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["items"]["items"]["properties"]["packaging"]["enum"],
+            serde_json::json!(PACKAGING_LABELS)
+        );
+        assert_eq!(
+            schema["properties"]["items"]["items"]["additionalProperties"],
+            serde_json::json!(false)
+        );
     }
 
     /// Pinned schema size (bytes) and the compact token estimate
     /// (bytes/4 heuristic; the model tokenizer of the deployed provider is
     /// not in the tool layer).
-    const SCHEMA_BYTES: usize = 787;
+    const SCHEMA_BYTES: usize = 1095;
     const SCHEMA_MAX_BYTES: usize = 1536;
     const SCHEMA_MAX_TOKENS: usize = SCHEMA_MAX_BYTES / 4;
 
@@ -2882,7 +3395,10 @@ mod tests {
             .unwrap();
         for source in COMMERCE_CONNECTOR_IDS {
             assert!(
-                out.contains(&format!("  {source}: configured=false")),
+                out.contains(&format!(
+                    "  {source}: browser_profile=absent api_credentials=absent api_authorized=no \
+                     api_scopes=- account_scope=None"
+                )),
                 "{out}"
             );
         }
@@ -2917,7 +3433,11 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            out.contains("mouser: configured=true auth=api_key:FAKTOR_MOUSER_KEY:unset"),
+            out.contains(
+                "mouser: browser_profile=absent api_credentials=configured kind=api_key \
+                 api_key=FAKTOR_MOUSER_KEY:unset api_authorized=no api_scopes=- \
+                 account_scope=None"
+            ),
             "{out}"
         );
         assert!(dir.path().join("commerce").exists());
@@ -3095,10 +3615,40 @@ mod tests {
         }
     }
 
-    fn profile_connector(profile: &str) -> CommerceProfileConnectorCfg {
-        CommerceProfileConnectorCfg {
+    fn profile_connector(profile: &str) -> CommerceMarketplaceConnectorEntry {
+        CommerceMarketplaceConnectorEntry::Profile(CommerceProfileConnectorCfg {
             enabled: true,
             profile: Some(profile.to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn marketplace_connector(
+        browser_profile: Option<&str>,
+        account_scope: Option<&str>,
+        api: Option<crate::config::MarketplaceApiCfg>,
+    ) -> CommerceMarketplaceConnectorEntry {
+        CommerceMarketplaceConnectorEntry::Marketplace(
+            crate::config::CommerceMarketplaceConnectorCfg {
+                enabled: true,
+                browser_profile: browser_profile.map(str::to_string),
+                account_scope: account_scope.map(str::to_string),
+                api,
+            },
+        )
+    }
+
+    fn open_platform_api(
+        app_key: &str,
+        secret: &str,
+        scopes: &[&str],
+    ) -> crate::config::MarketplaceApiCfg {
+        crate::config::MarketplaceApiCfg {
+            app_key_env: Some(app_key.to_string()),
+            app_secret_env: Some(secret.to_string()),
+            access_token_env: None,
+            access_token_expires_at_env: None,
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
         }
     }
 
@@ -3224,7 +3774,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_key_registers_the_source_disabled_and_unavailable() {
+    fn a_missing_key_registers_the_source_disabled_and_degraded() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = CommerceCfg {
             enabled: true,
@@ -3245,9 +3795,10 @@ mod tests {
             service.sources(),
             vec![SourceId::new("mouser").expect("source")]
         );
-        assert_eq!(
-            health_for(&service, "mouser"),
-            faktor_commerce::ConnectorHealth::Unavailable
+        let health = health_for(&service, "mouser");
+        assert!(
+            matches!(health, faktor_commerce::ConnectorHealth::Degraded { .. }),
+            "{health:?}"
         );
 
         // The planner never selects it: `auto` resolves to no source, an
@@ -3300,12 +3851,15 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            doctor
-                .contains("mouser: configured=true auth=api_key:FAKTOR_TEST_MOUSER_MISSING:unset"),
+            doctor.contains(
+                "mouser: browser_profile=absent api_credentials=configured kind=api_key \
+                 api_key=FAKTOR_TEST_MOUSER_MISSING:unset api_authorized=no api_scopes=- \
+                 account_scope=None"
+            ),
             "{doctor}"
         );
         assert!(
-            doctor.contains("registered=true health=unavailable config_state=unconfigured"),
+            doctor.contains("registered=true health=degraded config_state=unconfigured"),
             "{doctor}"
         );
         let status = rt
@@ -3319,10 +3873,10 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            status.contains("sources_registered=1 sources_unavailable=1"),
+            status.contains("sources_registered=1 sources_unavailable=0"),
             "{status}"
         );
-        assert!(status.contains("sources: mouser=unavailable"), "{status}");
+        assert!(status.contains("sources: mouser=degraded"), "{status}");
     }
 
     #[test]
@@ -3341,10 +3895,14 @@ mod tests {
         .unwrap();
         let report = register_with(&service, &cfg, Arc::new(MapCredentials::new()), false);
         assert_eq!(report.registered(), 0);
-        assert_eq!(report.rows[0].detail, "browser disabled");
         assert_eq!(
-            health_for(&service, "1688"),
-            faktor_commerce::ConnectorHealth::Unavailable
+            report.rows[0].detail,
+            "browser disabled and no api credential"
+        );
+        let health = health_for(&service, "1688");
+        assert!(
+            matches!(health, faktor_commerce::ConnectorHealth::Degraded { .. }),
+            "{health:?}"
         );
         assert!(!dir.path().join("commerce").join("profiles").exists());
     }
@@ -3885,5 +4443,1113 @@ mod tests {
             &active,
         );
         assert!(bundle.tool_names().contains(&SOURCE_MARKET_TOOL));
+    }
+
+    // ---- P0/P1: identity injection, selections, API attach, scoped jobs ----
+
+    fn run_ctx_for(session: u64, workspace: u64) -> ToolRunCtx {
+        let mut ctx = run_ctx();
+        ctx.session_id = SessionId::new(session);
+        ctx.identity = WorkspaceIdentity::new(
+            WorkspaceId::new(workspace),
+            WorktreeId::new(workspace),
+            TaskId::new(workspace),
+        );
+        ctx
+    }
+
+    async fn run_with_ctx(
+        ctx: ToolRunCtx,
+        service: Arc<CommerceSourceService>,
+        args: serde_json::Value,
+    ) -> Result<ToolOutcome, Error> {
+        let tool = source_market_tool(service);
+        (tool.execute)(ctx, args).await
+    }
+
+    fn fixture_offer_with_variant(source: &str, mpn: &str) -> CommercialOffer {
+        let source_id = SourceId::new(source).expect("source id");
+        CommercialOffer {
+            source: source_id.clone(),
+            identity: faktor_commerce::ProductIdentity {
+                manufacturer: Some(Text::new("STMicroelectronics").expect("manufacturer")),
+                manufacturer_part_number: Some(Text::new(mpn).expect("mpn")),
+                source_part_number: None,
+                offer_id: Some(Text::new("offer-1").expect("offer id")),
+                canonical_url: None,
+                category: None,
+            },
+            title: Text::new(mpn).expect("title"),
+            description: None,
+            currency: faktor_commerce::Currency::USD,
+            price_breaks: vec![faktor_commerce::PriceBreak {
+                min_quantity: faktor_commerce::NonZeroQuantity::new(1).expect("min qty"),
+                max_quantity: None,
+                unit_price: Money::parse(faktor_commerce::Currency::USD, "1.250000")
+                    .expect("money"),
+                visibility: faktor_commerce::PriceVisibility::Public,
+                account_scope: None,
+                promotion: None,
+            }],
+            variants: vec![faktor_commerce::VariantOffer {
+                variant_id: VariantId::new("sku-black-1m").expect("variant id"),
+                attributes: vec![faktor_commerce::VariantAttribute {
+                    name: Text::new("颜色").expect("attribute name"),
+                    value: Text::new("黑色").expect("attribute value"),
+                }],
+                packaging: Some(PackagingType::CutTape),
+                moq: None,
+                order_multiple: None,
+                standard_pack: None,
+                stock: StockState::InStock {
+                    quantity: faktor_commerce::NonZeroQuantity::new(10).expect("stock"),
+                },
+                price_breaks: Vec::new(),
+                lead_time: None,
+            }],
+            moq: None,
+            order_multiple: None,
+            standard_pack: None,
+            stock: StockState::InStock {
+                quantity: faktor_commerce::NonZeroQuantity::new(1_000).expect("stock"),
+            },
+            lead_time: None,
+            packaging: Vec::new(),
+            supplier: None,
+            manufacturer: None,
+            provenance: faktor_commerce::OfferProvenance {
+                origin: faktor_commerce::ObservationOrigin::OfficialApi,
+                source: source_id,
+                extractor_version: None,
+                connector_version: None,
+                normalization_version: None,
+                content_digest: None,
+                account_scope: None,
+                locale: None,
+                market: None,
+                source_confidence_bp: None,
+            },
+            observed_at_ms: 1,
+            price_visibility: faktor_commerce::PriceVisibility::Public,
+            lifecycle: faktor_commerce::LifecycleStatus::Unknown,
+        }
+    }
+
+    /// A registry-facing connector that records the exact selections and the
+    /// acquisition account scope it was called with.
+    #[derive(Default)]
+    struct QuoteRecordingState {
+        quotes: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+        accounts: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    struct RecordingCommerceConnector {
+        source: SourceId,
+        state: Arc<QuoteRecordingState>,
+        offer: CommercialOffer,
+    }
+
+    #[async_trait::async_trait]
+    impl faktor_commerce::connector::CommerceConnector for RecordingCommerceConnector {
+        fn source(&self) -> SourceId {
+            self.source.clone()
+        }
+
+        fn capabilities(&self) -> faktor_commerce::connector::ConnectorCapabilities {
+            faktor_commerce::connector::ConnectorCapabilities {
+                discovery: true,
+                exact_product: true,
+                quantity_pricing: true,
+                stock: true,
+                packaging: true,
+                account_pricing: false,
+                supplier_data: false,
+                bulk: true,
+                mechanisms: vec![faktor_commerce::AcquisitionMechanism::OfficialApi],
+            }
+        }
+
+        async fn discover(
+            &self,
+            _ctx: &faktor_commerce::connector::AcquireCtx,
+            _req: faktor_commerce::SearchRequest,
+        ) -> Result<Vec<faktor_commerce::connector::Discovery>, SourceError> {
+            Ok(Vec::new())
+        }
+
+        async fn product(
+            &self,
+            _ctx: &faktor_commerce::connector::AcquireCtx,
+            _req: faktor_commerce::ProductRequest,
+        ) -> Result<CommercialOffer, SourceError> {
+            Ok(self.offer.clone())
+        }
+
+        async fn quote(
+            &self,
+            ctx: &faktor_commerce::connector::AcquireCtx,
+            req: QuoteRequest,
+        ) -> Result<Vec<faktor_commerce::connector::QuoteCandidate>, SourceError> {
+            self.state.quotes.lock().unwrap().push((
+                req.variant
+                    .as_ref()
+                    .map(|variant| variant.as_str().to_string()),
+                req.packaging
+                    .map(|packaging| packaging.as_str().to_string()),
+            ));
+            self.state
+                .accounts
+                .lock()
+                .unwrap()
+                .push(ctx.account_scope.as_ref().map(|a| a.as_str().to_string()));
+            Ok(vec![faktor_commerce::connector::QuoteCandidate {
+                resolution: faktor_commerce::price_at_quantity(
+                    &self.offer,
+                    faktor_commerce::VariantRequest::None,
+                    req.quantity.as_quantity(),
+                ),
+                offer: self.offer.clone(),
+                freshness: faktor_commerce::Freshness::Live,
+            }])
+        }
+    }
+
+    /// A site connector that records the identity the runtime wrapper injected
+    /// into its `AcquireCtx`.
+    #[derive(Default)]
+    struct IdentityRecordingState {
+        seen: std::sync::Mutex<Vec<String>>,
+        quotes: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    struct IdentityRecordingSiteConnector {
+        state: Arc<IdentityRecordingState>,
+    }
+
+    #[async_trait::async_trait]
+    impl connectors::SiteConnector for IdentityRecordingSiteConnector {
+        fn source(&self) -> SourceId {
+            SourceId::new("mouser").expect("source")
+        }
+
+        fn capabilities(&self) -> connectors::ConnectorCapabilities {
+            connectors::ConnectorCapabilities {
+                source: SourceId::new("mouser").expect("source"),
+                discovery: connectors::CapabilityLevel::Supported,
+                exact_product: connectors::CapabilityLevel::Supported,
+                quantity_pricing: connectors::CapabilityLevel::Supported,
+                stock: connectors::CapabilityLevel::Supported,
+                packaging: connectors::CapabilityLevel::Supported,
+                account_pricing: connectors::CapabilityLevel::Supported,
+                supplier_data: connectors::CapabilityLevel::Unsupported,
+                bulk: connectors::CapabilityLevel::Supported,
+                mechanisms: vec![connectors::Mechanism::OfficialApi],
+            }
+        }
+
+        async fn discover(
+            &self,
+            ctx: &connectors::AcquireCtx,
+            _req: connectors::SearchRequest,
+        ) -> Result<Vec<connectors::Discovery>, SourceError> {
+            self.record(ctx);
+            Ok(Vec::new())
+        }
+
+        async fn product(
+            &self,
+            ctx: &connectors::AcquireCtx,
+            _req: connectors::ProductRequest,
+        ) -> Result<CommercialOffer, SourceError> {
+            self.record(ctx);
+            Ok(fixture_offer_with_variant("mouser", "TPS5430DDAR"))
+        }
+
+        async fn quote(
+            &self,
+            ctx: &connectors::AcquireCtx,
+            req: connectors::QuoteRequest,
+        ) -> Result<Vec<connectors::QuoteCandidate>, SourceError> {
+            self.record(ctx);
+            self.state.quotes.lock().unwrap().push((
+                req.variant().map(|variant| variant.as_str().to_string()),
+                req.packaging()
+                    .map(|packaging| packaging.as_str().to_string()),
+            ));
+            let offer = fixture_offer_with_variant("mouser", "TPS5430DDAR");
+            Ok(vec![connectors::QuoteCandidate {
+                source: SourceId::new("mouser").expect("source"),
+                resolution: faktor_commerce::price_at_quantity(
+                    &offer,
+                    faktor_commerce::VariantRequest::None,
+                    faktor_commerce::NonZeroQuantity::new(1)
+                        .expect("quantity")
+                        .as_quantity(),
+                ),
+                offer,
+                freshness: faktor_commerce::Freshness::Live,
+            }])
+        }
+    }
+
+    impl IdentityRecordingSiteConnector {
+        fn record(&self, ctx: &connectors::AcquireCtx) {
+            self.state.seen.lock().unwrap().push(format!(
+                "account={:?} market={:?} locale={:?}",
+                ctx.account_scope().map(AccountScope::as_str),
+                ctx.market().map(Text::as_str),
+                ctx.locale().map(Text::as_str),
+            ));
+        }
+    }
+
+    fn test_seams(transport: Arc<FixtureTransport>) -> CommerceSeams {
+        CommerceSeams {
+            transport,
+            browser: None,
+            credentials: Arc::new(MapCredentials::new()),
+            diagnostics: None,
+            secrets: Arc::new(connectors::SecretGuard::new()),
+        }
+    }
+
+    #[test]
+    fn connector_identity_resolves_all_three_components_typed() {
+        let entry = CommerceMarketplaceConnectorEntry::Profile(CommerceProfileConnectorCfg {
+            enabled: true,
+            profile: Some("procurement-cn".to_string()),
+            account_scope: Some("acct-cn-1".to_string()),
+            market: Some("CN".to_string()),
+            locale: Some("zh-CN".to_string()),
+        });
+        let identity = connector_identity(&entry).expect("identity");
+        assert_eq!(
+            identity.account_scope().map(AccountScope::as_str),
+            Some("acct-cn-1")
+        );
+        assert_eq!(identity.market().map(Text::as_str), Some("CN"));
+        assert_eq!(identity.locale().map(Text::as_str), Some("zh-CN"));
+
+        let marketplace = marketplace_connector(Some("procurement-cn"), Some("acct-2"), None);
+        let identity = connector_identity(&marketplace).expect("identity");
+        assert_eq!(
+            identity.account_scope().map(AccountScope::as_str),
+            Some("acct-2")
+        );
+        assert!(identity.market().is_none());
+
+        // Invalid identity values are refused typed, never silently dropped.
+        let bad = CommerceMarketplaceConnectorEntry::Profile(CommerceProfileConnectorCfg {
+            enabled: true,
+            profile: Some("p".to_string()),
+            account_scope: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(connector_identity(&bad).is_err());
+    }
+
+    #[test]
+    fn identity_is_injected_from_config_and_never_from_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        let entry = CommerceMarketplaceConnectorEntry::Profile(CommerceProfileConnectorCfg {
+            enabled: true,
+            profile: Some("procurement-cn".to_string()),
+            account_scope: Some("acct-configured".to_string()),
+            market: Some("CN".to_string()),
+            locale: Some("zh-CN".to_string()),
+        });
+        let seams = test_seams(Arc::new(FixtureTransport::new()));
+        let secrets = Arc::new(connectors::SecretGuard::new());
+        let state = Arc::new(IdentityRecordingState::default());
+        let build_state = state.clone();
+        let diagnostics: Arc<dyn connectors::Diagnostics> = Arc::new(connectors::NoopDiagnostics);
+        let clock: Arc<dyn connectors::Clock> = Arc::new(connectors::SystemClock);
+        let report = register_marketplace_source(
+            &service,
+            "mouser",
+            &entry,
+            "procurement-cn",
+            move |_| {
+                Ok(IdentityRecordingSiteConnector {
+                    state: build_state.clone(),
+                })
+            },
+            |connector, _, _| Ok((connector, None)),
+            &seams,
+            &secrets,
+            |identity| {
+                commerce_connector_runtime(
+                    &seams,
+                    &Arc::new(connectors::QuotaState::new()),
+                    &diagnostics,
+                    &clock,
+                    identity,
+                )
+            },
+            faktor_commerce::connector::ConnectorPolicy::default(),
+        )
+        .expect("registration");
+        assert!(report.registered, "{report:?}");
+
+        // The request context carries a DIFFERENT account scope: the
+        // registration-time identity must win.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let request = QuoteRequest::new(
+            ProductRef::parse("TPS5430DDAR", None).expect("ref"),
+            10,
+            Some(PackagingType::CutTape),
+            None,
+            None,
+            FreshnessMode::Live,
+        )
+        .expect("quote request");
+        rt.block_on(
+            service.quote(
+                &faktor_commerce::connector::AcquireCtx::new()
+                    .with_account(AccountScope::new("acct-from-request").expect("scope")),
+                request,
+            ),
+        )
+        .expect("quote");
+        let seen = state.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the site connector must be called");
+        for line in &seen {
+            assert!(
+                line.contains("account=Some(\"acct-configured\")"),
+                "the configured identity must win: {line}"
+            );
+            assert!(line.contains("market=Some(\"CN\")"), "{line}");
+            assert!(line.contains("locale=Some(\"zh-CN\")"), "{line}");
+        }
+
+        // And the tool schema/args never accept an identity override.
+        let error = rt
+            .block_on(run_with_ctx(
+                run_ctx(),
+                service.clone(),
+                serde_json::json!({
+                    "op": "quote", "ref": "TPS5430DDAR", "qty": 10,
+                    "account_scope": "acct-from-request"
+                }),
+            ))
+            .expect_err("an identity argument must be refused");
+        assert_eq!(error.kind, ErrorKind::Malformed);
+    }
+
+    #[test]
+    fn quote_selections_reach_the_registered_site_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        let entry = marketplace_connector(Some("procurement-cn"), None, None);
+        let seams = test_seams(Arc::new(FixtureTransport::new()));
+        let secrets = Arc::new(connectors::SecretGuard::new());
+        let state = Arc::new(IdentityRecordingState::default());
+        let build_state = state.clone();
+        let diagnostics: Arc<dyn connectors::Diagnostics> = Arc::new(connectors::NoopDiagnostics);
+        let clock: Arc<dyn connectors::Clock> = Arc::new(connectors::SystemClock);
+        let report = register_marketplace_source(
+            &service,
+            "mouser",
+            &entry,
+            "procurement-cn",
+            move |_| {
+                Ok(IdentityRecordingSiteConnector {
+                    state: build_state.clone(),
+                })
+            },
+            |connector, _, _| Ok((connector, None)),
+            &seams,
+            &secrets,
+            |identity| {
+                commerce_connector_runtime(
+                    &seams,
+                    &Arc::new(connectors::QuotaState::new()),
+                    &diagnostics,
+                    &clock,
+                    identity,
+                )
+            },
+            faktor_commerce::connector::ConnectorPolicy::default(),
+        )
+        .expect("registration");
+        assert!(report.registered, "{report:?}");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(run_with_ctx(
+            run_ctx(),
+            service.clone(),
+            serde_json::json!({
+                "op": "quote", "ref": "TPS5430DDAR", "qty": 10,
+                "variant": "颜色=黑色;长度=1m", "packaging": "digi_reel"
+            }),
+        ))
+        .expect("quote");
+        assert_eq!(
+            state.quotes.lock().unwrap().as_slice(),
+            &[(
+                Some("颜色=黑色;长度=1m".to_string()),
+                Some("digi_reel".to_string())
+            )],
+            "the commerce selections must ride the connector bridge'             s with_variant/with_packaging onto the site request"
+        );
+    }
+
+    #[test]
+    fn marketplace_api_registration_attaches_open_platform_and_open_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.china1688 = Some(marketplace_connector(
+            Some("procurement-cn"),
+            Some("acct-cn"),
+            Some(open_platform_api(
+                "FAKTOR_TEST_1688_KEY",
+                "FAKTOR_TEST_1688_SECRET",
+                &["discovery", "product", "price"],
+            )),
+        ));
+        cfg.connectors.alibaba = Some(marketplace_connector(
+            Some("procurement-global"),
+            None,
+            Some(open_platform_api(
+                "FAKTOR_TEST_ALIBABA_KEY",
+                "FAKTOR_TEST_ALIBABA_SECRET",
+                &["buyer_discovery", "trade_terms"],
+            )),
+        ));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        let credentials = Arc::new(
+            MapCredentials::new()
+                .with("FAKTOR_TEST_1688_KEY", "k")
+                .with("FAKTOR_TEST_1688_SECRET", "s")
+                .with("FAKTOR_TEST_ALIBABA_KEY", "k")
+                .with("FAKTOR_TEST_ALIBABA_SECRET", "s"),
+        );
+        let report = register_with(&service, &cfg, credentials, false);
+        assert_eq!(report.registered(), 2, "{:?}", report.rows);
+        let china = &report.rows[0];
+        assert_eq!(
+            china.detail,
+            "profile=procurement-cn api=open_platform scopes=discovery,product,price"
+        );
+        let alibaba = &report.rows[1];
+        assert_eq!(
+            alibaba.detail,
+            "profile=procurement-global api=open_api scopes=buyer_discovery,trade_terms"
+        );
+        let sources: Vec<String> = service
+            .sources()
+            .iter()
+            .map(|source| source.as_str().to_string())
+            .collect();
+        assert_eq!(sources, vec!["1688", "alibaba"]);
+        assert_eq!(
+            health_for(&service, "1688"),
+            faktor_commerce::ConnectorHealth::Healthy
+        );
+
+        // A missing app secret registers Disabled with the NAME in the
+        // detail (never a value).
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.china1688 = Some(marketplace_connector(
+            None,
+            None,
+            Some(open_platform_api(
+                "FAKTOR_TEST_1688_KEY",
+                "FAKTOR_TEST_1688_MISSING_SECRET",
+                &["discovery"],
+            )),
+        ));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        let credentials = Arc::new(MapCredentials::new().with("FAKTOR_TEST_1688_KEY", "k"));
+        let report = register_with(&service, &cfg, credentials, false);
+        assert_eq!(report.registered(), 0);
+        assert!(
+            report.rows[0]
+                .detail
+                .contains("FAKTOR_TEST_1688_MISSING_SECRET"),
+            "{:?}",
+            report.rows
+        );
+        let health = health_for(&service, "1688");
+        assert!(
+            matches!(health, faktor_commerce::ConnectorHealth::Degraded { .. }),
+            "{health:?}"
+        );
+    }
+
+    #[test]
+    fn api_enabled_marketplace_stays_dialable_with_the_browser_disabled() {
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.china1688 = Some(marketplace_connector(
+            None,
+            None,
+            Some(open_platform_api(
+                "FAKTOR_TEST_1688_KEY",
+                "FAKTOR_TEST_1688_SECRET",
+                &["discovery"],
+            )),
+        ));
+        let policy = commerce_destination_policy(&cfg).expect("policy");
+        let url = reqwest::Url::parse("https://gw.open.1688.com/openapi").expect("url");
+        assert!(
+            faktor_provider::egress::check_url(&policy, &url).is_ok(),
+            "an api-only marketplace source must be dialable"
+        );
+        // The browser-only shape with the browser disabled stays denied.
+        let mut browser_only = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        browser_only.connectors.china1688 = Some(profile_connector("procurement-cn"));
+        let policy = commerce_destination_policy(&browser_only).expect("policy");
+        assert!(matches!(
+            faktor_provider::egress::check_url(&policy, &url),
+            Err(EgressError::Denied { .. })
+        ));
+    }
+
+    #[test]
+    fn doctor_prints_explicit_per_source_identity_and_api_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.china1688 = Some(marketplace_connector(
+            Some("procurement-cn"),
+            Some("acct-cn-1"),
+            Some(open_platform_api(
+                "FAKTOR_TEST_1688_KEY",
+                "FAKTOR_TEST_1688_SECRET",
+                &["discovery", "price"],
+            )),
+        ));
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let out = admin_rt()
+            .block_on(run_commerce_admin(
+                CommerceAdminAction::Doctor,
+                dir.path(),
+                &cfg,
+                Arc::new(FakeBrowser {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                }),
+            ))
+            .unwrap();
+        assert!(
+            out.contains(
+                "1688: browser_profile=configured profile=procurement-cn:absent \
+                 api_credentials=configured kind=open_platform \
+                 app_key=FAKTOR_TEST_1688_KEY:unset \
+                 app_secret=FAKTOR_TEST_1688_SECRET:unset api_authorized=no \
+                 api_scopes=discovery,price account_scope=set"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "mouser: browser_profile=absent api_credentials=configured kind=api_key \
+                 api_key=FAKTOR_TEST_MOUSER_KEY:unset api_authorized=no api_scopes=- \
+                 account_scope=None"
+            ),
+            "{out}"
+        );
+        // Never one generic `configured=true`.
+        assert!(!out.contains("configured=true"), "{out}");
+        assert!(!out.contains("auth=api_key"), "{out}");
+    }
+
+    #[test]
+    fn quote_variant_and_packaging_round_trip_through_the_tool_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        let state = Arc::new(QuoteRecordingState::default());
+        service
+            .register(
+                Arc::new(RecordingCommerceConnector {
+                    source: SourceId::new("mouser").expect("source"),
+                    state: state.clone(),
+                    offer: fixture_offer_with_variant("mouser", "TPS5430DDAR"),
+                }),
+                faktor_commerce::connector::ConnectorPolicy::default(),
+            )
+            .expect("register");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // A deterministic exact variant id plus packaging round-trips.
+        let outcome = rt
+            .block_on(run_with_ctx(
+                run_ctx(),
+                service.clone(),
+                serde_json::json!({
+                    "op": "quote", "ref": "TPS5430DDAR", "qty": 10,
+                    "variant": "sku-black-1m", "packaging": "cut_tape"
+                }),
+            ))
+            .expect("quote");
+        assert!(outcome.text.contains("\"status\":\"completed\""));
+        assert_eq!(
+            state.quotes.lock().unwrap().as_slice(),
+            &[(
+                Some("sku-black-1m".to_string()),
+                Some("cut_tape".to_string())
+            )]
+        );
+
+        // A bounded marketplace attribute expression rides the SAME field:
+        // the adapters resolve it through their deterministic select_variant
+        // path (never a cheapest-SKU guess).
+        rt.block_on(run_with_ctx(
+            run_ctx(),
+            service.clone(),
+            serde_json::json!({
+                "op": "quote", "ref": "TPS5430DDAR", "qty": 10,
+                "variant": "颜色=黑色;长度=1m"
+            }),
+        ))
+        .expect("expression quote");
+        assert_eq!(
+            state.quotes.lock().unwrap().last().cloned(),
+            Some((Some("颜色=黑色;长度=1m".to_string()), None))
+        );
+
+        // Oversized/empty/unknown selections fail typed at the boundary.
+        for bad in [
+            serde_json::json!({"op": "quote", "ref": "X", "qty": 1, "variant": "x".repeat(MAX_VARIANT_SELECTION_BYTES + 1)}),
+            serde_json::json!({"op": "quote", "ref": "X", "qty": 1, "variant": "  "}),
+            serde_json::json!({"op": "quote", "ref": "X", "qty": 1, "packaging": "pallet"}),
+        ] {
+            assert!(
+                rt.block_on(run_with_ctx(run_ctx(), service.clone(), bad.clone()))
+                    .is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        // The product result exposes the available variant ids so an
+        // ambiguous selection can be re-issued exactly.
+        let outcome = rt
+            .block_on(run_with_ctx(
+                run_ctx(),
+                service.clone(),
+                serde_json::json!({"op": "product", "ref": "TPS5430DDAR"}),
+            ))
+            .expect("product");
+        assert!(outcome.text.contains("sku-black-1m"), "{}", outcome.text);
+        assert!(outcome.text.contains("颜色=黑色"), "{}", outcome.text);
+    }
+
+    #[test]
+    fn bom_selections_are_validated_and_never_silently_dropped() {
+        let args = serde_json::json!({
+            "op": "bom",
+            "variant": "sku-black-1m",
+            "packaging": "cut_tape",
+            "items": [
+                {"q": "TPS5430DDAR", "qty": 10},
+                {"q": "TPS5430DDAR", "qty": 20, "variant": "sku-white-1m", "packaging": "bulk"}
+            ]
+        });
+        let bom = parse_bom(&args).expect("parse");
+        assert_eq!(bom.items().len(), 2);
+        assert_eq!(
+            bom.items()[0].variant.as_ref().map(VariantId::as_str),
+            Some("sku-black-1m"),
+            "top-level selection is folded into the line"
+        );
+        assert_eq!(bom.items()[0].packaging, Some(PackagingType::CutTape));
+        assert_eq!(
+            bom.items()[1].variant.as_ref().map(VariantId::as_str),
+            Some("sku-white-1m"),
+            "a line selection overrides the default"
+        );
+        assert_eq!(bom.items()[1].packaging, Some(PackagingType::Bulk));
+        assert!(bom.items()[0].has_selection());
+        assert_ne!(
+            bom.items()[0].key(),
+            bom.items()[1].key(),
+            "duplicate queries with different selections stay distinct lines"
+        );
+        assert_ne!(
+            bom.digest(),
+            Bom::from_pairs(&[("TPS5430DDAR", 10), ("TPS5430DDAR", 20)])
+                .expect("unselected bom")
+                .digest(),
+            "selections are part of the BOM digest"
+        );
+
+        // An unselected BOM keeps the frozen pre-selection digest.
+        let plain = parse_bom(&serde_json::json!({
+            "op": "bom",
+            "items": [{"q": "TPS5430DDAR", "qty": 10}]
+        }))
+        .expect("parse");
+        assert!(!plain.items()[0].has_selection());
+        assert_eq!(
+            plain.digest(),
+            Bom::from_pairs(&[("TPS5430DDAR", 10)])
+                .expect("bom")
+                .digest(),
+            "an unselected BOM keeps the frozen digest"
+        );
+
+        // Strictness: unknown item keys and bad selections are typed.
+        for bad in [
+            serde_json::json!({"op": "bom", "items": [{"q": "X", "qty": 1, "note": "hi"}]}),
+            serde_json::json!({"op": "bom", "items": [{"q": "X", "qty": 1}], "packaging": "pallet"}),
+            serde_json::json!({"op": "bom", "items": [{"q": "X", "qty": 1, "variant": ""}]}),
+        ] {
+            assert!(parse_bom(&bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn bom_per_line_selections_round_trip_through_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        let state = Arc::new(QuoteRecordingState::default());
+        service
+            .register(
+                Arc::new(RecordingCommerceConnector {
+                    source: SourceId::new("mouser").expect("source"),
+                    state: state.clone(),
+                    offer: fixture_offer_with_variant("mouser", "TPS5430DDAR"),
+                }),
+                faktor_commerce::connector::ConnectorPolicy::default(),
+            )
+            .expect("register");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let outcome = rt
+            .block_on(run_with_ctx(
+                run_ctx(),
+                service.clone(),
+                serde_json::json!({
+                    "op": "bom",
+                    "sources": ["mouser"],
+                    "freshness": "live",
+                    "items": [
+                        {"q": "TPS5430DDAR", "qty": 10,
+                         "variant": "sku-black-1m", "packaging": "cut_tape"},
+                        {"q": "TPS5430DDAR", "qty": 20, "variant": "sku-white-1m"},
+                        {"q": "TPS5430DDAR", "qty": 30}
+                    ]
+                }),
+            ))
+            .expect("bom");
+        assert!(
+            outcome.text.contains("\"status\":\"completed\""),
+            "{}",
+            outcome.text
+        );
+        assert!(outcome.text.contains("\"matched\":3"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("\"job_id\":\"job_"),
+            "{}",
+            outcome.text
+        );
+
+        // Every line's selection reached the quote engine in request order;
+        // the duplicate query without a selection is a distinct third line.
+        let quotes = state.quotes.lock().unwrap().clone();
+        assert_eq!(quotes.len(), 3, "one quote per durable line");
+        assert_eq!(
+            quotes[0],
+            (
+                Some("sku-black-1m".to_string()),
+                Some("cut_tape".to_string())
+            )
+        );
+        assert_eq!(quotes[1], (Some("sku-white-1m".to_string()), None));
+        assert_eq!(quotes[2], (None, None));
+
+        // The parsed per-line selections are part of the deterministic job
+        // identity: changing one line's selection changes the digest (and a
+        // job can never attach across two different selection sets).
+        let principal = principal_for(&run_ctx(), &AcquireCtx::new());
+        let sources =
+            SourceSet::named(vec![SourceId::new("mouser").expect("source")]).expect("sources");
+        let digest_for = |bom: Bom| {
+            let request = faktor_commerce::bom_request(
+                bom,
+                sources.clone(),
+                FreshnessMode::Live,
+                DetailLevel::Compact,
+                None,
+            );
+            service.digest_for(&principal, &request, None)
+        };
+        let with_packaging = parse_bom(&serde_json::json!({
+            "op": "bom",
+            "items": [
+                {"q": "TPS5430DDAR", "qty": 10,
+                 "variant": "sku-black-1m", "packaging": "cut_tape"},
+                {"q": "TPS5430DDAR", "qty": 20, "variant": "sku-white-1m"},
+                {"q": "TPS5430DDAR", "qty": 30}
+            ]
+        }))
+        .expect("parse");
+        let without_packaging = parse_bom(&serde_json::json!({
+            "op": "bom",
+            "items": [
+                {"q": "TPS5430DDAR", "qty": 10, "variant": "sku-black-1m"},
+                {"q": "TPS5430DDAR", "qty": 20, "variant": "sku-white-1m"},
+                {"q": "TPS5430DDAR", "qty": 30}
+            ]
+        }))
+        .expect("parse");
+        assert_ne!(
+            digest_for(with_packaging.clone()),
+            digest_for(without_packaging),
+            "a changed per-line selection is a different job"
+        );
+        assert_eq!(
+            digest_for(with_packaging.clone()),
+            digest_for(with_packaging),
+            "the same selections produce the same digest"
+        );
+    }
+
+    #[test]
+    fn job_status_and_dedup_are_scoped_to_the_caller_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CommerceCfg {
+            enabled: true,
+            ..CommerceCfg::default()
+        };
+        cfg.connectors.mouser = Some(api_connector("FAKTOR_TEST_MOUSER_KEY"));
+        let service = CommerceSourceService::open(
+            dir.path(),
+            service_config(&cfg),
+            artifacts_for(dir.path()),
+        )
+        .unwrap();
+        service
+            .register(
+                Arc::new(RecordingCommerceConnector {
+                    source: SourceId::new("mouser").expect("source"),
+                    state: Arc::new(QuoteRecordingState::default()),
+                    offer: fixture_offer_with_variant("mouser", "TPS5430DDAR"),
+                }),
+                faktor_commerce::connector::ConnectorPolicy::default(),
+            )
+            .expect("register");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bom_args = serde_json::json!({
+            "op": "bom",
+            "items": [{"q": "TPS5430DDAR", "qty": 10}],
+            "sources": ["mouser"],
+            "freshness": "live"
+        });
+
+        let first = rt
+            .block_on(run_with_ctx(
+                run_ctx_for(1, 1),
+                service.clone(),
+                bom_args.clone(),
+            ))
+            .expect("first job");
+        let first: serde_json::Value = serde_json::from_str(&first.text).expect("json");
+        let job_id = first["job_id"].as_str().expect("job id").to_string();
+
+        // The owner reads its own job.
+        let own = rt
+            .block_on(run_with_ctx(
+                run_ctx_for(1, 1),
+                service.clone(),
+                serde_json::json!({"op": "job", "job_id": job_id}),
+            ))
+            .expect("owner read");
+        let own: serde_json::Value = serde_json::from_str(&own.text).expect("json");
+        assert_eq!(own["job_id"].as_str(), Some(job_id.as_str()));
+
+        // A different session in the same workspace: typed NotFound, exactly
+        // like a missing job.
+        let error = rt
+            .block_on(run_with_ctx(
+                run_ctx_for(2, 1),
+                service.clone(),
+                serde_json::json!({"op": "job", "job_id": job_id}),
+            ))
+            .expect_err("cross-session read");
+        assert_eq!(error.kind, ErrorKind::NotFound);
+        let error = rt
+            .block_on(run_with_ctx(
+                run_ctx_for(1, 2),
+                service.clone(),
+                serde_json::json!({"op": "job", "job_id": job_id}),
+            ))
+            .expect_err("cross-workspace read");
+        assert_eq!(error.kind, ErrorKind::NotFound);
+
+        // Dedup at the durable store: the SAME principal submitting the same
+        // request attaches to the active job; another session/account never
+        // does. (The running tool already advanced the job above, so submit
+        // fresh requests without advancing.)
+        let account_one = AccountScope::new("acct-one").expect("account scope");
+        let acquire_one =
+            faktor_commerce::connector::AcquireCtx::new().with_account(account_one.clone());
+        let principal_one = principal_for(&run_ctx_for(1, 1), &acquire_one);
+        let acquire_two = faktor_commerce::connector::AcquireCtx::new()
+            .with_account(AccountScope::new("acct-two").expect("account scope"));
+        let principal_other_account = principal_for(&run_ctx_for(1, 1), &acquire_two);
+        let principal_other_session = principal_for(
+            &run_ctx_for(2, 1),
+            &faktor_commerce::connector::AcquireCtx::new().with_account(account_one.clone()),
+        );
+        let line = BomItem::new("TPS5430DDAR", 10).expect("item");
+        let request = |account: Option<AccountScope>| {
+            faktor_commerce::bom_request(
+                Bom::new(vec![line.clone()]).expect("bom"),
+                faktor_commerce::SourceSet::named(vec![SourceId::new("mouser").unwrap()])
+                    .expect("sources"),
+                FreshnessMode::Live,
+                DetailLevel::Compact,
+                account,
+            )
+        };
+        let store = service.store().expect("store");
+        let now = faktor_commerce::service::now_ms();
+        let sources = [SourceId::new("mouser").unwrap()];
+        let (job_a, attached_a) = faktor_commerce::jobs::submit_job(
+            store,
+            request(Some(account_one.clone())),
+            &sources,
+            None,
+            &principal_one,
+            now,
+        )
+        .expect("submit a");
+        assert!(!attached_a);
+        let (job_b, attached_b) = faktor_commerce::jobs::submit_job(
+            store,
+            request(Some(account_one.clone())),
+            &sources,
+            None,
+            &principal_one,
+            now,
+        )
+        .expect("submit b");
+        assert!(attached_b, "the same owner must attach");
+        assert_eq!(job_a.id, job_b.id);
+        let (job_c, attached_c) = faktor_commerce::jobs::submit_job(
+            store,
+            request(Some(AccountScope::new("acct-two").expect("scope"))),
+            &sources,
+            None,
+            &principal_other_account,
+            now,
+        )
+        .expect("submit c");
+        assert!(!attached_c, "another account must never attach");
+        assert_ne!(job_a.id, job_c.id);
+        let (job_d, attached_d) = faktor_commerce::jobs::submit_job(
+            store,
+            request(Some(account_one.clone())),
+            &sources,
+            None,
+            &principal_other_session,
+            now,
+        )
+        .expect("submit d");
+        assert!(!attached_d, "another session must never attach");
+        assert_ne!(job_a.id, job_d.id);
+
+        // Scoped reads at the service boundary: wrong owner is NotFound.
+        service
+            .job_status(&principal_one, &job_a.id)
+            .expect("owner read");
+        assert!(matches!(
+            service.job_status(&principal_other_account, &job_a.id),
+            Err(ServiceError::Source(SourceError::ProductNotFound))
+        ));
+        assert!(matches!(
+            service.job_status(&principal_other_session, &job_a.id),
+            Err(ServiceError::Source(SourceError::ProductNotFound))
+        ));
+
+        // A different session NEVER attaches to the active job: it mints its
+        // own job identity.
+        let other = rt
+            .block_on(run_with_ctx(
+                run_ctx_for(2, 1),
+                service.clone(),
+                bom_args.clone(),
+            ))
+            .expect("other session job");
+        let other: serde_json::Value = serde_json::from_str(&other.text).expect("json");
+        assert_ne!(
+            other["job_id"].as_str(),
+            Some(job_id.as_str()),
+            "two sessions must never share one active job"
+        );
+        // And the other session can read ITS job, not the first one.
+        assert!(rt
+            .block_on(run_with_ctx(
+                run_ctx_for(2, 1),
+                service.clone(),
+                serde_json::json!({"op": "job", "job_id": other["job_id"].as_str().unwrap()}),
+            ))
+            .is_ok());
     }
 }

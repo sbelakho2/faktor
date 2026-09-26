@@ -9,6 +9,11 @@
 //! - [`provider`]: the [`provider::ScmProvider`] seam — repository, issue,
 //!   remote ref, branch/PR reconciliation, comment, review events — with no
 //!   provider-specific type anywhere;
+//! - [`completion`]: the thin completion-step adapter
+//!   ([`completion::CompletionScm`] / [`completion::GitHubCompletionScm`])
+//!   the orchestrator's native PR step drives — installation resolution from
+//!   the synced durable rows plus the canonical branch/PR reconciliation,
+//!   never a second SCM domain;
 //! - [`github`]: the real GitHub App adapter (installation-token auth
 //!   through the injected checked transport, minimal repository
 //!   permissions, durable rate-limit backoff, ETag revalidation);
@@ -26,6 +31,7 @@
 //! the domain, and no HTTP client is constructed here (all I/O executes
 //! through the daemon's ONE policy-checked transport).
 
+pub mod completion;
 pub mod error;
 pub mod github;
 pub mod ids;
@@ -36,6 +42,10 @@ pub mod sync;
 pub mod token;
 pub mod webhook;
 
+pub use completion::{
+    CompletionPrRequest, CompletionPrResult, CompletionScm, GitHubCompletionScm,
+    COMPLETION_REPOSITORY_PAGE, MAX_COMPLETION_ORGANIZATION_BYTES,
+};
 pub use error::ScmError;
 pub use github::{
     Clock, GitHubApp, GitHubAppConfig, InstallationToken, InstallationTokenSource, ManualClock,

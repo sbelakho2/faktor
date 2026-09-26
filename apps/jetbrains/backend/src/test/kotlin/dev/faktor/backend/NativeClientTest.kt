@@ -1484,6 +1484,26 @@ object NativeBridgeSmoke {
                     step("task-run listing (GET task-runs)") {
                         println("  runs=${client.taskRuns(sid).size}")
                     }
+                    step("binary attachment upload (image parity)") {
+                        // The SAME durable representation the VS Code client
+                        // uses: bytes -> CAS-backed store -> typed id. Model
+                        // vision validation happens at task admission (Rust
+                        // side), not at upload.
+                        val bytes = byteArrayOf(
+                            0x89.toByte(), 'P'.toByte(), 'N'.toByte(), 'G'.toByte()
+                        )
+                        val uploaded = client.uploadAttachment(
+                            sid,
+                            "image/png",
+                            "shot.png",
+                            java.util.Base64.getEncoder().encodeToString(bytes)
+                        )
+                        if (uploaded.digest.length != 64) fail("digest is not 64 hex chars")
+                        if (uploaded.mime != "image/png") fail("mime mismatch: ${uploaded.mime}")
+                        if (uploaded.size != bytes.size.toLong()) fail("size mismatch")
+                        if (uploaded.filename != "shot.png") fail("filename mismatch")
+                        println("  attachment=${uploaded.digest.take(12)}... size=${uploaded.size}")
+                    }
                     step("agent listing (GET native agents)") {
                         println("  agents=${client.agents(sid).size}")
                     }

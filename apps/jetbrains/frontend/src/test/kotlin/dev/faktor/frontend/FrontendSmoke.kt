@@ -11,12 +11,14 @@ import dev.faktor.backend.BackendProcessManager
 import dev.faktor.backend.NativeClient
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeAttachmentId
 import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
@@ -605,6 +607,26 @@ object FrontendSmoke {
                 "{\"goal\":\"g\"}",
                 NativeRequests.startTaskRun("g")
             )
+            // Image parity: a durable attachment id rides the SAME task-run
+            // DTO member in the same representation the VS Code client uses.
+            val attachmentId = NativeAttachmentId(
+                "a".repeat(64), "image/png", "shot.png", 4
+            )
+            assertEquals(
+                "{\"goal\":\"g\",\"attachments\":[{\"digest\":\"" + "a".repeat(64) +
+                    "\",\"mime\":\"image/png\",\"filename\":\"shot.png\",\"size\":4}]}",
+                NativeRequests.startTaskRun("g", attachments = listOf(attachmentId))
+            )
+            assertEquals(
+                "{\"mime\":\"image/png\",\"filename\":\"shot.png\",\"data_base64\":\"iVBORw==\"}",
+                NativeRequests.uploadAttachment("image/png", "shot.png", "iVBORw==")
+            )
+            val parsedId = parseNativeAttachmentId(
+                "{\"digest\":\"" + "b".repeat(64) +
+                    "\",\"mime\":\"image/png\",\"filename\":null,\"size\":4}"
+            )
+            assertEquals("image/png", parsedId.mime)
+            assertEquals(4L, parsedId.size)
             assertEquals(
                 "{\"goal\":\"g\",\"criteria\":[\"c\"],\"n\":3,\"files\":[\"/tmp/a.rs\"]}",
                 NativeRequests.startTournament("g", listOf("c"), 3, files = listOf("/tmp/a.rs"))
@@ -1723,6 +1745,19 @@ object FrontendSmoke {
             assertTrue(!attachments.files()[0].startsWith(".."), "paths must be absolute")
             attachments.clear()
             assertEquals(0, attachments.count())
+            // Image parity: the classifier mirrors the daemon allowlist and
+            // the bounded read refuses an oversized image before base64.
+            assertEquals("image/png", AttachmentImages.mimeOf("shot.PNG"))
+            assertEquals("image/jpeg", AttachmentImages.mimeOf(dir.toString() + "/a.jpeg"))
+            assertTrue(AttachmentImages.mimeOf(dir.toString() + "/spec.pdf") == null)
+            val shot = Files.createTempFile("faktor-attach-image-", ".png")
+            Files.write(shot, byteArrayOf(1, 2, 3, 4))
+            val read = AttachmentImages.readBounded(shot.toFile())
+            assertTrue(read != null && read.size == 4, "the bounded image read is byte-exact")
+            assertTrue(
+                AttachmentImages.readBounded(shot.toFile(), 3L) == null,
+                "an over-bound image is refused before any upload"
+            )
             val panel = FaktorChatPanel(
                 FaktorFrontendService(
                     Paths.get("target/debug/faktor-cli"),

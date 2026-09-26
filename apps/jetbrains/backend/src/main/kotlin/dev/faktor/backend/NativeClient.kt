@@ -20,6 +20,7 @@ import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
@@ -66,6 +67,7 @@ import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.parseNativeAbortAck
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeAttachmentId
 import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
@@ -266,14 +268,33 @@ class NativeClient(
         maxCostMicro: BigInteger? = null,
         mutationMode: String? = null,
         files: List<String>? = null,
+        attachments: List<NativeAttachmentId>? = null,
         completionContract: NativeCompletionContract? = null
     ): NativeTaskRunStarted = parseNativeTaskRunStarted(
         request(
             "POST", "/native/session/" + encode(sessionId) + "/task-runs", null,
             NativeRequests.startTaskRun(
                 goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
-                completionContract
+                attachments, completionContract
             )
+        )
+    )
+
+    /**
+     * Upload ONE bounded binary attachment (standard base64) into the
+     * session's durable store; the response is the typed id a task start's
+     * `attachments` member accepts. Images use the same representation and
+     * are validated against the chosen model at task admission.
+     */
+    fun uploadAttachment(
+        sessionId: String,
+        mime: String,
+        filename: String? = null,
+        dataBase64: String
+    ): NativeAttachmentId = parseNativeAttachmentId(
+        request(
+            "POST", "/native/session/" + encode(sessionId) + "/attachments", null,
+            NativeRequests.uploadAttachment(mime, filename, dataBase64)
         )
     )
 

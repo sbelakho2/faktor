@@ -30,7 +30,9 @@ use crate::error::{invalid, AcquisitionError, VerificationKind};
 use crate::health::{ConnectorHealth, ExtractionHealth};
 use crate::mechanism::{AcquisitionMechanism, MECHANISM_PRECEDENCE};
 use crate::quota::QuotaState;
-use crate::request::{normalize_identity, AcquisitionRequest, RequestedField, RequestedFreshness};
+use crate::request::{
+    normalize_identity, AcquisitionRequest, RequestedField, RequestedFields, RequestedFreshness,
+};
 
 /// Whether a non-API mechanism may substitute when the official API quota is
 /// exhausted. Default: `false` (never silently circumvent API limits).
@@ -38,6 +40,112 @@ use crate::request::{normalize_identity, AcquisitionRequest, RequestedField, Req
 pub struct SubstitutionPolicy {
     /// The explicit opt-in flag.
     pub allow_non_api_when_api_quota_exhausted: bool,
+}
+
+/// The runtime-facing input bundle of one planning call.
+///
+/// This is the adapter between a production service (which owns requests,
+/// connector registries, caches and health records) and the generic planner:
+/// it names exactly the inputs `docs/acquire.md` §6 requires — capability,
+/// credential availability, quota, cache, health, the advertised mechanisms,
+/// requested freshness and requested fields — and turns them into
+/// [`PlannerInputs`]. It adds no policy of its own.
+///
+/// `mechanisms` is authoritative: a mechanism missing from the advertised
+/// list is treated as ineligible even when the capability map mentions it, so
+/// a caller cannot widen the plan by accident.
+pub struct RuntimeAcquisitionState {
+    /// The raw identity (URL or opaque ref); the planner normalizes it.
+    pub identity: String,
+    /// The fields the caller wants.
+    pub fields: RequestedFields,
+    /// How fresh the result must be.
+    pub freshness: RequestedFreshness,
+    /// Account scope, when the request is account-scoped.
+    pub account_scope: Option<String>,
+    /// The connector's advertised capabilities (mechanism and field levels).
+    pub capability: ConnectorCapabilities,
+    /// Credential availability per mechanism (never credential values).
+    pub credential: CredentialAvailability,
+    /// The quota state of the official API path.
+    pub quota: QuotaState,
+    /// The cache state for this identity.
+    pub cache: CacheState,
+    /// The planner-facing health of the connector at `now_ms`.
+    pub health: ConnectorHealth,
+    /// The mechanisms the connector actually advertises.
+    pub mechanisms: Vec<AcquisitionMechanism>,
+    /// The freshness class TTLs of the cache.
+    pub ttl: FreshnessClassTtl,
+    /// Per-field extraction health memory.
+    pub field_health: ExtractionHealth,
+    /// The current instant.
+    pub now_ms: u64,
+}
+
+impl RuntimeAcquisitionState {
+    /// The canonical request this state plans for.
+    pub fn request(&self) -> AcquisitionRequest {
+        AcquisitionRequest {
+            identity: self.identity.clone(),
+            fields: self.fields.clone(),
+            freshness: self.freshness,
+            account_scope: self.account_scope.clone(),
+        }
+    }
+
+    /// The advertised capabilities restricted to the advertised mechanism
+    /// list: an unadvertised mechanism is demoted to
+    /// [`CapabilityLevel::None`].
+    pub fn restricted_capabilities(&self) -> ConnectorCapabilities {
+        let mut restricted = self.capability.clone();
+        for mechanism in MECHANISM_PRECEDENCE {
+            if self.mechanisms.contains(&mechanism) {
+                continue;
+            }
+            restricted
+                .mechanisms
+                .insert(mechanism, CapabilityLevel::None);
+            if let Some(fields) = restricted.fields.get_mut(&mechanism) {
+                for level in fields.values_mut() {
+                    *level = CapabilityLevel::None;
+                }
+            }
+        }
+        restricted
+    }
+
+    /// Produce a plan with the given planner.
+    pub fn plan(&self, planner: &AcquisitionPlanner) -> AcquisitionPlan {
+        let request = self.request();
+        let capabilities = self.restricted_capabilities();
+        let inputs = PlannerInputs {
+            request: &request,
+            capabilities: &capabilities,
+            health: &self.health,
+            credentials: &self.credential,
+            quota: &self.quota,
+            cache: &self.cache,
+            ttl: &self.ttl,
+            field_health: &self.field_health,
+            now_ms: self.now_ms,
+        };
+        planner.plan(&inputs)
+    }
+}
+
+/// A planner seam: production services depend on this port so the concrete
+/// planner can be observed (tests) or replaced (diagnostics) without touching
+/// the execution path.
+pub trait AcquisitionPlanning: Send + Sync {
+    /// Produce a plan for one runtime state.
+    fn plan(&self, state: &RuntimeAcquisitionState) -> AcquisitionPlan;
+}
+
+impl AcquisitionPlanning for AcquisitionPlanner {
+    fn plan(&self, state: &RuntimeAcquisitionState) -> AcquisitionPlan {
+        RuntimeAcquisitionState::plan(state, self)
+    }
 }
 
 /// A machine-readable note attached to a plan.
@@ -111,6 +219,13 @@ pub enum PlanNote {
 }
 
 /// What the planner decided.
+///
+/// The runtime-facing vocabulary maps one-to-one onto these variants:
+/// `Use(mechanism)` is [`PlanDecision::Acquire`], `ServeCache` is
+/// [`PlanDecision::ServeFromCache`], `HumanRequired` is
+/// [`PlanDecision::RequireVerification`] and `Refuse` is
+/// [`PlanDecision::Refuse`]. A runtime executes exactly one of these; none of
+/// them permits the executor to choose a different mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum PlanDecision {

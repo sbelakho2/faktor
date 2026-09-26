@@ -597,13 +597,31 @@ pub fn build_daemon(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
 ) -> Result<DaemonGraph, String> {
+    // The sync entry is the acquisition-planner seam with no planner: one
+    // shared construction path for steps 1-2 (store/session + CAS) and step 3
+    // (the ONE supervisor), so no parallel authority is ever assembled here.
+    build_daemon_with_acquisition_planner(data_dir, config, None)
+}
+
+/// [`build_daemon`] with an explicit Faktor Acquire planner seam. Every
+/// production entry ([`build_daemon`], the MCP/serve family) passes `None`,
+/// so the ONE commerce service is constructed exactly as before with the
+/// default [`faktor_commerce::service::AcquisitionPlanning`] implementation.
+/// The production-wiring certification passes a spy here to prove the
+/// daemon's REAL `build_daemon_core` assembly invokes
+/// `AcquisitionPlanning::plan()` on the service's execution path. There is no
+/// config key, environment variable or CLI flag for this seam.
+pub fn build_daemon_with_acquisition_planner(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
+) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
-    // 1-2: the durable store + CAS (full integrity scan on this entry).
+    // 1-2: the durable store + CAS (full integrity scan on this entry);
+    // 3: ONE daemon supervisor, exactly as [`build_daemon`].
     let session = SessionManager::open(data_dir.join("store"), data_dir.join("cas"), true)
         .map_err(|e| e.to_string())?;
-    // 3: ONE daemon supervisor (audit P0-40): the SAME Arc supervises every
-    // MCP server child, every hook child, every tool/terminal child.
     let supervisor = ProcessSupervisor::new(session.cas());
     build_daemon_core(
         data_dir,
@@ -613,7 +631,45 @@ pub fn build_daemon(
         vec![],
         None,
         graph::SemanticCfg::default(),
+        planner,
     )
+}
+
+/// The explicit-planner arm of the daemon's commerce construction: identical
+/// validation, disabled parity, service config, connector registration and
+/// artifact wiring to [`tools_market::open_commerce_service_with`], with the
+/// caller's planner installed through
+/// [`faktor_commerce::service::CommerceSourceService::open_with_planner`].
+/// Production never reaches this function (`planner: None` at the step above).
+fn open_commerce_service_with_planner(
+    data_dir: &std::path::Path,
+    cfg: &config::CommerceCfg,
+    artifacts: Arc<dyn faktor_commerce::ArtifactStore>,
+    seams: tools_market::CommerceSeams,
+    planner: Arc<dyn faktor_commerce::service::AcquisitionPlanning>,
+) -> Result<Option<Arc<faktor_commerce::service::CommerceSourceService>>, String> {
+    cfg.validate()?;
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let service = faktor_commerce::service::CommerceSourceService::open_with_planner(
+        data_dir,
+        tools_market::service_config(cfg),
+        artifacts,
+        planner,
+    )
+    .map_err(|e| format!("commerce store: {e}"))?;
+    let registration = tools_market::register_commerce_connectors(&service, cfg, &seams)?;
+    tracing::info!(
+        database = %data_dir
+            .join(faktor_commerce::COMMERCE_DIR_NAME)
+            .join(cfg.database_name())
+            .display(),
+        registered = registration.registered(),
+        disabled = registration.disabled(),
+        "commerce source enabled"
+    );
+    Ok(Some(service))
 }
 
 /// Async daemon build with the MCP layer (spec §31): configured servers are
@@ -725,7 +781,7 @@ async fn build_daemon_with_mcp_inner(
     // 4-16 of the construction order; the servers already ride the ONE
     // supervisor above).
     let mut graph = build_daemon_core(
-        data_dir, session, supervisor, config, mcp_tools, chunk_tx, semantic,
+        data_dir, session, supervisor, config, mcp_tools, chunk_tx, semantic, None,
     )?;
     graph.mcp_servers = servers;
     Ok(graph)
@@ -958,6 +1014,16 @@ fn register_commerce_credential(
     };
     match credential {
         config::ConnectorCredential::ApiKey(Some(name)) => register_env(name),
+        config::ConnectorCredential::Marketplace { api: Some(api), .. } => {
+            // Only the secret-bearing names are registered with the scan
+            // registry; the expiry name holds a timestamp, not a secret.
+            for name in [api.app_key_env, api.app_secret_env, api.access_token_env]
+                .into_iter()
+                .flatten()
+            {
+                register_env(name);
+            }
+        }
         config::ConnectorCredential::OAuthPair(Some(client_id), Some(client_secret)) => {
             register_env(client_id);
             register_env(client_secret);
@@ -1216,6 +1282,7 @@ fn daemon_context_prior(
 /// Callers open the store and create the ONE supervisor (steps 1-3) — the
 /// async MCP connect must ride that same supervisor — and everything else
 /// of the daemon lifetime is this function's construction.
+#[allow(clippy::too_many_arguments)]
 fn build_daemon_core(
     data_dir: &std::path::Path,
     session: Arc<SessionManager>,
@@ -1224,6 +1291,7 @@ fn build_daemon_core(
     extra_tools: Vec<faktor_agent::Tool>,
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
     semantic: graph::SemanticCfg,
+    planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
 ) -> Result<DaemonGraph, String> {
     // Step 4 — checked transport/security: the daemon's ONE sandbox policy
     // from the `[sandbox]` section (destination gate + OS-level
@@ -1389,15 +1457,29 @@ fn build_daemon_core(
     // connectors fill it at registration and the tool gateway + CAS artifact
     // store scrub through the SAME Arc.
     let commerce_secrets = commerce_seams.secrets.clone();
-    let commerce = tools_market::open_commerce_service_with(
-        data_dir,
-        &config.commerce,
-        Arc::new(tools_market::CasArtifacts::with_secrets(
-            cas.clone(),
-            commerce_secrets.clone(),
-        )),
-        commerce_seams,
-    )?;
+    let commerce_artifacts = Arc::new(tools_market::CasArtifacts::with_secrets(
+        cas.clone(),
+        commerce_secrets.clone(),
+    ));
+    // Production (`planner: None`) constructs through the tools_market entry
+    // exactly as before; the `Some` arm exists only for the
+    // production-wiring certification, which proves the planner's `plan()`
+    // runs on this very daemon assembly path.
+    let commerce = match planner {
+        None => tools_market::open_commerce_service_with(
+            data_dir,
+            &config.commerce,
+            commerce_artifacts,
+            commerce_seams,
+        )?,
+        Some(planner) => open_commerce_service_with_planner(
+            data_dir,
+            &config.commerce,
+            commerce_artifacts,
+            commerce_seams,
+            planner,
+        )?,
+    };
     // The builtin tool registry + the MCP tools (a collision never replaces
     // a builtin) and the engine layer the runtime hands its tools: edit
     // engine, CAS-backed checkpoints, the permission engine over the
@@ -3136,13 +3218,70 @@ async fn serve_impl(
         scm_daemon = crate::scm_daemon::build_scm_daemon(
             &config_cloud,
             &data_dir,
-            scm_store,
+            scm_store.clone(),
             graph.transport.clone(),
         )
         .map_err(|e| format!("cloud scm wiring: {e}"))?;
         if let Some(daemon) = &scm_daemon {
             deps = deps.with_scm_webhook(daemon.clone());
             tracing::info!("github app scm surface enabled");
+        }
+        // Completion-step SCM (P0 item 6): the SAME strict
+        // `[cloud.github_app]` section, operator-staged payload and shared
+        // `scm.db` rows the sync/webhook daemon uses feed the canonical
+        // `faktor_scm::GitHubCompletionScm` adapter of the task executor — a
+        // contracted PR step then runs the REAL GitHub App adapter instead
+        // of a private SCM domain. Disabled = no adapter is wired and a
+        // contracted PR step records the explicit
+        // `native_pr_scm_not_configured` blocker (fail closed, never a
+        // silent rebuild without the provider).
+        if let Some(app_cfg) = config_cloud.github_app.as_ref().filter(|app| app.enabled) {
+            app_cfg.validate()?;
+            let payload_root = config_cloud
+                .payload_root(&data_dir)
+                .map_err(|e| format!("cloud config: {e}"))?;
+            let payloads = crate::payload::PayloadDir::new(payload_root);
+            let private_key_name = app_cfg
+                .key_payload
+                .as_deref()
+                .ok_or("cloud github_app: an enabled section requires `private_key`")?;
+            let private_key_pem = payloads
+                .load_private_key_pem(private_key_name)
+                .map_err(|e| format!("cloud github_app: {e}"))?;
+            let organization = app_cfg.organization()?;
+            let app_config = app_cfg.app_config()?;
+            let clock: Arc<dyn faktor_scm::Clock> = Arc::new(faktor_scm::SystemClock);
+            let mut token_config = faktor_scm::GitHubAppTokenConfig {
+                app_id: app_cfg.app_id.unwrap_or(0),
+                private_key_pkcs8_pem: private_key_pem.into(),
+                api_base: app_config.api_base.clone(),
+                user_agent: app_config.user_agent.clone(),
+                ..Default::default()
+            };
+            token_config.max_attempts = token_config.max_attempts.max(1);
+            let tokens = Arc::new(
+                faktor_scm::GitHubAppTokenSource::new(
+                    token_config,
+                    graph.transport.clone(),
+                    clock.clone(),
+                )
+                .map_err(|e| format!("cloud github_app: {e}"))?,
+            );
+            let app = faktor_scm::GitHubApp::new(
+                app_config,
+                graph.transport.clone(),
+                tokens,
+                scm_store.clone(),
+                clock,
+            )
+            .map_err(|e| format!("cloud github_app: {e}"))?;
+            let completion_scm =
+                faktor_scm::GitHubCompletionScm::new(Arc::new(app), scm_store, organization)
+                    .map_err(|e| format!("cloud github_app: {e}"))?;
+            graph
+                .tasks
+                .set_completion_scm_provider(Some(Arc::new(completion_scm)));
+            tracing::info!("github app completion scm enabled");
         }
         tracing::info!("cloud control plane enabled");
     }
@@ -6986,6 +7125,7 @@ mod tests {
             vec![],
             None,
             semantic,
+            None,
         )
         .expect("daemon core builds with a configured semantic provider");
         assert_eq!(graph.semantic.providers().len(), 1);

@@ -322,24 +322,6 @@ pub(crate) fn offer_from_observation(
     Ok(offer)
 }
 
-/// Fill only fields the API did not provide from a browser observation.
-/// Existing API-derived values are never overwritten.
-pub(crate) fn merge_observation(offer: &mut CommercialOffer, observation: &FallbackObservation) {
-    if !offer.stock.is_known() {
-        if let Some(value) = observation.get("availability") {
-            let stock = normalize::parse_stock_label(value);
-            if stock.is_known() {
-                offer.stock = stock;
-            }
-        }
-    }
-    if offer.lead_time.is_none() {
-        if let Some(value) = observation.get("lead_time") {
-            offer.lead_time = normalize::parse_lead_time_label(value);
-        }
-    }
-}
-
 fn normalize_price_breaks(
     part: &Part,
 ) -> Result<(Option<Currency>, Vec<PriceBreak>), NormalizeError> {

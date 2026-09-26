@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use faktor_acquire::health::{ConnectorHealth as AcquireHealth, HealthPolicy, HealthTracker};
+use faktor_acquire::{invalid, AcquisitionError};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::ConditionalValidators;
@@ -128,7 +130,8 @@ impl Cancellation {
 }
 
 /// The acquisition context every connector call receives: deadline,
-/// cancellation, account scope, profile identity, freshness and quota.
+/// cancellation, account scope, profile identity, freshness, quota and the
+/// mechanism the runtime planner chose.
 #[derive(Clone)]
 pub struct AcquireCtx {
     /// The absolute deadline, when the caller set one.
@@ -143,6 +146,9 @@ pub struct AcquireCtx {
     pub freshness: FreshnessMode,
     /// The quota snapshot the planner handed in.
     pub quota: Option<QuotaState>,
+    /// The mechanism the runtime planner chose for this call. Connectors
+    /// execute exactly this mechanism and never select one themselves.
+    pub mechanism: Option<AcquisitionMechanism>,
 }
 
 impl Default for AcquireCtx {
@@ -161,6 +167,7 @@ impl AcquireCtx {
             profile: None,
             freshness: FreshnessMode::PreferCache,
             quota: None,
+            mechanism: None,
         }
     }
 
@@ -192,6 +199,18 @@ impl AcquireCtx {
     pub fn with_freshness(mut self, freshness: FreshnessMode) -> Self {
         self.freshness = freshness;
         self
+    }
+
+    /// Install the mechanism the runtime planner chose. Only the acquisition
+    /// service calls this; a connector must never choose for itself.
+    pub fn with_mechanism(mut self, mechanism: AcquisitionMechanism) -> Self {
+        self.mechanism = Some(mechanism);
+        self
+    }
+
+    /// The mechanism the runtime planner chose, when one was handed in.
+    pub fn mechanism(&self) -> Option<AcquisitionMechanism> {
+        self.mechanism
     }
 
     /// The remaining budget, when a deadline is set.
@@ -667,6 +686,19 @@ impl AcquisitionPath {
             Self::Browser => "browser",
         }
     }
+
+    /// The path that executes a mechanism: the official API and direct HTTP
+    /// are the API path; every browser extraction mechanism is the browser
+    /// path. The service reports outcomes on exactly this path, so no state
+    /// can claim health for a path that was not used.
+    pub const fn of_mechanism(mechanism: AcquisitionMechanism) -> Self {
+        match mechanism {
+            AcquisitionMechanism::OfficialApi | AcquisitionMechanism::DirectHttp => Self::Api,
+            AcquisitionMechanism::BrowserNetwork
+            | AcquisitionMechanism::EmbeddedState
+            | AcquisitionMechanism::Dom => Self::Browser,
+        }
+    }
 }
 
 /// Per-source acquisition policy.
@@ -729,69 +761,174 @@ impl From<RegistryError> for SourceError {
     }
 }
 
-/// One path's independent circuit breaker.
-#[derive(Debug, Clone, Default)]
-struct Breaker {
-    failures: u32,
-    open_until_ms: Option<u64>,
-    last_error: Option<SourceError>,
-}
-
-impl Breaker {
-    fn open_until(&self, now_ms: u64) -> Option<u64> {
-        match self.open_until_ms {
-            Some(until) if until > now_ms => Some(until),
-            Some(_) => None,
-            None => None,
-        }
-    }
-
-    fn note_success(&mut self) {
-        self.failures = 0;
-        self.open_until_ms = None;
-        self.last_error = None;
-    }
-
-    fn note_failure(&mut self, error: &SourceError, policy: &ConnectorPolicy, now_ms: u64) {
-        self.last_error = Some(error.clone());
-        match error {
-            SourceError::RateLimited { retry_after_ms } => {
-                self.open_until_ms = Some(now_ms.saturating_add(*retry_after_ms));
-            }
-            SourceError::QuotaExhausted { reset_ms } => {
-                self.open_until_ms = Some(now_ms.saturating_add(*reset_ms));
-            }
-            SourceError::CoolingDown { until_ms } => {
-                self.open_until_ms = Some(*until_ms);
-            }
-            SourceError::AuthenticationRequired
-            | SourceError::VerificationRequired { .. }
-            | SourceError::Disabled
-            | SourceError::InvalidRequest
-            | SourceError::ProductNotFound
-            | SourceError::VariantAmbiguous
-            | SourceError::Cancelled
-            | SourceError::Deadline => {}
-            _ => {
-                self.failures = self.failures.saturating_add(1);
-                if self.failures >= policy.max_consecutive_failures {
-                    self.open_until_ms = Some(now_ms.saturating_add(policy.cooldown_ms));
-                }
-            }
-        }
+/// Map a domain failure into the acquisition vocabulary, for the one health
+/// state machine ([`HealthTracker`]) the registry delegates to.
+pub fn to_acquisition_error(error: &SourceError) -> AcquisitionError {
+    match error {
+        SourceError::Disabled => AcquisitionError::Disabled,
+        SourceError::InvalidRequest => invalid("invalid request"),
+        SourceError::AuthenticationRequired => AcquisitionError::AuthenticationRequired,
+        SourceError::VerificationRequired { kind } => AcquisitionError::VerificationRequired {
+            kind: to_acquisition_verification(*kind),
+        },
+        SourceError::RateLimited { retry_after_ms } => AcquisitionError::RateLimited {
+            retry_after_ms: *retry_after_ms,
+        },
+        SourceError::QuotaExhausted { reset_ms } => AcquisitionError::QuotaExhausted {
+            reset_ms: *reset_ms,
+        },
+        SourceError::CoolingDown { until_ms } => AcquisitionError::CoolingDown {
+            until_ms: *until_ms,
+        },
+        SourceError::EgressUnavailable => AcquisitionError::EgressUnavailable,
+        SourceError::NetworkTimeout => AcquisitionError::NetworkTimeout,
+        SourceError::ApiUnavailable => AcquisitionError::ApiUnavailable,
+        SourceError::BrowserUnavailable => AcquisitionError::BrowserUnavailable,
+        SourceError::BrowserCrashed => AcquisitionError::BrowserCrashed,
+        SourceError::ProductNotFound => AcquisitionError::NotFound,
+        SourceError::VariantAmbiguous => invalid("variant ambiguous"),
+        SourceError::ExtractionIncomplete => AcquisitionError::ExtractionIncomplete,
+        SourceError::ExtractionConflict => AcquisitionError::ExtractionConflict,
+        // The domain error carries no byte bound; the tracker only needs the
+        // failure class (a degraded transient).
+        SourceError::ResponseTooLarge => AcquisitionError::ResponseTooLarge { limit_bytes: 0 },
+        SourceError::Cancelled => AcquisitionError::Cancelled,
+        SourceError::Deadline => AcquisitionError::Deadline,
+        SourceError::Store => AcquisitionError::Store,
     }
 }
 
+/// Map a domain verification kind onto the acquisition vocabulary.
+pub const fn to_acquisition_verification(
+    kind: VerificationKind,
+) -> faktor_acquire::VerificationKind {
+    match kind {
+        VerificationKind::Captcha
+        | VerificationKind::TwoFactor
+        | VerificationKind::EmailCode
+        | VerificationKind::SmsCode => faktor_acquire::VerificationKind::Challenge,
+        VerificationKind::Login | VerificationKind::Manual => {
+            faktor_acquire::VerificationKind::Consent
+        }
+        VerificationKind::Unknown => faktor_acquire::VerificationKind::Unknown,
+    }
+}
+
+/// Map an acquisition verification kind back onto the domain vocabulary.
+pub const fn to_commerce_verification(kind: faktor_acquire::VerificationKind) -> VerificationKind {
+    match kind {
+        faktor_acquire::VerificationKind::Challenge => VerificationKind::Captcha,
+        faktor_acquire::VerificationKind::Consent => VerificationKind::Manual,
+        faktor_acquire::VerificationKind::Unknown => VerificationKind::Unknown,
+    }
+}
+
+/// Map the single health state machine's state onto the domain health type.
+pub fn health_from_acquisition(health: &AcquireHealth) -> ConnectorHealth {
+    match health {
+        AcquireHealth::Healthy => ConnectorHealth::Healthy,
+        AcquireHealth::Degraded { reason } => ConnectorHealth::Degraded {
+            reason: Text::<256>::new(reason)
+                .unwrap_or_else(|_| Text::from_static_label("degraded")),
+        },
+        AcquireHealth::CoolingDown { until_ms } => ConnectorHealth::CoolingDown {
+            until_ms: *until_ms,
+        },
+        AcquireHealth::RateLimited { until_ms } => ConnectorHealth::RateLimited {
+            until_ms: *until_ms,
+        },
+        AcquireHealth::AuthenticationRequired => ConnectorHealth::AuthenticationRequired,
+        AcquireHealth::VerificationRequired { kind } => ConnectorHealth::VerificationRequired {
+            challenge: Text::from_static_label(match kind {
+                faktor_acquire::VerificationKind::Challenge => "captcha",
+                faktor_acquire::VerificationKind::Consent => "manual",
+                faktor_acquire::VerificationKind::Unknown => "unknown",
+            }),
+        },
+        AcquireHealth::QuotaExhausted { reset_ms } => ConnectorHealth::QuotaExhausted {
+            reset_ms: *reset_ms,
+        },
+        AcquireHealth::Unavailable => ConnectorHealth::Unavailable,
+    }
+}
+
+/// The typed refusal of an unusable path state, when there is one.
+fn unusable_error(health: &AcquireHealth, now_ms: u64) -> Option<SourceError> {
+    match health {
+        AcquireHealth::CoolingDown { until_ms } if now_ms < *until_ms => {
+            Some(SourceError::CoolingDown {
+                until_ms: *until_ms,
+            })
+        }
+        AcquireHealth::RateLimited { until_ms } if now_ms < *until_ms => {
+            Some(SourceError::RateLimited {
+                retry_after_ms: until_ms - now_ms,
+            })
+        }
+        AcquireHealth::AuthenticationRequired => Some(SourceError::AuthenticationRequired),
+        AcquireHealth::VerificationRequired { kind } => Some(SourceError::VerificationRequired {
+            kind: to_commerce_verification(*kind),
+        }),
+        AcquireHealth::QuotaExhausted { reset_ms } if now_ms < *reset_ms => {
+            Some(SourceError::QuotaExhausted {
+                reset_ms: *reset_ms,
+            })
+        }
+        AcquireHealth::Unavailable => Some(SourceError::EgressUnavailable),
+        _ => None,
+    }
+}
+
+/// The open-until instant of a path's state, when it is time-blocked.
+fn open_until(health: Option<&AcquireHealth>, now_ms: u64) -> Option<u64> {
+    match health {
+        Some(
+            AcquireHealth::CoolingDown { until_ms }
+            | AcquireHealth::RateLimited { until_ms }
+            | AcquireHealth::QuotaExhausted { reset_ms: until_ms },
+        ) if *until_ms > now_ms => Some(*until_ms),
+        _ => None,
+    }
+}
+
+/// The registry state: exactly one health/breaker state machine per path
+/// (the acquire [`HealthTracker`]), so there is no second authority whose
+/// state can diverge from what the planner and the service observe.
 #[derive(Default)]
 struct RegistryState {
-    health: BTreeMap<SourceId, ConnectorHealth>,
+    api: BTreeMap<SourceId, HealthTracker>,
+    browser: BTreeMap<SourceId, HealthTracker>,
     last_error: BTreeMap<SourceId, SourceError>,
-    api: BTreeMap<SourceId, Breaker>,
-    browser: BTreeMap<SourceId, Breaker>,
+}
+
+impl RegistryState {
+    fn trackers_mut(&mut self, path: AcquisitionPath) -> &mut BTreeMap<SourceId, HealthTracker> {
+        match path {
+            AcquisitionPath::Api => &mut self.api,
+            AcquisitionPath::Browser => &mut self.browser,
+        }
+    }
+
+    fn health(&self, source: &SourceId, path: AcquisitionPath) -> Option<&AcquireHealth> {
+        let trackers = match path {
+            AcquisitionPath::Api => &self.api,
+            AcquisitionPath::Browser => &self.browser,
+        };
+        trackers.get(source).map(HealthTracker::health)
+    }
+}
+
+/// The tracker policy for one source, derived from its connector policy.
+fn tracker_for(policy: ConnectorPolicy) -> HealthTracker {
+    HealthTracker::new(HealthPolicy {
+        degrade_threshold: policy.max_consecutive_failures,
+        cooldown_ms: policy.cooldown_ms,
+    })
 }
 
 /// The connector registry: connectors by source, capability advertisement,
-/// per-source policy and independent API/browser circuit breakers.
+/// per-source policy and independent API/browser circuit breakers driven by
+/// the one acquire health state machine.
 pub struct ConnectorRegistry {
     connectors: BTreeMap<SourceId, Arc<dyn CommerceConnector>>,
     policies: BTreeMap<SourceId, ConnectorPolicy>,
@@ -874,25 +1011,28 @@ impl ConnectorRegistry {
         self.policies.get(source).copied()
     }
 
-    /// Sources that advertise `capability`, are policy-enabled for the API
-    /// path and are not currently broken.
+    /// Sources that advertise `capability`, are policy-enabled for at least
+    /// one advertised mechanism's path, and have that path currently usable.
+    /// A connector that only advertises browser mechanisms is not hidden by a
+    /// broken API breaker, and vice versa.
     pub fn capable_sources(&self, capability: Capability, now_ms: u64) -> Vec<SourceId> {
         let mut out = Vec::new();
         for (source, connector) in &self.connectors {
             let policy = self.policies.get(source).copied().unwrap_or_default();
-            if !policy.api_enabled {
+            if !policy.api_enabled && !policy.browser_enabled {
                 continue;
             }
-            if !connector.capabilities().has(capability) {
+            let capabilities = connector.capabilities();
+            if !capabilities.has(capability) {
                 continue;
             }
-            if self
-                .path_allowed(source, AcquisitionPath::Api, now_ms)
-                .is_err()
-            {
-                continue;
+            let allowed = capabilities.mechanisms.iter().any(|mechanism| {
+                self.path_allowed(source, AcquisitionPath::of_mechanism(*mechanism), now_ms)
+                    .is_ok()
+            });
+            if allowed {
+                out.push(source.clone());
             }
-            out.push(source.clone());
         }
         out
     }
@@ -923,19 +1063,56 @@ impl ConnectorRegistry {
         Ok(out)
     }
 
-    /// The planner-facing health of a source.
-    pub fn health(&self, source: &SourceId, now_ms: u64) -> ConnectorHealth {
+    /// The health the planner should see for one mechanism's path. It is the
+    /// state of that path's tracker only: a browser outcome can never be
+    /// reported as API health, and the API state can never block a browser
+    /// mechanism that was separately planned.
+    pub fn mechanism_health(
+        &self,
+        source: &SourceId,
+        mechanism: AcquisitionMechanism,
+        _now_ms: u64,
+    ) -> AcquireHealth {
+        let path = AcquisitionPath::of_mechanism(mechanism);
+        let Ok(state) = self.state.lock() else {
+            return AcquireHealth::Unavailable;
+        };
+        state
+            .health(source, path)
+            .cloned()
+            .unwrap_or(AcquireHealth::Healthy)
+    }
+
+    /// The health of one path, independent of the other.
+    pub fn path_health(
+        &self,
+        source: &SourceId,
+        path: AcquisitionPath,
+        _now_ms: u64,
+    ) -> AcquireHealth {
+        let Ok(state) = self.state.lock() else {
+            return AcquireHealth::Unavailable;
+        };
+        state
+            .health(source, path)
+            .cloned()
+            .unwrap_or(AcquireHealth::Healthy)
+    }
+
+    /// The planner-facing health of a source: the API path's state when that
+    /// path has ever been exercised, otherwise the browser path's (a
+    /// browser-only connector), otherwise healthy. Domain display type;
+    /// planning uses [`Self::mechanism_health`].
+    pub fn health(&self, source: &SourceId, _now_ms: u64) -> ConnectorHealth {
         let Ok(state) = self.state.lock() else {
             return ConnectorHealth::Unavailable;
         };
-        if let Some(until) = state.api.get(source).and_then(|b| b.open_until(now_ms)) {
-            return ConnectorHealth::CoolingDown { until_ms: until };
-        }
-        state
-            .health
-            .get(source)
+        let chosen = state
+            .health(source, AcquisitionPath::Api)
+            .or_else(|| state.health(source, AcquisitionPath::Browser))
             .cloned()
-            .unwrap_or(ConnectorHealth::Healthy)
+            .unwrap_or(AcquireHealth::Healthy);
+        health_from_acquisition(&chosen)
     }
 
     /// The last failure recorded for a source, if any.
@@ -946,36 +1123,24 @@ impl ConnectorRegistry {
             .and_then(|state| state.last_error.get(source).cloned())
     }
 
-    /// Record a success on one path: that path's breaker closes.
+    /// Record a success on one path: only that path's tracker moves. A
+    /// browser success never closes the API breaker or clears API-derived
+    /// health, and vice versa.
     pub fn note_success(&self, source: &SourceId, path: AcquisitionPath) {
+        let policy = self.policies.get(source).copied().unwrap_or_default();
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        match path {
-            AcquisitionPath::Api => {
-                if let Some(breaker) = state.api.get_mut(source) {
-                    breaker.note_success();
-                }
-                state
-                    .health
-                    .insert(source.clone(), ConnectorHealth::Healthy);
-            }
-            AcquisitionPath::Browser => {
-                if let Some(breaker) = state.browser.get_mut(source) {
-                    breaker.note_success();
-                }
-                if !state.health.contains_key(source) {
-                    state
-                        .health
-                        .insert(source.clone(), ConnectorHealth::Healthy);
-                }
-            }
-        }
+        let tracker = state
+            .trackers_mut(path)
+            .entry(source.clone())
+            .or_insert_with(|| tracker_for(policy));
+        tracker.on_success();
         state.last_error.remove(source);
     }
 
-    /// Record a failure on one path: only that path's breaker moves, and the
-    /// planner-facing health follows the error.
+    /// Record a failure on one path: only that path's tracker moves, with the
+    /// one acquire health state machine doing the mapping.
     pub fn note_failure(
         &self,
         source: &SourceId,
@@ -987,18 +1152,17 @@ impl ConnectorRegistry {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let breaker = match path {
-            AcquisitionPath::Api => state.api.entry(source.clone()).or_default(),
-            AcquisitionPath::Browser => state.browser.entry(source.clone()).or_default(),
-        };
-        breaker.note_failure(error, &policy, now_ms);
-        state
-            .health
-            .insert(source.clone(), error.clone().into_health());
+        let tracker = state
+            .trackers_mut(path)
+            .entry(source.clone())
+            .or_insert_with(|| tracker_for(policy));
+        tracker.on_error(&to_acquisition_error(error), now_ms);
         state.last_error.insert(source.clone(), error.clone());
     }
 
-    /// May this path be used right now?
+    /// May this path be used right now? Only that path's own state is
+    /// consulted (plus policy), so the API and browser paths are
+    /// independently circuit-broken.
     pub fn path_allowed(
         &self,
         source: &SourceId,
@@ -1020,53 +1184,13 @@ impl ConnectorRegistry {
         let Ok(state) = self.state.lock() else {
             return Err(SourceError::Store);
         };
-        let breaker = match path {
-            AcquisitionPath::Api => state.api.get(source),
-            AcquisitionPath::Browser => state.browser.get(source),
-        };
-        if let Some(until) = breaker.and_then(|b| b.open_until(now_ms)) {
-            return Err(SourceError::CoolingDown { until_ms: until });
-        }
-        match state.health.get(source) {
-            Some(ConnectorHealth::AuthenticationRequired) => {
-                return Err(SourceError::AuthenticationRequired)
-            }
-            Some(ConnectorHealth::VerificationRequired { .. }) => {
-                return Err(SourceError::VerificationRequired {
-                    kind: VerificationKind::Unknown,
-                })
-            }
-            Some(ConnectorHealth::QuotaExhausted { reset_ms }) => {
-                return Err(SourceError::QuotaExhausted {
-                    reset_ms: *reset_ms,
-                })
-            }
-            _ => {}
+        if let Some(error) = state
+            .health(source, path)
+            .and_then(|health| unusable_error(health, now_ms))
+        {
+            return Err(error);
         }
         Ok(())
-    }
-
-    /// Browser fallback is legitimate only for availability/resilience
-    /// failures. A rate-limited, quota-exhausted, unauthenticated or
-    /// verification-blocked API is never bypassed with the browser — that
-    /// would be quota evasion (`docs/acquire.md` §10).
-    pub fn browser_fallback_allowed(
-        &self,
-        source: &SourceId,
-        last_api_error: &SourceError,
-        now_ms: u64,
-    ) -> bool {
-        match last_api_error {
-            SourceError::RateLimited { .. }
-            | SourceError::QuotaExhausted { .. }
-            | SourceError::CoolingDown { .. }
-            | SourceError::AuthenticationRequired
-            | SourceError::VerificationRequired { .. }
-            | SourceError::Disabled => return false,
-            _ => {}
-        }
-        self.path_allowed(source, AcquisitionPath::Browser, now_ms)
-            .is_ok()
     }
 
     /// The independent API and browser breaker states for one source
@@ -1076,8 +1200,8 @@ impl ConnectorRegistry {
             return (None, None);
         };
         (
-            state.api.get(source).and_then(|b| b.open_until(now_ms)),
-            state.browser.get(source).and_then(|b| b.open_until(now_ms)),
+            open_until(state.health(source, AcquisitionPath::Api), now_ms),
+            open_until(state.health(source, AcquisitionPath::Browser), now_ms),
         )
     }
 
@@ -1126,20 +1250,6 @@ impl BrowserAuthority for UnavailableBrowser {
     ) -> Result<BrowserCapture, SourceError> {
         Err(SourceError::BrowserUnavailable)
     }
-}
-
-/// True when this error justifies a browser fallback (the inverse of the
-/// quota-evasion guard, exposed for planning).
-pub fn browser_fallback_justified(error: &SourceError) -> bool {
-    !matches!(
-        error,
-        SourceError::RateLimited { .. }
-            | SourceError::QuotaExhausted { .. }
-            | SourceError::CoolingDown { .. }
-            | SourceError::AuthenticationRequired
-            | SourceError::VerificationRequired { .. }
-            | SourceError::Disabled
-    )
 }
 
 #[cfg(test)]
@@ -1291,7 +1401,26 @@ mod tests {
     }
 
     #[test]
-    fn browser_fallback_never_evades_quota_or_rate_limits() {
+    fn paths_are_independent_and_mechanisms_map_to_the_path_used() {
+        assert_eq!(
+            AcquisitionPath::of_mechanism(AcquisitionMechanism::OfficialApi),
+            AcquisitionPath::Api
+        );
+        assert_eq!(
+            AcquisitionPath::of_mechanism(AcquisitionMechanism::DirectHttp),
+            AcquisitionPath::Api
+        );
+        for mechanism in [
+            AcquisitionMechanism::BrowserNetwork,
+            AcquisitionMechanism::EmbeddedState,
+            AcquisitionMechanism::Dom,
+        ] {
+            assert_eq!(
+                AcquisitionPath::of_mechanism(mechanism),
+                AcquisitionPath::Browser
+            );
+        }
+
         let mut registry = ConnectorRegistry::new();
         registry
             .register(fake("1688", full_capabilities()))
@@ -1299,49 +1428,98 @@ mod tests {
         let source = source("1688");
         let now = 5_000u64;
 
-        assert!(!registry.browser_fallback_allowed(
+        // A browser failure opens only the browser path.
+        registry.note_failure(
             &source,
-            &SourceError::RateLimited {
-                retry_after_ms: 1_000
-            },
-            now
-        ));
-        assert!(!registry.browser_fallback_allowed(
-            &source,
-            &SourceError::QuotaExhausted { reset_ms: 1_000 },
-            now
-        ));
-        assert!(!registry.browser_fallback_allowed(
-            &source,
-            &SourceError::AuthenticationRequired,
-            now
-        ));
-        assert!(!registry.browser_fallback_allowed(
-            &source,
-            &SourceError::VerificationRequired {
-                kind: VerificationKind::Captcha
-            },
-            now
-        ));
-        assert!(registry.browser_fallback_allowed(&source, &SourceError::ApiUnavailable, now));
-        assert!(registry.browser_fallback_allowed(&source, &SourceError::NetworkTimeout, now));
-        assert!(browser_fallback_justified(&SourceError::ApiUnavailable));
-        assert!(!browser_fallback_justified(&SourceError::QuotaExhausted {
-            reset_ms: 1
-        }));
+            AcquisitionPath::Browser,
+            &SourceError::NetworkTimeout,
+            now,
+        );
+        let (api_open, browser_open) = registry.breaker_state(&source, now);
+        assert!(api_open.is_none(), "the api path was not used");
+        assert!(
+            registry
+                .path_allowed(&source, AcquisitionPath::Api, now)
+                .is_ok(),
+            "a browser failure must not block the API path"
+        );
+        assert!(registry
+            .path_allowed(&source, AcquisitionPath::Browser, now)
+            .is_ok());
+        // The mechanism-scoped health is exactly the path that was used.
+        assert_eq!(
+            registry.mechanism_health(&source, AcquisitionMechanism::BrowserNetwork, now),
+            AcquireHealth::Degraded {
+                reason: "network_timeout".to_string()
+            }
+        );
+        assert_eq!(
+            registry.mechanism_health(&source, AcquisitionMechanism::OfficialApi, now),
+            AcquireHealth::Healthy,
+            "browser state never claims API health"
+        );
+        assert!(
+            browser_open.is_none(),
+            "one transient failure is not open yet"
+        );
 
-        // A policy that disables the browser path refuses fallback too.
-        let mut registry = ConnectorRegistry::new();
-        registry
-            .register_with_policy(
-                fake("1688", full_capabilities()),
-                ConnectorPolicy {
-                    browser_enabled: false,
-                    ..ConnectorPolicy::default()
-                },
-            )
-            .expect("registration");
-        assert!(!registry.browser_fallback_allowed(&source, &SourceError::ApiUnavailable, now));
+        // Three transient browser failures open the browser breaker only.
+        for _ in 0..3 {
+            registry.note_failure(
+                &source,
+                AcquisitionPath::Browser,
+                &SourceError::NetworkTimeout,
+                now,
+            );
+        }
+        let (api_open, browser_open) = registry.breaker_state(&source, now);
+        assert!(api_open.is_none());
+        assert_eq!(browser_open, Some(now + 60_000));
+        assert!(matches!(
+            registry.path_allowed(&source, AcquisitionPath::Browser, now),
+            Err(SourceError::CoolingDown { .. })
+        ));
+        assert!(registry
+            .path_allowed(&source, AcquisitionPath::Api, now)
+            .is_ok());
+
+        // A browser success clears the browser path and never the API state.
+        registry.note_failure(
+            &source,
+            AcquisitionPath::Api,
+            &SourceError::NetworkTimeout,
+            now,
+        );
+        registry.note_failure(
+            &source,
+            AcquisitionPath::Api,
+            &SourceError::NetworkTimeout,
+            now,
+        );
+        registry.note_failure(
+            &source,
+            AcquisitionPath::Api,
+            &SourceError::NetworkTimeout,
+            now,
+        );
+        assert!(registry
+            .breaker_state(&source, now)
+            .0
+            .is_some_and(|until| until > now));
+        registry.note_success(&source, AcquisitionPath::Browser);
+        assert!(
+            registry
+                .breaker_state(&source, now)
+                .0
+                .is_some_and(|until| until > now),
+            "a browser success must not close the API breaker"
+        );
+        assert!(
+            registry
+                .path_allowed(&source, AcquisitionPath::Browser, now)
+                .is_ok(),
+            "the browser path recovered on its own success"
+        );
     }
 
     #[test]

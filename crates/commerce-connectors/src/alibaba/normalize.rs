@@ -11,11 +11,11 @@ use faktor_commerce::offer::{
     VariantOffer,
 };
 use faktor_commerce::quantity::NonZeroQuantity;
-use faktor_commerce::text::{CanonicalUrl, Text};
+use faktor_commerce::text::{AccountScope, CanonicalUrl, Text};
 use faktor_commerce::{CommercialOffer, PriceVisibility, ProductIdentity, SourceError, SourceId};
 
 use super::extract::Draft;
-use crate::context::AcquireCtx;
+use crate::context::{AccessVisibility, AcquireCtx};
 use crate::contract::extract::{
     reconcile, Field, FieldObservation, FieldValue, ResolvedField, Strategy, VariantEntry,
 };
@@ -120,6 +120,7 @@ pub fn assemble(
     url: &CanonicalUrl,
     drafts: &[Draft],
     now_ms: u64,
+    access: &AccessVisibility,
 ) -> Result<Assembly, SourceError> {
     let mut observations: BTreeMap<Field, Vec<FieldObservation>> = BTreeMap::new();
     for draft in drafts {
@@ -179,10 +180,13 @@ pub fn assemble(
     let supplier_name = text_of(&resolve(&observations, Field::Supplier));
     let manufacturer_name = text_of(&resolve(&observations, Field::Manufacturer));
 
-    let price_visibility = if inquiry {
-        PriceVisibility::InquiryRequired
+    // Page data decides whether a price exists (an inquiry has no number);
+    // the capture authority — never the mere presence of a numeric price —
+    // decides its visibility.
+    let (price_visibility, price_account_scope) = if inquiry {
+        (PriceVisibility::InquiryRequired, None)
     } else if price.value().is_some() || !variants.is_empty() || drafts_have_tiers(drafts) {
-        PriceVisibility::Public
+        (access.price_visibility(), access.price_account_scope())
     } else {
         return Err(SourceError::ExtractionIncomplete);
     };
@@ -190,7 +194,12 @@ pub fn assemble(
     let price_breaks = if inquiry || !variants.is_empty() {
         Vec::new()
     } else if drafts_have_tiers(drafts) {
-        tiers_of(drafts, currency, price_visibility)?
+        tiers_of(
+            drafts,
+            currency,
+            price_visibility,
+            price_account_scope.clone(),
+        )?
     } else {
         match money_of(&price) {
             Some(unit_price) => vec![PriceBreak {
@@ -198,7 +207,7 @@ pub fn assemble(
                 max_quantity: None,
                 unit_price,
                 visibility: price_visibility,
-                account_scope: None,
+                account_scope: price_account_scope.clone(),
                 promotion: None,
             }],
             None => Vec::new(),
@@ -220,8 +229,8 @@ pub fn assemble(
                     min_quantity: variant.moq.or(moq).unwrap_or_else(one),
                     max_quantity: None,
                     unit_price,
-                    visibility: PriceVisibility::Public,
-                    account_scope: None,
+                    visibility: price_visibility,
+                    account_scope: price_account_scope.clone(),
                     promotion: None,
                 }],
                 _ => Vec::new(),
@@ -320,6 +329,7 @@ fn tiers_of(
     drafts: &[Draft],
     currency: Currency,
     visibility: PriceVisibility,
+    account_scope: Option<AccountScope>,
 ) -> Result<Vec<PriceBreak>, SourceError> {
     let mut ordered: Vec<&Draft> = drafts
         .iter()
@@ -343,7 +353,7 @@ fn tiers_of(
                 .and_then(|(next, _)| NonZeroQuantity::new(next.get().saturating_sub(1)).ok()),
             unit_price: *unit_price,
             visibility,
-            account_scope: None,
+            account_scope: account_scope.clone(),
             promotion: None,
         });
     }

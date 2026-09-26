@@ -11,10 +11,12 @@
 //! * The documented quota (30 calls/min, 1000/day) is installed into the
 //!   shared [`QuotaState`](crate::quota::QuotaState) on every operation, so
 //!   the limits hold no matter how the runtime wired the context.
-//! * Browser fallback is policy-gated (default off) and is attempted only
-//!   for a field the API did not expose or for a URL reference the Search
-//!   API cannot serve. It is structurally impossible on a rate limit or an
-//!   exhausted quota ([`crate::browser::fallback_decision`]).
+//! * Mechanism selection belongs to the runtime `AcquisitionPlanner`: the
+//!   connector executes exactly the [`Mechanism`](crate::contract::Mechanism)
+//!   handed in through the context. The API mechanism never touches the
+//!   browser seam, and a browser mechanism never falls back to the API; a
+//!   request the chosen mechanism cannot serve is refused typed. An
+//!   exhausted API quota therefore refuses rather than silently browsing.
 
 pub mod normalize;
 
@@ -25,7 +27,6 @@ use faktor_commerce::text::CanonicalUrl;
 use faktor_commerce::{CommercialOffer, Freshness, PricingContext, SourceError, SourceId};
 use serde_json::json;
 
-use crate::browser::{self, FallbackCause};
 use crate::config::{ConfigError, MouserConnectorConfig};
 use crate::context::{AcquireCtx, ConnectorEventKind};
 use crate::contract::{
@@ -115,45 +116,30 @@ impl MouserConnector {
         .map_err(|_| SourceError::InvalidRequest)
     }
 
-    /// Fill fields the API did not expose from a policy-gated browser
-    /// observation. Existing API values are never overwritten and a browser
-    /// failure never hides the API result.
-    async fn fill_absent_fields(&self, ctx: &AcquireCtx, offer: &mut CommercialOffer) {
-        if offer.stock.is_known() && offer.lead_time.is_some() {
-            return;
-        }
-        let Some(url) = offer.identity.canonical_url.clone() else {
-            return;
-        };
-        let wanted: &[&'static str] = &["availability", "lead_time"];
-        match browser::attempt(
-            ctx,
-            &self.source,
-            FallbackCause::FieldAbsentFromApi,
-            &url,
-            wanted,
-        )
-        .await
-        {
-            Ok(Some(observation)) => normalize::merge_observation(offer, &observation),
-            Ok(None) => {}
-            Err(_) => ctx.record(
-                &self.source,
-                "browser_fallback",
-                ConnectorEventKind::Note,
-                None,
-                Some("fallback_failed"),
-            ),
-        }
+    /// The mechanism the runtime planner chose, or a typed refusal when the
+    /// caller ran the connector outside the runtime.
+    fn chosen_mechanism(ctx: &AcquireCtx) -> Result<Mechanism, SourceError> {
+        ctx.mechanism().ok_or(SourceError::InvalidRequest)
     }
 
-    /// A URL reference cannot be served by the Search API: only the browser
-    /// (when the policy enables it) can inspect it.
-    async fn product_from_url(
+    /// True for the browser extraction mechanisms; the API mechanisms are
+    /// the official API and direct first-party HTTP.
+    fn is_browser(mechanism: Mechanism) -> bool {
+        matches!(
+            mechanism,
+            Mechanism::BrowserNetwork | Mechanism::EmbeddedState | Mechanism::Dom
+        )
+    }
+
+    /// Execute the browser mechanism for a URL reference. Only reached when
+    /// the planner chose a browser mechanism; the API path never calls it
+    /// and vice versa.
+    async fn product_from_browser(
         &self,
         ctx: &AcquireCtx,
         url: &CanonicalUrl,
     ) -> Result<CommercialOffer, SourceError> {
+        let provider = ctx.browser().ok_or(SourceError::BrowserUnavailable)?;
         let wanted: &[&'static str] = &[
             "mpn",
             "manufacturer",
@@ -161,20 +147,15 @@ impl MouserConnector {
             "availability",
             "lead_time",
         ];
-        match browser::attempt(
-            ctx,
+        ctx.record(
             &self.source,
-            FallbackCause::FieldAbsentFromApi,
-            url,
-            wanted,
-        )
-        .await?
-        {
-            Some(observation) => {
-                normalize::offer_from_observation(&observation, url, &self.source, ctx)
-            }
-            None => Err(SourceError::InvalidRequest),
-        }
+            "browser",
+            ConnectorEventKind::Request,
+            None,
+            Some("mechanism=browser"),
+        );
+        let observation = provider.observe(ctx, &self.source, url, wanted).await?;
+        normalize::offer_from_observation(&observation, url, &self.source, ctx)
     }
 }
 
@@ -210,6 +191,10 @@ impl SiteConnector for MouserConnector {
     ) -> Result<Vec<Discovery>, SourceError> {
         ctx.check_alive()?;
         reject_cache_only(req.freshness())?;
+        // The Search API is the only executable discovery mechanism.
+        if Self::chosen_mechanism(ctx)? != Mechanism::OfficialApi {
+            return Err(SourceError::InvalidRequest);
+        }
         self.ensure_quota(ctx);
         let query = req.query().as_str();
         let (endpoint, body) = if crate::normalize::looks_like_mpn(query) {
@@ -245,9 +230,21 @@ impl SiteConnector for MouserConnector {
     ) -> Result<CommercialOffer, SourceError> {
         ctx.check_alive()?;
         reject_cache_only(req.freshness())?;
+        let mechanism = Self::chosen_mechanism(ctx)?;
+        if Self::is_browser(mechanism) {
+            let ProductReference::Url(url) = req.reference() else {
+                return Err(SourceError::InvalidRequest);
+            };
+            return self.product_from_browser(ctx, url).await;
+        }
+        if mechanism != Mechanism::OfficialApi {
+            return Err(SourceError::InvalidRequest);
+        }
         self.ensure_quota(ctx);
-        if let ProductReference::Url(url) = req.reference() {
-            return self.product_from_url(ctx, url).await;
+        // The Search API cannot serve a bare URL reference; under the API
+        // mechanism that is a typed refusal, never a silent browser switch.
+        if let ProductReference::Url(_) = req.reference() {
+            return Err(SourceError::InvalidRequest);
         }
         let body = Self::part_number_body(req.reference().as_str())?;
         let response = http::send(
@@ -259,9 +256,7 @@ impl SiteConnector for MouserConnector {
         .await?;
         http::map_status(&response)?;
         let parsed = normalize::parse_search_response(response.body())?;
-        let mut offer = normalize::first_offer(&parsed, &self.source, ctx)?;
-        self.fill_absent_fields(ctx, &mut offer).await;
-        Ok(offer)
+        normalize::first_offer(&parsed, &self.source, ctx)
     }
 
     async fn quote(
@@ -292,7 +287,6 @@ impl SiteConnector for MouserConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::FallbackPolicy;
     use crate::config::MouserConnectorConfig;
     use crate::contract::RequestedFreshness;
     use crate::normalize::validate_tiers;
@@ -520,7 +514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_fallback_is_off_by_default_and_never_evades_429() {
+    async fn api_mechanism_never_evades_429_or_switches_to_the_browser() {
         let browser = Arc::new(RecordingBrowser::returning(
             crate::browser::FallbackObservation::new(vec![(
                 text("availability"),
@@ -528,9 +522,7 @@ mod tests {
             )])
             .expect("observation"),
         ));
-        let rig = Rig::new()
-            .browser(browser.clone())
-            .policy(FallbackPolicy::enabled());
+        let rig = Rig::new().browser(browser.clone());
         rig.transport.push(CannedResponse::with_status(429, "{}"));
         let connector = mouser_connector(&rig.secrets);
         let error = connector
@@ -546,11 +538,11 @@ mod tests {
         assert_eq!(
             browser.calls(),
             0,
-            "a 429 is never bypassed with the browser"
+            "an API-mechanism call never touches the browser"
         );
 
-        // Default policy (off) with an injecting browser: the refusal is the
-        // policy, and the browser stays untouched too.
+        // Missing fields under the API mechanism stay missing: no silent
+        // browser fill, even with a provider injected.
         let browser = Arc::new(RecordingBrowser::new());
         let rig = Rig::new().browser(browser.clone());
         rig.transport.push(CannedResponse::new(
@@ -570,9 +562,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_fields_are_filled_from_the_browser_only_when_enabled() {
+    async fn browser_mechanism_executes_the_browser_instead_of_the_api() {
         let browser = Arc::new(RecordingBrowser::returning(
             crate::browser::FallbackObservation::new(vec![
+                (text("mpn"), text("TPS5430DDA")),
+                (text("manufacturer"), text("Texas Instruments")),
                 (text("availability"), text("42 In Stock")),
                 (text("lead_time"), text("6 Weeks")),
             ])
@@ -580,27 +574,23 @@ mod tests {
         ));
         let rig = Rig::new()
             .browser(browser.clone())
-            .policy(FallbackPolicy::enabled());
-        rig.transport.push(CannedResponse::new(
-            200,
-            fixture_body("mouser/missing_fields.json"),
-        ));
+            .mechanism(Mechanism::BrowserNetwork);
+        let url = CanonicalUrl::parse(
+            "https://www.mouser.com/ProductDetail/Texas-Instruments/TPS5430DDA",
+        )
+        .expect("url");
         let connector = mouser_connector(&rig.secrets);
         let offer = connector
-            .product(
-                &rig.ctx(),
-                ProductRequest::new(ProductReference::ManufacturerPartNumber(text("TPS5430DDA"))),
-            )
+            .product(&rig.ctx(), ProductRequest::new(ProductReference::Url(url)))
             .await
-            .expect("offer");
+            .expect("browser offer");
         assert_eq!(offer.stock.available_quantity(), Some(42));
-        assert_eq!(
-            offer.lead_time,
-            Some(faktor_commerce::LeadTime::new(42, 42).expect("lead"))
-        );
         assert_eq!(browser.calls(), 1);
-        // The API-derived price list is untouched.
-        assert_eq!(offer.price_breaks.len(), 1);
+        assert_eq!(
+            rig.transport.request_count(),
+            0,
+            "a browser-mechanism call never touches the API"
+        );
     }
 
     #[tokio::test]
@@ -631,7 +621,7 @@ mod tests {
         ));
         let rig = Rig::new()
             .browser(browser.clone())
-            .policy(FallbackPolicy::enabled());
+            .mechanism(Mechanism::BrowserNetwork);
         let connector = mouser_connector(&rig.secrets);
         let offer = connector
             .product(&rig.ctx(), ProductRequest::new(ProductReference::Url(url)))
@@ -643,6 +633,7 @@ mod tests {
             faktor_commerce::PriceVisibility::Unknown
         );
         assert_eq!(browser.calls(), 1);
+        assert_eq!(rig.transport.request_count(), 0, "no API request");
     }
 
     #[tokio::test]

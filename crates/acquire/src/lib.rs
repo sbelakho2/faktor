@@ -78,7 +78,8 @@ pub use http::{
 };
 pub use mechanism::{AcquisitionMechanism, MECHANISM_PRECEDENCE};
 pub use planner::{
-    AcquisitionPlan, AcquisitionPlanner, PlanDecision, PlanNote, PlannerInputs, SubstitutionPolicy,
+    AcquisitionPlan, AcquisitionPlanner, AcquisitionPlanning, PlanDecision, PlanNote,
+    PlannerInputs, RuntimeAcquisitionState, SubstitutionPolicy,
 };
 pub use provenance::{content_digest, AcquisitionProvenance};
 pub use quota::{parse_retry_after_seconds, QuotaState, QuotaWindow, MAX_THROTTLE_SCALE};

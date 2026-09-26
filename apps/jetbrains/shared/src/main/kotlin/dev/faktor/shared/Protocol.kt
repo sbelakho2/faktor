@@ -100,3 +100,16 @@ class BearerAuth(val password: String) {
         const val HEADER_NAME: String = "Authorization"
     }
 }
+
+/**
+ * ASCII-only lowercase that compiles across the whole supported kotlinc
+ * range: 1.3 has no `String.lowercase()`, and kotlinc >= 1.5 rejects the
+ * deprecated `String.toLowerCase()` under the split-mode smoke's warning
+ * policy. Only ASCII case is folded, which is all these call sites need
+ * (OS names, MIME extensions, endpoint schemes/hosts).
+ */
+fun asciiLowerCase(text: String): String {
+    val out = StringBuilder(text.length)
+    for (ch in text) out.append(Character.toLowerCase(ch))
+    return out.toString()
+}

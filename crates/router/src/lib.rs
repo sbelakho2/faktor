@@ -3078,6 +3078,36 @@ mod tests {
         assert_paths_never_select_bad(&good_desc(), &bad, &tools_req, "hard-rate-limit axis");
     }
 
+    /// P1 item 10: when a turn carries image parts the runtime adds the
+    /// `vision` capability requirement; qualification must then exclude
+    /// every non-vision candidate (fail closed) while the same candidates
+    /// stay eligible for a text-only request.
+    #[test]
+    fn vision_requirement_excludes_non_vision_candidates() {
+        let vision = {
+            let mut d = good_desc();
+            d.vision = true;
+            d
+        };
+        let no_vision = cheap_bad_desc();
+        assert!(!no_vision.vision, "the cheap competitor is vision-less");
+        let req = tiny_req(&["tools", "streaming", "vision"], 60);
+        assert_paths_never_select_bad(&vision, &no_vision, &req, "vision axis");
+        // With no vision-capable candidate the route is a typed capability
+        // refusal NAMING the missing capability (never a silent downgrade).
+        let only_no_vision = Router::new(vec![no_vision.clone()]);
+        let err = only_no_vision.route(&req, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("vision"),
+            "the refusal must name the missing capability: {err}"
+        );
+        // Without the requirement the same non-vision model is eligible:
+        // the filter is caused by the request, not by hidden defaults.
+        let text_req = tiny_req(&["tools", "streaming"], 60);
+        let d = Router::new(vec![no_vision]).route(&text_req, &[]).unwrap();
+        assert_eq!(d.model, "bm");
+    }
+
     #[test]
     fn soft_rate_limit_is_not_a_qualification_blocker() {
         // Only Hard state and an ACTIVE cooldown exclude; Soft is an

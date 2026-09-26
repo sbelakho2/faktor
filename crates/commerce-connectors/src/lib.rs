@@ -32,9 +32,11 @@
 //!   shared [`quota::QuotaState`], and DigiKey additionally consumes
 //!   `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`Retry-After` headers, so
 //!   the hard-coded numbers are never the only limit.
-//! * **Never quota evasion.** [`browser::fallback_decision`] refuses
-//!   rate-limit/quota causes unconditionally; the policy flag defaults to
-//!   off.
+//! * **The planner selects, the adapter executes.** The runtime
+//!   `AcquisitionPlanner` (with its default no-substitution policy for an
+//!   exhausted API quota) chooses the mechanism; adapters execute exactly
+//!   the [`contract::Mechanism`] handed in through the context and can
+//!   never switch API and browser themselves.
 //! * **Exact money only.** Prices are captured as raw JSON tokens and
 //!   parsed with integer arithmetic ([`normalize::money_from_raw`]); there
 //!   is no `f64` anywhere in this crate (enforced by [`self_scan`]).
@@ -66,6 +68,8 @@
 //! truncated bodies, oversized bodies) must produce typed
 //! [`SourceError`]s — never a panic and never a misparsed price.
 
+mod aop;
+
 pub mod alibaba;
 pub mod browser;
 pub mod china1688;
@@ -91,10 +95,8 @@ pub use alibaba::{
     AlibabaConnector, ApiScopes as AlibabaApiScopes, OpenApiConfig, BROWSER_SEARCH_URL,
     EGRESS_LABEL as ALIBABA_EGRESS_LABEL,
 };
-pub use browser::{
-    fallback_decision, BrowserFallback, FallbackCause, FallbackDecision, FallbackObservation,
-    FallbackPolicy, FallbackRefusal, MAX_FALLBACK_FIELDS,
-};
+pub use aop::{RefreshedToken, TokenRefresher};
+pub use browser::{BrowserFallback, FallbackObservation, MAX_FALLBACK_FIELDS};
 pub use china1688::{
     ApiScopes as China1688ApiScopes, China1688Connector, OpenPlatformConfig,
     BROWSER_SEARCH_URL as CN_BROWSER_SEARCH_URL, EGRESS_LABEL as CN_EGRESS_LABEL,
@@ -104,8 +106,9 @@ pub use config::{
     ProfileConnectorConfig,
 };
 pub use context::{
-    AcquireCtx, AcquireCtxBuilder, Cancellation, Clock, ConnectorEvent, ConnectorEventKind,
-    Diagnostics, ManualClock, MemoryDiagnostics, NoopDiagnostics, SystemClock,
+    AccessVisibility, AcquireCtx, AcquireCtxBuilder, Cancellation, Clock, ConnectorEvent,
+    ConnectorEventKind, ConnectorIdentity, Diagnostics, ManualClock, MemoryDiagnostics,
+    NoopDiagnostics, SystemClock, VisibilityScopeError,
 };
 pub use contract::bridge::{ConnectorRuntime, Registered};
 pub use contract::capture::{

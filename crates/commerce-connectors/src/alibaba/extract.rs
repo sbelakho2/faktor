@@ -787,6 +787,7 @@ pub fn variant_id_for(spec: &str) -> Result<VariantId, SourceError> {
 mod tests {
     use super::*;
     use crate::alibaba::normalize::assemble;
+    use crate::context::AccessVisibility;
     use faktor_commerce::money::Money;
     use faktor_commerce::text::CanonicalUrl;
     use serde_json::json;
@@ -875,6 +876,7 @@ mod tests {
                 None,
             )],
             1,
+            &AccessVisibility::Anonymous,
         )
         .expect("currency inferred from the price");
         assert_eq!(offer.offer.currency, Currency::CNY);
@@ -889,6 +891,7 @@ mod tests {
                 Some("CNY"),
             )],
             1,
+            &AccessVisibility::Anonymous,
         )
         .expect_err("declared/price conflict must refuse");
         assert_eq!(error, SourceError::ExtractionConflict);
@@ -898,7 +901,15 @@ mod tests {
         let mut inquiry = Draft::success(Strategy::NetworkJson, None);
         inquiry.push_text(&source, Field::Title, "USB Cable", 1);
         inquiry.push_text(&source, Field::InquiryOnly, "inquiry", 1);
-        let offer = assemble(&source, &ctx, &url, &[inquiry], 1).expect("inquiry offer");
+        let offer = assemble(
+            &source,
+            &ctx,
+            &url,
+            &[inquiry],
+            1,
+            &AccessVisibility::Anonymous,
+        )
+        .expect("inquiry offer");
         assert_eq!(offer.offer.currency, crate::alibaba::DEFAULT_CURRENCY);
     }
 }

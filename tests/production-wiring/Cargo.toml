@@ -1,0 +1,94 @@
+[package]
+name = "faktor-tests-production-wiring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The lib IS the faktor-cli binary source compiled as a library (via
+# `include!` in src/lib.rs): this is what lets the certification tests call
+# the EXACT `build_daemon_core` graph assembly the executable runs, instead
+# of re-building a look-alike daemon. It has no unit tests of its own (the
+# included binary's own test module is excluded because the lib is built
+# without `cfg(test)`), so `[lib] test = false` keeps `cargo test` from
+# re-running the CLI's suite under this package name.
+[lib]
+name = "faktor_tests_production_wiring"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+faktor-core.workspace = true
+faktor-protocol.workspace = true
+faktor-server.workspace = true
+faktor-session.workspace = true
+faktor-agent.workspace = true
+faktor-orchestrator.workspace = true
+faktor-context.workspace = true
+faktor-evidence.workspace = true
+faktor-memory.workspace = true
+faktor-scheduler.workspace = true
+faktor-provider.workspace = true
+faktor-ollama.workspace = true
+faktor-deepseek.workspace = true
+faktor-openai.workspace = true
+faktor-anthropic.workspace = true
+faktor-google.workspace = true
+faktor-gateway.workspace = true
+faktor-fs.workspace = true
+faktor-edit.workspace = true
+faktor-snapshot.workspace = true
+faktor-git.workspace = true
+faktor-terminal.workspace = true
+faktor-mcp.workspace = true
+faktor-lsp.workspace = true
+faktor-index.workspace = true
+faktor-search.workspace = true
+faktor-sandbox.workspace = true
+faktor-store.workspace = true
+faktor-cas.workspace = true
+faktor-acp.workspace = true
+faktor-verify.workspace = true
+faktor-hooks.workspace = true
+faktor-learning.workspace = true
+faktor-instructions.workspace = true
+faktor-router.workspace = true
+faktor-security.workspace = true
+faktor-semantic.workspace = true
+faktor-cloud.workspace = true
+faktor-worker.workspace = true
+faktor-updater.workspace = true
+faktor-scm.workspace = true
+faktor-commerce.workspace = true
+faktor-acquire.workspace = true
+faktor-commerce-connectors.workspace = true
+faktor-browser.workspace = true
+async-trait = "0.1"
+futures.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+faktor-provider = { workspace = true, features = ["test-utils"] }
+# The Alibaba/1688 contract mock recomputes the documented AOP signature
+# from the actual wire bytes, independently of the production signer.
+hmac = "0.12"
+sha1 = "0.10"
+# The cli sources' `#[cfg(test)]` modules are COMPILED (not run: `[lib]
+# test = false`) when clippy checks `--all-targets`, exactly as they are in
+# the faktor-cli package; these mirror that package's test-only deps.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls", "http2"] }
+blake3.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+libc = "0.2"
+
+[lints]
+workspace = true

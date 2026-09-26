@@ -5479,6 +5479,19 @@ impl AgentRuntime {
             if !envelope_fixed {
                 self.note_execution_phase(handle, ExecutionPhase::Planning);
                 let mut intent = crate::ModelCallIntent::implement_main();
+                // Router qualification (P1 item 10): a turn whose FINAL
+                // history carries resolved image parts requires the vision
+                // capability, so a vision-less candidate is filtered out by
+                // the router BEFORE the provider-boundary refusal and can
+                // never be chosen for a call that would be refused anyway.
+                // Text-only turns are untouched (byte-identical consult).
+                if history
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .any(|p| matches!(p.kind, faktor_provider::ContentKind::ImageData { .. }))
+                {
+                    intent.required_capabilities.push("vision".into());
+                }
                 // The wire request carries no explicit max_output
                 // (build_request), so the provider's own output bound is
                 // the call's real output cap: price and qualify the route
@@ -21469,6 +21482,132 @@ mod tests {
         assert_eq!(handle.list_attachments(16).unwrap(), vec![image]);
     }
 
+    /// Router qualification (P1 item 10): a turn carrying resolved image
+    /// parts requires `vision` on the routed call, so a vision-less
+    /// candidate can never win the consult and fail only at the provider
+    /// boundary; a text-only turn's consult and wire plan are untouched.
+    #[tokio::test]
+    async fn routed_consult_requires_vision_when_images_ride_the_turn() {
+        fn vision_caps() -> ModelCapabilities {
+            ModelCapabilities {
+                tools: true,
+                streaming: true,
+                vision: true,
+                context: 131_072,
+                ..Default::default()
+            }
+        }
+        type WireCapture = Vec<RequestMessage>;
+        let seen: Arc<std::sync::Mutex<Vec<WireCapture>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let spy = RecordingRouter::new();
+        let inner = Arc::new(FakeProvider::with_script(
+            "fake",
+            vision_caps(),
+            vec![ScriptedResponse::Text("seen".into()), ScriptedResponse::End],
+        ));
+        let provider = Arc::new(InspectingProvider::new(inner, move |_n, req| {
+            sink.lock().unwrap().push(req.messages.clone());
+            Ok(())
+        }));
+        let (mut deps, _dir) = deps_with(provider, vec![]);
+        deps.routing = spy.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+        let image = handle
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG")
+            .unwrap();
+        runtime
+            .seed_task_attachments(session, std::slice::from_ref(&image))
+            .unwrap();
+        let outcome = runtime
+            .run_turn(session, "describe the image", &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        let requests = spy.requests();
+        let implement = requests
+            .iter()
+            .find(|r| r.phase == RouterPhase::Implement)
+            .expect("the image turn must route the Implement call");
+        assert!(
+            implement
+                .required_capabilities
+                .iter()
+                .any(|c| c == "vision"),
+            "image parts must require vision at qualification: {implement:?}"
+        );
+        // The wire order is text FIRST, the byte-exact image appended after
+        // (ordered content parts, never a replaced text blob).
+        let wires = seen.lock().unwrap().clone();
+        assert_eq!(wires.len(), 1, "one provider request");
+        let user = wires[0]
+            .iter()
+            .rev()
+            .find(|m| {
+                m.role == Role::User
+                    && m.content.iter().any(|p| {
+                        matches!(&p.kind, faktor_provider::ContentKind::Text { text } if !text.is_empty())
+                    })
+            })
+            .expect("the turn's user message");
+        assert!(
+            matches!(
+                &user.content[0].kind,
+                faktor_provider::ContentKind::Text { text } if text == "describe the image"
+            ),
+            "the prompt text part must stay first and byte-identical"
+        );
+        assert!(
+            matches!(
+                &user.content[1].kind,
+                faktor_provider::ContentKind::ImageData { mime, data }
+                    if mime.as_str() == "image/png" && data.as_slice() == b"\x89PNG"
+            ),
+            "the byte-exact image must follow the text part"
+        );
+
+        // Text-only turn on the same graph: no vision requirement and no
+        // media part anywhere on the wire (the text-only plan is untouched).
+        let seen: Arc<std::sync::Mutex<Vec<WireCapture>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let spy = RecordingRouter::new();
+        let inner = Arc::new(FakeProvider::with_script(
+            "fake",
+            vision_caps(),
+            vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+        ));
+        let provider = Arc::new(InspectingProvider::new(inner, move |_n, req| {
+            sink.lock().unwrap().push(req.messages.clone());
+            Ok(())
+        }));
+        let (mut deps, _dir2) = deps_with(provider, vec![]);
+        deps.routing = spy.clone();
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let outcome = runtime.run_turn(session, "hello", &[]).await.unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        for r in spy.requests() {
+            assert!(
+                !r.required_capabilities.iter().any(|c| c == "vision"),
+                "text-only consults must not require vision: {r:?}"
+            );
+        }
+        let wires = seen.lock().unwrap().clone();
+        assert_eq!(wires.len(), 1, "one provider request");
+        for m in &wires[0] {
+            for p in &m.content {
+                assert!(
+                    matches!(&p.kind, faktor_provider::ContentKind::Text { .. }),
+                    "text-only wire carries no media parts: {p:?}"
+                );
+            }
+        }
+    }
+
     /// A document-capable provider receives non-image DOCUMENT attachments
     /// as byte-exact `FileData` parts (PDF and plain text, input order
     /// preserved), while opaque non-document attachments stay CAS-only.
@@ -31519,7 +31658,9 @@ mod tests {
         }
         let records = handle2.turn_records().unwrap();
         assert!(
-            records.iter().all(|r| r.status != "active"),
+            records
+                .iter()
+                .all(|r| faktor_store::is_terminal_turn_record_status(&r.status)),
             "every logical turn ended: {records:?}"
         );
     }

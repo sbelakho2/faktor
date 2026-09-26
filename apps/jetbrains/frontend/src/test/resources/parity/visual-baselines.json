@@ -1,5 +1,5 @@
 {
-  "schema": "faktor-parity-visual-baselines/v1",
+  "schema": "faktor-parity-visual-baselines/v2",
   "method": "offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline",
   "panelDigests": {
     "task-tree": "1d31d35ebfc841e2803df4c1db44d760ece086364f4f216b7293ab85721d38c1",
@@ -10,5 +10,17 @@
     "evidence": "7d0c35d650bdbcac5e5979f6536a2dbd410761bbd1d46d3be7840a06bf41d963",
     "settings": "73af8743c5a046055cd0dcef92843776306e2240b8afcdb15c2e56852720216d",
     "history": "3c8421e31a46a98ccd9255f97d35409e0825a16a5f3e152948833b0be37fcbd0"
+  },
+  "environmentDigests": {
+    "mac-os-x-aarch64-jvm17": {
+    "task-tree": "19d1bc64873b1cfa71151ffdabc829ba2ab888a4820b33515f74478c84164fb6",
+    "blockers": "0a6ba6d1e0fcee4361bec7f6a4f070903b5743f9aee7ca2257468634ac67ca7e",
+    "tournament": "821c50021cdcd169de64e3bc7b1b21d8d3d3827574376ec50cb4b4c31f31a6cf",
+    "permissions": "8f99988c6225bbf446a24856cd15b599095a59124a36dc6da4b766738cd28886",
+    "terminal": "4838a7fb9fe768f85a6c94842d1cca25d4954f7487a624bb37c7648bab54c15d",
+    "evidence": "00ae5b99832cbe0ab234c2eec966b845811315a7db9656061a33f8bc70ed7fc1",
+    "settings": "e449733f9f69479dd26abf194aebb53943d3ac982141b394bb6577fcb2bac852",
+    "history": "875d2e25a94ad5fa09a0760d5551197d97c8029fd18d449dff0e08e051db738e"
+    }
   }
 }

@@ -21,6 +21,7 @@ import dev.faktor.shared.JsonValue
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
@@ -430,11 +431,39 @@ class FaktorChatPanel(
         val files = attachments.files()
         val contract = completionContractFromControls()
         runAsync("start task") {
+            // Image parity (same representation as the VS Code client): an
+            // allowlisted image is read (bounded) and uploaded as a durable
+            // binary attachment; the run carries its typed id. Non-image
+            // paths keep the workspace-relative `files` vocabulary. An
+            // undeliverable image refuses loudly here, before any start.
+            val binary = ArrayList<NativeAttachmentId>()
+            val pathFiles = ArrayList<String>()
+            for (path in files) {
+                val mime = AttachmentImages.mimeOf(path)
+                if (mime == null) {
+                    pathFiles.add(path)
+                    continue
+                }
+                val file = java.io.File(path)
+                val bytes = AttachmentImages.readBounded(file)
+                    ?: throw IllegalStateException(
+                        "image attachment " + file.name + " is not a regular file or exceeds the " +
+                            AttachmentImages.MAX_IMAGE_BYTES + " byte per-image bound"
+                    )
+                binary.add(
+                    service.uploadAttachment(
+                        mime,
+                        file.name,
+                        java.util.Base64.getEncoder().encodeToString(bytes)
+                    )
+                )
+            }
             val started = service.startTaskRun(
                 goal,
                 if (criteria.isEmpty()) null else criteria,
                 mutationMode = settingsPanel.mutationMode(),
-                files = if (files.isEmpty()) null else files,
+                files = if (pathFiles.isEmpty()) null else pathFiles,
+                attachments = if (binary.isEmpty()) null else binary,
                 completionContract = contract
             )
             submittedCompletion = contract

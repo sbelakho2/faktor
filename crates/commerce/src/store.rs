@@ -488,6 +488,10 @@ pub struct JobRow {
     pub compact_json: Option<String>,
     /// The last typed failure label.
     pub last_error: Option<String>,
+    /// The canonical owner key (workspace + session + account scope) derived
+    /// by the runtime principal. `None` only on a legacy row written before
+    /// ownership existed: such a row is unusable and refused on read.
+    pub owner_key: Option<String>,
 }
 
 /// A durable job item row.
@@ -766,6 +770,18 @@ pub const COMMERCE_MIGRATIONS: &[&str] = &[
         UNIQUE (source, profile, challenge_key)
      );
      CREATE INDEX IF NOT EXISTS idx_challenge_open ON challenge(state, detected_ms);",
+    // v3 — per-job owner key (workspace + session + account scope). Active
+    // legacy rows predating ownership cannot be attributed to any principal:
+    // they are terminalized in the same migration with the typed
+    // `owner_scope_missing` diagnostic (never resumed, never readable), and
+    // terminal legacy rows keep a NULL owner and are refused on read.
+    "ALTER TABLE job ADD COLUMN owner_key TEXT;
+     CREATE INDEX IF NOT EXISTS idx_job_owner_digest ON job(owner_key, digest, state);
+     UPDATE job
+        SET state = 'cancelled',
+            finished_ms = COALESCE(finished_ms, updated_ms),
+            last_error = 'owner_scope_missing'
+      WHERE owner_key IS NULL AND state IN ('queued', 'running');",
 ];
 
 /// The newest schema version this binary knows.
@@ -1692,56 +1708,71 @@ impl CommerceStore {
 
     // ------------------------------------------------------------------ jobs
 
-    /// Insert one job row. Returns false when the job id already exists
-    /// (idempotent replay).
+    /// Insert one job row with its owner key. Returns false when the job id
+    /// already exists (idempotent replay).
     pub fn insert_job(
         &self,
         job: &crate::jobs::CommerceJob,
+        owner_key: &str,
         now_ms: u64,
     ) -> Result<bool, CommerceStoreError> {
+        if owner_key.is_empty() || owner_key.len() > 128 {
+            return Err(CommerceStoreError::Malformed(
+                "job owner key is empty or out of bounds".to_string(),
+            ));
+        }
         let request = NormalizedPayload::from_serializable(&job.request)?;
         let conn = self.lock()?;
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO job(job_id, digest, kind, state, request_json, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            "INSERT OR IGNORE INTO job(job_id, digest, kind, state, request_json, owner_key,
+                created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             params![
                 job.id,
                 job.digest,
                 job.request.work.kind(),
                 job.state.as_str(),
                 request.as_str(),
+                owner_key,
                 now_ms as i64,
             ],
         )?;
         Ok(changed > 0)
     }
 
-    /// The active (queued/running) job with this digest, if any.
+    /// The active (queued/running) job with this digest FOR THIS OWNER, if
+    /// any. The owner key is part of the predicate: a digest collision or a
+    /// crafted digest can never attach one principal to another principal's
+    /// active job. Legacy ownerless rows (NULL) never match.
     pub fn find_active_job(
         &self,
         digest: &str,
+        owner_key: &str,
     ) -> Result<Option<crate::jobs::CommerceJob>, CommerceStoreError> {
         let conn = self.lock()?;
         let row = conn
             .query_row(
                 "SELECT job_id, digest, state, request_json
-                 FROM job WHERE digest = ?1 AND state IN ('queued', 'running')
+                 FROM job WHERE digest = ?1 AND owner_key = ?2
+                     AND state IN ('queued', 'running')
                  ORDER BY created_ms DESC, job_id DESC LIMIT 1",
-                params![digest],
+                params![digest, owner_key],
                 decode_job_tuple,
             )
             .optional()?;
         row.map(decode_job).transpose()
     }
 
-    /// One job by id.
+    /// One job by id. The row carries its owner key (`None` for a legacy
+    /// ownerless row); callers decide visibility, but an ownerless row is
+    /// never attributable to a requester.
     pub fn job(&self, job_id: &str) -> Result<Option<JobRow>, CommerceStoreError> {
         let conn = self.lock()?;
         let row = conn
             .query_row(
                 "SELECT job_id, digest, kind, state, request_json, created_ms, updated_ms,
                         started_ms, finished_ms, matched, ambiguous, unmatched, artifact_digest,
-                        artifact_bytes, compact_json, last_error
+                        artifact_bytes, compact_json, last_error, owner_key
                  FROM job WHERE job_id = ?1",
                 params![job_id],
                 decode_job_row,
@@ -1757,8 +1788,8 @@ impl CommerceStore {
         let mut stmt = conn.prepare(
             "SELECT job_id, digest, kind, state, request_json, created_ms, updated_ms,
                     started_ms, finished_ms, matched, ambiguous, unmatched, artifact_digest,
-                    artifact_bytes, compact_json, last_error
-             FROM job WHERE state IN ('queued', 'running')
+                    artifact_bytes, compact_json, last_error, owner_key
+             FROM job WHERE state IN ('queued', 'running') AND owner_key IS NOT NULL
              ORDER BY created_ms ASC, job_id ASC",
         )?;
         let rows = stmt.query_map([], decode_job_row)?;
@@ -2112,6 +2143,7 @@ fn decode_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         artifact_bytes: r.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
         compact_json: r.get(14)?,
         last_error: r.get(15)?,
+        owner_key: r.get(16)?,
     })
 }
 

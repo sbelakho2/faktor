@@ -16,6 +16,7 @@ import dev.faktor.shared.ReleaseDigest
 import dev.faktor.shared.ReleasePidHandshake
 import dev.faktor.shared.ReleasePidLine
 import dev.faktor.shared.StartupLine
+import dev.faktor.shared.asciiLowerCase
 import dev.faktor.shared.parseNativeHealth
 import dev.faktor.shared.parseNativePromptReceipt
 import dev.faktor.shared.parseNativeSessionCreated
@@ -570,7 +571,7 @@ private fun startVictim(): Process =
 
 private fun javaBinary(): String = Paths.get(
     System.getProperty("java.home"), "bin",
-    if (System.getProperty("os.name", "").toLowerCase().contains("win")) "java.exe" else "java"
+    if (asciiLowerCase(System.getProperty("os.name", "")).contains("win")) "java.exe" else "java"
 ).toString()
 
 private fun readPidFile(pidfile: Path): Long? {

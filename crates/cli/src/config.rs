@@ -4133,16 +4133,27 @@ impl std::fmt::Debug for CommerceDigikeyConnectorCfg {
     }
 }
 
-/// `commerce.connectors.1688` / `commerce.connectors.alibaba`: browser
-/// profile names. The credential lives inside the browser profile, never in
-/// this config.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
+/// `commerce.connectors.<source>` profile shape: a browser profile plus the
+/// connector's immutable commercial identity. The credential lives inside
+/// the browser profile, never in this config; `account_scope`, `market` and
+/// `locale` are injected at registration and are never taken from a tool
+/// request.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CommerceProfileConnectorCfg {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub profile: Option<String>,
+    /// The account scope every acquisition of this connector belongs to.
+    #[serde(default)]
+    pub account_scope: Option<String>,
+    /// The market every acquisition of this connector is scoped to.
+    #[serde(default)]
+    pub market: Option<String>,
+    /// The locale every acquisition of this connector is scoped to.
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 impl ConnectorEnabled for CommerceProfileConnectorCfg {
@@ -4151,16 +4162,307 @@ impl ConnectorEnabled for CommerceProfileConnectorCfg {
     }
 }
 
+impl CommerceProfileConnectorCfg {
+    /// The configured browser profile name.
+    pub fn profile_name(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    /// The configured account scope.
+    pub fn account_scope(&self) -> Option<&str> {
+        self.account_scope.as_deref()
+    }
+
+    /// The configured market.
+    pub fn market(&self) -> Option<&str> {
+        self.market.as_deref()
+    }
+
+    /// The configured locale.
+    pub fn locale(&self) -> Option<&str> {
+        self.locale.as_deref()
+    }
+}
+
+/// `commerce.connectors.<source>.api` for the marketplace connectors: the
+/// Open Platform / Open API credential. Every field is an environment
+/// variable NAME — the config never carries a value, and `Debug` redacts
+/// each configured name.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MarketplaceApiCfg {
+    /// The environment variable naming the app key (required when `api` is
+    /// present).
+    #[serde(default)]
+    pub app_key_env: Option<String>,
+    /// The environment variable naming the app secret, when the credential
+    /// has one.
+    #[serde(default)]
+    pub app_secret_env: Option<String>,
+    /// The environment variable naming a pre-authorized access token, when
+    /// the operator stages one instead of interactive authorization. The
+    /// connector requires the token's absolute expiry alongside it, so
+    /// `access_token_expires_at_env` is required whenever this is set.
+    #[serde(default)]
+    pub access_token_env: Option<String>,
+    /// The environment variable naming the access token's absolute expiry
+    /// (unix milliseconds). Only meaningful with `access_token_env`.
+    #[serde(default)]
+    pub access_token_expires_at_env: Option<String>,
+    /// The granted scope labels (source-specific; validated at startup).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for MarketplaceApiCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarketplaceApiCfg")
+            .field(
+                "app_key_env",
+                &self.app_key_env.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "app_secret_env",
+                &self.app_secret_env.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "access_token_env",
+                &self.access_token_env.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "access_token_expires_at_env",
+                &self
+                    .access_token_expires_at_env
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+impl MarketplaceApiCfg {
+    /// The environment variable names of this credential (never values).
+    pub fn env_names(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        for name in [
+            self.app_key_env.as_deref(),
+            self.app_secret_env.as_deref(),
+            self.access_token_env.as_deref(),
+            self.access_token_expires_at_env.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            names.push(name);
+        }
+        names
+    }
+}
+
+/// `commerce.connectors.1688` / `commerce.connectors.alibaba` API-capable
+/// shape: the browser profile plus the optional Open Platform / Open API
+/// credential. At least one path must be usable.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CommerceMarketplaceConnectorCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The browser profile name; absent keeps the source's default profile
+    /// when the browser path is enabled.
+    #[serde(default)]
+    pub browser_profile: Option<String>,
+    /// The account scope every acquisition of this connector belongs to.
+    #[serde(default)]
+    pub account_scope: Option<String>,
+    /// The optional Open Platform / Open API credential.
+    #[serde(default)]
+    pub api: Option<MarketplaceApiCfg>,
+}
+
+impl ConnectorEnabled for CommerceMarketplaceConnectorCfg {
+    fn connector_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl CommerceMarketplaceConnectorCfg {
+    /// The configured browser profile name.
+    pub fn browser_profile(&self) -> Option<&str> {
+        self.browser_profile.as_deref()
+    }
+
+    /// The configured account scope.
+    pub fn account_scope(&self) -> Option<&str> {
+        self.account_scope.as_deref()
+    }
+
+    /// The configured API credential, when present.
+    pub fn api(&self) -> Option<&MarketplaceApiCfg> {
+        self.api.as_ref()
+    }
+}
+
+/// One configured 1688/alibaba entry: either the profile-only shape or the
+/// API-capable marketplace shape. Both are strict (`deny_unknown_fields`
+/// inside each struct); mixing the two shapes' keys is refused with a typed
+/// message instead of silently dropping one half.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, Debug)]
+#[serde(untagged)]
+pub enum CommerceMarketplaceConnectorEntry {
+    /// The browser-profile-only shape.
+    Profile(CommerceProfileConnectorCfg),
+    /// The browser profile + optional Open Platform/Open API shape.
+    Marketplace(CommerceMarketplaceConnectorCfg),
+}
+
+/// Every key either shape accepts (unknown-field errors list them).
+pub const MARKETPLACE_CONNECTOR_FIELDS: &[&str] = &[
+    "enabled",
+    "profile",
+    "browser_profile",
+    "account_scope",
+    "market",
+    "locale",
+    "api",
+];
+
+impl CommerceMarketplaceConnectorEntry {
+    /// Whether the configured entry is enabled.
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Profile(cfg) => cfg.enabled,
+            Self::Marketplace(cfg) => cfg.enabled,
+        }
+    }
+
+    /// The configured browser profile name, whatever the shape.
+    pub fn browser_profile(&self) -> Option<&str> {
+        match self {
+            Self::Profile(cfg) => cfg.profile_name(),
+            Self::Marketplace(cfg) => cfg.browser_profile(),
+        }
+    }
+
+    /// The configured account scope identity, whatever the shape.
+    pub fn account_scope(&self) -> Option<&str> {
+        match self {
+            Self::Profile(cfg) => cfg.account_scope(),
+            Self::Marketplace(cfg) => cfg.account_scope(),
+        }
+    }
+
+    /// The configured market identity (marketplace shape has none).
+    pub fn market(&self) -> Option<&str> {
+        match self {
+            Self::Profile(cfg) => cfg.market(),
+            Self::Marketplace(_) => None,
+        }
+    }
+
+    /// The configured locale identity (marketplace shape has none).
+    pub fn locale(&self) -> Option<&str> {
+        match self {
+            Self::Profile(cfg) => cfg.locale(),
+            Self::Marketplace(_) => None,
+        }
+    }
+
+    /// The configured API credential, when the marketplace shape carries one.
+    pub fn api(&self) -> Option<&MarketplaceApiCfg> {
+        match self {
+            Self::Profile(_) => None,
+            Self::Marketplace(cfg) => cfg.api(),
+        }
+    }
+}
+
+/// Strict, map-only parsing of one 1688/alibaba entry: unknown keys are named
+/// precisely (`unknown field`) and the two shapes never mix.
+impl<'de> serde::Deserialize<'de> for CommerceMarketplaceConnectorEntry {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct EntryVisitor;
+
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = CommerceMarketplaceConnectorEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the commerce.connectors.<source> section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !MARKETPLACE_CONNECTOR_FIELDS.contains(&key.as_str()) {
+                        return Err(A::Error::unknown_field(&key, MARKETPLACE_CONNECTOR_FIELDS));
+                    }
+                    if values.contains_key(&key) {
+                        return Err(A::Error::custom(format!(
+                            "duplicate field `{key}` in a commerce connector section"
+                        )));
+                    }
+                    values.insert(key, map.next_value::<serde_json::Value>()?);
+                }
+                let profile_shape = ["profile", "market", "locale"]
+                    .iter()
+                    .any(|key| values.contains_key(*key));
+                if profile_shape {
+                    for marketplace_only in ["browser_profile", "api"] {
+                        if values.contains_key(marketplace_only) {
+                            return Err(A::Error::custom(format!(
+                                "commerce connector config mixes the profile and marketplace \
+                                 shapes: `{marketplace_only}` is not accepted with \
+                                 `profile`/`market`/`locale`"
+                            )));
+                        }
+                    }
+                    serde_json::from_value::<CommerceProfileConnectorCfg>(
+                        serde_json::Value::Object(values),
+                    )
+                    .map(CommerceMarketplaceConnectorEntry::Profile)
+                    .map_err(A::Error::custom)
+                } else {
+                    serde_json::from_value::<CommerceMarketplaceConnectorCfg>(
+                        serde_json::Value::Object(values),
+                    )
+                    .map(CommerceMarketplaceConnectorEntry::Marketplace)
+                    .map_err(A::Error::custom)
+                }
+            }
+        }
+
+        de.deserialize_map(EntryVisitor)
+    }
+}
+
+fn deserialize_enabled_marketplace<'de, D>(
+    de: D,
+) -> Result<Option<CommerceMarketplaceConnectorEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<CommerceMarketplaceConnectorEntry> as serde::Deserialize>::deserialize(de)?;
+    Ok(raw.filter(CommerceMarketplaceConnectorEntry::enabled))
+}
+
 /// The `commerce.connectors` map: exactly the five known source ids; any
 /// other key is a startup error. A present-but-disabled connector resolves
 /// to `None` (disabled parity).
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommerceConnectorsCfg {
-    #[serde(rename = "1688", deserialize_with = "deserialize_enabled_connector")]
-    pub china1688: Option<CommerceProfileConnectorCfg>,
-    #[serde(deserialize_with = "deserialize_enabled_connector")]
-    pub alibaba: Option<CommerceProfileConnectorCfg>,
+    #[serde(rename = "1688", deserialize_with = "deserialize_enabled_marketplace")]
+    pub china1688: Option<CommerceMarketplaceConnectorEntry>,
+    #[serde(deserialize_with = "deserialize_enabled_marketplace")]
+    pub alibaba: Option<CommerceMarketplaceConnectorEntry>,
     #[serde(deserialize_with = "deserialize_enabled_connector")]
     pub lcsc: Option<CommerceApiConnectorCfg>,
     #[serde(deserialize_with = "deserialize_enabled_connector")]
@@ -4175,13 +4477,10 @@ impl CommerceConnectorsCfg {
     pub fn enabled(&self) -> Vec<(&'static str, ConnectorCredential<'_>)> {
         let mut rows: Vec<(&'static str, ConnectorCredential<'_>)> = Vec::new();
         if let Some(cfg) = &self.china1688 {
-            rows.push(("1688", ConnectorCredential::Profile(cfg.profile.as_deref())));
+            rows.push(("1688", marketplace_credential(cfg)));
         }
         if let Some(cfg) = &self.alibaba {
-            rows.push((
-                "alibaba",
-                ConnectorCredential::Profile(cfg.profile.as_deref()),
-            ));
+            rows.push(("alibaba", marketplace_credential(cfg)));
         }
         if let Some(cfg) = &self.lcsc {
             rows.push((
@@ -4208,12 +4507,63 @@ impl CommerceConnectorsCfg {
     }
 }
 
+fn marketplace_credential(cfg: &CommerceMarketplaceConnectorEntry) -> ConnectorCredential<'_> {
+    match cfg {
+        CommerceMarketplaceConnectorEntry::Profile(profile) => {
+            ConnectorCredential::Profile(profile.profile_name())
+        }
+        CommerceMarketplaceConnectorEntry::Marketplace(marketplace) => {
+            ConnectorCredential::Marketplace {
+                browser_profile: marketplace.browser_profile(),
+                api: marketplace.api().map(|api| MarketplaceApiEnvNames {
+                    app_key_env: api.app_key_env.as_deref(),
+                    app_secret_env: api.app_secret_env.as_deref(),
+                    access_token_env: api.access_token_env.as_deref(),
+                    access_token_expires_at_env: api.access_token_expires_at_env.as_deref(),
+                }),
+            }
+        }
+    }
+}
+
+/// The env-var NAMES of one marketplace API credential (never values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketplaceApiEnvNames<'a> {
+    pub app_key_env: Option<&'a str>,
+    pub app_secret_env: Option<&'a str>,
+    pub access_token_env: Option<&'a str>,
+    pub access_token_expires_at_env: Option<&'a str>,
+}
+
+impl MarketplaceApiEnvNames<'_> {
+    /// Every configured env-var name.
+    pub fn all(&self) -> Vec<&str> {
+        [
+            self.app_key_env,
+            self.app_secret_env,
+            self.access_token_env,
+            self.access_token_expires_at_env,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
 /// The credential requirement of one enabled connector: env-var NAMES (or a
 /// profile), never values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorCredential<'a> {
     /// A profile-based browser connector.
     Profile(Option<&'a str>),
+    /// A 1688/alibaba marketplace connector: an optional browser profile plus
+    /// an optional Open Platform / Open API credential.
+    Marketplace {
+        /// The configured browser profile, when the browser path is used.
+        browser_profile: Option<&'a str>,
+        /// The configured API credential env-var names, when present.
+        api: Option<MarketplaceApiEnvNames<'a>>,
+    },
     /// A single API key env var name.
     ApiKey(Option<&'a str>),
     /// An OAuth client id + secret env var name pair.
@@ -4457,6 +4807,67 @@ impl CommerceCfg {
                     };
                     validate_profile_name(&format!("connectors.{source}.profile"), profile)?;
                 }
+                ConnectorCredential::Marketplace {
+                    browser_profile,
+                    api,
+                } => {
+                    if let Some(profile) = browser_profile {
+                        validate_profile_name(
+                            &format!("connectors.{source}.browser_profile"),
+                            profile,
+                        )?;
+                    }
+                    if !self.browser.enabled && api.is_none() {
+                        return Err(format!(
+                            "commerce connectors: {source} enables neither the browser path \
+                             (browser disabled) nor an `api` credential"
+                        ));
+                    }
+                    let Some(api) = api else { continue };
+                    let Some(app_key_env) = api.app_key_env else {
+                        return Err(format!(
+                            "commerce connectors: {source}.api requires app_key_env to name an \
+                             environment variable"
+                        ));
+                    };
+                    let Some(app_secret_env) = api.app_secret_env else {
+                        return Err(format!(
+                            "commerce connectors: {source}.api requires app_secret_env to name \
+                             an environment variable"
+                        ));
+                    };
+                    validate_env_name(
+                        &format!("connectors.{source}.api.app_key_env"),
+                        app_key_env,
+                    )?;
+                    validate_env_name(
+                        &format!("connectors.{source}.api.app_secret_env"),
+                        app_secret_env,
+                    )?;
+                    for (field, name) in [
+                        ("access_token_env", api.access_token_env),
+                        (
+                            "access_token_expires_at_env",
+                            api.access_token_expires_at_env,
+                        ),
+                    ] {
+                        if let Some(name) = name {
+                            validate_env_name(&format!("connectors.{source}.api.{field}"), name)?;
+                        }
+                    }
+                    if api.access_token_env.is_some() && api.access_token_expires_at_env.is_none() {
+                        return Err(format!(
+                            "commerce connectors: {source}.api requires \
+                             access_token_expires_at_env alongside access_token_env"
+                        ));
+                    }
+                    if api.access_token_expires_at_env.is_some() && api.access_token_env.is_none() {
+                        return Err(format!(
+                            "commerce connectors: {source}.api requires access_token_env \
+                             alongside access_token_expires_at_env"
+                        ));
+                    }
+                }
                 ConnectorCredential::ApiKey(api_key_env) => {
                     let Some(api_key_env) = api_key_env else {
                         return Err(format!(
@@ -4481,8 +4892,90 @@ impl CommerceCfg {
                 }
             }
         }
+        // Identity scopes and API scope labels are validated per source, with
+        // the source's own known scope vocabulary.
+        for (source, entry) in [
+            ("1688", self.connectors.china1688.as_ref()),
+            ("alibaba", self.connectors.alibaba.as_ref()),
+        ] {
+            let Some(entry) = entry else { continue };
+            for (field, value) in [
+                ("account_scope", entry.account_scope()),
+                ("market", entry.market()),
+                ("locale", entry.locale()),
+            ] {
+                if let Some(value) = value {
+                    validate_identity_value(&format!("connectors.{source}.{field}"), value)?;
+                }
+            }
+            if let Some(api) = entry.api() {
+                if api.scopes.is_empty() {
+                    return Err(format!(
+                        "commerce connectors: {source}.api requires at least one scope from {}{}",
+                        marketplace_scope_labels(source).join(", "),
+                        if marketplace_scope_labels(source).is_empty() {
+                            " (no api scopes are defined for this source)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                let known = marketplace_scope_labels(source);
+                if known.is_empty() {
+                    return Err(format!(
+                        "commerce connectors: {source} does not support an `api` credential"
+                    ));
+                }
+                let mut seen: Vec<&str> = Vec::new();
+                for scope in &api.scopes {
+                    if !known.contains(&scope.as_str()) {
+                        return Err(format!(
+                            "commerce connectors: {source}.api scope {scope:?} is unknown \
+                             (known: {})",
+                            known.join(", ")
+                        ));
+                    }
+                    if seen.contains(&scope.as_str()) {
+                        return Err(format!(
+                            "commerce connectors: {source}.api scope {scope:?} is duplicated"
+                        ));
+                    }
+                    seen.push(scope.as_str());
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// The scope labels the marketplace APIs accept per source.
+pub fn marketplace_scope_labels(source: &str) -> &'static [&'static str] {
+    match source {
+        "1688" => &[
+            "discovery",
+            "product",
+            "price",
+            "stock",
+            "supplier",
+            "variants",
+            "moq",
+        ],
+        "alibaba" => &[
+            "seller_product",
+            "buyer_discovery",
+            "trade_terms",
+            "supplier_profile",
+        ],
+        _ => &[],
+    }
+}
+
+/// Validate one identity field through the commerce domain's own bounded text
+/// type: bounded, non-empty, control-character-free.
+fn validate_identity_value(field: &str, value: &str) -> Result<(), String> {
+    faktor_commerce::Text::<{ faktor_commerce::MAX_ACCOUNT_SCOPE_BYTES }>::new(value)
+        .map_err(|error| format!("commerce connectors: {field} is invalid: {error}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7658,6 +8151,197 @@ mod commerce_config_tests {
             json["connectors"]["mouser"]["api_key_env"],
             "FAKTOR_MOUSER_KEY"
         );
+    }
+
+    #[test]
+    fn marketplace_connector_shape_carries_identity_and_api_names() {
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "browser": {"enabled": true},
+            "connectors": {
+                "1688": {
+                    "enabled": true,
+                    "browser_profile": "procurement-cn",
+                    "account_scope": "acct-cn-1",
+                    "api": {
+                        "app_key_env": "FAKTOR_1688_APP_KEY",
+                        "app_secret_env": "FAKTOR_1688_APP_SECRET",
+                        "scopes": ["discovery", "product", "price", "variants"]
+                    }
+                },
+                "alibaba": {
+                    "enabled": true,
+                    "browser_profile": "procurement-global",
+                    "api": {
+                        "app_key_env": "FAKTOR_ALIBABA_APP_KEY",
+                        "app_secret_env": "FAKTOR_ALIBABA_APP_SECRET",
+                        "access_token_env": "FAKTOR_ALIBABA_TOKEN",
+                        "access_token_expires_at_env": "FAKTOR_ALIBABA_TOKEN_EXPIRES_AT",
+                        "scopes": ["buyer_discovery", "trade_terms"]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let commerce = &cfg.commerce;
+        commerce.validate().unwrap();
+        let entry = commerce.connectors.china1688.as_ref().expect("1688 entry");
+        assert_eq!(entry.browser_profile(), Some("procurement-cn"));
+        assert_eq!(entry.account_scope(), Some("acct-cn-1"));
+        assert_eq!(entry.market(), None, "the marketplace shape has no market");
+        let api = entry.api().expect("api");
+        assert_eq!(api.app_key_env.as_deref(), Some("FAKTOR_1688_APP_KEY"));
+        assert_eq!(
+            api.app_secret_env.as_deref(),
+            Some("FAKTOR_1688_APP_SECRET")
+        );
+        assert_eq!(
+            api.scopes,
+            vec!["discovery", "product", "price", "variants"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        let alibaba = commerce.connectors.alibaba.as_ref().expect("alibaba");
+        assert_eq!(
+            alibaba
+                .api()
+                .and_then(|api| api.access_token_expires_at_env.as_deref()),
+            Some("FAKTOR_ALIBABA_TOKEN_EXPIRES_AT")
+        );
+    }
+
+    #[test]
+    fn profile_shape_carries_account_scope_market_and_locale() {
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "browser": {"enabled": true},
+            "connectors": {
+                "1688": {
+                    "enabled": true,
+                    "profile": "procurement-cn",
+                    "account_scope": "acct-cn-1",
+                    "market": "CN",
+                    "locale": "zh-CN"
+                },
+                "alibaba": {"enabled": true, "browser_profile": null, "account_scope": "acct-global"}
+            }
+        }))
+        .unwrap();
+        cfg.commerce.validate().unwrap();
+        let entry = cfg.commerce.connectors.china1688.as_ref().unwrap();
+        assert_eq!(entry.account_scope(), Some("acct-cn-1"));
+        assert_eq!(entry.market(), Some("CN"));
+        assert_eq!(entry.locale(), Some("zh-CN"));
+        // The marketplace shape accepts a null browser profile (the default
+        // profile) plus an account scope.
+        let alibaba = cfg.commerce.connectors.alibaba.as_ref().unwrap();
+        assert_eq!(alibaba.browser_profile(), None);
+        assert_eq!(alibaba.account_scope(), Some("acct-global"));
+        assert!(alibaba.api().is_none());
+    }
+
+    #[test]
+    fn marketplace_api_is_strict_and_never_carries_values() {
+        // Unknown keys anywhere in the section (including `api`) fail.
+        for connectors in [
+            serde_json::json!({"1688": {"enabled": true, "api": {"key": "x"}}}),
+            serde_json::json!({"1688": {"enabled": true, "profile": "p", "api": {"app_key_env": "A"}}}),
+            serde_json::json!({"1688": {"enabled": true, "browser_profile": "p", "market": "CN"}}),
+            serde_json::json!({"1688": {"enabled": true, "api": {"app_key_env": "A", "secret": "s"}}}),
+        ] {
+            let error = parse_commerce(serde_json::json!({
+                "enabled": true,
+                "browser": {"enabled": true},
+                "connectors": connectors
+            }))
+            .expect_err("strict connector section");
+            let text = error.to_string();
+            assert!(
+                text.contains("unknown field") || text.contains("mixes"),
+                "{text}"
+            );
+        }
+
+        // The api block requires app_key_env + app_secret_env + at least one
+        // known scope; the token pair is all-or-nothing.
+        for api in [
+            serde_json::json!({"app_secret_env": "S", "scopes": ["discovery"]}),
+            serde_json::json!({"app_key_env": "K", "scopes": ["discovery"]}),
+            serde_json::json!({"app_key_env": "K", "app_secret_env": "S"}),
+            serde_json::json!({"app_key_env": "K", "app_secret_env": "S", "scopes": []}),
+            serde_json::json!({"app_key_env": "K", "app_secret_env": "S", "scopes": ["nope"]}),
+            serde_json::json!({"app_key_env": "K", "app_secret_env": "S", "access_token_env": "T", "scopes": ["discovery"]}),
+            serde_json::json!({"app_key_env": "K", "app_secret_env": "S", "access_token_expires_at_env": "E", "scopes": ["discovery"]}),
+            serde_json::json!({"app_key_env": "sk-live-123", "app_secret_env": "S", "scopes": ["discovery"]}),
+        ] {
+            let cfg = parse_commerce(serde_json::json!({
+                "enabled": true,
+                "browser": {"enabled": true},
+                "connectors": {"1688": {"enabled": true, "api": api.clone()}}
+            }))
+            .unwrap();
+            assert!(
+                cfg.commerce.validate().is_err(),
+                "api {api} must be refused"
+            );
+        }
+
+        // A browser-disabled marketplace entry with no api has no usable
+        // path and must not silently validate.
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "connectors": {"1688": {"enabled": true, "account_scope": "acct"}}
+        }))
+        .unwrap();
+        assert!(cfg.commerce.validate().is_err());
+
+        // Identity values go through the domain's bounded text type.
+        for bad in [serde_json::json!(""), serde_json::json!("\u{0007}")] {
+            let cfg = parse_commerce(serde_json::json!({
+                "enabled": true,
+                "browser": {"enabled": true},
+                "connectors": {"1688": {"enabled": true, "account_scope": bad}}
+            }))
+            .unwrap();
+            assert!(cfg.commerce.validate().is_err(), "bad identity must fail");
+        }
+    }
+
+    #[test]
+    fn marketplace_api_debug_and_serialization_keep_names_only() {
+        let cfg = parse_commerce(serde_json::json!({
+            "enabled": true,
+            "browser": {"enabled": true},
+            "connectors": {"1688": {
+                "enabled": true,
+                "api": {
+                    "app_key_env": "FAKTOR_1688_APP_KEY",
+                    "app_secret_env": "FAKTOR_1688_APP_SECRET",
+                    "scopes": ["discovery", "price"]
+                }
+            }}
+        }))
+        .unwrap();
+        let debug = format!("{:?}", cfg.commerce);
+        assert!(debug.contains("<redacted>"), "{debug}");
+        for name in ["FAKTOR_1688_APP_KEY", "FAKTOR_1688_APP_SECRET"] {
+            assert!(!debug.contains(name), "Debug leaked {name}: {debug}");
+        }
+        assert!(debug.contains("discovery"), "scopes stay visible: {debug}");
+        let json = serde_json::to_value(&cfg.commerce).unwrap();
+        assert_eq!(
+            json["connectors"]["1688"]["api"]["app_key_env"],
+            "FAKTOR_1688_APP_KEY"
+        );
+        assert_eq!(
+            json["connectors"]["1688"]["api"]["scopes"],
+            serde_json::json!(["discovery", "price"])
+        );
+        // And the two shapes round-trip through save/load.
+        let text = serde_json::to_string(&cfg.commerce).unwrap();
+        let parsed: CommerceCfg = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, cfg.commerce);
     }
 
     #[test]

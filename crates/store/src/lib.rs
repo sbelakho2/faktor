@@ -871,6 +871,16 @@ pub const TURN_RECORD_COMPLETED: &str = "completed";
 pub const TURN_RECORD_CANCELLED: &str = "cancelled";
 pub const TURN_RECORD_FAILED: &str = "failed";
 
+/// The ONE terminal-status predicate of a durable `turn_record` row: a
+/// record is terminal exactly when it is no longer [`TURN_RECORD_ACTIVE`] —
+/// [`TURN_RECORD_COMPLETED`], [`TURN_RECORD_CANCELLED`] or
+/// [`TURN_RECORD_FAILED`] (the three statuses [`Store::finish_turn_record`]
+/// accepts). Callers that wait for a turn to finalize use THIS predicate
+/// instead of re-spelling `!= "active"`, so the vocabulary cannot drift.
+pub fn is_terminal_turn_record_status(status: &str) -> bool {
+    status != TURN_RECORD_ACTIVE
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRow {
     pub id: i64,

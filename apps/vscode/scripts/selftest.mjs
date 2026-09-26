@@ -2532,19 +2532,9 @@ async function pendingSubmissionTests() {
     assert(restores[0].message.includes('413') || restores[0].message.includes('upload'), restores[0].message);
   });
 
-  await test('image submission is refused loudly and the draft/images remain', async () => {
+  await test('image submissions upload their bytes and start with the durable ids', async () => {
     const calls = [];
     const restores = [];
-    const client = {
-      uploadAttachment: async () => {
-        calls.push('upload');
-        throw new Error('must not upload an image');
-      },
-      startTaskRun: async () => {
-        calls.push('start');
-        throw new Error('must not start an image submission');
-      },
-    };
     const image = binaryAttachment({
       mime: 'image/png',
       filename: 'shot.png',
@@ -2552,26 +2542,92 @@ async function pendingSubmissionTests() {
       bytes: 4,
       dataBase64: Buffer.from([137, 80, 78, 71]).toString('base64'),
     });
-    const envelope = pendingEnvelope({ attachments: [image] });
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        calls.push({ kind: 'upload', sessionId, request });
+        return {
+          digest: 'e'.repeat(64),
+          mime: request.mime,
+          filename: request.filename ?? null,
+          size: 4,
+        };
+      },
+      startTaskRun: async (sessionId, request) => {
+        calls.push({ kind: 'start', sessionId, request });
+        return taskRunStartedJson;
+      },
+    };
     const outcome = await ts.admitPendingSubmission({
       client,
       sessionId: '7',
-      pending: envelope,
+      pending: pendingEnvelope({ attachments: [image] }),
       settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
       onStarted: () => {},
       onFailure: () => {},
       restore: (failure) => restores.push(failure),
     });
-    assertEqual(outcome.ok, false);
-    assertDeepEqual(calls, [], 'images are refused before any upload/start request');
-    assertEqual(restores.length, 1);
-    assertEqual(restores[0].kind, 'image_unsupported');
-    assert(
-      restores[0].message.includes('provider media/content parts are not wired'),
-      restores[0].message,
-    );
-    assert(envelope.files.length > 0, 'the image draft payload is kept for the restore');
-    assertEqual(outcome.attachmentIds.length, 0);
+    assertEqual(outcome.ok, true, 'an allowlisted image is admitted client-side');
+    assertEqual(restores.length, 0, 'success never restores');
+    assertEqual(calls.length, 2, 'one upload then exactly one start');
+    assertEqual(calls[0].kind, 'upload');
+    assertDeepEqual(calls[0].request, {
+      mime: 'image/png',
+      filename: 'shot.png',
+      data_base64: Buffer.from([137, 80, 78, 71]).toString('base64'),
+    });
+    assertEqual(calls[1].kind, 'start');
+    assertDeepEqual(calls[1].request.attachments, [
+      { digest: 'e'.repeat(64), mime: 'image/png', filename: 'shot.png', size: 4 },
+    ]);
+    assertEqual(outcome.attachmentIds.length, 1);
+  });
+
+  await test('undeliverable images are refused before any upload (mime allowlist + per-image bound)', async () => {
+    const cases = [
+      [
+        'mime',
+        binaryAttachment({ mime: 'image/svg+xml', filename: 'x.svg', isImage: true }),
+        'unsupported_image_type',
+      ],
+      [
+        'size',
+        binaryAttachment({
+          mime: 'image/png',
+          filename: 'huge.png',
+          isImage: true,
+          bytes: ts.MAX_PENDING_IMAGE_BYTES + 1,
+        }),
+        'oversized_image',
+      ],
+    ];
+    for (const [label, image, code] of cases) {
+      const calls = [];
+      const restores = [];
+      const outcome = await ts.admitPendingSubmission({
+        client: {
+          uploadAttachment: async () => {
+            calls.push('upload');
+            throw new Error(`${label}: must not upload`);
+          },
+          startTaskRun: async () => {
+            calls.push('start');
+            throw new Error(`${label}: must not start`);
+          },
+        },
+        sessionId: '7',
+        pending: pendingEnvelope({ attachments: [image] }),
+        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+        onStarted: () => {},
+        onFailure: () => {},
+        restore: (failure) => restores.push(failure),
+      });
+      assertEqual(outcome.ok, false, label);
+      assertDeepEqual(calls, [], `${label}: refused before any upload/start request`);
+      assertEqual(restores.length, 1, `${label}: restore exactly once`);
+      assertEqual(restores[0].kind, 'image_unsupported', label);
+      assertEqual(restores[0].code, code, label);
+      assertEqual(outcome.attachmentIds.length, 0, label);
+    }
   });
 
   await test('pending envelopes are re-validated strictly at the host boundary', () => {

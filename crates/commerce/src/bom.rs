@@ -8,9 +8,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::packaging::PackagingType;
 use crate::quantity::{NonZeroQuantity, MAX_ORDER_QUANTITY};
 use crate::query::{canonical_query, RequestError, MAX_QUERY_BYTES};
-use crate::text::Text;
+use crate::text::{Text, VariantId};
 
 pub use crate::query::MAX_BOM_LINES;
 
@@ -20,6 +21,13 @@ const BOM_ITEM_DOMAIN: &[u8] = b"faktor-commerce.bom-item/v1\0";
 const BOM_DIGEST_DOMAIN: &[u8] = b"faktor-commerce.bom/v1\0";
 
 /// One BOM line.
+///
+/// A line may carry a deterministic variant and/or packaging selection. The
+/// selection is identity-bearing: it is folded into [`BomItem::key`] and
+/// therefore into [`Bom::digest`], so two otherwise identical lines with
+/// different selections are two different lines and can never share a
+/// durable job item or a digest. A line without selections keeps the exact
+/// pre-selection key encoding (the digest is stable across this API).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BomItem {
@@ -27,6 +35,12 @@ pub struct BomItem {
     pub q: Text<{ MAX_QUERY_BYTES }>,
     /// The requested quantity (1..=1e9).
     pub qty: NonZeroQuantity,
+    /// The requested variant (id or bounded attribute expression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<VariantId>,
+    /// The requested packaging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packaging: Option<PackagingType>,
 }
 
 impl BomItem {
@@ -40,12 +54,52 @@ impl BomItem {
                 format!("{error} (maximum {MAX_ORDER_QUANTITY})"),
             )
         })?;
-        Ok(Self { q, qty })
+        Ok(Self {
+            q,
+            qty,
+            variant: None,
+            packaging: None,
+        })
     }
 
-    /// The stable item key: `BLAKE3(normalized query ‖ quantity)`.
+    /// Attach a variant selection to this line.
+    pub fn with_variant(mut self, variant: VariantId) -> Self {
+        self.variant = Some(variant);
+        self
+    }
+
+    /// Attach a packaging selection to this line.
+    pub fn with_packaging(mut self, packaging: PackagingType) -> Self {
+        self.packaging = Some(packaging);
+        self
+    }
+
+    /// True when this line requests a variant or packaging.
+    pub fn has_selection(&self) -> bool {
+        self.variant.is_some() || self.packaging.is_some()
+    }
+
+    /// The stable item key: `BLAKE3(normalized query ‖ quantity ‖
+    /// selections)`. The selection tags are appended only when present, so
+    /// an unselected line keeps the exact legacy key.
     pub fn key(&self) -> String {
-        item_key(self.q.as_str(), self.qty.get())
+        let normalized = canonical_query(self.q.as_str());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(BOM_ITEM_DOMAIN);
+        hash_base(&mut hasher, &normalized, self.qty.get());
+        if let Some(variant) = &self.variant {
+            hasher.update(&[1, b'v']);
+            let value = variant.as_str();
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        if let Some(packaging) = self.packaging {
+            hasher.update(&[1, b'p']);
+            let value = packaging.as_str();
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -57,10 +111,15 @@ pub fn item_key(query: &str, quantity: u64) -> String {
     let normalized = canonical_query(query);
     let mut hasher = blake3::Hasher::new();
     hasher.update(BOM_ITEM_DOMAIN);
+    hash_base(&mut hasher, &normalized, quantity);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The frozen base encoding: normalized query length + bytes + quantity.
+fn hash_base(hasher: &mut blake3::Hasher, normalized: &str, quantity: u64) {
     hasher.update(&(normalized.len() as u64).to_le_bytes());
     hasher.update(normalized.as_bytes());
     hasher.update(&quantity.to_le_bytes());
-    hasher.finalize().to_hex().to_string()
 }
 
 /// A validated BOM: 1..=500 lines, each line within its bounds.
@@ -216,5 +275,102 @@ mod tests {
         assert_eq!(forward.digest(), again.digest());
         assert_ne!(forward.digest(), backward.digest());
         assert_eq!(forward.digest().len(), 64);
+    }
+
+    #[test]
+    fn unselected_lines_keep_the_frozen_pre_selection_encoding() {
+        // The digest of an item without selections must not move: the base
+        // encoding stays `item_key` (the pre-selection API) and the
+        // selection tags are appended only when present.
+        let item = BomItem::new("TPS5430DDAR", 100).expect("line");
+        assert_eq!(item.key(), item_key("TPS5430DDAR", 100));
+        assert!(!item.has_selection());
+
+        let bom = Bom::from_pairs(&[("a", 1), ("b", 2)]).expect("bom");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(BOM_DIGEST_DOMAIN);
+        hasher.update(&2u64.to_le_bytes());
+        hasher.update(item_key("a", 1).as_bytes());
+        hasher.update(item_key("b", 2).as_bytes());
+        assert_eq!(
+            bom.digest(),
+            hasher.finalize().to_hex().to_string(),
+            "an unselected BOM digest is the frozen legacy digest"
+        );
+    }
+
+    #[test]
+    fn per_line_selections_are_identity_bearing() {
+        let variant = VariantId::new("sku-black-1m").expect("variant");
+        let base = BomItem::new("TPS5430DDAR", 100).expect("line");
+        let selected = base.clone().with_variant(variant.clone());
+        let packaged = base.clone().with_packaging(PackagingType::Tray);
+        let both = selected.clone().with_packaging(PackagingType::Tray);
+
+        assert!(selected.has_selection());
+        assert_ne!(
+            base.key(),
+            selected.key(),
+            "a variant selection is identity"
+        );
+        assert_ne!(base.key(), packaged.key(), "packaging is identity");
+        assert_ne!(
+            selected.key(),
+            packaged.key(),
+            "variant and packaging never collide"
+        );
+        assert_eq!(
+            selected.key(),
+            base.clone().with_variant(variant.clone()).key(),
+            "the same selection has the same key"
+        );
+
+        // Duplicate queries with different selections remain distinct lines
+        // at the same ordinal and in the digest.
+        assert_ne!(
+            crate::jobs::bom_line_key(0, &base),
+            crate::jobs::bom_line_key(0, &selected)
+        );
+        let plain = Bom::new(vec![base.clone(), base.clone()]).expect("bom");
+        let selected_bom = Bom::new(vec![base.clone(), selected.clone()]).expect("bom");
+        let both_bom = Bom::new(vec![base.clone(), both.clone()]).expect("bom");
+        assert_ne!(plain.digest(), selected_bom.digest());
+        assert_ne!(selected_bom.digest(), both_bom.digest());
+        assert_eq!(
+            selected_bom.digest(),
+            Bom::new(vec![base.clone(), base.clone().with_variant(variant)])
+                .expect("bom")
+                .digest()
+        );
+    }
+
+    #[test]
+    fn legacy_selection_free_json_round_trips_to_the_same_digest() {
+        // Durable job requests written before the selection API have no
+        // variant/packaging members; they must load with the exact digest
+        // they had.
+        let legacy: Bom =
+            serde_json::from_str(r#"[{"q":"TPS5430DDAR","qty":100}]"#).expect("legacy json");
+        assert_eq!(
+            legacy.digest(),
+            Bom::from_pairs(&[("TPS5430DDAR", 100)])
+                .expect("bom")
+                .digest()
+        );
+        assert!(!legacy.items()[0].has_selection());
+
+        // Selections round-trip, and unknown members are still refused.
+        let selected: Bom = serde_json::from_str(
+            r#"[{"q":"TPS5430DDAR","qty":100,"variant":"sku-black-1m","packaging":"tray"}]"#,
+        )
+        .expect("selected json");
+        assert_eq!(
+            selected.items()[0].variant.as_ref().map(VariantId::as_str),
+            Some("sku-black-1m")
+        );
+        assert_eq!(selected.items()[0].packaging, Some(PackagingType::Tray));
+        assert!(
+            serde_json::from_str::<Bom>(r#"[{"q":"TPS5430DDAR","qty":100,"note":"x"}]"#).is_err()
+        );
     }
 }

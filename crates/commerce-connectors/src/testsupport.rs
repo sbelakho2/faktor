@@ -3,14 +3,15 @@
 //! Site tests build their own context through these helpers so a connector
 //! unit test always runs with an injected fixture transport, a manual clock,
 //! a real quota state and a secret guard — never the process environment and
-//! never a network.
+//! never a network. The mechanism the runtime planner would have chosen is
+//! set explicitly; the default is the primary API mechanism.
 
 use std::sync::Arc;
 
 use faktor_commerce::text::Text;
 
-use crate::browser::FallbackPolicy;
 use crate::context::{AcquireCtx, ManualClock, MemoryDiagnostics};
+use crate::contract::Mechanism;
 use crate::quota::QuotaState;
 use crate::secrets::SecretGuard;
 use crate::testing::{FixtureTransport, RecordingBrowser};
@@ -31,12 +32,12 @@ pub(crate) struct Rig {
     pub(crate) secrets: Arc<SecretGuard>,
     pub(crate) diagnostics: Arc<MemoryDiagnostics>,
     pub(crate) browser: Arc<RecordingBrowser>,
-    pub(crate) policy: FallbackPolicy,
+    pub(crate) mechanism: Mechanism,
     pub(crate) clock: Arc<ManualClock>,
 }
 
 impl Rig {
-    /// A rig with the browser policy off (the default).
+    /// A rig with the API mechanism selected and no browser answer.
     pub(crate) fn new() -> Self {
         Self {
             transport: Arc::new(FixtureTransport::new()),
@@ -44,7 +45,7 @@ impl Rig {
             secrets: Arc::new(SecretGuard::new()),
             diagnostics: Arc::new(MemoryDiagnostics::new()),
             browser: Arc::new(RecordingBrowser::new()),
-            policy: FallbackPolicy::default(),
+            mechanism: Mechanism::OfficialApi,
             clock: Arc::new(ManualClock::new(TEST_NOW_MS)),
         }
     }
@@ -55,9 +56,9 @@ impl Rig {
         self
     }
 
-    /// Set the browser-fallback policy.
-    pub(crate) fn policy(mut self, policy: FallbackPolicy) -> Self {
-        self.policy = policy;
+    /// Set the mechanism the runtime planner chose.
+    pub(crate) fn mechanism(mut self, mechanism: Mechanism) -> Self {
+        self.mechanism = mechanism;
         self
     }
 
@@ -71,7 +72,7 @@ impl Rig {
         .clock(self.clock.clone())
         .diagnostics(self.diagnostics.clone())
         .browser(self.browser.clone())
-        .fallback_policy(self.policy)
+        .mechanism(self.mechanism)
         .build()
     }
 }

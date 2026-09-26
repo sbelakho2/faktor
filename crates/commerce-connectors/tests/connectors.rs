@@ -18,11 +18,11 @@ use faktor_commerce_connectors::contract::{
 use faktor_commerce_connectors::testing::{
     CannedResponse, FixtureTransport, MapCredentials, RecordingBrowser,
 };
+use faktor_commerce_connectors::MemoryDiagnostics;
 use faktor_commerce_connectors::{
     AcquireCtx, AlibabaConnector, China1688Connector, DigiKeyConnector, LcscConnector, ManualClock,
     MouserConnector, QuotaState, SecretGuard, SourceError, Text,
 };
-use faktor_commerce_connectors::{FallbackPolicy, MemoryDiagnostics};
 
 const MOUSER_KEY: &str = "mouser-sanitized-key-0123456789abcdef";
 const DIGIKEY_CLIENT_ID: &str = "digikey-sanitized-client-id-0001";
@@ -52,7 +52,13 @@ impl Harness {
         }
     }
 
+    /// The default test context: the runtime planner chose the API mechanism.
     fn ctx(&self) -> AcquireCtx {
+        self.ctx_mechanism(Mechanism::OfficialApi)
+    }
+
+    /// A context carrying the mechanism the runtime planner chose.
+    fn ctx_mechanism(&self, mechanism: Mechanism) -> AcquireCtx {
         AcquireCtx::builder(
             self.transport.clone(),
             self.quota.clone(),
@@ -61,7 +67,7 @@ impl Harness {
         .clock(Arc::new(ManualClock::new(1_700_000_000_000)))
         .diagnostics(self.diagnostics.clone())
         .browser(self.browser.clone())
-        .fallback_policy(FallbackPolicy::default())
+        .mechanism(mechanism)
         .build()
     }
 
@@ -292,7 +298,9 @@ async fn marketplaces_refuse_typed_without_an_injected_browser() {
         profile: Some(text("procurement-cn")),
     })
     .expect("1688");
-    let ctx = harness.ctx();
+    // Browser-only connectors are planned onto a browser mechanism; with no
+    // browser authority injected the refusal is typed.
+    let ctx = harness.ctx_mechanism(Mechanism::BrowserNetwork);
     for connector in [
         &alibaba as &dyn SiteConnector,
         &china1688 as &dyn SiteConnector,
@@ -329,7 +337,7 @@ async fn marketplaces_refuse_typed_without_an_injected_browser() {
 }
 
 #[tokio::test]
-async fn api_and_browser_fallback_are_independently_gated() {
+async fn api_mechanism_never_bypasses_a_rate_limit_with_the_browser() {
     let harness = Harness::new();
     harness
         .transport

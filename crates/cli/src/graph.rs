@@ -2226,8 +2226,13 @@ mod tests {
 
     /// Steps 1-3 + 17 are not inline in the core body: they live in the daemon
     /// entries (store + supervisor) and in serve (ServerDeps assembly). Each
-    /// gets its structural assertion here.
-    const ENTRY_HEADERS: &[&str] = &["fn build_daemon(", "fn build_daemon_with_mcp_inner("];
+    /// gets its structural assertion here. `build_daemon` delegates to the
+    /// planner-seam entry, so that shared sync entry is where steps 1-3 are
+    /// constructed exactly once.
+    const ENTRY_HEADERS: &[&str] = &[
+        "fn build_daemon_with_acquisition_planner(",
+        "fn build_daemon_with_mcp_inner(",
+    ];
 
     #[test]
     fn construction_order_markers_rise_strictly_inside_the_core_builder() {

@@ -31,6 +31,7 @@ import dev.faktor.shared.ReleaseDigest
 import dev.faktor.shared.ReleasePidHandshake
 import dev.faktor.shared.ReleasePidLine
 import dev.faktor.shared.StartupLine
+import dev.faktor.shared.asciiLowerCase
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
@@ -396,7 +397,7 @@ private fun verifyAnnouncementDigest(
 // --------------------------------------------------------- process probes
 
 private fun isWindows(): Boolean =
-    System.getProperty("os.name", "").toLowerCase().contains("win")
+    asciiLowerCase(System.getProperty("os.name", "")).contains("win")
 
 /** True while `pid` names a live process (a zombie still owns its pid). */
 internal fun pidAlive(pid: Long): Boolean {
