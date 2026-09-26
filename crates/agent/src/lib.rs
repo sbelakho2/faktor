@@ -3459,11 +3459,15 @@ mod advisory_evidence_poll_tests {
 
     #[tokio::test]
     async fn provider_panic_is_caught_and_typed() {
+        // The provider panic must surface as a typed status; under a loaded
+        // runner the 500ms default let the wall budget win the race. The
+        // assertion is about the typed panic, so give the catch path room.
+        let panic_budget = std::time::Duration::from_secs(5);
         let outcome = poll_evidence_with_wall_budget_outcome(
             Arc::new(PanickingProvider),
             session(),
             query(),
-            budget(),
+            panic_budget,
         )
         .await;
         assert!(outcome.evidence.is_empty());
@@ -3479,7 +3483,7 @@ mod advisory_evidence_poll_tests {
             Arc::new(PanickingProvider),
             session(),
             query(),
-            budget(),
+            panic_budget,
         )
         .await;
         let after = evidence_poll_degraded_diagnostics();
@@ -4864,7 +4868,7 @@ mod bounded_evidence_executor_tests {
 
         // Wedge the single worker, then its first replacement: two runtime
         // abandonments reach the absolute cap.
-        for _ in 0..2 {
+        for round in 1..=2usize {
             let outcome = poll_on_executor(
                 executor.clone(),
                 Arc::new(SyncBlockingProvider),
@@ -4877,10 +4881,22 @@ mod bounded_evidence_executor_tests {
                 outcome.status,
                 EvidencePollStatus::TimedOut { .. }
             ));
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            executor.maintain();
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            executor.maintain();
+            // The abandonment lands on a maintenance tick after the
+            // retirement deadline; wait bounded instead of assuming a fixed
+            // schedule under load.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                executor.maintain();
+                if executor.stats().runtime_abandoned >= round {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "runtime abandonment {round} did not land within the bounded wait: {:?}",
+                    executor.stats()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
         let stats = executor.stats();
         assert_eq!(stats.runtime_abandoned, 2, "the absolute cap: {stats:?}");
