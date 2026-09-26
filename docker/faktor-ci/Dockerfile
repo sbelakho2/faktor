@@ -16,7 +16,11 @@
 # minimum JVM for the pinned Gradle wrapper (9.7.1).
 # The JDK 11 JRE stays for the apt-kotlinc smoke fallback (kotlinc 1.3.31
 # cannot read JDK >= 16 class files). JAVA_HOME is pinned to the JDK 17 tree
-# so Gradle never depends on update-alternatives state.
+# so Gradle never depends on update-alternatives state. `libharfbuzz0b`,
+# `fontconfig` and `fonts-dejavu-core` are the pinned headless-Swing font
+# runtime the credential/parity smoke needs (JDK 17's libfontmanager loads
+# libharfbuzz at class-init; without it every panel row fails closed with
+# SunFontManager errors).
 #
 # Once `scripts/build-ci-image.sh` pushes this image, the lanes switch to
 # `image: <ref>@sha256:<digest>` and their apt steps disappear (annotate with
@@ -54,6 +58,9 @@ RUN set -eux; \
         pkg-config=1.8.1-2build1 \
         libssl-dev=3.0.13-0ubuntu3.15 \
         kotlin=1.3.31+ds1-1ubuntu1 \
+        libharfbuzz0b=8.3.0-2build2 \
+        fontconfig=2.15.0-1.1ubuntu2 \
+        fonts-dejavu-core=2.37-8 \
         openjdk-11-jre-headless=11.0.32.1+1-1ubuntu1~24.04 \
         openjdk-17-jre-headless=17.0.20.1+1-1~24.04 \
         openjdk-17-jdk-headless=17.0.20.1+1-1~24.04 \
@@ -68,6 +75,9 @@ RUN set -eux; \
         pkg-config=1.8.1-2build1 \
         libssl-dev=3.0.13-0ubuntu3.15 \
         kotlin=1.3.31+ds1-1ubuntu1 \
+        libharfbuzz0b=8.3.0-2build2 \
+        fontconfig=2.15.0-1.1ubuntu2 \
+        fonts-dejavu-core=2.37-8 \
         openjdk-11-jre-headless=11.0.32.1+1-1ubuntu1~24.04 \
         openjdk-17-jre-headless=17.0.20.1+1-1~24.04 \
         openjdk-17-jdk-headless=17.0.20.1+1-1~24.04 \

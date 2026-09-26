@@ -570,7 +570,7 @@ private fun startVictim(): Process =
 
 private fun javaBinary(): String = Paths.get(
     System.getProperty("java.home"), "bin",
-    if (System.getProperty("os.name", "").lowercase().contains("win")) "java.exe" else "java"
+    if (System.getProperty("os.name", "").toLowerCase().contains("win")) "java.exe" else "java"
 ).toString()
 
 private fun readPidFile(pidfile: Path): Long? {
