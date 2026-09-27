@@ -132,18 +132,29 @@ Implemented (this revision of the daemon):
 - `GET /models` — the flat daemon model catalog:
   `[{provider, model, context, maxOutput, tools, parallelTools,
   reasoning, thinking, vision, structuredOutput, embeddings, streaming,
-  source}]`, walking every registered provider instance × its
-  `known_models()` × `capabilities(model)`. `source` is the provenance
-  string: `"liveProbe"` when the provider reports a live runtime context
-  limit for the model (e.g. an Ollama `/api/ps` allocation),
-  `"providerCatalog"` when the entry carries a non-default capability
-  profile (configured or probed), else `"conservativeDefault"` (the
-  fail-safe default profile).
+  source, documentCapable, attachmentLimits}]`, walking every registered
+  provider instance × its `known_models()` × `capabilities(model)`.
+  `source` is the provenance string: `"liveProbe"` when the provider
+  reports a live runtime context limit for the model (e.g. an Ollama
+  `/api/ps` allocation), `"providerCatalog"` when the entry carries a
+  non-default capability profile (configured or probed), else
+  `"conservativeDefault"` (the fail-safe default profile).
+  `documentCapable` is the model's document-delivery gate (the
+  vision-like gate for `application/pdf` / `text/plain` attachments) and
+  `attachmentLimits` is the daemon-advertised attachment admission
+  contract of that exact provider/model, assembled by the ONE Rust source
+  of truth (`faktor_provider::AttachmentLimits::for_model`):
+  `{maxUploadBytes, maxRequestBytes, maxAttachmentBytes,
+  image: {mimes: [{mime, maxBytes}], maxRequestBytes},
+  document: {capable, mimes: [{mime, maxBytes}], maxRequestBytes}}`.
+  Clients consume these values instead of mirroring daemon constants and
+  keep only a conservative emergency ceiling for the window before the
+  catalog is read.
 - `GET /capabilities` — introspection map for capability-driven UI:
-  `{ "<provider>": { models: [{id, capabilities}],
-  runtimeContextLimitSupported: bool } }` (same registry walk; the
-  boolean is true when any known model of the provider reports a live
-  runtime limit).
+  `{ "<provider>": { models: [{id, capabilities, documentCapable,
+  attachmentLimits}], runtimeContextLimitSupported: bool } }` (same
+  registry walk; the boolean is true when any known model of the provider
+  reports a live runtime limit).
 - `GET /native/health` / `GET /native/ready` — see "Liveness and
   readiness" above.
 - `POST /native/session` — create one durable session:
@@ -155,6 +166,24 @@ Implemented (this revision of the daemon):
   daemon's single executor entry: `{session_id, prompt, files?}` (the body
   id must match the path) → `{op_id, run_id, accepted, queued}`. Empty
   prompts are a typed 400; unknown sessions 404.
+- `POST /native/session/{id}/attachments` — upload ONE durable typed
+  attachment: `{mime, filename?, data_base64}` (strict DTO) →
+  `{digest, mime, filename, size}`. `data_base64` is the CANONICAL
+  standard-alphabet base64 of the raw bytes: whitespace and every
+  non-canonical form (bad length/padding, non-zero trailing bits, foreign
+  alphabet) are typed 400s, and the decoder reads the wire bytes directly
+  into one pre-sized bounded destination. The decoded bytes are bounded by
+  the advertised `attachmentLimits.maxUploadBytes`; identical bytes dedupe
+  to the first durable row. IMAGE and DOCUMENT delivery is validated
+  model-aware at task admission, never at upload: images against
+  `vision` + the image MIME/byte contract, `application/pdf` /
+  `text/plain` against the chosen model's `documentCapable` and document
+  MIME/byte contract; a refusal keeps the durable bytes. Ordinary
+  workspace source files ride the repository-context `files` path of a
+  prompt/task start and are never uploaded blindly.
+- `GET /native/session/{id}/attachments/{digest}` and
+  `.../{digest}/bytes` — resolve one durable attachment's metadata or its
+  verified bytes by BLAKE3 digest; unknown digests are typed 404s.
 - `GET /native/session/{id}/events?after=<seq>` — the durable journal SSE
   stream, cursor-resumable: frames are `id: <seq>`, `event: <kind>`,
   `data: <native_event_row>` (the exact shape of the `/native/events`

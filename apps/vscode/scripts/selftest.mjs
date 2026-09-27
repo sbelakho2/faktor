@@ -147,6 +147,28 @@ const sessionSummaryJson = {
   model: 'm',
   state: 'idle',
 };
+const attachmentLimitsJson = {
+  maxUploadBytes: 7340032,
+  maxRequestBytes: 10485760,
+  maxAttachmentBytes: 33554432,
+  image: {
+    mimes: [
+      { mime: 'image/png', maxBytes: 5242880 },
+      { mime: 'image/jpeg', maxBytes: 5242880 },
+      { mime: 'image/gif', maxBytes: 5242880 },
+      { mime: 'image/webp', maxBytes: 5242880 },
+    ],
+    maxRequestBytes: 16777216,
+  },
+  document: {
+    capable: true,
+    mimes: [
+      { mime: 'application/pdf', maxBytes: 8388608 },
+      { mime: 'text/plain', maxBytes: 8388608 },
+    ],
+    maxRequestBytes: 16777216,
+  },
+};
 const modelInfoJson = {
   provider: 'fake',
   model: 'm',
@@ -161,7 +183,15 @@ const modelInfoJson = {
   embeddings: false,
   streaming: true,
   source: 'providerCatalog',
+  documentCapable: true,
+  attachmentLimits: attachmentLimitsJson,
 };
+
+/** The shared daemon/IDE limit fixture (checked by the Rust side too). */
+function attachmentLimitsFixture() {
+  const url = new URL('../../../fixtures/attachment-limits.json', import.meta.url);
+  return JSON.parse(readFileSync(url, 'utf8'));
+}
 const projectionJson = {
   session: { id: '7', title: 'selftest', provider: 'fake', model: 'm', lifecycle: 'open' },
   state: { machine: 'idle', label: 'Idle', active: false, terminal: false },
@@ -585,6 +615,37 @@ const semanticStatusJson = {
   snapshotState: { providers: [], fallback: true },
 };
 const abortAckJson = { aborted: ['1'] };
+// Audits 5/6/16: a PARTIAL generation with a capped fingerprint round.
+const indexCoverageJson = {
+  sessionId: '7',
+  index_coverage: {
+    workspace: 3,
+    state: 'ready',
+    generation: 2,
+    published_generation: 2,
+    coverage: {
+      files_seen: 4500,
+      files_indexed: 512,
+      bytes_indexed: 2048,
+      complete: false,
+      truncated_reason: 'batch_files',
+    },
+    fingerprint: {
+      scanned: 12,
+      complete: false,
+      shard: 3,
+      round_start: 1,
+      epoch: 4,
+      shards_done: 7,
+      verify: true,
+      cursors: [],
+      truncated_reason: 'fingerprint_files',
+    },
+    freshness: 'partial',
+    serving: true,
+  },
+};
+const indexCoverageUnhostedJson = { sessionId: '7', index_coverage: null };
 
 // --------------------------------------------------------------- fake fetch
 
@@ -661,6 +722,19 @@ async function validatorAccepts() {
     assertEqual(nc.validateSessionCreated(clone(sessionCreatedJson)).id, '7');
     assertEqual(nc.validateSessionList({ sessions: [clone(sessionSummaryJson)] }).length, 1);
     assertEqual(nc.validateModelCatalog([clone(modelInfoJson)]).length, 1);
+    const parsedModel = nc.validateModelCatalog([clone(modelInfoJson)])[0];
+    assertEqual(parsedModel.documentCapable, true, 'advertised document gate parsed');
+    assertEqual(parsedModel.attachmentLimits?.document.capable, true);
+    assertEqual(parsedModel.attachmentLimits?.image.mimes[0].maxBytes, 5242880);
+    assertEqual(parsedModel.attachmentLimits?.maxUploadBytes, 7340032);
+    // Additive contract: a legacy daemon entry without the new fields keeps
+    // validating (emergency fallback at the policy layer, never a throw).
+    const legacyModel = clone(modelInfoJson);
+    delete legacyModel.documentCapable;
+    delete legacyModel.attachmentLimits;
+    const legacyParsed = nc.validateModelCatalog([legacyModel])[0];
+    assertEqual(legacyParsed.documentCapable, false);
+    assertEqual(legacyParsed.attachmentLimits, null);
     assertEqual(nc.validateProjection(clone(projectionJson)).filesChanged[0], 'a.ts');
     assertEqual(nc.validateTurns([{ opId: '1', status: 'completed', provider: 'p', model: 'm', variant: null, toolMode: null, startedAt: 1, updatedMs: 2, queueSeq: null, promptMessageId: null }]).length, 1);
     assertEqual(nc.validateTaskViews([clone(taskViewJson)])[0].budget.spentCostMicro, 12n);
@@ -761,6 +835,46 @@ async function validatorRejects() {
     assertProtocol(
       () => nc.validateModelCatalog([{ ...clone(modelInfoJson), context: '8192' }]),
       'expected a finite number',
+    );
+    assertProtocol(
+      () => nc.validateModelCatalog([{ ...clone(modelInfoJson), documentCapable: 'yes' }]),
+      'expected a boolean',
+    );
+    assertProtocol(
+      () =>
+        nc.validateModelCatalog([
+          { ...clone(modelInfoJson), attachmentLimits: { ...clone(attachmentLimitsJson), maxUploadBytes: '7' } },
+        ]),
+      'attachmentLimits.maxUploadBytes',
+    );
+    assertProtocol(
+      () =>
+        nc.validateModelCatalog([
+          {
+            ...clone(modelInfoJson),
+            attachmentLimits: {
+              ...clone(attachmentLimitsJson),
+              document: { ...clone(attachmentLimitsJson.document), capable: 'yes' },
+            },
+          },
+        ]),
+      'expected a boolean',
+    );
+    assertProtocol(
+      () =>
+        nc.validateModelCatalog([
+          {
+            ...clone(modelInfoJson),
+            attachmentLimits: {
+              ...clone(attachmentLimitsJson),
+              image: {
+                ...clone(attachmentLimitsJson.image),
+                mimes: [{ mime: 'image/png' }],
+              },
+            },
+          },
+        ]),
+      'missing required field maxBytes',
     );
     assertProtocol(
       () => nc.validateProjection({ ...clone(projectionJson), state: { machine: 'idle', label: 'Idle', active: false, terminal: false, rogue: 1 }, queued: '0' }),
@@ -933,6 +1047,48 @@ async function validatorRejects() {
       () => nc.validateCreditGrant({ ok: true, duplicate: false }),
       'missing required field credits',
     );
+    // Index coverage (audits 5/6/16): missing known fields, typed counters,
+    // unknown freshness tags and a non-object response all fail loudly; a
+    // null coverage is the ONLY honest "unhosted" answer.
+    const coverageFixture = indexCoverageJson.index_coverage;
+    assertProtocol(
+      () => nc.validateIndexCoverage({ sessionId: '7', index_coverage: { ...clone(coverageFixture), freshness: 'sorta' } }),
+      'unknown freshness',
+    );
+    const missingFreshness = clone(coverageFixture);
+    delete missingFreshness.freshness;
+    assertProtocol(
+      () => nc.validateIndexCoverage({ sessionId: '7', index_coverage: missingFreshness }),
+      'missing required field freshness',
+    );
+    assertProtocol(
+      () =>
+        nc.validateIndexCoverage({
+          sessionId: '7',
+          index_coverage: {
+            ...clone(coverageFixture),
+            coverage: { ...clone(coverageFixture.coverage), files_indexed: '512' },
+          },
+        }),
+      'expected a finite number',
+    );
+    assertProtocol(
+      () =>
+        nc.validateIndexCoverage({
+          sessionId: '7',
+          index_coverage: {
+            ...clone(coverageFixture),
+            fingerprint: { ...clone(coverageFixture.fingerprint), verify: 'yes' },
+          },
+        }),
+      'expected a boolean',
+    );
+    assertProtocol(() => nc.validateIndexCoverage('nope'), 'expected an object');
+    assertEqual(
+      nc.validateIndexCoverage(indexCoverageUnhostedJson),
+      null,
+      'null coverage is the honest unhosted answer',
+    );
   });
 }
 
@@ -986,6 +1142,8 @@ async function clientAccepts() {
       'GET /native/evidence/41': () => jsonResponse(evidenceJson),
       'POST /native/evidence/41/retrieve': () => jsonResponse(evidenceRetrievalJson),
       'GET /native/semantic/status': () => jsonResponse(semanticStatusJson),
+      'GET /native/index/coverage': (call) =>
+        jsonResponse(call.query.session === '7' ? indexCoverageJson : indexCoverageUnhostedJson),
       'POST /native/session/7/abort': () => jsonResponse(abortAckJson),
     };
     const { client, calls } = makeClient(routes);
@@ -1054,6 +1212,22 @@ async function clientAccepts() {
     assertEqual((await client.evidence('7', 41)).backingRetained, true);
     assertEqual((await client.retrieveEvidence('7', 41, { selector: 'all' })).byteLen, 3);
     assertEqual((await client.semanticStatus()).snapshotState.fallback, true);
+    const coverage = await client.indexCoverage('7');
+    assertEqual(coverage.coverage.files_indexed, 512);
+    assertEqual(coverage.fingerprint.shard, 3);
+    assertEqual(coverage.freshness, 'partial');
+    assertEqual(coverage.serving, true);
+    assertEqual(await client.indexCoverage('8'), null, 'an unhosted service is honestly null');
+    assertEqual(nc.indexCoverageLabel(coverage), 'index: partial 512/4500 files');
+    assertEqual(
+      nc.indexCoverageLabel({
+        ...coverage,
+        freshness: 'stale_while_rebuilding',
+        coverage: { ...coverage.coverage, complete: true },
+      }),
+      'index: stale while rebuilding',
+    );
+    assertEqual(nc.indexCoverageLabel(null), 'index: not reported');
     assertEqual((await client.abortSession('7', '3')).aborted[0], '1');
 
     // Request construction: auth, bodies, paths, cursor paging.
@@ -1418,6 +1592,28 @@ async function stateTests() {
     unsubscribe();
     store.patch({ daemon: 'stopped' });
     assertEqual(calls, 2, 'unsubscribed listeners must not fire');
+  });
+
+  await test('index coverage never bleeds across a session switch or daemon stop', () => {
+    const store = new st.FaktorStore();
+    const coverage = indexCoverageJson.index_coverage;
+    store.patch({
+      daemon: 'running',
+      session: { id: '7', title: 'a', provider: 'fake', model: 'm', state: 'open' },
+    });
+    store.patch({ indexCoverage: coverage });
+    assertEqual(store.snapshot().indexCoverage.freshness, 'partial');
+    // Same session, new read: the panel updates in place.
+    store.patch({ indexCoverage: { ...coverage, freshness: 'current' } });
+    assertEqual(store.snapshot().indexCoverage.freshness, 'current');
+    // A different session must not inherit the previous workspace's coverage.
+    store.patch({
+      session: { id: '8', title: 'b', provider: 'fake', model: 'm', state: 'open' },
+    });
+    assertEqual(store.snapshot().indexCoverage, null);
+    // A daemon stop drops it too (the daemon, not the session, owned it).
+    store.patch({ daemon: 'stopped' });
+    assertEqual(store.snapshot().indexCoverage, null);
   });
 
   await test('transcript reducer renders durable message pages and SSE frames', () => {
@@ -2628,6 +2824,144 @@ async function pendingSubmissionTests() {
       assertEqual(restores[0].code, code, label);
       assertEqual(outcome.attachmentIds.length, 0, label);
     }
+  });
+
+  await test('the advertised model contract drives attachment gates; the emergency ceiling is only the fallback', () => {
+    const fixture = attachmentLimitsFixture();
+    // The shared fixture is the Rust-checked canonical contract.
+    const advertised = ts.attachmentPolicyFromLimits(fixture.canonical);
+    assertEqual(advertised.source, 'advertised');
+    assertEqual(advertised.maxUploadBytes, fixture.canonical.maxUploadBytes);
+    assertEqual(advertised.maxImageBytes, 5242880);
+    assertEqual(advertised.documentCapable, true);
+    assertDeepEqual(advertised.documentMimes, ['application/pdf', 'text/plain']);
+    // The emergency fallback is byte-identical to the daemon constants and
+    // CONSERVATIVE: never above any advertised bound.
+    assertEqual(ts.EMERGENCY_ATTACHMENT_POLICY.source, 'emergency');
+    assertEqual(ts.EMERGENCY_ATTACHMENT_POLICY.maxUploadBytes, ts.MAX_PENDING_ATTACHMENT_BYTES);
+    assertEqual(ts.EMERGENCY_ATTACHMENT_POLICY.maxUploadBytes, fixture.emergencyCeiling.maxUploadBytes);
+    assertEqual(ts.EMERGENCY_ATTACHMENT_POLICY.maxImageBytes, fixture.emergencyCeiling.maxImageBytes);
+    assertEqual(ts.EMERGENCY_ATTACHMENT_POLICY.maxDocumentBytes, fixture.emergencyCeiling.maxDocumentBytes);
+    assertDeepEqual([...ts.SUPPORTED_PENDING_IMAGE_MIMES], fixture.emergencyCeiling.imageMimes);
+    assertDeepEqual([...ts.SUPPORTED_PENDING_DOCUMENT_MIMES], fixture.emergencyCeiling.documentMimes);
+    for (const entry of fixture.canonical.image.mimes) {
+      assert(
+        ts.EMERGENCY_ATTACHMENT_POLICY.maxImageBytes <= entry.maxBytes,
+        `emergency image ceiling must stay <= advertised ${entry.mime}`,
+      );
+    }
+    for (const entry of fixture.canonical.document.mimes) {
+      assert(
+        ts.EMERGENCY_ATTACHMENT_POLICY.maxDocumentBytes <= entry.maxBytes,
+        `emergency document ceiling must stay <= advertised ${entry.mime}`,
+      );
+    }
+    // Catalog resolution: the exact (provider, model) entry wins; a missing
+    // model falls back to the emergency ceiling, never to no ceiling.
+    const catalog = [nc.validateModelCatalog([{ ...clone(modelInfoJson), provider: 'p', model: 'm' }])[0]];
+    assertEqual(ts.attachmentPolicyForModel(catalog, 'p', 'm').source, 'advertised');
+    assertEqual(ts.attachmentPolicyForModel(catalog, 'p', 'unknown'), ts.EMERGENCY_ATTACHMENT_POLICY);
+  });
+
+  await test('advertised image bounds gate before upload (tighter AND looser than the emergency ceiling)', () => {
+    const fixture = attachmentLimitsFixture();
+    const image = (bytes) =>
+      binaryAttachment({ mime: 'image/png', filename: 'image.png', isImage: true, bytes });
+    // A tighter advertised per-image bound wins over the emergency 5 MiB.
+    const tight = ts.attachmentPolicyFromLimits({
+      ...clone(fixture.canonical),
+      image: {
+        ...clone(fixture.canonical.image),
+        mimes: fixture.canonical.image.mimes.map((entry) => ({ ...entry, maxBytes: 1024 })),
+      },
+    });
+    const refusal = ts.pendingImageRefusal([image(2048)], tight);
+    assertEqual(refusal.kind, 'image_unsupported');
+    assertEqual(refusal.code, 'oversized_image');
+    assert(refusal.message.includes('1024'), refusal.message);
+    // A looser advertised bound (20 MiB per image) admits an 8 MiB image
+    // that the emergency fallback would refuse — consumed, not mirrored.
+    const loose = ts.attachmentPolicyFromLimits({
+      ...clone(fixture.canonical),
+      image: {
+        ...clone(fixture.canonical.image),
+        mimes: fixture.canonical.image.mimes.map((entry) => ({ ...entry, maxBytes: 20 * 1024 * 1024 })),
+      },
+    });
+    assertEqual(ts.pendingImageRefusal([image(8 * 1024 * 1024)], loose), null);
+    assertEqual(
+      ts.pendingImageRefusal([image(8 * 1024 * 1024)], ts.EMERGENCY_ATTACHMENT_POLICY).code,
+      'oversized_image',
+      'without the catalog the conservative ceiling still refuses',
+    );
+    // The advertised request-wide image total is enforced too: four 4.5 MiB
+    // images each fit the 5 MiB per-image bound but total 18 MiB > 16 MiB.
+    const total = ts.pendingImageRefusal(
+      [image(4_500_000), image(4_500_000), image(4_500_000), image(4_500_000)],
+      ts.attachmentPolicyFromLimits(fixture.canonical),
+    );
+    assertEqual(total.code, 'oversized_image');
+    assert(total.message.includes('request image bound'), total.message);
+  });
+
+  await test('documents ride the advertised capability contract (legacy daemons keep deciding)', async () => {
+    const fixture = attachmentLimitsFixture();
+    const pdf = binaryAttachment({ bytes: 3 });
+    // Advertised capable: the document passes the client gate.
+    assertEqual(ts.pendingDocumentRefusal([pdf], ts.attachmentPolicyFromLimits(fixture.canonical)), null);
+    // Advertised incapable: refused before any upload, with the model reason.
+    const incapable = ts.attachmentPolicyFromLimits({
+      ...clone(fixture.canonical),
+      document: { ...clone(fixture.canonical.document), capable: false },
+    });
+    const refusal = ts.pendingDocumentRefusal([pdf], incapable);
+    assertEqual(refusal.kind, 'document_unsupported');
+    assertEqual(refusal.code, 'unsupported_document_type');
+    assert(refusal.message.includes('document'), refusal.message);
+    // Legacy daemon (no advertised contract): the daemon's own admission
+    // decides, so the client does not refuse on capability grounds.
+    assertEqual(ts.pendingDocumentRefusal([pdf], ts.EMERGENCY_ATTACHMENT_POLICY), null);
+    // Advertised per-document bound is consumed.
+    const smallDocs = ts.attachmentPolicyFromLimits({
+      ...clone(fixture.canonical),
+      document: {
+        ...clone(fixture.canonical.document),
+        mimes: fixture.canonical.document.mimes.map((entry) => ({ ...entry, maxBytes: 1024 })),
+      },
+    });
+    assertEqual(
+      ts.pendingDocumentRefusal([binaryAttachment({ bytes: 2048 })], smallDocs).code,
+      'oversized_document',
+    );
+    // The advertised upload ceiling refuses end-to-end BEFORE any request.
+    const calls = [];
+    const restores = [];
+    const outcome = await ts.admitPendingSubmission({
+      client: {
+        uploadAttachment: async () => {
+          calls.push('upload');
+          throw new Error('must not upload');
+        },
+        startTaskRun: async () => {
+          calls.push('start');
+          throw new Error('must not start');
+        },
+      },
+      sessionId: '7',
+      pending: pendingEnvelope({ attachments: [pdf] }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      attachmentLimits: ts.attachmentPolicyFromLimits({
+        ...clone(fixture.canonical),
+        maxUploadBytes: 2,
+      }),
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure) => restores.push(failure),
+    });
+    assertEqual(outcome.ok, false);
+    assertDeepEqual(calls, [], 'refused before any upload/start request');
+    assertEqual(outcome.failure.code, 'oversized_upload');
+    assertEqual(restores.length, 1);
   });
 
   await test('pending envelopes are re-validated strictly at the host boundary', () => {

@@ -1,36 +1,42 @@
-//! Production-wiring certification for the completion PR step: the DAEMON'S
-//! `TaskExecutor` (built by `build_daemon_core`), configured exactly as
-//! `serve_impl` configures it, executes a contracted `include_pr` task
-//! through the REAL `faktor_scm::GitHubCompletionScm` over the real
-//! `GitHubApp` adapter, against a loopback fake GitHub server.
+//! MANUAL adapter-contract certification — the explicit exception to the
+//! production-wiring authority-replacement static scan
+//! (`production_wiring_tests_never_replace_built_daemon_authorities` in
+//! `faktor-tests-static-authority`): embedded hosts (and this contract test)
+//! may install a hand-built canonical SCM adapter onto a built executor
+//! through [`faktor_orchestrator::runtime::task_executor::TaskExecutor::set_completion_scm_provider`].
 //!
-//! The graph is built ONLY through the production builder with the strict
-//! `[cloud.github_app]` section in config (fake API base) plus the
-//! documented external token-source/clock seams — no adapter is ever
-//! installed onto the executor after the build: the builder transforms the
-//! config into the executor's provider itself, and the test asserts the
-//! adapter path end to end.
+//! This file certifies that MANUAL seam against the real
+//! `faktor_scm::GitHubCompletionScm` + `faktor_scm::GitHubApp` adapter over a
+//! loopback fake GitHub server:
 //!
-//! The assertions are on the ADAPTER PATH itself: the fake GitHub sees the
-//! installation-token bearer, the exact refs payload at the verified head,
-//! and the PR create with the orchestrator's head/base/marker — never a
-//! test-double SCM provider.
+//! 1. a built executor with NO provider records the explicit
+//!    `native_pr_scm_not_configured` blocker for a contracted PR step;
+//! 2. after `set_completion_scm_provider(Some(adapter))` the SAME executor
+//!    runs the contracted step through the adapter (installation-token
+//!    bearer, exact refs payload, PR identity);
+//! 3. after `set_completion_scm_provider(None)` the blocker is back.
+//!
+//! The CONFIG-driven daemon wiring (`[cloud.github_app]` ->
+//! `build_daemon_core` -> executor) is certified separately in
+//! `completion_scm.rs`; this test covers only the manual embedded-host seam.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use faktor_core::completion::CompletionContract;
+use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use faktor_core::id::VerificationRecordId;
 use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
 use faktor_provider::egress::PolicyCheckedHttpTransport;
-use faktor_scm::store::RepositoryRow;
-use faktor_scm::{ManualClock, StaticTokenSource};
+use faktor_scm::completion::GitHubCompletionScm;
+use faktor_scm::github::GitHubAppConfig;
+use faktor_scm::store::{MemoryScmStore, RepositoryRow, ScmStore};
+use faktor_scm::{GitHubApp, ManualClock, StaticTokenSource};
 use faktor_session::{Task, TaskBudget};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use faktor_tests_production_wiring::wiring::{self, CloudGithubAppCfg, Config, GithubAppSeams};
+use faktor_tests_production_wiring::wiring::{self, Config};
 
 const TENANT: &str = "tenant-a";
 const NOW_MS: i64 = 1_700_000_000_000;
@@ -264,7 +270,6 @@ fn repository_row(owner: &str, name: &str, installation_id: i64) -> RepositoryRo
 fn seed_contract_task(
     graph: &wiring::DaemonGraph,
     parent: faktor_core::SessionId,
-    goal: &str,
 ) -> VerificationRecordId {
     let handle = graph.session.get_session(parent).unwrap().unwrap();
     let task_id = handle.task_id().unwrap();
@@ -273,7 +278,7 @@ fn seed_contract_task(
         .create_task(Task {
             task_id,
             session_id: parent,
-            goal: goal.to_string(),
+            goal: "ship the manually wired PR".to_string(),
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
@@ -318,14 +323,55 @@ fn seed_contract_task(
         .unwrap()
 }
 
+/// One fresh session over `repo` with the session-owned worktree row the
+/// completion step resolves its root from.
+fn session_for(graph: &wiring::DaemonGraph, repo: &Path, label: &str) -> faktor_core::SessionId {
+    let workspace = graph
+        .session
+        .create_workspace(repo.to_str().unwrap())
+        .unwrap();
+    let handle = graph
+        .session
+        .create_session(workspace, label, "provider", "model")
+        .unwrap();
+    let parent = handle.id();
+    graph.session.ensure_owner_worktree(parent).unwrap();
+    parent
+}
+
+async fn run_and_expect_blocker(graph: &wiring::DaemonGraph, parent: faktor_core::SessionId) {
+    let proof = seed_contract_task(graph, parent);
+    let report = graph
+        .tasks
+        .run_completion_steps(parent, proof)
+        .await
+        .expect("the executor runs the contracted steps")
+        .expect("include_pr contract is requested");
+    assert_eq!(
+        report.outcome_of(CompletionStep::Pr),
+        Some(CompletionStepOutcome::Failed),
+        "{report:?}"
+    );
+    let detail = &report
+        .records
+        .iter()
+        .find(|record| record.step == CompletionStep::Pr)
+        .expect("a PR step record")
+        .detail;
+    assert!(
+        detail.contains("native_pr_scm_not_configured"),
+        "the fail-closed configuration blocker must be explicit: {detail}"
+    );
+}
+
 // ------------------------------------------------------------------- test
 
-/// The daemon executor's contracted PR step runs the production
-/// `GitHubCompletionScm`/`GitHubApp` adapter against the fake GitHub server:
-/// the ref is created at the verified HEAD with the minted installation
-/// token and the PR carries the exact head/base/marker identity.
+/// The MANUAL adapter-contract seam (embedded hosts): a hand-built
+/// `GitHubCompletionScm`/`GitHubApp` adapter installed through
+/// `set_completion_scm_provider` runs a contracted PR step through the real
+/// adapter; clearing it restores the explicit configuration blocker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn completion_pr_goes_through_the_production_github_app_adapter() {
+async fn manual_completion_scm_adapter_contract_and_embedded_host_injection() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -357,68 +403,7 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
     git(&repo, &["checkout", "-q", "-b", "feature/x"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
 
-    // The fake GitHub server the config's api_base points the REAL adapter
-    // at.
     let server = MockServer::start().await;
-
-    // The daemon graph: the production builder transforms the strict
-    // `[cloud.github_app]` section into the executor's completion SCM
-    // provider. Only EXTERNAL seams are substituted (a deterministic token
-    // source and clock) — the test never installs an adapter post-build.
-    let data = dir.path().join("data");
-    let mut config = Config::default();
-    config.cloud.enabled = true;
-    config.cloud.github_app = Some(CloudGithubAppCfg {
-        enabled: true,
-        app_id: Some(7),
-        key_payload: Some("unused.pem".to_string()),
-        webhook_secret: Some("unused.secret".to_string()),
-        api_base: Some(server.base()),
-        organization: Some(TENANT.to_string()),
-        ..Default::default()
-    });
-    let graph = wiring::build_production_graph_with_scm_seams(
-        &data,
-        config,
-        GithubAppSeams {
-            token_source: Some(Arc::new(
-                StaticTokenSource::minimal(i64::MAX).expect("deterministic token source"),
-            )),
-            clock: Some(Arc::new(ManualClock::new(NOW_MS))),
-            // The loopback-permitting external transport seam: the fake
-            // GitHub server is not reachable through the daemon's
-            // external-only gate, so the test substitutes the documented
-            // external I/O seam (never a post-build adapter install).
-            transport: Some(Arc::new(PolicyCheckedHttpTransport::permissive())),
-        },
-    )
-    .expect("production daemon graph");
-    // The daemon opened the ONE durable SCM store at construction; the
-    // synced repository row the completion adapter resolves installations
-    // from is seeded through that same store authority.
-    let store = graph
-        .scm
-        .clone()
-        .expect("an enabled [cloud] section wires the durable scm store");
-    store
-        .upsert_repository(&repository_row("acme", "widgets", 7))
-        .expect("synced repository row");
-
-    let workspace = graph
-        .session
-        .create_workspace(repo.to_str().unwrap())
-        .unwrap();
-    let handle = graph
-        .session
-        .create_session(workspace, "completion wiring", "provider", "model")
-        .unwrap();
-    let parent = handle.id();
-    // The protocol surfaces' own owner-worktree adoption: the completion
-    // step resolves the owner root from the session's durable worktree row.
-    graph.session.ensure_owner_worktree(parent).unwrap();
-
-    // Script the canonical reconciliation: absent branch -> create ref ->
-    // absent PR -> create PR.
     server.push(
         "GET",
         "/repos/acme/widgets/git/ref/heads/feature/x",
@@ -447,9 +432,9 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
         Reply::json(
             201,
             serde_json::json!({
-                "number": 41,
+                "number": 42,
                 "state": "open",
-                "html_url": "https://example.test/acme/widgets/pull/41",
+                "html_url": "https://example.test/acme/widgets/pull/42",
                 "updated_at": "2026-01-01T00:00:00Z",
                 "head": { "ref": "feature/x", "sha": head },
                 "base": { "ref": "main" },
@@ -458,26 +443,58 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
         ),
     );
 
-    let proof = seed_contract_task(&graph, parent, "ship the wired PR");
-    // The task is contracted while the graph was built; if the builder had
-    // NOT transformed `[cloud.github_app]` into the executor's provider the
-    // native PR step would fail with `native_pr_scm_not_configured` — the
-    // run below proves the built executor already carries the adapter.
+    // The daemon graph with the DEFAULT config: no `[cloud]`, so the builder
+    // wires no completion SCM provider and opens no SCM store.
+    let data = dir.path().join("data");
+    let graph =
+        wiring::build_production_graph(&data, Config::default()).expect("production daemon graph");
+    assert!(
+        graph.scm.is_none(),
+        "cloud-disabled parity: no SCM store is opened"
+    );
+
+    // 1. No provider: the contracted PR step is the explicit blocker.
+    let session_blocked = session_for(&graph, &repo, "manual blocked");
+    run_and_expect_blocker(&graph, session_blocked).await;
+
+    // The hand-built canonical adapter over a loopback fake GitHub and a
+    // test-owned synced store.
+    let store: Arc<dyn ScmStore> = Arc::new(MemoryScmStore::new());
+    store
+        .upsert_repository(&repository_row("acme", "widgets", 7))
+        .expect("synced repository row");
+    let app = GitHubApp::new(
+        GitHubAppConfig {
+            api_base: server.base(),
+            ..Default::default()
+        },
+        Arc::new(PolicyCheckedHttpTransport::permissive()),
+        Arc::new(StaticTokenSource::minimal(i64::MAX).expect("token source")),
+        store.clone(),
+        Arc::new(ManualClock::new(NOW_MS)),
+    )
+    .expect("github app adapter");
+    let adapter =
+        GitHubCompletionScm::new(Arc::new(app), store, TENANT).expect("completion adapter");
+    graph
+        .tasks
+        .set_completion_scm_provider(Some(Arc::new(adapter)));
+
+    // 2. Installed manually: the SAME executor now runs the contracted step
+    // through the real adapter.
+    let session_wired = session_for(&graph, &repo, "manual wired");
+    let proof = seed_contract_task(&graph, session_wired);
     let report = graph
         .tasks
-        .run_completion_steps(parent, proof)
+        .run_completion_steps(session_wired, proof)
         .await
-        .expect("the daemon executor runs the contracted steps")
+        .expect("the executor runs the contracted steps")
         .expect("include_pr contract is requested");
     assert!(report.all_succeeded(), "{report:?}");
     assert_eq!(
         report.pr_url.as_deref(),
-        Some("https://example.test/acme/widgets/pull/41")
+        Some("https://example.test/acme/widgets/pull/42")
     );
-
-    // The fake GitHub server proves the ADAPTER path: installation-token
-    // bearer + exact ref at the verified head + PR create with the
-    // orchestrator's identity.
     let refs = server.requests("POST", "/repos/acme/widgets/git/refs");
     assert_eq!(refs.len(), 1, "the branch is created through GitHubApp");
     assert_eq!(
@@ -488,31 +505,14 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
     let refs_body: serde_json::Value = serde_json::from_str(&refs[0].body).unwrap();
     assert_eq!(refs_body["ref"], "refs/heads/feature/x");
     assert_eq!(refs_body["sha"], head, "created at the verified head");
-
     let prs = server.requests("POST", "/repos/acme/widgets/pulls");
     assert_eq!(prs.len(), 1, "the PR is created through GitHubApp");
     let pr_body: serde_json::Value = serde_json::from_str(&prs[0].body).unwrap();
     assert_eq!(pr_body["head"], "feature/x");
     assert_eq!(pr_body["base"], "main");
-    assert_eq!(pr_body["title"], "faktor: ship the wired PR");
-    assert!(
-        pr_body["body"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Created by Faktor task"),
-        "{pr_body}"
-    );
 
-    // The durable step row certifies through the adapter, not a local fact.
-    let task_id = handle.task_id().unwrap();
-    let revision = handle.task_revision(task_id).unwrap();
-    let rows = handle
-        .ledger_completion_step_statuses(task_id.raw(), revision.raw())
-        .unwrap();
-    let last = rows.last().expect("a durable completion step row");
-    assert_eq!(
-        last.status,
-        faktor_core::completion::CompletionStepOutcome::Succeeded
-    );
-    assert!(last.detail.contains("github"), "{last:?}");
+    // 3. Cleared: the blocker is back (the clear rebuilt the runner).
+    graph.tasks.set_completion_scm_provider(None);
+    let session_cleared = session_for(&graph, &repo, "manual cleared");
+    run_and_expect_blocker(&graph, session_cleared).await;
 }

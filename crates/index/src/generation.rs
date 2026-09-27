@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::coverage::{FingerprintCoverage, IndexCoverage, ScanCursor};
 use crate::{FileEntry, Symbol, WorkspaceIndex};
 
 /// Format tag of a generation file; bumped on incompatible envelope shapes.
@@ -51,6 +52,29 @@ pub struct GenerationFile {
     /// Filesystem fingerprint the build was scanned against.
     pub fingerprint: Vec<FingerprintEntry>,
     pub data: WorkspaceData,
+    /// Durable index coverage of this generation (audit 5): what the batch
+    /// walker saw/indexed and whether the generation is complete. Absent on
+    /// legacy envelopes -> [`IndexCoverage::complete`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<IndexCoverage>,
+    /// Continuation cursor of the CONTENT batch walk (audit 5). `Some` while
+    /// coverage is incomplete; `None` once the walk exhausted the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<ScanCursor>,
+    /// Durable fingerprint coverage (audit 6): shard round state; a capped
+    /// fingerprint is never fully clean. Absent -> complete (legacy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_coverage: Option<FingerprintCoverage>,
+    /// In-progress fingerprint "next" map of an unfinished round: entries
+    /// observed so far. Removals materialize only when the round completes
+    /// (`fingerprint` becomes this map), so a capped round never drops a
+    /// suffix it has not yet walked. Tagged with `fingerprint_next_epoch`:
+    /// a resumed round continues its own map, a new round starts empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fingerprint_next: Vec<FingerprintEntry>,
+    /// Epoch of [`GenerationFile::fingerprint_next`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_next_epoch: Option<u64>,
 }
 
 /// Deterministically ordered per-workspace index payload.
@@ -95,6 +119,35 @@ impl GenerationFile {
         generation: u64,
         index: &WorkspaceIndex,
         fingerprint: Vec<FingerprintEntry>,
+    ) -> Self {
+        // Legacy/plain capture: a complete generation with no continuation
+        // state (the shape pre-coverage callers and tests expect).
+        Self::capture_with_coverage(
+            workspace,
+            generation,
+            index,
+            fingerprint,
+            IndexCoverage::complete(),
+            None,
+            FingerprintCoverage::complete(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// [`GenerationFile::capture`] carrying the durable coverage, content
+    /// continuation cursor and fingerprint shard state (audit 5/6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_with_coverage(
+        workspace: u64,
+        generation: u64,
+        index: &WorkspaceIndex,
+        fingerprint: Vec<FingerprintEntry>,
+        coverage: IndexCoverage,
+        cursor: Option<ScanCursor>,
+        fingerprint_coverage: FingerprintCoverage,
+        fingerprint_next: Vec<FingerprintEntry>,
+        fingerprint_next_epoch: Option<u64>,
     ) -> Self {
         let mut files = BTreeMap::new();
         if let Some(map) = index.files.get(&crate::WorkspaceId::new(workspace)) {
@@ -149,6 +202,53 @@ impl GenerationFile {
                     .unwrap_or_default()
                     .sanitize(),
             },
+            coverage: Some(coverage),
+            cursor,
+            fingerprint_coverage: Some(fingerprint_coverage),
+            fingerprint_next,
+            fingerprint_next_epoch,
+        }
+    }
+
+    /// The generation's durable coverage (legacy envelopes = complete).
+    pub fn coverage(&self) -> IndexCoverage {
+        self.coverage.clone().unwrap_or_default()
+    }
+
+    /// The generation's fingerprint coverage (legacy envelopes = complete).
+    pub fn fingerprint_coverage(&self) -> FingerprintCoverage {
+        self.fingerprint_coverage.clone().unwrap_or_default()
+    }
+
+    /// Workspace CONTENT identity of this generation: a BLAKE3 digest over
+    /// the canonical envelope members that define content + fingerprint
+    /// (workspace, generation, fingerprint, data) with `built_ms` and the
+    /// coverage/continuation bookkeeping excluded, so re-serializing an
+    /// unchanged generation yields the same identity. Evidence packages
+    /// carry this value (audit 16).
+    pub fn identity(&self) -> String {
+        let mut canonical = self.clone();
+        canonical.built_ms = 0;
+        canonical.coverage = None;
+        canonical.cursor = None;
+        canonical.fingerprint_coverage = None;
+        canonical.fingerprint_next = Vec::new();
+        canonical.fingerprint_next_epoch = None;
+        match canonical.to_bytes() {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+            // Unreachable for plain data; a hostile envelope cannot reach
+            // this path either (serialization of decoded values is total).
+            Err(_) => "identity-unavailable".to_string(),
+        }
+    }
+
+    /// Fingerprint-only identity: BLAKE3 over the canonical fingerprint list.
+    pub fn fingerprint_identity(&self) -> String {
+        let mut canonical = self.fingerprint.clone();
+        canonical.sort();
+        match serde_json::to_vec(&canonical) {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+            Err(_) => "fingerprint-identity-unavailable".to_string(),
         }
     }
 
@@ -398,6 +498,72 @@ mod tests {
         // difference).
         ea.built_ms = eb.built_ms;
         assert_eq!(ea.to_bytes().unwrap(), eb.to_bytes().unwrap());
+    }
+
+    #[test]
+    fn coverage_and_continuation_roundtrip_and_legacy_defaults_are_complete() {
+        use crate::coverage::{FingerprintCoverage, IndexCoverage, ScanCursor, ScanFrame};
+        let (idx, ws) = sample();
+        let mut cov = IndexCoverage::empty();
+        cov.files_seen = 3;
+        cov.files_indexed = 2;
+        cov.bytes_indexed = 42;
+        cov.complete = false;
+        cov.truncated_reason = Some("batch_files".into());
+        let cursor = ScanCursor {
+            frames: vec![ScanFrame {
+                dir: String::new(),
+                after: "src/a.rs".into(),
+            }],
+        };
+        let fp = FingerprintCoverage::round(3);
+        let env = GenerationFile::capture_with_coverage(
+            ws,
+            1,
+            &idx,
+            vec![],
+            cov.clone(),
+            Some(cursor.clone()),
+            fp.clone(),
+            vec![],
+            None,
+        );
+        let bytes = env.to_bytes().unwrap();
+        let back = GenerationFile::from_bytes(&bytes).unwrap();
+        assert_eq!(back.coverage(), cov);
+        assert_eq!(back.cursor, Some(cursor));
+        assert_eq!(back.fingerprint_coverage(), fp);
+        // Identity is stable across re-serialization (built_ms excluded) and
+        // changes when content changes.
+        let mut reserialized = back.clone();
+        reserialized.built_ms += 1;
+        assert_eq!(reserialized.identity(), back.identity());
+        assert_eq!(
+            reserialized.fingerprint_identity(),
+            back.fingerprint_identity()
+        );
+        let mut other = back.clone();
+        other.fingerprint.push(FingerprintEntry {
+            path: "z.rs".into(),
+            size: 1,
+            modified_ms: 1,
+        });
+        assert_ne!(other.identity(), back.identity());
+        assert_ne!(other.fingerprint_identity(), back.fingerprint_identity());
+        // Legacy envelope (no coverage members) decodes as COMPLETE.
+        let legacy = GenerationFile::capture(ws, 2, &idx, vec![]);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&legacy.to_bytes().unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("coverage");
+        value.as_object_mut().unwrap().remove("cursor");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint_coverage");
+        let decoded = GenerationFile::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(decoded.coverage().complete);
+        assert!(decoded.cursor.is_none());
+        assert!(decoded.fingerprint_coverage().complete);
     }
 
     #[test]

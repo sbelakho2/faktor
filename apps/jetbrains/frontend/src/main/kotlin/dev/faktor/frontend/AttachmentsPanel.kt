@@ -11,6 +11,8 @@
 // no path and cannot be attached yet (a saved screenshot works).
 package dev.faktor.frontend
 
+import dev.faktor.shared.NativeAttachmentLimits
+import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.asciiLowerCase
 import java.awt.BorderLayout
 import java.awt.FlowLayout
@@ -35,8 +37,77 @@ import javax.swing.TransferHandler
  */
 object AttachmentImages {
 
-    /** Mirror of the daemon-wide per-image model bound. */
+    /** Emergency fallback per-image bound (daemon-wide default). */
     const val MAX_IMAGE_BYTES = 5L * 1024 * 1024
+
+    /** Emergency fallback per-document bound (daemon-wide default). */
+    const val MAX_DOCUMENT_BYTES = 8L * 1024 * 1024
+
+    /** Emergency fallback decoded-byte upload ceiling. */
+    const val MAX_UPLOAD_BYTES = 7L * 1024 * 1024
+
+    /** Emergency image allowlist (daemon-wide defaults). */
+    val EMERGENCY_IMAGE_MIMES = listOf("image/png", "image/jpeg", "image/gif", "image/webp")
+
+    /** Emergency document allowlist (daemon-wide defaults). */
+    val EMERGENCY_DOCUMENT_MIMES = listOf("application/pdf", "text/plain")
+
+    /**
+     * The attachment admission policy of ONE chosen model: the daemon's
+     * advertised `/models` numbers (`source = "advertised"`) or the
+     * conservative emergency ceiling when the catalog is unavailable. The
+     * client never mirrors the daemon's live numbers.
+     */
+    data class Policy(
+        val source: String,
+        val maxUploadBytes: Long,
+        val maxAttachmentBytes: Long,
+        val imageMimes: List<String>,
+        val maxImageBytes: Long,
+        val maxRequestImageBytes: Long,
+        val documentCapable: Boolean,
+        val documentMimes: List<String>,
+        val maxDocumentBytes: Long,
+        val maxRequestDocumentBytes: Long
+    )
+
+    fun emergencyPolicy(): Policy = Policy(
+        source = "emergency",
+        maxUploadBytes = MAX_UPLOAD_BYTES,
+        maxAttachmentBytes = 32L * 1024 * 1024,
+        imageMimes = EMERGENCY_IMAGE_MIMES,
+        maxImageBytes = MAX_IMAGE_BYTES,
+        maxRequestImageBytes = 16L * 1024 * 1024,
+        // Unknown until advertised: a legacy daemon decides document
+        // admission itself, so the emergency policy never refuses on
+        // capability grounds.
+        documentCapable = false,
+        documentMimes = EMERGENCY_DOCUMENT_MIMES,
+        maxDocumentBytes = MAX_DOCUMENT_BYTES,
+        maxRequestDocumentBytes = 16L * 1024 * 1024
+    )
+
+    /** Turn the daemon's advertised limits into the client policy. */
+    fun policyFromLimits(limits: NativeAttachmentLimits): Policy = Policy(
+        source = "advertised",
+        maxUploadBytes = limits.maxUploadBytes,
+        maxAttachmentBytes = limits.maxAttachmentBytes,
+        imageMimes = limits.image.mimes.map { it.mime },
+        maxImageBytes = limits.image.mimes.map { it.maxBytes }.minOrNull() ?: MAX_IMAGE_BYTES,
+        maxRequestImageBytes = limits.image.maxRequestBytes,
+        documentCapable = limits.document.capable,
+        documentMimes = limits.document.mimes.map { it.mime },
+        maxDocumentBytes = limits.document.mimes.map { it.maxBytes }.minOrNull() ?: MAX_DOCUMENT_BYTES,
+        maxRequestDocumentBytes = limits.document.maxRequestBytes
+    )
+
+    /** The policy for one provider/model from the fetched catalog. */
+    fun policyForModel(catalog: List<NativeModelInfo>, provider: String, model: String): Policy {
+        val entry = catalog.firstOrNull { it.provider == provider && it.model == model }
+            ?: return emergencyPolicy()
+        val limits = entry.attachmentLimits ?: return emergencyPolicy()
+        return policyFromLimits(limits)
+    }
 
     /** The daemon-deliverable mime for `path`, or null (stays a path). */
     fun mimeOf(path: String): String? = when (asciiLowerCase(path.substringAfterLast('.', ""))) {
@@ -46,6 +117,14 @@ object AttachmentImages {
         "webp" -> "image/webp"
         else -> null
     }
+
+    /** The deliverable DOCUMENT mime for `path`, or null (stays a path). */
+    fun documentMimeOf(path: String): String? =
+        when (asciiLowerCase(path.substringAfterLast('.', ""))) {
+            "pdf" -> "application/pdf"
+            "txt" -> "text/plain"
+            else -> null
+        }
 
     /**
      * Bounded read of one image file: null when `file` is not a regular

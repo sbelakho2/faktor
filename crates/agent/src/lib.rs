@@ -359,6 +359,63 @@ pub enum RouteFailure {
     InternalTelemetry,
 }
 
+/// What one model call's output may be trusted to BE (item 26): the
+/// explicit trust class of an intent's output. The class gates what the
+/// runtime may do with the output — in particular, a
+/// [`OutputTrust::ContextCompression`] summary can replace TRANSCRIPT
+/// context but can never certify task completion nor replace immutable
+/// task facts/ledger rows (those remain the deterministic durable rows'
+/// authority).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTrust {
+    /// Throwaway output (titles, labels): never a durable fact, never
+    /// completion evidence.
+    Ephemeral,
+    /// A context-compression summary (compaction): it may stand in for
+    /// transcript context, but it certifies NOTHING and overwrites no
+    /// immutable task fact or ledger row. Its provenance is recorded as
+    /// [`OutputTrust::provenance_tag`].
+    ContextCompression,
+    /// Implementation work product (code edits, tool calls): a
+    /// deterministic gate must still verify it before completion.
+    Implementation,
+    /// An independent verification opinion (review verdict): evidence the
+    /// deterministic gates consume, never a certification by itself.
+    VerificationOpinion,
+}
+
+impl OutputTrust {
+    /// Stable provenance tag recorded wherever this output's origin is
+    /// journaled (context-compression provenance included).
+    pub const fn provenance_tag(self) -> &'static str {
+        match self {
+            OutputTrust::Ephemeral => "ephemeral",
+            OutputTrust::ContextCompression => "context_compression",
+            OutputTrust::Implementation => "implementation",
+            OutputTrust::VerificationOpinion => "verification_opinion",
+        }
+    }
+
+    /// Whether this output may feed the completion-certification path.
+    /// Compaction summaries and ephemeral output NEVER can — a compaction
+    /// failure (or an accepted summary) cannot certify completion.
+    pub const fn certifies_completion(self) -> bool {
+        matches!(
+            self,
+            OutputTrust::Implementation | OutputTrust::VerificationOpinion
+        )
+    }
+
+    /// Whether this output may replace immutable durable task facts/ledger
+    /// rows. Only a verification opinion may author durable evidence rows
+    /// (its verdicts); context compression and ephemeral output may never
+    /// replace or overwrite any durable row.
+    pub const fn may_replace_durable_facts(self) -> bool {
+        matches!(self, OutputTrust::VerificationOpinion)
+    }
+}
+
 /// The routing decision authority consumed by the agent runtime before
 /// EVERY paid model call (the former "auto"-sentinel path is gone: there is
 /// no un-routed model call anymore, and there is no fallback).
@@ -416,6 +473,11 @@ pub struct ModelCallIntent {
     /// 0..=100 semantic risk of the call (a review of a risky change is
     /// high; interior summarization is low).
     pub semantic_risk: u8,
+    /// What this call's output may be trusted to BE (item 26): the
+    /// compaction/ephemeral intents carry their non-certifying trust class
+    /// explicitly, so no downstream path can mistake a summary or a title
+    /// for completion evidence or durable task facts.
+    pub output_trust: OutputTrust,
 }
 
 impl ModelCallIntent {
@@ -423,6 +485,24 @@ impl ModelCallIntent {
     /// toward the best available candidate).
     pub fn quality_floor(&self) -> u8 {
         self.quality.minimum().min(100)
+    }
+
+    /// The preferred quality target of the call (the minimum for a hard
+    /// requirement): a compaction call prefers its 60 target but may relax
+    /// to its adaptive minimum.
+    pub fn quality_target(&self) -> u8 {
+        self.quality.target().min(100)
+    }
+
+    /// The output trust class of this call.
+    pub fn output_trust(&self) -> OutputTrust {
+        self.output_trust
+    }
+
+    /// True when this intent may feed completion certification at all
+    /// (compaction and ephemeral intents never can).
+    pub fn certifies_completion(&self) -> bool {
+        self.output_trust.certifies_completion()
     }
 
     /// Build the route request for this intent against the ACTUAL planned
@@ -462,8 +542,9 @@ impl ModelCallIntent {
 }
 
 /// The per-phase intent builders the runtime uses (quality is a HARD floor
-/// for Implement/Review — the audit's default; interior calls stay on the
-/// documented 60 floor with their own real dimensions).
+/// for Implement/Review/Debug — the audit's default; the compaction
+/// summarizer runs under the ADAPTIVE floor below its 60 target, and its
+/// output trust class can never certify completion).
 impl ModelCallIntent {
     /// The main Implement-phase model call of an iteration: the required
     /// capabilities mirror the planner's wire needs (tools + streaming).
@@ -474,11 +555,27 @@ impl ModelCallIntent {
             quality: QualityRequirement::Hard { minimum: 60 },
             expected_output_tokens: u64::MAX,
             semantic_risk: 0,
+            output_trust: OutputTrust::Implementation,
+        }
+    }
+
+    /// A Debug-phase call: like Implement, a HARD 60 coding floor; its
+    /// output is implementation work product (deterministically verified).
+    pub fn debug() -> Self {
+        Self {
+            phase: RouterPhase::Debug,
+            required_capabilities: vec!["tools".into(), "streaming".into()],
+            quality: QualityRequirement::Hard { minimum: 60 },
+            expected_output_tokens: u64::MAX,
+            semantic_risk: 0,
+            output_trust: OutputTrust::Implementation,
         }
     }
 
     /// A Review-phase call (the independent risky-change review): bounded
-    /// package input, a small typed verdict output.
+    /// package input, a small typed verdict output. The HARD 60 floor is
+    /// unchanged; the verdict is a verification opinion, never a
+    /// certification by itself.
     pub fn review() -> Self {
         Self {
             phase: RouterPhase::Review,
@@ -486,17 +583,41 @@ impl ModelCallIntent {
             quality: QualityRequirement::Hard { minimum: 60 },
             expected_output_tokens: 2048,
             semantic_risk: 100,
+            output_trust: OutputTrust::VerificationOpinion,
         }
     }
 
-    /// The compaction summarizer call (interior, low semantic risk).
+    /// The compaction summarizer call (interior, low semantic risk): the
+    /// floor is ADAPTIVE — the 60 target is preferred, but the router may
+    /// relax to the 50 minimum when the mode's economics decide, so a
+    /// lower-quality declared model may summarize. The output trust is
+    /// [`OutputTrust::ContextCompression`]: the summary can replace
+    /// transcript context and NOTHING else (no completion certification,
+    /// no durable task facts/ledger rows).
     pub fn compact() -> Self {
         Self {
             phase: RouterPhase::Compact,
             required_capabilities: vec!["streaming".into()],
-            quality: QualityRequirement::Hard { minimum: 60 },
+            quality: QualityRequirement::Adaptive {
+                minimum: 50,
+                target: 60,
+            },
             expected_output_tokens: 4096,
             semantic_risk: 0,
+            output_trust: OutputTrust::ContextCompression,
+        }
+    }
+
+    /// A Title-phase call: throwaway ephemeral output, never a durable fact
+    /// and never completion evidence.
+    pub fn title() -> Self {
+        Self {
+            phase: RouterPhase::Title,
+            required_capabilities: vec!["streaming".into()],
+            quality: QualityRequirement::Hard { minimum: 60 },
+            expected_output_tokens: 512,
+            semantic_risk: 0,
+            output_trust: OutputTrust::Ephemeral,
         }
     }
 }
@@ -837,19 +958,20 @@ impl EconomicRoutingPolicy {
             .iter()
             .find(|c| c.provider == provider && c.model == model)
             .ok_or(RouteFailure::NoCapableModel)?;
-        let pin_quality = phase_quality(&pinned.economics, req.phase);
-        if pin_quality < req.quality_floor.min(100) {
-            // The pin is below the request's HARD quality floor: fail
-            // closed — the request's floor is never lowered to the pin.
-            return Err(RouteFailure::PolicyDenied);
-        }
+        let floor = req.quality_floor.min(100);
+        // The pin's authority-aware quality is validated by the router's
+        // OWN qualification below (measured outcomes supersede the pin's
+        // declared statement, and a ConservativeUnknown placeholder never
+        // clears a positive floor) — the pin is never pre-judged from a
+        // numeric placeholder here.
+        //
         // Validation request only the pin can serve among candidates that
         // do not dominate it on every quality axis: the pin's own true
-        // capabilities, its own phase quality as the floor, and its own
-        // estimated latency as the preference. A candidate that beats the
-        // pin on cost while matching it on caps/quality/latency still wins
-        // the router's evaluation — and that is a loud PolicyDenied below,
-        // never a silent substitution of the pin.
+        // capabilities, the request's authority-aware quality floor, and
+        // its own estimated latency as the preference. A candidate that
+        // beats the pin on cost while matching it on caps/quality/latency
+        // still wins the router's evaluation — and that is a loud
+        // PolicyDenied below, never a silent substitution of the pin.
         let mut caps: Vec<String> = req.required_capabilities.clone();
         for (flag, name) in [
             (pinned.tools, "tools"),
@@ -870,7 +992,7 @@ impl EconomicRoutingPolicy {
             required_capabilities: caps,
             context_tokens: req.context_tokens,
             estimated_output_tokens: req.estimated_output_tokens,
-            quality_floor: pin_quality,
+            quality_floor: floor,
             task_budget_remaining_micro: req.task_budget_remaining_micro,
             latency_preference_ms: Some(pinned.economics.estimated_latency_ms),
             task_class: req.task_class,
@@ -6214,12 +6336,23 @@ mod model_call_intent_tests {
 
     #[test]
     fn quality_floors_are_hard_and_never_lowered() {
-        // Implement/Review route on a HARD 60 floor; Adaptive carries a
-        // target and a never-below minimum; route_request applies the
-        // minimum verbatim (the policy decides nothing above it).
+        // Implement/Review/Debug route on a HARD 60 floor; the compaction
+        // summarizer is ADAPTIVE (60 target, 50 minimum) because its output
+        // cannot certify anything; route_request applies the minimum
+        // verbatim (the policy decides nothing above it).
         assert_eq!(ModelCallIntent::implement_main().quality_floor(), 60);
+        assert_eq!(ModelCallIntent::debug().quality_floor(), 60);
         assert_eq!(ModelCallIntent::review().quality_floor(), 60);
-        assert_eq!(ModelCallIntent::compact().quality_floor(), 60);
+        let compact = ModelCallIntent::compact();
+        assert_eq!(compact.quality_floor(), 50, "adaptive minimum");
+        assert_eq!(compact.quality_target(), 60, "adaptive target");
+        assert!(matches!(
+            compact.quality,
+            QualityRequirement::Adaptive {
+                minimum: 50,
+                target: 60
+            }
+        ));
         let adaptive = ModelCallIntent {
             phase: RouterPhase::Implement,
             required_capabilities: vec![],
@@ -6229,10 +6362,54 @@ mod model_call_intent_tests {
             },
             expected_output_tokens: 2048,
             semantic_risk: 0,
+            output_trust: OutputTrust::Implementation,
         };
         assert_eq!(adaptive.quality.minimum(), 70);
         assert_eq!(adaptive.quality.target(), 85);
         assert_eq!(adaptive.quality_floor(), 70);
+        assert_eq!(adaptive.quality_target(), 85);
+    }
+
+    #[test]
+    fn output_trust_is_explicit_and_compaction_can_never_certify() {
+        // Item 26: every intent carries what its output may be trusted to
+        // BE. Compaction is a context-compression summary: it may stand in
+        // for transcript context but it certifies no completion and
+        // replaces no immutable task fact/ledger row; a title is ephemeral;
+        // implement/review keep their completion-capable classes.
+        assert_eq!(
+            ModelCallIntent::implement_main().output_trust(),
+            OutputTrust::Implementation
+        );
+        assert_eq!(
+            ModelCallIntent::debug().output_trust(),
+            OutputTrust::Implementation
+        );
+        assert_eq!(
+            ModelCallIntent::review().output_trust(),
+            OutputTrust::VerificationOpinion
+        );
+        assert_eq!(
+            ModelCallIntent::compact().output_trust(),
+            OutputTrust::ContextCompression
+        );
+        assert_eq!(
+            ModelCallIntent::title().output_trust(),
+            OutputTrust::Ephemeral
+        );
+        assert!(!ModelCallIntent::compact().certifies_completion());
+        assert!(!ModelCallIntent::title().certifies_completion());
+        assert!(ModelCallIntent::implement_main().certifies_completion());
+        assert!(ModelCallIntent::review().certifies_completion());
+        assert!(!OutputTrust::ContextCompression.certifies_completion());
+        assert!(!OutputTrust::Ephemeral.certifies_completion());
+        assert!(!OutputTrust::ContextCompression.may_replace_durable_facts());
+        assert!(!OutputTrust::Ephemeral.may_replace_durable_facts());
+        assert!(OutputTrust::VerificationOpinion.may_replace_durable_facts());
+        assert_eq!(
+            OutputTrust::ContextCompression.provenance_tag(),
+            "context_compression"
+        );
     }
 
     #[test]
@@ -6371,5 +6548,105 @@ mod efficiency_flags_tests {
         // prior while the flag is off (the handle is not even observed).
         let gated = off.context_prior(handle);
         assert!(gated.is_none());
+    }
+}
+
+#[cfg(test)]
+mod compact_adaptive_quality_tests {
+    use super::*;
+    use faktor_core::model::{
+        MicroUsdPerMillionTokens, ModelCapabilities, ModelEconomics, ModelSource, PriceQuote,
+        PricingSnapshot, PricingState, QualityAuthority, QualityStatement,
+    };
+    use faktor_router::{EmptyOutcomeStore, RouteCandidate, RouterService};
+
+    fn candidate(provider: &str, model: &str, quality: u8, price: u64) -> RouteCandidate {
+        let caps = ModelCapabilities {
+            context: 128_000,
+            max_output: 16_000,
+            tools: true,
+            streaming: true,
+            ..Default::default()
+        };
+        let economics = ModelEconomics {
+            tool_reliability: quality,
+            reasoning_reliability: quality,
+            coding_reliability: quality,
+            context_reliability: quality,
+            estimated_latency_ms: 300,
+            ..Default::default()
+        };
+        let descriptor = faktor_core::model::ModelDescriptor {
+            provider: provider.into(),
+            model: model.into(),
+            context: caps.context as u64,
+            max_output: caps.max_output as u64,
+            tools: caps.tools,
+            parallel_tools: caps.parallel_tools,
+            reasoning: caps.reasoning,
+            thinking: caps.thinking,
+            vision: caps.vision,
+            structured_output: caps.json_schema,
+            embeddings: caps.embeddings,
+            streaming: caps.streaming,
+            economics,
+            source: ModelSource::UserOverride,
+        };
+        let pricing = PricingState::Known(PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(price),
+                output: MicroUsdPerMillionTokens(price),
+                cache_read: MicroUsdPerMillionTokens(0),
+                cache_write: MicroUsdPerMillionTokens(0),
+            },
+            1,
+            "test".into(),
+        ));
+        // A DECLARED prior (BuiltInPrior authority): the row is authorized
+        // by its owner, not by a ConservativeUnknown placeholder.
+        let statement = QualityStatement {
+            tool_reliability: quality,
+            reasoning_reliability: quality,
+            coding_reliability: quality,
+            context_reliability: quality,
+            authority: QualityAuthority::UserConfigured {
+                source: format!("providers.{provider}.quality"),
+                version: "faktor-user-quality-v1".into(),
+            },
+        };
+        RouteCandidate::with_quality(descriptor, pricing, statement)
+    }
+
+    #[test]
+    fn compact_adaptive_floor_selects_the_lower_quality_model_but_cannot_certify() {
+        // A strong-but-expensive 90 model and a cheap declared-50 model.
+        let strong = candidate("strong", "big", 90, 30_000_000);
+        let cheap = candidate("weak", "small", 50, 100_000);
+        let service = Arc::new(RouterService::with_route_candidates(
+            vec![strong, cheap],
+            Arc::new(EmptyOutcomeStore),
+        ));
+        let policy = EconomicRoutingPolicy::new(service, RoutingMode::Economy);
+        // Hard Implement floor 60: the 50-quality model is refused, so the
+        // expensive 90 model serves (the hard floor is unchanged).
+        let implement = ModelCallIntent::implement_main().route_request(1_000, 100, 0);
+        assert_eq!(policy.route(&implement).unwrap().model, "big");
+        // Compact runs at its ADAPTIVE minimum (50 < 60): the cheap model is
+        // authorized and expected-cost picks it, so a lower-quality model
+        // may summarize.
+        let compact = ModelCallIntent::compact();
+        assert_eq!(compact.quality_floor(), 50);
+        assert_eq!(compact.quality_target(), 60);
+        let req = compact.route_request(1_000, 100, 0);
+        let decision = policy.route(&req).unwrap();
+        assert_eq!(decision.model, "small");
+        // ... and the compaction output can never certify completion nor
+        // replace immutable task facts/ledger rows.
+        assert!(!compact.certifies_completion());
+        assert!(!compact.output_trust().may_replace_durable_facts());
+        assert_eq!(
+            compact.output_trust().provenance_tag(),
+            "context_compression"
+        );
     }
 }

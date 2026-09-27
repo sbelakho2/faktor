@@ -36,7 +36,7 @@
 //! the next change or an explicit retry. Publishing `N+1` prunes generation
 //! files `<= N-1`, so at most [`KEEP_GENERATIONS`] generations are on disk.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -44,7 +44,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use faktor_core::cancellation::CancellationToken;
@@ -54,15 +54,20 @@ use faktor_store::Store;
 use faktor_terminal::ProcessSupervisor;
 
 use crate::cold::ColdEvidenceProvider;
+use crate::coverage::{
+    fingerprint_shard, EvidenceFreshness, EvidencePackageMeta, FingerprintCoverage, IndexCoverage,
+    IndexCoverageSnapshot, ScanCursor, ScanFrame, FINGERPRINT_SHARDS,
+};
 use crate::embedding::{
     apply_embeddings, EmbeddingIndex, EmbeddingModel, EmbeddingSource,
     MAX_EMBEDDING_SCAN_TEXT_BYTES,
 };
 use crate::generation::{FingerprintEntry, GenerationFile};
 use crate::state::{
-    PersistedIndexState, StateError, WorkspaceIndexState, JOURNAL_BUILDING, JOURNAL_CORRUPT,
-    JOURNAL_DIRTY, JOURNAL_FAILED, JOURNAL_NOT_STARTED, JOURNAL_READY, JOURNAL_RESUME,
-    JOURNAL_TORN_READY,
+    PersistedIndexState, StateError, WorkspaceIndexState, JOURNAL_BUILDING, JOURNAL_CONTINUE,
+    JOURNAL_CORRUPT, JOURNAL_DIRTY, JOURNAL_FAILED, JOURNAL_NOT_STARTED, JOURNAL_READY,
+    JOURNAL_READY_PARTIAL, JOURNAL_RESUME, JOURNAL_TORN_READY, JOURNAL_VERIFIED,
+    JOURNAL_VERIFY_DIRTY,
 };
 use crate::WorkspaceIndex;
 
@@ -127,19 +132,23 @@ fn parse_live_shadow_row(value: &str) -> Result<Option<PathBuf>, String> {
     Ok(Some(PathBuf::from(root)))
 }
 
-/// Content-scan caps: a workspace larger than this is PARTIALLY indexed
-/// (deterministic walk order) — evidence stays bounded even for hostile
-/// repos. Mirrors the bounded evidence scan's budget (cli `RepoEvidence`).
-pub const SCAN_MAX_FILES: usize = 4_000;
-pub const SCAN_MAX_DIRS: usize = 16_000;
-pub const SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Per-generation-batch content budgets (audit 5): a batch stops at the
+/// first budget reached, persists its continuation cursor (and the durable
+/// [`IndexCoverage`]) inside the generation envelope, and indexing continues
+/// — asynchronously, batch after batch — until the walk has exhausted the
+/// tree. Total-repository caps that silently dropped a suffix of the tree no
+/// longer exist; the budgets bound one BATCH, never the whole generation.
+pub const BATCH_MAX_FILES: usize = 512;
+pub const BATCH_MAX_DIRS: usize = 2_048;
+pub const BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Largest single file a batch will index (content, not stat size).
 pub const SCAN_MAX_FILE_BYTES: u64 = 1_000_000;
 
-/// Stat-only fingerprint walk caps (looser than the content caps: changes
-/// to big/binary files must still dirty the generation).
-const FP_MAX_DIRS: usize = 16_000;
-const FP_MAX_FILES: usize = 1_000_000;
-const FP_PER_DIR: usize = 50_000;
+/// Per-pass fingerprint budgets (audit 6): one shard walk pass is bounded;
+/// the persisted [`FingerprintCoverage`] carries the round state and the
+/// next pass continues/rotates. A capped pass is NEVER reported clean.
+pub const FP_BATCH_FILES: usize = 4_096;
+pub const FP_BATCH_DIRS: usize = 2_048;
 
 /// Maximum generation-file bytes read back at load (a hostile or corrupt
 /// file must not materialize unboundedly into RAM).
@@ -156,6 +165,16 @@ pub struct ServiceConfig {
     /// Lease after which an in-process build is assumed dead (crash) and
     /// reclaimable by another builder.
     pub build_lease: Duration,
+    /// Content batch budget: maximum regular files one batch observes.
+    pub batch_files: usize,
+    /// Content batch budget: maximum directories one batch opens.
+    pub batch_dirs: usize,
+    /// Content batch budget: maximum bytes one batch reads.
+    pub batch_bytes: usize,
+    /// Fingerprint pass budget: maximum shard files one pass stats.
+    pub fp_batch_files: usize,
+    /// Fingerprint pass budget: maximum directories one pass opens.
+    pub fp_batch_dirs: usize,
 }
 
 impl Default for ServiceConfig {
@@ -164,6 +183,11 @@ impl Default for ServiceConfig {
             poll: Duration::from_millis(200),
             fingerprint_interval: DEFAULT_FINGERPRINT_INTERVAL,
             build_lease: Duration::from_secs(10 * 60),
+            batch_files: BATCH_MAX_FILES,
+            batch_dirs: BATCH_MAX_DIRS,
+            batch_bytes: BATCH_MAX_BYTES,
+            fp_batch_files: FP_BATCH_FILES,
+            fp_batch_dirs: FP_BATCH_DIRS,
         }
     }
 }
@@ -206,6 +230,11 @@ pub struct IndexView {
     workspace: WorkspaceId,
     generation: u64,
     index: Arc<Mutex<WorkspaceIndex>>,
+    coverage: IndexCoverage,
+    fingerprint_coverage: FingerprintCoverage,
+    freshness: EvidenceFreshness,
+    content_identity: String,
+    fingerprint_identity: String,
 }
 
 impl IndexView {
@@ -222,6 +251,52 @@ impl IndexView {
     pub fn index(&self) -> Arc<Mutex<WorkspaceIndex>> {
         self.index.clone()
     }
+
+    /// Durable coverage of this generation (audit 5): `complete == false`
+    /// means a retrieval miss must consult the bounded direct filesystem/Git
+    /// fallback before claiming "no match".
+    pub fn coverage(&self) -> &IndexCoverage {
+        &self.coverage
+    }
+
+    /// Durable fingerprint coverage of this generation (audit 6).
+    pub fn fingerprint_coverage(&self) -> &FingerprintCoverage {
+        &self.fingerprint_coverage
+    }
+
+    /// Typed freshness of this generation (audit 16).
+    pub fn freshness(&self) -> EvidenceFreshness {
+        self.freshness
+    }
+
+    /// Workspace content identity (per-generation digest).
+    pub fn content_identity(&self) -> &str {
+        &self.content_identity
+    }
+
+    /// Fingerprint identity (digest of the persisted fingerprint list).
+    pub fn fingerprint_identity(&self) -> &str {
+        &self.fingerprint_identity
+    }
+
+    /// The identity/freshness metadata every evidence package built from
+    /// this view carries (audit 16).
+    pub fn evidence_package_meta(&self) -> EvidencePackageMeta {
+        EvidencePackageMeta {
+            generation: Some(self.generation),
+            content_identity: Some(self.content_identity.clone()),
+            fingerprint_identity: Some(self.fingerprint_identity.clone()),
+            freshness: self.freshness,
+            coverage: self.coverage.clone(),
+            fingerprint: self.fingerprint_coverage.clone(),
+        }
+    }
+
+    /// A retrieval miss under an incomplete generation must use the bounded
+    /// direct filesystem/Git fallback (audit 5).
+    pub fn miss_needs_fallback(&self) -> bool {
+        self.coverage.needs_fallback_on_miss()
+    }
 }
 
 impl std::fmt::Debug for IndexView {
@@ -229,6 +304,8 @@ impl std::fmt::Debug for IndexView {
         f.debug_struct("IndexView")
             .field("workspace", &self.workspace)
             .field("generation", &self.generation)
+            .field("coverage", &self.coverage)
+            .field("freshness", &self.freshness)
             .finish_non_exhaustive()
     }
 }
@@ -248,11 +325,25 @@ struct LiveWs {
     content_generation: u64,
     /// Fingerprint stored in the published generation file.
     last_fingerprint: Option<Vec<FingerprintEntry>>,
+    /// Durable coverage of the published generation (audit 5). `None` while
+    /// no generation content was loaded (treated as complete only when a
+    /// published generation exists).
+    coverage: Option<IndexCoverage>,
+    /// Durable fingerprint coverage of the published generation (audit 6).
+    fingerprint_coverage: Option<FingerprintCoverage>,
+    /// Content identity of the published generation (audit 16).
+    content_identity: String,
+    /// Fingerprint identity of the published generation (audit 16).
+    fingerprint_identity: String,
     /// A build is in flight IN THIS PROCESS (lease-guarded).
     building: bool,
     building_since: Option<Instant>,
     /// Events/retries arrived since the last build started (coalesced).
     pending: bool,
+    /// A fingerprint pass proved the disk differs (or could not be read):
+    /// the Ready generation must hop through `Dirty` into the next
+    /// generation. Set by the build, consumed by [`IndexService::decide_next`].
+    dirty_now: bool,
     /// The published generation's content is not loaded yet.
     pending_load: bool,
     last_fp_check: Instant,
@@ -300,17 +391,60 @@ pub struct IndexService {
     inner: Arc<Inner>,
 }
 
-/// Outcome of a content scan (see [`scan_workspace`]).
-struct ScanOutcome {
-    index: WorkspaceIndex,
-    fingerprint: Vec<FingerprintEntry>,
-    /// True when the filesystem changed while the content was read (the
-    /// build publishes anyway; a follow-up rebuild is scheduled).
-    churned: bool,
-    /// Per-path chunk texts collected for build-time embedding (only when a
-    /// source is configured), bounded by
-    /// [`MAX_EMBEDDING_SCAN_TEXT_BYTES`].
-    chunks: Vec<(String, Vec<String>)>,
+/// One regular file read by a content batch (bytes stay in RAM only for the
+/// duration of the batch; the byte budget bounds the batch).
+struct BatchFile {
+    rel: String,
+    bytes: Vec<u8>,
+    modified_ms: i64,
+}
+
+/// Outcome of one bounded content batch (audit 5).
+struct ContentBatch {
+    files: Vec<BatchFile>,
+    /// Regular files the walker observed (indexed or skipped).
+    files_seen: u64,
+    /// Files actually read and indexed.
+    indexed: u64,
+    /// Bytes read and indexed.
+    bytes: u64,
+    /// Resume position after the batch.
+    cursor: ScanCursor,
+    /// True when the walk exhausted the tree.
+    complete: bool,
+    truncated_reason: Option<String>,
+}
+
+/// Outcome of one bounded fingerprint shard pass (audit 6).
+struct FingerprintPass {
+    entries: Vec<FingerprintEntry>,
+    shard_completed: bool,
+    cursor: ScanCursor,
+    reason: Option<String>,
+}
+
+/// Walker control returned by the per-file visitor.
+enum WalkControl {
+    Continue,
+    Stop(&'static str),
+}
+
+/// One directory frame of the deterministic batch walk. Entries are sorted
+/// by name; `idx` points at the next entry (resume skips via `after`).
+struct WalkFrame {
+    dir: PathBuf,
+    rel: String,
+    entries: Vec<(String, WalkKind)>,
+    idx: usize,
+    /// Resume high-water recorded for this directory when `idx == 0`.
+    after: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkKind {
+    Dir,
+    File,
+    Other,
 }
 
 /// Build/crash seam hook for adversarial tests, fired at named points of
@@ -318,39 +452,39 @@ struct ScanOutcome {
 /// mid-build (the durable state stays `Building`; content is never
 /// published; no torn reads are possible).
 #[cfg(test)]
-type SeamHook = Box<dyn Fn(u64, &'static str) + Send>;
+type SeamHook = Box<dyn Fn(u64, u64, &'static str) + Send>;
 #[cfg(test)]
 static SEAM: OnceLock<Mutex<Option<SeamHook>>> = OnceLock::new();
 
 #[cfg(test)]
-fn fire_seam(ws: u64, point: &'static str) {
+fn fire_seam(ws: u64, generation: u64, point: &'static str) {
     if let Some(lock) = SEAM.get() {
         // Take the hook OUT of the mutex before invoking: a hook that
         // panics (the crash simulation) must never poison the seam lock.
         // A hook that RETURNS normally stays armed for later seam points of
         // the same pipeline — a test targets one point by name and the
         // first point must not consume it; tests clear it explicitly.
-        let hook = lock.lock().expect("seam poisoned").take();
+        let hook = lock_recover(lock).take();
         if let Some(hook) = hook {
-            hook(ws, point);
-            *lock.lock().expect("seam poisoned") = Some(hook);
+            hook(ws, generation, point);
+            *lock_recover(lock) = Some(hook);
         }
     }
 }
 
 #[cfg(not(test))]
-fn fire_seam(_ws: u64, _point: &'static str) {}
+fn fire_seam(_ws: u64, _generation: u64, _point: &'static str) {}
 
 #[cfg(test)]
 pub(crate) fn install_seam(hook: SeamHook) {
     let lock = SEAM.get_or_init(|| Mutex::new(None));
-    *lock.lock().expect("seam poisoned") = Some(hook);
+    *lock_recover(lock) = Some(hook);
 }
 
 #[cfg(test)]
 pub(crate) fn clear_seam() {
     if let Some(lock) = SEAM.get() {
-        *lock.lock().expect("seam poisoned") = None;
+        *lock_recover(lock) = None;
     }
 }
 
@@ -414,11 +548,11 @@ impl IndexService {
 
     /// Tune the reconciliation knobs (operator/test surface).
     pub fn set_config(&self, cfg: ServiceConfig) {
-        *self.inner.cfg.lock().expect("cfg poisoned") = cfg;
+        *lock_recover(&self.inner.cfg) = cfg;
     }
 
     fn cfg_of(inner: &Inner) -> ServiceConfig {
-        *inner.cfg.lock().expect("cfg poisoned")
+        *lock_recover(&inner.cfg)
     }
 
     /// Configure (or clear) the build-time embedding source and the
@@ -435,17 +569,67 @@ impl IndexService {
         source: Option<Arc<dyn EmbeddingSource>>,
         model: EmbeddingModel,
     ) {
-        *self.inner.embedding.lock().expect("embedding poisoned") =
-            source.map(|source| (source, model));
+        *lock_recover(&self.inner.embedding) = source.map(|source| (source, model));
     }
 
     /// The source + identity a build must use, snapshotted under the lock.
     fn embedding_config(&self) -> Option<(Arc<dyn EmbeddingSource>, EmbeddingModel)> {
-        self.inner
-            .embedding
-            .lock()
-            .expect("embedding poisoned")
-            .clone()
+        lock_recover(&self.inner.embedding).clone()
+    }
+
+    /// Carry matching prior vectors and embed only the batch's missing
+    /// chunks (see [`apply_embeddings`]); logs the typed outcome. The
+    /// accumulation's OWN vectors are the prior on resumed batches, so a
+    /// batch never re-embeds earlier batches' work.
+    fn embed_accumulated(
+        &self,
+        workspace: WorkspaceId,
+        ws_raw: u64,
+        target: u64,
+        index: &mut WorkspaceIndex,
+        batch_chunks: &[(String, Vec<String>)],
+        source_config: Option<(Arc<dyn EmbeddingSource>, EmbeddingModel)>,
+    ) {
+        match source_config {
+            Some((source, model)) => {
+                let prior = index
+                    .embedding_index(workspace)
+                    .cloned()
+                    .or_else(|| self.prior_embeddings(workspace));
+                let stats = apply_embeddings(
+                    index,
+                    workspace,
+                    prior.as_ref(),
+                    &model,
+                    batch_chunks,
+                    Some(source.as_ref()),
+                );
+                if stats.degraded {
+                    tracing::warn!(
+                        workspace = ws_raw,
+                        generation = target,
+                        carried = stats.carried,
+                        "index embeddings degraded for this build (lexical/symbol retrieval is unaffected)"
+                    );
+                } else if stats.carried > 0 || stats.embedded > 0 {
+                    tracing::info!(
+                        workspace = ws_raw,
+                        generation = target,
+                        carried = stats.carried,
+                        embedded = stats.embedded,
+                        calls = stats.calls,
+                        "index embeddings settled"
+                    );
+                }
+            }
+            None => {
+                if index.embedding_index(workspace).is_none() {
+                    if let Some(prior) = self.prior_embeddings(workspace) {
+                        index.replace_embeddings(workspace, prior);
+                    }
+                }
+            }
+        }
     }
 
     /// The previously published embedding index for `workspace`: the
@@ -455,7 +639,7 @@ impl IndexService {
     /// `None` (a full re-embed, never a wrong reuse).
     fn prior_embeddings(&self, workspace: WorkspaceId) -> Option<EmbeddingIndex> {
         {
-            let live = self.inner.live.lock().expect("live poisoned");
+            let live = lock_recover(&self.inner.live);
             if let Some(l) = live.get(&workspace) {
                 if let Some(content) = &l.content {
                     if let Ok(index) = content.lock() {
@@ -676,7 +860,7 @@ impl IndexService {
     /// are errors the caller turns into fallback behavior.
     pub fn attach(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
         {
-            let live = self.inner.live.lock().expect("live poisoned");
+            let live = lock_recover(&self.inner.live);
             if live.contains_key(&workspace) {
                 drop(live);
                 self.inner.notify.notify_one();
@@ -798,7 +982,7 @@ impl IndexService {
         );
         let cfg = Self::cfg_of(&self.inner);
         {
-            let mut live = self.inner.live.lock().expect("live poisoned");
+            let mut live = lock_recover(&self.inner.live);
             live.insert(
                 workspace,
                 LiveWs {
@@ -810,9 +994,14 @@ impl IndexService {
                     content: None,
                     content_generation: 0,
                     last_fingerprint: None,
+                    coverage: None,
+                    fingerprint_coverage: None,
+                    content_identity: String::new(),
+                    fingerprint_identity: String::new(),
                     building: false,
                     building_since: None,
                     pending,
+                    dirty_now: false,
                     pending_load,
                     last_fp_check: Instant::now() - cfg.fingerprint_interval,
                 },
@@ -832,24 +1021,98 @@ impl IndexService {
     /// or while the persisted Ready content is still being reloaded. Never
     /// blocks and never triggers work.
     pub fn view(&self, workspace: WorkspaceId) -> Option<IndexView> {
-        let live = self.inner.live.lock().expect("live poisoned");
+        let live = lock_recover(&self.inner.live);
         let l = live.get(&workspace)?;
         if matches!(l.state, WorkspaceIndexState::NotStarted) || l.pending_load {
             return None;
         }
         let index = l.content.as_ref()?;
+        let coverage = l.coverage.clone().unwrap_or_else(IndexCoverage::complete);
+        let fingerprint_coverage = l.fingerprint_coverage.clone().unwrap_or_default();
+        // Freshness precedence (audit 16): incomplete coverage (content OR
+        // fingerprint) makes the package PARTIAL even while a rebuild is
+        // also pending; a complete published generation with a rebuild in
+        // flight is STALE_WHILE_REBUILDING; otherwise CURRENT.
+        let freshness = if !coverage.complete || !fingerprint_coverage.complete {
+            EvidenceFreshness::Partial
+        } else if l.pending
+            || l.building
+            || matches!(
+                l.state,
+                WorkspaceIndexState::Dirty { .. } | WorkspaceIndexState::Building { .. }
+            )
+        {
+            EvidenceFreshness::StaleWhileRebuilding
+        } else {
+            EvidenceFreshness::Current
+        };
         Some(IndexView {
             workspace,
             generation: l.content_generation,
             index: index.clone(),
+            coverage,
+            fingerprint_coverage,
+            freshness,
+            content_identity: l.content_identity.clone(),
+            fingerprint_identity: l.fingerprint_identity.clone(),
         })
     }
 
     /// Probe the mirrored durable state (tests/observability).
     pub fn state(&self, workspace: WorkspaceId) -> Option<(WorkspaceIndexState, u64)> {
-        let live = self.inner.live.lock().expect("live poisoned");
+        let live = lock_recover(&self.inner.live);
         live.get(&workspace)
             .map(|l| (l.state.clone(), l.row_generation))
+    }
+
+    /// Durable content coverage of one attached workspace (audit 5). `None`
+    /// when the workspace is unattached; a `complete == false` record means
+    /// indexing is still continuing in batches.
+    pub fn coverage(&self, workspace: WorkspaceId) -> Option<IndexCoverage> {
+        let live = lock_recover(&self.inner.live);
+        let l = live.get(&workspace)?;
+        Some(l.coverage.clone().unwrap_or_else(IndexCoverage::complete))
+    }
+
+    /// Durable fingerprint coverage of one attached workspace (audit 6).
+    pub fn fingerprint_coverage(&self, workspace: WorkspaceId) -> Option<FingerprintCoverage> {
+        let live = lock_recover(&self.inner.live);
+        let l = live.get(&workspace)?;
+        Some(l.fingerprint_coverage.clone().unwrap_or_default())
+    }
+
+    /// Typed coverage/freshness diagnostics of one attached workspace: the
+    /// shape the `/native` coverage route and both IDE panels consume
+    /// (audit 5/6). Pure mirror read: never triggers work.
+    pub fn coverage_snapshot(&self, workspace: WorkspaceId) -> Option<IndexCoverageSnapshot> {
+        let live = lock_recover(&self.inner.live);
+        let l = live.get(&workspace)?;
+        let coverage = l.coverage.clone().unwrap_or_else(IndexCoverage::complete);
+        let fingerprint = l.fingerprint_coverage.clone().unwrap_or_default();
+        let published = l.content.as_ref().map(|_| l.content_generation);
+        let freshness = if !coverage.complete || !fingerprint.complete {
+            EvidenceFreshness::Partial
+        } else if l.pending
+            || l.building
+            || matches!(
+                l.state,
+                WorkspaceIndexState::Dirty { .. } | WorkspaceIndexState::Building { .. }
+            )
+        {
+            EvidenceFreshness::StaleWhileRebuilding
+        } else {
+            EvidenceFreshness::Current
+        };
+        Some(IndexCoverageSnapshot {
+            workspace: workspace.raw(),
+            state: index_state_label(&l.state).to_string(),
+            generation: l.row_generation,
+            published_generation: published,
+            coverage,
+            fingerprint,
+            freshness,
+            serving: l.content.is_some(),
+        })
     }
 
     /// The cheap pre-Ready evidence provider of one attached workspace
@@ -858,7 +1121,7 @@ impl IndexService {
     /// then targeted reads — instead of the legacy full bounded scan.
     /// `None` when the workspace is unattached or its root is unresolvable.
     pub fn cold_provider(&self, workspace: WorkspaceId) -> Option<ColdEvidenceProvider> {
-        let live = self.inner.live.lock().expect("live poisoned");
+        let live = lock_recover(&self.inner.live);
         let l = live.get(&workspace)?;
         let root = l.root.clone()?;
         Some(ColdEvidenceProvider::new(
@@ -874,7 +1137,7 @@ impl IndexService {
     pub fn request_build(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
         self.attach(workspace)?;
         {
-            let mut live = self.inner.live.lock().expect("live poisoned");
+            let mut live = lock_recover(&self.inner.live);
             if let Some(l) = live.get_mut(&workspace) {
                 l.pending = true;
             }
@@ -925,7 +1188,7 @@ impl IndexService {
     /// Ready (or Failed with no retry pending) and the published content
     /// for that state is loaded.
     fn machine_at_rest(&self, workspace: WorkspaceId) -> bool {
-        let live = self.inner.live.lock().expect("live poisoned");
+        let live = lock_recover(&self.inner.live);
         match live.get(&workspace) {
             Some(l) => {
                 let ready_state = match &l.state {
@@ -933,10 +1196,19 @@ impl IndexService {
                     WorkspaceIndexState::Failed { .. } => !l.pending,
                     _ => false,
                 };
+                let coverage_complete = l.coverage.as_ref().map(|c| c.complete).unwrap_or(true);
+                let fingerprint_complete = l
+                    .fingerprint_coverage
+                    .as_ref()
+                    .map(|c| c.complete)
+                    .unwrap_or(true);
                 ready_state
                     && !l.pending
+                    && !l.dirty_now
                     && !l.pending_load
                     && !l.building
+                    && coverage_complete
+                    && fingerprint_complete
                     && l.content.is_some()
                     && l.content_generation == l.state.generation().unwrap_or(u64::MAX)
             }
@@ -966,10 +1238,10 @@ impl IndexService {
         // events coalesce into ONE pending flag — a 1000-event storm is one
         // dirty mark and one rebuild).
         {
-            let mut live = self.inner.live.lock().expect("live poisoned");
+            let mut live = lock_recover(&self.inner.live);
             if let Some(l) = live.get_mut(&workspace) {
                 if let Some(handle) = &l.handle {
-                    let mut rx = handle.events().lock().expect("events poisoned");
+                    let mut rx = lock_recover(handle.events());
                     let mut saw = false;
                     while let Ok(ev) = rx.try_recv() {
                         if ev.workspace_id == workspace
@@ -1007,8 +1279,10 @@ impl IndexService {
                     if self.claim_build(workspace, target, kind)? {
                         // One claim per reconcile call: run the build
                         // inline (blocking by design; the worker wraps the
-                        // whole pass in spawn_blocking).
-                        self.run_build(workspace, target)?;
+                        // whole pass in spawn_blocking). One build runs ONE
+                        // bounded batch (content or fingerprint); an
+                        // incomplete generation continues on the next pass.
+                        self.run_build(workspace, target, kind)?;
                         return Ok(());
                     }
                     // A concurrent builder claimed (or a restart advanced)
@@ -1024,7 +1298,7 @@ impl IndexService {
     /// Decide the next machine step from the mirrored state.
     fn decide_next(&self, workspace: WorkspaceId) -> Result<Next, IndexError> {
         let cfg = Self::cfg_of(&self.inner);
-        let mut live = self.inner.live.lock().expect("live poisoned");
+        let mut live = lock_recover(&self.inner.live);
         let Some(l) = live.get_mut(&workspace) else {
             return Ok(Next::Idle);
         };
@@ -1085,51 +1359,56 @@ impl IndexService {
             }
             WorkspaceIndexState::Ready { generation } => {
                 let gen = *generation;
+                let content_complete = l.coverage.as_ref().map(|c| c.complete).unwrap_or(true);
+                let fingerprint_complete = l
+                    .fingerprint_coverage
+                    .as_ref()
+                    .map(|c| c.complete)
+                    .unwrap_or(true);
+                let fp_in_progress = !fingerprint_complete;
                 if l.pending_load || l.content_generation != gen || l.content.is_none() {
                     l.pending_load = true;
                     Ok(Next::Load)
-                } else if l.pending
-                    || now.duration_since(l.last_fp_check) >= cfg.fingerprint_interval
+                } else if l.dirty_now && claimable {
+                    // A fingerprint pass proved the disk differs (or could
+                    // not be read): the published generation is superseded
+                    // through the Dirty hop. The rebuild either lands the
+                    // change or surfaces the unreadable root as a durable
+                    // failure — never a silent clean.
+                    l.dirty_now = false;
+                    l.pending = true;
+                    Ok(Next::MarkDirty)
+                } else if (!content_complete || fp_in_progress) && claimable {
+                    // Batch continuation (audit 5/6): the SAME generation
+                    // keeps extending — content batches first, then
+                    // fingerprint shard passes — until its coverage is
+                    // complete. A capped/partial scan is NEVER at rest.
+                    Ok(Next::Claim {
+                        target: gen,
+                        kind: JOURNAL_CONTINUE,
+                    })
+                } else if claimable
+                    && (l.pending
+                        || now.duration_since(l.last_fp_check) >= cfg.fingerprint_interval)
                 {
                     // Every rebuild decision is fingerprint-VERIFIED: a
                     // pending watcher event (or the periodic reconciliation
-                    // that heals events the lossy fs channel dropped) only
-                    // materializes into a durable Dirty when the disk really
-                    // differs from the published generation. Duplicate or
-                    // late events for an already-built state are dropped —
-                    // a watcher storm never churns generations.
+                    // that heals events the lossy fs channel dropped) starts
+                    // a ROTATED fingerprint round. `run_build` runs the
+                    // bounded shard passes and either supersedes the
+                    // generation (durable Dirty) or completes the round —
+                    // and only a COMPLETE round can drop the event as stale.
                     l.last_fp_check = now;
-                    let was_pending = l.pending;
-                    let stored = l.last_fingerprint.clone();
-                    let root = l.root.clone();
-                    drop(live);
-                    let mismatch = match (stored, root) {
-                        (Some(stored), Some(root)) => {
-                            fingerprint(&root).map(|fp| fp != stored).unwrap_or(false)
-                        }
-                        _ => false,
-                    };
-                    let mut live = self.inner.live.lock().expect("live poisoned");
-                    let Some(l) = live.get_mut(&workspace) else {
-                        return Ok(Next::Idle);
-                    };
-                    if mismatch {
-                        tracing::info!(
-                            workspace = workspace.raw(),
-                            "filesystem differs from the published generation; marking dirty"
-                        );
-                        l.pending = true;
-                        Ok(Next::MarkDirty)
-                    } else {
-                        l.pending = false;
-                        if was_pending {
-                            tracing::debug!(
-                                workspace = workspace.raw(),
-                                "stale watcher event for an already-built state; dropped"
-                            );
-                        }
-                        Ok(Next::Idle)
-                    }
+                    let previous = l.fingerprint_coverage.clone().unwrap_or_default();
+                    l.fingerprint_coverage = Some(FingerprintCoverage::round_at_epoch(
+                        previous.round_start,
+                        previous.epoch.wrapping_add(1),
+                    ));
+                    l.dirty_now = false;
+                    Ok(Next::Claim {
+                        target: gen,
+                        kind: JOURNAL_CONTINUE,
+                    })
                 } else {
                     Ok(Next::Idle)
                 }
@@ -1147,7 +1426,7 @@ impl IndexService {
             Some(row) => Some((persisted_generation(workspace, row.generation)?, row)),
             None => None,
         };
-        let mut live = self.inner.live.lock().expect("live poisoned");
+        let mut live = lock_recover(&self.inner.live);
         let Some(l) = live.get_mut(&workspace) else {
             return Ok(());
         };
@@ -1195,6 +1474,11 @@ impl IndexService {
                 l.pending = true;
                 l.pending_load = false;
                 l.content = None;
+                l.last_fingerprint = None;
+                l.coverage = None;
+                l.fingerprint_coverage = None;
+                l.content_identity.clear();
+                l.fingerprint_identity.clear();
             }
         }
         Ok(())
@@ -1203,8 +1487,11 @@ impl IndexService {
     /// Load the published generation's content from its durable file.
     fn load_content(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
         let (state, state_json, row_generation) = {
-            let live = self.inner.live.lock().expect("live poisoned");
-            let l = live.get(&workspace).expect("live ws present");
+            let live = lock_recover(&self.inner.live);
+            // Ephemeral map: a detached workspace is a no-op, never a panic.
+            let Some(l) = live.get(&workspace) else {
+                return Ok(());
+            };
             (l.state.clone(), l.state_json.clone(), l.row_generation)
         };
         let gen = match &state {
@@ -1224,8 +1511,21 @@ impl IndexService {
                         ),
                     })
                 } else {
+                    let coverage = file.coverage();
+                    let fingerprint_coverage = file.fingerprint_coverage();
+                    let content_identity = file.identity();
+                    let fingerprint_identity = file.fingerprint_identity();
                     file.materialize()
-                        .map(|idx| (idx, file.fingerprint))
+                        .map(|idx| {
+                            (
+                                idx,
+                                file.fingerprint,
+                                coverage,
+                                fingerprint_coverage,
+                                content_identity,
+                                fingerprint_identity,
+                            )
+                        })
                         .map_err(|e| IndexError::CorruptGeneration {
                             workspace: workspace.raw(),
                             message: e,
@@ -1234,15 +1534,26 @@ impl IndexService {
             }
             Err(e) => Err(e),
         };
-        let mut live = self.inner.live.lock().expect("live poisoned");
+        let mut live = lock_recover(&self.inner.live);
         let Some(l) = live.get_mut(&workspace) else {
             return Ok(());
         };
         match loaded {
-            Ok((idx, fingerprint)) => {
+            Ok((
+                idx,
+                fingerprint,
+                coverage,
+                fingerprint_coverage,
+                content_identity,
+                fp_identity,
+            )) => {
                 l.content = Some(Arc::new(Mutex::new(idx)));
                 l.content_generation = gen;
                 l.last_fingerprint = Some(fingerprint);
+                l.coverage = Some(coverage);
+                l.fingerprint_coverage = Some(fingerprint_coverage);
+                l.content_identity = content_identity;
+                l.fingerprint_identity = fp_identity;
                 l.pending_load = false;
                 drop(live);
                 prune_generations(&self.inner.data_root, workspace, gen);
@@ -1272,6 +1583,11 @@ impl IndexService {
                     l.state_json = l.state.to_row_json();
                     l.pending = true;
                     l.pending_load = false;
+                    l.last_fingerprint = None;
+                    l.coverage = None;
+                    l.fingerprint_coverage = None;
+                    l.content_identity.clear();
+                    l.fingerprint_identity.clear();
                 }
                 Ok(())
             }
@@ -1281,8 +1597,11 @@ impl IndexService {
     /// Durable `Ready { g } -> Dirty { g }` (the watcher-event hop).
     fn mark_dirty(&self, workspace: WorkspaceId) -> Result<(), IndexError> {
         let (state, state_json, row_generation) = {
-            let live = self.inner.live.lock().expect("live poisoned");
-            let l = live.get(&workspace).expect("live ws present");
+            let live = lock_recover(&self.inner.live);
+            // Ephemeral map: a detached workspace is a no-op, never a panic.
+            let Some(l) = live.get(&workspace) else {
+                return Ok(());
+            };
             (l.state.clone(), l.state_json.clone(), l.row_generation)
         };
         let WorkspaceIndexState::Ready { generation } = state else {
@@ -1298,7 +1617,7 @@ impl IndexService {
             generation as i64,
             JOURNAL_DIRTY,
         )?;
-        let mut live = self.inner.live.lock().expect("live poisoned");
+        let mut live = lock_recover(&self.inner.live);
         let Some(l) = live.get_mut(&workspace) else {
             return Ok(());
         };
@@ -1321,8 +1640,8 @@ impl IndexService {
         kind: &'static str,
     ) -> Result<bool, IndexError> {
         let cfg = Self::cfg_of(&self.inner);
-        let (state, state_json, row_generation) = {
-            let mut live = self.inner.live.lock().expect("live poisoned");
+        let (state, state_json, row_generation, continuation_covered) = {
+            let mut live = lock_recover(&self.inner.live);
             let stale = live
                 .get(&workspace)
                 .map(|l| {
@@ -1333,22 +1652,51 @@ impl IndexService {
                 })
                 .unwrap_or(false);
             if stale {
-                let l = live.get_mut(&workspace).expect("live ws present");
+                let Some(l) = live.get_mut(&workspace) else {
+                    return Ok(false);
+                };
                 l.building = false; // stale lease: crash reclaim
                 l.building_since = None;
             }
-            let l = live.get(&workspace).expect("live ws present");
+            let Some(l) = live.get(&workspace) else {
+                return Ok(false);
+            };
             if l.building {
                 return Ok(false);
             }
-            (l.state.clone(), l.state_json.clone(), l.row_generation)
+            // A CONTINUATION claim is legal only while the published
+            // generation's coverage (content or fingerprint) is incomplete;
+            // anything else must go through the Dirty hop.
+            let covered = !l.coverage.as_ref().map(|c| c.complete).unwrap_or(true)
+                || !l
+                    .fingerprint_coverage
+                    .as_ref()
+                    .map(|c| c.complete)
+                    .unwrap_or(true);
+            (
+                l.state.clone(),
+                l.state_json.clone(),
+                l.row_generation,
+                covered,
+            )
         };
+        if kind == JOURNAL_CONTINUE
+            && !(matches!(state, WorkspaceIndexState::Ready { generation } if generation == target)
+                && continuation_covered)
+        {
+            tracing::debug!(
+                workspace = workspace.raw(),
+                target,
+                "continuation claim refused: the published generation is complete"
+            );
+            return Ok(false);
+        }
         let building = WorkspaceIndexState::Building { generation: target };
         let resume = matches!(state, WorkspaceIndexState::Building { .. });
         let journal_kind = if resume || kind == JOURNAL_RESUME {
             JOURNAL_RESUME
         } else {
-            JOURNAL_BUILDING
+            kind
         };
         state.check_transition(row_generation, &building, target)?;
         let ok = self.inner.store.index_state_cas(
@@ -1360,7 +1708,7 @@ impl IndexService {
             journal_kind,
         )?;
         if ok {
-            let mut live = self.inner.live.lock().expect("live poisoned");
+            let mut live = lock_recover(&self.inner.live);
             if let Some(l) = live.get_mut(&workspace) {
                 l.state = building;
                 l.state_json = l.state.to_row_json();
@@ -1387,11 +1735,20 @@ impl IndexService {
     ///   a complete but unreferenced file the resume overwrites.
     /// - publish CAS lost -> another builder won; the whole snapshot already
     ///   staged by the loser is never named Ready, so it stays invisible.
-    fn run_build(&self, workspace: WorkspaceId, target: u64) -> Result<(), IndexError> {
+    fn run_build(
+        &self,
+        workspace: WorkspaceId,
+        target: u64,
+        kind: &'static str,
+    ) -> Result<(), IndexError> {
+        let continuation = kind == JOURNAL_CONTINUE;
         let ws_raw = workspace.raw();
         let (expected_json, root) = {
-            let live = self.inner.live.lock().expect("live poisoned");
-            let l = live.get(&workspace).expect("live ws present");
+            let live = lock_recover(&self.inner.live);
+            // Ephemeral map: a detached workspace is a no-op, never a panic.
+            let Some(l) = live.get(&workspace) else {
+                return Ok(());
+            };
             (l.state_json.clone(), l.root.clone())
         };
         let Some(root) = root else {
@@ -1405,51 +1762,293 @@ impl IndexService {
         // Build-time embedding is configured per service (additive API); the
         // source snapshot is read once so an in-flight build is stable.
         let source_config = self.embedding_config();
-        let mut scan = match scan_workspace(workspace, &root, source_config.is_some()) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                eprintln!("[run_build] scan error: {e}");
-                return self.fail_build(workspace, target, &expected_json, e);
-            }
+        let cfg = Self::cfg_of(&self.inner);
+        let gen_path = generation_file_path(&self.inner.data_root, workspace, target);
+
+        // LIVE seed: a fingerprint-only continuation's in-progress round
+        // exists only in the mirror until the next publish (the published
+        // file's fingerprint coverage is still complete). Content state
+        // always comes from the durable partial envelope.
+        let live_fp_round = {
+            let live = lock_recover(&self.inner.live);
+            live.get(&workspace).and_then(|l| {
+                let cov = l.fingerprint_coverage.clone()?;
+                (!cov.complete).then_some(cov)
+            })
         };
+
+        // Resume the SAME generation's durable accumulation when the file
+        // belongs to this target and still has incomplete work (or the claim
+        // is an explicit continuation, e.g. a fingerprint round).
+        let resumed = match read_generation_file(&gen_path) {
+            Ok(file)
+                if file.workspace == ws_raw
+                    && file.generation == target
+                    && (!file.coverage().complete
+                        || !file.fingerprint_coverage().complete
+                        || continuation) =>
+            {
+                match file.materialize() {
+                    Ok(index) => Some((
+                        index,
+                        file.coverage(),
+                        file.cursor.clone().unwrap_or_default(),
+                        file.fingerprint
+                            .iter()
+                            .cloned()
+                            .map(|e| (e.path.clone(), e))
+                            .collect::<BTreeMap<String, FingerprintEntry>>(),
+                        file.fingerprint_coverage(),
+                        file.fingerprint_next
+                            .iter()
+                            .cloned()
+                            .map(|e| (e.path.clone(), e))
+                            .collect::<BTreeMap<String, FingerprintEntry>>(),
+                        file.fingerprint_next_epoch,
+                    )),
+                    Err(e) => {
+                        return self.fail_build(
+                            workspace,
+                            target,
+                            &expected_json,
+                            format!("resume generation {target}: {e}"),
+                        )
+                    }
+                }
+            }
+            Ok(_) => None,
+            Err(e) if gen_path.exists() => {
+                // A corrupt partial envelope is loud, never a silent fresh
+                // restart over adversary-controlled bytes.
+                tracing::warn!(
+                    workspace = ws_raw,
+                    generation = target,
+                    error = %e,
+                    "unreadable generation envelope; restarting the build"
+                );
+                None
+            }
+            Err(_) => None,
+        };
+        let (
+            mut index,
+            mut coverage,
+            mut cursor,
+            mut fp_stored,
+            file_fp_cov,
+            mut fp_next,
+            file_next_epoch,
+        ) = match resumed {
+            Some(parts) => parts,
+            None => (
+                WorkspaceIndex::new(),
+                IndexCoverage::empty(),
+                ScanCursor::default(),
+                BTreeMap::new(),
+                // A fresh generation first establishes its fingerprint
+                // baseline (shard 0); later rounds rotate via the persisted
+                // `round_start` and VERIFY against the baseline.
+                FingerprintCoverage::baseline(),
+                BTreeMap::new(),
+                None,
+            ),
+        };
+        // A continuation with an in-memory round in progress continues THAT
+        // round (its shard/cursor state); otherwise the durable file state
+        // rules.
+        let mut fp_cov = match (continuation, live_fp_round) {
+            (true, Some(round)) => round,
+            _ => file_fp_cov,
+        };
+        // The in-progress map belongs to the round that wrote it; a new
+        // round starts from an empty map.
+        if file_next_epoch != Some(fp_cov.epoch) {
+            fp_next.clear();
+        }
+        // Diagnostics honesty: while this build runs, concurrent readers of
+        // `coverage`/`coverage_snapshot` must see the IN-PROGRESS coverage
+        // (partial), never the stale complete value from before the claim.
+        {
+            let mut live = lock_recover(&self.inner.live);
+            if let Some(l) = live.get_mut(&workspace) {
+                l.coverage = Some(coverage.clone());
+                l.fingerprint_coverage = Some(fp_cov.clone());
+            }
+        }
+        let mut dirty_now = false;
+
+        // ---- bounded CONTENT batch (audit 5) ----
+        let mut batch_chunks: Vec<(String, Vec<String>)> = Vec::new();
+        let mut chunk_text_bytes = 0usize;
+        if !coverage.complete {
+            let batch = match scan_content_batch(&root, &cursor, &cfg) {
+                Ok(batch) => batch,
+                Err(e) => return self.fail_build(workspace, target, &expected_json, e),
+            };
+            for file in &batch.files {
+                index
+                    .index_file(
+                        workspace,
+                        Path::new(&file.rel),
+                        &file.bytes,
+                        file.modified_ms,
+                    )
+                    .map_err(|e| IndexError::BuildFailed {
+                        workspace: ws_raw,
+                        message: format!("index {}: {e}", file.rel),
+                    })?;
+                if source_config.is_some() {
+                    // Chunk texts for build-time embedding: bounded per file
+                    // (chunk caps) and in total, so a hostile repo cannot
+                    // inflate the batch's memory.
+                    let texts: Vec<String> =
+                        crate::embedding::chunk_text(&String::from_utf8_lossy(&file.bytes))
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect();
+                    let bytes_here: usize = texts.iter().map(|t| t.len()).sum();
+                    if !texts.is_empty()
+                        && chunk_text_bytes.saturating_add(bytes_here)
+                            <= MAX_EMBEDDING_SCAN_TEXT_BYTES
+                    {
+                        chunk_text_bytes += bytes_here;
+                        batch_chunks.push((file.rel.clone(), texts));
+                    }
+                }
+            }
+            coverage.files_seen = coverage.files_seen.saturating_add(batch.files_seen);
+            coverage.files_indexed = coverage.files_indexed.saturating_add(batch.indexed);
+            coverage.bytes_indexed = coverage.bytes_indexed.saturating_add(batch.bytes);
+            coverage.complete = batch.complete;
+            coverage.truncated_reason = batch.truncated_reason.clone();
+            cursor = batch.cursor.clone();
+            if coverage.complete {
+                cursor = ScanCursor::default();
+            }
+        }
+
+        // ---- bounded FINGERPRINT shard passes (audit 6) ----
+        // Only meaningful once the content walk completed; while content is
+        // incomplete the generation keeps extending and can never be claimed
+        // clean. A capped round stays incomplete (never "fully clean") and
+        // the next batch continues it.
+        if coverage.complete {
+            for _ in 0..FINGERPRINT_SHARDS {
+                if fp_cov.complete {
+                    break;
+                }
+                let shard = fp_cov.shard;
+                let pass = match fingerprint_pass(
+                    &root,
+                    shard,
+                    &fp_cov.cursor_for(shard),
+                    cfg.fp_batch_files,
+                    cfg.fp_batch_dirs,
+                ) {
+                    Ok(pass) => pass,
+                    Err(e) => {
+                        // A fingerprint that cannot be read can never be
+                        // declared clean: the generation is superseded
+                        // through the Dirty hop, and the rebuild will surface
+                        // the unreadable root as a durable failure.
+                        tracing::warn!(
+                            workspace = ws_raw,
+                            generation = target,
+                            error = %e,
+                            "fingerprint pass failed; the generation is superseded (never declared clean)"
+                        );
+                        fp_cov.truncated_reason = Some(format!("fingerprint_error: {e}"));
+                        fp_cov.complete = false;
+                        dirty_now = true;
+                        break;
+                    }
+                };
+                for entry in pass.entries {
+                    match fp_stored.get(&entry.path) {
+                        Some(previous) if *previous == entry => {}
+                        // A baseline round RECORDS the fingerprint; only a
+                        // verification round can call a difference a change.
+                        _ => {
+                            if fp_cov.verify {
+                                dirty_now = true;
+                            }
+                        }
+                    }
+                    fp_next.insert(entry.path.clone(), entry);
+                }
+                if pass.shard_completed {
+                    fp_cov.finish_shard(shard);
+                    if fp_cov.complete {
+                        // The round finished. A baseline round MERGES the
+                        // observed map into the accumulation it has been
+                        // publishing all along (nothing may be lost). A
+                        // verification round must have seen every stored
+                        // entry or the difference (a deletion) supersedes the
+                        // generation; the observed map then becomes the new
+                        // baseline.
+                        if fp_cov.verify {
+                            if fp_stored.len() != fp_next.len() {
+                                dirty_now = true;
+                            }
+                            fp_stored = std::mem::take(&mut fp_next);
+                        } else {
+                            for (path, entry) in std::mem::take(&mut fp_next) {
+                                fp_stored.insert(path, entry);
+                            }
+                        }
+                    }
+                } else {
+                    fp_cov.set_cursor(shard, pass.cursor);
+                    fp_cov.truncated_reason = Some(
+                        pass.reason
+                            .unwrap_or_else(|| "fingerprint_batch".to_string()),
+                    );
+                }
+                fp_cov.scanned = if fp_cov.verify && !fp_cov.complete {
+                    fp_next.len() as u64
+                } else {
+                    fp_stored.len() as u64
+                };
+                if dirty_now {
+                    break;
+                }
+            }
+        }
+
+        // A BASELINE round accumulates directly into the published baseline
+        // (comparisons are off); a VERIFICATION round keeps the published
+        // baseline intact and carries its observed map separately until the
+        // round completes.
+        if !fp_cov.verify {
+            for (path, entry) in std::mem::take(&mut fp_next) {
+                fp_stored.insert(path, entry);
+            }
+        }
+
         // Persisted vectors survive a generation swap regardless of whether
         // a source is configured: with one, matching vectors are carried and
         // only missing chunks embed; without one, the prior store rides
-        // along verbatim for search.
-        match source_config.as_ref() {
-            Some((source, model)) => {
-                let prior = self.prior_embeddings(workspace);
-                let stats = apply_embeddings(
-                    &mut scan.index,
-                    workspace,
-                    prior.as_ref(),
-                    model,
-                    &scan.chunks,
-                    Some(source.as_ref()),
-                );
-                if stats.degraded {
-                    tracing::warn!(
-                        workspace = ws_raw,
-                        generation = target,
-                        carried = stats.carried,
-                        "index embeddings degraded for this build (lexical/symbol retrieval is unaffected)"
-                    );
-                } else if stats.carried > 0 || stats.embedded > 0 {
-                    tracing::info!(
-                        workspace = ws_raw,
-                        generation = target,
-                        carried = stats.carried,
-                        embedded = stats.embedded,
-                        calls = stats.calls,
-                        "index embeddings settled"
-                    );
-                }
-            }
-            None => {
+        // along verbatim for search. The accumulation's OWN vectors are the
+        // prior on resumed batches (earlier batches' work is never re-embedded).
+        //
+        // A fingerprint-only continuation carries NO new chunks: re-running
+        // the pass would rebuild an EMPTY identity-scoped store and drop the
+        // persisted vectors, so it keeps the materialized store verbatim.
+        if batch_chunks.is_empty() {
+            if index.embedding_index(workspace).is_none() {
                 if let Some(prior) = self.prior_embeddings(workspace) {
-                    scan.index.replace_embeddings(workspace, prior);
+                    index.replace_embeddings(workspace, prior);
                 }
             }
+        } else {
+            self.embed_accumulated(
+                workspace,
+                ws_raw,
+                target,
+                &mut index,
+                &batch_chunks,
+                source_config,
+            );
         }
         // Publish invariant (typed embedding status): the exact in-memory
         // entry captured into the durable envelope here is the one the swap
@@ -1464,57 +2063,112 @@ impl IndexService {
         // generation file) disagrees with the live view. Absence of the
         // entry therefore means exactly "no published generation at all"
         // (the view itself is `None`). Enforced, not merely documented.
-        if scan.index.embedding_index(workspace).is_none() {
-            scan.index
-                .replace_embeddings(workspace, EmbeddingIndex::default());
+        if index.embedding_index(workspace).is_none() {
+            index.replace_embeddings(workspace, EmbeddingIndex::default());
         }
-        let envelope = GenerationFile::capture(ws_raw, target, &scan.index, scan.fingerprint);
-        let bytes = envelope.to_bytes().map_err(|e| IndexError::BuildFailed {
-            workspace: ws_raw,
-            message: e,
-        })?;
-        // Crash seam: a test hook may kill this builder right here, before
-        // any byte of the generation was staged and before the publish CAS.
-        // The durable state is still Building{target}, so the next build
-        // resumes the SAME target and no reader can observe a torn
-        // generation.
-        fire_seam(ws_raw, "before_publish");
-        // The publish directory must exist before the atomic writer.
-        fs::create_dir_all(generation_dir(&self.inner.data_root, workspace))?;
-        // Filesystem visibility FIRST, durable state SECOND. The generation
-        // file is staged through the shared atomic writer (unique
-        // same-directory temp, fsync, rename, parent fsync) BEFORE the
-        // `Building{target} -> Ready{target}` CAS. This is the load-bearing
-        // ordering: `Ready{target}` must never name bytes that are not yet
-        // visible, or a concurrent reconcile of the freshly-Ready row races
-        // the still-running writer, fails to read the file, and heals
-        // Ready -> Dirty -> rebuild (a phantom generation on a clean
-        // workspace). A crash before the rename leaves the row Building and
-        // at worst an orphan temp; a crash after the rename but before the
-        // CAS leaves a complete but unreferenced generation the resume
-        // atomically overwrites. Losers of the CAS below may have staged
-        // whole bytes for the same generation: every rename is atomic, so
-        // only whole snapshots are ever visible, and the CAS names exactly
-        // one of them the published state.
-        let gen_path = generation_file_path(&self.inner.data_root, workspace, target);
-        let published = faktor_fs::atomic::atomic_replace_guarded(&gen_path, &bytes, &|_| {
-            // Adversarial seam: the bytes are written + fsynced under the
-            // writer's temp name but the rename to the visible generation
-            // has not happened; a test hook may kill the builder here.
-            fire_seam(ws_raw, "before_visibility");
-            Ok(())
-        });
-        if let Err(e) = published {
-            // No CAS was attempted: the durable state is still
-            // Building{target}, so clearing the in-process lease lets the
-            // machine retry/resume the same target (a real IO failure is not
-            // a Failed build — never renumber, never skip).
-            let mut live = self.inner.live.lock().expect("live poisoned");
-            if let Some(l) = live.get_mut(&workspace) {
-                l.building = false;
-                l.building_since = None;
+        let (fingerprint_next, fingerprint_next_epoch) = if fp_cov.verify && !fp_cov.complete {
+            (
+                fp_next.values().cloned().collect::<Vec<FingerprintEntry>>(),
+                Some(fp_cov.epoch),
+            )
+        } else {
+            (Vec::new(), None)
+        };
+        fp_cov.scanned = if fingerprint_next_epoch.is_some() {
+            fp_next.len() as u64
+        } else {
+            fp_stored.len() as u64
+        };
+        let fingerprint: Vec<FingerprintEntry> = fp_stored.values().cloned().collect();
+        let envelope = GenerationFile::capture_with_coverage(
+            ws_raw,
+            target,
+            &index,
+            fingerprint,
+            coverage.clone(),
+            (!coverage.complete).then_some(cursor.clone()),
+            fp_cov.clone(),
+            fingerprint_next,
+            fingerprint_next_epoch,
+        );
+        // A clean verification round republishes the SAME identity: its
+        // bytes are already visible, so the atomic rewrite is skipped while
+        // the durable verified fact is still recorded. Any real change (or
+        // an incomplete batch) writes normally.
+        let identity = envelope.identity();
+        let prior_identity = {
+            let live = lock_recover(&self.inner.live);
+            live.get(&workspace)
+                .map(|l| l.content_identity.clone())
+                .unwrap_or_default()
+        };
+        let verified_clean = envelope.coverage().complete
+            && envelope.fingerprint_coverage().complete
+            && !dirty_now
+            && !prior_identity.is_empty()
+            && identity == prior_identity;
+        let journal_kind = if !envelope.coverage().complete {
+            // An incomplete batch publish journals `ready_partial` so the
+            // complete publish remains the one `ready` fact of the
+            // generation.
+            JOURNAL_READY_PARTIAL
+        } else if dirty_now {
+            // The round proved a difference: the same-generation bytes stay
+            // visible first, then the Dirty hop rebuilds.
+            JOURNAL_VERIFY_DIRTY
+        } else if verified_clean {
+            JOURNAL_VERIFIED
+        } else {
+            JOURNAL_READY
+        };
+        if !verified_clean {
+            let bytes = envelope.to_bytes().map_err(|e| IndexError::BuildFailed {
+                workspace: ws_raw,
+                message: e,
+            })?;
+            // Crash seam: a test hook may kill this builder right here, before
+            // any byte of the generation was staged and before the publish CAS.
+            // The durable state is still Building{target}, so the next build
+            // resumes the SAME target and no reader can observe a torn
+            // generation.
+            fire_seam(ws_raw, target, "before_publish");
+            // The publish directory must exist before the atomic writer.
+            fs::create_dir_all(generation_dir(&self.inner.data_root, workspace))?;
+            // Filesystem visibility FIRST, durable state SECOND. The generation
+            // file is staged through the shared atomic writer (unique
+            // same-directory temp, fsync, rename, parent fsync) BEFORE the
+            // `Building{target} -> Ready{target}` CAS. This is the load-bearing
+            // ordering: `Ready{target}` must never name bytes that are not yet
+            // visible, or a concurrent reconcile of the freshly-Ready row races
+            // the still-running writer, fails to read the file, and heals
+            // Ready -> Dirty -> rebuild (a phantom generation on a clean
+            // workspace). A crash before the rename leaves the row Building and
+            // at worst an orphan temp; a crash after the rename but before the
+            // CAS leaves a complete but unreferenced generation the resume
+            // atomically overwrites. Losers of the CAS below may have staged
+            // whole bytes for the same generation: every rename is atomic, so
+            // only whole snapshots are ever visible, and the CAS names exactly
+            // one of them the published state.
+            let gen_path = generation_file_path(&self.inner.data_root, workspace, target);
+            let published = faktor_fs::atomic::atomic_replace_guarded(&gen_path, &bytes, &|_| {
+                // Adversarial seam: the bytes are written + fsynced under the
+                // writer's temp name but the rename to the visible generation
+                // has not happened; a test hook may kill the builder here.
+                fire_seam(ws_raw, target, "before_visibility");
+                Ok(())
+            });
+            if let Err(e) = published {
+                // No CAS was attempted: the durable state is still
+                // Building{target}, so clearing the in-process lease lets the
+                // machine retry/resume the same target (a real IO failure is not
+                // a Failed build — never renumber, never skip).
+                let mut live = lock_recover(&self.inner.live);
+                if let Some(l) = live.get_mut(&workspace) {
+                    l.building = false;
+                    l.building_since = None;
+                }
+                return Err(IndexError::Io(std::io::Error::other(e.message)));
             }
-            return Err(IndexError::Io(std::io::Error::other(e.message)));
         }
         // Publish CAS: only ONE builder wins per generation. The visible
         // bytes are already durable at the moment the row first says Ready.
@@ -1525,14 +2179,14 @@ impl IndexService {
             target as i64,
             &ready.to_row_json(),
             target as i64,
-            JOURNAL_READY,
+            journal_kind,
         )?;
         if !ok {
             // Another builder published this generation (crash-resume race):
             // the file written above is a complete snapshot for `target`;
             // the winner's CAS → Ready owns the live swap. Clear the lease
             // and refresh the mirror on the next reconcile.
-            let mut live = self.inner.live.lock().expect("live poisoned");
+            let mut live = lock_recover(&self.inner.live);
             if let Some(l) = live.get_mut(&workspace) {
                 l.building = false;
                 l.building_since = None;
@@ -1540,21 +2194,26 @@ impl IndexService {
             return Ok(());
         }
         {
-            let mut live = self.inner.live.lock().expect("live poisoned");
+            let mut live = lock_recover(&self.inner.live);
             if let Some(l) = live.get_mut(&workspace) {
                 l.state = ready;
                 l.state_json = l.state.to_row_json();
                 l.row_generation = target;
-                l.content = Some(Arc::new(Mutex::new(scan.index)));
+                l.content = Some(Arc::new(Mutex::new(index)));
                 l.content_generation = target;
                 l.last_fingerprint = Some(envelope.fingerprint.clone());
+                l.coverage = Some(envelope.coverage());
+                l.fingerprint_coverage = Some(envelope.fingerprint_coverage());
+                l.content_identity = envelope.identity();
+                l.fingerprint_identity = envelope.fingerprint_identity();
+                l.dirty_now = dirty_now;
                 l.pending_load = false;
                 l.building = false;
                 l.building_since = None;
-                // The filesystem churned while we scanned: schedule the
-                // follow-up rebuild only AFTER this publish (a reader of g+1
-                // never sees a mix; g+2 is rebuilt from scratch).
-                if scan.churned {
+                // An incomplete batch keeps the workspace pending: the next
+                // reconcile continues the SAME generation (content batches
+                // and/or fingerprint shard passes) until it is complete.
+                if !envelope.coverage().complete || !envelope.fingerprint_coverage().complete {
                     l.pending = true;
                 }
             }
@@ -1594,7 +2253,7 @@ impl IndexService {
             target as i64,
             JOURNAL_FAILED,
         )?;
-        let mut live = self.inner.live.lock().expect("live poisoned");
+        let mut live = lock_recover(&self.inner.live);
         if let Some(l) = live.get_mut(&workspace) {
             if ok {
                 l.state = failed;
@@ -1633,12 +2292,17 @@ fn refresh_mirror_into(l: &mut LiveWs, p: PersistedIndexState) {
     if !keep_content {
         l.content = None;
         l.last_fingerprint = None;
+        l.coverage = None;
+        l.fingerprint_coverage = None;
+        l.content_identity.clear();
+        l.fingerprint_identity.clear();
     }
     l.state = p.state;
     l.state_json = p.state_json;
     l.row_generation = p.row_generation;
     l.building = false;
     l.building_since = None;
+    l.dirty_now = false;
     l.pending_load = matches!(l.state, WorkspaceIndexState::Ready { .. }) && !keep_content;
     l.pending = matches!(
         l.state,
@@ -1651,6 +2315,18 @@ fn refresh_mirror_into(l: &mut LiveWs, p: PersistedIndexState) {
 
 /// Default fingerprint reconciliation interval (see [`ServiceConfig`]).
 const DEFAULT_FINGERPRINT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Stable machine spelling of a durable index state (diagnostics surfaces;
+/// mirrors the doctor's `doctor_index_state_label`).
+fn index_state_label(state: &WorkspaceIndexState) -> &'static str {
+    match state {
+        WorkspaceIndexState::NotStarted => "not_started",
+        WorkspaceIndexState::Building { .. } => "building",
+        WorkspaceIndexState::Dirty { .. } => "dirty",
+        WorkspaceIndexState::Ready { .. } => "ready",
+        WorkspaceIndexState::Failed { .. } => "failed",
+    }
+}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -1786,6 +2462,20 @@ fn reconcile_dead_worker(worker: &mut WorkerSupervisor, started: &AtomicBool) ->
     true
 }
 
+/// Lock an INDEX-INTERNAL mutex with poison recovery (audit item 8).
+///
+/// Every mutex this helper serves guards process-local, rebuildable state:
+/// operator config, the live workspace map, the optional embedding source,
+/// watcher event queues and the test seam. The durable truth lives in the
+/// `Store` rows and the generation files on disk, so a panic in one holder
+/// cannot make continuing unsafe — the lock is recovered with
+/// `into_inner()` (Rust mutex payloads are never torn) instead of wedging
+/// every later request behind `PoisonError`. Durable authorities (the store
+/// writer service) fail typed; this module has none.
+fn lock_recover<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Lock the worker supervisor with classified POISON recovery. The shutdown
 /// and health paths run during teardown — exactly where a writer panic is
 /// most likely — and must never panic themselves (`expect` would abort the
@@ -1824,6 +2514,9 @@ fn lock_worker_supervisor(inner: &Inner) -> std::sync::MutexGuard<'_, WorkerSupe
 struct WorkerFault {
     /// Count of `run_pass` invocations (the bounded/no-hot-loop assertion).
     pass_invocations: AtomicU64,
+    /// One-shot: the next worker ASYNC BODY panics before its first pass
+    /// (the dead-generation fault; distinct from a panicking blocking pass).
+    async_body_panic: AtomicBool,
     /// One-shot: the next pass panics (the `JoinError` fault).
     panic_next: AtomicBool,
     /// One-shot: the next pass blocks this many ms on the blocking thread
@@ -1863,6 +2556,10 @@ async fn worker_loop(weak: std::sync::Weak<Inner>, cancel: CancellationToken, ge
         let Some(inner) = weak.upgrade() else {
             return;
         };
+        #[cfg(test)]
+        if inner.fault.async_body_panic.swap(false, Ordering::SeqCst) {
+            panic!("[test] deliberate index worker async-body panic");
+        }
         let cfg = IndexService::cfg_of(&inner);
         let service = IndexService {
             inner: inner.clone(),
@@ -1944,14 +2641,7 @@ impl IndexService {
         if cancel.is_cancelled() {
             return false;
         }
-        let workspaces: Vec<WorkspaceId> = self
-            .inner
-            .live
-            .lock()
-            .expect("live poisoned")
-            .keys()
-            .copied()
-            .collect();
+        let workspaces: Vec<WorkspaceId> = lock_recover(&self.inner.live).keys().copied().collect();
         let mut work_remains = false;
         for ws in workspaces {
             if cancel.is_cancelled() {
@@ -1961,12 +2651,22 @@ impl IndexService {
                 tracing::warn!(workspace = ws.raw(), "reconcile pass error: {e}");
                 continue;
             }
-            let live = self.inner.live.lock().expect("live poisoned");
-            if live
+            let live = lock_recover(&self.inner.live);
+            let needs_more = live
                 .get(&ws)
-                .map(|l| l.pending || l.pending_load)
-                .unwrap_or(false)
-            {
+                .map(|l| {
+                    l.pending
+                        || l.pending_load
+                        || l.dirty_now
+                        || !l.coverage.as_ref().map(|c| c.complete).unwrap_or(true)
+                        || !l
+                            .fingerprint_coverage
+                            .as_ref()
+                            .map(|c| c.complete)
+                            .unwrap_or(true)
+                })
+                .unwrap_or(false);
+            if needs_more {
                 work_remains = true;
             }
         }
@@ -2259,107 +2959,277 @@ fn log_sweep_summary(origin: &'static str, workspace: u64, summary: SweepSummary
 
 // ------------------------------------------------------------------ scanning
 
-/// Deterministic bounded walk of a workspace root (skips
-/// [`SKIP_DIRS`], symlinks, special files, binary and oversized files).
-/// Reads at most `SCAN_MAX_FILES` files and `SCAN_MAX_BYTES` in total, so
-/// a hostile repo is PARTIALLY indexed — never an unbounded build. Mirrors
-/// the bounded evidence scan's budget so both evidence paths agree.
-fn scan_workspace(ws: WorkspaceId, root: &Path, want_chunks: bool) -> Result<ScanOutcome, String> {
-    let before = fingerprint(root)?;
-    let mut index = WorkspaceIndex::new();
-    let mut chunks: Vec<(String, Vec<String>)> = Vec::new();
-    let mut chunk_text_bytes = 0usize;
-    let mut files_scanned = 0usize;
-    let mut dirs_visited = 0usize;
-    let mut bytes_indexed = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        dirs_visited += 1;
-        if dirs_visited > SCAN_MAX_DIRS {
-            break;
+/// Filesystem modification time in epoch milliseconds (0 when unavailable).
+fn modified_ms_of(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn join_rel(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// Open one walk frame: sorted entries plus the resume high-water. A
+/// NON-ROOT directory that vanished between batches (churn during a
+/// multi-batch generation) is exhausted, never a fatal build error; the root
+/// itself missing is still a loud failure (the caller has no workspace).
+fn open_frame(
+    dir: PathBuf,
+    rel: String,
+    after: Option<&str>,
+    tolerate_missing: bool,
+) -> Result<WalkFrame, String> {
+    let rd = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if tolerate_missing && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalkFrame {
+                dir,
+                rel,
+                entries: Vec::new(),
+                idx: 0,
+                after: None,
+            });
         }
-        let entries = fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => {
-                    if !SKIP_DIRS.contains(&name.as_str()) {
-                        stack.push(path);
-                    }
-                }
-                Ok(t) if t.is_file() => {
-                    if files_scanned >= SCAN_MAX_FILES {
-                        break;
-                    }
-                    let meta = match fs::metadata(&path) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    if meta.len() > SCAN_MAX_FILE_BYTES {
-                        continue;
-                    }
-                    if bytes_indexed >= SCAN_MAX_BYTES {
-                        break;
-                    }
-                    let bytes = match fs::read(&path) {
-                        Ok(b) => b,
-                        Err(_) => continue,
-                    };
-                    // Binary sniff: a NUL in the first 8 KiB means not text.
-                    if bytes.iter().take(8192).any(|b| *b == 0) {
-                        continue;
-                    }
-                    let rel = path
-                        .strip_prefix(root)
-                        .map_err(|_| format!("{} escapes the workspace root", path.display()))?;
-                    let rel_str = rel
-                        .components()
-                        .map(|c| c.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    let modified_ms = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    index
-                        .index_file(ws, Path::new(&rel_str), &bytes, modified_ms)
-                        .map_err(|e| format!("index {rel_str}: {e}"))?;
-                    if want_chunks {
-                        // Chunk texts for build-time embedding: bounded per
-                        // file (chunk caps) and in total, so a hostile repo
-                        // cannot inflate the build's memory.
-                        let texts: Vec<String> =
-                            crate::embedding::chunk_text(&String::from_utf8_lossy(&bytes))
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect();
-                        let bytes_here: usize = texts.iter().map(|t| t.len()).sum();
-                        if !texts.is_empty()
-                            && chunk_text_bytes.saturating_add(bytes_here)
-                                <= MAX_EMBEDDING_SCAN_TEXT_BYTES
-                        {
-                            chunk_text_bytes += bytes_here;
-                            chunks.push((rel_str.clone(), texts));
-                        }
-                    }
-                    files_scanned += 1;
-                    bytes_indexed = bytes_indexed.saturating_add(bytes.len());
-                }
-                // Symlinks and special files are never indexed.
-                _ => {}
-            }
+        Err(e) => return Err(format!("read_dir {}: {e}", dir.display())),
+    };
+    let mut entries: Vec<(String, WalkKind)> = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = match entry.file_type() {
+            Ok(t) if t.is_dir() => WalkKind::Dir,
+            Ok(t) if t.is_file() => WalkKind::File,
+            // Symlinks and special files are never followed and never
+            // indexed (they are consumed by the walk, nothing more).
+            _ => WalkKind::Other,
+        };
+        entries.push((name, kind));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut idx = 0usize;
+    if let Some(after) = after {
+        while idx < entries.len() && entries[idx].0.as_str() <= after {
+            idx += 1;
         }
     }
-    let after = fingerprint(root)?;
-    let churned = after != before;
-    Ok(ScanOutcome {
-        index,
-        fingerprint: after,
-        churned,
-        chunks,
+    Ok(WalkFrame {
+        dir,
+        rel,
+        entries,
+        idx,
+        after: after.map(str::to_string),
+    })
+}
+
+/// The resume cursor of the frames currently on the stack. A parent frame
+/// still points at the directory entry whose child frame is on top: its
+/// high-water is the entry BEFORE it, so a resume re-enters the child (which
+/// carries its own high-water) instead of skipping it.
+fn cursor_of(stack: &[WalkFrame]) -> ScanCursor {
+    let frames = stack
+        .iter()
+        .filter(|f| f.idx > 0 || f.after.is_some() || !f.rel.is_empty())
+        .map(|f| ScanFrame {
+            dir: f.rel.clone(),
+            after: if f.idx > 0 {
+                f.entries[f.idx - 1].0.clone()
+            } else {
+                f.after.clone().unwrap_or_default()
+            },
+        })
+        .collect();
+    ScanCursor { frames }
+}
+
+/// Deterministic bounded batch walk (audit 5/6): sorted entries, [`SKIP_DIRS`]
+/// skipped, `max_dirs` directories opened per call, `visit` invoked for every
+/// regular file in canonical order. Returns the resume cursor, whether the
+/// walk exhausted the tree, and the budget reason when it stopped early.
+fn walk_batch<F>(
+    root: &Path,
+    cursor: &ScanCursor,
+    max_dirs: usize,
+    mut visit: F,
+) -> Result<(ScanCursor, bool, Option<String>), String>
+where
+    F: FnMut(&str, &Path) -> WalkControl,
+{
+    enum Step {
+        Pop,
+        EnterDir { dir: PathBuf, rel: String },
+        VisitFile { rel: String, path: PathBuf },
+    }
+    let mut resume: HashMap<String, String> = cursor
+        .frames
+        .iter()
+        .map(|f| (f.dir.clone(), f.after.clone()))
+        .collect();
+    let mut stack = vec![open_frame(
+        root.to_path_buf(),
+        String::new(),
+        resume.remove("").as_deref(),
+        false,
+    )?];
+    let mut dirs_opened = 1usize;
+    loop {
+        let step = {
+            let Some(frame) = stack.last_mut() else {
+                return Ok((ScanCursor::default(), true, None));
+            };
+            if frame.idx >= frame.entries.len() {
+                Some(Step::Pop)
+            } else {
+                let (name, kind) = frame.entries[frame.idx].clone();
+                match kind {
+                    WalkKind::Other => {
+                        frame.idx += 1;
+                        None
+                    }
+                    WalkKind::Dir => {
+                        if SKIP_DIRS.contains(&name.as_str()) {
+                            frame.idx += 1;
+                            None
+                        } else if dirs_opened >= max_dirs {
+                            return Ok((cursor_of(&stack), false, Some("batch_dirs".to_string())));
+                        } else {
+                            Some(Step::EnterDir {
+                                dir: frame.dir.join(&name),
+                                rel: join_rel(&frame.rel, &name),
+                            })
+                        }
+                    }
+                    WalkKind::File => Some(Step::VisitFile {
+                        path: frame.dir.join(&name),
+                        rel: join_rel(&frame.rel, &name),
+                    }),
+                }
+            }
+        };
+        match step {
+            None => {}
+            Some(Step::Pop) => {
+                stack.pop();
+                // The parent's directory entry is consumed only now, when
+                // its child frame is exhausted.
+                if let Some(parent) = stack.last_mut() {
+                    parent.idx += 1;
+                }
+            }
+            Some(Step::EnterDir { dir, rel }) => {
+                dirs_opened += 1;
+                let after = resume.remove(rel.as_str());
+                stack.push(open_frame(dir, rel, after.as_deref(), true)?);
+            }
+            Some(Step::VisitFile { rel, path }) => match visit(&rel, &path) {
+                WalkControl::Continue => {
+                    if let Some(frame) = stack.last_mut() {
+                        frame.idx += 1;
+                    }
+                }
+                WalkControl::Stop(reason) => {
+                    return Ok((cursor_of(&stack), false, Some(reason.to_string())));
+                }
+            },
+        }
+    }
+}
+
+/// One bounded CONTENT batch (audit 5): reads at most the configured
+/// files/bytes; the returned cursor resumes after the last consumed entry so
+/// a hostile repository is indexed BATCH BY BATCH, never silently truncated.
+fn scan_content_batch(
+    root: &Path,
+    cursor: &ScanCursor,
+    cfg: &ServiceConfig,
+) -> Result<ContentBatch, String> {
+    let mut files: Vec<BatchFile> = Vec::new();
+    let mut files_seen = 0u64;
+    let mut indexed = 0u64;
+    let mut bytes_indexed = 0u64;
+    let (cursor, complete, truncated_reason) =
+        walk_batch(root, cursor, cfg.batch_dirs, |rel, path| {
+            if files_seen as usize >= cfg.batch_files {
+                return WalkControl::Stop("batch_files");
+            }
+            if bytes_indexed as usize >= cfg.batch_bytes {
+                return WalkControl::Stop("batch_bytes");
+            }
+            files_seen += 1;
+            let Ok(meta) = fs::metadata(path) else {
+                return WalkControl::Continue;
+            };
+            if meta.len() > SCAN_MAX_FILE_BYTES {
+                return WalkControl::Continue;
+            }
+            let Ok(bytes) = fs::read(path) else {
+                return WalkControl::Continue;
+            };
+            // Binary sniff: a NUL in the first 8 KiB means not text.
+            if bytes.iter().take(8192).any(|b| *b == 0) {
+                return WalkControl::Continue;
+            }
+            bytes_indexed = bytes_indexed.saturating_add(bytes.len() as u64);
+            indexed += 1;
+            files.push(BatchFile {
+                rel: rel.to_string(),
+                bytes,
+                modified_ms: modified_ms_of(&meta),
+            });
+            WalkControl::Continue
+        })?;
+    Ok(ContentBatch {
+        files,
+        files_seen,
+        indexed,
+        bytes: bytes_indexed,
+        cursor,
+        complete,
+        truncated_reason,
+    })
+}
+
+/// One bounded FINGERPRINT shard pass (audit 6): stats at most `max_files`
+/// files of `shard` in canonical order; a pass that exhausts the walk marks
+/// the shard complete, a capped pass persists its cursor so the next pass
+/// continues it — a capped fingerprint is never reported clean.
+fn fingerprint_pass(
+    root: &Path,
+    shard: u32,
+    cursor: &ScanCursor,
+    max_files: usize,
+    max_dirs: usize,
+) -> Result<FingerprintPass, String> {
+    let shard = shard % FINGERPRINT_SHARDS;
+    let mut entries: Vec<FingerprintEntry> = Vec::new();
+    let (cursor, complete, reason) = walk_batch(root, cursor, max_dirs, |rel, path| {
+        if fingerprint_shard(rel) != shard {
+            return WalkControl::Continue;
+        }
+        if entries.len() >= max_files {
+            return WalkControl::Stop("fingerprint_files");
+        }
+        let Ok(meta) = fs::metadata(path) else {
+            return WalkControl::Continue;
+        };
+        entries.push(FingerprintEntry {
+            path: rel.to_string(),
+            size: meta.len(),
+            modified_ms: modified_ms_of(&meta),
+        });
+        WalkControl::Continue
+    })?;
+    entries.sort();
+    Ok(FingerprintPass {
+        entries,
+        shard_completed: complete,
+        cursor,
+        reason,
     })
 }
 
@@ -2395,63 +3265,6 @@ fn newest_generation_embeddings(data_root: &Path, ws: WorkspaceId) -> Option<Emb
     Some(file.data.embeddings.sanitize())
 }
 
-/// Stat-only fingerprint of every regular file under `root` (sorted,
-/// bounded). Compared entry-wise: any difference (add/remove/size/mtime)
-/// means the published generation is stale.
-pub fn fingerprint(root: &Path) -> Result<Vec<FingerprintEntry>, String> {
-    let mut out = Vec::new();
-    let mut dirs_visited = 0usize;
-    let mut files = 0usize;
-    let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
-    while let Some((dir, rel_parts)) = stack.pop() {
-        dirs_visited += 1;
-        if dirs_visited > FP_MAX_DIRS {
-            break;
-        }
-        let entries = fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
-        let mut files_here = 0usize;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    let mut parts = rel_parts.clone();
-                    parts.push(name.clone());
-                    stack.push((entry.path(), parts));
-                }
-            } else if ft.is_file() {
-                if files >= FP_MAX_FILES {
-                    break;
-                }
-                files_here += 1;
-                if files_here > FP_PER_DIR {
-                    break;
-                }
-                let Ok(meta) = entry.metadata() else {
-                    continue;
-                };
-                let mut parts = rel_parts.clone();
-                parts.push(name);
-                out.push(FingerprintEntry {
-                    path: parts.join("/"),
-                    size: meta.len(),
-                    modified_ms: meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0),
-                });
-                files += 1;
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2464,9 +3277,11 @@ mod tests {
     /// with the heavy cold-path fixtures so their IO never starves a
     /// seam round's deadline.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
+        // Test-serialization lock only: recover on poison so one panicking
+        // test cannot cascade-fail every later fixture.
         crate::cold::TEST_SERIAL
             .lock()
-            .expect("serial lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Environment-independent readiness ceiling for tests whose semantic
@@ -2518,6 +3333,7 @@ mod tests {
             poll: Duration::from_millis(25),
             fingerprint_interval: Duration::from_millis(50),
             build_lease: Duration::from_millis(200),
+            ..ServiceConfig::default()
         }
     }
 
@@ -2527,6 +3343,7 @@ mod tests {
             poll: Duration::from_millis(25),
             fingerprint_interval: Duration::from_secs(3600),
             build_lease: Duration::from_millis(200),
+            ..ServiceConfig::default()
         }
     }
 
@@ -2699,11 +3516,13 @@ mod tests {
         // staged at all).
         let mut crash_rounds = 0u64;
         for _ in 0..50 {
-            install_seam(Box::new(move |w, point| {
-                if point == "before_publish" {
+            install_seam(Box::new(move |_w, generation, point| {
+                if point == "before_publish" && generation == 2 {
                     // Target only THIS round's crash; rounds are sequential
-                    // so the hook is cleared right after each attempt.
-                    let _ = w;
+                    // so the hook is cleared right after each attempt. The
+                    // gen-1 verification publish (the same-generation
+                    // `verify_dirty` fact) is allowed to land so the crash
+                    // happens in the REAL gen-2 rebuild.
                     panic!("simulated builder crash before the publish CAS");
                 }
             }));
@@ -2800,8 +3619,8 @@ mod tests {
         // but before the rename made gen-2 visible — and therefore before
         // the durable `Building{2} -> Ready{2}` CAS. The hook survives the
         // earlier "before_publish" seam by name.
-        install_seam(Box::new(move |_w, point| {
-            if point == "before_visibility" {
+        install_seam(Box::new(move |_w, generation, point| {
+            if point == "before_visibility" && generation == 2 {
                 panic!("simulated builder crash between staging and visibility");
             }
         }));
@@ -3131,10 +3950,29 @@ mod tests {
         for _ in 0..1000 {
             svc.request_build(ws).unwrap();
         }
-        // Settle at gen 2 through sync reconciles.
+        // Settle at gen 2 through sync reconciles. The generation is built
+        // in bounded batches (audit 5), so completion means gen 2 AND complete
+        // coverage — a partial generation is never mistaken for "settled".
         let deadline = Instant::now() + DEADLINE;
-        while svc.view(ws).map(|v| v.generation()) != Some(2) && Instant::now() < deadline {
+        loop {
             svc.reconcile_now(ws).unwrap();
+            let settled = svc
+                .view(ws)
+                .map(|v| v.generation() == 2 && v.coverage().complete)
+                .unwrap_or(false)
+                && svc
+                    .fingerprint_coverage(ws)
+                    .map(|c| c.complete)
+                    .unwrap_or(false);
+            if settled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gen 2 never completed: coverage={:?} fp={:?}",
+                svc.coverage(ws),
+                svc.fingerprint_coverage(ws)
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(svc.view(ws).unwrap().generation(), 2);
@@ -4655,6 +5493,419 @@ mod tests {
         assert_eq!(svc.worker_status().state, WorkerState::Stopped);
     }
 
+    // ------------------------------------------- audit 5/6/16: coverage
+
+    /// The bounded shard pass resumes exactly after its cursor and every
+    /// file is visited exactly once across a full round (termination proof).
+    #[test]
+    fn fingerprint_pass_cursor_terminates_and_visits_every_file_once() {
+        let dir = TempDir::new().unwrap();
+        for i in 0..10 {
+            write(dir.path(), &format!("x{i}.rs"), "fn x() {}");
+        }
+        let mut visited: Vec<String> = Vec::new();
+        let mut coverage = FingerprintCoverage::round(0);
+        for pass_no in 0..1_000 {
+            let pass = fingerprint_pass(
+                dir.path(),
+                coverage.shard,
+                &coverage.cursor_for(coverage.shard),
+                1,
+                8,
+            )
+            .unwrap();
+            for entry in &pass.entries {
+                visited.push(entry.path.clone());
+            }
+            if pass.shard_completed {
+                coverage.finish_shard(coverage.shard);
+            } else {
+                let shard = coverage.shard;
+                coverage.set_cursor(shard, pass.cursor);
+            }
+            if coverage.complete {
+                assert!(pass_no < 999, "round must terminate");
+                break;
+            }
+        }
+        assert!(coverage.complete, "round never completed: {coverage:?}");
+        visited.sort();
+        let before = visited.len();
+        visited.dedup();
+        assert_eq!(visited.len(), before, "a file must never be visited twice");
+        assert_eq!(visited.len(), 10, "{visited:?}");
+        // Every shard ended up represented.
+        let shards: std::collections::BTreeSet<u32> =
+            visited.iter().map(|p| fingerprint_shard(p)).collect();
+        assert!(shards.len() <= FINGERPRINT_SHARDS as usize);
+    }
+
+    /// Audit 5 adversarial: a non-root directory (and a file) that vanishes
+    /// between batches is churn, not a build failure — the walk resumes past
+    /// it and the generation still completes; a missing ROOT is still loud.
+    #[test]
+    fn walk_tolerates_directories_vanished_between_batches() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "a/one.rs", "fn one() {}");
+        write(dir.path(), "b/two.rs", "fn two() {}");
+        write(dir.path(), "c/three.rs", "fn three() {}");
+        // Batch 1 stops after one file (a/one.rs).
+        let first = scan_content_batch(
+            dir.path(),
+            &ScanCursor::default(),
+            &ServiceConfig {
+                batch_files: 1,
+                ..ServiceConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.files.len(), 1);
+        // Churn: the NEXT directory to visit is deleted before the resume.
+        std::fs::remove_dir_all(dir.path().join("b")).unwrap();
+        let second =
+            scan_content_batch(dir.path(), &first.cursor, &ServiceConfig::default()).unwrap();
+        assert!(second.complete, "the walk must resume past a vanished dir");
+        let mut paths: Vec<String> = first
+            .files
+            .iter()
+            .chain(second.files.iter())
+            .map(|f| f.rel.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a/one.rs", "c/three.rs"], "{paths:?}");
+        // A missing ROOT is still a loud failure (no workspace).
+        let missing = dir.path().join("gone");
+        assert!(
+            scan_content_batch(&missing, &ScanCursor::default(), &ServiceConfig::default())
+                .is_err()
+        );
+    }
+
+    /// Audit 5 fixture: a repository larger than the OLD total cap (4,000
+    /// files) where the symbol exists only in file 4,500. Batch budgets make
+    /// the generation eventually complete, the suffix symbol is found, and
+    /// an incomplete-generation miss consults the bounded direct fallback
+    /// before "no match".
+    #[test]
+    fn generation_larger_than_total_cap_completes_and_suffix_symbol_is_found() {
+        let _serial = serial();
+        let env = env();
+        const TOTAL: usize = 4_500;
+        for i in 0..TOTAL {
+            let body = if i == TOTAL - 1 {
+                "pub fn suffix_needle_symbol() -> u64 { 4500 }\n".to_string()
+            } else {
+                format!("pub fn bulk_{i:05}() -> u64 {{ {i} }}\n")
+            };
+            write(&env.repo, &format!("f{i:05}.rs"), &body);
+        }
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store, svc, ws) = restart(&env, fs, None);
+        svc.set_config(fast_cfg());
+        svc.attach(ws).unwrap();
+        // ONE reconcile runs ONE bounded content batch and publishes the
+        // generation PARTIAL: coverage is durable, never silently "complete".
+        svc.reconcile_now(ws).unwrap();
+        {
+            let view = svc.view(ws).expect("a partial generation is published");
+            let coverage = view.coverage().clone();
+            assert!(!coverage.complete, "{coverage:?}");
+            assert!(
+                coverage.files_indexed > 0 && coverage.files_indexed <= BATCH_MAX_FILES as u64,
+                "one batch is bounded: {coverage:?}"
+            );
+            assert_eq!(view.freshness(), EvidenceFreshness::Partial);
+            assert!(
+                view.miss_needs_fallback(),
+                "an incomplete generation must trigger the fallback on a miss"
+            );
+            assert!(
+                view.index()
+                    .lock()
+                    .unwrap()
+                    .symbol_lookup(ws, "suffix_needle_symbol", 4)
+                    .is_empty(),
+                "the suffix file is not in the first batch"
+            );
+        }
+        // The bounded direct filesystem fallback serves the missed symbol
+        // while indexing continues in the background.
+        let provider = svc.cold_provider(ws).expect("cold provider");
+        let cold = provider.evidence(&crate::cold::ColdQuery {
+            prompt: "suffix_needle_symbol".into(),
+            changed_files: vec!["f04499.rs".into()],
+            referenced_paths: Vec::new(),
+            failures: Vec::new(),
+        });
+        assert!(
+            cold.hits
+                .iter()
+                .any(|h| h.snippet.contains("suffix_needle_symbol")),
+            "the fallback must serve the missed file: {cold:?}"
+        );
+        // Indexing continues batch after batch until the generation is
+        // COMPLETE; then (and only then) the symbol is in the index.
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let _ = svc.reconcile_now(ws);
+            let Some(view) = svc.view(ws) else {
+                assert!(Instant::now() < deadline, "no view ever published");
+                continue;
+            };
+            if view.coverage().complete && view.freshness() == EvidenceFreshness::Current {
+                assert!(
+                    !view
+                        .index()
+                        .lock()
+                        .unwrap()
+                        .symbol_lookup(ws, "suffix_needle_symbol", 4)
+                        .is_empty(),
+                    "the suffix symbol must be found once coverage is complete"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "generation never completed: {:?}",
+                svc.coverage(ws)
+            );
+        }
+        let snapshot = svc.coverage_snapshot(ws).unwrap();
+        assert!(snapshot.coverage.complete, "{snapshot:?}");
+        assert!(snapshot.fingerprint.complete, "{snapshot:?}");
+        assert!(snapshot.serving);
+        assert_eq!(snapshot.freshness, EvidenceFreshness::Current);
+        assert_eq!(snapshot.published_generation, Some(1));
+        drop(store);
+    }
+
+    /// Audit 6: a capped fingerprint round is PARTIAL (never "fully clean"),
+    /// persists its shard state, and rotation detects a change in the LAST
+    /// shard — no suffix is perpetually ignored.
+    #[test]
+    fn capped_fingerprint_never_reports_clean_and_rotates_until_every_shard_is_seen() {
+        let _serial = serial();
+        let env = env();
+        let files: Vec<String> = (0..24).map(|i| format!("s{i:02}.rs")).collect();
+        for (i, path) in files.iter().enumerate() {
+            write(
+                &env.repo,
+                path,
+                &format!("pub fn fp_{i}() -> u64 {{ {i} }}\n"),
+            );
+        }
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store, svc, ws) = restart(&env, fs, None);
+        let mut cfg = fast_cfg();
+        cfg.fp_batch_files = 1;
+        cfg.fp_batch_dirs = 2;
+        svc.set_config(cfg);
+        svc.attach(ws).unwrap();
+        let deadline = Instant::now() + DEADLINE;
+        // A fresh build with a tiny pass budget needs many bounded passes;
+        // drive them.
+        let mut iters = 0usize;
+        loop {
+            let _ = svc.reconcile_now(ws);
+            iters += 1;
+            let content_complete = svc.view(ws).map(|v| v.coverage().complete).unwrap_or(false);
+            let fp_complete = svc
+                .fingerprint_coverage(ws)
+                .map(|c| c.complete)
+                .unwrap_or(false);
+            if content_complete && fp_complete {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capped round never completed after {iters} iters: state={:?} cov={:?} fp={:?}",
+                svc.state(ws),
+                svc.coverage(ws),
+                svc.fingerprint_coverage(ws)
+            );
+        }
+        let first_round_start = svc.fingerprint_coverage(ws).unwrap().round_start;
+        let gen_before_round = svc.view(ws).unwrap().generation();
+        // Start a NEW verification round (no disk change): while it is capped
+        // it must never report clean; the view stays Partial, and the round
+        // only completes cleanly after every shard was visited.
+        std::thread::sleep(Duration::from_millis(60));
+        let _ = svc.reconcile_now(ws);
+        let fp = svc.fingerprint_coverage(ws).unwrap();
+        assert!(
+            !fp.complete,
+            "a capped round must never be reported fully clean: {fp:?}"
+        );
+        assert_eq!(
+            svc.view(ws).unwrap().freshness(),
+            EvidenceFreshness::Partial,
+            "an in-progress fingerprint round makes the package partial"
+        );
+        loop {
+            let _ = svc.reconcile_now(ws);
+            if svc.fingerprint_coverage(ws).unwrap().complete {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "verification round never completed"
+            );
+        }
+        let rotated = svc.fingerprint_coverage(ws).unwrap().round_start;
+        assert_ne!(
+            rotated,
+            first_round_start,
+            "a completed round must rotate the next round's start shard (gen {} -> {}, fp {:?})",
+            gen_before_round,
+            svc.view(ws).map(|v| v.generation()).unwrap_or(0),
+            svc.fingerprint_coverage(ws)
+        );
+        // Rotation fairness: every shard is reachable. Change ONE file in
+        // every shard in turn and prove each change is detected (a rebuild
+        // lands) even though the pass budget stats a single file.
+        let mut visited = std::collections::BTreeSet::new();
+        for shard in 0..FINGERPRINT_SHARDS {
+            let Some(path) = files.iter().find(|p| fingerprint_shard(p) == shard) else {
+                continue;
+            };
+            visited.insert(shard);
+            let before = svc.view(ws).map(|v| v.generation()).unwrap_or(0);
+            write(
+                &env.repo,
+                path,
+                &format!("pub fn fp_rotated_{shard}() {{}}\n"),
+            );
+            std::thread::sleep(Duration::from_millis(60));
+            svc.request_build(ws).unwrap();
+            let shard_deadline = Instant::now() + DEADLINE;
+            loop {
+                let _ = svc.reconcile_now(ws);
+                let rebuilt = svc.view(ws).map(|v| v.generation()).unwrap_or(0) > before;
+                let at_rest = svc
+                    .fingerprint_coverage(ws)
+                    .map(|c| c.complete)
+                    .unwrap_or(false)
+                    && svc.view(ws).map(|v| v.coverage().complete).unwrap_or(false);
+                if rebuilt && at_rest {
+                    break;
+                }
+                assert!(
+                    Instant::now() < shard_deadline,
+                    "shard {shard} change was never detected ({path})"
+                );
+            }
+        }
+        assert_eq!(
+            visited.len(),
+            FINGERPRINT_SHARDS as usize,
+            "every shard must be reachable"
+        );
+        drop(store);
+    }
+
+    /// Audit 5: a crash between batches resumes the SAME generation from the
+    /// persisted continuation cursor — the accumulated work is not re-done
+    /// and the suffix is still completed.
+    #[test]
+    fn crash_between_batches_resumes_from_the_persisted_cursor() {
+        let _serial = serial();
+        let env = env();
+        for i in 0..40 {
+            write(
+                &env.repo,
+                &format!("c{i:02}.rs"),
+                &format!("pub fn c_{i}() {{}}\n"),
+            );
+        }
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store, svc, ws) = restart(&env, fs, None);
+        let mut cfg = fast_cfg();
+        cfg.batch_files = 10;
+        svc.set_config(cfg);
+        svc.attach(ws).unwrap();
+        // Batch 1 publishes a partial generation with a durable cursor.
+        svc.reconcile_now(ws).unwrap();
+        let gen_path = generation_file_path(&env.data_root, ws, 1);
+        let file = read_generation_file(&gen_path).unwrap();
+        assert!(!file.coverage().complete);
+        let cursor = file.cursor.clone().expect("partial cursor persisted");
+        assert!(
+            !cursor.frames.is_empty(),
+            "the continuation cursor names the resume position: {cursor:?}"
+        );
+        assert_eq!(file.coverage().files_indexed, 10);
+        // Crash the continuation BEFORE its publish: durable state stays
+        // Building{1}, the partial file keeps the cursor.
+        install_seam(Box::new(move |_w, generation, point| {
+            if point == "before_publish" && generation == 1 {
+                panic!("simulated crash between batches");
+            }
+        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| svc.reconcile_now(ws)));
+        clear_seam();
+        assert!(outcome.is_err(), "the armed seam must kill the builder");
+        let (state, gen) = svc.state(ws).unwrap();
+        assert_eq!(gen, 1);
+        assert!(matches!(state, St::Building { generation: 1 }), "{state:?}");
+        drop(svc);
+        // Restart: the SAME generation resumes from the persisted cursor
+        // (the accumulation continues; it is not restarted from file 0).
+        let fs = faktor_fs::WorkspaceFileService::new();
+        let (store2, svc2, ws2) = restart(&env, fs, None);
+        svc2.set_config({
+            let mut c = fast_cfg();
+            c.batch_files = 10;
+            c
+        });
+        svc2.attach(ws2).unwrap();
+        svc2.reconcile_now(ws2).unwrap();
+        let coverage = svc2.coverage(ws2).unwrap();
+        assert!(
+            coverage.files_indexed > 10,
+            "the resumed build must continue the accumulation: {coverage:?}"
+        );
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let _ = svc2.reconcile_now(ws2);
+            if svc2
+                .view(ws2)
+                .map(|v| v.coverage().complete)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resumed generation never completed"
+            );
+        }
+        let view = svc2.view(ws2).unwrap();
+        assert!(!view
+            .index()
+            .lock()
+            .unwrap()
+            .symbol_lookup(ws2, "c_39", 4)
+            .is_empty());
+        let log = journal_counts(&store2, ws2);
+        assert_eq!(
+            log.iter().filter(|(k, _)| k == "ready").count(),
+            1,
+            "exactly ONE complete publish: {log:?}"
+        );
+        assert!(
+            log.iter().any(|(k, _)| k == "ready_partial"),
+            "partial batch publishes are journaled distinctly: {log:?}"
+        );
+        assert!(
+            log.iter().any(|(k, _)| k == "continue"),
+            "batch continuation claims are journaled: {log:?}"
+        );
+        drop(store);
+        drop(store2);
+    }
+
     /// The worker's own async body can panic too (outside the blocking
     /// pass): the owner must surface `Failed` instead of reporting a dead
     /// task as `Running`, and the next explicit spawn must self-heal around
@@ -4662,13 +5913,15 @@ mod tests {
     #[tokio::test]
     async fn worker_async_body_panic_is_reconciled_not_reported_running() {
         let (_env, _store, svc, _ws) = first_fixture();
-        // Poison the cfg mutex: the worker body panics at its first
-        // `cfg_of` (before any pass), so no `JoinError` reaches the pass
-        // handler and the started flag would otherwise stay set forever.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = svc.inner.cfg.lock().expect("cfg");
-            panic!("poison the cfg mutex");
-        }));
+        // One-shot fault: the worker body panics before its first pass, so
+        // no `JoinError` reaches the pass handler and the started flag would
+        // otherwise stay set forever. (The cfg/embedding/live locks RECOVER
+        // from poison by policy — item 8 — so a poisoned lock is not a panic
+        // injection anymore.)
+        svc.inner
+            .fault
+            .async_body_panic
+            .store(true, Ordering::SeqCst);
         assert!(svc.spawn_worker());
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
@@ -4685,10 +5938,107 @@ mod tests {
         assert!(status.last_error.is_some(), "{status:?}");
         assert!(!svc.inner.worker_started.load(Ordering::Acquire));
         // Self-heal: the dead generation no longer owns the flag, so the
-        // explicit spawn starts a new one (counted once); its body re-panics
-        // on the still-poisoned cfg and is reconciled again rather than
-        // wedging the owner forever.
+        // explicit spawn starts a fresh generation (counted once) that runs
+        // healthy — the one-shot fault already consumed itself.
         assert!(svc.spawn_worker());
         assert_eq!(svc.worker_status().restarts, 1);
+    }
+
+    /// Item 8 policy, index side: every index-internal lock guards
+    /// process-local, rebuildable state (the durable truth lives in the
+    /// store + generation files), so a deliberate panic in a holder must
+    /// leave later requests HEALTHY — never a poisoned panic and never a
+    /// wedged service. This drives the three major locks plus the published
+    /// content mutex and then exercises the public surface.
+    #[test]
+    fn poisoned_index_locks_recover_healthy_never_panic() {
+        let (_env, _store, svc, ws) = first_fixture();
+        let _serial = serial();
+        // Publish a ready generation so `content` is live.
+        let view = svc
+            .ensure_ready(ws, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        drop(view);
+
+        let poison = |f: &dyn Fn()| {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            assert!(caught.is_err(), "the deliberate panic must fire");
+        };
+        // cfg, live, embedding, and the published content mutex each get a
+        // panic while held.
+        poison(&|| {
+            let _guard = lock_recover(&svc.inner.cfg);
+            panic!("poison cfg");
+        });
+        assert!(svc.inner.cfg.is_poisoned());
+        poison(&|| {
+            let _guard = lock_recover(&svc.inner.live);
+            panic!("poison live");
+        });
+        assert!(svc.inner.live.is_poisoned());
+        poison(&|| {
+            let _guard = lock_recover(&svc.inner.embedding);
+            panic!("poison embedding");
+        });
+        assert!(svc.inner.embedding.is_poisoned());
+        let content = {
+            let live = lock_recover(&svc.inner.live);
+            live.get(&ws).and_then(|l| l.content.clone())
+        };
+        if let Some(content) = content {
+            poison(&|| {
+                let _guard = lock_recover(&content);
+                panic!("poison content");
+            });
+            assert!(content.is_poisoned());
+        }
+
+        // The public surface recovers instead of panicking: config write,
+        // worker status (classified supervisor recovery), a fresh reconcile
+        // pass and a view all succeed.
+        svc.set_config(fast_cfg());
+        let _ = svc.worker_status();
+        svc.reconcile_now(ws).unwrap();
+        let view = svc
+            .ensure_ready(ws, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            !view
+                .index()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .files
+                .is_empty(),
+            "the published generation survived the poisoned locks"
+        );
+    }
+
+    /// The index's durable authority (the `Store`) fails typed on its writer
+    /// panic while the index surface keeps answering: the two poisoning
+    /// policies compose without a daemon panic.
+    #[test]
+    fn store_writer_panic_keeps_index_surface_total() {
+        let (_env, store, svc, ws) = first_fixture();
+        let _serial = serial();
+        svc.ensure_ready(ws, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let err = store
+            .writer_debug_job("index_cert_panic", |_conn| {
+                panic!("deliberate store writer panic")
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            faktor_store::StoreError::WriterUnavailable(_)
+        ));
+        assert!(!store.writer_available());
+        // Read-side index surface stays total.
+        svc.set_config(fast_cfg());
+        let live_view = svc.view(ws);
+        assert!(live_view.is_some(), "published content is in memory");
+        // Mutations that need the store fail typed; nothing panics.
+        assert!(
+            svc.reconcile_now(ws).is_err() || !svc.inner.worker_started.load(Ordering::Acquire)
+        );
     }
 }

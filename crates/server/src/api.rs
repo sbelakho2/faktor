@@ -1015,6 +1015,50 @@ impl ServerStatusProbe {
     }
 }
 
+/// Query of [`native_index_coverage`]: exactly one session whose workspace
+/// coverage is reported. Strict (`deny_unknown_fields`): a typo is a 400.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeIndexCoverageQuery {
+    pub session: String,
+}
+
+/// `GET /native/index/coverage?session=<id>` — additive index coverage
+/// diagnostics (audits 5/6/16). Reports the durable [`faktor_index::IndexCoverage`]
+/// (files seen/indexed, bytes, `complete`, `truncated_reason`), the
+/// fingerprint shard coverage and the typed freshness of the session's
+/// workspace generation, so the IDE panels can display a PARTIAL generation
+/// honestly. Pure read: never opens the index service and never starts a
+/// build; `index_coverage: null` when the service was never hosted for this
+/// daemon (never a fabricated "complete").
+pub(crate) async fn native_index_coverage(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<NativeIndexCoverageQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Err(e) = authed(&headers, &state) {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(e.to_json()),
+        )
+            .into_response();
+    }
+    let handle = match native_resolve_session(&state, &query.session) {
+        Ok(handle) => handle,
+        Err(response) => return *response,
+    };
+    let snapshot = handle
+        .row()
+        .ok()
+        .and_then(|row| state.deps.agent.index_coverage_snapshot(row.workspace_id));
+    axum::Json(serde_json::json!({
+        "sessionId": query.session,
+        "index_coverage": snapshot,
+    }))
+    .into_response()
+}
+
 /// Bind (port 0 = ephemeral) and serve. Returns once listening.
 pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHandle> {
     drain_chunk_stream(&mut deps);
@@ -1268,6 +1312,9 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
             "/native/semantic/capabilities",
             get(native_semantic_capabilities),
         )
+        // Index coverage diagnostics (audits 5/6, additive): durable
+        // per-workspace coverage/fingerprint coverage/freshness; pure read.
+        .route("/native/index/coverage", get(native_index_coverage))
         // Control-plane surface (additive; disabled by default): identity,
         // organizations, members, synced repositories and approvals. Strict
         // DTOs, cursor pagination, idempotency keys and tenant isolation are
@@ -2070,6 +2117,71 @@ pub(crate) mod tests {
         let _ = handle.request_shutdown();
     }
 
+    /// Audit 5/6 additive surface: `/native/index/coverage?session=<id>` is
+    /// auth-gated, strict (unknown query fields are 400), malformed session
+    /// ids are 400, and an index service that was never hosted answers the
+    /// typed `index_coverage: null` — never a fabricated "complete". The
+    /// hosted partial/complete snapshots are covered by the index and
+    /// runtime suites.
+    #[tokio::test]
+    async fn native_index_coverage_auth_strictness_and_unhosted_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let ws = deps.session.create_workspace("/tmp").unwrap();
+        let sid = deps
+            .session
+            .create_session(ws, "t-cov", "fake", "m")
+            .unwrap()
+            .id()
+            .to_string();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+
+        let resp = client
+            .get(format!("{base}/native/index/coverage?session={sid}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "coverage diagnostics are auth-gated");
+
+        let resp = client
+            .get(format!(
+                "{base}/native/index/coverage?session={sid}&bogus=1"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "strict query DTO");
+
+        let resp = client
+            .get(format!(
+                "{base}/native/index/coverage?session=not-a-session"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "malformed session id");
+
+        let resp = client
+            .get(format!("{base}/native/index/coverage?session={sid}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["sessionId"], sid);
+        assert!(
+            body["index_coverage"].is_null(),
+            "an unhosted service is reported honestly: {body}"
+        );
+        drop(handle);
+    }
+
     #[tokio::test]
     async fn native_projection_idle_session_shape_auth_and_errors() {
         // GET /session/{id}/projection on a session that never ran a turn:
@@ -2501,6 +2613,25 @@ pub(crate) mod tests {
                 .any(|m| m["provider"] == "fake" && m["model"] == "default"),
             "registered fake provider still catalogued: {list:?}"
         );
+        // The advertised attachment contract rides every /models entry (the
+        // ONE Rust source of truth): the OpenAI family is document-capable
+        // with its image/document allowlists and the daemon's HTTP ceilings.
+        let gpt_x = list
+            .iter()
+            .find(|m| m["provider"] == "openai" && m["model"] == "gpt-x")
+            .expect("gpt-x entry present");
+        assert_eq!(gpt_x["documentCapable"], true);
+        let limits = &gpt_x["attachmentLimits"];
+        assert_eq!(limits["document"]["capable"], true);
+        assert_eq!(limits["document"]["mimes"][0]["mime"], "application/pdf");
+        assert_eq!(limits["document"]["mimes"][1]["mime"], "text/plain");
+        assert_eq!(limits["image"]["mimes"][0]["mime"], "image/png");
+        assert_eq!(limits["maxUploadBytes"], MAX_ATTACHMENT_UPLOAD_BYTES as u64);
+        assert_eq!(limits["maxRequestBytes"], MAX_BODY_BYTES as u64);
+        assert!(
+            limits["image"]["mimes"][0]["maxBytes"].as_u64().unwrap() > 0,
+            "every advertised per-MIME bound is positive: {limits:?}"
+        );
         // Deterministic ordering: sorted by provider then model.
         let keys: Vec<(&str, &str)> = list
             .iter()
@@ -2537,6 +2668,12 @@ pub(crate) mod tests {
                 .iter()
                 .any(|m| m["id"] == "gpt-y" && m["capabilities"]["max_output"] == 8_192),
             "gpt-y capabilities: {models:?}"
+        );
+        assert!(
+            models.iter().any(|m| m["id"] == "gpt-x"
+                && m["documentCapable"] == true
+                && m["attachmentLimits"]["document"]["capable"] == true),
+            "gpt-x advertised attachment contract: {models:?}"
         );
         assert_eq!(openai_entry["runtimeContextLimitSupported"], false);
         let fake_entry = body.get("fake").expect("fake provider key present");

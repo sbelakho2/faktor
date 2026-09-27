@@ -8,7 +8,7 @@ use faktor_core::model::{
     BillingOrigin, MicroUsdPerMillionTokens, ModelCapabilities, PriceQuote, RoutingMode,
 };
 use faktor_orchestrator::runtime::task_executor::MutationMode;
-use faktor_provider::catalog::{BillingOriginProvider, PricingOverrides};
+use faktor_provider::catalog::{BillingOriginProvider, PricingOverrides, QualityOverrideProvider};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::Provider;
 use faktor_sandbox::{NetworkGate, SandboxGuarantee, SandboxPolicy};
@@ -3139,6 +3139,12 @@ pub enum ProviderCfg {
         allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
+        /// The additive per-instance quality declaration (quality-authority
+        /// audit item 1): authorizes this endpoint's models for quality
+        /// floors with explicit `UserConfigured` provenance. Never applied
+        /// to any other instance.
+        #[serde(default)]
+        quality: Option<ProviderQualityCfg>,
     },
     OpenAi {
         id: String,
@@ -3160,6 +3166,12 @@ pub enum ProviderCfg {
         allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
+        /// The additive per-instance quality declaration (quality-authority
+        /// audit item 1): authorizes this endpoint's models for quality
+        /// floors with explicit `UserConfigured` provenance. Never applied
+        /// to any other instance.
+        #[serde(default)]
+        quality: Option<ProviderQualityCfg>,
     },
     Anthropic {
         id: String,
@@ -3173,6 +3185,12 @@ pub enum ProviderCfg {
         allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
+        /// The additive per-instance quality declaration (quality-authority
+        /// audit item 1): authorizes this endpoint's models for quality
+        /// floors with explicit `UserConfigured` provenance. Never applied
+        /// to any other instance.
+        #[serde(default)]
+        quality: Option<ProviderQualityCfg>,
     },
     Google {
         id: String,
@@ -3186,6 +3204,12 @@ pub enum ProviderCfg {
         allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
+        /// The additive per-instance quality declaration (quality-authority
+        /// audit item 1): authorizes this endpoint's models for quality
+        /// floors with explicit `UserConfigured` provenance. Never applied
+        /// to any other instance.
+        #[serde(default)]
+        quality: Option<ProviderQualityCfg>,
     },
     DeepSeek {
         id: String,
@@ -3201,6 +3225,12 @@ pub enum ProviderCfg {
         allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
+        /// The additive per-instance quality declaration (quality-authority
+        /// audit item 1): authorizes this endpoint's models for quality
+        /// floors with explicit `UserConfigured` provenance. Never applied
+        /// to any other instance.
+        #[serde(default)]
+        quality: Option<ProviderQualityCfg>,
     },
     Gateway {
         id: String,
@@ -3215,6 +3245,12 @@ pub enum ProviderCfg {
         allow_loopback: bool,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
+        /// The additive per-instance quality declaration (quality-authority
+        /// audit item 1): authorizes this endpoint's models for quality
+        /// floors with explicit `UserConfigured` provenance. Never applied
+        /// to any other instance.
+        #[serde(default)]
+        quality: Option<ProviderQualityCfg>,
     },
 }
 
@@ -3392,6 +3428,78 @@ impl ProviderPricingCfg {
     }
 }
 
+/// The additive per-provider `quality` declaration section (quality-
+/// authority audit item 1): the user's explicit reliability statement for
+/// ONE configured instance — coding/context/tool/reasoning reliability,
+/// each range-checked `0..=100`. Example:
+/// `{"quality": {"coding_reliability": 72, "context_reliability": 80}}`.
+///
+/// This is what AUTHORIZES a row whose quality would otherwise be
+/// `ConservativeUnknown` (a local/unknown endpoint) to clear quality
+/// floors — the dead-end removal: without a declaration, an unknown row's
+/// neutral placeholder never clears a floor and the operator has no
+/// declared way to authorize it. Durable verified routing outcomes
+/// supersede the declaration; the declaration never applies to another
+/// instance, and it never manufactures a measurement (provenance stays
+/// `UserConfigured`).
+///
+/// Unknown keys are parse errors; an empty table or any out-of-range value
+/// is a typed validation error.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProviderQualityCfg {
+    pub coding_reliability: Option<u8>,
+    pub context_reliability: Option<u8>,
+    pub tool_reliability: Option<u8>,
+    pub reasoning_reliability: Option<u8>,
+}
+
+impl ProviderQualityCfg {
+    /// True when no dimension is declared (the section's empty sentinel).
+    pub fn is_empty(&self) -> bool {
+        self == &ProviderQualityCfg::default()
+    }
+
+    /// Typed validation: at least one dimension must be declared, and every
+    /// declared value must be in `0..=100` (the audit's range). `0` is a
+    /// REAL declaration (this endpoint is useless on that dimension) — it
+    /// is not an error.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.is_empty() {
+            return Err(
+                "quality declaration is empty: declare at least one of coding_reliability, \
+                 context_reliability, tool_reliability, reasoning_reliability in 0..=100"
+                    .to_string(),
+            );
+        }
+        for (name, value) in [
+            ("coding_reliability", self.coding_reliability),
+            ("context_reliability", self.context_reliability),
+            ("tool_reliability", self.tool_reliability),
+            ("reasoning_reliability", self.reasoning_reliability),
+        ] {
+            if let Some(v) = value {
+                if v > 100 {
+                    return Err(format!(
+                        "quality declaration {name} = {v} is out of range 0..=100"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Map the parsed config onto the provider crate's declaration policy.
+    pub(crate) fn to_overrides(&self) -> faktor_provider::catalog::QualityOverrides {
+        faktor_provider::catalog::QualityOverrides {
+            coding_reliability: self.coding_reliability,
+            context_reliability: self.context_reliability,
+            tool_reliability: self.tool_reliability,
+            reasoning_reliability: self.reasoning_reliability,
+        }
+    }
+}
+
 /// The canonical official OpenAI API base URL (the ONLY OpenAI `base_url`
 /// that resolves to [`BillingOrigin::OfficialOpenAi`]).
 pub const OPENAI_OFFICIAL_BASE_URL: &str = "https://api.openai.com/v1";
@@ -3540,6 +3648,28 @@ impl ProviderCfg {
         }
     }
 
+    /// The quality declaration section of this entry, when configured.
+    pub fn quality(&self) -> Option<&ProviderQualityCfg> {
+        match self {
+            ProviderCfg::Ollama { quality, .. }
+            | ProviderCfg::OpenAi { quality, .. }
+            | ProviderCfg::Anthropic { quality, .. }
+            | ProviderCfg::Google { quality, .. }
+            | ProviderCfg::DeepSeek { quality, .. }
+            | ProviderCfg::Gateway { quality, .. } => quality.as_ref(),
+        }
+    }
+
+    /// Validate this entry's quality declaration surface (typed errors:
+    /// empty tables, out-of-range values). Called by strict config
+    /// validation and by the adapter build.
+    pub fn validate_quality(&self) -> Result<(), String> {
+        match self.quality() {
+            Some(q) => q.validate(),
+            None => Ok(()),
+        }
+    }
+
     /// Validate this entry's pricing override surface (typed errors for
     /// hostile values: 0 input, absurd magnitudes, tables on local
     /// runtimes). Called by the strict config validation and by the
@@ -3674,7 +3804,6 @@ impl ProviderCfg {
     }
 
     pub fn build(&self, transport: Arc<dyn HttpTransport>) -> Result<Arc<dyn Provider>, String> {
-        let instance = self.id();
         let provider: Arc<dyn Provider> = match self {
             ProviderCfg::Ollama { base_url, .. } => {
                 let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
@@ -3765,18 +3894,37 @@ impl ProviderCfg {
                 faktor_gateway::build(cfg, transport.clone())
             }
         };
-        // Billing-origin audit: EVERY configured endpoint is wrapped with
-        // its STRICTLY-resolved billing origin (official canonical endpoint
-        // vs custom base_url vs gateway vs local), so a custom
-        // OpenAI-compatible endpoint can never inherit official list prices
-        // through its transport family id. A configured `pricing` section
-        // then applies (exact prices -> UserOverride rows, ceiling ->
-        // Composite rows for Unknown-priced models only; both bump the
-        // pricing epoch). Hostile values are refused HERE so a provider
-        // whose pricing cannot be honored never registers — and the
-        // local-runtime (ollama) gate also holds on the raw `build` path
-        // (the daemon's warm-up path builds ollama separately, where
-        // `Config::validate`/`load_strict` refuse such a config loudly).
+        // Billing-origin audit + quality-authority declaration: every
+        // configured endpoint is wrapped with its STRICTLY-resolved billing
+        // origin (official canonical endpoint vs custom base_url vs gateway
+        // vs local) and, when declared, its quality statement — applied to
+        // THIS instance only. Validation happens here so a provider whose
+        // pricing/quality cannot be honored never registers.
+        //
+        // A configured `pricing` section: exact prices -> UserOverride
+        // rows, ceiling -> Composite rows for Unknown-priced models only;
+        // both bump the pricing epoch. The `quality` section stamps
+        // `UserConfigured` provenance and authorizes unknown-quality rows
+        // (durable verified outcomes still supersede it). The
+        // local-runtime (ollama) pricing gate also holds on the raw
+        // `build` path (the daemon's warm-up path builds ollama separately,
+        // where `Config::validate`/`load_strict` refuse such a config
+        // loudly).
+        let provider = self.wrap_catalog_authority(provider)?;
+        Ok(provider)
+    }
+
+    /// Wrap an ALREADY-BUILT adapter with this entry's catalog authorities:
+    /// the strictly-resolved billing origin, the validated pricing
+    /// overrides and the validated quality declaration. The daemon's
+    /// concrete-ollama path (live probing keeps the concrete Arc) uses this
+    /// so the REGISTERED instance carries the same authority wrappers as
+    /// [`ProviderCfg::build`].
+    pub fn wrap_catalog_authority(
+        &self,
+        provider: Arc<dyn Provider>,
+    ) -> Result<Arc<dyn Provider>, String> {
+        let instance = self.id();
         let overrides = match self.pricing() {
             Some(pricing) => {
                 pricing.validate(self.kind())?;
@@ -3784,12 +3932,29 @@ impl ProviderCfg {
             }
             None => PricingOverrides::default(),
         };
-        Ok(BillingOriginProvider::wrap(
-            provider,
-            instance,
-            self.billing_origin(),
-            overrides,
-        ))
+        // Quality-authority declaration (item 1): validated HERE so a
+        // provider whose quality cannot be honored never registers, then
+        // applied only to THIS instance's catalog rows (the wrapper's
+        // source names `providers.<id>.quality`). Durable verified outcomes
+        // still supersede it at qualification.
+        let quality = match self.quality() {
+            Some(quality) => {
+                quality.validate()?;
+                quality.to_overrides()
+            }
+            None => faktor_provider::catalog::QualityOverrides::default(),
+        };
+        let origin_wrapped =
+            BillingOriginProvider::wrap(provider, instance, self.billing_origin(), overrides);
+        if quality.is_empty() {
+            Ok(origin_wrapped)
+        } else {
+            Ok(QualityOverrideProvider::wrap(
+                origin_wrapped,
+                instance,
+                quality,
+            ))
+        }
     }
 }
 
@@ -3841,6 +4006,8 @@ impl Config {
         }
         for p in &self.providers {
             p.validate_pricing()
+                .map_err(|e| format!("provider {}: {e}", p.id()))?;
+            p.validate_quality()
                 .map_err(|e| format!("provider {}: {e}", p.id()))?;
             p.validate_endpoint_address_class(sandbox.network.installed())
                 .map_err(|e| format!("provider {}: {e}", p.id()))?;
@@ -5260,12 +5427,14 @@ mod tests {
                     base_url: None,
                     pricing: None,
                     allow_loopback: true,
+                    quality: None,
                 },
                 ProviderCfg::Ollama {
                     id: "other".into(),
                     base_url: None,
                     pricing: None,
                     allow_loopback: true,
+                    quality: None,
                 },
                 ProviderCfg::OpenAi {
                     id: "dup".into(),
@@ -5274,6 +5443,7 @@ mod tests {
                     api: None,
                     pricing: None,
                     allow_loopback: true,
+                    quality: None,
                 },
             ],
             ..Default::default()
@@ -5293,6 +5463,7 @@ mod tests {
                     api: None,
                     pricing: None,
                     allow_loopback: true,
+                    quality: None,
                 },
             ],
             ..Default::default()
@@ -5312,6 +5483,7 @@ mod tests {
                 api: None,
                 allow_loopback,
                 pricing: None,
+                quality: None,
             }],
             sandbox: SandboxCfg {
                 network: rows,
@@ -5488,6 +5660,7 @@ mod tests {
                 base_url: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             }
             .openai_family(),
             None
@@ -5534,6 +5707,7 @@ mod tests {
             api,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         let request = || GenericAgentRequest {
             model: "m".into(),
@@ -5834,6 +6008,7 @@ mod tests {
                 ..Default::default()
             }),
             allow_loopback: true,
+            quality: None,
         };
         let e = ollama
             .validate_pricing()
@@ -5892,6 +6067,7 @@ mod tests {
             api: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         assert_eq!(
             cfg.key().as_ref().map(SecretValue::expose),
@@ -5912,6 +6088,7 @@ mod tests {
             base_url: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         assert_eq!(cfg.id(), "ollama");
     }
@@ -5931,6 +6108,7 @@ mod tests {
                 api: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             };
             registry
                 .try_register(cfg.build(open_transport()).unwrap())
@@ -5966,6 +6144,7 @@ mod tests {
                 api_key_env: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             };
             let provider = cfg
                 .build(open_transport())
@@ -5983,6 +6162,7 @@ mod tests {
             api_key_env: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         assert!(cfg.build(open_transport()).is_err());
         // A gateway without an explicit endpoint is refused: the config
@@ -5994,6 +6174,7 @@ mod tests {
             api_key_env: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         let err = cfg
             .build(open_transport())
@@ -6018,6 +6199,7 @@ mod tests {
             api: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         let official_openai_slash = ProviderCfg::OpenAi {
             id: "a2".into(),
@@ -6026,6 +6208,7 @@ mod tests {
             api: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         let custom_openai = ProviderCfg::OpenAi {
             id: "corp-proxy".into(),
@@ -6034,6 +6217,7 @@ mod tests {
             api: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         assert_eq!(
             official_openai.billing_origin(),
@@ -6054,6 +6238,7 @@ mod tests {
                 api_key_env: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             }
             .billing_origin(),
             BillingOrigin::OfficialAnthropic
@@ -6064,6 +6249,7 @@ mod tests {
                 api_key_env: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             }
             .billing_origin(),
             BillingOrigin::OfficialGoogle
@@ -6075,6 +6261,7 @@ mod tests {
             api_key_env: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         assert_eq!(
             deepseek("direct", None).billing_origin(),
@@ -6103,6 +6290,7 @@ mod tests {
                 api_key_env: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             }
             .billing_origin(),
             BillingOrigin::Gateway
@@ -6113,6 +6301,7 @@ mod tests {
                 base_url: None,
                 pricing: None,
                 allow_loopback: true,
+                quality: None,
             }
             .billing_origin(),
             BillingOrigin::Local
@@ -6126,6 +6315,7 @@ mod tests {
             api: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         };
         assert_ne!(custom_openai.id(), same_custom_other_id.id());
         assert_eq!(
@@ -6150,6 +6340,7 @@ mod tests {
             api: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         }
         .build(open_transport())
         .unwrap();
@@ -6195,6 +6386,7 @@ mod tests {
             api_key_env: None,
             pricing: None,
             allow_loopback: true,
+            quality: None,
         }
         .build(open_transport())
         .unwrap();
@@ -8379,5 +8571,77 @@ mod commerce_config_tests {
                 "{section} must be refused at validation"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod quality_declaration_tests {
+    use super::*;
+
+    #[test]
+    fn quality_declaration_is_strict_range_checked_and_empty_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // A declaration on a LOCAL endpoint is the sanctioned way to
+        // authorize its models (unlike pricing tables, which stay refused
+        // on local runtimes).
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "ollama", "id": "local",
+                 "quality": {"coding_reliability": 70, "context_reliability": 80}}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_strict(&path).unwrap();
+        let q = cfg.providers[0].quality().expect("declared");
+        assert_eq!(q.coding_reliability, Some(70));
+        assert_eq!(q.context_reliability, Some(80));
+        assert!(!q.is_empty());
+        // 0 is a REAL declaration (allowed); 100 is the ceiling.
+        for value in [0, 100] {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"providers": [
+                        {{"kind": "ollama", "id": "local",
+                          "quality": {{"coding_reliability": {value}}}}}
+                    ]}}"#
+                ),
+            )
+            .unwrap();
+            Config::load_strict(&path).unwrap();
+        }
+        // Out of range is a typed refusal naming the range.
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "ollama", "id": "local",
+                 "quality": {"coding_reliability": 101}}
+            ]}"#,
+        )
+        .unwrap();
+        let e = Config::load_strict(&path).unwrap_err();
+        assert!(e.contains("0..=100"), "{e}");
+        // An empty table declares nothing: refused.
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "ollama", "id": "local", "quality": {}}
+            ]}"#,
+        )
+        .unwrap();
+        let e = Config::load_strict(&path).unwrap_err();
+        assert!(e.contains("empty"), "{e}");
+        // Unknown keys are parse errors (strict section).
+        std::fs::write(
+            &path,
+            r#"{"providers": [
+                {"kind": "ollama", "id": "local",
+                 "quality": {"coding_reliablity": 70}}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(Config::load_strict(&path).is_err());
     }
 }

@@ -2187,8 +2187,13 @@ mod tests {
                     let ctx = ctx(&f);
                     rt.block_on(async { (tool.execute)(ctx, args).await })
                 }));
+                // The seam fires inside the writer job (between the checkpoint
+                // row and its event, still in the transaction): the durable
+                // authority contains the deliberate panic, so the crash is
+                // observed either as a caller unwind or as the writer
+                // refusing further mutations.
                 assert!(
-                    caught.is_err(),
+                    f.store.seam_crash_observed(&caught),
                     "{tool_name} at seam {seam} must fire the injected crash"
                 );
                 // The seam fired inside the checkpoint command: the durable

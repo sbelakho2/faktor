@@ -64,6 +64,11 @@ pub(crate) mod workers;
 
 pub(crate) use agents::*;
 pub(crate) use attachment::*;
+/// The strict-protocol canonical base64 decoder and the decoded-byte
+/// upload ceiling: public so the single-allocation/max-size property is
+/// certified by an integration test with a counting allocator
+/// (`tests/attachment_decode_alloc.rs`).
+pub use attachment::{decode_attachment_base64, MAX_ATTACHMENT_UPLOAD_BYTES};
 pub(crate) use billing::*;
 pub(crate) use board::*;
 pub(crate) use control_plane::*;

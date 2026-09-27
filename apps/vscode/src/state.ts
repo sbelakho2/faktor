@@ -11,7 +11,7 @@
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
-import type { NativeBoardPage } from './nativeClient.ts';
+import type { NativeBoardPage, NativeIndexCoverageSnapshot } from './nativeClient.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -433,6 +433,11 @@ export interface FaktorSnapshot {
   /** The run-family coordination board surface (explicitly unavailable when
    * the serving daemon exposes no board read). */
   readonly board: BoardStateSummary | null;
+  /** Durable index coverage of the session's workspace (audits 5/6): a
+   * PARTIAL generation and a stale-while-rebuilding index are named, never
+   * flattened into "ready". Null until a read happens or when the daemon
+   * never hosted an index service. */
+  readonly indexCoverage: NativeIndexCoverageSnapshot | null;
   readonly transcript: readonly TranscriptEntry[];
   readonly streamStatus: string;
   readonly lastError: string | null;
@@ -459,6 +464,7 @@ export function emptySnapshot(): FaktorSnapshot {
     cockpitSections: [],
     tournament: null,
     board: null,
+    indexCoverage: null,
     transcript: [],
     streamStatus: 'stopped',
     lastError: null,
@@ -507,6 +513,7 @@ export class FaktorStore {
     if (sessionChanged || stopped) {
       next.tournament = null;
       next.board = null;
+      next.indexCoverage = null;
     }
     // The usage/credits panel is ORGANIZATION-scoped (not session-owned): it
     // survives a session switch and is dropped only when the daemon stops.

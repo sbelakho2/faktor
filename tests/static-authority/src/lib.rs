@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Twelve structural invariants are locked by scanning the repository's
+//! Fourteen structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -94,6 +94,28 @@
 //!     the mutation outside the workspace. Deletions go through
 //!     `WorkspaceHandle::remove_file` (anchored, no-follow), content writes
 //!     through `write_atomic`/`crate::atomic`.
+//! 13. **Repository hygiene** (audit items 20-21) — the COMMITTED file set
+//!     (`git ls-files`) carries no Python bytecode (`__pycache__/`,
+//!     `*.py[cod]`), no compiled build artifacts (`*.o`, `*.rlib`,
+//!     `*.dylib`, `*.vsix`, `*.jar`, …) and no opaque extensionless binary
+//!     at or above 64 KiB. Deliberate binary fixtures are exact,
+//!     justified, load-bearing allowlist entries (asserted non-stale), and
+//!     the license authority is wired: canonical Apache-2.0 `LICENSE`
+//!     pinned by SHA-256, `NOTICE`, every workspace member inheriting
+//!     `license.workspace = true`, and the `deny.toml` policy step
+//!     (`scripts/check-licenses.sh`) present in the trusted static lane.
+//! 14. **No post-build authority replacement in the production-wiring
+//!     certification** — `tests/production-wiring/src|tests/**` must reach
+//!     the daemon through its own production builder; after the graph is
+//!     built the tests may substitute EXTERNAL seams only (fake servers,
+//!     clocks, credentials, transports, config). Installing/replacing a
+//!     built authority (`set_*provider`, `replace_*`) or constructing a
+//!     top-level subsystem service (executor, supervisor, ledger, runtime,
+//!     session manager, provider registry, durable SCM store) turns the
+//!     certification into a look-alike rig and is a red test. Exactly ONE
+//!     explicitly named module is exempt: the manual adapter-contract
+//!     certification, whose setter use is asserted load-bearing and
+//!     non-stale.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -5460,6 +5482,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/pty/tests/windows_lifecycle.rs", 1),
         ("crates/winjob/tests/windows_tree.rs", 1),
         ("crates/cloud/tests/durability_memory.rs", 1),
+        ("crates/server/tests/attachment_decode_alloc.rs", 1),
         ("crates/orchestrator/src/shadow_tests.rs", 1),
         ("crates/cli/src/main.rs", 2),
         ("tests/coding-benchmark/src/daemon.rs", 1),
@@ -5751,5 +5774,756 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                  deny unsafe_code manually"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // scan 13: repository hygiene + license authority (audit 20-21)
+    // ------------------------------------------------------------------
+
+    /// Bytecode / compiled-artifact extensions that must never be committed.
+    /// A deliberate fixture with one of these extensions may exist only via a
+    /// documented [`HYGIENE_ALLOWLIST`] entry.
+    const HYGIENE_ARTIFACT_EXTENSIONS: &[&str] = &[
+        "pyc", "pyo", "pyd", "o", "obj", "a", "rlib", "rmeta", "so", "dylib", "dll", "exe",
+        "class", "pdb", "jar", "vsix",
+    ];
+
+    /// Opaque extensionless binaries at or above this size are refused: a
+    /// committed executable has no source story. The historical violation
+    /// this rule codifies is root `mu_test` (465576 B Mach-O arm64, added by
+    /// 9d4824a, zero references, deleted by audit item 21).
+    const HYGIENE_OPAQUE_MIN_BYTES: u64 = 64 * 1024;
+
+    /// Committed-artifact allowlist: exact repository-relative paths with a
+    /// written justification. The scan asserts every entry is non-stale
+    /// (the committed file exists) AND load-bearing (the rules would flag it
+    /// without the exemption), so the list cannot rot into a silent bypass.
+    const HYGIENE_ALLOWLIST: &[(&str, &str)] = &[
+        (
+            "apps/jetbrains/gradle/wrapper/gradle-wrapper.jar",
+            "pinned Gradle wrapper jar (build-tool bootstrap, not a product build output); its \
+             sha256 is verified by scripts/check-gradle-integrity.sh before any build, and the \
+             wrapper cannot bootstrap without a shipped jar",
+        ),
+        (
+            "scripts/certification/fixtures/release-artifacts/full/extension/faktor.vsix",
+            "certification fixture simulating a packaged release artifact set; consumed by the \
+             scripts/certification evidence tests, never shipped or executed",
+        ),
+        (
+            "scripts/certification/fixtures/release-artifacts/subset/extension/faktor.vsix",
+            "certification fixture simulating a packaged release artifact set; consumed by the \
+             scripts/certification evidence tests, never shipped or executed",
+        ),
+    ];
+
+    /// Committed paths that must stay deleted (the historical bytecode and
+    /// stray executable the hygiene rules were introduced for). Presence is a
+    /// red test even before the file is staged.
+    const HYGIENE_RETIRED_PATHS: &[&str] = &[
+        "crates/cli/tests/fixtures/__pycache__/mcp_mock.cpython-314.pyc",
+        "mu_test",
+    ];
+
+    /// Artifact reason for a committed path, independent of file contents.
+    fn hygiene_artifact_reason(rel: &str) -> Option<String> {
+        if rel.split('/').any(|segment| segment == "__pycache__") {
+            return Some("committed Python bytecode cache (__pycache__/)".to_string());
+        }
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let extension = name
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase());
+        if let Some(extension) = extension {
+            if HYGIENE_ARTIFACT_EXTENSIONS.contains(&extension.as_str()) {
+                return Some(format!("committed build artifact (*.{extension})"));
+            }
+        }
+        None
+    }
+
+    /// Opaque-extensionless-binary reason: no extension (dotfiles excluded —
+    /// they are configuration, not blobs), size at or above the threshold,
+    /// and a NUL byte in the first 8 KiB (the binary sniff).
+    fn hygiene_opaque_binary_reason(path: &Path, rel: &str) -> Option<String> {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let has_extension = name
+            .rsplit_once('.')
+            .is_some_and(|(stem, _)| !stem.is_empty());
+        if has_extension || name.starts_with('.') {
+            return None;
+        }
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_file() || metadata.len() < HYGIENE_OPAQUE_MIN_BYTES {
+            return None;
+        }
+        let mut head = [0u8; 8192];
+        let mut file = std::fs::File::open(path).ok()?;
+        use std::io::Read;
+        let read = file.read(&mut head).ok()?;
+        if head[..read].contains(&0) {
+            return Some(format!(
+                "opaque extensionless binary ({} bytes, no extension, no provenance)",
+                metadata.len()
+            ));
+        }
+        None
+    }
+
+    /// Hygiene violations for `rels` under `root`; exact allowlist entries
+    /// are exempted before any rule runs.
+    fn hygiene_violations(root: &Path, rels: &[String], allowlist: &[(&str, &str)]) -> Vec<String> {
+        let mut violations = Vec::new();
+        for rel in rels {
+            let rel = normalize_rel(rel);
+            if allowlist.iter().any(|(allowed, _)| *allowed == rel) {
+                continue;
+            }
+            if let Some(reason) = hygiene_artifact_reason(&rel) {
+                violations.push(format!("{rel}: {reason}"));
+                continue;
+            }
+            if let Some(reason) = hygiene_opaque_binary_reason(&root.join(&rel), &rel) {
+                violations.push(format!("{rel}: {reason}"));
+            }
+        }
+        violations
+    }
+
+    /// The COMMITTED file set (`git ls-files --cached`), `/`-normalized and
+    /// filtered to files that still exist on disk (an unstaged deletion is a
+    /// pending commit, not a committed artifact). The scan judges committed
+    /// material, never a developer's untracked scratch files; git is part of
+    /// every checkout this suite runs in.
+    fn hygiene_tracked_files() -> Vec<String> {
+        let root = repo_root();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", "-z", "--cached"])
+            .output()
+            .unwrap_or_else(|error| panic!("git ls-files must run for the hygiene scan: {error}"));
+        assert!(
+            output.status.success(),
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| normalize_rel(&String::from_utf8_lossy(entry)))
+            .filter(|rel| root.join(rel).is_file())
+            .collect()
+    }
+
+    /// Compact SHA-256 (zero dependencies are a design constraint of this
+    /// crate). Correctness is pinned by the `abc` vector in the license test.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut state: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let mut message = bytes.to_vec();
+        let bit_len = (bytes.len() as u64).wrapping_mul(8);
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in message.chunks(64) {
+            let mut w = [0u32; 64];
+            for (index, word) in w.iter_mut().take(16).enumerate() {
+                let at = index * 4;
+                *word =
+                    u32::from_be_bytes([chunk[at], chunk[at + 1], chunk[at + 2], chunk[at + 3]]);
+            }
+            for index in 16..64 {
+                let s0 = w[index - 15].rotate_right(7)
+                    ^ w[index - 15].rotate_right(18)
+                    ^ (w[index - 15] >> 3);
+                let s1 = w[index - 2].rotate_right(17)
+                    ^ w[index - 2].rotate_right(19)
+                    ^ (w[index - 2] >> 10);
+                w[index] = w[index - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[index - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+            for index in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let temp1 = h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[index])
+                    .wrapping_add(w[index]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let temp2 = s0.wrapping_add(maj);
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(temp1);
+                d = c;
+                c = b;
+                b = a;
+                a = temp1.wrapping_add(temp2);
+            }
+            state[0] = state[0].wrapping_add(a);
+            state[1] = state[1].wrapping_add(b);
+            state[2] = state[2].wrapping_add(c);
+            state[3] = state[3].wrapping_add(d);
+            state[4] = state[4].wrapping_add(e);
+            state[5] = state[5].wrapping_add(f);
+            state[6] = state[6].wrapping_add(g);
+            state[7] = state[7].wrapping_add(h);
+        }
+        state.iter().map(|word| format!("{word:08x}")).collect()
+    }
+
+    /// The committed tree carries no bytecode, no compiled build artifacts
+    /// and no opaque extensionless binaries; every exception is a
+    /// load-bearing documented allowlist entry.
+    #[test]
+    fn committed_tree_carries_no_bytecode_build_artifacts_or_opaque_binaries() {
+        let root = repo_root();
+        let tracked = hygiene_tracked_files();
+        assert!(
+            tracked.len() >= 500,
+            "hygiene scan walked nothing: {} committed files",
+            tracked.len()
+        );
+        for (allowed, justification) in HYGIENE_ALLOWLIST {
+            assert!(
+                !justification.trim().is_empty(),
+                "{allowed}: hygiene allowlist entry needs a written justification"
+            );
+            assert!(
+                tracked.iter().any(|rel| rel == allowed),
+                "{allowed}: stale hygiene allowlist entry (no such committed file)"
+            );
+            let unexempted = hygiene_violations(&root, &[allowed.to_string()], &[]);
+            assert!(
+                !unexempted.is_empty(),
+                "{allowed}: hygiene allowlist entry is not load-bearing (the rules pass it)"
+            );
+        }
+        let offenders = hygiene_violations(&root, &tracked, HYGIENE_ALLOWLIST);
+        assert_no_offenders(
+            "repository-hygiene scan: committed bytecode / compiled artifacts / opaque \
+             extensionless binaries are refused; deliberate binary fixtures belong under a \
+             named fixture directory with documented provenance + digest and a consuming test",
+            &offenders,
+            tracked.len(),
+            500,
+        );
+        for retired in HYGIENE_RETIRED_PATHS {
+            assert!(
+                !root.join(retired).exists(),
+                "{retired}: the retired hygiene violation must stay deleted (see docs/repo-hygiene.md)"
+            );
+        }
+    }
+
+    /// Adversarial proof that the hygiene rules fire: a synthetic tree with
+    /// planted violations is flagged; legitimate material (extensionless
+    /// source scripts, binaries with non-artifact extensions, allowlisted
+    /// fixtures) passes. The SHA-256 helper backing the license pin is
+    /// checked against the published `abc` vector.
+    #[test]
+    fn hygiene_scanner_fires_on_planted_violations() {
+        let dir = std::env::temp_dir().join(format!("faktor-hygiene-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |rel: &str, bytes: &[u8]| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).expect("fixture dir");
+            std::fs::write(&path, bytes).expect("fixture write");
+        };
+        write(
+            "pkg/__pycache__/mock.cpython-314.pyc",
+            b"\x03\xf3\r\nplanted bytecode",
+        );
+        write("objects/unit.o", b"\x7fELF\x02\x01\x01\x00\x00\x00\x00");
+        let mut opaque = vec![0u8; 70_000];
+        opaque[..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+        write("bin/tool", &opaque);
+        let script = vec![b'#'; 70_000];
+        write("scripts/tool", &script);
+        let mut icon = vec![0u8; 70_000];
+        icon[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        write("assets/icon.png", &icon);
+        write("artifacts/pinned.jar", b"PK\x03\x04planted jar");
+        let rels = [
+            "pkg/__pycache__/mock.cpython-314.pyc",
+            "objects/unit.o",
+            "bin/tool",
+            "scripts/tool",
+            "assets/icon.png",
+            "artifacts/pinned.jar",
+        ]
+        .map(str::to_string)
+        .to_vec();
+
+        let offenders = hygiene_violations(&dir, &rels, &[]);
+        assert_eq!(
+            offenders.len(),
+            4,
+            "planted violations must all fire: {offenders:?}"
+        );
+        for expected in [
+            "__pycache__/mock.cpython-314.pyc",
+            "objects/unit.o",
+            "bin/tool: opaque extensionless binary",
+            "artifacts/pinned.jar",
+        ] {
+            assert!(
+                offenders.iter().any(|offender| offender.contains(expected)),
+                "planted violation {expected:?} was not flagged: {offenders:?}"
+            );
+        }
+
+        let allowlist: &[(&str, &str)] = &[("artifacts/pinned.jar", "planted allowlisted fixture")];
+        let exempted = hygiene_violations(&dir, &rels, allowlist);
+        assert_eq!(
+            exempted.len(),
+            3,
+            "the allowlisted fixture must be exempted: {exempted:?}"
+        );
+        assert!(
+            exempted
+                .iter()
+                .all(|offender| !offender.contains("pinned.jar")),
+            "an allowlisted path must never be reported: {exempted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the local SHA-256 implementation must be correct"
+        );
+    }
+
+    /// License authority: the canonical Apache-2.0 text is pinned by digest,
+    /// NOTICE exists, every workspace member inherits the workspace license
+    /// (no overrides), the deny.toml policy is committed, the bytecode class
+    /// is ignored, and the policy step is wired into the trusted static lane.
+    #[test]
+    fn license_and_policy_authority_is_wired() {
+        let root = repo_root();
+
+        const LICENSE_SHA256: &str =
+            "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30";
+        let license = std::fs::read(root.join("LICENSE")).expect("committed root LICENSE");
+        assert_eq!(
+            sha256_hex(&license),
+            LICENSE_SHA256,
+            "LICENSE must be the canonical unmodified Apache-2.0 text (apache.org licenses/LICENSE-2.0)"
+        );
+        assert!(
+            String::from_utf8_lossy(&license)
+                .trim_start()
+                .starts_with("Apache License"),
+            "LICENSE must carry the canonical Apache-2.0 header"
+        );
+        assert!(
+            String::from_utf8_lossy(&license).contains("Version 2.0, January 2004"),
+            "LICENSE must declare Apache License Version 2.0"
+        );
+
+        let notice = std::fs::read_to_string(root.join("NOTICE")).expect("committed root NOTICE");
+        assert!(!notice.trim().is_empty(), "NOTICE must not be empty");
+        assert!(
+            notice.contains("Apache License"),
+            "NOTICE must name the Apache License"
+        );
+        assert!(
+            notice.contains("LICENSE"),
+            "NOTICE must point at the LICENSE file"
+        );
+
+        let workspace =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace Cargo.toml");
+        assert!(
+            workspace.contains("license = \"Apache-2.0\""),
+            "the workspace package must declare the Apache-2.0 SPDX license"
+        );
+        let members = {
+            let at = workspace.find("members = [").expect("members list");
+            let body = &workspace[at + "members = [".len()..];
+            let end = body.find(']').expect("members terminator");
+            body[..end]
+                .split(',')
+                .filter_map(|entry| {
+                    let entry = entry.trim();
+                    let entry = entry.strip_prefix('"')?.strip_suffix('"')?;
+                    Some(entry.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(members.len() > 40, "workspace member walk is not empty");
+        for member in &members {
+            let manifest_path = root.join(member).join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display()));
+            assert!(
+                manifest.contains("license.workspace = true"),
+                "{member}: must inherit the workspace license (license.workspace = true)"
+            );
+            assert!(
+                !manifest.contains("license-file"),
+                "{member}: license-file bypasses the SPDX license policy"
+            );
+            assert!(
+                !manifest.contains("\nlicense = \""),
+                "{member}: a hard-coded license override breaks the single-license workspace policy"
+            );
+        }
+
+        let deny = std::fs::read_to_string(root.join("deny.toml")).expect("committed deny.toml");
+        for required in [
+            "[licenses]",
+            "[bans]",
+            "[sources]",
+            "unknown-registry = \"deny\"",
+            "unknown-git = \"deny\"",
+            "allow-registry = [\"https://github.com/rust-lang/crates.io-index\"]",
+            "\"Apache-2.0 WITH LLVM-exception\"",
+        ] {
+            assert!(deny.contains(required), "deny.toml must carry {required}");
+        }
+
+        let gate = std::fs::read_to_string(root.join("scripts/check-licenses.sh"))
+            .expect("committed scripts/check-licenses.sh");
+        assert!(
+            gate.contains("cargo metadata --format-version 1 --locked"),
+            "the license gate must evaluate the locked cargo metadata graph"
+        );
+        assert!(
+            gate.contains("cargo deny") && gate.contains("check licenses bans sources"),
+            "the license gate must run cargo-deny when the binary is available"
+        );
+        let trusted = std::fs::read_to_string(root.join(".woodpecker/trusted/trusted.yaml"))
+            .expect("trusted workflow");
+        assert!(
+            trusted.matches("scripts/check-licenses.sh").count() >= 2,
+            "the license gate must be a static-lane command AND appear in its lane marker command list"
+        );
+
+        let ignore = std::fs::read_to_string(root.join(".gitignore")).expect(".gitignore");
+        for pattern in ["__pycache__/", "*.py[cod]", "/mu_test"] {
+            assert!(
+                ignore.contains(pattern),
+                ".gitignore must ignore the hygiene class {pattern}"
+            );
+        }
+        for retired in HYGIENE_RETIRED_PATHS {
+            assert!(
+                !root.join(retired).exists(),
+                "{retired}: retired hygiene violation reintroduced"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // scan 14: production-wiring post-build authority replacement
+    // ------------------------------------------------------------------
+
+    /// The production-wiring certification tree: the tests must reach the
+    /// daemon through its own builders (`build_production_graph*` /
+    /// `build_daemon*`, which run the executable's `build_daemon_core`);
+    /// after the graph is built only EXTERNAL seams may be substituted (fake
+    /// servers, clocks, credentials, transports, config). Installing or
+    /// replacing a built authority (`set_*provider`, `replace_*`) or
+    /// constructing a top-level subsystem service in the test turns the
+    /// certification into a look-alike rig and is a red test.
+    ///
+    /// `build.rs` is harness plumbing and `src/lib.rs` is the `include!` of
+    /// the REAL `faktor-cli` sources at the crate root, so only the Rust
+    /// files under `src/` and `tests/` are scanned (the included production
+    /// text is certified by the production scans instead).
+    const PRODUCTION_WIRING_ROOT: &str = "tests/production-wiring";
+
+    /// The explicitly named MANUAL adapter-contract module(s): the embedded-
+    /// host injection seam is the ONE documented place a production-wiring
+    /// test may install a hand-built adapter onto a built executor, so the
+    /// authority-replacement markers are exempt there. Exact paths only, no
+    /// globs — a new exempt file must be named here deliberately, and every
+    /// entry is asserted to exist AND to actually use the replacement API
+    /// (stale exemptions are red).
+    const AUTHORITY_REPLACEMENT_EXEMPT_FILES: &[&str] =
+        &["tests/production-wiring/tests/completion_scm_adapter_contract.rs"];
+
+    /// Top-level daemon subsystem services a production-wiring test must
+    /// never construct: the production graph owns each one exactly once, so
+    /// a test-local construction is a parallel authority.
+    const PRODUCTION_WIRING_FORBIDDEN_CONSTRUCTORS: &[&str] = &[
+        "ProcessSupervisor::new",
+        "TaskExecutor::new(",
+        "TaskExecutor::new_owner_direct_for_test_harness(",
+        "OrchestratorRuntime::new",
+        "ShadowRoots::new(",
+        "DurableBudgetLedger::new",
+        "SemanticProviderRegistry::new",
+        "AgentRuntime::new",
+        "ProviderRegistry::new",
+        "ServerDeps::new(",
+        "SessionManager::open(",
+        "SessionManager::open_quick(",
+        "IndexService::open_with_supervisor(",
+        "SqliteScmStore::open(",
+        "MemoryScmStore::new(",
+    ];
+
+    /// Every `.rs` file under `tests/production-wiring/{src,tests}`.
+    fn walk_production_wiring_sources() -> Vec<String> {
+        let root = repo_root().join(PRODUCTION_WIRING_ROOT);
+        let mut out = Vec::new();
+        let mut stack = vec![root.join("src"), root.join("tests")];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file()
+                    && path.extension().and_then(|e| e.to_str()) == Some("rs")
+                {
+                    let rel = path
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    out.push(normalize_rel(&rel));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The source with comments and string/char literals replaced by spaces
+    /// (newlines preserved), so comments/docs/fixture strings can never fire
+    /// the replacement markers.
+    fn masked_wiring_code(src: &str) -> String {
+        let code = code_mask(src);
+        src.bytes()
+            .zip(code.iter())
+            .map(|(byte, is_code)| {
+                if *is_code || byte == b'\n' || byte == b'\r' {
+                    byte as char
+                } else {
+                    ' '
+                }
+            })
+            .collect()
+    }
+
+    /// `set_<ident>provider(` calls (the authority-installation shape) on
+    /// masked code, with their line and trimmed text.
+    fn set_provider_calls(masked: &str) -> Vec<(usize, String)> {
+        let bytes = masked.as_bytes();
+        let mut hits = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = masked[from..].find("set_") {
+            let at = from + rel;
+            let boundary =
+                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let mut end = at + 4;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let ident = &masked[at + 4..end];
+            if boundary
+                && !ident.is_empty()
+                && ident.ends_with("provider")
+                && masked[end..].starts_with('(')
+            {
+                hits.push((line_of(masked, at), trim_line(masked, at)));
+            }
+            from = end.max(at + 4);
+        }
+        hits
+    }
+
+    /// `replace_<ident>(` calls (wholesale authority replacement) on masked
+    /// code. `String::replace_range`/`replace_all` inside build plumbing is
+    /// never scanned (only `src/`+`tests/` sources are walked), and a plain
+    /// `str::replace(` has no `replace_` prefix, so the marker stays exact.
+    fn replace_calls(masked: &str) -> Vec<(usize, String)> {
+        let bytes = masked.as_bytes();
+        let mut hits = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = masked[from..].find("replace_") {
+            let at = from + rel;
+            let boundary =
+                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let mut end = at + "replace_".len();
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if boundary && end > at + "replace_".len() && masked[end..].starts_with('(') {
+                hits.push((line_of(masked, at), trim_line(masked, at)));
+            }
+            from = end.max(at + "replace_".len());
+        }
+        hits
+    }
+
+    /// Offenders of one production-wiring source: post-build authority
+    /// replacement markers, unless the file is the explicitly named manual
+    /// adapter-contract module.
+    fn authority_replacement_offenders(rel: &str, src: &str) -> Vec<String> {
+        let rel = normalize_rel(rel);
+        if AUTHORITY_REPLACEMENT_EXEMPT_FILES.contains(&rel.as_str()) {
+            return Vec::new();
+        }
+        let mut offenders = Vec::new();
+        for marker in PRODUCTION_WIRING_FORBIDDEN_CONSTRUCTORS {
+            for at in code_needle_offsets(src, marker) {
+                offenders.push(format!(
+                    "{rel}:{}: {marker}  [top-level subsystem service constructed in a \
+                     production-wiring test; reach it through the production builder]",
+                    line_of(src, at)
+                ));
+            }
+        }
+        let masked = masked_wiring_code(src);
+        for (line, text) in set_provider_calls(&masked) {
+            offenders.push(format!(
+                "{rel}:{line}: {text}  [post-build authority replacement; use an external \
+                 seam or the production builder]"
+            ));
+        }
+        for (line, text) in replace_calls(&masked) {
+            offenders.push(format!(
+                "{rel}:{line}: {text}  [post-build authority replacement; use an external \
+                 seam or the production builder]"
+            ));
+        }
+        offenders
+    }
+
+    /// The production-wiring tests reach the production daemon through its
+    /// own builder and never replace a built authority afterwards. The ONE
+    /// exemption (the manual adapter-contract module) is asserted to exist
+    /// and to really use `set_completion_scm_provider`, so it can never go
+    /// stale silently; the same module passes the scan unchanged.
+    #[test]
+    fn production_wiring_tests_never_replace_built_daemon_authorities() {
+        let files = walk_production_wiring_sources();
+        assert!(
+            files.len() >= 5,
+            "production-wiring walk too small: {files:?}"
+        );
+        let mut offenders = Vec::new();
+        let mut builders = 0usize;
+        for rel in &files {
+            let src = std::fs::read_to_string(repo_root().join(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            if src.contains("build_production_graph") {
+                builders += 1;
+            }
+            offenders.extend(authority_replacement_offenders(rel, &src));
+        }
+        assert!(
+            builders >= 4,
+            "the production-wiring tree must actually call the production builder \
+             (build_production_graph*): only {builders} of {} files do",
+            files.len()
+        );
+        for exempt in AUTHORITY_REPLACEMENT_EXEMPT_FILES {
+            let src = std::fs::read_to_string(repo_root().join(exempt))
+                .unwrap_or_else(|e| panic!("exempt module {exempt}: {e}"));
+            assert!(
+                src.contains("set_completion_scm_provider"),
+                "{exempt}: stale adapter-contract exemption — the module no longer uses the \
+                 manual replacement API and must be removed from the allowlist"
+            );
+            assert!(
+                authority_replacement_offenders(exempt, &src).is_empty(),
+                "{exempt}: the explicitly named adapter-contract module must stay exempt"
+            );
+        }
+        assert_no_offenders(
+            "production-wiring authority-replacement scan: tests/production-wiring must reach the \
+             daemon through build_production_graph/build_daemon and substitute external seams only \
+             (set_*provider / replace_* / top-level subsystem construction are reserved for the \
+             explicitly named adapter-contract module)",
+            &offenders,
+            files.len(),
+            5,
+        );
+    }
+
+    /// Planted-violation proof: each forbidden shape fires on a synthetic
+    /// source, comment/string mentions never fire, external seams stay
+    /// allowed, and the explicitly named manual adapter-contract module is
+    /// the one exemption.
+    #[test]
+    fn production_wiring_authority_replacement_scan_fires_on_planted_violations() {
+        let non_exempt = "tests/production-wiring/tests/planted.rs";
+        let planted_setter = "fn t() { graph.tasks.set_completion_scm_provider(Some(adapter)); }\n";
+        let offenders = authority_replacement_offenders(non_exempt, planted_setter);
+        assert_eq!(offenders.len(), 1, "{offenders:?}");
+        assert!(
+            offenders[0].contains("set_completion_scm_provider"),
+            "{offenders:?}"
+        );
+
+        let planted_replace = "fn t() { replace_scm_store(new_store); }\n";
+        assert!(
+            !authority_replacement_offenders(non_exempt, planted_replace).is_empty(),
+            "a replace_* authority swap must fire"
+        );
+
+        let planted_service = "fn t() { let _ = TaskExecutor::new(&orch, s, a, sh); }\n";
+        let offenders = authority_replacement_offenders(non_exempt, planted_service);
+        assert_eq!(offenders.len(), 1, "{offenders:?}");
+        assert!(offenders[0].contains("TaskExecutor::new("), "{offenders:?}");
+
+        let comment_and_string = "// graph.tasks.set_completion_scm_provider(Some(x))\n\
+             const DOC: &str = \"replace_scm_store(TaskExecutor::new())\";\nfn t() {}\n";
+        assert!(
+            authority_replacement_offenders(non_exempt, comment_and_string).is_empty(),
+            "comments and string literals can never fire the scan"
+        );
+
+        let external_seams = "fn t() {\n    let _ = StaticTokenSource::minimal(1);\n    \
+             let _ = ManualClock::new(1);\n    let c = Config::default();\n    \
+             let _ = PolicyCheckedHttpTransport::permissive();\n    let _ = c.model;\n}\n";
+        assert!(
+            authority_replacement_offenders(non_exempt, external_seams).is_empty(),
+            "external seams, clocks, credentials, transports and config stay allowed"
+        );
+
+        assert!(
+            authority_replacement_offenders(
+                "tests/production-wiring/tests/completion_scm_adapter_contract.rs",
+                planted_setter
+            )
+            .is_empty(),
+            "the explicitly named manual adapter-contract module is the one exemption"
+        );
     }
 }

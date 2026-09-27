@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "description": "ONE Rust source of truth for the daemon's attachment admission limits: canonical is exactly faktor_provider::AttachmentLimits::for_model(MAX_ATTACHMENT_UPLOAD_BYTES, api::MAX_BODY_BYTES, MAX_MODEL_IMAGE_BYTES, true, MAX_MODEL_DOCUMENT_BYTES) for the default provider profile; emergencyCeiling is the conservative fallback the IDEs keep for the window before the model catalog is read. Checked by crates/server/src/native/models.rs and consumed by apps/vscode and apps/jetbrains tests.",
+  "canonical": {
+    "maxUploadBytes": 7340032,
+    "maxRequestBytes": 10485760,
+    "maxAttachmentBytes": 33554432,
+    "image": {
+      "mimes": [
+        { "mime": "image/png", "maxBytes": 5242880 },
+        { "mime": "image/jpeg", "maxBytes": 5242880 },
+        { "mime": "image/gif", "maxBytes": 5242880 },
+        { "mime": "image/webp", "maxBytes": 5242880 }
+      ],
+      "maxRequestBytes": 16777216
+    },
+    "document": {
+      "capable": true,
+      "mimes": [
+        { "mime": "application/pdf", "maxBytes": 8388608 },
+        { "mime": "text/plain", "maxBytes": 8388608 }
+      ],
+      "maxRequestBytes": 16777216
+    }
+  },
+  "emergencyCeiling": {
+    "maxUploadBytes": 7340032,
+    "maxRequestBytes": 10485760,
+    "maxImageBytes": 5242880,
+    "maxDocumentBytes": 8388608,
+    "imageMimes": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+    "documentMimes": ["application/pdf", "text/plain"]
+  }
+}

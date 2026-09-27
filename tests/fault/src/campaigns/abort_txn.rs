@@ -440,7 +440,7 @@ fn crash_run(seed: u64, boundary: &BoundarySpec) -> Result<WorldState, String> {
     let caught = catch_unwind(AssertUnwindSafe(|| {
         let _ = fixture.handle.abort(None);
     }));
-    super::expect_crash_fired(caught)?;
+    super::expect_crash_fired_or_unavailable(caught, &fixture.manager.store())?;
     drop(fixture.handle);
     drop(fixture.manager);
     // `fixture.dir` stays alive until the end of the run: the reopen below

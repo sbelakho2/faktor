@@ -30,6 +30,7 @@ import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativeHealth
 import dev.faktor.shared.NativeIdentity
+import dev.faktor.shared.NativeIndexCoverageResponse
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativePermissionAck
@@ -349,6 +350,11 @@ class FaktorFrontendService(
     // ---------------------------------------------------------- projections
 
     fun projection(): NativeProjection = clientOrThrow().projection(requireSession())
+
+    /** Durable index coverage of the current session's workspace (audits
+     * 5/6/16); a never-hosted index service answers a null snapshot. */
+    fun indexCoverage(): NativeIndexCoverageResponse =
+        clientOrThrow().indexCoverage(requireSession())
 
     fun messages(limit: Long = 50): dev.faktor.shared.NativeMessagePage =
         clientOrThrow().messages(requireSession(), null, limit)

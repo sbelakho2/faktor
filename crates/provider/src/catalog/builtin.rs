@@ -43,7 +43,7 @@
 //! the same models — reliability/latency estimates the economic router
 //! uses to compare candidates. These are deliberate, conservative routing
 //! priors, NOT vendor truths: every profile carries
-//! [`QualityAuthority::ConservativeUnknown`] and the
+//! [`QualityAuthority::BuiltInPrior`] and the
 //! [`PERFORMANCE_PRIOR_VERSION`] benchmark string, and durable verified
 //! outcomes dominate them whenever verified history exists.
 
@@ -636,8 +636,8 @@ pub fn quote_of(row: &BuiltinPrice) -> PriceQuote {
 }
 
 /// The documented Faktor routing prior of one (origin, model), when the
-/// table documents it: a [`ModelPerformanceProfile`] carrying the
-/// conservative-unknown authority and the frozen benchmark version.
+/// table documents it: a [`ModelPerformanceProfile`] carrying the explicit
+/// built-in-prior authority and the frozen benchmark version.
 pub fn performance_prior(origin: BillingOrigin, model: &str) -> Option<ModelPerformanceProfile> {
     let model = model.trim().to_ascii_lowercase();
     PERFORMANCE_TABLE
@@ -651,7 +651,7 @@ pub fn performance_prior(origin: BillingOrigin, model: &str) -> Option<ModelPerf
                 estimated_latency_ms: row.estimated_latency_ms,
                 rate_limit_state: faktor_core::model::RateLimitState::Healthy,
             },
-            authority: QualityAuthority::ConservativeUnknown,
+            authority: QualityAuthority::BuiltInPrior,
             benchmark_version: PERFORMANCE_PRIOR_VERSION.to_string(),
         })
 }
@@ -951,13 +951,13 @@ mod tests {
     }
 
     #[test]
-    fn performance_priors_are_conservative_unknown_and_never_vendor_truths() {
+    fn performance_priors_are_built_in_priors_and_never_vendor_truths() {
         assert_eq!(PERFORMANCE_TABLE.len(), TABLE.len());
         for row in PERFORMANCE_TABLE {
             let profile = performance_prior(row.origin, row.model).expect("documented prior");
             assert_eq!(
                 profile.authority,
-                QualityAuthority::ConservativeUnknown,
+                QualityAuthority::BuiltInPrior,
                 "{} prior authority",
                 row.model
             );

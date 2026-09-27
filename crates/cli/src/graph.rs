@@ -67,7 +67,10 @@ use faktor_index::IndexService;
 use faktor_orchestrator::runtime::shadow::ShadowRoots;
 use faktor_orchestrator::runtime::task_executor::TaskExecutor;
 use faktor_orchestrator::runtime::OrchestratorRuntime;
-use faktor_provider::catalog::{admissible_effective, ModelCatalogEntry, Provenance};
+use faktor_provider::catalog::{
+    admissible_effective, token_accounting_for, tokenizer_compatibility_of, ModelCatalogEntry,
+    Provenance, TokenAccounting, TokenizerCompatibility,
+};
 use faktor_provider::egress::HttpTransport;
 use faktor_provider::ProviderRegistry;
 use faktor_server::permission::ChannelPermissionRequester;
@@ -207,6 +210,14 @@ pub struct DaemonGraph {
     ///     profile, broker or network request exists, and the
     ///     `source_market` tool is not even registered.
     pub commerce: Option<Arc<faktor_commerce::service::CommerceSourceService>>,
+    /// The daemon's ONE durable SCM store (GitHub App synced installation/
+    /// repository rows), opened at step 21 exactly while `[cloud]` is
+    /// enabled: the SAME allocation carries the completion-step SCM adapter
+    /// wired onto [`DaemonGraph::tasks`] from `[cloud.github_app]` and the
+    /// serve path's control-plane/webhook surface. `None` while `[cloud]` is
+    /// disabled — no `scm.db` is created and a contracted PR step records the
+    /// explicit `native_pr_scm_not_configured` blocker.
+    pub scm: Option<Arc<dyn faktor_scm::ScmStore>>,
     /// 18. The reasoning runtime (drives sessions with commands).
     pub agent: Arc<AgentRuntime>,
     /// THE durable evidence authority (schema v21): the ONE evidence store
@@ -354,7 +365,11 @@ fn route_candidate_for(
     provider_id: &str,
     entry: &ModelCatalogEntry,
 ) -> faktor_router::RouteCandidate {
-    faktor_router::RouteCandidate::new(descriptor_for(provider_id, entry), entry.pricing.clone())
+    faktor_router::RouteCandidate::with_quality(
+        descriptor_for(provider_id, entry),
+        entry.pricing.clone(),
+        entry.quality_statement(),
+    )
 }
 
 /// A router candidate descriptor for one registered provider model, built
@@ -375,7 +390,7 @@ fn route_candidate_for(
 /// - `source` records the row's provenance.
 fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescriptor {
     let caps = &entry.capabilities;
-    let qp = entry.quality_prior;
+    let qp = &entry.quality_prior;
     let economics = faktor_core::model::ModelEconomics {
         tool_reliability: qp.tool_reliability,
         reasoning_reliability: qp.reasoning_reliability,
@@ -465,6 +480,117 @@ fn ensure_balanced_candidate(candidates: &[faktor_router::RouteCandidate]) -> Re
          or switch routing_mode to economy",
         candidates.len()
     ))
+}
+
+/// One catalog row's certified tokenizer facts (audit item 22): the exact
+/// compatibility class (`exact | upper_bound | unsupported`), the row's
+/// accounting contract, and the estimate kind + uncertainty every token
+/// count of this row carries into budget telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizerCertificationRow {
+    pub provider: String,
+    pub model: String,
+    pub tokenizer: String,
+    pub accounting: TokenAccounting,
+    pub compatibility: TokenizerCompatibility,
+    /// `exact` | `upper_bound` | `unsupported` — the estimate classification
+    /// budget telemetry attaches to this row's counts.
+    pub estimate_kind: &'static str,
+    /// The uncertainty attached to budget telemetry for non-exact rows
+    /// (`Some("upper_bound")`); `None` only for exact accounting.
+    pub uncertainty: Option<&'static str>,
+}
+
+impl TokenizerCertificationRow {
+    pub fn is_exact(&self) -> bool {
+        self.compatibility == TokenizerCompatibility::Exact
+    }
+}
+
+/// Certify every (provider label, model) row against the tokenizer
+/// registry (audit item 22, the pure matrix):
+///
+/// - exact backend registered → `exact`;
+/// - conservative-accounting row without one → `upper_bound`, routable,
+///   with the uncertainty attached to budget telemetry;
+/// - exact-accounting row without one → a TYPED configuration refusal
+///   (the row is never silently counted with the estimator).
+pub fn certify_tokenizer_rows(
+    rows: &[(String, String)],
+    registry: &faktor_context::TokenizerRegistry,
+) -> Result<Vec<TokenizerCertificationRow>, String> {
+    let mut out: Vec<TokenizerCertificationRow> = Vec::with_capacity(rows.len());
+    for (provider, model) in rows {
+        let id = faktor_provider::tokenizer_for(model, Some(provider));
+        let accounting = token_accounting_for(id);
+        let exact_backend_available = registry.resolve(id).is_some();
+        let compatibility = tokenizer_compatibility_of(accounting, exact_backend_available);
+        if accounting == TokenAccounting::Exact && compatibility != TokenizerCompatibility::Exact {
+            return Err(format!(
+                "tokenizer certification: {provider}/{model} demands EXACT token accounting but \
+                 no exact tokenizer is available for {id} — refusing the configuration instead \
+                 of silently estimating an exact-accounting row"
+            ));
+        }
+        let (estimate_kind, uncertainty) = match compatibility {
+            TokenizerCompatibility::Exact => ("exact", None),
+            TokenizerCompatibility::UpperBound => ("upper_bound", Some("upper_bound")),
+            TokenizerCompatibility::Unsupported => ("unsupported", Some("unsupported")),
+        };
+        out.push(TokenizerCertificationRow {
+            provider: provider.clone(),
+            model: model.clone(),
+            tokenizer: id.to_string(),
+            accounting,
+            compatibility,
+            estimate_kind,
+            uncertainty,
+        });
+    }
+    Ok(out)
+}
+
+/// The built-in documented catalog rows as (family label, model) pairs:
+/// every model the versioned built-in table documents is certified too, so
+/// a missing exact tokenizer for a BUILT-IN exact-accounting row refuses
+/// the configuration at boot exactly like a configured row.
+pub fn builtin_tokenizer_rows() -> Vec<(String, String)> {
+    use faktor_core::model::BillingOrigin;
+    faktor_provider::catalog::builtin::TABLE
+        .iter()
+        .map(|row| {
+            let family = match row.origin {
+                BillingOrigin::OfficialOpenAi => "openai",
+                BillingOrigin::OfficialAnthropic => "anthropic",
+                BillingOrigin::OfficialGoogle => "google",
+                BillingOrigin::OfficialDeepSeek => "deepseek",
+                BillingOrigin::CustomEndpoint => "custom",
+                BillingOrigin::Gateway => "gateway",
+                BillingOrigin::Local => "ollama",
+            };
+            (family.to_string(), row.model.to_string())
+        })
+        .collect()
+}
+
+/// Certify every registered provider's catalog rows (built-in documented
+/// rows + configured adapters' known models) against the tokenizer
+/// registry. The daemon calls this at boot: a failure is a typed
+/// configuration refusal (audit item 22).
+pub fn certify_provider_tokenizers(
+    providers: &ProviderRegistry,
+    registry: &faktor_context::TokenizerRegistry,
+) -> Result<Vec<TokenizerCertificationRow>, String> {
+    let mut rows: Vec<(String, String)> = builtin_tokenizer_rows();
+    for id in providers.ids() {
+        let Some(p) = providers.get(&id) else {
+            continue;
+        };
+        for model in p.known_models() {
+            rows.push((id.clone(), model));
+        }
+    }
+    certify_tokenizer_rows(&rows, registry)
 }
 
 /// The daemon's router candidate set: every admitted model of every
@@ -607,7 +733,7 @@ mod tests {
     use super::*;
     use faktor_core::model::{
         MicroUsdPerMillionTokens, ModelCapabilities, ModelEconomics, PriceAuthority, PriceQuote,
-        PricingSnapshot,
+        PricingSnapshot, QualityAuthority,
     };
     use faktor_provider::catalog::{
         ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
@@ -710,7 +836,17 @@ mod tests {
             caps: ModelCapabilities,
             pricing: PricingState,
         ) -> Arc<dyn Provider> {
-            Self::with_prior(id, model, caps, pricing, QualityPrior::default())
+            // The test double DECLARES its neutral 50 prior (BuiltInPrior
+            // authority): these rows stand in for real catalog rows whose
+            // adapter/built-in prior is known, not for undeclared
+            // ConservativeUnknown placeholders.
+            Self::with_prior(
+                id,
+                model,
+                caps,
+                pricing,
+                QualityPrior::built_in(50, 50, 50, 50, 1000),
+            )
         }
     }
 
@@ -733,7 +869,7 @@ mod tests {
                 model: model.to_string(),
                 capabilities: self.capabilities(model),
                 pricing: self.pricing.clone(),
-                quality_prior: self.quality_prior,
+                quality_prior: self.quality_prior.clone(),
                 source_epoch: CATALOG_FIRST_EPOCH,
                 provenance: Provenance::ProviderCatalog,
             }
@@ -989,6 +1125,7 @@ mod tests {
                 pricing_ceiling_micro_usd_per_million_tokens: Some(42_000_000),
                 ..Default::default()
             }),
+            quality: None,
             allow_loopback: true,
         };
         let mut registry = ProviderRegistry::new();
@@ -1266,7 +1403,11 @@ mod tests {
                 required_capabilities: vec!["tools".into()],
                 context_tokens: 2,
                 estimated_output_tokens: 1,
-                quality_floor: 50,
+                // No quality requirement here: this test pins the UNKNOWN
+                // PRICING semantics. An undeclared pin's quality is a
+                // ConservativeUnknown placeholder that would clear no
+                // positive floor (the quality-authority audit).
+                quality_floor: 0,
                 ..Default::default()
             })
             .expect("pinned validation passes");
@@ -1314,6 +1455,7 @@ mod tests {
                 api_key_env: None,
                 api: None,
                 pricing: Some(pricing),
+                quality: None,
                 allow_loopback: true,
             };
             registry
@@ -1364,6 +1506,7 @@ mod tests {
             id: "ollama".into(),
             base_url: None,
             pricing: None,
+            quality: None,
             allow_loopback: true,
         };
         let mut registry = ProviderRegistry::new();
@@ -1386,6 +1529,7 @@ mod tests {
                 output_micro_usd_per_million_tokens: Some(60_000_000),
                 ..Default::default()
             }),
+            quality: None,
             allow_loopback: true,
         };
         let e = match hostile.build(open_transport()) {
@@ -1414,6 +1558,7 @@ mod tests {
             context_reliability: context_rel,
             availability: 100,
             estimated_latency_ms: latency_ms,
+            authority: QualityAuthority::BuiltInPrior,
         }
     }
 
@@ -2226,11 +2371,12 @@ mod tests {
 
     /// Steps 1-3 + 17 are not inline in the core body: they live in the daemon
     /// entries (store + supervisor) and in serve (ServerDeps assembly). Each
-    /// gets its structural assertion here. `build_daemon` delegates to the
-    /// planner-seam entry, so that shared sync entry is where steps 1-3 are
-    /// constructed exactly once.
+    /// gets its structural assertion here. Every public sync entry delegates
+    /// to the shared `build_daemon_with_seams_and_planner` (the acquisition-
+    /// planner and GitHub-App seams have no other construction path), so that
+    /// shared entry is where steps 1-3 are constructed exactly once.
     const ENTRY_HEADERS: &[&str] = &[
-        "fn build_daemon_with_acquisition_planner(",
+        "fn build_daemon_with_seams_and_planner(",
         "fn build_daemon_with_mcp_inner(",
     ];
 
@@ -2605,5 +2751,108 @@ mod tests {
             phase_bundle_table(&configured),
             "configured-but-inactive commerce must not change one bundle byte"
         );
+    }
+    #[test]
+    fn user_declared_local_endpoint_routes_an_implement_turn_undeclared_stays_conservative() {
+        use faktor_agent::{ModelCallIntent, RouteFailure};
+        let req = ModelCallIntent::implement_main().route_request(1_000, 100, 0);
+        // Undeclared: the local endpoint's quality is a ConservativeUnknown
+        // placeholder — it clears no floor, so the hard 60 refuses typed.
+        let plain = crate::config::ProviderCfg::Ollama {
+            id: "local".into(),
+            base_url: None,
+            pricing: None,
+            quality: None,
+            allow_loopback: true,
+        };
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(plain.build(open_transport()).unwrap())
+            .unwrap();
+        let undeclared_entry = registry.get("local").unwrap().catalog_entry("default");
+        assert!(
+            undeclared_entry
+                .quality_prior
+                .authority
+                .is_conservative_unknown(),
+            "an undeclared endpoint keeps the ConservativeUnknown placeholder"
+        );
+        let policy = empty_store_policy(&registry, RoutingMode::Economy).unwrap();
+        assert!(matches!(
+            policy.route(&req),
+            Err(RouteFailure::NoCapableModel)
+        ));
+        // The user declaration authorizes the SAME endpoint for the hard
+        // implement floor: the dead end (no declared way to authorize a
+        // local model) is removed; provenance stays UserConfigured, never
+        // measured.
+        let declared = crate::config::ProviderCfg::Ollama {
+            id: "local".into(),
+            base_url: None,
+            pricing: None,
+            quality: Some(crate::config::ProviderQualityCfg {
+                coding_reliability: Some(70),
+                ..Default::default()
+            }),
+            allow_loopback: true,
+        };
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(declared.build(open_transport()).unwrap())
+            .unwrap();
+        let entry = registry.get("local").unwrap().catalog_entry("default");
+        assert_eq!(entry.quality_prior.coding_reliability, 70);
+        match &entry.quality_prior.authority {
+            faktor_core::model::QualityAuthority::UserConfigured { source, .. } => {
+                assert_eq!(source, "providers.local.quality");
+            }
+            other => panic!("expected UserConfigured, got {other:?}"),
+        }
+        let policy = empty_store_policy(&registry, RoutingMode::Economy).unwrap();
+        let decision = policy
+            .route(&req)
+            .expect("the declared local endpoint must serve the implement turn");
+        assert_eq!(decision.provider, "local");
+        assert_eq!(decision.model, "default");
+        assert!(decision.pricing_snapshot.unwrap().is_local_zero());
+    }
+
+    #[test]
+    fn tokenizer_certification_matrix_and_exact_missing_failure() {
+        let registry = faktor_context::TokenizerRegistry::with_builtin_backends();
+        let rows = vec![
+            ("openai".to_string(), "gpt-4o".to_string()),
+            ("anthropic".to_string(), "claude-opus-4-1".to_string()),
+            ("corp".to_string(), "my-model".to_string()),
+        ];
+        let certified = certify_tokenizer_rows(&rows, &registry).unwrap();
+        let gpt = &certified[0];
+        assert_eq!(gpt.compatibility, TokenizerCompatibility::Exact);
+        assert_eq!(gpt.estimate_kind, "exact");
+        assert_eq!(gpt.uncertainty, None);
+        let claude = &certified[1];
+        assert_eq!(claude.accounting, TokenAccounting::Conservative);
+        assert_eq!(claude.compatibility, TokenizerCompatibility::UpperBound);
+        assert_eq!(claude.estimate_kind, "upper_bound");
+        assert_eq!(claude.uncertainty, Some("upper_bound"));
+        let generic = &certified[2];
+        assert_eq!(generic.compatibility, TokenizerCompatibility::UpperBound);
+        // An exact-accounting row without an exact tokenizer is refused
+        // immediately (configuration failure), never estimated silently.
+        let none = faktor_context::TokenizerRegistry::new();
+        let err = certify_tokenizer_rows(&[("openai".to_string(), "gpt-4o".to_string())], &none)
+            .unwrap_err();
+        assert!(err.contains("EXACT"), "{err}");
+        // Conservative-accounting rows stay routable with the upper-bound
+        // uncertainty attached.
+        assert!(certify_tokenizer_rows(
+            &[("anthropic".to_string(), "claude-opus-4-1".to_string())],
+            &none,
+        )
+        .is_ok());
+        // Every built-in documented row is part of the certified matrix.
+        let builtin = builtin_tokenizer_rows();
+        assert!(builtin.iter().any(|(_, m)| m == "gpt-4o"));
+        assert!(builtin.iter().any(|(_, m)| m == "claude-opus-4"));
     }
 }

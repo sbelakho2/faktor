@@ -9,6 +9,9 @@ it needs credentials or a server this checkout does not have.
 | --- | --- | --- |
 | `rust-toolchain.toml` pinned channel 1.98.0 (+rustfmt/clippy, minimal) | Applied | `rust-toolchain.toml` |
 | CI resolves the toolchain file (linux lane asserts it; JetBrains smoke derives `--default-toolchain` from it) | Applied | `.woodpecker/**` |
+| Apache-2.0 `LICENSE` (canonical text pinned by sha256) + `NOTICE`; every workspace member inherits `license.workspace = true` | Applied | `LICENSE`, `NOTICE`, `tests/static-authority/src/lib.rs` (scan 13) |
+| Dependency license/bans/sources policy (`deny.toml`) enforced in the trusted static lane via `scripts/check-licenses.sh` (locked `cargo metadata` + optional cargo-deny) | Applied | `deny.toml`, `scripts/check-licenses.sh`, `.woodpecker/trusted/trusted.yaml` |
+| Committed-artifact hygiene scan (bytecode / build artifacts / opaque extensionless binaries ≥ 64 KiB) with justified load-bearing allowlist and planted-fixture proof | Applied | `tests/static-authority/src/lib.rs` (scan 13), `.gitignore`, `docs/repo-hygiene.md` |
 | Container images pinned by multi-arch index digest (non-Rust) | Applied | `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml`, `.woodpecker/trusted/nightly.yaml`, `scripts/woodpecker/docker-compose.yml` |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
 | Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict) and the PR path | Applied | GitHub API |

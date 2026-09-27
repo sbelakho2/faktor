@@ -346,6 +346,28 @@ pub fn expect_crash_fired(caught: std::thread::Result<()>) -> Result<(), String>
     }
 }
 
+/// Crash signal under the durable-writer policy (audit items 7+8): a store
+/// durability seam panics on the writer OWNER thread, not on the caller's.
+/// The writer service catches it, stops admitting mutations and surfaces the
+/// typed `WriterUnavailable`; higher layers may treat that refusal as a
+/// recoverable row error and keep going, so a campaign certifies the crash
+/// when the caller panicked OR the store writer became unavailable. The
+/// deliberate panic must never kill a daemon and never leave a healthy
+/// writer behind.
+pub fn expect_crash_fired_or_unavailable(
+    caught: std::thread::Result<()>,
+    store: &faktor_store::Store,
+) -> Result<(), String> {
+    if caught.is_err() || !store.writer_available() {
+        Ok(())
+    } else {
+        Err(
+            "seam boundary was never reached: the op completed without crashing and the store writer stayed healthy"
+                .into(),
+        )
+    }
+}
+
 // Keep a compact representation of the campaign table for the manual
 // runbook (used by the [fault]-gated tests to self-describe).
 #[allow(dead_code)]

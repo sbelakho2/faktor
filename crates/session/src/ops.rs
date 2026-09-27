@@ -2607,7 +2607,13 @@ mod tests {
             ordinal: 0,
         });
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&s)));
-        assert!(caught.is_err(), "seam {seam} must fire");
+        // The crash seam fires inside the writer job (in-transaction): the
+        // writer contains the deliberate panic, so the crash is observed
+        // either as a caller unwind or as the durable authority stopping.
+        assert!(
+            m.store().seam_crash_observed(&caught),
+            "seam {seam} must fire"
+        );
         drop(s);
         drop(m);
         reopen(dir).get_session(sid).unwrap().unwrap()

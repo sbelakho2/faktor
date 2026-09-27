@@ -119,6 +119,42 @@ pub enum ColdOrigin {
     None,
 }
 
+impl ColdOrigin {
+    /// Typed freshness of a package served by this origin (audit 16): a
+    /// stale persisted generation is `stale_while_rebuilding`; every
+    /// direct/targeted read is honestly `partial` (no complete generation
+    /// backs it).
+    pub fn freshness(&self) -> crate::coverage::EvidenceFreshness {
+        match self {
+            ColdOrigin::StaleGeneration { .. } => {
+                crate::coverage::EvidenceFreshness::StaleWhileRebuilding
+            }
+            ColdOrigin::TrackedSearch { .. }
+            | ColdOrigin::DirectReads { .. }
+            | ColdOrigin::None => crate::coverage::EvidenceFreshness::Partial,
+        }
+    }
+
+    /// The persisted generation the package came from, when any.
+    pub fn generation(&self) -> Option<u64> {
+        match self {
+            ColdOrigin::StaleGeneration { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
+}
+
+impl ColdEvidence {
+    /// The identity/freshness metadata every cold package carries
+    /// (audit 16): no content identity exists without a served generation.
+    pub fn package_meta(&self) -> crate::coverage::EvidencePackageMeta {
+        crate::coverage::EvidencePackageMeta::cold(
+            self.origin.generation(),
+            self.origin.freshness(),
+        )
+    }
+}
+
 /// Work the call actually performed (proves "never a full walk").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ColdStats {

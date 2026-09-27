@@ -16,18 +16,34 @@ use std::sync::Arc;
 
 use crate::{
     build_daemon, build_daemon_with_acquisition_planner, build_daemon_with_mcp_and_chunks,
+    build_daemon_with_scm_seams,
 };
 
-pub use crate::config::{CommerceCfg, Config};
+pub use crate::config::{CloudGithubAppCfg, CommerceCfg, Config};
 pub use crate::graph::{DaemonGraph, SemanticCfg};
 pub use crate::tools_market::{
     commerce_seams, register_commerce_connectors, CommerceRegistration, CommerceSeams,
 };
+pub use crate::GithubAppSeams;
 
 /// Build the production daemon graph exactly as the executable does through
 /// [`crate::build_daemon`] (the `faktor run`/`doctor`/command entry).
 pub fn build_production_graph(data_dir: &Path, config: Config) -> Result<DaemonGraph, String> {
     build_daemon(data_dir, Some(config))
+}
+
+/// [`build_production_graph`] with the explicit GitHub App EXTERNAL seams:
+/// the SAME production `build_daemon_core` assembly runs (so
+/// `[cloud.github_app]` is still transformed into the completion SCM
+/// provider by the daemon), while the certification substitutes only the
+/// external transport/token source/clock. No post-build authority
+/// replacement.
+pub fn build_production_graph_with_scm_seams(
+    data_dir: &Path,
+    config: Config,
+    seams: GithubAppSeams,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_scm_seams(data_dir, Some(config), seams)
 }
 
 /// [`build_production_graph`] with an explicit acquisition-planner seam: the

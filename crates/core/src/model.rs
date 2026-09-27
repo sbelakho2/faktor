@@ -1498,30 +1498,146 @@ impl Default for ModelPerformance {
     }
 }
 
-/// What a [`ModelPerformanceProfile`]'s prior RESTS on (quality-authority
-/// audit): a prior is never a vendor truth by default — built-in priors are
-/// documented Faktor routing priors, durable verified outcomes dominate them
-/// when present, and a user may override them explicitly.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
+/// ONE durable verified routing outcome: the measured evidence a
+/// [`QualityAuthority::Measured`] statement rests on. Every field is a real
+/// recorded fact (provider/model/phase, the conservative verified-success
+/// confidence in ppm, the sample count behind it, and when it was observed)
+/// — never inferred from a model name or a vendor claim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct VerifiedOutcome {
+    pub provider: String,
+    pub model: String,
+    pub phase: RouterPhase,
+    /// Conservative verified-success confidence in ppm (1_000_000 = 100%).
+    pub success_ppm: u32,
+    /// Number of durable verified samples behind `success_ppm`.
+    pub sample_count: u64,
+    /// Wall-clock ms this evidence was observed/recorded.
+    pub observed_at_ms: u64,
+}
+
+/// Deterministic variant rank of a phase (the enum has no derived `Ord`;
+/// this fixed table is the stable ordering used by quality Ord impls).
+fn phase_rank(phase: RouterPhase) -> u8 {
+    match phase {
+        RouterPhase::Plan => 0,
+        RouterPhase::Explore => 1,
+        RouterPhase::Retrieve => 2,
+        RouterPhase::Implement => 3,
+        RouterPhase::Review => 4,
+        RouterPhase::TestAnalysis => 5,
+        RouterPhase::Debug => 6,
+        RouterPhase::Compact => 7,
+        RouterPhase::Summarize => 8,
+        RouterPhase::Title => 9,
+        RouterPhase::Embed => 10,
+    }
+}
+
+impl PartialOrd for VerifiedOutcome {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VerifiedOutcome {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.provider
+            .cmp(&other.provider)
+            .then_with(|| self.model.cmp(&other.model))
+            .then_with(|| phase_rank(self.phase).cmp(&phase_rank(other.phase)))
+            .then_with(|| self.success_ppm.cmp(&other.success_ppm))
+            .then_with(|| self.sample_count.cmp(&other.sample_count))
+            .then_with(|| self.observed_at_ms.cmp(&other.observed_at_ms))
+    }
+}
+
+/// What a quality statement RESTS on (quality-authority audit, item 11): a
+/// quality number is never a measured truth by default. Ranked weakest to
+/// strongest so qualification and reporting can compare authorities:
+/// `ConservativeUnknown` (no knowledge at all — the numeric placeholder is
+/// NOT a measured 50) < `BuiltInPrior` (a documented Faktor routing prior or
+/// adapter-declared prior) < `UserConfigured` (the operator declared the
+/// value for this instance) < `Measured` (durable verified outcomes, which
+/// supersede every declaration).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "payload")]
 pub enum QualityAuthority {
-    /// The prior came from the durable VERIFIED-outcome corpus: measured
-    /// success/rework history, the strongest authority.
-    VerifiedCorpus,
-    /// The user explicitly configured this performance prior.
-    UserOverride,
-    /// A built-in CONSERVATIVE-UNKNOWN routing prior (documented Faktor
-    /// scoring priors, not vendor claims), the weakest authority.
-    #[serde(rename = "conservative_unknown")]
+    /// A built-in documented routing prior (Faktor's own conservative
+    /// scoring estimate) or an adapter-declared prior: a prior, never a
+    /// measurement.
+    BuiltInPrior,
+    /// The user explicitly configured this quality statement for ONE
+    /// configured provider instance; `source`/`version` are the provenance
+    /// of the declaration.
+    UserConfigured { source: String, version: String },
+    /// NO quality knowledge: the numeric placeholder must never clear a
+    /// floor on its own and the provenance of the statement is part of the
+    /// statement.
     ConservativeUnknown,
+    /// Durable VERIFIED-outcome history measured this model/phase; the
+    /// strongest authority and the one that supersedes declared values.
+    Measured(VerifiedOutcome),
+}
+
+impl QualityAuthority {
+    /// Authority rank, weakest to strongest (`ConservativeUnknown` = 0,
+    /// `BuiltInPrior` = 1, `UserConfigured` = 2, `Measured` = 3). Rank is
+    /// the authority axis ONLY; it never substitutes for the value.
+    pub const fn rank(&self) -> u8 {
+        match self {
+            QualityAuthority::ConservativeUnknown => 0,
+            QualityAuthority::BuiltInPrior => 1,
+            QualityAuthority::UserConfigured { .. } => 2,
+            QualityAuthority::Measured(_) => 3,
+        }
+    }
+
+    /// True when this statement rests on durable verified outcomes.
+    pub const fn is_measured(&self) -> bool {
+        matches!(self, QualityAuthority::Measured(_))
+    }
+
+    /// True when no declared knowledge exists (the placeholder case).
+    pub const fn is_conservative_unknown(&self) -> bool {
+        matches!(self, QualityAuthority::ConservativeUnknown)
+    }
+}
+
+impl PartialOrd for QualityAuthority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QualityAuthority {
+    /// Deterministic total order: authority rank first, then the payload
+    /// (declaration source/version, or the measured evidence) — never
+    /// comparing across authority kinds as if the numbers were one blob.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| match (self, other) {
+                (
+                    QualityAuthority::UserConfigured {
+                        source: a,
+                        version: b,
+                    },
+                    QualityAuthority::UserConfigured {
+                        source: c,
+                        version: d,
+                    },
+                ) => (a, b).cmp(&(c, d)),
+                (QualityAuthority::Measured(a), QualityAuthority::Measured(b)) => a.cmp(b),
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
 }
 
 /// One model's performance prior with its authority and the benchmark
 /// version that produced it (quality-authority audit): built-in priors
-/// carry [`QualityAuthority::ConservativeUnknown`] and a version string so
-/// a prior is always inspectable and never silently treated as measured.
+/// carry [`QualityAuthority::BuiltInPrior`] and a version string so a prior
+/// is always inspectable and never silently treated as measured.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelPerformanceProfile {
     /// The non-monetary prior itself.
@@ -1530,6 +1646,84 @@ pub struct ModelPerformanceProfile {
     pub authority: QualityAuthority,
     /// The benchmark/prior-table version (e.g. `"faktor-routing-priors-v1"`).
     pub benchmark_version: String,
+}
+
+/// The four reliability dimensions of one quality statement plus its
+/// explicit provenance. This is the authority-carrying sibling of the
+/// non-monetary [`ModelPerformance`] projection: the router qualification
+/// path reads THIS so an undeclared placeholder can never masquerade as a
+/// measured value, while reporting/settlement keep the numeric view.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct QualityStatement {
+    pub tool_reliability: u8,
+    pub reasoning_reliability: u8,
+    pub coding_reliability: u8,
+    pub context_reliability: u8,
+    pub authority: QualityAuthority,
+}
+
+impl QualityStatement {
+    /// A statement from one [`ModelPerformance`] view under an explicit
+    /// authority.
+    pub fn from_performance(p: &ModelPerformance, authority: QualityAuthority) -> Self {
+        Self {
+            tool_reliability: p.coding_reliability,
+            reasoning_reliability: p.coding_reliability,
+            coding_reliability: p.coding_reliability,
+            context_reliability: p.context_reliability,
+            authority,
+        }
+    }
+
+    /// The conservative-unknown placeholder: the numeric values are
+    /// INSPECTABLE but semantically unknown — a floor is never cleared by
+    /// them.
+    pub fn conservative_unknown(p: &ModelPerformance) -> Self {
+        Self::from_performance(p, QualityAuthority::ConservativeUnknown)
+    }
+
+    /// A MEASURED statement from durable verified outcomes: every
+    /// reliability dimension carries the conservative verified-success
+    /// confidence (ppm scaled to 0..=100) and the authority payload names
+    /// the exact evidence. Measured supersedes every declared value.
+    pub fn measured(success_ppm: u32, evidence: VerifiedOutcome) -> Self {
+        let value = u8::try_from(success_ppm.min(1_000_000) / 10_000).unwrap_or(100);
+        Self {
+            tool_reliability: value,
+            reasoning_reliability: value,
+            coding_reliability: value,
+            context_reliability: value,
+            authority: QualityAuthority::Measured(evidence),
+        }
+    }
+
+    /// The phase quality metric qualification applies: heavy phases
+    /// (Implement/Review/Debug) judge the coding reliability; every other
+    /// phase judges context reliability. Mirrors the router's documented
+    /// per-phase floor metric exactly.
+    pub fn phase_value(&self, phase: RouterPhase) -> u8 {
+        match phase {
+            RouterPhase::Implement | RouterPhase::Review | RouterPhase::Debug => {
+                self.coding_reliability
+            }
+            _ => self.context_reliability,
+        }
+    }
+
+    /// Authority-aware floor decision. Floor `0` means "no quality
+    /// requirement" and always clears. A [`QualityAuthority::
+    /// ConservativeUnknown`] statement clears NOTHING above zero: its
+    /// numeric placeholder is not a measured 50, so it can only be
+    /// authorized by a user declaration (or by measured outcomes).
+    pub fn clears_floor(&self, phase: RouterPhase, floor: u8) -> bool {
+        if floor == 0 {
+            return true;
+        }
+        if self.authority.is_conservative_unknown() {
+            return false;
+        }
+        self.phase_value(phase) >= floor
+    }
 }
 
 /// The billing origin of a configured endpoint (billing-origin audit):

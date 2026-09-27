@@ -226,6 +226,9 @@ steps:
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
       - cargo test -p faktor-tests-fuzz-seeds
+      # License / bans / sources policy (root deny.toml) evaluated against the
+      # locked cargo metadata graph; cargo-deny itself re-checks when present.
+      - bash scripts/check-licenses.sh
       - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
       - |
         set -eu
@@ -234,6 +237,7 @@ steps:
         cargo test -p faktor-tests-static-authority
         cargo test -p faktor-security
         cargo test -p faktor-tests-fuzz-seeds
+        bash scripts/check-licenses.sh
         SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
         CMDS
         )"

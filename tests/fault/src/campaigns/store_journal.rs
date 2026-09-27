@@ -647,6 +647,84 @@ fn smoke_store_journal_boundaries() {
     assert_eq!(checks, SMOKE_SEEDS * c.boundaries.len() as u64);
 }
 
+/// Audit items 7+8 (writer service): a deliberate panic inside the writer
+/// owner is a DURABLE-AUTHORITY failure, not a daemon panic. Per seed:
+/// 1. a real crash seam panics mid-transaction on the owner thread -> the
+///    caller receives the typed `WriterUnavailable` refusal and every later
+///    mutation is refused typed while reads still work;
+/// 2. the durability boundary stands: reopening yields a healthy writer and
+///    the durable world is exactly one legal prefix (old or committed), with
+///    the session row/journal readable;
+/// 3. after reopen the store accepts writes again (fresh validated
+///    authority) — no permanent wedge from a single panic.
+#[test]
+#[ignore = "[fault] writer-service panic => typed unavailable + healthy reopen, 32 seeds"]
+fn writer_service_panic_is_typed_and_reopen_recovers() {
+    let mut boundary_hits = 0u64;
+    for seed in 0..32u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, session) = setup(dir.path(), seed);
+        // One durable write so the reopen comparison has content.
+        exec_op(&store, session, seed, Op::Flush1);
+        let before = dump_world(&store, session);
+
+        // Deliberate panic while the owner holds the connection and an open
+        // transaction (the seam fires after the INSERT, before COMMIT).
+        store.crash_arm(CrashArm {
+            point: "ev_precommit",
+            ordinal: 0,
+        });
+        let err = store
+            .append_event_v(
+                session,
+                Some(OpId::new(7)),
+                EventKind::ToolStarted,
+                AgentState::ExecutingTool,
+                seed as i64,
+                Some(serde_json::json!({ "seed": seed })),
+                1,
+            )
+            .expect_err("the armed seam must abort the command");
+        assert!(
+            matches!(err, faktor_store::StoreError::WriterUnavailable(_)),
+            "seed {seed}: expected typed WriterUnavailable, got {err:?}"
+        );
+        assert!(!store.writer_available(), "seed {seed}");
+        // The poisoned authority refuses further mutations typed; reads
+        // still serve the committed prefix.
+        let ws = store.list_sessions(None).unwrap()[0].workspace_id;
+        let err = store
+            .create_session(ws, "after-panic", "p", "m")
+            .expect_err("mutations must be refused typed");
+        assert!(
+            matches!(err, faktor_store::StoreError::WriterUnavailable(_)),
+            "seed {seed}: {err:?}"
+        );
+        let _ = store.events_range(session, 0, None).unwrap();
+        boundary_hits += 1;
+        drop(store);
+
+        // Reopen: healthy writer; durable world is old or new, never torn.
+        let reopened = Store::open(dir.path().join("store"), true).unwrap();
+        assert!(reopened.writer_available(), "seed {seed}");
+        let after = dump_world(&reopened, session);
+        let committed = after != before;
+        assert!(
+            after == before || after == dump_world(&reopened, session),
+            "seed {seed}: torn durable world"
+        );
+        if committed {
+            // The aborted op never committed: reopening after ev_precommit
+            // must roll back to exactly the pre-op world.
+            assert_eq!(after, before, "seed {seed}: precommit crash must roll back");
+        }
+        // Fresh authority accepts writes again.
+        let ws = reopened.create_workspace("/after").unwrap();
+        reopened.create_session(ws, "after", "p", "m").unwrap();
+    }
+    assert_eq!(boundary_hits, 32);
+}
+
 #[test]
 #[ignore = "[fault] store/journal append+compaction crash at every durability boundary, 500 seeds"]
 fn full_store_journal_boundaries() {

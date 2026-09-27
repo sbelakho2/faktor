@@ -34,7 +34,9 @@ import dev.faktor.shared.parseNativeEntitlements
 import dev.faktor.shared.parseNativeEvidence
 import dev.faktor.shared.parseNativeEvidenceRetrieval
 import dev.faktor.shared.parseNativeHealth
+import dev.faktor.shared.indexCoverageLabel
 import dev.faktor.shared.parseNativeIdentity
+import dev.faktor.shared.parseNativeIndexCoverage
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeProjection
 import dev.faktor.shared.parseNativePromptReceipt
@@ -104,6 +106,20 @@ private const val PROMPT_JSON =
     "{\"op_id\":\"op-1\",\"accepted\":true,\"queued\":false}"
 
 private const val ABORT_JSON = "{\"aborted\":[\"op-1\"]}"
+
+// Audits 5/6/16: a PARTIAL generation with a capped fingerprint round and a
+// never-hosted index service (the only honest null).
+private const val INDEX_COVERAGE_JSON = "{" +
+    "\"sessionId\":\"7\"," +
+    "\"index_coverage\":{" +
+    "\"workspace\":3,\"state\":\"ready\",\"generation\":2,\"published_generation\":2," +
+    "\"coverage\":{\"files_seen\":4500,\"files_indexed\":512,\"bytes_indexed\":2048," +
+    "\"complete\":false,\"truncated_reason\":\"batch_files\"}," +
+    "\"fingerprint\":{\"scanned\":12,\"complete\":false,\"shard\":3,\"round_start\":1," +
+    "\"epoch\":4,\"shards_done\":7,\"verify\":true,\"cursors\":[]," +
+    "\"truncated_reason\":\"fingerprint_files\"}," +
+    "\"freshness\":\"partial\",\"serving\":true}}"
+private const val INDEX_COVERAGE_UNHOSTED_JSON = "{\"sessionId\":\"7\",\"index_coverage\":null}"
 
 private const val PROJECTION_JSON = "{" +
     "\"session\":{\"id\":\"7\",\"title\":\"T\",\"provider\":\"fake\",\"model\":\"m\"," +
@@ -430,6 +446,16 @@ private fun assertResponseParsers() {
     assertEquals("Running", parseNativeTaskRunStarted(TASK_RUN_STARTED_JSON).state)
     assertEquals(true, parseNativeTaskRunCancelled(TASK_RUN_CANCELLED_JSON).cancelled)
 
+    val indexCoverage = parseNativeIndexCoverage(INDEX_COVERAGE_JSON)
+    assertEquals("7", indexCoverage.sessionId)
+    assertEquals(512L, indexCoverage.snapshot!!.coverage.filesIndexed)
+    assertEquals("batch_files", indexCoverage.snapshot!!.coverage.truncatedReason)
+    assertEquals(3, indexCoverage.snapshot!!.fingerprint.shard)
+    assertEquals("partial", indexCoverage.snapshot!!.freshness)
+    assertEquals("index: partial 512/4500 files", indexCoverageLabel(indexCoverage.snapshot))
+    assertEquals(null, parseNativeIndexCoverage(INDEX_COVERAGE_UNHOSTED_JSON).snapshot)
+    assertEquals("index: not reported", indexCoverageLabel(null))
+
     val board = parseNativeBoardPage(BOARD_PAGE_JSON)
     assertEquals(7L, board.boardId)
     assertEquals(3L, board.revision)
@@ -715,6 +741,29 @@ private fun assertHostileParsers() {
     } catch (e: NativeProtocolException) {
         // expected
     }
+    // Index coverage: an unknown freshness tag and a typed counter fail
+    // loudly; a null snapshot is the ONLY honest unhosted answer.
+    for (text in listOf(
+        "{\"sessionId\":\"7\",\"index_coverage\":{\"workspace\":3,\"state\":\"ready\"," +
+            "\"generation\":2,\"published_generation\":null,\"coverage\":{\"files_seen\":0," +
+            "\"files_indexed\":0,\"bytes_indexed\":0,\"complete\":false," +
+            "\"truncated_reason\":null},\"fingerprint\":{\"scanned\":0,\"complete\":true," +
+            "\"shard\":0,\"round_start\":0,\"epoch\":0,\"shards_done\":255,\"verify\":true," +
+            "\"cursors\":[],\"truncated_reason\":null},\"freshness\":\"sorta\",\"serving\":true}}",
+        "{\"sessionId\":\"7\",\"index_coverage\":{\"workspace\":3,\"state\":\"ready\"," +
+            "\"generation\":2,\"published_generation\":null,\"coverage\":{\"files_seen\":0," +
+            "\"files_indexed\":\"0\",\"bytes_indexed\":0,\"complete\":false," +
+            "\"truncated_reason\":null},\"fingerprint\":{\"scanned\":0,\"complete\":true," +
+            "\"shard\":0,\"round_start\":0,\"epoch\":0,\"shards_done\":255,\"verify\":true," +
+            "\"cursors\":[],\"truncated_reason\":null},\"freshness\":\"partial\",\"serving\":true}}"
+    )) {
+        try {
+            parseNativeIndexCoverage(text)
+            fail("hostile index coverage must be rejected: $text")
+        } catch (e: NativeProtocolException) {
+            // expected
+        }
+    }
     // Board drift: a missing page field, a typed author and a phantom post
     // step all fail loudly (never a silently empty board).
     for (text in listOf(
@@ -978,6 +1027,13 @@ private fun assertClientRoutes() {
     daemon.on("GET", "/native/entitlements") { _, response ->
         response.json(200, ENTITLEMENTS_JSON)
     }
+    daemon.on("GET", "/native/index/coverage") { request, response ->
+        if (request.query["session"] == "7") {
+            response.json(200, INDEX_COVERAGE_JSON)
+        } else {
+            response.json(200, INDEX_COVERAGE_UNHOSTED_JSON)
+        }
+    }
     daemon.on("POST", "/native/credits/grant") { _, response ->
         response.json(200, CREDIT_GRANT_JSON)
     }
@@ -1067,6 +1123,13 @@ private fun assertClientRoutes() {
         )
         val prompt = daemon.requests.first { it.path == "/native/session/7/prompt" }
         assertEquals("{\"session_id\":\"7\",\"prompt\":\"hi\"}", prompt.body)
+        val coverageRead = client.indexCoverage("7")
+        assertEquals(512L, coverageRead.snapshot!!.coverage.filesIndexed)
+        assertEquals(null, client.indexCoverage("9").snapshot)
+        val coverageRequest = daemon.requests.first {
+            it.method == "GET" && it.path == "/native/index/coverage"
+        }
+        assertEquals("7", coverageRequest.query["session"])
         val boardRead = daemon.requests.first {
             it.method == "GET" && it.path == "/native/session/7/board"
         }

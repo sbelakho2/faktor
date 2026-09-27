@@ -15,11 +15,16 @@ use std::path::Path;
 use faktor_core::id::WorkspaceId;
 
 pub mod cold;
+pub mod coverage;
 pub mod embedding;
 pub mod generation;
 pub mod service;
 pub mod state;
 
+pub use coverage::{
+    fingerprint_shard, EvidenceFreshness, EvidencePackageMeta, FingerprintCoverage, IndexCoverage,
+    IndexCoverageSnapshot, ScanCursor, ScanFrame, FINGERPRINT_SHARDS,
+};
 pub use embedding::{
     apply_embeddings, chunk_text, content_hash, EmbeddingIndex, EmbeddingModel, EmbeddingRecord,
     EmbeddingSource, EmbeddingStats,
