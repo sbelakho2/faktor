@@ -2540,7 +2540,7 @@ mod tests {
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = cps.after_write(row.id, "f.txt", before, after, 1, b"edited");
                 }));
-                assert!(caught.is_err(), "seam {seam} must fire");
+                assert!(store.seam_crash_observed(&caught), "seam {seam} must fire");
                 (row.id, after)
             };
             let cas = Arc::new(Cas::open(cas_path.clone()).unwrap());

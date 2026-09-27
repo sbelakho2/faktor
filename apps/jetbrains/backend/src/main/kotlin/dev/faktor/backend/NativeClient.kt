@@ -32,6 +32,7 @@ import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativeHealth
 import dev.faktor.shared.NativeIdentity
+import dev.faktor.shared.NativeIndexCoverageResponse
 import dev.faktor.shared.NativeMessagePage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeProjection
@@ -78,6 +79,7 @@ import dev.faktor.shared.parseNativeEvidence
 import dev.faktor.shared.parseNativeEvidenceRetrieval
 import dev.faktor.shared.parseNativeHealth
 import dev.faktor.shared.parseNativeIdentity
+import dev.faktor.shared.parseNativeIndexCoverage
 import dev.faktor.shared.parseNativeMessagePage
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
@@ -227,6 +229,13 @@ class NativeClient(
     fun projection(sessionId: String): NativeProjection =
         parseNativeProjection(
             request("GET", "/session/" + encode(sessionId) + "/projection")
+        )
+
+    /** Durable index coverage of the session's workspace (audits 5/6/16):
+     * `snapshot == null` when the daemon never hosted an index service. */
+    fun indexCoverage(sessionId: String): NativeIndexCoverageResponse =
+        parseNativeIndexCoverage(
+            request("GET", "/native/index/coverage", query("session" to sessionId))
         )
 
     fun messages(sessionId: String, before: Long? = null, limit: Long? = null): NativeMessagePage =

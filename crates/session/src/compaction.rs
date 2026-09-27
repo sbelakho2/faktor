@@ -304,7 +304,10 @@ mod tests {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = s.record_compaction_defaults(100_000, 40_000, 50_000, "summarize");
             }));
-            assert!(caught.is_err(), "seam {seam} must fire");
+            assert!(
+                m.store().seam_crash_observed(&caught),
+                "seam {seam} must fire"
+            );
             drop(s);
             drop(m);
             let m =

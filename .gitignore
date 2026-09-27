@@ -15,3 +15,22 @@ fuzz/Cargo.lock
 # OS core dumps (crash artifacts; never source)
 core
 core.*
+
+# Python bytecode from test mock servers (never source; the .py source is the
+# committed fixture). Enforced by the repository-hygiene scan in
+# tests/static-authority.
+__pycache__/
+*.py[cod]
+
+# Stray compiled outputs / opaque binaries at any depth (build artifacts are
+# never source; intentional binary fixtures live under a named fixture dir
+# with documented provenance + digest and a consuming test). Enforced by the
+# repository-hygiene scan in tests/static-authority.
+*.o
+*.obj
+*.rlib
+*.rmeta
+*.dylib
+*.dll
+*.exe
+/mu_test

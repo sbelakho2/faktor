@@ -1328,7 +1328,10 @@ pub(crate) mod tests {
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = s.abort(None);
                 }));
-                assert!(caught.is_err(), "seam {seam} ordinal {ordinal} must fire");
+                assert!(
+                    m.store().seam_crash_observed(&caught),
+                    "seam {seam} ordinal {ordinal} must fire"
+                );
                 drop(s);
                 drop(m);
                 let after = reopen(&dir).get_session(sid).unwrap().unwrap();
@@ -1419,7 +1422,10 @@ pub(crate) mod tests {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = s.abort(None);
         }));
-        assert!(caught.is_err(), "the second tool's txn must crash");
+        assert!(
+            m.store().seam_crash_observed(&caught),
+            "the second tool's txn must crash"
+        );
         drop(s);
         drop(m);
         let after = reopen(&dir).get_session(sid).unwrap().unwrap();
@@ -1488,7 +1494,10 @@ pub(crate) mod tests {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = s.abort(None);
             }));
-            assert!(caught.is_err(), "seam {seam} must fire");
+            assert!(
+                m.store().seam_crash_observed(&caught),
+                "seam {seam} must fire"
+            );
             drop(s);
             drop(m);
             let after = reopen(&dir).get_session(sid).unwrap().unwrap();

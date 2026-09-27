@@ -36,6 +36,21 @@ pub const JOURNAL_FAILED: &str = "failed";
 pub const JOURNAL_RESUME: &str = "resume";
 pub const JOURNAL_CORRUPT: &str = "corrupt";
 pub const JOURNAL_TORN_READY: &str = "torn_ready";
+/// A batch-continuation claim: `Ready { g } -> Building { g }` extending the
+/// SAME generation while its durable coverage is incomplete (audit 5/6).
+pub const JOURNAL_CONTINUE: &str = "continue";
+/// A batch publish that is still incomplete: `Building { g } -> Ready { g }`
+/// with `coverage.complete == false` (the next batch continues the same
+/// generation). The complete publish uses [`JOURNAL_READY`].
+pub const JOURNAL_READY_PARTIAL: &str = "ready_partial";
+/// A finished fingerprint round that found the disk IDENTICAL to the
+/// published generation: `Building { g } -> Ready { g }` with the same
+/// content identity (audit 6 verification fact).
+pub const JOURNAL_VERIFIED: &str = "verified";
+/// A fingerprint round that found a difference: the same-generation publish
+/// first (bytes stay visible), then the `Dirty { g } -> Building { g+1 }`
+/// rebuild.
+pub const JOURNAL_VERIFY_DIRTY: &str = "verify_dirty";
 
 /// One workspace's persisted index state. The enum is stored as opaque JSON
 /// in the `index_state.state_json` column; the numeric generation of the
@@ -150,6 +165,19 @@ impl WorkspaceIndexState {
                 WorkspaceIndexState::Building { generation: x },
                 WorkspaceIndexState::Ready { generation: y },
             ) => x == y,
+            // Ready -> Building of the SAME generation: the CONTENT
+            // CONTINUATION hop (audit 5/6). A generation built in bounded
+            // batches is published while its coverage is incomplete and the
+            // next batch extends it in place — never renumbering, never
+            // going through Dirty (which targets N+1). The service gates
+            // this hop on the published coverage being incomplete
+            // (`JOURNAL_CONTINUE`); the machine only enforces the identity
+            // of the generation so a continuation can never leak into a
+            // different target.
+            (
+                WorkspaceIndexState::Ready { generation: x },
+                WorkspaceIndexState::Building { generation: y },
+            ) => x == y && *y == to_row_generation,
             // Building -> Building (same generation): crash-resume journal.
             (
                 WorkspaceIndexState::Building { generation: x },
@@ -255,6 +283,21 @@ mod tests {
         d(2).check_transition(2, &b(3), 3).unwrap();
         d(2).check_transition(2, &b(2), 2).unwrap_err();
         d(2).check_transition(2, &b(4), 4).unwrap_err();
+    }
+
+    #[test]
+    fn continuation_hop_extends_the_same_generation_and_never_renumbers() {
+        // Audit 5/6: an incomplete generation is extended in place through
+        // the Ready{g} -> Building{g} continuation hop (the service gates it
+        // on incomplete coverage); any other target stays illegal.
+        let r1 = WorkspaceIndexState::Ready { generation: 1 };
+        assert_eq!(r1.check_transition(1, &b(1), 1), Ok(()));
+        assert!(r1.check_transition(1, &b(2), 2).is_err());
+        // The hop back to Ready is the ordinary publish.
+        b(1).check_transition(1, &r1, 1).unwrap();
+        // A continuation can never become a phantom generation: the row
+        // generation must equal the target.
+        assert!(r1.check_transition(1, &b(1), 2).is_err());
     }
 
     #[test]

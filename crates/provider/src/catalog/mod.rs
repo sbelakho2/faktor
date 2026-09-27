@@ -49,7 +49,8 @@ use std::sync::Arc;
 
 use faktor_core::model::{
     BillingOrigin, EffectivePriceState, MicroUsdPerMillionTokens, ModelCapabilities,
-    ModelPerformance, PriceAuthority, PriceQuote, PricingSnapshot, RoutingMode,
+    ModelPerformance, PriceAuthority, PriceQuote, PricingSnapshot, QualityAuthority,
+    QualityStatement, RoutingMode,
 };
 
 use crate::{GenericAgentRequest, Provider, ProviderIdentity, ProviderStream};
@@ -73,6 +74,84 @@ pub use builtin::BUILTIN_SOURCE_ID;
 /// conservative ceilings; the entry's [`Provenance`] still distinguishes
 /// `UserOverride` from `Composite`).
 pub const USER_OVERRIDE_SOURCE_ID: &str = "faktor-user-override-v1";
+
+/// Which token-accounting contract a catalog row declares (item 22). Exact
+/// rows require a real local tokenizer before the runtime may count them;
+/// conservative rows stay routable and their counts are honestly labeled
+/// `TokenEstimateKind::UpperBound` with the uncertainty attached to budget
+/// telemetry.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenAccounting {
+    /// The row's tokenizer family has a real local vocabulary contract
+    /// (OpenAI tiktoken families): an exact backend is REQUIRED.
+    Exact,
+    /// No local vocabulary exists for the family: counts are bounded
+    /// estimates by construction.
+    Conservative,
+}
+
+/// The certification classification of one model row's tokenizer
+/// (item 22): the `exact | upper_bound | unsupported` vocabulary the
+/// doctor/certification reports.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenizerCompatibility {
+    /// A real local backend counted the row's tokenizer exactly.
+    Exact,
+    /// No local vocab for the family: the conservative estimator's bounded
+    /// value, labeled `UpperBound` — routable.
+    UpperBound,
+    /// The row demands exact accounting but no exact tokenizer is
+    /// available: configuration/certification refuses it. Never silently
+    /// downgraded to an estimate.
+    Unsupported,
+}
+
+impl TokenizerCompatibility {
+    /// Stable lowercase label (`exact`/`upper_bound`/`unsupported`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TokenizerCompatibility::Exact => "exact",
+            TokenizerCompatibility::UpperBound => "upper_bound",
+            TokenizerCompatibility::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// The token-accounting contract of one tokenizer identity (item 22): the
+/// OpenAI tiktoken families have a real local vocabulary contract and
+/// demand exact accounting; every other family has no local vocabulary and
+/// accounts conservatively.
+pub fn token_accounting_for(id: crate::TokenizerId) -> TokenAccounting {
+    match id.family {
+        crate::TokenFamily::O200kBase | crate::TokenFamily::Cl100kBase => TokenAccounting::Exact,
+        _ => TokenAccounting::Conservative,
+    }
+}
+
+/// Classify one row's tokenizer compatibility against the one fact the
+/// caller resolved (whether an exact local backend is registered):
+/// `exact | upper_bound | unsupported`. An exact-accounting row without an
+/// exact tokenizer is [`TokenizerCompatibility::Unsupported`] (never
+/// silently downgraded to an estimate); a conservative-accounting row
+/// without one stays routable as [`TokenizerCompatibility::UpperBound`].
+pub const fn tokenizer_compatibility_of(
+    accounting: TokenAccounting,
+    exact_backend_available: bool,
+) -> TokenizerCompatibility {
+    if exact_backend_available {
+        return TokenizerCompatibility::Exact;
+    }
+    match accounting {
+        TokenAccounting::Exact => TokenizerCompatibility::Unsupported,
+        TokenAccounting::Conservative => TokenizerCompatibility::UpperBound,
+    }
+}
 
 /// Why a catalog entry carries the price/prior it does. Ranked so the
 /// entry's derived [`Ord`] is stable across processes.
@@ -101,8 +180,16 @@ pub enum Provenance {
 /// (`coding_quality()`/`context_reliability`); priors live there today, so
 /// this type is a catalog-side view of the same dimensions, not a new
 /// invented prior model.
+///
+/// The `authority` field is the quality-authority audit's provenance: an
+/// undeclared row carries [`QualityAuthority::ConservativeUnknown`] with
+/// the neutral 50 placeholder — inspectable numbers that are NOT a measured
+/// 50 and never clear a quality floor on their own; documented built-in
+/// priors carry [`QualityAuthority::BuiltInPrior`]; `[providers.*.quality]`
+/// declarations carry `UserConfigured`; durable verified outcomes supersede
+/// all of them at qualification.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(default)]
 pub struct QualityPrior {
@@ -115,14 +202,19 @@ pub struct QualityPrior {
     /// legacy 1000 ms, built-in performance priors carry their documented
     /// Faktor estimate.
     pub estimated_latency_ms: u64,
+    /// Why the numeric values are what they are (never inferred from the
+    /// numbers themselves).
+    pub authority: QualityAuthority,
 }
 
 impl QualityPrior {
     /// The conservative generic prior: exactly the reliability/availability
     /// numbers the routing graph produced before catalogs existed
     /// (`ModelEconomics::default()` — neutral 50 reliability on every
-    /// dimension, 100 availability, 1000 ms). Exposed as a named constant
-    /// so the default is inspectable and never re-invented per call site.
+    /// dimension, 100 availability, 1000 ms), carrying the explicit
+    /// [`QualityAuthority::ConservativeUnknown`] provenance. Exposed as a
+    /// named constant so the default is inspectable and never re-invented
+    /// per call site.
     pub const fn conservative_generic() -> Self {
         Self {
             tool_reliability: 50,
@@ -131,6 +223,7 @@ impl QualityPrior {
             context_reliability: 50,
             availability: 100,
             estimated_latency_ms: 1000,
+            authority: QualityAuthority::ConservativeUnknown,
         }
     }
 
@@ -141,6 +234,39 @@ impl QualityPrior {
             coding_reliability: self.coding_reliability,
             estimated_latency_ms: self.estimated_latency_ms,
             rate_limit_state: faktor_core::model::RateLimitState::Healthy,
+        }
+    }
+
+    /// The authority-carrying statement of this prior (coding/context/tool/
+    /// reasoning reliability + provenance): what router qualification
+    /// consumes so an unknown placeholder is never read as measured.
+    pub fn statement(&self) -> QualityStatement {
+        QualityStatement {
+            tool_reliability: self.tool_reliability,
+            reasoning_reliability: self.reasoning_reliability,
+            coding_reliability: self.coding_reliability,
+            context_reliability: self.context_reliability,
+            authority: self.authority.clone(),
+        }
+    }
+
+    /// A documented built-in prior (Faktor's own routing estimate) with the
+    /// explicit [`QualityAuthority::BuiltInPrior`] provenance.
+    pub fn built_in(
+        tool_reliability: u8,
+        reasoning_reliability: u8,
+        coding_reliability: u8,
+        context_reliability: u8,
+        estimated_latency_ms: u64,
+    ) -> Self {
+        Self {
+            tool_reliability,
+            reasoning_reliability,
+            coding_reliability,
+            context_reliability,
+            availability: 100,
+            estimated_latency_ms,
+            authority: QualityAuthority::BuiltInPrior,
         }
     }
 }
@@ -218,6 +344,42 @@ impl ModelCatalogEntry {
     /// conservative generic estimator.
     pub fn tokenizer_id(&self) -> crate::TokenizerId {
         crate::tokenizer_for(&self.model, Some(&self.provider))
+    }
+
+    /// The authority-carrying quality statement of this row (item 1/11):
+    /// the four reliability dimensions plus the provenance decided by the
+    /// adapter, the built-in prior table, or the user's `quality` override.
+    /// Router qualification consumes THIS, so an undeclared
+    /// [`QualityAuthority::ConservativeUnknown`] placeholder never clears a
+    /// floor on its own numeric value.
+    pub fn quality_statement(&self) -> QualityStatement {
+        self.quality_prior.statement()
+    }
+
+    /// The token-accounting contract of this row (item 22): `Exact` for the
+    /// tokenizer families whose real local vocabularies the runtime
+    /// implements (the OpenAI tiktoken families), `Conservative` for every
+    /// family without a local vocabulary (the counts stay honest
+    /// `UpperBound` estimates). Certification refuses an exact-accounting
+    /// row whose exact tokenizer is not available.
+    pub fn token_accounting(&self) -> TokenAccounting {
+        token_accounting_for(self.tokenizer_id())
+    }
+
+    /// Classify this row's tokenizer compatibility against the one fact the
+    /// caller resolved: whether an EXACT local backend is registered for
+    /// [`ModelCatalogEntry::tokenizer_id`]. Reporting vocabulary is
+    /// `exact | upper_bound | unsupported`:
+    ///
+    /// - exact backend available → [`TokenizerCompatibility::Exact`];
+    /// - exact-accounting row without one → [`TokenizerCompatibility::
+    ///   Unsupported`] (certification must refuse it instead of silently
+    ///   counting with the estimator);
+    /// - conservative-accounting row without one → [`TokenizerCompatibility::
+    ///   UpperBound`]: routable, every count honestly labeled
+    ///   `TokenEstimateKind::UpperBound`.
+    pub fn tokenizer_compatibility(&self, exact_backend_available: bool) -> TokenizerCompatibility {
+        tokenizer_compatibility_of(self.token_accounting(), exact_backend_available)
     }
 
     /// The route-time [`PricingSnapshot`] this row's price knowledge cuts
@@ -570,6 +732,152 @@ impl Provider for PricingOverrideProvider {
     }
 }
 
+// ------------------------------------------------------- quality overrides
+
+/// User-configured quality declaration for ONE provider instance (the
+/// `[providers.<id>.quality]` config surface, quality-authority audit
+/// item 1). The declaration rewrites the row's reliability dimensions and
+/// stamps the explicit provenance
+/// [`QualityAuthority::UserConfigured`] — it is what AUTHORIZES a row whose
+/// quality would otherwise be [`QualityAuthority::ConservativeUnknown`]
+/// (e.g. a local endpoint with no built-in prior) to clear quality floors
+/// without any magic number.
+///
+/// Semantics:
+///
+/// - declared dimensions take the declared 0..=100 values (callers
+///   validate before constructing);
+/// - undeclared dimensions keep the adapter/built-in values but the
+///   statement authority is `UserConfigured` — the user owns the
+///   declaration;
+/// - durable VERIFIED routing outcomes supersede the declaration at
+///   qualification/scoring time: measured evidence always wins;
+/// - an empty declaration is a no-op (the sentinel for "not configured").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QualityOverrides {
+    pub coding_reliability: Option<u8>,
+    pub context_reliability: Option<u8>,
+    pub tool_reliability: Option<u8>,
+    pub reasoning_reliability: Option<u8>,
+}
+
+/// Source id stamped onto every user quality declaration.
+pub const USER_QUALITY_SOURCE_ID: &str = "faktor-user-quality-v1";
+
+impl QualityOverrides {
+    /// True when nothing at all is declared.
+    pub fn is_empty(&self) -> bool {
+        self == &QualityOverrides::default()
+    }
+
+    /// The declaration source string for one provider instance.
+    pub fn source_for(instance_id: &str) -> String {
+        format!("providers.{instance_id}.quality")
+    }
+
+    /// Apply this declaration to one adapter-produced entry. Only the
+    /// declared dimensions are rewritten; the authority becomes
+    /// `UserConfigured{source, version}` with `source` naming the exact
+    /// configured instance.
+    pub fn apply(&self, mut entry: ModelCatalogEntry) -> ModelCatalogEntry {
+        if self.is_empty() {
+            return entry;
+        }
+        if let Some(v) = self.coding_reliability {
+            entry.quality_prior.coding_reliability = v;
+        }
+        if let Some(v) = self.context_reliability {
+            entry.quality_prior.context_reliability = v;
+        }
+        if let Some(v) = self.tool_reliability {
+            entry.quality_prior.tool_reliability = v;
+        }
+        if let Some(v) = self.reasoning_reliability {
+            entry.quality_prior.reasoning_reliability = v;
+        }
+        entry.quality_prior.authority = QualityAuthority::UserConfigured {
+            source: Self::source_for(&entry.provider),
+            version: USER_QUALITY_SOURCE_ID.to_string(),
+        };
+        entry
+    }
+}
+
+/// An instance-wrapped provider whose [`Provider::catalog_entry`] results
+/// carry a [`QualityOverrides`] declaration. Identity/capabilities/streaming
+/// delegate to the wrapped adapter; only the quality statement of the
+/// catalog rows is rewritten, scoped to this configured instance.
+pub struct QualityOverrideProvider {
+    inner: Arc<dyn Provider>,
+    instance_id: String,
+    overrides: QualityOverrides,
+}
+
+impl QualityOverrideProvider {
+    pub fn wrap(
+        inner: Arc<dyn Provider>,
+        instance_id: impl Into<String>,
+        overrides: QualityOverrides,
+    ) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            inner,
+            instance_id: instance_id.into(),
+            overrides,
+        })
+    }
+}
+
+impl Provider for QualityOverrideProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn identity(&self) -> ProviderIdentity {
+        ProviderIdentity::new(self.instance_id.clone(), self.id())
+    }
+
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        self.inner.capabilities(model)
+    }
+
+    fn known_models(&self) -> Vec<String> {
+        self.inner.known_models()
+    }
+
+    fn runtime_context_limit(&self, model: &str) -> Option<usize> {
+        self.inner.runtime_context_limit(model)
+    }
+
+    fn document_capable(&self, model: &str) -> bool {
+        self.inner.document_capable(model)
+    }
+
+    fn max_document_bytes(&self) -> usize {
+        self.inner.max_document_bytes()
+    }
+
+    fn supports_embeddings(&self, model: &str) -> bool {
+        self.inner.supports_embeddings(model)
+    }
+
+    fn embed(
+        &self,
+        req: crate::EmbeddingRequest,
+    ) -> Result<crate::EmbeddingResponse, crate::ProviderError> {
+        self.inner.embed(req)
+    }
+
+    fn catalog_entry(&self, model: &str) -> ModelCatalogEntry {
+        let mut entry = self.inner.catalog_entry(model);
+        entry.provider = self.instance_id.clone();
+        self.overrides.apply(entry)
+    }
+
+    fn stream(&self, req: GenericAgentRequest) -> ProviderStream {
+        self.inner.stream(req)
+    }
+}
+
 /// An instance-wrapped provider whose catalog rows resolve pricing by the
 /// endpoint's strict [`BillingOrigin`] (billing-origin audit), then apply
 /// the user's [`PricingOverrides`]:
@@ -704,8 +1012,19 @@ impl Provider for BillingOriginProvider {
                     context_reliability: profile.prior.context_reliability,
                     availability: entry.quality_prior.availability,
                     estimated_latency_ms: profile.prior.estimated_latency_ms,
+                    // A documented built-in prior is a PRIOR with explicit
+                    // provenance — never a silent "measured" statement and
+                    // never an unknown placeholder.
+                    authority: QualityAuthority::BuiltInPrior,
                 };
             }
+        } else if entry.quality_prior != QualityPrior::default() {
+            // An adapter that declared real (non-default) prior values IS
+            // declaring knowledge: mark it as a built-in prior, never as a
+            // measured statement. The default placeholder stays
+            // ConservativeUnknown so undeclared rows are never authorized
+            // by a magic number.
+            entry.quality_prior.authority = QualityAuthority::BuiltInPrior;
         }
         self.overrides.apply(entry)
     }
@@ -1714,5 +2033,223 @@ mod tests {
             true,
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod quality_authority_tests {
+    use super::*;
+    use faktor_core::model::{RouterPhase, VerifiedOutcome};
+
+    /// Legacy provider double: exercises wrapping without any adapter
+    /// catalog override (default ConservativeUnknown quality).
+    #[derive(Clone)]
+    struct PlainProvider {
+        id: String,
+        models: Vec<String>,
+    }
+
+    impl Provider for PlainProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            ModelCapabilities::small_local()
+        }
+
+        fn known_models(&self) -> Vec<String> {
+            self.models.clone()
+        }
+
+        fn stream(&self, _req: crate::GenericAgentRequest) -> crate::ProviderStream {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    fn plain(id: &str) -> Arc<dyn Provider> {
+        Arc::new(PlainProvider {
+            id: id.into(),
+            models: vec!["m".into()],
+        })
+    }
+
+    #[test]
+    fn quality_overrides_are_instance_scoped_with_explicit_provenance() {
+        // The declaration rewrites only its OWN configured instance and
+        // stamps `UserConfigured{source, version}`; the same adapter under
+        // another (or no) instance keeps its ConservativeUnknown
+        // placeholder. Undeclared dimensions keep the adapter value.
+        let declared = QualityOverrideProvider::wrap(
+            plain("ollama"),
+            "local-a",
+            QualityOverrides {
+                coding_reliability: Some(72),
+                context_reliability: Some(80),
+                tool_reliability: None,
+                reasoning_reliability: Some(55),
+            },
+        );
+        let e = declared.catalog_entry("m");
+        assert_eq!(e.provider, "local-a");
+        assert_eq!(e.quality_prior.coding_reliability, 72);
+        assert_eq!(e.quality_prior.context_reliability, 80);
+        assert_eq!(e.quality_prior.reasoning_reliability, 55);
+        assert_eq!(
+            e.quality_prior.tool_reliability, 50,
+            "an undeclared dimension keeps the adapter value"
+        );
+        match &e.quality_prior.authority {
+            QualityAuthority::UserConfigured { source, version } => {
+                assert_eq!(source, "providers.local-a.quality");
+                assert_eq!(version, USER_QUALITY_SOURCE_ID);
+            }
+            other => panic!("expected UserConfigured, got {other:?}"),
+        }
+        // The wrapped value is a declaration, never a measurement.
+        assert!(!e.quality_prior.authority.is_measured());
+        // Another instance of the SAME adapter without a declaration is
+        // untouched: the override never leaks across instances.
+        let other =
+            QualityOverrideProvider::wrap(plain("ollama"), "local-b", QualityOverrides::default());
+        let o = other.catalog_entry("m");
+        assert_eq!(o.provider, "local-b");
+        assert_eq!(o.quality_prior, QualityPrior::conservative_generic());
+        assert!(o.quality_prior.authority.is_conservative_unknown());
+        // And the raw adapter keeps the placeholder too.
+        let raw = plain("ollama").catalog_entry("m");
+        assert!(raw.quality_prior.authority.is_conservative_unknown());
+    }
+
+    #[test]
+    fn authority_aware_floors_never_read_the_placeholder_as_measured() {
+        // The numeric 50 of the conservative placeholder is NOT a measured
+        // 50: it clears no positive floor (heavy or cheap phase), while a
+        // declared/built-in prior of the same value does. Floor 0 always
+        // clears (no requirement).
+        let unknown = QualityPrior::default().statement();
+        assert!(!unknown.clears_floor(RouterPhase::Implement, 50));
+        assert!(!unknown.clears_floor(RouterPhase::Compact, 50));
+        assert!(unknown.clears_floor(RouterPhase::Implement, 0));
+        let declared = QualityPrior {
+            coding_reliability: 50,
+            context_reliability: 50,
+            authority: QualityAuthority::UserConfigured {
+                source: "providers.x.quality".into(),
+                version: USER_QUALITY_SOURCE_ID.into(),
+            },
+            ..QualityPrior::default()
+        }
+        .statement();
+        assert!(declared.clears_floor(RouterPhase::Implement, 50));
+        assert!(declared.clears_floor(RouterPhase::Compact, 50));
+        assert!(!declared.clears_floor(RouterPhase::Implement, 51));
+        // A documented built-in prior (BuiltInPrior) clears by its value.
+        let built_in = QualityPrior::built_in(50, 50, 50, 50, 1000).statement();
+        assert!(built_in.clears_floor(RouterPhase::Compact, 50));
+        assert_eq!(
+            built_in.authority.rank(),
+            QualityAuthority::BuiltInPrior.rank()
+        );
+        // Authority ranking is explicit and monotone.
+        assert!(QualityAuthority::ConservativeUnknown.rank() < built_in.authority.rank());
+        assert!(built_in.authority.rank() < declared.authority.rank());
+    }
+
+    #[test]
+    fn measured_statement_scales_confidence_and_records_evidence() {
+        let evidence = VerifiedOutcome {
+            provider: "p".into(),
+            model: "m".into(),
+            phase: RouterPhase::Implement,
+            success_ppm: 850_000,
+            sample_count: 40,
+            observed_at_ms: 7,
+        };
+        let st = QualityStatement::measured(850_000, evidence.clone());
+        assert_eq!(st.coding_reliability, 85);
+        assert_eq!(st.context_reliability, 85);
+        assert_eq!(st.tool_reliability, 85);
+        assert_eq!(st.reasoning_reliability, 85);
+        assert!(st.authority.is_measured());
+        match st.authority {
+            QualityAuthority::Measured(ref found) => assert_eq!(found, &evidence),
+            other => panic!("expected Measured, got {other:?}"),
+        }
+        assert!(st.clears_floor(RouterPhase::Implement, 85));
+        assert!(!st.clears_floor(RouterPhase::Implement, 86));
+    }
+
+    #[test]
+    fn tokenizer_accounting_matrix_is_family_driven_and_exact_requires_a_backend() {
+        // Item 22 matrix: the OpenAI tiktoken families declare EXACT
+        // accounting and become Unsupported without a local backend; every
+        // other family stays Conservative/UpperBound (routable).
+        let gpt = ModelCatalogEntry {
+            ..entry("openai", "gpt-4o")
+        };
+        assert_eq!(gpt.token_accounting(), TokenAccounting::Exact);
+        assert_eq!(
+            gpt.tokenizer_compatibility(true),
+            TokenizerCompatibility::Exact
+        );
+        assert_eq!(
+            gpt.tokenizer_compatibility(false),
+            TokenizerCompatibility::Unsupported
+        );
+        assert_eq!(gpt.tokenizer_id(), crate::TokenizerId::O200K_BASE);
+        let claude = ModelCatalogEntry {
+            ..entry("anthropic", "claude-opus-4-1")
+        };
+        assert_eq!(claude.token_accounting(), TokenAccounting::Conservative);
+        assert_eq!(
+            claude.tokenizer_compatibility(false),
+            TokenizerCompatibility::UpperBound
+        );
+        assert_eq!(
+            claude.tokenizer_compatibility(true),
+            TokenizerCompatibility::Exact
+        );
+        let generic = ModelCatalogEntry {
+            ..entry("corp", "my-model")
+        };
+        assert_eq!(generic.token_accounting(), TokenAccounting::Conservative);
+        assert_eq!(
+            generic.tokenizer_compatibility(false),
+            TokenizerCompatibility::UpperBound
+        );
+        // The free classification mirrors the row methods exactly.
+        assert_eq!(
+            tokenizer_compatibility_of(TokenAccounting::Exact, false),
+            TokenizerCompatibility::Unsupported
+        );
+        assert_eq!(
+            tokenizer_compatibility_of(TokenAccounting::Conservative, false).as_str(),
+            "upper_bound"
+        );
+        assert_eq!(
+            tokenizer_compatibility_of(TokenAccounting::Exact, true).as_str(),
+            "exact"
+        );
+        assert_eq!(
+            token_accounting_for(crate::TokenizerId::CL100K_BASE),
+            TokenAccounting::Exact
+        );
+        assert_eq!(
+            token_accounting_for(crate::TokenizerId::GENERIC_ESTIMATOR),
+            TokenAccounting::Conservative
+        );
+    }
+
+    fn entry(provider: &str, model: &str) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            provider: provider.into(),
+            model: model.into(),
+            capabilities: ModelCapabilities::small_local(),
+            pricing: PricingState::Unknown,
+            quality_prior: QualityPrior::default(),
+            source_epoch: CATALOG_FIRST_EPOCH,
+            provenance: Provenance::BuiltIn,
+        }
     }
 }

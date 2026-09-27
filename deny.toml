@@ -1,0 +1,78 @@
+# Dependency license / bans / sources policy (audit items 20-21).
+#
+# Enforcement:
+#   * local and CI: `bash scripts/check-licenses.sh` evaluates the SAME
+#     policy against `cargo metadata` output with python3 (no tool install
+#     required), and additionally runs `cargo deny check licenses bans
+#     sources` when a cargo-deny binary is on PATH.
+#   * trusted CI static lane: the script is a required step, so a policy
+#     violation is a red lane, never a review nit.
+#
+# The `[licenses] allow` list is the single source of truth: the script
+# parses this file, so the two engines cannot drift.
+
+[graph]
+# Check the default resolve graph (host target, default features). CI runs
+# `cargo metadata` with the committed lockfile; the graph table is left at
+# its defaults deliberately.
+
+[licenses]
+# Permissive licenses only. Every entry is either present in the current
+# lockfile or a standard permissive SPDX identifier (see
+# docs/repo-hygiene.md for the review rule). Copyleft licenses (GPL, AGPL,
+# LGPL-only, SSPL, ...) are refused; an OR-branch satisfied by an allowed
+# license passes, an AND must be fully allowed.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# Per-crate exceptions stay empty; narrow allowances belong in `allow` with
+# a review (never a blanket crate exemption).
+exceptions = []
+
+[licenses.private]
+# Workspace crates are private (not published), but their declared license
+# is still policy-checked: the script asserts every workspace member
+# resolves to Apache-2.0 via `license.workspace = true`.
+ignore = false
+
+[bans]
+# Duplicate major versions are normal in this graph; the hard rules are
+# wildcard requirements and an empty (currently) explicit ban list.
+multiple-versions = "allow"
+# cargo-deny flags every version-less path dependency as a wildcard, and the
+# 50+ workspace-internal `{ path = ... }` entries are deliberately
+# version-less (they are never published). Wildcard denial for EXTERNAL
+# registry requirements is enforced by scripts/check-licenses.sh (which
+# excludes path edges); keep this engine setting allow so the two do not
+# disagree on internal edges. Tighten to deny only together with adding
+# `version = ...` to every workspace path dependency.
+wildcards = "allow"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

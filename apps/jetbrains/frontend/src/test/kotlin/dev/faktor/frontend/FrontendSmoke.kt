@@ -9,6 +9,7 @@ package dev.faktor.frontend
 import dev.faktor.backend.BackendConnection
 import dev.faktor.backend.BackendProcessManager
 import dev.faktor.backend.NativeClient
+import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeAttachmentId
@@ -31,6 +32,8 @@ import dev.faktor.shared.parseNativePresentationAck
 import dev.faktor.shared.parseNativeSessionUsage
 import dev.faktor.shared.parseNativeTaskCompletionSteps
 import dev.faktor.shared.parseNativeTaskProof
+import dev.faktor.shared.indexCoverageLabel
+import dev.faktor.shared.parseNativeIndexCoverage
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
 import dev.faktor.shared.parseNativeTournament
@@ -38,6 +41,7 @@ import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
+import dev.faktor.shared.view
 import java.awt.image.BufferedImage
 import java.math.BigInteger
 import java.nio.file.Files
@@ -473,6 +477,22 @@ object FrontendSmoke {
             assertEquals("building", task.phase)
         }
 
+        step("canned native parsing: index coverage names partial state honestly") {
+            val partial = parseNativeIndexCoverage(INDEX_COVERAGE_JSON)
+            assertEquals("partial", partial.snapshot!!.freshness)
+            assertEquals(512L, partial.snapshot!!.coverage.filesIndexed)
+            assertEquals(4500L, partial.snapshot!!.coverage.filesSeen)
+            assertEquals("batch_files", partial.snapshot!!.coverage.truncatedReason)
+            assertEquals(3, partial.snapshot!!.fingerprint.shard)
+            assertEquals("index: partial 512/4500 files", indexCoverageLabel(partial.snapshot))
+            // A never-hosted index service is reported honestly, never faked
+            // as current.
+            assertEquals(
+                "index: not reported",
+                indexCoverageLabel(parseNativeIndexCoverage(INDEX_COVERAGE_UNHOSTED_JSON).snapshot)
+            )
+        }
+
         step("canned native parsing: verification criteria/check summaries") {
             val verification = parseNativeTaskVerification(TASK_VERIFICATION_JSON)
             val record = verification.records[0]
@@ -560,6 +580,76 @@ object FrontendSmoke {
             assertEquals("9", permissions[0].sessionId)
             assertEquals("shell", permissions[0].capability)
             assertTrue(permissions[0].detail.contains("bash"), "detail JSON must be kept")
+        }
+
+        step("attachment limits: advertised contract consumed, emergency ceiling from the shared fixture") {
+            // The shared fixture is the Rust-checked daemon contract; the
+            // JetBrains client consumes the advertised values and keeps the
+            // conservative emergency ceiling only as a fallback.
+            val root = System.getProperty("faktor.repo.root")
+            val fixturePath =
+                if (root.isNullOrBlank()) Paths.get("fixtures", "attachment-limits.json")
+                else Paths.get(root, "fixtures", "attachment-limits.json")
+            assertTrue(Files.exists(fixturePath), "shared fixture missing at $fixturePath")
+            val fixture = JsonCodec.parse(Files.readString(fixturePath)).view("fixture")
+            val canonical = fixture.field("canonical").rawJson()
+            val emergency = fixture.field("emergencyCeiling")
+            // A legacy daemon entry stays parseable (emergency fallback).
+            val legacy = parseNativeModelCatalog(MODELS_JSON)
+            assertEquals(null, legacy[0].attachmentLimits)
+            assertEquals(
+                "emergency",
+                AttachmentImages.policyForModel(legacy, "fake", "m").source,
+                "a legacy catalog must fall back to the emergency ceiling"
+            )
+            // The advertised entry parses and drives the policy.
+            val advertisedJson = "[{\"provider\":\"fake\",\"model\":\"m\",\"context\":1000," +
+                "\"maxOutput\":100,\"tools\":true,\"parallelTools\":false,\"reasoning\":true," +
+                "\"thinking\":true,\"vision\":false,\"structuredOutput\":false," +
+                "\"embeddings\":false,\"streaming\":true,\"source\":\"conservativeDefault\"," +
+                "\"documentCapable\":true,\"attachmentLimits\":" + canonical + "}]"
+            val catalog = parseNativeModelCatalog(advertisedJson)
+            assertEquals(true, catalog[0].documentCapable)
+            val limits = catalog[0].attachmentLimits ?: fail("advertised limits must parse")
+            assertEquals(7340032L, limits.maxUploadBytes)
+            assertEquals(5242880L, limits.image.mimes[0].maxBytes)
+            assertEquals(8388608L, limits.document.mimes[0].maxBytes)
+            val policy = AttachmentImages.policyForModel(catalog, "fake", "m")
+            assertEquals("advertised", policy.source)
+            assertEquals(7340032L, policy.maxUploadBytes)
+            assertEquals(5242880L, policy.maxImageBytes)
+            assertEquals(true, policy.documentCapable)
+            assertEquals(listOf("application/pdf", "text/plain"), policy.documentMimes)
+            // Unknown model / provider falls back to the emergency ceiling.
+            assertEquals("emergency", AttachmentImages.policyForModel(catalog, "fake", "other").source)
+            assertEquals("emergency", AttachmentImages.policyForModel(catalog, "other", "m").source)
+            // The emergency ceiling is byte-identical to the fixture and
+            // CONSERVATIVE: never above the advertised per-MIME bound.
+            val emergencyPolicy = AttachmentImages.emergencyPolicy()
+            assertEquals(emergency.field("maxUploadBytes").long(), emergencyPolicy.maxUploadBytes)
+            assertEquals(emergency.field("maxImageBytes").long(), emergencyPolicy.maxImageBytes)
+            assertEquals(emergency.field("maxDocumentBytes").long(), emergencyPolicy.maxDocumentBytes)
+            assertEquals(AttachmentImages.MAX_IMAGE_BYTES, emergencyPolicy.maxImageBytes)
+            assertEquals(AttachmentImages.MAX_UPLOAD_BYTES, emergencyPolicy.maxUploadBytes)
+            assertTrue(
+                emergencyPolicy.maxImageBytes <= policy.maxImageBytes,
+                "the emergency ceiling must stay conservative"
+            )
+            // A tighter advertised bound flows into a tighter policy (and
+            // the bounded read refuses above it).
+            val tight = AttachmentImages.policyFromLimits(
+                limits.copy(
+                    image = limits.image.copy(
+                        mimes = limits.image.mimes.map { it.copy(maxBytes = 3L) }
+                    )
+                )
+            )
+            assertEquals(3L, tight.maxImageBytes)
+            val shot = Files.createTempFile("faktor-attach-limits-", ".png")
+            Files.write(shot, byteArrayOf(1, 2, 3, 4))
+            assertEquals(null, AttachmentImages.readBounded(shot.toFile(), tight.maxImageBytes))
+            val read = AttachmentImages.readBounded(shot.toFile(), policy.maxImageBytes)
+            assertTrue(read != null && read.size == 4, "the advertised bound reads byte-exact")
         }
 
         step("permission reply: typed 409 refusals classify and render explicitly") {
@@ -1802,6 +1892,54 @@ object FrontendSmoke {
                     if (!client.health().ok) fail("health ok=false")
                     if (!client.awaitReady(10_000L).ready) fail("daemon never ready")
                 }
+                step("real: /models advertises the attachment contract the client consumes") {
+                    val catalog = client.modelCatalog()
+                    // This smoke daemon boots with the baked default config
+                    // (no configured providers), so the catalog may be
+                    // empty; the advertisement itself is pinned by the
+                    // shared fixture + canned parse rows above and by the
+                    // Rust route test. When a provider IS registered, the
+                    // served contract must parse and drive the client.
+                    if (catalog.isEmpty()) {
+                        println("  (no configured providers: /models is empty; contract covered by fixture rows)")
+                        return@step
+                    }
+                    val entry = catalog.first()
+                    val limits = entry.attachmentLimits
+                        ?: fail("the real daemon must advertise attachmentLimits")
+                    assertEquals(
+                        entry.documentCapable,
+                        limits.document.capable,
+                        "the document gate must match documentCapable"
+                    )
+                    assertTrue(limits.maxUploadBytes > 0, "upload ceiling must be positive")
+                    assertTrue(
+                        limits.maxRequestBytes >= limits.maxUploadBytes,
+                        "the request ceiling can never sit below the upload ceiling"
+                    )
+                    assertTrue(limits.image.mimes.isNotEmpty(), "image mimes must be advertised")
+                    assertTrue(limits.document.mimes.isNotEmpty(), "document mimes must be advertised")
+                    assertTrue(
+                        limits.image.mimes.all { it.maxBytes > 0 },
+                        "every advertised per-MIME bound is positive"
+                    )
+                    // The client policy consumes the advertised numbers for
+                    // the exact (provider, model) pair; the emergency ceiling
+                    // remains the fallback for unknown models.
+                    val policy = AttachmentImages.policyForModel(catalog, entry.provider, entry.model)
+                    assertEquals("advertised", policy.source)
+                    assertEquals(limits.maxUploadBytes, policy.maxUploadBytes)
+                    assertEquals(limits.image.mimes.map { it.mime }, policy.imageMimes)
+                    assertTrue(
+                        AttachmentImages.emergencyPolicy().maxImageBytes <=
+                            limits.image.mimes.maxOf { it.maxBytes },
+                        "the emergency ceiling must stay conservative"
+                    )
+                    assertEquals(
+                        "emergency",
+                        AttachmentImages.policyForModel(catalog, entry.provider, "unknown-model").source
+                    )
+                }
                 step("create session") {
                     sessionId = client.createSession(
                         "default", "default", workspace.toString(), "frontend smoke"
@@ -1949,3 +2087,17 @@ object FrontendSmoke {
         }
     }
 }
+
+// Audits 5/6/16: a PARTIAL generation with a capped fingerprint round and a
+// never-hosted index service (the only honest null).
+private const val INDEX_COVERAGE_JSON = "{" +
+    "\"sessionId\":\"7\"," +
+    "\"index_coverage\":{" +
+    "\"workspace\":3,\"state\":\"ready\",\"generation\":2,\"published_generation\":2," +
+    "\"coverage\":{\"files_seen\":4500,\"files_indexed\":512,\"bytes_indexed\":2048," +
+    "\"complete\":false,\"truncated_reason\":\"batch_files\"}," +
+    "\"fingerprint\":{\"scanned\":12,\"complete\":false,\"shard\":3,\"round_start\":1," +
+    "\"epoch\":4,\"shards_done\":7,\"verify\":true,\"cursors\":[]," +
+    "\"truncated_reason\":\"fingerprint_files\"}," +
+    "\"freshness\":\"partial\",\"serving\":true}}"
+private const val INDEX_COVERAGE_UNHOSTED_JSON = "{\"sessionId\":\"7\",\"index_coverage\":null}"

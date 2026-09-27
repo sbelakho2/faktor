@@ -896,7 +896,10 @@ mod tests {
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = s.recover_all();
                 }));
-                assert!(caught.is_err(), "seam {seam} ordinal {ordinal} must fire");
+                assert!(
+                    m.store().seam_crash_observed(&caught),
+                    "seam {seam} ordinal {ordinal} must fire"
+                );
                 drop(s);
                 drop(m);
                 let m2 = reopen(&dir);

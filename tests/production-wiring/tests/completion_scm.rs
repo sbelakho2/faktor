@@ -4,6 +4,13 @@
 //! through the REAL `faktor_scm::GitHubCompletionScm` over the real
 //! `GitHubApp` adapter, against a loopback fake GitHub server.
 //!
+//! The graph is built ONLY through the production builder with the strict
+//! `[cloud.github_app]` section in config (fake API base) plus the
+//! documented external token-source/clock seams — no adapter is ever
+//! installed onto the executor after the build: the builder transforms the
+//! config into the executor's provider itself, and the test asserts the
+//! adapter path end to end.
+//!
 //! The assertions are on the ADAPTER PATH itself: the fake GitHub sees the
 //! installation-token bearer, the exact refs payload at the verified head,
 //! and the PR create with the orchestrator's head/base/marker — never a
@@ -18,14 +25,12 @@ use faktor_core::completion::CompletionContract;
 use faktor_core::id::VerificationRecordId;
 use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
 use faktor_provider::egress::PolicyCheckedHttpTransport;
-use faktor_scm::completion::GitHubCompletionScm;
-use faktor_scm::github::GitHubAppConfig;
-use faktor_scm::store::{MemoryScmStore, RepositoryRow, ScmStore};
-use faktor_scm::{GitHubApp, ManualClock, StaticTokenSource};
+use faktor_scm::store::RepositoryRow;
+use faktor_scm::{ManualClock, StaticTokenSource};
 use faktor_session::{Task, TaskBudget};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use faktor_tests_production_wiring::wiring::{self, Config};
+use faktor_tests_production_wiring::wiring::{self, CloudGithubAppCfg, Config, GithubAppSeams};
 
 const TENANT: &str = "tenant-a";
 const NOW_MS: i64 = 1_700_000_000_000;
@@ -352,11 +357,53 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
     git(&repo, &["checkout", "-q", "-b", "feature/x"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
 
-    // The daemon graph: the production TaskExecutor, session store and
-    // supervisor the serve path builds.
+    // The fake GitHub server the config's api_base points the REAL adapter
+    // at.
+    let server = MockServer::start().await;
+
+    // The daemon graph: the production builder transforms the strict
+    // `[cloud.github_app]` section into the executor's completion SCM
+    // provider. Only EXTERNAL seams are substituted (a deterministic token
+    // source and clock) — the test never installs an adapter post-build.
     let data = dir.path().join("data");
-    let graph =
-        wiring::build_production_graph(&data, Config::default()).expect("production daemon graph");
+    let mut config = Config::default();
+    config.cloud.enabled = true;
+    config.cloud.github_app = Some(CloudGithubAppCfg {
+        enabled: true,
+        app_id: Some(7),
+        key_payload: Some("unused.pem".to_string()),
+        webhook_secret: Some("unused.secret".to_string()),
+        api_base: Some(server.base()),
+        organization: Some(TENANT.to_string()),
+        ..Default::default()
+    });
+    let graph = wiring::build_production_graph_with_scm_seams(
+        &data,
+        config,
+        GithubAppSeams {
+            token_source: Some(Arc::new(
+                StaticTokenSource::minimal(i64::MAX).expect("deterministic token source"),
+            )),
+            clock: Some(Arc::new(ManualClock::new(NOW_MS))),
+            // The loopback-permitting external transport seam: the fake
+            // GitHub server is not reachable through the daemon's
+            // external-only gate, so the test substitutes the documented
+            // external I/O seam (never a post-build adapter install).
+            transport: Some(Arc::new(PolicyCheckedHttpTransport::permissive())),
+        },
+    )
+    .expect("production daemon graph");
+    // The daemon opened the ONE durable SCM store at construction; the
+    // synced repository row the completion adapter resolves installations
+    // from is seeded through that same store authority.
+    let store = graph
+        .scm
+        .clone()
+        .expect("an enabled [cloud] section wires the durable scm store");
+    store
+        .upsert_repository(&repository_row("acme", "widgets", 7))
+        .expect("synced repository row");
+
     let workspace = graph
         .session
         .create_workspace(repo.to_str().unwrap())
@@ -369,30 +416,6 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
     // The protocol surfaces' own owner-worktree adoption: the completion
     // step resolves the owner root from the session's durable worktree row.
     graph.session.ensure_owner_worktree(parent).unwrap();
-
-    // The PRODUCTION SCM adapter (the same construction `serve_impl` wires),
-    // over a permssive checked transport to the loopback fake GitHub.
-    let server = MockServer::start().await;
-    let store: Arc<dyn ScmStore> = Arc::new(MemoryScmStore::new());
-    store
-        .upsert_repository(&repository_row("acme", "widgets", 7))
-        .expect("synced repository row");
-    let app = GitHubApp::new(
-        GitHubAppConfig {
-            api_base: server.base(),
-            ..Default::default()
-        },
-        Arc::new(PolicyCheckedHttpTransport::permissive()),
-        Arc::new(StaticTokenSource::minimal(i64::MAX).expect("token source")),
-        store.clone(),
-        Arc::new(ManualClock::new(NOW_MS)),
-    )
-    .expect("github app adapter");
-    let adapter =
-        GitHubCompletionScm::new(Arc::new(app), store.clone(), TENANT).expect("completion adapter");
-    graph
-        .tasks
-        .set_completion_scm_provider(Some(Arc::new(adapter)));
 
     // Script the canonical reconciliation: absent branch -> create ref ->
     // absent PR -> create PR.
@@ -436,6 +459,10 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
     );
 
     let proof = seed_contract_task(&graph, parent, "ship the wired PR");
+    // The task is contracted while the graph was built; if the builder had
+    // NOT transformed `[cloud.github_app]` into the executor's provider the
+    // native PR step would fail with `native_pr_scm_not_configured` — the
+    // run below proves the built executor already carries the adapter.
     let report = graph
         .tasks
         .run_completion_steps(parent, proof)

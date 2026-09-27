@@ -430,6 +430,16 @@ pub struct EvidenceQuery {
     pub failures: Vec<String>,
 }
 
+/// One evidence package together with the durable identity/freshness
+/// metadata audit 16 requires every package to carry: the index generation,
+/// the workspace content/fingerprint identity, the coverage and the typed
+/// freshness. Cold packages carry honest `None` identities (no generation)
+/// and `stale_while_rebuilding`/`partial` freshness.
+struct IndexEvidencePackage {
+    evidence: Vec<Evidence>,
+    meta: faktor_index::EvidencePackageMeta,
+}
+
 /// Hard wall budget of the legacy evidence degrade (audit 14/26): when the
 /// IndexService cannot be hosted, the old bounded-scan provider is awaited
 /// under this cap, so a slow or stuck provider can never hold a turn past
@@ -444,8 +454,9 @@ const LEGACY_EVIDENCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 /// indistinguishable `None` (the old `Option` wrapper's defect) and can
 /// never be mistaken for an honest "no evidence" answer.
 enum ColdEvidenceOutcome {
-    /// The cold provider served a (possibly empty) package.
-    Served(Vec<Evidence>),
+    /// The cold provider served a (possibly empty) package with its typed
+    /// freshness metadata (audit 16).
+    Served(Vec<Evidence>, faktor_index::EvidencePackageMeta),
     /// The IndexService is not hosted (or not attached): the caller's
     /// documented legacy bounded-scan degrade.
     NotHosted,
@@ -5232,10 +5243,17 @@ impl AgentRuntime {
             // therefore never silently equivalent to "no evidence found" —
             // a policy that already treats missing evidence as failing can
             // distinguish the two from the durable record.
+            let mut evidence_package_meta: Option<faktor_index::EvidencePackageMeta> = None;
             let mut evidence = match self.index_evidence_if_ready(handle, &evidence_query)? {
-                Some(evidence) => evidence,
+                Some(package) => {
+                    evidence_package_meta = Some(package.meta);
+                    package.evidence
+                }
                 None => match self.cold_evidence_if_unready(handle, &evidence_query).await {
-                    ColdEvidenceOutcome::Served(evidence) => evidence,
+                    ColdEvidenceOutcome::Served(evidence, meta) => {
+                        evidence_package_meta = Some(meta);
+                        evidence
+                    }
                     ColdEvidenceOutcome::Degraded(status) => {
                         // The cold ladder ran but its off-turn bridge failed
                         // (provider panic / unschedulable bridge): the SAME
@@ -5272,6 +5290,17 @@ impl AgentRuntime {
                     }
                 },
             };
+            if let Some(meta) = &evidence_package_meta {
+                // Audit 16: the package's generation/identity/freshness is a
+                // first-class, observable fact of the turn's evidence.
+                tracing::debug!(
+                    generation = meta.generation,
+                    freshness = meta.freshness.as_str(),
+                    coverage_complete = meta.coverage.complete,
+                    fingerprint_complete = meta.fingerprint.complete,
+                    "evidence package freshness"
+                );
+            }
             // Semantic provider DATA (audits 49/54/58/77): ONE bounded,
             // guarded consult per logical turn, and only when a REGISTERED
             // provider covers the operation. The payload rides as
@@ -11674,6 +11703,21 @@ impl AgentRuntime {
             .map(|service| service.worker_status())
     }
 
+    /// Read-only coverage diagnostics of the lazily-hosted index service
+    /// (audits 5/6): `Some(snapshot)` exactly when the service was ever
+    /// opened AND the workspace is attached. Never opens the service and
+    /// never starts a build as a side effect; `None` is the honest "no
+    /// hosted index to report" (never a fabricated complete coverage).
+    pub fn index_coverage_snapshot(
+        &self,
+        workspace: faktor_core::WorkspaceId,
+    ) -> Option<faktor_index::IndexCoverageSnapshot> {
+        self.index_service
+            .get()
+            .and_then(|service| service.as_ref())
+            .and_then(|service| service.coverage_snapshot(workspace))
+    }
+
     /// First-turn evidence swap (audits 30/64): `Some(evidence)` only when
     /// the session's workspace resolves AND the IndexService has a Ready
     /// generation for it. Attaching the workspace kicks the background
@@ -11686,7 +11730,7 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
         query: &EvidenceQuery,
-    ) -> faktor_core::Result<Option<Vec<Evidence>>> {
+    ) -> faktor_core::Result<Option<IndexEvidencePackage>> {
         let Some(ws) = handle.row().ok().map(|r| r.workspace_id) else {
             return Ok(None);
         };
@@ -11727,12 +11771,19 @@ impl AgentRuntime {
             );
             return Ok(None);
         };
+        let meta = view.evidence_package_meta();
         if query.prompt.len() > INDEX_EVIDENCE_MAX_PROMPT_BYTES {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(IndexEvidencePackage {
+                evidence: Vec::new(),
+                meta,
+            }));
         }
         let concepts = Self::evidence_concepts(query);
         if concepts.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(IndexEvidencePackage {
+                evidence: Vec::new(),
+                meta,
+            }));
         }
         // The CONFIGURED embedder (resolved from `[embeddings]` and exposed
         // by the evidence provider) fuses the semantic leg; `None` keeps
@@ -11741,8 +11792,22 @@ impl AgentRuntime {
         // retrieval NEVER silently substitutes lexical-only evidence.
         let search = faktor_search::SearchService::new(view.index(), self.deps.evidence.embedder());
         let hits = search.evidence_package(ws, &concepts, INDEX_EVIDENCE_MAX_HITS)?;
-        Ok(Some(
-            hits.into_iter()
+        if hits.is_empty() && view.miss_needs_fallback() {
+            // Audit 5: a retrieval MISS under an INCOMPLETE generation is not
+            // "no match" — the bounded direct filesystem/Git ladder must run
+            // before the turn claims nothing exists. The package metadata
+            // (partial coverage) rides the degrade.
+            tracing::info!(
+                workspace = ws.raw(),
+                freshness = meta.freshness.as_str(),
+                indexed = meta.coverage.files_indexed,
+                "index miss under incomplete coverage; serving the bounded direct fallback"
+            );
+            return Ok(None);
+        }
+        Ok(Some(IndexEvidencePackage {
+            evidence: hits
+                .into_iter()
                 .enumerate()
                 .map(|(i, h)| Evidence {
                     path: h.path,
@@ -11750,7 +11815,8 @@ impl AgentRuntime {
                     score: 1.0 / (1.0 + i as f64),
                 })
                 .collect(),
-        ))
+            meta,
+        }))
     }
 
     /// Run the synchronous cold ladder off the turn thread and map its TYPED
@@ -11813,7 +11879,9 @@ impl AgentRuntime {
         };
         // The provider's origin/stats carry the degrade ladder for
         // observability; evidence mapping keeps the renderer's shape
-        // (scores finite in [0,1]: the wire planner clamps again).
+        // (scores finite in [0,1]: the wire planner clamps again). The
+        // typed freshness metadata is derived BEFORE the hits move.
+        let meta = package.package_meta();
         let mut out: Vec<Evidence> = package
             .hits
             .into_iter()
@@ -11835,7 +11903,7 @@ impl AgentRuntime {
                 .then_with(|| a.path.cmp(&b.path))
         });
         out.truncate(INDEX_EVIDENCE_MAX_HITS);
-        ColdEvidenceOutcome::Served(out)
+        ColdEvidenceOutcome::Served(out, meta)
     }
 
     /// Bounded repository knowledge for the context (spec §8 class 3 +
@@ -15575,6 +15643,118 @@ fn file_hash_from_row(hex: &str) -> Option<faktor_core::hash::FileHash> {
     }
 }
 
+/// Typed refusal of the high-risk evidence-hash gate (audit 16). Every
+/// variant is a REFUSAL to rely on the evidence, never a silent degrade:
+/// the caller records it as a blocking reason, so the change cannot
+/// complete on drifted bytes; the next turn refreshes against the new state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditEvidenceRefusal {
+    /// The durable expectation is not a well-formed hash.
+    MalformedExpectation { path: String },
+    /// The file's CURRENT bytes differ from the edit service's expectation.
+    Drifted {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    /// The edit expected the file deleted, but it exists (or cannot be
+    /// proven absent).
+    UnexpectedlyPresent { path: String },
+    /// The file could not be read for the check (not proof of absence).
+    Unreadable { path: String, reason: String },
+}
+
+impl std::fmt::Display for EditEvidenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "high-risk evidence refused (refresh required): ")?;
+        match self {
+            EditEvidenceRefusal::MalformedExpectation { path } => {
+                write!(f, "{path} carries a malformed durable edit hash")
+            }
+            EditEvidenceRefusal::Drifted {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{path} currently hashes to {actual} but the edit service expects {expected}"
+            ),
+            EditEvidenceRefusal::UnexpectedlyPresent { path } => write!(
+                f,
+                "the edit service expects {path} deleted, but it still exists"
+            ),
+            EditEvidenceRefusal::Unreadable { path, reason } => {
+                write!(f, "{path} cannot be read for the edit-hash check: {reason}")
+            }
+        }
+    }
+}
+
+/// Audit 16 high-risk evidence gate: before a high-risk edit/review relies
+/// on per-file evidence, every changed file's CURRENT bytes must hash to the
+/// edit/checkpoint authority's newest recorded expected hash for that path.
+/// A file that moved under the evidence, an unreadable file and an
+/// expected-but-present deletion are TYPED refusals — the caller must
+/// refresh, never review stale bytes. A path with NO durable expectation has
+/// nothing to drift FROM: the review fetch binds the evidence to the current
+/// bytes (the refresh branch), so it is not a refusal.
+fn require_edit_evidence_hashes(
+    deps: &AgentDeps,
+    handle: &faktor_session::SessionHandle,
+    ws: &faktor_fs::WorkspaceHandle,
+    changed: &[String],
+) -> Result<(), EditEvidenceRefusal> {
+    let rows = deps
+        .snapshots
+        .as_ref()
+        .and_then(|s| s.checkpoints(handle.id()).ok())
+        .unwrap_or_default();
+    for path in changed
+        .iter()
+        .take(faktor_verify::review::REVIEW_MAX_CHANGED_FILES)
+    {
+        let latest = rows
+            .iter()
+            .filter(|r| &r.path == path)
+            .max_by_key(|r| r.sequence);
+        let Some(row) = latest else {
+            // Refresh: no durable edit to compare against; the caller's
+            // evidence is bound to the bytes it just read.
+            continue;
+        };
+        if !row.after_exists {
+            // The expectation is a deletion: any readable content violates it.
+            if ws
+                .hash_file_streaming(std::path::Path::new(path), None)
+                .is_ok()
+            {
+                return Err(EditEvidenceRefusal::UnexpectedlyPresent { path: path.clone() });
+            }
+            continue;
+        }
+        let Some(expected) = file_hash_from_row(&row.after_hash) else {
+            return Err(EditEvidenceRefusal::MalformedExpectation { path: path.clone() });
+        };
+        match ws.hash_file_streaming(std::path::Path::new(path), None) {
+            Ok((_, actual)) if actual == expected => {}
+            Ok((_, actual)) => {
+                return Err(EditEvidenceRefusal::Drifted {
+                    path: path.clone(),
+                    expected: expected.to_hex(),
+                    actual: actual.to_hex(),
+                });
+            }
+            Err(e) => {
+                return Err(EditEvidenceRefusal::Unreadable {
+                    path: path.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Bounded whole-content read: Ok(Some(bytes)) when the file exists and is
 /// at most the side bound; Ok(None) when it exists but is too large; Err
 /// when missing/unreadable.
@@ -16530,6 +16710,20 @@ async fn independent_completion_review(
     }
     for s in &evidence.suspects {
         review_push_str(&mut suspects, s.clone());
+    }
+    // 3b. Audit 16 high-risk evidence gate: before this review relies on the
+    //     per-file evidence, every changed file's CURRENT hash must equal the
+    //     edit/checkpoint authority's expected hash. A mismatch is a TYPED
+    //     refusal (blocking reason) — the change never completes on drifted
+    //     bytes; the next attempt refreshes against the new state.
+    if evidence.risk.level == faktor_verify::review::RiskLevel::High || semantic_high {
+        if let Err(refusal) = require_edit_evidence_hashes(deps, handle, ws, changed) {
+            tracing::warn!(
+                session = %handle.id(),
+                "high-risk review evidence refused: {refusal}"
+            );
+            review_push_str(&mut blocking, refusal.to_string());
+        }
     }
     // 4. Risky changes get the REAL separate review call. NEVER skipped:
     //    RouterUnavailable → local signals stand (warned); every other
@@ -32666,7 +32860,10 @@ mod tests {
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = runtime.recover();
                 }));
-                assert!(caught.is_err(), "{name}: seam {seam}/{ordinal} must fire");
+                assert!(
+                    runtime.deps().session.store().seam_crash_observed(&caught),
+                    "{name}: seam {seam}/{ordinal} must fire"
+                );
                 drop(runtime);
             }
             drop(manager);
@@ -37488,6 +37685,133 @@ mod tests {
         review["evidence"]["structured"].clone()
     }
 
+    /// A write tool that deliberately records NO checkpoint row: the audit
+    /// 16 drift fixture needs the newest durable expectation to come from
+    /// somewhere else than this write.
+    fn uncheckpointed_write_tool() -> Tool {
+        Tool {
+            name: "write_file".into(),
+            description: "write without a checkpoint".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|ctx, args| {
+                Box::pin(async move {
+                    let Some(ws) = &ctx.workspace else {
+                        return Err(Error::internal("no workspace wired"));
+                    };
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = args
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    if let Some(parent) = std::path::Path::new(path).parent() {
+                        if !parent.as_os_str().is_empty() {
+                            if let Ok(resolved) = ws.resolve(parent) {
+                                let _ = std::fs::create_dir_all(&resolved);
+                            }
+                        }
+                    }
+                    ws.write_atomic(std::path::Path::new(path), content.as_bytes())
+                        .map_err(|e| Error::internal(format!("write {path}: {e}")))?;
+                    Ok(ToolOutcome {
+                        text: format!("wrote {path}"),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    })
+                })
+            }),
+        }
+    }
+
+    /// Run one high-risk turn on a fresh review env whose write to
+    /// `src/auth.rs` is deliberately NOT check-pointed; `seed_expectation`
+    /// decides whether a durable edit expectation exists first.
+    async fn run_high_risk_drift_scenario(seed_expectation: bool) -> serde_json::Value {
+        let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[]);
+        if seed_expectation {
+            // An out-of-band durable expectation that the disk will NOT
+            // satisfy (the file lands with different bytes).
+            let expected =
+                faktor_core::hash::FileHash::from(blake3::hash(b"expected bytes").into());
+            snapshots
+                .record_change(
+                    session,
+                    "src/auth.rs",
+                    faktor_snapshot::FileState::missing(),
+                    None,
+                    faktor_snapshot::FileState::existing(expected),
+                    Some(b"expected bytes"),
+                )
+                .unwrap();
+        }
+        let script = vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "content": "pub fn authenticate() -> bool { false }\n",
+                }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ];
+        let (routing, _calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
+        let (deps, _d) = snapshot_review_deps(
+            &manager,
+            &snapshots,
+            &cas,
+            vec![
+                Arc::new(scripted_provider(script)),
+                mock_review_provider(r#"{"verdict":"clean","findings":[]}"#),
+            ],
+            vec![uncheckpointed_write_tool()],
+            routing,
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let outcome = runtime
+            .run_turn(session, "harden the auth path", &[])
+            .await
+            .unwrap();
+        outcome.review.expect("a risky change must run the review")
+    }
+
+    /// Audit 16 (hash-mismatch refusal path): a high-risk review whose
+    /// changed file no longer hashes to the edit authority's expected hash
+    /// REFUSES to rely on the evidence — the review blocks with the typed
+    /// refusal, never a silent pass.
+    #[tokio::test]
+    async fn high_risk_review_refuses_drifted_evidence_hash() {
+        let review = run_high_risk_drift_scenario(true).await;
+        assert_eq!(review["verdict"], "block", "{review}");
+        let joined = review_strings(review.get("blocking")).join("\n");
+        assert!(
+            joined.contains("high-risk evidence refused (refresh required)"),
+            "the refusal must be typed: {joined}"
+        );
+        assert!(
+            joined.contains("src/auth.rs") && joined.contains("currently hashes to"),
+            "the drift must name the file and both hashes: {joined}"
+        );
+    }
+
+    /// Audit 16 (refresh branch): with NO durable edit expectation there is
+    /// no recorded hash to drift FROM, so the review relies on evidence bound
+    /// to the bytes it just read — it is refreshed, never refused.
+    #[tokio::test]
+    async fn high_risk_review_without_an_edit_expectation_reviews_current_bytes() {
+        let review = run_high_risk_drift_scenario(false).await;
+        assert_ne!(review["verdict"], "block", "{review}");
+        let joined = review_strings(review.get("blocking")).join("\n");
+        assert!(
+            !joined.contains("high-risk evidence refused"),
+            "a missing expectation is a refresh, not a refusal: {joined}"
+        );
+    }
+
     #[tokio::test]
     async fn risky_change_independent_review_block_gates_even_when_checks_pass() {
         // (a) P0-13: a RISKY change (security path) with a mocked review
@@ -39775,7 +40099,10 @@ mod tests {
             "the pre-compaction estimate keeps its documented floor: {}",
             compact.context_tokens
         );
-        assert_eq!(compact.quality_floor, 60);
+        assert_eq!(
+            compact.quality_floor, 50,
+            "the compaction summarizer routes under its ADAPTIVE minimum"
+        );
         assert!(
             requests.iter().any(|r| r.phase == RouterPhase::Implement),
             "the drive's own call is routed with the real role too"
@@ -39795,6 +40122,7 @@ mod tests {
             quality: crate::QualityRequirement::Hard { minimum: 60 },
             expected_output_tokens: reserve,
             semantic_risk: 0,
+            output_trust: crate::OutputTrust::Implementation,
         };
         let cases: Vec<(RouterPhase, crate::ModelCallIntent, u64, u64)> = vec![
             (
@@ -39851,7 +40179,11 @@ mod tests {
                 seen[0].estimated_output_tokens, reserve,
                 "{phase:?}: output tokens == the configured reserve"
             );
-            assert_eq!(seen[0].quality_floor, 60, "{phase:?}: hard floor");
+            assert_eq!(
+                seen[0].quality_floor,
+                intent.quality_floor(),
+                "{phase:?}: the intent's own floor crosses verbatim"
+            );
         }
     }
 

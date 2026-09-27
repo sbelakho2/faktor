@@ -389,10 +389,11 @@ fn crash_run(seed: u64, boundary: &BoundarySpec) -> Result<WorldState, String> {
             point: seam,
             ordinal: *ordinal,
         });
+        let store = runtime.deps().session.store();
         let caught = catch_unwind(AssertUnwindSafe(|| {
             let _ = runtime.recover();
         }));
-        super::expect_crash_fired(caught)?;
+        super::expect_crash_fired_or_unavailable(caught, &store)?;
         drop(runtime);
     }
     drop(manager);

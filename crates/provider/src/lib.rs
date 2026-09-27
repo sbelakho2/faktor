@@ -297,6 +297,102 @@ pub const MAX_REQUEST_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 /// estimate so a document can never be free in the budget.
 pub const DOCUMENT_PART_TOKEN_ESTIMATE: u64 = 16_384;
 
+// ------------------------------------------------- attachment admission limits
+
+/// One per-MIME entry of the advertised attachment admission contract: the
+/// canonical media type plus the RAW byte ceiling admission enforces for it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AttachmentMimeLimit {
+    pub mime: String,
+    pub max_bytes: u64,
+}
+
+/// The advertised IMAGE attachment admission contract of one provider/model:
+/// the closed deliverable MIME allowlist with its per-MIME byte ceiling and
+/// the request-wide image byte bound. Clients consume these values instead
+/// of mirroring daemon constants.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AttachmentImageLimits {
+    pub mimes: Vec<AttachmentMimeLimit>,
+    pub max_request_bytes: u64,
+}
+
+/// The advertised DOCUMENT attachment admission contract of one
+/// provider/model: the model's [`Provider::document_capable`] gate, the
+/// closed deliverable MIME allowlist with its per-MIME byte ceiling and the
+/// request-wide document byte bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AttachmentDocumentLimits {
+    pub capable: bool,
+    pub mimes: Vec<AttachmentMimeLimit>,
+    pub max_request_bytes: u64,
+}
+
+/// The complete attachment admission contract the daemon advertises for one
+/// provider/model on the native model-catalog surfaces. This is the ONE Rust
+/// source of truth clients consume; they keep only a conservative emergency
+/// ceiling for the window before the catalog is read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AttachmentLimits {
+    /// Decoded-byte ceiling of ONE HTTP attachment upload
+    /// (`faktor_server::api::MAX_BODY_BYTES`-derived).
+    pub max_upload_bytes: u64,
+    /// Whole HTTP request body ceiling of the daemon.
+    pub max_request_bytes: u64,
+    /// Structural per-attachment ceiling (session/CAS layer).
+    pub max_attachment_bytes: u64,
+    pub image: AttachmentImageLimits,
+    pub document: AttachmentDocumentLimits,
+}
+
+impl AttachmentLimits {
+    /// Build the advertised contract for one provider/model from the
+    /// daemon's own numbers: the HTTP upload/request ceilings (server
+    /// constants) and the provider's per-image/document delivery bounds
+    /// (caps by [`MAX_MEDIA_BYTES_HARD`], the structural ceiling every
+    /// resolvable attachment fits).
+    pub fn for_model(
+        max_upload_bytes: u64,
+        max_request_bytes: u64,
+        provider_max_image_bytes: usize,
+        document_capable: bool,
+        provider_max_document_bytes: usize,
+    ) -> Self {
+        let image_bound = provider_max_image_bytes.min(MAX_MEDIA_BYTES_HARD) as u64;
+        let document_bound = provider_max_document_bytes.min(MAX_MEDIA_BYTES_HARD) as u64;
+        Self {
+            max_upload_bytes,
+            max_request_bytes,
+            max_attachment_bytes: faktor_core::attachment::MAX_ATTACHMENT_BYTES,
+            image: AttachmentImageLimits {
+                mimes: SUPPORTED_IMAGE_MIMES
+                    .iter()
+                    .map(|mime| AttachmentMimeLimit {
+                        mime: (*mime).to_string(),
+                        max_bytes: image_bound,
+                    })
+                    .collect(),
+                max_request_bytes: MAX_REQUEST_IMAGE_BYTES as u64,
+            },
+            document: AttachmentDocumentLimits {
+                capable: document_capable,
+                mimes: SUPPORTED_DOCUMENT_MIMES
+                    .iter()
+                    .map(|mime| AttachmentMimeLimit {
+                        mime: (*mime).to_string(),
+                        max_bytes: document_bound,
+                    })
+                    .collect(),
+                max_request_bytes: MAX_REQUEST_DOCUMENT_BYTES as u64,
+            },
+        }
+    }
+}
+
 /// Resolved attachment bytes carried by [`ContentKind::ImageData`].
 ///
 /// This is the media part's bounded byte carrier:
@@ -3409,5 +3505,74 @@ mod tests {
             tokenizer_for("ollama/qwen3.8", None),
             "the provider prefix before the last '/' never changes the identity"
         );
+    }
+
+    #[test]
+    fn attachment_limits_contract_is_one_canonical_serializable_shape() {
+        let limits = AttachmentLimits::for_model(
+            7 * 1024 * 1024,
+            10 * 1024 * 1024,
+            MAX_MODEL_IMAGE_BYTES,
+            true,
+            MAX_MODEL_DOCUMENT_BYTES,
+        );
+        let json = serde_json::to_value(&limits).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "maxUploadBytes": 7_340_032u64,
+                "maxRequestBytes": 10_485_760u64,
+                "maxAttachmentBytes": faktor_core::attachment::MAX_ATTACHMENT_BYTES,
+                "image": {
+                    "mimes": [
+                        {"mime": "image/png", "maxBytes": 5_242_880u64},
+                        {"mime": "image/jpeg", "maxBytes": 5_242_880u64},
+                        {"mime": "image/gif", "maxBytes": 5_242_880u64},
+                        {"mime": "image/webp", "maxBytes": 5_242_880u64}
+                    ],
+                    "maxRequestBytes": 16_777_216u64
+                },
+                "document": {
+                    "capable": true,
+                    "mimes": [
+                        {"mime": "application/pdf", "maxBytes": 8_388_608u64},
+                        {"mime": "text/plain", "maxBytes": 8_388_608u64}
+                    ],
+                    "maxRequestBytes": 16_777_216u64
+                }
+            })
+        );
+        // The advertised contract round-trips strictly: unknown members and
+        // missing members are typed serde refusals, never silent defaults.
+        let back: AttachmentLimits = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, limits);
+        let mut extra = json.clone();
+        extra["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<AttachmentLimits>(extra).is_err());
+        let mut missing = json.clone();
+        missing["document"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capable");
+        assert!(serde_json::from_value::<AttachmentLimits>(missing).is_err());
+        // A provider bound above the structural ceiling is capped, never
+        // advertised larger than any resolvable attachment; a document-less
+        // provider advertises capable=false with its honest bound.
+        let capped = AttachmentLimits::for_model(
+            1,
+            2,
+            MAX_MEDIA_BYTES_HARD + 4096,
+            false,
+            MAX_MEDIA_BYTES_HARD + 4096,
+        );
+        assert_eq!(
+            capped.image.mimes[0].max_bytes, MAX_MEDIA_BYTES_HARD as u64,
+            "the structural ceiling caps every advertised per-MIME bound"
+        );
+        assert_eq!(
+            capped.document.mimes[1].max_bytes,
+            MAX_MEDIA_BYTES_HARD as u64
+        );
+        assert!(!capped.document.capable);
     }
 }

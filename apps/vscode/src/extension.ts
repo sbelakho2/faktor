@@ -26,6 +26,7 @@ import {
   NativeEntitlementSnapshot,
   NativeEvidenceSelector,
   NativeIdentity,
+  NativeIndexCoverageSnapshot,
   NativeMessagePage,
   NativeModelInfo,
   NativePermissionEntry,
@@ -39,6 +40,7 @@ import {
   NativeVerificationView,
   ResponseLike,
   classifyPermissionReplyFailure,
+  indexCoverageLabel,
   permissionReplyFailureMessage,
 } from './nativeClient';
 import {
@@ -81,10 +83,13 @@ import {
 } from './money.ts';
 import {
   AdmitFailure,
+  AttachmentAdmissionPolicy,
+  EMERGENCY_ATTACHMENT_POLICY,
   PendingSubmission,
   StartFailure,
   StartTaskSettings,
   admitPendingSubmission,
+  attachmentPolicyForModel,
   boundedWebviewFiles,
   hasCompletionSteps,
   parseCompletionContract,
@@ -948,6 +953,10 @@ async function refresh(): Promise<void> {
         client.modelCatalog().catch(() => [] as NativeModelInfo[]),
       ]);
     const board = await boardPromise;
+    // Durable index coverage (audits 5/6): optional like the board read — an
+    // older daemon or a never-hosted index service yields null, never a
+    // snapshot failure.
+    const indexCoverage = await indexCoverageFor(client, sessionId);
     const task =
       tasks.length > 0
         ? taskSummary(tasks[0]!, runs[0]?.state ?? null, active.completionContract)
@@ -1006,6 +1015,7 @@ async function refresh(): Promise<void> {
       usagePanel,
       tournament: cockpit?.tournament ?? null,
       board,
+      indexCoverage,
       lastError: null,
     });
     // Assistant/status/tool lines are durable message rows; re-render the
@@ -1221,6 +1231,23 @@ async function boardFor(client: NativeClient, sessionId: string): Promise<BoardS
       );
     }
     return unavailableBoardState(`board read failed: ${messageOf(error)}`);
+  }
+}
+
+/**
+ * Durable index coverage read (audits 5/6/16): optional like the board read;
+ * a missing route (older daemon), an unhosted index service or a read
+ * failure yields null, and the status bar simply omits the index suffix —
+ * never a fabricated "current".
+ */
+async function indexCoverageFor(
+  client: NativeClient,
+  sessionId: string,
+): Promise<NativeIndexCoverageSnapshot | null> {
+  try {
+    return await client.indexCoverage(sessionId);
+  } catch {
+    return null;
   }
 }
 
@@ -1456,6 +1483,24 @@ async function startTask(
       });
       return;
     }
+    // Attachment admission numbers come from the daemon's advertised model
+    // contract, never from client-side mirrors: fetch the catalog for the
+    // session's chosen model; on any read failure fall back to the
+    // conservative emergency ceiling. Only done when bytes are attached.
+    let attachmentLimits: AttachmentAdmissionPolicy | undefined;
+    if (pending.attachments.length > 0) {
+      const session = store.snapshot().session;
+      if (session !== null) {
+        try {
+          const catalog = await client.modelCatalog();
+          attachmentLimits = attachmentPolicyForModel(catalog, session.provider, session.model);
+        } catch {
+          attachmentLimits = EMERGENCY_ATTACHMENT_POLICY;
+        }
+      } else {
+        attachmentLimits = EMERGENCY_ATTACHMENT_POLICY;
+      }
+    }
     const budgetCostRaw = config('budgetCostMicro', 0);
     const maxCostMicro = microFromNumber(budgetCostRaw);
     if (maxCostMicro === null) {
@@ -1484,6 +1529,7 @@ async function startTask(
       sessionId,
       pending,
       settings,
+      attachmentLimits,
       onStarted: (started) => {
         active.activeRunId = started.run_id;
         active.completionContract = contract;
@@ -1956,9 +2002,16 @@ function updateStatusBar(): void {
   };
   const icon = icons[snapshot.daemon] ?? '$(circle-slash)';
   const task = snapshot.task ? ` · task ${snapshot.task.state}` : '';
-  statusBar.text = `${icon} Faktor: ${snapshot.daemon}${task}`;
+  // Audit 5/6: the durable index coverage is displayed honestly — a PARTIAL
+  // or stale-while-rebuilding generation is named, never flattened to
+  // "ready"; an unhosted index is omitted (not faked as current).
+  const index = snapshot.indexCoverage ? ` · ${indexCoverageLabel(snapshot.indexCoverage)}` : '';
+  statusBar.text = `${icon} Faktor: ${snapshot.daemon}${task}${index}`;
+  const indexTooltip = snapshot.indexCoverage
+    ? ` · ${indexCoverageLabel(snapshot.indexCoverage)}`
+    : '';
   statusBar.tooltip = snapshot.baseUrl
-    ? `Faktor daemon ${snapshot.daemon} at ${snapshot.baseUrl}${snapshot.session ? ` · session ${snapshot.session.title}` : ''}`
+    ? `Faktor daemon ${snapshot.daemon} at ${snapshot.baseUrl}${snapshot.session ? ` · session ${snapshot.session.title}` : ''}${indexTooltip}`
     : 'Faktor daemon stopped';
   statusBar.show();
 }

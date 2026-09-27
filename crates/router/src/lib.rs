@@ -62,8 +62,8 @@ use std::sync::{Arc, Mutex};
 
 use faktor_core::model::{
     unix_now_ms, EffectivePriceState, ModelDescriptor, ModelEconomics, ModelPerformance,
-    PriceAuthority, PricingSnapshot, PricingState, RateLimitState, RiskBucket, RouteDecision,
-    RouterPhase, TaskClass, TokenUsage,
+    PriceAuthority, PricingSnapshot, PricingState, QualityAuthority, QualityStatement,
+    RateLimitState, RiskBucket, RouteDecision, RouterPhase, TaskClass, TokenUsage, VerifiedOutcome,
 };
 
 /// MODEL-CHECK-ONLY journaled task-budget ledger (micro-units) with
@@ -244,17 +244,50 @@ impl CostEstimate {
 /// the pricing state the catalog authority resolved for it. Every priced
 /// qualification/scoring path consumes these; the descriptor alone can no
 /// longer smuggle a lossy per-token projection into a decision.
+///
+/// `quality` is the authority-carrying quality statement of the same
+/// catalog row (quality-authority audit items 1/11): the four reliability
+/// dimensions plus their provenance. Qualification reads THIS, so a row
+/// whose quality is [`QualityAuthority::ConservativeUnknown`] can never
+/// clear a floor by its placeholder number — only a user declaration or
+/// durable verified outcomes authorize it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteCandidate {
     pub descriptor: ModelDescriptor,
     pub pricing: PricingState,
+    pub quality: QualityStatement,
 }
 
 impl RouteCandidate {
+    /// The legacy shape: the quality statement is derived from the
+    /// descriptor's performance with [`QualityAuthority::BuiltInPrior`]
+    /// provenance (a prior, never a measured value). Untouched
+    /// descriptor-only callers keep their exact numeric behavior; catalog
+    /// callers use [`RouteCandidate::with_quality`] to carry the row's REAL
+    /// authority.
     pub fn new(descriptor: ModelDescriptor, pricing: PricingState) -> Self {
+        let quality = QualityStatement::from_performance(
+            &descriptor.performance(),
+            QualityAuthority::BuiltInPrior,
+        );
         Self {
             descriptor,
             pricing,
+            quality,
+        }
+    }
+
+    /// The authority-carrying constructor: descriptor + catalog pricing
+    /// state + the catalog row's quality statement (provenance included).
+    pub fn with_quality(
+        descriptor: ModelDescriptor,
+        pricing: PricingState,
+        quality: QualityStatement,
+    ) -> Self {
+        Self {
+            descriptor,
+            pricing,
+            quality,
         }
     }
 
@@ -490,6 +523,53 @@ fn clears_quality_floor(p: &ModelPerformance, phase: RouterPhase, floor: u8) -> 
     }
 }
 
+/// The default (empty) outcome registry for qualification entry points that
+/// carry no durable verified-outcome store: every measured consult misses
+/// and the candidate's OWN quality statement decides.
+static EMPTY_OUTCOMES: outcomes::EmptyOutcomeStore = outcomes::EmptyOutcomeStore;
+
+/// The AUTHORITY-AWARE quality statement of one candidate under one request
+/// (quality-authority audit items 1/11):
+///
+/// - when the durable verified-outcome store holds evidence for this
+///   (provider, model, phase, task_class, risk_bucket) key, the MEASURED
+///   statement is returned — its reliability is the conservative
+///   verified-success confidence scaled to 0..=100 and its authority is
+///   [`QualityAuthority::Measured`] with the evidence attached. Measured
+///   outcomes supersede the candidate's declared quality (a user
+///   declaration can never exceed measured reality);
+/// - otherwise the candidate's own authority-carrying statement is
+///   returned verbatim. A [`QualityAuthority::ConservativeUnknown`]
+///   placeholder clears nothing above floor 0; only a user declaration
+///   (or a declared built-in prior) authorizes it.
+pub fn effective_quality_statement(
+    candidate: &RouteCandidate,
+    phase: RouterPhase,
+    task_class: TaskClass,
+    risk_bucket: RiskBucket,
+    now_ms: u64,
+    outcomes: &dyn outcomes::OutcomeStore,
+) -> QualityStatement {
+    let d = &candidate.descriptor;
+    if let Some(stats) =
+        outcomes.lookup_stats(&d.provider, &d.model, phase, task_class, risk_bucket)
+    {
+        let success_ppm = outcomes::verified_success_confidence_ppm(&stats);
+        return QualityStatement::measured(
+            success_ppm,
+            VerifiedOutcome {
+                provider: d.provider.clone(),
+                model: d.model.clone(),
+                phase,
+                success_ppm,
+                sample_count: stats.sample_count,
+                observed_at_ms: now_ms,
+            },
+        );
+    }
+    candidate.quality.clone()
+}
+
 /// Cache-aware base cost of one call, shared by the qualification budget
 /// axis and the scored candidates (computed exactly once per candidate).
 fn base_call_cost(d: &ModelDescriptor, req: &RouteRequest, cache: &[CacheState]) -> u64 {
@@ -636,7 +716,23 @@ pub fn qualified_priced_candidates_at<'a>(
     now_ms: u64,
 ) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
     let refs: Vec<&'a RouteCandidate> = candidates.iter().collect();
-    qualify_priced_refs(&refs, req, cache, health, now_ms)
+    qualify_priced_refs(&refs, req, cache, health, now_ms, &EMPTY_OUTCOMES)
+}
+
+/// [`qualified_priced_candidates_at`] with the durable verified-outcome
+/// registry consulted for the quality axis: measured outcomes supersede
+/// each candidate's declared quality statement. This is the production
+/// entry point every [`RouterService`] route uses.
+pub fn qualified_priced_candidates_authoritative_at<'a>(
+    candidates: &'a [RouteCandidate],
+    req: &RouteRequest,
+    cache: &[CacheState],
+    health: &LiveHealth,
+    now_ms: u64,
+    outcomes: &dyn outcomes::OutcomeStore,
+) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
+    let refs: Vec<&'a RouteCandidate> = candidates.iter().collect();
+    qualify_priced_refs(&refs, req, cache, health, now_ms, outcomes)
 }
 
 fn qualify_priced_refs<'a>(
@@ -645,6 +741,7 @@ fn qualify_priced_refs<'a>(
     cache: &[CacheState],
     health: &LiveHealth,
     now_ms: u64,
+    outcomes: &dyn outcomes::OutcomeStore,
 ) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
     let floor = req.quality_floor.min(100);
     let mut fit_survivors = 0usize;
@@ -673,8 +770,21 @@ fn qualify_priced_refs<'a>(
             continue;
         }
         fit_survivors += 1;
-        // Axis 4: quality floor.
-        if !clears_quality_floor(&d.performance(), req.phase, floor) {
+        // Axis 4: the authority-aware phase quality floor (quality-authority
+        // audit): a ConservativeUnknown placeholder clears NOTHING above 0
+        // (its numeric 50 is not a measured 50), a user-declared or
+        // built-in prior clears by its value, and durable measured outcomes
+        // supersede both. The floor VALUES themselves are unchanged
+        // (implement/review/debug keep hard 60).
+        let quality = effective_quality_statement(
+            c,
+            req.phase,
+            req.task_class,
+            req.risk_bucket,
+            now_ms,
+            outcomes,
+        );
+        if !quality.clears_floor(req.phase, floor) {
             continue;
         }
         quality_survivors += 1;
@@ -761,11 +871,37 @@ pub fn qualify_specific_at<'a>(
     health: &LiveHealth,
     now_ms: u64,
 ) -> Result<QualifiedCandidate<'a>, QualificationFailure> {
+    qualify_specific_authoritative_at(
+        candidates,
+        provider,
+        model,
+        req,
+        cache,
+        health,
+        now_ms,
+        &EMPTY_OUTCOMES,
+    )
+}
+
+/// [`qualify_specific_at`] with the durable verified-outcome registry
+/// consulted for the pinned candidate's quality axis (measured outcomes
+/// supersede the pin's declared statement).
+#[allow(clippy::too_many_arguments)] // one explicit axis per parameter, mirroring the callers
+pub fn qualify_specific_authoritative_at<'a>(
+    candidates: &'a [RouteCandidate],
+    provider: &str,
+    model: &str,
+    req: &RouteRequest,
+    cache: &[CacheState],
+    health: &LiveHealth,
+    now_ms: u64,
+    outcomes: &dyn outcomes::OutcomeStore,
+) -> Result<QualifiedCandidate<'a>, QualificationFailure> {
     let refs: Vec<&'a RouteCandidate> = candidates
         .iter()
         .filter(|c| c.descriptor.provider == provider && c.descriptor.model == model)
         .collect();
-    let mut qualified = qualify_priced_refs(&refs, req, cache, health, now_ms)?;
+    let mut qualified = qualify_priced_refs(&refs, req, cache, health, now_ms, outcomes)?;
     Ok(qualified.remove(0))
 }
 
@@ -1619,7 +1755,44 @@ impl RouterService {
         now_ms: u64,
     ) -> Result<QualifiedCandidate<'_>, QualificationFailure> {
         let health = self.telemetry.snapshot();
-        qualify_specific_at(&self.priced, provider, model, req, cache, &health, now_ms)
+        qualify_specific_authoritative_at(
+            &self.priced,
+            provider,
+            model,
+            req,
+            cache,
+            &health,
+            now_ms,
+            self.outcomes.as_ref(),
+        )
+    }
+
+    /// The AUTHORITY-AWARE, measured-outcome-superseding quality statement
+    /// of one priced candidate (quality-authority audit): `None` when the
+    /// candidate is not in the priced set. Routing policies use this to
+    /// validate a pin's quality without ever reading the placeholder
+    /// number as measured.
+    pub fn effective_quality(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+        risk_bucket: RiskBucket,
+    ) -> Option<QualityStatement> {
+        self.priced
+            .iter()
+            .find(|c| c.descriptor.provider == provider && c.descriptor.model == model)
+            .map(|c| {
+                effective_quality_statement(
+                    c,
+                    phase,
+                    task_class,
+                    risk_bucket,
+                    unix_now_ms(),
+                    self.outcomes.as_ref(),
+                )
+            })
     }
 
     /// Expected cost = base + P(retry)*base + (1-P(success))*escalation,
@@ -1675,8 +1848,15 @@ impl RouterService {
         now_ms: u64,
     ) -> Result<RouteDecision, String> {
         let health = self.telemetry.snapshot();
-        let qualified = qualified_priced_candidates_at(&self.priced, req, cache, &health, now_ms)
-            .map_err(|f| f.route_error())?;
+        let qualified = qualified_priced_candidates_authoritative_at(
+            &self.priced,
+            req,
+            cache,
+            &health,
+            now_ms,
+            self.outcomes.as_ref(),
+        )
+        .map_err(|f| f.route_error())?;
         let scored = score_priced_candidates(&qualified, &self.priced, req, self.outcomes.as_ref());
         let winner = scored.iter().min_by(|a, b| a.compare(b)).ok_or_else(|| {
             "no candidate clears capability/fit filtering (missing: )".to_string()
@@ -1764,8 +1944,15 @@ impl RouterService {
         let health = self.telemetry.snapshot();
         // 1. THE cheap qualification pass (capability/quality/health/
         //    budget/latency) — the same single pass every path consumes.
-        let qualified = qualified_priced_candidates_at(&self.priced, req, cache, &health, now_ms)
-            .map_err(|f| f.route_error())?;
+        let qualified = qualified_priced_candidates_authoritative_at(
+            &self.priced,
+            req,
+            cache,
+            &health,
+            now_ms,
+            self.outcomes.as_ref(),
+        )
+        .map_err(|f| f.route_error())?;
         // 2. Pre-rank by the cheap (unmeasured) expected-cost ladder.
         let mut pre =
             score_priced_candidates(&qualified, &self.priced, req, self.outcomes.as_ref());
@@ -4876,5 +5063,243 @@ mod tests {
             unix_now_ms(),
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod quality_authority_tests {
+    use super::*;
+    use faktor_core::model::{MicroUsdPerMillionTokens, PriceQuote};
+
+    fn perf(code: u8, context: u8) -> ModelPerformance {
+        ModelPerformance {
+            context_reliability: context,
+            coding_reliability: code,
+            estimated_latency_ms: 500,
+            rate_limit_state: RateLimitState::Healthy,
+        }
+    }
+
+    fn descriptor(provider: &str, model: &str, code: u8, context: u8) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: provider.into(),
+            model: model.into(),
+            context: 128_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: true,
+            thinking: true,
+            vision: false,
+            structured_output: true,
+            embeddings: false,
+            streaming: true,
+            economics: ModelEconomics {
+                tool_reliability: code,
+                reasoning_reliability: code,
+                coding_reliability: code,
+                context_reliability: context,
+                estimated_latency_ms: 500,
+                ..Default::default()
+            },
+            source: faktor_core::model::ModelSource::ProviderCatalog,
+        }
+    }
+
+    fn exact(input: u64, output: u64) -> PricingState {
+        PricingState::Known(PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(input),
+                output: MicroUsdPerMillionTokens(output),
+                cache_read: MicroUsdPerMillionTokens(0),
+                cache_write: MicroUsdPerMillionTokens(0),
+            },
+            1,
+            "test-row".into(),
+        ))
+    }
+
+    fn candidate(
+        provider: &str,
+        model: &str,
+        code: u8,
+        context: u8,
+        quality: QualityStatement,
+    ) -> RouteCandidate {
+        RouteCandidate::with_quality(
+            descriptor(provider, model, code, context),
+            exact(1_000, 2_000),
+            quality,
+        )
+    }
+
+    fn request(floor: u8) -> RouteRequest {
+        RouteRequest {
+            phase: RouterPhase::Implement,
+            required_capabilities: vec![],
+            context_tokens: 1_000,
+            estimated_output_tokens: 100,
+            quality_floor: floor,
+            task_budget_remaining_micro: 0,
+            latency_preference_ms: None,
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Low,
+        }
+    }
+
+    #[test]
+    fn conservative_unknown_placeholder_never_clears_a_floor_but_a_declaration_does() {
+        // The audit core (item 11): the undeclared row carries the same
+        // numeric 50 as the declared one, but its authority says UNKNOWN —
+        // so it clears no positive floor. The user declaration authorizes
+        // its own value; both are admitted at floor 0 (no requirement).
+        let unknown = candidate(
+            "unknown",
+            "m",
+            50,
+            50,
+            QualityStatement::conservative_unknown(&perf(50, 50)),
+        );
+        let declared = candidate(
+            "declared",
+            "m",
+            50,
+            50,
+            QualityStatement {
+                tool_reliability: 50,
+                reasoning_reliability: 50,
+                coding_reliability: 50,
+                context_reliability: 50,
+                authority: QualityAuthority::UserConfigured {
+                    source: "providers.declared.quality".into(),
+                    version: "faktor-user-quality-v1".into(),
+                },
+            },
+        );
+        let both = vec![unknown.clone(), declared.clone()];
+        let q = qualified_priced_candidates_at(
+            &both,
+            &request(50),
+            &[],
+            &LiveHealth::default(),
+            unix_now_ms(),
+        )
+        .unwrap();
+        assert_eq!(q.len(), 1, "only the declared row is authorized");
+        assert_eq!(q[0].descriptor.provider, "declared");
+        let q0 = qualified_priced_candidates_at(
+            &both,
+            &request(0),
+            &[],
+            &LiveHealth::default(),
+            unix_now_ms(),
+        )
+        .unwrap();
+        assert_eq!(q0.len(), 2, "floor 0 imposes no quality requirement");
+        // The statement itself states the semantics exactly.
+        assert!(!unknown.quality.clears_floor(RouterPhase::Implement, 50));
+        assert!(declared.quality.clears_floor(RouterPhase::Implement, 50));
+    }
+
+    #[test]
+    fn measured_outcomes_supersede_declared_quality_in_both_directions() {
+        // Declared 95 with a recorded verified FAILURE: the measured
+        // statement supersedes the declaration and floor 80 refuses it.
+        let declared = candidate(
+            "declared",
+            "m",
+            95,
+            95,
+            QualityStatement {
+                tool_reliability: 95,
+                reasoning_reliability: 95,
+                coding_reliability: 95,
+                context_reliability: 95,
+                authority: QualityAuthority::UserConfigured {
+                    source: "providers.declared.quality".into(),
+                    version: "faktor-user-quality-v1".into(),
+                },
+            },
+        );
+        let key = OutcomeKey {
+            provider: "declared".into(),
+            model: "m".into(),
+            phase: RouterPhase::Implement,
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Low,
+        };
+        let weak = MemoryOutcomeStore::default();
+        weak.append_sample(
+            &key,
+            OutcomeSample {
+                verified_success: false,
+                rework_cost_micro: 500_000,
+                rework_turns: 2,
+            },
+        );
+        let weak_rows = vec![declared.clone()];
+        let err = qualified_priced_candidates_authoritative_at(
+            &weak_rows,
+            &request(80),
+            &[],
+            &LiveHealth::default(),
+            unix_now_ms(),
+            &weak,
+        )
+        .unwrap_err();
+        assert_eq!(err.quality_survivors, 0, "measured failure supersedes 95");
+        // An UNDECLARED placeholder with strong durable evidence is
+        // authorized BY THE MEASUREMENT (never by its numeric 50).
+        let unknown = candidate(
+            "unknown",
+            "m",
+            50,
+            50,
+            QualityStatement::conservative_unknown(&perf(50, 50)),
+        );
+        let strong = MemoryOutcomeStore::default();
+        let key = OutcomeKey {
+            provider: "unknown".into(),
+            model: "m".into(),
+            ..key
+        };
+        for _ in 0..100 {
+            strong.append_sample(
+                &key,
+                OutcomeSample {
+                    verified_success: true,
+                    rework_cost_micro: 0,
+                    rework_turns: 0,
+                },
+            );
+        }
+        let unknown_rows = vec![unknown.clone()];
+        let q = qualified_priced_candidates_authoritative_at(
+            &unknown_rows,
+            &request(60),
+            &[],
+            &LiveHealth::default(),
+            unix_now_ms(),
+            &strong,
+        )
+        .unwrap();
+        assert_eq!(q.len(), 1, "measured evidence authorizes the unknown row");
+        let st = effective_quality_statement(
+            &unknown,
+            RouterPhase::Implement,
+            TaskClass::Medium,
+            RiskBucket::Low,
+            unix_now_ms(),
+            &strong,
+        );
+        assert!(st.authority.is_measured());
+        assert!(st.coding_reliability >= 60, "confidence scales to 0..=100");
+        let evidence = match st.authority {
+            QualityAuthority::Measured(ref outcome) => outcome.clone(),
+            other => panic!("measured authority expected, got {other:?}"),
+        };
+        assert_eq!(evidence.provider, "unknown");
+        assert_eq!(evidence.sample_count, 100);
+        assert!(evidence.success_ppm >= 600_000);
     }
 }

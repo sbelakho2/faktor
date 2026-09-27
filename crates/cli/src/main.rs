@@ -584,6 +584,35 @@ fn build_report_json(include_self_digest: bool) -> Value {
     })
 }
 
+/// The injectable EXTERNAL seams of the daemon's GitHub App surface — the
+/// pieces of the `[cloud.github_app]` completion-SCM wiring that talk to the
+/// network or read the wall clock, so a certification host can substitute a
+/// deterministic double for any of them:
+///
+/// - [`Self::token_source`] replaces the installation-token credential
+///   source (production builds the RS256 [`faktor_scm::GitHubAppTokenSource`]
+///   over the operator-staged PKCS#8 key payload when `None`);
+/// - [`Self::clock`] replaces the wall clock (`None` = the production
+///   [`faktor_scm::SystemClock`]);
+/// - [`Self::transport`] replaces the daemon's checked egress transport for
+///   this surface only (`None` = the daemon's ONE policy-checked transport).
+///
+/// The API base, organization, app id and PR policy are CONFIG (the strict
+/// `[cloud.github_app]` section) — never a seam. There is no config key,
+/// environment variable or CLI flag for these seams; production entries
+/// always pass [`GithubAppSeams::default`], so the daemon builder wires the
+/// completion SCM provider from config by default.
+#[derive(Clone, Default)]
+pub struct GithubAppSeams {
+    /// The installation-token source override.
+    pub token_source: Option<Arc<dyn faktor_scm::InstallationTokenSource>>,
+    /// The clock override.
+    pub clock: Option<Arc<dyn faktor_scm::Clock>>,
+    /// The egress transport override (a loopback-permitting fake-server
+    /// transport in tests); production uses the daemon's checked transport.
+    pub transport: Option<Arc<dyn HttpTransport>>,
+}
+
 /// Build the full daemon dependency graph (audit 12/17): every lifetime
 /// authority is built EXACTLY ONCE in the order of
 /// [`graph::DAEMON_CONSTRUCTION_ORDER`] — steps 1-2 (store/session + CAS)
@@ -597,10 +626,23 @@ pub fn build_daemon(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
 ) -> Result<DaemonGraph, String> {
-    // The sync entry is the acquisition-planner seam with no planner: one
-    // shared construction path for steps 1-2 (store/session + CAS) and step 3
-    // (the ONE supervisor), so no parallel authority is ever assembled here.
-    build_daemon_with_acquisition_planner(data_dir, config, None)
+    // Production entries pass the default (`None`) external seams: the
+    // completion-SCM adapter is wired from `[cloud.github_app]` itself.
+    build_daemon_with_scm_seams(data_dir, config, GithubAppSeams::default())
+}
+
+/// [`build_daemon`] with the explicit GitHub App EXTERNAL seams (transport
+/// / token source / clock). The daemon's real `build_daemon_core` assembly
+/// still transforms `[cloud.github_app]` into the completion SCM provider;
+/// only the external I/O pieces are substituted, so the production-wiring
+/// certification proves the CONFIG -> adapter wiring instead of
+/// hand-installing the adapter after the build.
+pub fn build_daemon_with_scm_seams(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    scm_seams: GithubAppSeams,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_seams_and_planner(data_dir, config, scm_seams, None)
 }
 
 /// [`build_daemon`] with an explicit Faktor Acquire planner seam. Every
@@ -614,6 +656,18 @@ pub fn build_daemon(
 pub fn build_daemon_with_acquisition_planner(
     data_dir: &std::path::Path,
     config: Option<config::Config>,
+    planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_seams_and_planner(data_dir, config, GithubAppSeams::default(), planner)
+}
+
+/// The one shared sync construction path: steps 1-2 (store/session + CAS),
+/// step 3 (the ONE supervisor) and the core (steps 4-21) over both explicit
+/// seams (`None` in every production entry).
+fn build_daemon_with_seams_and_planner(
+    data_dir: &std::path::Path,
+    config: Option<config::Config>,
+    scm_seams: GithubAppSeams,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
@@ -632,6 +686,7 @@ pub fn build_daemon_with_acquisition_planner(
         None,
         graph::SemanticCfg::default(),
         planner,
+        scm_seams,
     )
 }
 
@@ -779,9 +834,17 @@ async fn build_daemon_with_mcp_inner(
     }
     // Now build the core graph on the SAME store with the MCP tools (steps
     // 4-16 of the construction order; the servers already ride the ONE
-    // supervisor above).
+    // supervisor above). Production external seams: the default ones.
     let mut graph = build_daemon_core(
-        data_dir, session, supervisor, config, mcp_tools, chunk_tx, semantic, None,
+        data_dir,
+        session,
+        supervisor,
+        config,
+        mcp_tools,
+        chunk_tx,
+        semantic,
+        None,
+        GithubAppSeams::default(),
     )?;
     graph.mcp_servers = servers;
     Ok(graph)
@@ -1276,12 +1339,15 @@ fn daemon_context_prior(
     Some(Arc::new(LearningRiskPrior::from_session(session.clone())))
 }
 
-/// The graph construction core (audit 12/17): steps 4-16 of
+/// The graph construction core (audit 12/17): steps 4-21 of
 /// [`graph::DAEMON_CONSTRUCTION_ORDER`] are built HERE, inline and in the
 /// documented order (the ordering test scans this function's body).
 /// Callers open the store and create the ONE supervisor (steps 1-3) — the
 /// async MCP connect must ride that same supervisor — and everything else
-/// of the daemon lifetime is this function's construction.
+/// of the daemon lifetime is this function's construction. The `scm_seams`
+/// are EXTERNAL seam substitutions only (`None` in production): the
+/// completion SCM provider is transformed from `[cloud.github_app]` here,
+/// never installed onto the executor after the build.
 #[allow(clippy::too_many_arguments)]
 fn build_daemon_core(
     data_dir: &std::path::Path,
@@ -1292,6 +1358,7 @@ fn build_daemon_core(
     chunk_tx: Option<std::sync::Arc<faktor_agent::ChunkSink>>,
     semantic: graph::SemanticCfg,
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
+    scm_seams: GithubAppSeams,
 ) -> Result<DaemonGraph, String> {
     // Step 4 — checked transport/security: the daemon's ONE sandbox policy
     // from the `[sandbox]` section (destination gate + OS-level
@@ -1333,11 +1400,20 @@ fn build_daemon_core(
             transport.clone()
         };
         if let Some(ollama) = p.build_ollama(provider_transport.clone()) {
+            // The registered instance carries this entry's catalog
+            // authorities (strict billing origin + pricing overrides + the
+            // `quality` declaration, item 1) while the CONCRETE Arc stays
+            // for live probing.
             let dyn_arc: Arc<dyn Provider> = ollama.clone();
-            providers
-                .try_register(dyn_arc)
-                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
-            ollama_warmers.push(ollama);
+            match p.wrap_catalog_authority(dyn_arc) {
+                Ok(wrapped) => {
+                    providers
+                        .try_register(wrapped)
+                        .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
+                    ollama_warmers.push(ollama);
+                }
+                Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
+            }
             continue;
         }
         match p.build(provider_transport) {
@@ -1440,6 +1516,40 @@ fn build_daemon_core(
     let learning = daemon_context_prior(config.efficiency.failure_learning, &session);
     let memory = graph::DaemonMemory::new(store.clone());
     let tokenizers = Arc::new(faktor_context::TokenizerRegistry::with_builtin_backends());
+    // Tokenizer compatibility certification (audit item 22): every
+    // built-in and configured catalog row is classified
+    // `exact | upper_bound | unsupported` against the ONE tokenizer
+    // registry; an exact-accounting row without an exact tokenizer refuses
+    // the daemon configuration immediately (never a silent estimate), and
+    // conservative-accounting rows stay routable with their UpperBound
+    // uncertainty recorded on the certification row.
+    let tokenizer_rows = graph::certify_provider_tokenizers(&providers, &tokenizers)?;
+    for row in &tokenizer_rows {
+        if row.is_exact() {
+            tracing::debug!(
+                provider = %row.provider,
+                model = %row.model,
+                tokenizer = %row.tokenizer,
+                compatibility = row.compatibility.as_str(),
+                estimate_kind = row.estimate_kind,
+                "tokenizer certification"
+            );
+        } else {
+            // Conservative-accounting row: routable, but every count it
+            // produces is an UpperBound — the uncertainty is attached to
+            // the daemon's budget/routing telemetry explicitly (never
+            // silently treated as exact).
+            tracing::info!(
+                provider = %row.provider,
+                model = %row.model,
+                tokenizer = %row.tokenizer,
+                compatibility = row.compatibility.as_str(),
+                estimate_kind = row.estimate_kind,
+                uncertainty = row.uncertainty,
+                "token accounting uncertainty: conservative UpperBound estimates"
+            );
+        }
+    }
     // Step 17 — Faktor Acquire (docs/acquire.md §13/§14): the ONE commerce
     // source service, constructed AFTER memory/tokenizers and BEFORE the
     // agent, because the `source_market` tool needs its Arc before the final
@@ -1603,6 +1713,37 @@ fn build_daemon_core(
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+    // Step 21 (continued) — the daemon's ONE durable SCM store and the
+    // completion-step SCM provider: an enabled `[cloud]` section opens the
+    // `scm.db` store HERE (the same allocation serve hands to the native
+    // control-plane/SCM surface — no second store authority), and an enabled
+    // `[cloud.github_app]` section is TRANSFORMED into the canonical
+    // `faktor_scm::GitHubCompletionScm` adapter of THIS executor at
+    // construction time. Disabled sections construct nothing (fail-closed
+    // parity: a contracted PR step then records the explicit
+    // `native_pr_scm_not_configured` blocker). Only the token source and
+    // clock may arrive through the external seams; API base, app id and
+    // organization are config.
+    let scm_store: Option<Arc<dyn faktor_scm::ScmStore>> = if config.cloud.enabled {
+        let path = config
+            .cloud
+            .scm_path(data_dir)
+            .map_err(|e| format!("cloud config: {e}"))?;
+        let path = enabled_section_db_path("cloud scm", path)?;
+        Some(Arc::new(faktor_scm::SqliteScmStore::open(&path).map_err(
+            |e| format!("cloud scm store {}: {e}", path.display()),
+        )?))
+    } else {
+        None
+    };
+    wire_completion_scm(
+        &config.cloud,
+        data_dir,
+        &transport,
+        scm_store.clone(),
+        &scm_seams,
+        &tasks,
+    )?;
     // THE durable evidence authority is the runtime's own allocation: the
     // graph stores the same `Arc` the runtime's compiler/archiver use, and
     // serve hands the same `Arc` to the native server. No second authority
@@ -1627,12 +1768,97 @@ fn build_daemon_core(
         memory,
         tokenizers,
         commerce,
+        scm: scm_store,
         agent,
         evidence,
         orchestrator,
         shadows,
         tasks,
     })
+}
+
+/// Transform the strict `[cloud.github_app]` section into the executor's
+/// completion-step SCM provider DURING daemon construction: the canonical
+/// [`faktor_scm::GitHubApp`] adapter over the daemon's ONE checked transport
+/// and durable `scm.db` store, wrapped by
+/// [`faktor_scm::GitHubCompletionScm`] for the executor's native PR step.
+///
+/// Disabled parity: while the section is absent/disabled nothing is read and
+/// nothing is installed — a contracted PR step then records the explicit
+/// `native_pr_scm_not_configured` blocker (never a silent skip). Production
+/// builds the RS256 token source from the operator-staged PKCS#8 key
+/// payload; the external seams may substitute the token source and the
+/// clock, but never the config.
+fn wire_completion_scm(
+    cloud: &config::CloudCfg,
+    data_dir: &std::path::Path,
+    transport: &Arc<dyn HttpTransport>,
+    store: Option<Arc<dyn faktor_scm::ScmStore>>,
+    seams: &GithubAppSeams,
+    tasks: &Arc<faktor_orchestrator::runtime::task_executor::TaskExecutor>,
+) -> Result<(), String> {
+    let Some(app_cfg) = cloud.github_app.as_ref().filter(|app| app.enabled) else {
+        return Ok(());
+    };
+    if !cloud.enabled {
+        return Err("cloud github_app: requires [cloud] enabled".into());
+    }
+    app_cfg.validate()?;
+    // An enabled github_app always rides an enabled [cloud] section, whose
+    // store the core opened above; a missing one is a construction-order
+    // violation, never a silently provider-less executor.
+    let store =
+        store.ok_or("cloud github_app: the enabled [cloud] section resolved no scm store")?;
+    let organization = app_cfg.organization()?;
+    let app_config = app_cfg.app_config()?;
+    // The external transport seam: a fake-server transport in certification,
+    // the daemon's ONE checked transport in production.
+    let transport: Arc<dyn HttpTransport> =
+        seams.transport.clone().unwrap_or_else(|| transport.clone());
+    let clock: Arc<dyn faktor_scm::Clock> = seams
+        .clock
+        .clone()
+        .unwrap_or_else(|| Arc::new(faktor_scm::SystemClock));
+    let tokens: Arc<dyn faktor_scm::InstallationTokenSource> = match &seams.token_source {
+        Some(tokens) => tokens.clone(),
+        None => {
+            let payload_root = cloud
+                .payload_root(data_dir)
+                .map_err(|e| format!("cloud github_app: {e}"))?;
+            let payloads = crate::payload::PayloadDir::new(payload_root);
+            let private_key_name = app_cfg
+                .key_payload
+                .as_deref()
+                .ok_or("cloud github_app: an enabled section requires `private_key`")?;
+            let private_key_pem = payloads
+                .load_private_key_pem(private_key_name)
+                .map_err(|e| format!("cloud github_app: {e}"))?;
+            let mut token_config = faktor_scm::GitHubAppTokenConfig {
+                app_id: app_cfg.app_id.unwrap_or(0),
+                private_key_pkcs8_pem: private_key_pem.into(),
+                api_base: app_config.api_base.clone(),
+                user_agent: app_config.user_agent.clone(),
+                ..Default::default()
+            };
+            token_config.max_attempts = token_config.max_attempts.max(1);
+            Arc::new(
+                faktor_scm::GitHubAppTokenSource::new(
+                    token_config,
+                    transport.clone(),
+                    clock.clone(),
+                )
+                .map_err(|e| format!("cloud github_app: {e}"))?,
+            )
+        }
+    };
+    let app =
+        faktor_scm::GitHubApp::new(app_config, transport.clone(), tokens, store.clone(), clock)
+            .map_err(|e| format!("cloud github_app: {e}"))?;
+    let completion_scm = faktor_scm::GitHubCompletionScm::new(Arc::new(app), store, organization)
+        .map_err(|e| format!("cloud github_app: {e}"))?;
+    tasks.set_completion_scm_provider(Some(Arc::new(completion_scm)));
+    tracing::info!("github app completion scm enabled");
+    Ok(())
 }
 
 /// Automatic-backup interval (audit 44): at most one snapshot per
@@ -3078,16 +3304,15 @@ async fn serve_impl(
     // graph (they ride the graph's checked transport), and both read the
     // operator-staged payload directory. Disabled sections build nothing.
     let config_cloud = config.cloud.clone();
-    let cloud_databases = if config.cloud.enabled {
-        let control_plane_path = config
-            .cloud
-            .control_plane_path(&data_dir)
-            .map_err(|e| format!("cloud config: {e}"))?;
-        let scm_path = config
-            .cloud
-            .scm_path(&data_dir)
-            .map_err(|e| format!("cloud config: {e}"))?;
-        Some((control_plane_path, scm_path))
+    // The control-plane path only: the durable SCM store is opened by the
+    // graph itself (step 21, `DaemonGraph::scm`) and serve reuses it.
+    let cloud_control_plane = if config.cloud.enabled {
+        Some(
+            config
+                .cloud
+                .control_plane_path(&data_dir)
+                .map_err(|e| format!("cloud config: {e}"))?,
+        )
     } else {
         None
     };
@@ -3188,9 +3413,11 @@ async fn serve_impl(
     deps = deps.with_terminal_policy(terminal_policy);
     deps.chunk_rx = Some(chunk_rx);
     // The additive real GitHub App surface (built only while the section is
-    // enabled; its initial sync is backgrounded after readiness below).
+    // enabled; its initial sync is backgrounded after readiness below). The
+    // durable SCM store itself is the graph's (opened once at step 21) —
+    // serve never opens a second store authority.
     let mut scm_daemon: Option<Arc<crate::scm_daemon::ScmDaemon>> = None;
-    if let Some((control_plane_path, scm_path)) = cloud_databases {
+    if let Some(control_plane_path) = cloud_control_plane {
         let control_plane_path =
             enabled_section_db_path("cloud control-plane", control_plane_path)?;
         let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
@@ -3204,21 +3431,23 @@ async fn serve_impl(
             ),
             Arc::new(faktor_cloud::SystemClock),
         ));
-        let scm_path = enabled_section_db_path("cloud scm", scm_path)?;
-        let scm = {
-            let store = faktor_scm::SqliteScmStore::open(&scm_path)
-                .map_err(|e| format!("cloud scm store {}: {e}", scm_path.display()))?;
-            Arc::new(store) as Arc<dyn faktor_scm::ScmStore>
-        };
-        let scm_store = scm.clone();
-        deps = deps.with_control_plane(control_plane).with_scm_store(scm);
+        // The enabled `[cloud]` section opened the graph's SCM store at
+        // construction (step 21); the control-plane routes, the webhook
+        // surface and the completion-step adapter all share that ONE store.
+        let scm_store = graph
+            .scm
+            .clone()
+            .ok_or("cloud scm: the enabled [cloud] section resolved no scm store")?;
+        deps = deps
+            .with_control_plane(control_plane)
+            .with_scm_store(scm_store.clone());
         // The GitHub App wiring rides the graph's ONE checked transport and
         // the operator-staged payload directory; a missing/corrupt/
         // too-permissive payload is a startup refusal (no half-wired SCM).
         scm_daemon = crate::scm_daemon::build_scm_daemon(
             &config_cloud,
             &data_dir,
-            scm_store.clone(),
+            scm_store,
             graph.transport.clone(),
         )
         .map_err(|e| format!("cloud scm wiring: {e}"))?;
@@ -3226,63 +3455,11 @@ async fn serve_impl(
             deps = deps.with_scm_webhook(daemon.clone());
             tracing::info!("github app scm surface enabled");
         }
-        // Completion-step SCM (P0 item 6): the SAME strict
-        // `[cloud.github_app]` section, operator-staged payload and shared
-        // `scm.db` rows the sync/webhook daemon uses feed the canonical
-        // `faktor_scm::GitHubCompletionScm` adapter of the task executor — a
-        // contracted PR step then runs the REAL GitHub App adapter instead
-        // of a private SCM domain. Disabled = no adapter is wired and a
-        // contracted PR step records the explicit
-        // `native_pr_scm_not_configured` blocker (fail closed, never a
-        // silent rebuild without the provider).
-        if let Some(app_cfg) = config_cloud.github_app.as_ref().filter(|app| app.enabled) {
-            app_cfg.validate()?;
-            let payload_root = config_cloud
-                .payload_root(&data_dir)
-                .map_err(|e| format!("cloud config: {e}"))?;
-            let payloads = crate::payload::PayloadDir::new(payload_root);
-            let private_key_name = app_cfg
-                .key_payload
-                .as_deref()
-                .ok_or("cloud github_app: an enabled section requires `private_key`")?;
-            let private_key_pem = payloads
-                .load_private_key_pem(private_key_name)
-                .map_err(|e| format!("cloud github_app: {e}"))?;
-            let organization = app_cfg.organization()?;
-            let app_config = app_cfg.app_config()?;
-            let clock: Arc<dyn faktor_scm::Clock> = Arc::new(faktor_scm::SystemClock);
-            let mut token_config = faktor_scm::GitHubAppTokenConfig {
-                app_id: app_cfg.app_id.unwrap_or(0),
-                private_key_pkcs8_pem: private_key_pem.into(),
-                api_base: app_config.api_base.clone(),
-                user_agent: app_config.user_agent.clone(),
-                ..Default::default()
-            };
-            token_config.max_attempts = token_config.max_attempts.max(1);
-            let tokens = Arc::new(
-                faktor_scm::GitHubAppTokenSource::new(
-                    token_config,
-                    graph.transport.clone(),
-                    clock.clone(),
-                )
-                .map_err(|e| format!("cloud github_app: {e}"))?,
-            );
-            let app = faktor_scm::GitHubApp::new(
-                app_config,
-                graph.transport.clone(),
-                tokens,
-                scm_store.clone(),
-                clock,
-            )
-            .map_err(|e| format!("cloud github_app: {e}"))?;
-            let completion_scm =
-                faktor_scm::GitHubCompletionScm::new(Arc::new(app), scm_store, organization)
-                    .map_err(|e| format!("cloud github_app: {e}"))?;
-            graph
-                .tasks
-                .set_completion_scm_provider(Some(Arc::new(completion_scm)));
-            tracing::info!("github app completion scm enabled");
-        }
+        // The completion-step SCM provider was transformed from the SAME
+        // `[cloud.github_app]` section DURING daemon construction
+        // (`build_daemon_core` wires `graph.tasks`), so serve never mutates
+        // the built executor; a disabled section stays provider-less and a
+        // contracted PR step records `native_pr_scm_not_configured`.
         tracing::info!("cloud control plane enabled");
     }
     // The additive `[cloud.sso]` section: the network OIDC adapter over the
@@ -4948,6 +5125,7 @@ fn doctor_run_with_config(
     doctor_worker_plane_line(config_path, &mut lines, &mut issues);
     doctor_sandbox_shell_line(config_path, &mut lines, &mut issues);
     doctor_network_isolation_line(&mut lines);
+    doctor_tokenizer_certification_line(config_path, &mut lines, &mut issues);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
             lines.push("store: ok".into());
@@ -5251,6 +5429,21 @@ struct DoctorGenerationStatus {
     workspace: u64,
     generation: u64,
     data: DoctorGenerationData,
+    /// Durable index coverage (audits 5/6): absent on legacy envelopes
+    /// (one-shot full builds, honestly treated as complete elsewhere).
+    #[serde(default)]
+    coverage: Option<faktor_index::IndexCoverage>,
+    /// Durable fingerprint shard coverage (audit 6).
+    #[serde(default)]
+    fingerprint_coverage: Option<faktor_index::FingerprintCoverage>,
+}
+
+/// The decoded published-generation facts the doctor reports: the typed
+/// embedding build status plus the durable coverage records (additive).
+struct DoctorPublishedStatus {
+    embedding: faktor_index::embedding::EmbeddingBuildStatus,
+    coverage: Option<faktor_index::IndexCoverage>,
+    fingerprint_coverage: Option<faktor_index::FingerprintCoverage>,
 }
 
 #[derive(serde::Deserialize)]
@@ -5377,8 +5570,18 @@ fn index_embedding_doctor(
             .join(raw.to_string())
             .join(format!("gen-{generation}.json"));
         match read_published_embedding_status(&path, raw, generation) {
-            Ok(Some(status)) => {
-                lines.push(format_index_embedding_line(raw, generation, &status));
+            Ok(Some(published)) => {
+                lines.push(format_index_embedding_line(
+                    raw,
+                    generation,
+                    &published.embedding,
+                ));
+                lines.push(format_index_coverage_line(
+                    raw,
+                    generation,
+                    published.coverage.as_ref(),
+                    published.fingerprint_coverage.as_ref(),
+                ));
             }
             Ok(None) => {
                 lines.push(format!(
@@ -5417,7 +5620,7 @@ fn read_published_embedding_status(
     path: &std::path::Path,
     raw: u64,
     generation: u64,
-) -> Result<Option<faktor_index::embedding::EmbeddingBuildStatus>, String> {
+) -> Result<Option<DoctorPublishedStatus>, String> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5451,12 +5654,56 @@ fn read_published_embedding_status(
     }
     // Mirror `EmbeddingIndex::sanitize`: another embedding format tag is
     // "no embeddings", never a fabricated status.
-    if decoded.data.embeddings.format != faktor_index::embedding::EMBEDDING_FORMAT {
-        return Ok(Some(
-            faktor_index::embedding::EmbeddingBuildStatus::Unconfigured,
-        ));
-    }
-    Ok(Some(decoded.data.embeddings.build.status()))
+    let embedding = if decoded.data.embeddings.format != faktor_index::embedding::EMBEDDING_FORMAT {
+        faktor_index::embedding::EmbeddingBuildStatus::Unconfigured
+    } else {
+        decoded.data.embeddings.build.status()
+    };
+    Ok(Some(DoctorPublishedStatus {
+        embedding,
+        coverage: decoded.coverage,
+        fingerprint_coverage: decoded.fingerprint_coverage,
+    }))
+}
+
+/// One additive doctor line per workspace: the durable index coverage
+/// (audits 5/6). A legacy envelope without a coverage record is NAMED as
+/// such (the old one-shot semantics), never silently reported as covered;
+/// an incomplete generation names its batch reason and counters.
+fn format_index_coverage_line(
+    raw: u64,
+    generation: u64,
+    coverage: Option<&faktor_index::IndexCoverage>,
+    fingerprint: Option<&faktor_index::FingerprintCoverage>,
+) -> String {
+    let coverage_text = match coverage {
+        None => "coverage=legacy (no record; treated complete)".to_string(),
+        Some(c) if c.complete => format!(
+            "coverage=complete files_seen={} files_indexed={} bytes_indexed={}",
+            c.files_seen, c.files_indexed, c.bytes_indexed
+        ),
+        Some(c) => format!(
+            "coverage=INCOMPLETE reason={} files_seen={} files_indexed={} bytes_indexed={}",
+            c.truncated_reason.as_deref().unwrap_or("unspecified"),
+            c.files_seen,
+            c.files_indexed,
+            c.bytes_indexed
+        ),
+    };
+    let fingerprint_text = match fingerprint {
+        None => "fingerprint=legacy".to_string(),
+        Some(f) if f.complete => "fingerprint=complete".to_string(),
+        Some(f) => format!(
+            "fingerprint=PARTIAL shard={}/{} round_start={} reason={}",
+            f.shard,
+            faktor_index::FINGERPRINT_SHARDS,
+            f.round_start,
+            f.truncated_reason.as_deref().unwrap_or("unspecified")
+        ),
+    };
+    format!(
+        "index coverage: workspace {raw}: generation {generation}: {coverage_text}; {fingerprint_text}"
+    )
 }
 
 /// One line per workspace: the typed state name is exact (`unconfigured`,
@@ -5701,6 +5948,117 @@ fn doctor_worker_plane_line(
                      (the daemon refuses this config and would not open the worker plane) {e}"
                 ));
             }
+            *issues += 1;
+        }
+    }
+}
+
+/// The tokenizer certification section (audit item 22): iterates every
+/// BUILT-IN documented catalog row plus (when a config is named) every
+/// configured provider's catalog rows, reporting
+/// `exact | upper_bound | unsupported` against the ONE tokenizer registry.
+/// An exact-accounting row without an exact tokenizer is an ISSUE — the
+/// daemon would refuse the configuration — while conservative-accounting
+/// rows are reported with the `upper_bound` uncertainty attached to their
+/// budget telemetry and stay routable.
+fn doctor_tokenizer_certification_line(
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let registry = faktor_context::TokenizerRegistry::with_builtin_backends();
+    let mut rows = graph::builtin_tokenizer_rows();
+    if let Some(path) = config_path {
+        match config::Config::load_strict(path) {
+            Ok(cfg) => {
+                // Build the configured adapters OFFLINE over a policy-shaped
+                // transport (the daemon's own destination policy, no secret
+                // scan installed — catalog rows need no request): this
+                // discovers each adapter's `known_models()` for the
+                // certification matrix without any network activity.
+                let sandbox = match cfg.sandbox_policy() {
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        lines.push(format!("tokenizers: FAILED sandbox policy: {e}"));
+                        *issues += 1;
+                        return;
+                    }
+                };
+                let destinations = sandbox
+                    .network
+                    .installed()
+                    .cloned()
+                    .unwrap_or_else(faktor_security::destination::DestinationPolicy::empty);
+                let transport: Arc<dyn faktor_provider::egress::HttpTransport> =
+                    match faktor_provider::egress::PolicyCheckedHttpTransport::try_with_policy(
+                        destinations,
+                    ) {
+                        Ok(t) => Arc::new(t),
+                        Err(e) => {
+                            lines.push(format!("tokenizers: FAILED egress transport: {e}"));
+                            *issues += 1;
+                            return;
+                        }
+                    };
+                let mut configured = ProviderRegistry::new();
+                for p in &cfg.providers {
+                    if let Ok(built) = p.build(transport.clone()) {
+                        let _ = configured.try_register(built);
+                    }
+                }
+                for id in configured.ids() {
+                    if let Some(p) = configured.get(&id) {
+                        for model in p.known_models() {
+                            rows.push((id.clone(), model));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                lines.push(format!(
+                    "tokenizers: FAILED config refused before certification: {e}"
+                ));
+                *issues += 1;
+                return;
+            }
+        }
+    }
+    match graph::certify_tokenizer_rows(&rows, &registry) {
+        Ok(certified) => {
+            let exact = certified.iter().filter(|r| r.is_exact()).count();
+            let upper = certified
+                .iter()
+                .filter(|r| {
+                    r.compatibility == faktor_provider::catalog::TokenizerCompatibility::UpperBound
+                })
+                .count();
+            let unsupported = certified
+                .iter()
+                .filter(|r| {
+                    r.compatibility == faktor_provider::catalog::TokenizerCompatibility::Unsupported
+                })
+                .count();
+            lines.push(format!(
+                "tokenizers: certified {} row(s) exact={exact} upper_bound={upper} \
+                 unsupported={unsupported}",
+                certified.len()
+            ));
+            for row in &certified {
+                lines.push(format!(
+                    "tokenizer: {} {} tokenizer={} compatibility={} accounting={:?} \
+                     estimate_kind={} uncertainty={}",
+                    row.provider,
+                    row.model,
+                    row.tokenizer,
+                    row.compatibility.as_str(),
+                    row.accounting,
+                    row.estimate_kind,
+                    row.uncertainty.unwrap_or("none"),
+                ));
+            }
+        }
+        Err(e) => {
+            lines.push(format!("tokenizers: FAILED {e}"));
             *issues += 1;
         }
     }
@@ -7126,6 +7484,7 @@ mod tests {
             None,
             semantic,
             None,
+            GithubAppSeams::default(),
         )
         .expect("daemon core builds with a configured semantic provider");
         assert_eq!(graph.semantic.providers().len(), 1);
@@ -9804,6 +10163,67 @@ mod tests {
     /// generation directory with no durable state row is flagged, and
     /// non-workspace junk (non-numeric names, the reserved id 0) is ignored
     /// without a line or a panic.
+    #[test]
+    fn doctor_reports_index_coverage_and_partial_fingerprint() {
+        use faktor_index::{FingerprintCoverage, IndexCoverage, IndexService};
+
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let index_root = dir.path().join("store").join("index_data");
+        let index = IndexService::open(
+            session.store(),
+            index_root,
+            faktor_fs::WorkspaceFileService::new(),
+        )
+        .unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), b"pub fn covered() -> i64 { 1 }\n").unwrap();
+        let ws = session.create_workspace(root.to_str().unwrap()).unwrap();
+        index
+            .ensure_ready(
+                ws,
+                std::time::Instant::now() + std::time::Duration::from_secs(120),
+            )
+            .unwrap();
+        drop(index);
+        drop(session);
+
+        let report = doctor_run(dir.path(), false);
+        let line = report
+            .lines
+            .iter()
+            .find(|l| l.starts_with(&format!("index coverage: workspace {}", ws.raw())))
+            .unwrap_or_else(|| panic!("coverage line missing: {:?}", report.lines));
+        assert!(line.contains("coverage=complete"), "{line}");
+        assert!(line.contains("fingerprint=complete"), "{line}");
+        assert!(line.contains("files_indexed=1"), "{line}");
+
+        // The PARTIAL rendering is typed and names the batch reason/shard.
+        let mut partial = IndexCoverage::empty();
+        partial.files_seen = 7;
+        partial.files_indexed = 5;
+        partial.bytes_indexed = 123;
+        partial.truncated_reason = Some("batch_files".into());
+        let mut fingerprint = FingerprintCoverage::round(3);
+        fingerprint.truncated_reason = Some("fingerprint_files".into());
+        let line = format_index_coverage_line(ws.raw(), 9, Some(&partial), Some(&fingerprint));
+        assert!(
+            line.contains("coverage=INCOMPLETE reason=batch_files"),
+            "{line}"
+        );
+        assert!(line.contains("files_indexed=5"), "{line}");
+        assert!(line.contains("fingerprint=PARTIAL shard=3/"), "{line}");
+        assert!(line.contains("reason=fingerprint_files"), "{line}");
+        // Legacy envelopes are NAMED, never silently reported complete.
+        let legacy = format_index_coverage_line(ws.raw(), 1, None, None);
+        assert!(
+            legacy.contains("coverage=legacy") && legacy.contains("fingerprint=legacy"),
+            "{legacy}"
+        );
+    }
+
     #[test]
     fn doctor_surfaces_corrupt_and_unmanaged_index_generations_without_panicking() {
         use faktor_index::IndexService;

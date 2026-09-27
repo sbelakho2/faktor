@@ -25,11 +25,26 @@
 //!
 //! Every OTHER call stays direct and synchronous on the shared
 //! [`Store`](crate::Store) (reads, compound transitions, recovery,
-//! checkpoints, ...). Direct and actor writes share the same writer lock, so
-//! both surfaces are safe to mix; see [`Store::direct`] for the deliberate
-//! sync-access marker. Callers that need a write observed by a later direct
-//! read must await the actor response (the actor fsyncs before replying), or
-//! serialize through [`Store::direct`].
+//! checkpoints, ...). Both surfaces submit to the SAME single-owner
+//! [`writer::WriterService`]: commands are prepared on the caller's thread,
+//! enqueued on a bounded queue and executed FIFO by one owner thread that
+//! holds the one `rusqlite::Connection`. See [`Store::direct`] for the
+//! deliberate sync-access marker. Callers that need a write observed by a
+//! later direct read must await the actor response (the actor fsyncs before
+//! replying), or serialize through [`Store::direct`].
+//!
+//! # Writer service (audit item 7)
+//!
+//! There is no process-wide `Mutex<Connection>` any more. Mutations are
+//! commands on a dedicated single-owner service (see [`writer`]): all inputs
+//! are prepared FIRST — JSON serialization of payloads (`HotWrite` batches,
+//! messages, parts, ledger blobs/entries/heads, task/verification columns,
+//! tool args/recovery/postcondition, queue files), destination connections
+//! for backups, and time stamps — and only SQLite statements/transactions
+//! run on the owner thread. The queue is bounded (typed
+//! [`StoreError::WriterQueueFull`] backpressure), results are typed oneshots,
+//! and queue wait / transaction duration / pending depth / checkpoint
+//! duration / slow transactions are instrumented ([`WriterTelemetry`]).
 //!
 //! # Stability rule
 //!
@@ -37,13 +52,31 @@
 //! version-skewed rows surface as `StoreError::Corrupt` (or `Sqlite`) —
 //! never a panic. `unwrap`/`expect` appear only where the input is provably
 //! constructed in-process this session (each site is commented).
+//!
+//! # Poisoning policy (audit item 8)
+//!
+//! Ephemeral in-process state (reader-pool permits/cache, crash seam) is
+//! recovered from a poisoned mutex with `into_inner()`. The durable writer
+//! authority does not panic: a panic inside a command (including a
+//! deliberate crash-seam panic) is caught at the service boundary, the
+//! writer stops admitting mutations, and every later mutation fails typed
+//! with [`StoreError::WriterUnavailable`] until the store is reopened.
+
+mod writer;
+
+pub use writer::{
+    WriterTelemetry, DEFAULT_WRITER_ENQUEUE_TIMEOUT, DEFAULT_WRITER_QUEUE_DEPTH,
+    SLOW_QUEUE_WAIT_THRESHOLD, SLOW_TRANSACTION_THRESHOLD,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+
+use writer::WriterService;
 
 use faktor_core::attachment::AttachmentId;
 use faktor_core::event::{Event, EventKind, JournalInvariants};
@@ -76,6 +109,21 @@ pub enum StoreError {
     Oversized(String),
     #[error("malformed value rejected: {0}")]
     Malformed(String),
+    /// Typed backpressure: the bounded writer queue was full for longer than
+    /// the configured enqueue wait, so the prepared command was refused
+    /// before touching the database.
+    #[error("writer queue full: {pending} pending (capacity {capacity}); `{operation}` refused")]
+    WriterQueueFull {
+        operation: &'static str,
+        pending: usize,
+        capacity: usize,
+    },
+    /// Typed durable-authority failure: a writer command panicked, so the
+    /// store stopped admitting mutations instead of panicking or continuing
+    /// on an unproven connection. Reopen the store to obtain a fresh,
+    /// validated writer.
+    #[error("durable store writer unavailable: {0}")]
+    WriterUnavailable(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -171,8 +219,8 @@ impl Drop for Permit {
 /// for the duration of the guard so a grouped actor batch's single COMMIT
 /// fsyncs the WAL before any caller ack, then restores the crate's configured
 /// `NORMAL` on drop (also on panic/error paths). Connection-scoped: the
-/// store writer lock is held by the caller for the whole batch, so no other
-/// writer observes the lifted mode.
+/// whole batch is ONE writer-service command, so no other writer observes
+/// the lifted mode.
 struct StrongSync<'a> {
     conn: &'a Connection,
 }
@@ -199,11 +247,12 @@ impl Semaphore {
     }
 
     /// Block until a permit is free or `deadline` passes (`Busy`).
+    ///
+    /// Poisoning policy: the permit counter is ephemeral in-process
+    /// bookkeeping, so a panic in one holder recovers the inner count
+    /// instead of disabling every reader.
     fn acquire_timeout(self: &Arc<Self>, deadline: Instant) -> StoreResult<Permit> {
-        let mut p = self
-            .permits
-            .lock()
-            .map_err(|_| StoreError::Migration("reader pool semaphore poisoned".into()))?;
+        let mut p = self.permits.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             if *p > 0 {
                 *p -= 1;
@@ -220,7 +269,7 @@ impl Semaphore {
             let (guard, _) = self
                 .available
                 .wait_timeout(p, deadline - now)
-                .map_err(|_| StoreError::Migration("reader pool semaphore poisoned".into()))?;
+                .unwrap_or_else(|p| p.into_inner());
             p = guard;
         }
     }
@@ -275,14 +324,16 @@ impl std::ops::Deref for ReadConn {
 impl Drop for ReadConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            if let Ok(mut conns) = self.pool.conns.lock() {
-                if conns.len() < READER_POOL {
-                    conns.push(conn);
-                    // The semaphore permit is released right after this
-                    // method, via the `_permit` field's drop.
-                    return;
-                }
+            // Ephemeral connection cache: a panic in another holder must not
+            // wedge every later reader; recover the pooled vector.
+            let mut conns = self.pool.conns.lock().unwrap_or_else(|p| p.into_inner());
+            if conns.len() < READER_POOL {
+                conns.push(conn);
+                // The semaphore permit is released right after this method,
+                // via the `_permit` field's drop.
+                return;
             }
+            drop(conns);
             drop(conn);
         }
     }
@@ -328,7 +379,9 @@ pub struct CrashSeam {
 
 impl std::fmt::Debug for CrashSeam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.state.lock().map(|s| s.armed).unwrap_or(None);
+        // Ephemeral seam bookkeeping: a panic in one holder must not disable
+        // the seam (or Debug), so recover the inner state.
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner()).armed;
         f.debug_struct("CrashSeam").field("armed", &s).finish()
     }
 }
@@ -375,15 +428,17 @@ impl CrashSeam {
     }
 }
 
-/// The daemon's durable store. `write` takes a single writer lock; `read`
-/// borrows a connection from a small pool (SQLite WAL allows concurrent
-/// readers). All mutations happen inside explicit transactions.
+/// The daemon's durable store. Mutations are prepared on the caller's thread
+/// and submitted to the single-owner [`WriterService`] (bounded queue, one
+/// SQL transaction at a time); `read` borrows a connection from a small pool
+/// (SQLite WAL allows concurrent readers). All mutations happen inside
+/// explicit transactions.
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
-    writer: Mutex<Connection>,
+    writer: WriterService,
     pool: Arc<ReaderPool>,
-    seam: CrashSeam,
+    seam: Arc<CrashSeam>,
     /// Last `updated_ms` issued to a memory-fact row. Fact order is the
     /// paging contract ("an upsert only moves a row toward the NEWEST
     /// end"), so fact stamps are MONOTONIC: two writes inside the same
@@ -1135,11 +1190,113 @@ pub enum HotWrite {
     },
 }
 
+/// [`HotWrite`] with every JSON body PRE-SERIALIZED before enqueueing (audit
+/// item 7). [`Store::batch_hot_writes`] builds these on the caller's thread;
+/// the writer owner then executes statements only — it never touches
+/// `serde_json` on the hot path.
+enum PreparedHotWrite {
+    AppendEvent {
+        session_id: SessionId,
+        op_id: Option<OpId>,
+        kind: EventKind,
+        state: AgentState,
+        ts_ms: i64,
+        payload_json: Option<String>,
+        payload_ver: i64,
+    },
+    PutMessage {
+        session_id: SessionId,
+        seq: i64,
+        role: String,
+        data_json: String,
+    },
+    PutPart {
+        message_id: i64,
+        kind: String,
+        data_json: String,
+    },
+    RecordProviderCall {
+        session_id: SessionId,
+        op_id: OpId,
+        provider: String,
+        model: String,
+        status: String,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        error: Option<String>,
+    },
+}
+
+impl PreparedHotWrite {
+    /// Serialize one caller command's JSON bodies. Runs on the caller's
+    /// thread, before the command is enqueued.
+    fn prepare(w: &HotWrite) -> Self {
+        match w {
+            HotWrite::AppendEvent {
+                session_id,
+                op_id,
+                kind,
+                state,
+                ts_ms,
+                payload,
+                payload_ver,
+            } => Self::AppendEvent {
+                session_id: *session_id,
+                op_id: *op_id,
+                kind: *kind,
+                state: *state,
+                ts_ms: *ts_ms,
+                payload_json: payload.as_ref().map(|p| p.to_string()),
+                payload_ver: *payload_ver,
+            },
+            HotWrite::PutMessage {
+                session_id,
+                seq,
+                role,
+                data,
+            } => Self::PutMessage {
+                session_id: *session_id,
+                seq: *seq,
+                role: role.clone(),
+                data_json: data.to_string(),
+            },
+            HotWrite::PutPart {
+                message_id,
+                kind,
+                data,
+            } => Self::PutPart {
+                message_id: *message_id,
+                kind: kind.clone(),
+                data_json: data.to_string(),
+            },
+            HotWrite::RecordProviderCall {
+                session_id,
+                op_id,
+                provider,
+                model,
+                status,
+                tokens_in,
+                tokens_out,
+                error,
+            } => Self::RecordProviderCall {
+                session_id: *session_id,
+                op_id: *op_id,
+                provider: provider.clone(),
+                model: model.clone(),
+                status: status.clone(),
+                tokens_in: *tokens_in,
+                tokens_out: *tokens_out,
+                error: error.clone(),
+            },
+        }
+    }
+}
+
 /// Microsecond timing split of one [`Store::batch_hot_writes`] group.
 ///
-/// `work_us` covers everything up to the commit statement (writer lock wait
-/// excluded: the lock is already held when timing starts, and it measures
-/// only the SQLite work itself). `commit_us` covers the COMMIT statement,
+/// `work_us` covers everything up to the commit statement (queue wait is
+/// excluded: it is measured by the writer service itself and attributed to
+/// the caller, not to SQLite work). `commit_us` covers the COMMIT statement,
 /// which under the group's `synchronous = FULL` includes the deliberate WAL
 /// fsync that makes the actor's ack mean "durable".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1464,7 +1621,7 @@ impl Store {
             }
         }
 
-        Ok(Self::finish_open(root, conn))
+        Self::finish_open(root, conn)
     }
 
     /// Fast normal-start open (production `serve`, plain `doctor`): WAL
@@ -1495,10 +1652,49 @@ impl Store {
             return Err(StoreError::Corrupt(issues));
         }
 
-        Ok(Self::finish_open(root, conn))
+        Self::finish_open(root, conn)
     }
 
-    fn finish_open(root: PathBuf, conn: Connection) -> Self {
+    /// [`Store::open`] with explicit writer queue bounds. Adversarial tests
+    /// drive the typed backpressure path and slow-holder scenarios without
+    /// waiting the production defaults; production callers use
+    /// [`Store::open`]/[`Store::open_fast`].
+    #[doc(hidden)]
+    pub fn open_with_writer_limits(
+        root: impl Into<PathBuf>,
+        integrity_check: bool,
+        queue_capacity: usize,
+        enqueue_timeout: Duration,
+    ) -> StoreResult<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        let db_path = root.join("faktor-plus.db");
+
+        let mut conn = Connection::open(&db_path)?;
+        configure(&conn)?;
+        migrate(&mut conn)?;
+        if integrity_check {
+            let issues = check_integrity(&conn)?;
+            if !issues.is_empty() {
+                return Err(StoreError::Corrupt(issues));
+            }
+        }
+        let max_ms: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(updated_ms), 0) FROM memory_fact",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let writer = WriterService::spawn_with_limits(conn, queue_capacity, enqueue_timeout)?;
+        Ok(Self::finish_open_with_writer(
+            root,
+            writer,
+            AtomicU64::new(max_ms.max(now_ms()).max(0) as u64),
+        ))
+    }
+
+    fn finish_open(root: PathBuf, conn: Connection) -> StoreResult<Self> {
         // Seed the fact sequence above every durable row (a burst that
         // crashed in the same millisecond as a write must not let the next
         // stamp tie an existing row) and above the wall clock (a machine
@@ -1510,14 +1706,24 @@ impl Store {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        let writer = Mutex::new(conn);
+        Ok(Self::finish_open_with_writer(
+            root,
+            WriterService::spawn(conn)?,
+            AtomicU64::new(max_ms.max(now_ms()).max(0) as u64),
+        ))
+    }
+
+    /// [`Store::finish_open`] over an already-spawned writer service
+    /// (adversarial tests configure the queue bounds through
+    /// [`Store::open_with_writer_limits`]).
+    fn finish_open_with_writer(root: PathBuf, writer: WriterService, fact_seq: AtomicU64) -> Self {
         let pool = Arc::new(ReaderPool::new());
         Self {
             root,
             writer,
             pool,
-            seam: CrashSeam::default(),
-            fact_seq: AtomicU64::new(max_ms.max(now_ms()).max(0) as u64),
+            seam: Arc::new(CrashSeam::default()),
+            fact_seq,
         }
     }
 
@@ -1540,6 +1746,19 @@ impl Store {
         self.seam.arm(arm);
     }
 
+    /// True when an armed [`CrashSeam`] boundary was observed for `caught`:
+    /// either the caller unwound, or the seam panic fired inside a writer job
+    /// (between the side-row write and the event write, still inside the
+    /// transaction) and the durable authority stopped admitting mutations —
+    /// the panic is contained at the [`WriterService`] boundary and surfaced
+    /// as the typed `StoreError::WriterUnavailable`. Seam-atomicity tests
+    /// assert this BEFORE reopening the store, so a boundary that never fired
+    /// can never be mistaken for a clean old/new world.
+    #[doc(hidden)]
+    pub fn seam_crash_observed<T>(&self, caught: &std::thread::Result<T>) -> bool {
+        caught.is_err() || !self.writer_available()
+    }
+
     pub fn path(&self) -> PathBuf {
         self.root.join("faktor-plus.db")
     }
@@ -1548,18 +1767,47 @@ impl Store {
     /// `DbActor` (faktor-session) that batches the hot append paths through
     /// [`Store::batch_hot_writes`]. All reads and every non-hot write
     /// (compound transitions, queue ops, checkpoints, tool runs, recovery)
-    /// go through this surface and share the same writer lock + reader pool,
-    /// so direct and actor writes never corrupt each other. Read-your-write
+    /// go through this surface and share the same single-owner writer
+    /// service + reader pool, so direct and actor writes never corrupt each
+    /// other. Read-your-write
     /// across the two surfaces is only guaranteed once the actor response
     /// (post-fsync) has been observed.
     pub fn direct(&self) -> &Store {
         self
     }
 
-    fn write(&self) -> MutexGuard<'_, Connection> {
-        // In-process invariant: the writer mutex is only poisoned by a panic
-        // in a query (a bug, not corrupt data), so unwinding is correct.
-        self.writer.lock().expect("store writer poisoned")
+    /// Typed writer-service instrumentation snapshot: queue wait,
+    /// transaction duration, pending depth, slow transactions, checkpoint
+    /// duration and durable-authority health. Cheap (atomics).
+    pub fn writer_telemetry(&self) -> WriterTelemetry {
+        self.writer.telemetry()
+    }
+
+    /// Run a raw closure on the single writer owner. `#[doc(hidden)]` test
+    /// seam (the same pattern as [`Store::crash_arm`]): adversarial tests
+    /// inject slow transactions and deliberate panics to certify the
+    /// service's queue semantics and poisoning policy. The closure must only
+    /// touch SQL state; production code never calls this.
+    #[doc(hidden)]
+    pub fn writer_debug_job<F>(&self, label: &'static str, f: F) -> StoreResult<()>
+    where
+        F: FnOnce(&mut Connection) + Send + 'static,
+    {
+        self.writer.execute_raw(label, f)
+    }
+
+    /// True while the durable writer authority still admits mutations.
+    /// `#[doc(hidden)]` test/fault probe.
+    #[doc(hidden)]
+    pub fn writer_available(&self) -> bool {
+        self.writer.is_available()
+    }
+
+    /// The typed reason the writer stopped admitting mutations, when it did.
+    /// `#[doc(hidden)]` test/fault probe.
+    #[doc(hidden)]
+    pub fn writer_unavailable_reason(&self) -> Option<String> {
+        self.writer.unavailable_reason()
     }
 
     /// Borrow a read connection. A semaphore permit is acquired first, so at
@@ -1571,11 +1819,8 @@ impl Store {
             .pool
             .sem
             .acquire_timeout(Instant::now() + BUSY_TIMEOUT)?;
-        let mut conns = self
-            .pool
-            .conns
-            .lock()
-            .map_err(|_| StoreError::Migration("reader pool poisoned".into()))?;
+        // Ephemeral connection cache: recover on poison (see Semaphore).
+        let mut conns = self.pool.conns.lock().unwrap_or_else(|p| p.into_inner());
         let conn = match conns.pop() {
             Some(c) => c,
             None => {
@@ -1604,11 +1849,28 @@ impl Store {
         })
     }
 
+    /// Raw test-only connection for adversarial fixture manipulation
+    /// (corrupt rows, illegal transitions, forged timestamps). Tests
+    /// deliberately bypass the writer service; production has no such
+    /// surface. SQLite's WAL locking still serializes against the owner
+    /// connection, so a test that races its own writer service observes the
+    /// engine's ordering, not a store-level lock.
+    #[cfg(test)]
+    pub(crate) fn raw_conn(&self) -> Connection {
+        let conn = Connection::open(self.path()).expect("open raw test connection");
+        configure(&conn).expect("configure raw test connection");
+        conn
+    }
+
     /// Idle connections currently in the pool; at most `READER_POOL`.
     /// Test probe.
     #[cfg(test)]
     pub(crate) fn reader_pool_len(&self) -> usize {
-        self.pool.conns.lock().map(|c| c.len()).unwrap_or(0)
+        self.pool
+            .conns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// Read connections ever opened since `open`; with the semaphore this
@@ -1622,17 +1884,19 @@ impl Store {
     // ---------------------------------------------------------------- workspaces
 
     pub fn create_workspace(&self, root: &str) -> StoreResult<WorkspaceId> {
-        let conn = self.write();
-        conn.execute(
-            "INSERT OR IGNORE INTO workspace(root, created_ms) VALUES (?1, ?2)",
-            params![root, now_ms()],
-        )?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM workspace WHERE root = ?1",
-            params![root],
-            |r| r.get(0),
-        )?;
-        id_field(&format!("workspace id {id} (root {root:?})"), id)
+        let root = root.to_owned();
+        self.writer.execute("create_workspace", move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO workspace(root, created_ms) VALUES (?1, ?2)",
+                params![root, now_ms()],
+            )?;
+            let id: i64 = conn.query_row(
+                "SELECT id FROM workspace WHERE root = ?1",
+                params![root],
+                |r| r.get(0),
+            )?;
+            id_field(&format!("workspace id {id} (root {root:?})"), id)
+        })
     }
 
     /// The recorded root path of a workspace; `None` when the workspace id is
@@ -1659,7 +1923,14 @@ impl Store {
         provider: &str,
         model: &str,
     ) -> StoreResult<SessionRow> {
-        let conn = self.write();
+        let title = title.to_owned();
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        // Preparation BEFORE enqueueing: the seed event's JSON is serialized
+        // here, not on the writer owner.
+        let created_payload_json =
+            serde_json::json!({ "title": title, "provider": provider, "model": model }).to_string();
+        self.writer.execute("create_session", move |conn| {
         let now = now_ms();
         conn.execute(
             "INSERT INTO session(workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms)
@@ -1679,19 +1950,19 @@ impl Store {
         // Seed the journal with SessionCreated so every session starts at seq 1.
         // The session row and its seed event are one transaction.
         let tx = conn.unchecked_transaction()?;
-        self.insert_event_locked(
+        Self::insert_event_locked(
             &tx,
             SessionId::new(id as u64),
             None,
             EventKind::SessionCreated,
             AgentState::Idle,
             now,
-            Some(serde_json::json!({ "title": title, "provider": provider, "model": model })),
+            Some(created_payload_json),
             1,
         )?;
         tx.commit()?;
         Ok(
-            match self.get_session_locked(&conn, SessionId::new(id as u64))? {
+            match Self::get_session_locked(conn, SessionId::new(id as u64))? {
                 Some(row) => row,
                 None => {
                     return Err(StoreError::Corrupt(vec![
@@ -1700,19 +1971,16 @@ impl Store {
                 }
             },
         )
+        })
     }
 
     pub fn get_session(&self, id: SessionId) -> StoreResult<Option<SessionRow>> {
         let conn = self.read()?;
-        let row = self.get_session_locked(&conn, id)?;
+        let row = Self::get_session_locked(&conn, id)?;
         Ok(row)
     }
 
-    fn get_session_locked(
-        &self,
-        conn: &Connection,
-        id: SessionId,
-    ) -> StoreResult<Option<SessionRow>> {
+    fn get_session_locked(conn: &Connection, id: SessionId) -> StoreResult<Option<SessionRow>> {
         let mut stmt = conn.prepare(
             "SELECT id, workspace_id, worktree_id, task_id, title, provider, model, state, lifecycle, created_ms, updated_ms
              FROM session WHERE id = ?1",
@@ -1763,22 +2031,23 @@ impl Store {
                 "worktree/task ids must be non-zero".into(),
             ));
         }
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE session SET worktree_id = ?2, task_id = ?3, updated_ms = ?4 WHERE id = ?1",
-            params![
-                id.raw() as i64,
-                worktree_id.raw() as i64,
-                task_id.raw() as i64,
-                now_ms()
-            ],
-        )?;
-        if n == 0 {
-            return Err(StoreError::Migration(format!(
-                "adopt_session_identity: session {id} does not exist"
-            )));
-        }
-        Ok(())
+        self.writer.execute("adopt_session_identity", move |conn| {
+            let n = conn.execute(
+                "UPDATE session SET worktree_id = ?2, task_id = ?3, updated_ms = ?4 WHERE id = ?1",
+                params![
+                    id.raw() as i64,
+                    worktree_id.raw() as i64,
+                    task_id.raw() as i64,
+                    now_ms()
+                ],
+            )?;
+            if n == 0 {
+                return Err(StoreError::Migration(format!(
+                    "adopt_session_identity: session {id} does not exist"
+                )));
+            }
+            Ok(())
+        })
     }
 
     pub fn set_session_lifecycle(
@@ -1786,31 +2055,33 @@ impl Store {
         id: SessionId,
         lifecycle: faktor_core::state::SessionLifecycle,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![
-                id.raw() as i64,
-                // In-process constructed enum (see create_session).
-                serde_json::to_string(&lifecycle).unwrap(),
-                now_ms()
-            ],
-        )?;
-        Ok(())
+        self.writer.execute("set_session_lifecycle", move |conn| {
+            conn.execute(
+                "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![
+                    id.raw() as i64,
+                    // In-process constructed enum (see create_session).
+                    serde_json::to_string(&lifecycle).unwrap(),
+                    now_ms()
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn set_session_state(&self, id: SessionId, state: AgentState) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![
-                id.raw() as i64,
-                // In-process constructed enum (see create_session).
-                serde_json::to_string(&state).unwrap(),
-                now_ms()
-            ],
-        )?;
-        Ok(())
+        self.writer.execute("set_session_state", move |conn| {
+            conn.execute(
+                "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![
+                    id.raw() as i64,
+                    // In-process constructed enum (see create_session).
+                    serde_json::to_string(&state).unwrap(),
+                    now_ms()
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Single conditional lifecycle UPDATE (`WHERE lifecycle = expected`).
@@ -1823,19 +2094,20 @@ impl Store {
         expected: SessionLifecycle,
         new: SessionLifecycle,
     ) -> StoreResult<bool> {
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE session SET lifecycle = ?3, updated_ms = ?4
+        self.writer.execute("set_lifecycle_if", move |conn| {
+            let n = conn.execute(
+                "UPDATE session SET lifecycle = ?3, updated_ms = ?4
              WHERE id = ?1 AND lifecycle = ?2",
-            params![
-                id.raw() as i64,
-                // In-process constructed enums (see create_session).
-                serde_json::to_string(&expected).unwrap(),
-                serde_json::to_string(&new).unwrap(),
-                now_ms()
-            ],
-        )?;
-        Ok(n > 0)
+                params![
+                    id.raw() as i64,
+                    // In-process constructed enums (see create_session).
+                    serde_json::to_string(&expected).unwrap(),
+                    serde_json::to_string(&new).unwrap(),
+                    now_ms()
+                ],
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// Durable session-title update (session.update, P1). Bumps
@@ -1844,12 +2116,14 @@ impl Store {
     /// NotFound). The journal is intentionally untouched: the title is
     /// session metadata, not a state-machine transition.
     pub fn update_session_title(&self, id: SessionId, title: &str) -> StoreResult<bool> {
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE session SET title = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![id.raw() as i64, title, now_ms()],
-        )?;
-        Ok(n > 0)
+        let title = title.to_owned();
+        self.writer.execute("update_session_title", move |conn| {
+            let n = conn.execute(
+                "UPDATE session SET title = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![id.raw() as i64, title, now_ms()],
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// ONE SQLite transaction: read the session row, verify
@@ -1866,38 +2140,40 @@ impl Store {
         op_id: Option<OpId>,
         t: SessionTransition,
     ) -> StoreResult<EventSeq> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        // (a) read the session row inside the transaction.
-        let Some(row) = self.get_session_locked(&tx, session_id)? else {
-            return Err(StoreError::Conflict(format!(
-                "session {session_id} does not exist; cannot transition"
-            )));
-        };
-        // (b) verify the expected values; mismatch aborts with nothing written.
-        if let Some(expected) = t.expected_lifecycle {
-            if row.lifecycle != expected {
+        // Preparation BEFORE enqueueing: event payload JSON serialization.
+        let transition_payload_json = t.event_payload.as_ref().map(|p| p.to_string());
+        self.writer.execute("transition_session", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            // (a) read the session row inside the transaction.
+            let Some(row) = Self::get_session_locked(&tx, session_id)? else {
                 return Err(StoreError::Conflict(format!(
-                    "session {session_id} lifecycle is {:?}, expected {:?}",
-                    row.lifecycle, expected
+                    "session {session_id} does not exist; cannot transition"
                 )));
+            };
+            // (b) verify the expected values; mismatch aborts with nothing written.
+            if let Some(expected) = t.expected_lifecycle {
+                if row.lifecycle != expected {
+                    return Err(StoreError::Conflict(format!(
+                        "session {session_id} lifecycle is {:?}, expected {:?}",
+                        row.lifecycle, expected
+                    )));
+                }
             }
-        }
-        if let Some(expected) = t.expected_state {
-            if row.state != expected {
-                return Err(StoreError::Conflict(format!(
-                    "session {session_id} state is {:?}, expected {:?}",
-                    row.state, expected
-                )));
+            if let Some(expected) = t.expected_state {
+                if row.state != expected {
+                    return Err(StoreError::Conflict(format!(
+                        "session {session_id} state is {:?}, expected {:?}",
+                        row.state, expected
+                    )));
+                }
             }
-        }
-        // (c) update lifecycle+state+updated_ms.
-        let now = now_ms();
-        // In-process constructed enums (see create_session).
-        let state_json = serde_json::to_string(&t.new_state).unwrap();
-        match t.new_lifecycle {
-            Some(lifecycle) => {
-                tx.execute(
+            // (c) update lifecycle+state+updated_ms.
+            let now = now_ms();
+            // In-process constructed enums (see create_session).
+            let state_json = serde_json::to_string(&t.new_state).unwrap();
+            match t.new_lifecycle {
+                Some(lifecycle) => {
+                    tx.execute(
                     "UPDATE session SET lifecycle = ?2, state = ?3, updated_ms = ?4 WHERE id = ?1",
                     params![
                         session_id.raw() as i64,
@@ -1907,28 +2183,29 @@ impl Store {
                         now
                     ],
                 )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
+                        params![session_id.raw() as i64, state_json, now],
+                    )?;
+                }
             }
-            None => {
-                tx.execute(
-                    "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                    params![session_id.raw() as i64, state_json, now],
-                )?;
-            }
-        }
-        // (d) append the event with the next gapless seq (shared insert path).
-        let seq = self.insert_event_locked(
-            &tx,
-            session_id,
-            op_id,
-            t.event_kind,
-            t.new_state,
-            now,
-            t.event_payload,
-            t.event_payload_ver,
-        )?;
-        // (e) commit: lifecycle change and event are durable together.
-        tx.commit()?;
-        Ok(seq)
+            // (d) append the event with the next gapless seq (shared insert path).
+            let seq = Self::insert_event_locked(
+                &tx,
+                session_id,
+                op_id,
+                t.event_kind,
+                t.new_state,
+                now,
+                transition_payload_json,
+                t.event_payload_ver,
+            )?;
+            // (e) commit: lifecycle change and event are durable together.
+            tx.commit()?;
+            Ok(seq)
+        })
     }
 
     // ---------------------------------------------------------------- event journal
@@ -1965,26 +2242,31 @@ impl Store {
         payload: Option<serde_json::Value>,
         payload_ver: i64,
     ) -> StoreResult<EventSeq> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let seq = self.insert_event_locked(
-            &tx,
-            session_id,
-            op_id,
-            kind,
-            state,
-            ts_ms,
-            payload,
-            payload_ver,
-        )?;
-        // Durability boundary: crossing `ev_precommit` fires the crash
-        // AFTER the insert executed but BEFORE the COMMIT (the append
-        // rolls back); crossing `ev_committed` fires right after the
-        // COMMIT returned (the append is durable, the ack was lost).
-        self.seam.trip("ev_precommit");
-        tx.commit()?;
-        self.seam.trip("ev_committed");
-        Ok(seq)
+        let seam = Arc::clone(&self.seam);
+        // Preparation BEFORE enqueueing: the event payload is serialized on
+        // the caller's thread.
+        let payload_json = payload.map(|p| p.to_string());
+        self.writer.execute("append_event_v", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let seq = Self::insert_event_locked(
+                &tx,
+                session_id,
+                op_id,
+                kind,
+                state,
+                ts_ms,
+                payload_json,
+                payload_ver,
+            )?;
+            // Durability boundary: crossing `ev_precommit` fires the crash
+            // AFTER the insert executed but BEFORE the COMMIT (the append
+            // rolls back); crossing `ev_committed` fires right after the
+            // COMMIT returned (the append is durable, the ack was lost).
+            seam.trip("ev_precommit");
+            tx.commit()?;
+            seam.trip("ev_committed");
+            Ok(seq)
+        })
     }
 
     /// The shared gapless-seq event insert path. Runs inside the CALLER'S
@@ -1995,19 +2277,18 @@ impl Store {
     /// and the actor batch passes its outer transaction connection directly.
     #[allow(clippy::too_many_arguments)]
     fn insert_event_locked(
-        &self,
         conn: &Connection,
         session_id: SessionId,
         op_id: Option<OpId>,
         kind: EventKind,
         state: AgentState,
         ts_ms: i64,
-        payload: Option<serde_json::Value>,
+        payload_json: Option<String>,
         payload_ver: i64,
     ) -> StoreResult<EventSeq> {
         // Serialize appends per session so seq computation is race-free.
-        // (The store writer lock already serializes; the per-session query is
-        // a second belt for future multi-writer refactors.)
+        // (The single-owner writer service already serializes every command;
+        // the per-session query is a second belt.)
         let prev: Option<i64> = conn.query_row(
             "SELECT MAX(seq) FROM event WHERE session_id = ?1",
             params![session_id.raw() as i64],
@@ -2040,7 +2321,7 @@ impl Store {
                 // In-process constructed enum (see create_session).
                 serde_json::to_string(&state).unwrap(),
                 ts,
-                payload.map(|p| p.to_string()),
+                payload_json,
                 payload_ver,
             ],
         )?;
@@ -2123,6 +2404,12 @@ impl ExpiredPermissionResolution {
 ///
 /// Dropping without [`Self::commit`] rolls the whole command back,
 /// exactly like a process death before the durability boundary.
+///
+/// The command body executes on the writer owner thread, so a seam panic
+/// unwinds there and drops the in-flight transaction (rollback). The
+/// [`WriterService`] contains that panic, stops admitting mutations and
+/// surfaces the typed `StoreError::WriterUnavailable` to the caller; tests
+/// certify the crash with [`Store::seam_crash_observed`] before reopening.
 #[doc(hidden)]
 pub struct SessionCommandTxn<'a> {
     tx: rusqlite::Transaction<'a>,
@@ -2203,6 +2490,25 @@ impl<'a> SessionCommandTxn<'a> {
     }
 }
 
+/// Per-candidate outcome of [`Store::cost_reconcile_uncertain`] (folded into
+/// the report OUTSIDE the writer command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostReconcileOutcome {
+    Skipped,
+    LeftUncertain,
+    ClosedUnknown,
+    Settled(u64),
+}
+
+/// Per-candidate outcome of [`Store::cost_finalize_uncertain`] (folded into
+/// the report OUTSIDE the writer command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostFinalizeOutcome {
+    Skipped,
+    LeftUncertain,
+    Settled(u64),
+}
+
 impl Store {
     /// `request_permission` as ONE transaction: insert the pending permission
     /// row and append `ToolRequested` (state `WaitingForPermission`) together.
@@ -2216,44 +2522,52 @@ impl Store {
         expected_state: AgentState,
         mut event: CommandEvent,
     ) -> StoreResult<(i64, i64, EventSeq)> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
-        let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
-        let changed = txn.tx.execute(
-            "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
+        let seam = Arc::clone(&self.seam);
+        let capability = capability.to_owned();
+        self.writer
+            .execute("insert_permission_and_event", move |conn| {
+                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
+                let changed = txn.tx.execute(
+                    "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
              VALUES (?1, ?2, ?3, 'pending', ?4)",
-            params![
-                session_id.raw() as i64,
-                op_id.raw() as i64,
-                capability,
-                expires_ms
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::Migration(
-                "insert_permission: expected exactly one inserted row".into(),
-            ));
-        }
-        let id = txn.tx.last_insert_rowid();
-        // The journal names the id this transaction actually allocated; the
-        // caller cannot know it before the insert.
-        if let Some(serde_json::Value::Object(obj)) = &mut event.payload {
-            obj.insert("permission_id".into(), serde_json::json!(id));
-        }
-        txn.side_row_applied();
-        let seq = self.insert_event_locked(
-            txn.conn(),
-            session_id,
-            event.op_id,
-            event.kind,
-            event.state,
-            event.ts_ms,
-            event.payload,
-            event.payload_ver,
-        )?;
-        txn.precommit();
-        txn.commit()?;
-        Ok((id, expires_ms, seq))
+                    params![
+                        session_id.raw() as i64,
+                        op_id.raw() as i64,
+                        capability,
+                        expires_ms
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Migration(
+                        "insert_permission: expected exactly one inserted row".into(),
+                    ));
+                }
+                let id = txn.tx.last_insert_rowid();
+                // The journal names the id this transaction actually allocated; the
+                // caller cannot know it before the insert.
+                if let Some(serde_json::Value::Object(obj)) = &mut event.payload {
+                    obj.insert("permission_id".into(), serde_json::json!(id));
+                }
+                txn.side_row_applied();
+                let seq = Self::insert_event_locked(
+                    txn.conn(),
+                    session_id,
+                    event.op_id,
+                    event.kind,
+                    event.state,
+                    event.ts_ms,
+                    // The journal names the id this transaction allocated, so this
+                    // one payload can only be serialized after the INSERT
+                    // (documented preparation exception; the value is small and
+                    // bounded).
+                    event.payload.map(|p| p.to_string()),
+                    event.payload_ver,
+                )?;
+                txn.precommit();
+                txn.commit()?;
+                Ok((id, expires_ms, seq))
+            })
     }
 
     /// `resolve_permission` as ONE transaction: terminalize an expired row /
@@ -2270,49 +2584,54 @@ impl Store {
         session_id: SessionId,
         decision: &str,
         expected_state: AgentState,
-        mut event: CommandEvent,
+        event: CommandEvent,
     ) -> StoreResult<EventSeq> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
-        let now = now_ms();
-        txn.tx.execute(
-            "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+        let seam = Arc::clone(&self.seam);
+        let decision = decision.to_owned();
+        let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        self.writer
+            .execute("resolve_permission_and_event", move |conn| {
+                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let now = now_ms();
+                txn.tx.execute(
+                    "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
-            params![id, now],
-        )?;
-        let changed = txn.tx.execute(
-            "UPDATE permission SET decision = ?2, resolved_ms = ?3
+                    params![id, now],
+                )?;
+                let changed = txn.tx.execute(
+                    "UPDATE permission SET decision = ?2, resolved_ms = ?3
              WHERE id = ?1 AND session_id = ?4 AND decision = 'pending' AND expires_ms > ?3",
-            params![id, decision, now, session_id.raw() as i64],
-        )?;
-        if changed != 1 {
-            // Commit BEFORE refusing: an expired row's terminalization must
-            // survive even though the resolution itself is refused.
-            txn.commit()?;
-            return Err(StoreError::Conflict(format!(
-                "permission {id} is not pending"
-            )));
-        }
-        let op_raw: i64 = txn.tx.query_row(
-            "SELECT op_id FROM permission WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )?;
-        event.op_id = Some(id_field(&format!("permission {id} op_id"), op_raw)?);
-        txn.side_row_applied();
-        let seq = self.insert_event_locked(
-            txn.conn(),
-            session_id,
-            event.op_id,
-            event.kind,
-            event.state,
-            event.ts_ms,
-            event.payload,
-            event.payload_ver,
-        )?;
-        txn.precommit();
-        txn.commit()?;
-        Ok(seq)
+                    params![id, decision, now, session_id.raw() as i64],
+                )?;
+                if changed != 1 {
+                    // Commit BEFORE refusing: an expired row's terminalization must
+                    // survive even though the resolution itself is refused.
+                    txn.commit()?;
+                    return Err(StoreError::Conflict(format!(
+                        "permission {id} is not pending"
+                    )));
+                }
+                let op_raw: i64 = txn.tx.query_row(
+                    "SELECT op_id FROM permission WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                let op_id = id_field(&format!("permission {id} op_id"), op_raw)?;
+                txn.side_row_applied();
+                let seq = Self::insert_event_locked(
+                    txn.conn(),
+                    session_id,
+                    Some(op_id),
+                    event.kind,
+                    event.state,
+                    event.ts_ms,
+                    event_payload_json,
+                    event.payload_ver,
+                )?;
+                txn.precommit();
+                txn.commit()?;
+                Ok(seq)
+            })
     }
 
     /// Reconcile a session's EXPIRED pending permissions as ONE transaction
@@ -2346,75 +2665,82 @@ impl Store {
                 event.kind
             )));
         }
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
-        let expired: Vec<(i64, OpId)> = {
-            let mut stmt = txn.tx.prepare(
-                "SELECT id, op_id FROM permission
+        let seam = Arc::clone(&self.seam);
+        self.writer
+            .execute("expire_pending_permissions_for_session", move |conn| {
+                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let expired: Vec<(i64, OpId)> = {
+                    let mut stmt = txn.tx.prepare(
+                        "SELECT id, op_id FROM permission
                  WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2
                  ORDER BY id ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![session_id.raw() as i64, now_ms], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows.into_iter()
-                .map(|(id, op_raw)| Ok((id, id_field(&format!("permission {id} op_id"), op_raw)?)))
-                .collect::<StoreResult<Vec<_>>>()?
-        };
-        if expired.is_empty() {
-            // Drop without commit: the durable world is untouched.
-            return Ok(ExpiredPermissionResolution::default());
-        }
-        let changed = txn.tx.execute(
-            "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+                    )?;
+                    let rows = stmt
+                        .query_map(params![session_id.raw() as i64, now_ms], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    rows.into_iter()
+                        .map(|(id, op_raw)| {
+                            Ok((id, id_field(&format!("permission {id} op_id"), op_raw)?))
+                        })
+                        .collect::<StoreResult<Vec<_>>>()?
+                };
+                if expired.is_empty() {
+                    // Drop without commit: the durable world is untouched.
+                    return Ok(ExpiredPermissionResolution::default());
+                }
+                let changed = txn.tx.execute(
+                    "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE session_id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
-            params![session_id.raw() as i64, now_ms],
-        )?;
-        if changed != expired.len() {
-            return Err(StoreError::Migration(format!(
+                    params![session_id.raw() as i64, now_ms],
+                )?;
+                if changed != expired.len() {
+                    return Err(StoreError::Migration(format!(
                 "expire_pending_permissions: expected {} terminalized rows, updated {changed}",
                 expired.len()
             )));
-        }
-        // The journal names the rows this transaction actually terminalized;
-        // the caller cannot know them before the SELECT under the same lock.
-        let ids: Vec<i64> = expired.iter().map(|(id, _)| *id).collect();
-        let ops: Vec<i64> = expired.iter().map(|(_, op)| op.raw() as i64).collect();
-        match &mut event.payload {
-            Some(serde_json::Value::Object(obj)) => {
-                obj.insert("permission_ids".into(), serde_json::json!(ids));
-                obj.insert("op_ids".into(), serde_json::json!(ops));
-            }
-            Some(_) => {}
-            None => {
-                event.payload = Some(serde_json::json!({
-                    "permission_ids": ids,
-                    "op_ids": ops,
-                }));
-            }
-        }
-        if event.op_id.is_none() && expired.len() == 1 {
-            event.op_id = Some(expired[0].1);
-        }
-        txn.side_row_applied();
-        let seq = self.insert_event_locked(
-            txn.conn(),
-            session_id,
-            event.op_id,
-            event.kind,
-            event.state,
-            event.ts_ms,
-            event.payload,
-            event.payload_ver,
-        )?;
-        txn.precommit();
-        txn.commit()?;
-        Ok(ExpiredPermissionResolution {
-            expired,
-            event_seq: Some(seq),
-        })
+                }
+                // The journal names the rows this transaction actually terminalized;
+                // the caller cannot know them before the SELECT under the same lock.
+                let ids: Vec<i64> = expired.iter().map(|(id, _)| *id).collect();
+                let ops: Vec<i64> = expired.iter().map(|(_, op)| op.raw() as i64).collect();
+                match &mut event.payload {
+                    Some(serde_json::Value::Object(obj)) => {
+                        obj.insert("permission_ids".into(), serde_json::json!(ids));
+                        obj.insert("op_ids".into(), serde_json::json!(ops));
+                    }
+                    Some(_) => {}
+                    None => {
+                        event.payload = Some(serde_json::json!({
+                            "permission_ids": ids,
+                            "op_ids": ops,
+                        }));
+                    }
+                }
+                if event.op_id.is_none() && expired.len() == 1 {
+                    event.op_id = Some(expired[0].1);
+                }
+                txn.side_row_applied();
+                let seq = Self::insert_event_locked(
+                    txn.conn(),
+                    session_id,
+                    event.op_id,
+                    event.kind,
+                    event.state,
+                    event.ts_ms,
+                    // The ids this sweep terminalized are only known inside the
+                    // transaction (documented preparation exception).
+                    event.payload.map(|p| p.to_string()),
+                    event.payload_ver,
+                )?;
+                txn.precommit();
+                txn.commit()?;
+                Ok(ExpiredPermissionResolution {
+                    expired,
+                    event_seq: Some(seq),
+                })
+            })
     }
 
     /// `start_tool_run` as ONE transaction: insert the running tool_run row
@@ -2433,8 +2759,15 @@ impl Store {
         expected_state: AgentState,
         event: CommandEvent,
     ) -> StoreResult<(i64, EventSeq)> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let seam = Arc::clone(&self.seam);
+        let tool = tool.to_owned();
+        // Preparation BEFORE enqueueing: argument/recovery/replay JSON.
+        let args_json = args.to_string();
+        let recovery_json = recovery.to_string();
+        let replay_json = replay_descriptor.map(|d| d.to_string());
+        let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        self.writer.execute("start_tool_run_and_event", move |conn| {
+        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let changed = txn.tx.execute(
             "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash, replay_descriptor)
              VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'unknown', ?6, ?7, ?8)",
@@ -2442,11 +2775,11 @@ impl Store {
                 session_id.raw() as i64,
                 op_id.raw() as i64,
                 tool,
-                args.to_string(),
+                args_json,
                 now_ms(),
-                recovery.to_string(),
+                recovery_json,
                 expected_hash,
-                replay_descriptor.map(|d| d.to_string()),
+                replay_json,
             ],
         )?;
         if changed != 1 {
@@ -2456,19 +2789,20 @@ impl Store {
         }
         let row_id = txn.tx.last_insert_rowid();
         txn.side_row_applied();
-        let seq = self.insert_event_locked(
+        let seq = Self::insert_event_locked(
             txn.conn(),
             session_id,
             event.op_id,
             event.kind,
             event.state,
             event.ts_ms,
-            event.payload,
+            event_payload_json,
             event.payload_ver,
         )?;
         txn.precommit();
         txn.commit()?;
         Ok((row_id, seq))
+        })
     }
 
     /// `finish_tool_run` as ONE transaction: move exactly ONE still-running
@@ -2484,38 +2818,44 @@ impl Store {
         expected_state: AgentState,
         event: CommandEvent,
     ) -> StoreResult<EventSeq> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
-        let changed = txn.tx.execute(
-            "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
+        let seam = Arc::clone(&self.seam);
+        let status = status.to_owned();
+        let effect_status = effect_status.to_owned();
+        let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        self.writer
+            .execute("finish_tool_run_and_event", move |conn| {
+                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let changed = txn.tx.execute(
+                    "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
              WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
-            params![
-                session_id.raw() as i64,
-                op_id.raw() as i64,
-                status,
-                effect_status,
-                now_ms()
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::Conflict(format!(
-                "tool run {op_id} is not running"
-            )));
-        }
-        txn.side_row_applied();
-        let seq = self.insert_event_locked(
-            txn.conn(),
-            session_id,
-            event.op_id,
-            event.kind,
-            event.state,
-            event.ts_ms,
-            event.payload,
-            event.payload_ver,
-        )?;
-        txn.precommit();
-        txn.commit()?;
-        Ok(seq)
+                    params![
+                        session_id.raw() as i64,
+                        op_id.raw() as i64,
+                        status,
+                        effect_status,
+                        now_ms()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Conflict(format!(
+                        "tool run {op_id} is not running"
+                    )));
+                }
+                txn.side_row_applied();
+                let seq = Self::insert_event_locked(
+                    txn.conn(),
+                    session_id,
+                    event.op_id,
+                    event.kind,
+                    event.state,
+                    event.ts_ms,
+                    event_payload_json,
+                    event.payload_ver,
+                )?;
+                txn.precommit();
+                txn.commit()?;
+                Ok(seq)
+            })
     }
 
     /// Crash/abort terminalization as ONE transaction: move exactly ONE
@@ -2548,38 +2888,44 @@ impl Store {
         state: AgentState,
         payload: Option<serde_json::Value>,
     ) -> StoreResult<EventSeq> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, state)?;
-        let changed = txn.tx.execute(
-            "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
+        let seam = Arc::clone(&self.seam);
+        let status = status.to_owned();
+        let effect_status = effect_status.to_owned();
+        let payload_json = payload.map(|p| p.to_string());
+        self.writer
+            .execute("finish_recovered_tool_run_and_event", move |conn| {
+                let txn = SessionCommandTxn::begin(conn, &seam, session_id, state)?;
+                let changed = txn.tx.execute(
+                    "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
              WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
-            params![
-                session_id.raw() as i64,
-                op_id.raw() as i64,
-                status,
-                effect_status,
-                now_ms()
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::Conflict(format!(
-                "recovered tool run {op_id} is not running"
-            )));
-        }
-        txn.side_row_applied();
-        let seq = self.insert_event_locked(
-            txn.conn(),
-            session_id,
-            Some(op_id),
-            event_kind,
-            state,
-            now_ms(),
-            payload,
-            1,
-        )?;
-        txn.precommit();
-        txn.commit()?;
-        Ok(seq)
+                    params![
+                        session_id.raw() as i64,
+                        op_id.raw() as i64,
+                        status,
+                        effect_status,
+                        now_ms()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Conflict(format!(
+                        "recovered tool run {op_id} is not running"
+                    )));
+                }
+                txn.side_row_applied();
+                let seq = Self::insert_event_locked(
+                    txn.conn(),
+                    session_id,
+                    Some(op_id),
+                    event_kind,
+                    state,
+                    now_ms(),
+                    payload_json,
+                    1,
+                )?;
+                txn.precommit();
+                txn.commit()?;
+                Ok(seq)
+            })
     }
 
     /// `put_checkpoint` as ONE transaction: insert the checkpoint row (with a
@@ -2597,8 +2943,14 @@ impl Store {
         expected_state: AgentState,
         event: CommandEvent,
     ) -> StoreResult<(i64, EventSeq)> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let seam = Arc::clone(&self.seam);
+        let path = path.to_owned();
+        let before_hash = before_hash.to_owned();
+        let after_hash = after_hash.to_owned();
+        let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        self.writer.execute("put_checkpoint_and_event", move |conn| {
+        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let duplicate: Option<i64> = txn
             .tx
             .query_row(
@@ -2634,19 +2986,20 @@ impl Store {
         }
         let id = txn.tx.last_insert_rowid();
         txn.side_row_applied();
-        let seq = self.insert_event_locked(
+        let seq = Self::insert_event_locked(
             txn.conn(),
             session_id,
             event.op_id,
             event.kind,
             event.state,
             event.ts_ms,
-            event.payload,
+            event_payload_json,
             event.payload_ver,
         )?;
         txn.precommit();
         txn.commit()?;
         Ok((id, seq))
+        })
     }
 
     /// The CONTENT-AWARE checkpoint command: allocate the per-session
@@ -2676,8 +3029,13 @@ impl Store {
         after_cas_hash: Option<&str>,
         expected_state: AgentState,
     ) -> StoreResult<(i64, i64, EventSeq)> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let seam = Arc::clone(&self.seam);
+        let path = path.to_owned();
+        let before_hash = before_hash.to_owned();
+        let after_hash = after_hash.to_owned();
+        let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        self.writer.execute("insert_checkpoint_and_event", move |conn| {
+        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let prev: i64 = txn.tx.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM checkpoint WHERE session_id = ?1",
             params![session_id.raw() as i64],
@@ -2707,26 +3065,32 @@ impl Store {
         }
         let id = txn.tx.last_insert_rowid();
         txn.side_row_applied();
-        let seq = self.insert_event_locked(
+        let seq = Self::insert_event_locked(
             txn.conn(),
             session_id,
             None,
             EventKind::CheckpointCreated,
             expected_state,
             ts,
-            Some(serde_json::json!({
-                "sequence": sequence,
-                "path": path,
-                "before_hash": before_hash,
-                "after_hash": after_hash,
-                "before_exists": before_exists,
-                "after_exists": after_exists,
-            })),
+            // `sequence` is allocated by the transaction, so this payload
+            // can only be serialized inside it (documented exception).
+            Some(
+                serde_json::json!({
+                    "sequence": sequence,
+                    "path": path,
+                    "before_hash": before_hash,
+                    "after_hash": after_hash,
+                    "before_exists": before_exists,
+                    "after_exists": after_exists,
+                })
+                .to_string(),
+            ),
             1,
         )?;
         txn.precommit();
         txn.commit()?;
         Ok((id, sequence, seq))
+        })
     }
 
     /// `record_compaction` as ONE transaction: insert the compaction row and
@@ -2743,8 +3107,11 @@ impl Store {
         expected_state: AgentState,
         event: CommandEvent,
     ) -> StoreResult<EventSeq> {
-        let mut conn = self.write();
-        let txn = SessionCommandTxn::begin(&mut conn, &self.seam, session_id, expected_state)?;
+        let seam = Arc::clone(&self.seam);
+        let strategy = strategy.to_owned();
+        let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        self.writer.execute("record_compaction_and_event", move |conn| {
+        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let changed = txn.tx.execute(
             "INSERT INTO compaction(session_id, before_tokens, after_tokens, target_tokens, accepted, strategy, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2764,19 +3131,20 @@ impl Store {
             ));
         }
         txn.side_row_applied();
-        let seq = self.insert_event_locked(
+        let seq = Self::insert_event_locked(
             txn.conn(),
             session_id,
             event.op_id,
             event.kind,
             event.state,
             event.ts_ms,
-            event.payload,
+            event_payload_json,
             event.payload_ver,
         )?;
         txn.precommit();
         txn.commit()?;
         Ok(seq)
+        })
     }
 
     // -------------------------------------------------- actor batch surface
@@ -2806,68 +3174,74 @@ impl Store {
         if writes.is_empty() {
             return Ok((Vec::new(), BatchTiming::default()));
         }
-        let conn = self.write();
-        // Acknowledged appends must survive a process kill: force the WAL
-        // commit fsync for the whole group (the actor replies only after
-        // this method returns). Restored to the configured NORMAL on drop.
-        let _strong = StrongSync::on(&conn)?;
-        let work_start = Instant::now();
-        let run = (|| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let mut out = Vec::with_capacity(writes.len());
-            for w in writes {
-                // Per-write savepoint: one failing write must not roll the
-                // whole group back (a duplicate message seq on one session
-                // must not lose another session's parts).
-                conn.execute_batch("SAVEPOINT hot_write")?;
-                let r = match self.hot_write_on(&conn, w) {
-                    Ok(o) => {
-                        conn.execute_batch("RELEASE hot_write")?;
-                        Ok(o)
-                    }
-                    Err(e) => {
-                        conn.execute_batch("ROLLBACK TO hot_write")?;
-                        conn.execute_batch("RELEASE hot_write")?;
-                        Err(e)
-                    }
-                };
-                out.push(r);
-                // Durability boundary inside the group: crash right after
-                // write `out.len()` executed (its savepoint released) but
-                // before the group COMMIT — the whole group rolls back.
-                self.seam.trip("flush_progress");
+        let seam = Arc::clone(&self.seam);
+        // Preparation BEFORE enqueueing: every JSON body of the batch is
+        // serialized here (caller's thread); the writer owner executes
+        // statements only.
+        let writes: Vec<PreparedHotWrite> = writes.iter().map(PreparedHotWrite::prepare).collect();
+        self.writer.execute("batch_hot_writes", move |conn| {
+            // Acknowledged appends must survive a process kill: force the WAL
+            // commit fsync for the whole group (the actor replies only after
+            // this method returns). Restored to the configured NORMAL on drop.
+            let _strong = StrongSync::on(conn)?;
+            let work_start = Instant::now();
+            let run = (|| {
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                let mut out = Vec::with_capacity(writes.len());
+                for w in writes {
+                    // Per-write savepoint: one failing write must not roll the
+                    // whole group back (a duplicate message seq on one session
+                    // must not lose another session's parts).
+                    conn.execute_batch("SAVEPOINT hot_write")?;
+                    let r = match Self::hot_write_on(conn, &w) {
+                        Ok(o) => {
+                            conn.execute_batch("RELEASE hot_write")?;
+                            Ok(o)
+                        }
+                        Err(e) => {
+                            conn.execute_batch("ROLLBACK TO hot_write")?;
+                            conn.execute_batch("RELEASE hot_write")?;
+                            Err(e)
+                        }
+                    };
+                    out.push(r);
+                    // Durability boundary inside the group: crash right after
+                    // write `out.len()` executed (its savepoint released) but
+                    // before the group COMMIT — the whole group rolls back.
+                    seam.trip("flush_progress");
+                }
+                let commit_start = Instant::now();
+                let work_us = commit_start
+                    .duration_since(work_start)
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64;
+                // Durability boundary: crash after every write executed, before
+                // the fsynced COMMIT (the whole actor flush rolls back).
+                seam.trip("flush_precommit");
+                conn.execute_batch("COMMIT")?;
+                // Crash right after the COMMIT fsync: the whole flush is
+                // durable; the caller's ack was lost.
+                seam.trip("flush_committed");
+                Ok((
+                    out,
+                    BatchTiming {
+                        work_us,
+                        commit_us: commit_start.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    },
+                ))
+            })();
+            match run {
+                Ok(out) => Ok(out),
+                Err(e) => {
+                    // Never leave the writer connection inside a transaction.
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
             }
-            let commit_start = Instant::now();
-            let work_us = commit_start
-                .duration_since(work_start)
-                .as_micros()
-                .min(u64::MAX as u128) as u64;
-            // Durability boundary: crash after every write executed, before
-            // the fsynced COMMIT (the whole actor flush rolls back).
-            self.seam.trip("flush_precommit");
-            conn.execute_batch("COMMIT")?;
-            // Crash right after the COMMIT fsync: the whole flush is
-            // durable; the caller's ack was lost.
-            self.seam.trip("flush_committed");
-            Ok((
-                out,
-                BatchTiming {
-                    work_us,
-                    commit_us: commit_start.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                },
-            ))
-        })();
-        match run {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                // Never leave the writer connection inside a transaction.
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        })
     }
 
-    /// Run a bounded PASSIVE WAL checkpoint on the shared writer connection.
+    /// Run a bounded PASSIVE WAL checkpoint on the writer owner's connection.
     ///
     /// Maintenance only: [`configure`] disables SQLite's own
     /// `wal_autocheckpoint`, so checkpoint work is scheduled by the caller
@@ -2878,49 +3252,57 @@ impl Store {
     /// [`StoreError`] surface as every other call: a failure is the caller's
     /// to log, never a corruption by itself.
     pub fn wal_checkpoint_passive(&self) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        // Instrumentation: the checkpoint's duration is measured on the
+        // writer owner (the only place it runs) and recorded even when the
+        // pragma itself fails.
+        let (result, elapsed) = self
+            .writer
+            .execute_raw("wal_checkpoint_passive", move |conn| {
+                let started = Instant::now();
+                let result = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                (result, started.elapsed())
+            })?;
+        self.writer.record_checkpoint(elapsed);
+        result?;
         Ok(())
     }
 
-    fn hot_write_on(&self, conn: &Connection, w: &HotWrite) -> StoreResult<HotWriteOutcome> {
+    fn hot_write_on(conn: &Connection, w: &PreparedHotWrite) -> StoreResult<HotWriteOutcome> {
         match w {
-            HotWrite::AppendEvent {
+            PreparedHotWrite::AppendEvent {
                 session_id,
                 op_id,
                 kind,
                 state,
                 ts_ms,
-                payload,
+                payload_json,
                 payload_ver,
-            } => self
-                .insert_event_locked(
-                    conn,
-                    *session_id,
-                    *op_id,
-                    *kind,
-                    *state,
-                    *ts_ms,
-                    payload.clone(),
-                    *payload_ver,
-                )
-                .map(HotWriteOutcome::EventSeq),
-            HotWrite::PutMessage {
+            } => Self::insert_event_locked(
+                conn,
+                *session_id,
+                *op_id,
+                *kind,
+                *state,
+                *ts_ms,
+                payload_json.clone(),
+                *payload_ver,
+            )
+            .map(HotWriteOutcome::EventSeq),
+            PreparedHotWrite::PutMessage {
                 session_id,
                 seq,
                 role,
-                data,
-            } => self
-                .insert_message_on(conn, *session_id, *seq, role, data)
+                data_json,
+            } => Self::insert_message_on(conn, *session_id, *seq, role, data_json)
                 .map(HotWriteOutcome::RowId),
-            HotWrite::PutPart {
+            PreparedHotWrite::PutPart {
                 message_id,
                 kind,
-                data,
-            } => self
-                .insert_part_on(conn, *message_id, kind, data)
-                .map(HotWriteOutcome::RowId),
-            HotWrite::RecordProviderCall {
+                data_json,
+            } => {
+                Self::insert_part_on(conn, *message_id, kind, data_json).map(HotWriteOutcome::RowId)
+            }
+            PreparedHotWrite::RecordProviderCall {
                 session_id,
                 op_id,
                 provider,
@@ -2929,32 +3311,31 @@ impl Store {
                 tokens_in,
                 tokens_out,
                 error,
-            } => self
-                .insert_provider_call_on(
-                    conn,
-                    *session_id,
-                    *op_id,
-                    provider,
-                    model,
-                    status,
-                    *tokens_in,
-                    *tokens_out,
-                    error.as_deref(),
-                    None,
-                    None,
-                    None,
-                    // Hot-write rows predate the v19 segment observation: no
-                    // per-call segments, the binary prefix rule stays.
-                    None,
-                    // Hot-write rows predate the v18 attempt surface: no
-                    // attempt identity, no reservation link (the actor is
-                    // migrated in the agent stream-loop wave).
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .map(HotWriteOutcome::RowId),
+            } => Self::insert_provider_call_on(
+                conn,
+                *session_id,
+                *op_id,
+                provider,
+                model,
+                status,
+                *tokens_in,
+                *tokens_out,
+                error.as_deref(),
+                None,
+                None,
+                None,
+                // Hot-write rows predate the v19 segment observation: no
+                // per-call segments, the binary prefix rule stays.
+                None,
+                // Hot-write rows predate the v18 attempt surface: no
+                // attempt identity, no reservation link (the actor is
+                // migrated in the agent stream-loop wave).
+                None,
+                None,
+                None,
+                None,
+            )
+            .map(HotWriteOutcome::RowId),
         }
     }
 
@@ -3138,24 +3519,27 @@ impl Store {
         role: &str,
         data: serde_json::Value,
     ) -> StoreResult<i64> {
-        let conn = self.write();
-        self.insert_message_on(&conn, session_id, seq, role, &data)
+        let role = role.to_owned();
+        // Preparation BEFORE enqueueing: the message JSON body.
+        let data_json = data.to_string();
+        self.writer.execute("put_message", move |conn| {
+            Self::insert_message_on(conn, session_id, seq, &role, &data_json)
+        })
     }
 
     /// Shared single-row message insert (fixed-arity contract). Runs on the
     /// caller's connection: the actor batch executes it inside one grouped
     /// transaction, the direct path outside any explicit transaction.
     fn insert_message_on(
-        &self,
         conn: &Connection,
         session_id: SessionId,
         seq: i64,
         role: &str,
-        data: &serde_json::Value,
+        data_json: &str,
     ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO message(session_id, seq, role, data, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id.raw() as i64, seq, role, data.to_string(), now_ms()],
+            params![session_id.raw() as i64, seq, role, data_json, now_ms()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -3166,21 +3550,24 @@ impl Store {
         kind: &str,
         data: serde_json::Value,
     ) -> StoreResult<i64> {
-        let conn = self.write();
-        self.insert_part_on(&conn, message_id, kind, &data)
+        let kind = kind.to_owned();
+        // Preparation BEFORE enqueueing: the part JSON body.
+        let data_json = data.to_string();
+        self.writer.execute("put_part", move |conn| {
+            Self::insert_part_on(conn, message_id, &kind, &data_json)
+        })
     }
 
     /// Shared single-row part insert; see [`Self::insert_message_on`].
     fn insert_part_on(
-        &self,
         conn: &Connection,
         message_id: i64,
         kind: &str,
-        data: &serde_json::Value,
+        data_json: &str,
     ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO part(message_id, kind, data, created_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![message_id, kind, data.to_string(), now_ms()],
+            params![message_id, kind, data_json, now_ms()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -3234,25 +3621,26 @@ impl Store {
     /// untouched: it is the durable log of what happened; deleting a
     /// conversation row is not a state-machine event.
     pub fn delete_message(&self, session_id: SessionId, seq: i64) -> StoreResult<bool> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM message WHERE session_id = ?1 AND seq = ?2",
+        self.writer.execute("delete_message", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM message WHERE session_id = ?1 AND seq = ?2",
+                    params![session_id.raw() as i64, seq],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                return Ok(false);
+            };
+            tx.execute("DELETE FROM part WHERE message_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM message WHERE session_id = ?1 AND seq = ?2",
                 params![session_id.raw() as i64, seq],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(id) = id else {
-            return Ok(false);
-        };
-        tx.execute("DELETE FROM part WHERE message_id = ?1", params![id])?;
-        tx.execute(
-            "DELETE FROM message WHERE session_id = ?1 AND seq = ?2",
-            params![session_id.raw() as i64, seq],
-        )?;
-        tx.commit()?;
-        Ok(true)
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     // ---------------------------------------------------------------- task ledger
@@ -3282,30 +3670,35 @@ impl Store {
         session_id: SessionId,
         ledger: serde_json::Value,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        // v10: the ledger blob moved to `task_ledger` when the typed
-        // durable `task` rows took over the `task` table name.
-        conn.execute(
-            "DELETE FROM task_ledger WHERE session_id = ?1",
-            params![session_id.raw() as i64],
-        )?;
-        conn.execute(
-            "INSERT INTO task_ledger(session_id, ledger, updated_ms) VALUES (?1, ?2, ?3)",
-            params![session_id.raw() as i64, ledger.to_string(), now_ms()],
-        )?;
-        Ok(())
+        // Preparation BEFORE enqueueing: the ledger JSON blob.
+        let ledger_json = ledger.to_string();
+        self.writer.execute("put_task_ledger", move |conn| {
+            // v10: the ledger blob moved to `task_ledger` when the typed
+            // durable `task` rows took over the `task` table name.
+            conn.execute(
+                "DELETE FROM task_ledger WHERE session_id = ?1",
+                params![session_id.raw() as i64],
+            )?;
+            conn.execute(
+                "INSERT INTO task_ledger(session_id, ledger, updated_ms) VALUES (?1, ?2, ?3)",
+                params![session_id.raw() as i64, ledger_json, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Raw-SQL seam (adversarial tests + crash forensics only): executes one
-    /// SQL batch on the shared writer connection. Deliberately NOT
+    /// SQL batch on the writer owner's connection. Deliberately NOT
     /// cfg(test)-gated so downstream crate tests (faktor-session's typed
     /// ledger corruption tests) can craft corrupt rows; using it in
     /// production is equivalent to corrupting the database yourself.
     #[doc(hidden)]
     pub fn sql_execute(&self, sql: &str) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute_batch(sql)?;
-        Ok(())
+        let sql = sql.to_owned();
+        self.writer.execute("sql_execute", move |conn| {
+            conn.execute_batch(&sql)?;
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------- typed session ledger
@@ -3335,28 +3728,32 @@ impl Store {
                 "ledger entry schema_ver must be > 0".into(),
             ));
         }
-        let conn = self.write();
-        // One transaction: seq allocation and the insert are atomic. The
-        // next seq NEVER rewinds below the head checkpoint (GREATEST of the
-        // entry max and the folded checkpoint), so after a compaction the
-        // "fold entries after checkpoint_seq" cursor keeps advancing even
-        // though pruned rows are gone.
-        let tx = conn.unchecked_transaction()?;
-        let prev: Option<i64> = tx.query_row(
-            "SELECT MAX(seq) FROM ledger_entry WHERE session_id = ?1",
-            params![session_id.raw() as i64],
-            |r| r.get(0),
-        )?;
-        let checkpoint: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(checkpoint_seq), 0) FROM ledger_head WHERE session_id = ?1",
-            params![session_id.raw() as i64],
-            |r| r.get(0),
-        )?;
-        let seq = prev
-            .map(|p| p.max(checkpoint))
-            .unwrap_or(checkpoint)
-            .saturating_add(1);
-        tx.execute(
+        let seam = Arc::clone(&self.seam);
+        let entry_type = entry_type.to_owned();
+        // Preparation BEFORE enqueueing: the entry payload JSON.
+        let payload_json = payload.to_string();
+        self.writer.execute("append_ledger_entry", move |conn| {
+            // One transaction: seq allocation and the insert are atomic. The
+            // next seq NEVER rewinds below the head checkpoint (GREATEST of the
+            // entry max and the folded checkpoint), so after a compaction the
+            // "fold entries after checkpoint_seq" cursor keeps advancing even
+            // though pruned rows are gone.
+            let tx = conn.unchecked_transaction()?;
+            let prev: Option<i64> = tx.query_row(
+                "SELECT MAX(seq) FROM ledger_entry WHERE session_id = ?1",
+                params![session_id.raw() as i64],
+                |r| r.get(0),
+            )?;
+            let checkpoint: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(checkpoint_seq), 0) FROM ledger_head WHERE session_id = ?1",
+                params![session_id.raw() as i64],
+                |r| r.get(0),
+            )?;
+            let seq = prev
+                .map(|p| p.max(checkpoint))
+                .unwrap_or(checkpoint)
+                .saturating_add(1);
+            tx.execute(
             "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -3364,16 +3761,17 @@ impl Store {
                 seq,
                 entry_type,
                 schema_ver,
-                payload.to_string(),
+                payload_json,
                 now_ms()
             ],
         )?;
-        // Durability boundary of one typed-ledger append: crash before the
-        // COMMIT (entry rolls back) or right after it (entry durable).
-        self.seam.trip("le_precommit");
-        tx.commit()?;
-        self.seam.trip("le_committed");
-        Ok(seq)
+            // Durability boundary of one typed-ledger append: crash before the
+            // COMMIT (entry rolls back) or right after it (entry durable).
+            seam.trip("le_precommit");
+            tx.commit()?;
+            seam.trip("le_committed");
+            Ok(seq)
+        })
     }
 
     /// Read ledger entries of one session, ascending by seq. Bounded reads:
@@ -3479,11 +3877,14 @@ impl Store {
         checkpoint_seq: i64,
         schema_ver: i64,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        // Durability boundary of the standalone head refresh: crash before
-        // the autocommit statement or right after it.
-        self.seam.trip("head_prewrite");
-        conn.execute(
+        let seam = Arc::clone(&self.seam);
+        // Preparation BEFORE enqueueing: the head JSON.
+        let head_json = head_json.to_string();
+        self.writer.execute("put_ledger_head", move |conn| {
+            // Durability boundary of the standalone head refresh: crash before
+            // the autocommit statement or right after it.
+            seam.trip("head_prewrite");
+            conn.execute(
             "INSERT INTO ledger_head(session_id, head_json, checkpoint_seq, schema_ver, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id) DO UPDATE SET
@@ -3493,14 +3894,15 @@ impl Store {
                 updated_ms = excluded.updated_ms",
             params![
                 session_id.raw() as i64,
-                head_json.to_string(),
+                head_json,
                 checkpoint_seq,
                 schema_ver,
                 now_ms()
             ],
         )?;
-        self.seam.trip("head_written");
-        Ok(())
+            seam.trip("head_written");
+            Ok(())
+        })
     }
 
     /// ONE transaction: delete every ledger entry with `seq < below_seq`
@@ -3520,29 +3922,33 @@ impl Store {
         checkpoint_seq: i64,
         schema_ver: i64,
     ) -> StoreResult<usize> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let sid = session_id.raw() as i64;
-        let mut sql =
-            format!("DELETE FROM ledger_entry WHERE session_id = {sid} AND seq < {below_seq}");
-        if !protect.is_empty() {
-            sql.push_str(&format!(
-                " AND seq NOT IN ({})",
-                std::iter::repeat_n("?", protect.len())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ));
-        }
-        let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
-        for p in protect {
-            params.push(p);
-        }
-        let deleted = tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
-        // Durability boundary mid-fold: crash after the DELETE executed but
-        // before the head rewrite (the whole compaction transaction rolls
-        // back — entries and head stay consistent).
-        self.seam.trip("compact_fold");
-        tx.execute(
+        let seam = Arc::clone(&self.seam);
+        let protect = protect.to_owned();
+        // Preparation BEFORE enqueueing: the folded head JSON.
+        let head_json = head_json.to_string();
+        self.writer.execute("compact_ledger", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let sid = session_id.raw() as i64;
+            let mut sql =
+                format!("DELETE FROM ledger_entry WHERE session_id = {sid} AND seq < {below_seq}");
+            if !protect.is_empty() {
+                sql.push_str(&format!(
+                    " AND seq NOT IN ({})",
+                    std::iter::repeat_n("?", protect.len())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+            for p in &protect {
+                params.push(p);
+            }
+            let deleted = tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+            // Durability boundary mid-fold: crash after the DELETE executed but
+            // before the head rewrite (the whole compaction transaction rolls
+            // back — entries and head stay consistent).
+            seam.trip("compact_fold");
+            tx.execute(
             "INSERT INTO ledger_head(session_id, head_json, checkpoint_seq, schema_ver, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id) DO UPDATE SET
@@ -3552,19 +3958,20 @@ impl Store {
                  updated_ms = excluded.updated_ms",
             params![
                 session_id.raw() as i64,
-                head_json.to_string(),
+                head_json,
                 checkpoint_seq,
                 schema_ver,
                 now_ms()
             ],
         )?;
-        // Durability boundary of the compaction fold: crash before the
-        // COMMIT (delete + head rewrite roll back together) or right after
-        // it (the fold is durable).
-        self.seam.trip("compact_precommit");
-        tx.commit()?;
-        self.seam.trip("compact_committed");
-        Ok(deleted)
+            // Durability boundary of the compaction fold: crash before the
+            // COMMIT (delete + head rewrite roll back together) or right after
+            // it (the fold is durable).
+            seam.trip("compact_precommit");
+            tx.commit()?;
+            seam.trip("compact_committed");
+            Ok(deleted)
+        })
     }
 
     // ---------------------------------------------------------------- durable task
@@ -3576,7 +3983,16 @@ impl Store {
     /// The caller enforces the bounded-field contract (goal/criteria/plan
     /// caps); the store only persists.
     pub fn upsert_task(&self, t: &TaskRow) -> StoreResult<()> {
-        let mut conn = self.write();
+        let t = t.to_owned();
+        // Preparation BEFORE enqueueing: every serialized TaskRow column.
+        let criteria_json =
+            serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into());
+        let plan_json = serde_json::to_string(&t.plan).unwrap_or_else(|_| "[]".into());
+        let state_json = serde_json::to_string(&t.state)
+            .expect("in-process TaskState serialization cannot fail");
+        let attachments_json =
+            serde_json::to_string(&t.attachments).unwrap_or_else(|_| "[]".into());
+        self.writer.execute("upsert_task", move |conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current_state_raw: Option<String> = tx
             .query_row(
@@ -3635,24 +4051,23 @@ impl Store {
                 t.task_id.raw() as i64,
                 t.session_id.raw() as i64,
                 t.goal,
-                // In-process serialized arrays (see parse_json): failures
-                // here are impossible for caller-constructed values.
-                serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(&t.plan).unwrap_or_else(|_| "[]".into()),
+                criteria_json,
+                plan_json,
                 t.max_tokens.map(|m| m as i64),
                 t.max_turns.map(|m| m as i64),
                 t.spent_tokens.min(i64::MAX as u64) as i64,
                 t.spent_turns.min(i64::MAX as u32) as i64,
                 // In-process constructed enum (see create_session).
-                serde_json::to_string(&t.state).unwrap(),
+                state_json,
                 t.created_ms,
                 t.updated_ms,
                 t.revision.raw() as i64,
-                serde_json::to_string(&t.attachments).unwrap_or_else(|_| "[]".into()),
+                attachments_json,
             ],
         )?;
         tx.commit()?;
         Ok(())
+        })
     }
 
     pub fn get_task(&self, session_id: SessionId, task_id: TaskId) -> StoreResult<Option<TaskRow>> {
@@ -3707,123 +4122,124 @@ impl Store {
         record_id: VerificationRecordId,
         now: i64,
     ) -> StoreResult<std::result::Result<TaskRow, TaskCompletionRefusal>> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // The task's current base worktree: the session row (v8 identity).
-        let base: Option<(i64, i64)> = tx
-            .query_row(
-                "SELECT workspace_id, worktree_id FROM session WHERE id = ?1",
-                params![session_id.raw() as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((task_ws, task_wt)) = base else {
-            return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
-        };
-        let task = {
-            let mut stmt = tx.prepare(
-                "SELECT task_id, session_id, goal, acceptance_criteria, plan,
+        self.writer.execute("task_complete_verified", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // The task's current base worktree: the session row (v8 identity).
+            let base: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT workspace_id, worktree_id FROM session WHERE id = ?1",
+                    params![session_id.raw() as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((task_ws, task_wt)) = base else {
+                return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
+            };
+            let task = {
+                let mut stmt = tx.prepare(
+                    "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                         max_tokens, max_turns, spent_tokens, spent_turns,
                         state, created_ms, updated_ms, revision, attachments
                  FROM task WHERE session_id = ?1 AND task_id = ?2",
-            )?;
-            let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
-            match rows.next()? {
-                Some(row) => Some(task_row_map(row, session_id)?),
-                None => None,
+                )?;
+                let mut rows =
+                    stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
+                match rows.next()? {
+                    Some(row) => Some(task_row_map(row, session_id)?),
+                    None => None,
+                }
+            };
+            let Some(task) = task else {
+                return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
+            };
+            if task.revision != expected_revision {
+                return Ok(Err(TaskCompletionRefusal::RevisionMismatch {
+                    expected: expected_revision,
+                    actual: task.revision,
+                }));
             }
-        };
-        let Some(task) = task else {
-            return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
-        };
-        if task.revision != expected_revision {
-            return Ok(Err(TaskCompletionRefusal::RevisionMismatch {
-                expected: expected_revision,
-                actual: task.revision,
-            }));
-        }
-        if task.state != TaskState::Verifying {
-            return Ok(Err(TaskCompletionRefusal::NotVerifying {
-                actual: task.state,
-            }));
-        }
-        let record = {
-            let mut stmt = tx.prepare(
-                "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
+            if task.state != TaskState::Verifying {
+                return Ok(Err(TaskCompletionRefusal::NotVerifying {
+                    actual: task.state,
+                }));
+            }
+            let record = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
                         criteria_json, checks_json, changed_files_json,
                         unrelated_changes_json, reviewer_json, status,
                         started_ms, completed_ms
                  FROM verification_record WHERE id = ?1",
-            )?;
-            let mut rows = stmt.query(params![record_id.raw() as i64])?;
-            match rows.next()? {
-                Some(row) => Some(verification_record_map(row)?),
-                None => None,
+                )?;
+                let mut rows = stmt.query(params![record_id.raw() as i64])?;
+                match rows.next()? {
+                    Some(row) => Some(verification_record_map(row)?),
+                    None => None,
+                }
+            };
+            let Some(record) = record else {
+                return Ok(Err(TaskCompletionRefusal::RecordMissing { record_id }));
+            };
+            if record.task_id != task_id {
+                return Ok(Err(TaskCompletionRefusal::RecordWrongTask {
+                    record_id,
+                    record_task: record.task_id,
+                    requested: task_id,
+                }));
             }
-        };
-        let Some(record) = record else {
-            return Ok(Err(TaskCompletionRefusal::RecordMissing { record_id }));
-        };
-        if record.task_id != task_id {
-            return Ok(Err(TaskCompletionRefusal::RecordWrongTask {
-                record_id,
-                record_task: record.task_id,
-                requested: task_id,
-            }));
-        }
-        if record.revision != expected_revision {
-            return Ok(Err(TaskCompletionRefusal::RecordWrongRevision {
-                record_id,
-                record_revision: record.revision,
-                expected: expected_revision,
-            }));
-        }
-        if record.status != VerificationStatus::Passed {
-            return Ok(Err(TaskCompletionRefusal::RecordNotPassed {
-                record_id,
-                status: record.status,
-            }));
-        }
-        let missing: Vec<String> = task
-            .acceptance_criteria
-            .iter()
-            .filter(|c| {
-                !record
-                    .criteria
-                    .iter()
-                    .any(|cv| cv.passed && &cv.criterion_key == *c)
-            })
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return Ok(Err(TaskCompletionRefusal::CriteriaNotCovered {
-                record_id,
-                missing,
-            }));
-        }
-        let task_ws_id =
-            id_field::<WorkspaceId>(&format!("session {session_id} workspace_id"), task_ws)?;
-        let task_wt_id =
-            id_field::<WorktreeId>(&format!("session {session_id} worktree_id"), task_wt)?;
-        if record.workspace_id != task_ws_id || record.worktree_id != task_wt_id {
-            return Ok(Err(TaskCompletionRefusal::WorktreeMismatch {
-                record_id,
-                record_workspace: record.workspace_id,
-                record_worktree: record.worktree_id,
-                task_workspace: task_ws_id,
-                task_worktree: task_wt_id,
-            }));
-        }
-        // (h) THE ACCOUNTING GATE (completion-vs-reserve invariant): no
-        // reservation of this task may still hold budget — `reserved`
-        // (dispatch never began), `dispatched` (the provider may have
-        // billed) or `uncertain` (a crashed dispatched attempt). The count
-        // runs INSIDE this IMMEDIATE transaction, so a reserve that landed
-        // after the session layer's accounting pass but before this write is
-        // caught: any nonzero count rolls the transaction back with a typed
-        // refusal and the task row stays exactly as it was (Verifying).
-        let (reserved, dispatched, reserved_micro, uncertain, uncertain_micro) = tx.query_row(
-            "SELECT
+            if record.revision != expected_revision {
+                return Ok(Err(TaskCompletionRefusal::RecordWrongRevision {
+                    record_id,
+                    record_revision: record.revision,
+                    expected: expected_revision,
+                }));
+            }
+            if record.status != VerificationStatus::Passed {
+                return Ok(Err(TaskCompletionRefusal::RecordNotPassed {
+                    record_id,
+                    status: record.status,
+                }));
+            }
+            let missing: Vec<String> = task
+                .acceptance_criteria
+                .iter()
+                .filter(|c| {
+                    !record
+                        .criteria
+                        .iter()
+                        .any(|cv| cv.passed && &cv.criterion_key == *c)
+                })
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                return Ok(Err(TaskCompletionRefusal::CriteriaNotCovered {
+                    record_id,
+                    missing,
+                }));
+            }
+            let task_ws_id =
+                id_field::<WorkspaceId>(&format!("session {session_id} workspace_id"), task_ws)?;
+            let task_wt_id =
+                id_field::<WorktreeId>(&format!("session {session_id} worktree_id"), task_wt)?;
+            if record.workspace_id != task_ws_id || record.worktree_id != task_wt_id {
+                return Ok(Err(TaskCompletionRefusal::WorktreeMismatch {
+                    record_id,
+                    record_workspace: record.workspace_id,
+                    record_worktree: record.worktree_id,
+                    task_workspace: task_ws_id,
+                    task_worktree: task_wt_id,
+                }));
+            }
+            // (h) THE ACCOUNTING GATE (completion-vs-reserve invariant): no
+            // reservation of this task may still hold budget — `reserved`
+            // (dispatch never began), `dispatched` (the provider may have
+            // billed) or `uncertain` (a crashed dispatched attempt). The count
+            // runs INSIDE this IMMEDIATE transaction, so a reserve that landed
+            // after the session layer's accounting pass but before this write is
+            // caught: any nonzero count rolls the transaction back with a typed
+            // refusal and the task row stays exactly as it was (Verifying).
+            let (reserved, dispatched, reserved_micro, uncertain, uncertain_micro) = tx.query_row(
+                "SELECT
                      COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0),
                      COALESCE(SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END), 0),
                      COALESCE(SUM(CASE WHEN status IN ('reserved', 'dispatched')
@@ -3833,60 +4249,61 @@ impl Store {
                                        THEN predicted_micro ELSE 0 END), 0)
                  FROM cost_reservation
                  WHERE session_id = ?1 AND task_id = ?2",
-            params![session_id.raw() as i64, task_id.raw() as i64],
-            |r| {
-                Ok((
-                    usize::try_from(r.get::<_, i64>(0)?).unwrap_or(usize::MAX),
-                    usize::try_from(r.get::<_, i64>(1)?).unwrap_or(usize::MAX),
-                    u64::try_from(r.get::<_, i64>(2)?).unwrap_or(u64::MAX),
-                    usize::try_from(r.get::<_, i64>(3)?).unwrap_or(usize::MAX),
-                    u64::try_from(r.get::<_, i64>(4)?).unwrap_or(u64::MAX),
+                params![session_id.raw() as i64, task_id.raw() as i64],
+                |r| {
+                    Ok((
+                        usize::try_from(r.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                        usize::try_from(r.get::<_, i64>(1)?).unwrap_or(usize::MAX),
+                        u64::try_from(r.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+                        usize::try_from(r.get::<_, i64>(3)?).unwrap_or(usize::MAX),
+                        u64::try_from(r.get::<_, i64>(4)?).unwrap_or(u64::MAX),
+                    ))
+                },
+            )?;
+            if reserved
+                .saturating_add(dispatched)
+                .saturating_add(uncertain)
+                != 0
+            {
+                tx.rollback()?;
+                return Ok(Err(TaskCompletionRefusal::ReservationsHeld {
+                    reserved,
+                    dispatched,
+                    reserved_micro,
+                    uncertain,
+                    uncertain_micro,
+                }));
+            }
+            let new_revision = expected_revision.checked_next().ok_or_else(|| {
+                StoreError::Malformed(format!(
+                    "task {session_id}/{task_id} revision overflow at completion"
                 ))
-            },
-        )?;
-        if reserved
-            .saturating_add(dispatched)
-            .saturating_add(uncertain)
-            != 0
-        {
-            tx.rollback()?;
-            return Ok(Err(TaskCompletionRefusal::ReservationsHeld {
-                reserved,
-                dispatched,
-                reserved_micro,
-                uncertain,
-                uncertain_micro,
-            }));
-        }
-        let new_revision = expected_revision.checked_next().ok_or_else(|| {
-            StoreError::Malformed(format!(
-                "task {session_id}/{task_id} revision overflow at completion"
-            ))
-        })?;
-        let updated = tx.execute(
-            "UPDATE task SET state = ?3, revision = ?4, updated_ms = ?5
+            })?;
+            let updated = tx.execute(
+                "UPDATE task SET state = ?3, revision = ?4, updated_ms = ?5
              WHERE session_id = ?1 AND task_id = ?2 AND revision = ?6",
-            params![
-                session_id.raw() as i64,
-                task_id.raw() as i64,
-                // In-process constructed enum (see create_session).
-                serde_json::to_string(&TaskState::VerifiedComplete).unwrap(),
-                new_revision.raw() as i64,
-                now,
-                expected_revision.raw() as i64
-            ],
-        )?;
-        if updated != 1 {
-            return Err(StoreError::Conflict(format!(
-                "task {session_id}/{task_id} vanished between validation and write"
-            )));
-        }
-        tx.commit()?;
-        let mut completed = task;
-        completed.state = TaskState::VerifiedComplete;
-        completed.revision = new_revision;
-        completed.updated_ms = now;
-        Ok(Ok(completed))
+                params![
+                    session_id.raw() as i64,
+                    task_id.raw() as i64,
+                    // In-process constructed enum (see create_session).
+                    serde_json::to_string(&TaskState::VerifiedComplete).unwrap(),
+                    new_revision.raw() as i64,
+                    now,
+                    expected_revision.raw() as i64
+                ],
+            )?;
+            if updated != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "task {session_id}/{task_id} vanished between validation and write"
+                )));
+            }
+            tx.commit()?;
+            let mut completed = task;
+            completed.state = TaskState::VerifiedComplete;
+            completed.revision = new_revision;
+            completed.updated_ms = now;
+            Ok(Ok(completed))
+        })
     }
 
     // ------------------------------------------------------- verification records
@@ -3916,37 +4333,52 @@ impl Store {
         environment_fingerprint_json: Option<&str>,
         candidate_proof_ref_json: Option<&str>,
     ) -> StoreResult<VerificationRecordId> {
-        let conn = self.write();
-        conn.execute(
-            "INSERT INTO verification_record(
+        let rec = rec.to_owned();
+        let environment_fingerprint_json = environment_fingerprint_json.map(|v| v.to_owned());
+        let candidate_proof_ref_json = candidate_proof_ref_json.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: every serialized record column.
+        let criteria_json = serde_json::to_string(&rec.criteria).unwrap_or_else(|_| "[]".into());
+        let checks_json = serde_json::to_string(&rec.checks).unwrap_or_else(|_| "[]".into());
+        let changed_files_json =
+            serde_json::to_string(&rec.changed_files).unwrap_or_else(|_| "[]".into());
+        let unrelated_changes_json =
+            serde_json::to_string(&rec.unrelated_changes).unwrap_or_else(|_| "[]".into());
+        let status_json =
+            serde_json::to_string(&rec.status).expect("in-process status serialization");
+        let reviewer_json = rec.reviewer.as_ref().map(|v| v.to_string());
+        self.writer
+            .execute("verification_record_put_with_evidence", move |conn| {
+                conn.execute(
+                    "INSERT INTO verification_record(
                 task_id, revision, workspace_id, worktree_id, tree_hash,
                 criteria_json, checks_json, changed_files_json,
                 unrelated_changes_json, reviewer_json, status,
                 started_ms, completed_ms,
                 environment_fingerprint_json, candidate_proof_ref_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                rec.task_id.raw() as i64,
-                rec.revision.raw() as i64,
-                rec.workspace_id.raw() as i64,
-                rec.worktree_id.raw() as i64,
-                rec.tree_hash,
-                serde_json::to_string(&rec.criteria).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(&rec.checks).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(&rec.changed_files).unwrap_or_else(|_| "[]".into()),
-                serde_json::to_string(&rec.unrelated_changes).unwrap_or_else(|_| "[]".into()),
-                rec.reviewer.as_ref().map(|v| v.to_string()),
-                serde_json::to_string(&rec.status).unwrap(),
-                rec.started_ms,
-                rec.completed_ms,
-                environment_fingerprint_json,
-                candidate_proof_ref_json,
-            ],
-        )?;
-        let id = conn.last_insert_rowid();
-        // SQLite rowids start at 1, so a fresh row id is always a valid
-        // (non-zero) record id.
-        Ok(VerificationRecordId::new(id as u64))
+                    params![
+                        rec.task_id.raw() as i64,
+                        rec.revision.raw() as i64,
+                        rec.workspace_id.raw() as i64,
+                        rec.worktree_id.raw() as i64,
+                        rec.tree_hash,
+                        criteria_json,
+                        checks_json,
+                        changed_files_json,
+                        unrelated_changes_json,
+                        reviewer_json,
+                        status_json,
+                        rec.started_ms,
+                        rec.completed_ms,
+                        environment_fingerprint_json,
+                        candidate_proof_ref_json,
+                    ],
+                )?;
+                let id = conn.last_insert_rowid();
+                // SQLite rowids start at 1, so a fresh row id is always a valid
+                // (non-zero) record id.
+                Ok(VerificationRecordId::new(id as u64))
+            })
     }
 
     /// Additive v20 twin of [`Store::verification_record_get`]: the row plus
@@ -4065,46 +4497,48 @@ impl Store {
                 "record {record_id}: finalize status must be Passed or Failed, got {new_status:?}"
             )));
         }
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let updated = tx.execute(
-            "UPDATE verification_record
+        self.writer
+            .execute("verification_record_finalize", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let updated = tx.execute(
+                    "UPDATE verification_record
              SET status = ?2, completed_ms = ?3
              WHERE id = ?1 AND status = ?4",
-            params![
-                record_id.raw() as i64,
-                serde_json::to_string(&new_status).unwrap(),
-                completed_ms,
-                serde_json::to_string(&VerificationStatus::Running).unwrap()
-            ],
-        )?;
-        if updated == 1 {
-            tx.commit()?;
-            return Ok(Ok(()));
-        }
-        // The CAS missed: surface the current status so callers can tell an
-        // already-final record from a not-yet-started one.
-        let current_raw: Option<String> = tx
-            .query_row(
-                "SELECT status FROM verification_record WHERE id = ?1",
-                params![record_id.raw() as i64],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let current: Option<VerificationStatus> = match current_raw {
-            Some(raw) => Some(parse_json(
-                &format!("verification_record {record_id} status"),
-                &raw,
-            )?),
-            None => None,
-        };
-        match current {
-            Some(current) => Ok(Err(RecordFinalizeRefusal::NotRunning {
-                record_id,
-                current,
-            })),
-            None => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
-        }
+                    params![
+                        record_id.raw() as i64,
+                        serde_json::to_string(&new_status).unwrap(),
+                        completed_ms,
+                        serde_json::to_string(&VerificationStatus::Running).unwrap()
+                    ],
+                )?;
+                if updated == 1 {
+                    tx.commit()?;
+                    return Ok(Ok(()));
+                }
+                // The CAS missed: surface the current status so callers can tell an
+                // already-final record from a not-yet-started one.
+                let current_raw: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM verification_record WHERE id = ?1",
+                        params![record_id.raw() as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let current: Option<VerificationStatus> = match current_raw {
+                    Some(raw) => Some(parse_json(
+                        &format!("verification_record {record_id} status"),
+                        &raw,
+                    )?),
+                    None => None,
+                };
+                match current {
+                    Some(current) => Ok(Err(RecordFinalizeRefusal::NotRunning {
+                        record_id,
+                        current,
+                    })),
+                    None => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
+                }
+            })
     }
 
     // ------------------------------------------------ verification jobs (v22)
@@ -4127,82 +4561,86 @@ impl Store {
         checks: &[VerificationJobRow],
     ) -> StoreResult<bool> {
         validate_verification_attempt(attempt, changed, checks)?;
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM verification_attempt
+        let attempt = attempt.to_owned();
+        let changed = changed.to_owned();
+        let checks = checks.to_owned();
+        self.writer
+            .execute("verification_attempt_begin", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM verification_attempt
                  WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3",
-                params![
-                    attempt.session_id.raw() as i64,
-                    attempt.task_id.raw() as i64,
-                    attempt.attempt_op_id as i64
-                ],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if exists.is_some() {
-            return Ok(false);
-        }
-        for check in checks {
-            if check.inline_status.is_some() {
-                continue;
-            }
-            let open_elsewhere: Option<i64> = tx
-                .query_row(
-                    "SELECT attempt_op_id FROM verification_job
+                        params![
+                            attempt.session_id.raw() as i64,
+                            attempt.task_id.raw() as i64,
+                            attempt.attempt_op_id as i64
+                        ],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if exists.is_some() {
+                    return Ok(false);
+                }
+                for check in &checks {
+                    if check.inline_status.is_some() {
+                        continue;
+                    }
+                    let open_elsewhere: Option<i64> = tx
+                        .query_row(
+                            "SELECT attempt_op_id FROM verification_job
                      WHERE session_id = ?1 AND task_id = ?2 AND check_id = ?3
                        AND inline_status IS NULL AND state IN ('queued', 'running')
                        AND attempt_op_id <> ?4",
-                    params![
-                        attempt.session_id.raw() as i64,
-                        attempt.task_id.raw() as i64,
-                        check.check_id,
-                        attempt.attempt_op_id as i64
-                    ],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(prior) = open_elsewhere {
-                return Err(StoreError::Conflict(format!(
+                            params![
+                                attempt.session_id.raw() as i64,
+                                attempt.task_id.raw() as i64,
+                                check.check_id,
+                                attempt.attempt_op_id as i64
+                            ],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if let Some(prior) = open_elsewhere {
+                        return Err(StoreError::Conflict(format!(
                     "check '{}' has an open job of attempt {prior}; supersede that attempt before \
                      beginning attempt {}",
                     check.check_id, attempt.attempt_op_id
                 )));
-            }
-        }
-        tx.execute(
-            "INSERT INTO verification_attempt(
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO verification_attempt(
                 session_id, task_id, attempt_op_id, task_revision, workspace_root,
                 environment_fingerprint_json, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                attempt.session_id.raw() as i64,
-                attempt.task_id.raw() as i64,
-                attempt.attempt_op_id as i64,
-                attempt.task_revision.raw() as i64,
-                attempt.workspace_root,
-                attempt.environment_fingerprint_json,
-                attempt.created_ms
-            ],
-        )?;
-        for (ordinal, path) in changed.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO verification_attempt_changed_file(
+                    params![
+                        attempt.session_id.raw() as i64,
+                        attempt.task_id.raw() as i64,
+                        attempt.attempt_op_id as i64,
+                        attempt.task_revision.raw() as i64,
+                        attempt.workspace_root,
+                        attempt.environment_fingerprint_json,
+                        attempt.created_ms
+                    ],
+                )?;
+                for (ordinal, path) in changed.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO verification_attempt_changed_file(
                     session_id, task_id, attempt_op_id, ordinal, path)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    attempt.session_id.raw() as i64,
-                    attempt.task_id.raw() as i64,
-                    attempt.attempt_op_id as i64,
-                    ordinal as i64,
-                    path
-                ],
-            )?;
-        }
-        for check in checks {
-            tx.execute(
-                "INSERT INTO verification_job(
+                        params![
+                            attempt.session_id.raw() as i64,
+                            attempt.task_id.raw() as i64,
+                            attempt.attempt_op_id as i64,
+                            ordinal as i64,
+                            path
+                        ],
+                    )?;
+                }
+                for check in &checks {
+                    tx.execute(
+                        "INSERT INTO verification_job(
                     session_id, task_id, attempt_op_id, check_id, ordinal,
                     task_revision, workspace_root, kind, command, program,
                     args_json, spec_json, budget_ms, inline_status, state, note,
@@ -4210,33 +4648,34 @@ impl Store {
                     finished_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-                params![
-                    check.session_id.raw() as i64,
-                    check.task_id.raw() as i64,
-                    check.attempt_op_id as i64,
-                    check.check_id,
-                    check.ordinal as i64,
-                    check.task_revision.raw() as i64,
-                    check.workspace_root,
-                    check.kind,
-                    check.command,
-                    check.program,
-                    check.args_json,
-                    check.spec_json,
-                    check.budget_ms as i64,
-                    check.inline_status,
-                    check.state,
-                    check.note,
-                    check.op_id.map(|op| op as i64),
-                    check.environment_fingerprint_json,
-                    check.created_ms,
-                    check.updated_ms,
-                    check.finished_ms
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(true)
+                        params![
+                            check.session_id.raw() as i64,
+                            check.task_id.raw() as i64,
+                            check.attempt_op_id as i64,
+                            check.check_id,
+                            check.ordinal as i64,
+                            check.task_revision.raw() as i64,
+                            check.workspace_root,
+                            check.kind,
+                            check.command,
+                            check.program,
+                            check.args_json,
+                            check.spec_json,
+                            check.budget_ms as i64,
+                            check.inline_status,
+                            check.state,
+                            check.note,
+                            check.op_id.map(|op| op as i64),
+                            check.environment_fingerprint_json,
+                            check.created_ms,
+                            check.updated_ms,
+                            check.finished_ms
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(true)
+            })
     }
 
     /// One attempt view by identity, or `None`.
@@ -4343,23 +4782,26 @@ impl Store {
                 reason.len()
             )));
         }
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cancelled = tx.execute(
-            "UPDATE verification_job
+        let reason = reason.to_owned();
+        self.writer
+            .execute("verification_attempt_cancel", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let cancelled = tx.execute(
+                    "UPDATE verification_job
              SET state = 'cancelled', note = ?4, updated_ms = ?5, finished_ms = ?5
              WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
                AND inline_status IS NULL AND state IN ('queued', 'running')",
-            params![
-                session_id.raw() as i64,
-                task_id.raw() as i64,
-                attempt_op_id as i64,
-                reason,
-                now
-            ],
-        )?;
-        tx.commit()?;
-        Ok(cancelled as u64)
+                    params![
+                        session_id.raw() as i64,
+                        task_id.raw() as i64,
+                        attempt_op_id as i64,
+                        reason,
+                        now
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(cancelled as u64)
+            })
     }
 
     /// Claim one `queued` background job: the guarded CAS to `running` with
@@ -4380,46 +4822,48 @@ impl Store {
                 "job claim op_id must be non-zero".into(),
             ));
         }
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(newest) = newest_attempt_op(&tx, session_id, task_id)? {
-            if newest > attempt_op_id {
-                return Ok(Err(VerificationJobRefusal::Superseded {
-                    attempt_op_id,
-                    newest_attempt_op_id: newest,
+        let check_id = check_id.to_owned();
+        self.writer.execute("verification_job_claim", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(newest) = newest_attempt_op(&tx, session_id, task_id)? {
+                if newest > attempt_op_id {
+                    return Ok(Err(VerificationJobRefusal::Superseded {
+                        attempt_op_id,
+                        newest_attempt_op_id: newest,
+                    }));
+                }
+            }
+            let row = verification_job_get(&tx, session_id, task_id, attempt_op_id, &check_id)?;
+            let Some(mut job) = row else {
+                return Ok(Err(VerificationJobRefusal::Missing {
+                    check_id: check_id.to_string(),
+                }));
+            };
+            if job.inline_status.is_some() || job.state != "queued" {
+                return Ok(Err(VerificationJobRefusal::NotOpen {
+                    check_id: check_id.to_string(),
+                    state: job.state,
                 }));
             }
-        }
-        let row = verification_job_get(&tx, session_id, task_id, attempt_op_id, check_id)?;
-        let Some(mut job) = row else {
-            return Ok(Err(VerificationJobRefusal::Missing {
-                check_id: check_id.to_string(),
-            }));
-        };
-        if job.inline_status.is_some() || job.state != "queued" {
-            return Ok(Err(VerificationJobRefusal::NotOpen {
-                check_id: check_id.to_string(),
-                state: job.state,
-            }));
-        }
-        job.state = "running".into();
-        job.op_id = Some(op_id);
-        job.updated_ms = now;
-        tx.execute(
-            "UPDATE verification_job SET state = 'running', op_id = ?5, updated_ms = ?6
+            job.state = "running".into();
+            job.op_id = Some(op_id);
+            job.updated_ms = now;
+            tx.execute(
+                "UPDATE verification_job SET state = 'running', op_id = ?5, updated_ms = ?6
              WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
                AND check_id = ?4 AND state = 'queued'",
-            params![
-                session_id.raw() as i64,
-                task_id.raw() as i64,
-                attempt_op_id as i64,
-                check_id,
-                op_id as i64,
-                now
-            ],
-        )?;
-        tx.commit()?;
-        Ok(Ok(job))
+                params![
+                    session_id.raw() as i64,
+                    task_id.raw() as i64,
+                    attempt_op_id as i64,
+                    check_id,
+                    op_id as i64,
+                    now
+                ],
+            )?;
+            tx.commit()?;
+            Ok(Ok(job))
+        })
     }
 
     /// Resolve one `running` background job to a terminal state and record
@@ -4460,85 +4904,91 @@ impl Store {
                 )));
             }
         }
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(newest) = newest_attempt_op(&tx, session_id, task_id)? {
-            if newest > attempt_op_id {
-                return Ok(Err(VerificationJobRefusal::Superseded {
-                    attempt_op_id,
-                    newest_attempt_op_id: newest,
-                }));
-            }
-        }
-        let Some(mut job) =
-            verification_job_get(&tx, session_id, task_id, attempt_op_id, check_id)?
-        else {
-            return Ok(Err(VerificationJobRefusal::Missing {
-                check_id: check_id.to_string(),
-            }));
-        };
-        if job.inline_status.is_some() || job.state != "running" {
-            return Ok(Err(VerificationJobRefusal::NotOpen {
-                check_id: check_id.to_string(),
-                state: job.state,
-            }));
-        }
-        if let Some(result) = result_json {
-            let already: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM verification_job_result
+        let check_id = check_id.to_owned();
+        let state = state.to_owned();
+        let note = note.map(|v| v.to_owned());
+        let result_json = result_json.map(|v| v.to_owned());
+        self.writer
+            .execute("verification_job_resolve", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if let Some(newest) = newest_attempt_op(&tx, session_id, task_id)? {
+                    if newest > attempt_op_id {
+                        return Ok(Err(VerificationJobRefusal::Superseded {
+                            attempt_op_id,
+                            newest_attempt_op_id: newest,
+                        }));
+                    }
+                }
+                let Some(mut job) =
+                    verification_job_get(&tx, session_id, task_id, attempt_op_id, &check_id)?
+                else {
+                    return Ok(Err(VerificationJobRefusal::Missing {
+                        check_id: check_id.to_string(),
+                    }));
+                };
+                if job.inline_status.is_some() || job.state != "running" {
+                    return Ok(Err(VerificationJobRefusal::NotOpen {
+                        check_id: check_id.to_string(),
+                        state: job.state,
+                    }));
+                }
+                if let Some(result) = result_json {
+                    let already: Option<i64> = tx
+                        .query_row(
+                            "SELECT 1 FROM verification_job_result
                      WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
                        AND check_id = ?4",
+                            params![
+                                session_id.raw() as i64,
+                                task_id.raw() as i64,
+                                attempt_op_id as i64,
+                                check_id
+                            ],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if already.is_some() {
+                        return Ok(Err(VerificationJobRefusal::ResultExists {
+                            check_id: check_id.to_string(),
+                        }));
+                    }
+                    tx.execute(
+                        "INSERT INTO verification_job_result(
+                    session_id, task_id, attempt_op_id, check_id, result_json, finished_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            session_id.raw() as i64,
+                            task_id.raw() as i64,
+                            attempt_op_id as i64,
+                            check_id,
+                            result,
+                            now
+                        ],
+                    )?;
+                    job.result_json = Some(result.to_string());
+                }
+                job.state = state.to_string();
+                job.note = note.clone();
+                job.updated_ms = now;
+                job.finished_ms = Some(now);
+                tx.execute(
+                    "UPDATE verification_job
+             SET state = ?5, note = ?6, updated_ms = ?7, finished_ms = ?7
+             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
+               AND check_id = ?4 AND state = 'running'",
                     params![
                         session_id.raw() as i64,
                         task_id.raw() as i64,
                         attempt_op_id as i64,
-                        check_id
+                        check_id,
+                        state,
+                        note,
+                        now
                     ],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if already.is_some() {
-                return Ok(Err(VerificationJobRefusal::ResultExists {
-                    check_id: check_id.to_string(),
-                }));
-            }
-            tx.execute(
-                "INSERT INTO verification_job_result(
-                    session_id, task_id, attempt_op_id, check_id, result_json, finished_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    session_id.raw() as i64,
-                    task_id.raw() as i64,
-                    attempt_op_id as i64,
-                    check_id,
-                    result,
-                    now
-                ],
-            )?;
-            job.result_json = Some(result.to_string());
-        }
-        job.state = state.to_string();
-        job.note = note.map(str::to_string);
-        job.updated_ms = now;
-        job.finished_ms = Some(now);
-        tx.execute(
-            "UPDATE verification_job
-             SET state = ?5, note = ?6, updated_ms = ?7, finished_ms = ?7
-             WHERE session_id = ?1 AND task_id = ?2 AND attempt_op_id = ?3
-               AND check_id = ?4 AND state = 'running'",
-            params![
-                session_id.raw() as i64,
-                task_id.raw() as i64,
-                attempt_op_id as i64,
-                check_id,
-                state,
-                note,
-                now
-            ],
-        )?;
-        tx.commit()?;
-        Ok(Ok(job))
+                )?;
+                tx.commit()?;
+                Ok(Ok(job))
+            })
     }
 
     /// Honest post-restart recovery for one session (schema v22): every
@@ -4552,11 +5002,12 @@ impl Store {
         session_id: SessionId,
         now: i64,
     ) -> StoreResult<VerificationJobRecovery> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut report = VerificationJobRecovery::default();
-        let orphaned = tx.execute(
-            "UPDATE verification_job
+        self.writer
+            .execute("verification_jobs_requeue_running", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut report = VerificationJobRecovery::default();
+                let orphaned = tx.execute(
+                    "UPDATE verification_job
              SET state = 'unavailable', finished_ms = ?2, updated_ms = ?2,
                  note = 'orphaned job: its attempt record is missing; never certified'
              WHERE session_id = ?1 AND state IN ('queued', 'running')
@@ -4565,21 +5016,22 @@ impl Store {
                    WHERE a.session_id = verification_job.session_id
                      AND a.task_id = verification_job.task_id
                      AND a.attempt_op_id = verification_job.attempt_op_id)",
-            params![session_id.raw() as i64, now],
-        )?;
-        report.orphaned = orphaned as u64;
-        let requeued = tx.execute(
-            "UPDATE verification_job
+                    params![session_id.raw() as i64, now],
+                )?;
+                report.orphaned = orphaned as u64;
+                let requeued = tx.execute(
+                    "UPDATE verification_job
              SET state = 'queued', op_id = NULL, note =
                  're-queued after a restart: the previous executor died mid-check and never \
                   produced a verdict; the check re-runs deterministically',
                  updated_ms = ?2, finished_ms = NULL
              WHERE session_id = ?1 AND state = 'running'",
-            params![session_id.raw() as i64, now],
-        )?;
-        report.requeued = requeued as u64;
-        tx.commit()?;
-        Ok(report)
+                    params![session_id.raw() as i64, now],
+                )?;
+                report.requeued = requeued as u64;
+                tx.commit()?;
+                Ok(report)
+            })
     }
 
     /// One-shot, idempotent v22 legacy-verification repair (invoked by every
@@ -4588,8 +5040,10 @@ impl Store {
     /// session already carrying the durable import marker is skipped whole;
     /// corrupt rows are skipped loudly with typed notes and left in place.
     pub fn import_legacy_verification_facts(&self) -> StoreResult<LegacyVerificationImport> {
-        let mut conn = self.write();
-        import_legacy_verification_facts_conn(&mut conn)
+        self.writer
+            .execute("import_legacy_verification_facts", move |conn| {
+                import_legacy_verification_facts_conn(conn)
+            })
     }
 
     pub fn list_tasks(&self, session_id: SessionId) -> StoreResult<Vec<TaskRow>> {
@@ -4649,7 +5103,12 @@ impl Store {
         expected_hash: Option<String>,
         replay_descriptor: Option<serde_json::Value>,
     ) -> StoreResult<i64> {
-        let conn = self.write();
+        let tool = tool.to_owned();
+        // Preparation BEFORE enqueueing: argument/recovery/replay JSON.
+        let args_json = args.to_string();
+        let recovery_json = recovery.to_string();
+        let replay_json = replay_descriptor.map(|d| d.to_string());
+        self.writer.execute("start_tool_run", move |conn| {
         conn.execute(
             "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash, replay_descriptor)
              VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'unknown', ?6, ?7, ?8)",
@@ -4657,14 +5116,15 @@ impl Store {
                 session_id.raw() as i64,
                 op_id.raw() as i64,
                 tool,
-                args.to_string(),
+                args_json,
                 now_ms(),
-                recovery.to_string(),
+                recovery_json,
                 expected_hash,
-                replay_descriptor.map(|d| d.to_string()),
+                replay_json,
             ],
         )?;
         Ok(conn.last_insert_rowid())
+        })
     }
 
     /// Record the workspace-write postcondition a tool reported at execution
@@ -4678,47 +5138,53 @@ impl Store {
         op_id: OpId,
         postcondition: &serde_json::Value,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE tool_run SET postcondition = ?3
+        let postcondition = postcondition.to_owned();
+        // Preparation BEFORE enqueueing: the postcondition JSON.
+        let postcondition_json = postcondition.to_string();
+        self.writer
+            .execute("record_tool_postcondition", move |conn| {
+                let n = conn.execute(
+                    "UPDATE tool_run SET postcondition = ?3
              WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
-            params![
-                session_id.raw() as i64,
-                op_id.raw() as i64,
-                postcondition.to_string()
-            ],
-        )?;
-        if n == 0 {
-            return Err(StoreError::Migration(
-                "record_tool_postcondition: no running row".into(),
-            ));
-        }
-        Ok(())
+                    params![
+                        session_id.raw() as i64,
+                        op_id.raw() as i64,
+                        postcondition_json
+                    ],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::Migration(
+                        "record_tool_postcondition: no running row".into(),
+                    ));
+                }
+                Ok(())
+            })
     }
 
     /// Bump the physical-attempt counter of one still-running tool run (v7:
     /// a crash-recovery replay is a NEW PHYSICAL attempt of the SAME logical
     /// operation). Loud when the row is not running.
     pub fn bump_tool_run_attempt(&self, session_id: SessionId, op_id: OpId) -> StoreResult<i64> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let n = tx.execute(
-            "UPDATE tool_run SET attempt = attempt + 1
+        self.writer.execute("bump_tool_run_attempt", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let n = tx.execute(
+                "UPDATE tool_run SET attempt = attempt + 1
              WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
-            params![session_id.raw() as i64, op_id.raw() as i64],
-        )?;
-        if n == 0 {
-            return Err(StoreError::Migration(
-                "bump_tool_run_attempt: no running row".into(),
-            ));
-        }
-        let attempt: i64 = tx.query_row(
-            "SELECT attempt FROM tool_run WHERE session_id = ?1 AND op_id = ?2",
-            params![session_id.raw() as i64, op_id.raw() as i64],
-            |r| r.get(0),
-        )?;
-        tx.commit()?;
-        Ok(attempt)
+                params![session_id.raw() as i64, op_id.raw() as i64],
+            )?;
+            if n == 0 {
+                return Err(StoreError::Migration(
+                    "bump_tool_run_attempt: no running row".into(),
+                ));
+            }
+            let attempt: i64 = tx.query_row(
+                "SELECT attempt FROM tool_run WHERE session_id = ?1 AND op_id = ?2",
+                params![session_id.raw() as i64, op_id.raw() as i64],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            Ok(attempt)
+        })
     }
 
     pub fn finish_tool_run(
@@ -4728,24 +5194,27 @@ impl Store {
         status: &str,
         effect_status: &str,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
+        let status = status.to_owned();
+        let effect_status = effect_status.to_owned();
+        self.writer.execute("finish_tool_run", move |conn| {
+            let n = conn.execute(
+                "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
              WHERE session_id = ?1 AND op_id = ?2",
-            params![
-                session_id.raw() as i64,
-                op_id.raw() as i64,
-                status,
-                effect_status,
-                now_ms()
-            ],
-        )?;
-        if n == 0 {
-            return Err(StoreError::Migration(
-                "finish_tool_run: no matching row".into(),
-            ));
-        }
-        Ok(())
+                params![
+                    session_id.raw() as i64,
+                    op_id.raw() as i64,
+                    status,
+                    effect_status,
+                    now_ms()
+                ],
+            )?;
+            if n == 0 {
+                return Err(StoreError::Migration(
+                    "finish_tool_run: no matching row".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     pub fn set_tool_run_effect(
@@ -4754,12 +5223,14 @@ impl Store {
         op_id: OpId,
         effect_status: &str,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "UPDATE tool_run SET effect_status = ?3 WHERE session_id = ?1 AND op_id = ?2",
-            params![session_id.raw() as i64, op_id.raw() as i64, effect_status],
-        )?;
-        Ok(())
+        let effect_status = effect_status.to_owned();
+        self.writer.execute("set_tool_run_effect", move |conn| {
+            conn.execute(
+                "UPDATE tool_run SET effect_status = ?3 WHERE session_id = ?1 AND op_id = ?2",
+                params![session_id.raw() as i64, op_id.raw() as i64, effect_status],
+            )?;
+            Ok(())
+        })
     }
 
     /// Unfinished tool runs (ToolStarted without ToolCompleted): the crash
@@ -4799,7 +5270,10 @@ impl Store {
         model: &str,
         variant: Option<&str>,
     ) -> StoreResult<i64> {
-        let conn = self.write();
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        let variant = variant.map(|v| v.to_owned());
+        self.writer.execute("start_turn_record", move |conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE turn_record SET status = ?3, updated_ms = ?4
@@ -4838,6 +5312,7 @@ impl Store {
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(id)
+        })
     }
 
     /// Finalize the record's effective envelope at logical-turn start (the
@@ -4852,7 +5327,11 @@ impl Store {
         variant: Option<&str>,
         tool_mode: Option<&str>,
     ) -> StoreResult<bool> {
-        let conn = self.write();
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        let variant = variant.map(|v| v.to_owned());
+        let tool_mode = tool_mode.map(|v| v.to_owned());
+        self.writer.execute("set_turn_record_envelope", move |conn| {
         let n = conn.execute(
             "UPDATE turn_record SET effective_provider = ?3, effective_model = ?4, variant = ?5, tool_mode = ?6, updated_ms = ?7
              WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
@@ -4867,6 +5346,7 @@ impl Store {
             ],
         )?;
         Ok(n > 0)
+        })
     }
 
     /// Close an active turn record (completed | cancelled | failed).
@@ -4885,18 +5365,20 @@ impl Store {
                 "finish_turn_record: invalid status {status:?}"
             )));
         }
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE turn_record SET status = ?3, updated_ms = ?4
+        let status = status.to_owned();
+        self.writer.execute("finish_turn_record", move |conn| {
+            let n = conn.execute(
+                "UPDATE turn_record SET status = ?3, updated_ms = ?4
              WHERE session_id = ?1 AND turn_op_id = ?2 AND status = 'active'",
-            params![
-                session_id.raw() as i64,
-                turn_op_id.raw() as i64,
-                status,
-                now_ms()
-            ],
-        )?;
-        Ok(n > 0)
+                params![
+                    session_id.raw() as i64,
+                    turn_op_id.raw() as i64,
+                    status,
+                    now_ms()
+                ],
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// The session's single active logical-turn record (at most one exists).
@@ -5052,26 +5534,33 @@ impl Store {
         if let Some(json) = prefix_segments_json {
             validate_prefix_segments_json(json)?;
         }
-        let conn = self.write();
-        self.insert_provider_call_on(
-            &conn,
-            session_id,
-            op_id,
-            provider,
-            model,
-            status,
-            tokens_in,
-            tokens_out,
-            error,
-            prompt_prefix_hash,
-            prompt_tokens,
-            prefix_stability,
-            prefix_segments_json,
-            None,
-            None,
-            None,
-            None,
-        )
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        let status = status.to_owned();
+        let error = error.map(|v| v.to_owned());
+        let prefix_segments_json = prefix_segments_json.map(|v| v.to_owned());
+        self.writer
+            .execute("record_provider_call_with_prefix_segments", move |conn| {
+                Self::insert_provider_call_on(
+                    conn,
+                    session_id,
+                    op_id,
+                    &provider,
+                    &model,
+                    &status,
+                    tokens_in,
+                    tokens_out,
+                    error.as_deref(),
+                    prompt_prefix_hash,
+                    prompt_tokens,
+                    prefix_stability,
+                    prefix_segments_json.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
     }
 
     /// Attempt-oriented provider-call record (attempt accounting, schema
@@ -5099,29 +5588,36 @@ impl Store {
         tokens_out: Option<u64>,
         error: Option<&str>,
     ) -> StoreResult<i64> {
-        let conn = self.write();
-        conn.execute(
-            "INSERT INTO provider_call(session_id, op_id, parent_model_call_op_id,
+        let attempt = attempt.to_owned();
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        let status = status.to_owned();
+        let error = error.map(|v| v.to_owned());
+        self.writer
+            .execute("record_provider_call_attempt", move |conn| {
+                conn.execute(
+                    "INSERT INTO provider_call(session_id, op_id, parent_model_call_op_id,
                 attempt_op_id, attempt_ordinal, reservation_id,
                 provider, model, started_ms, ended_ms, status, tokens_in,
                 tokens_out, error)
              VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                session_id.raw() as i64,
-                attempt.logical_op_id.raw() as i64,
-                attempt.attempt_op_id.raw() as i64,
-                attempt.ordinal as i64,
-                reservation_id,
-                provider,
-                model,
-                now_ms(),
-                status,
-                tokens_in.map(|t| t as i64),
-                tokens_out.map(|t| t as i64),
-                error
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
+                    params![
+                        session_id.raw() as i64,
+                        attempt.logical_op_id.raw() as i64,
+                        attempt.attempt_op_id.raw() as i64,
+                        attempt.ordinal as i64,
+                        reservation_id,
+                        provider,
+                        model,
+                        now_ms(),
+                        status,
+                        tokens_in.map(|t| t as i64),
+                        tokens_out.map(|t| t as i64),
+                        error
+                    ],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
     }
 
     /// Shared single-row provider-call insert; see [`Self::insert_message_on`].
@@ -5132,7 +5628,6 @@ impl Store {
     /// segment observation).
     #[allow(clippy::too_many_arguments)]
     fn insert_provider_call_on(
-        &self,
         conn: &Connection,
         session_id: SessionId,
         op_id: OpId,
@@ -5304,8 +5799,8 @@ impl Store {
     /// ALLOCATE the next per-session checkpoint sequence and insert the row
     /// in ONE transaction (P1 "checkpoint numbering race"): two concurrent
     /// writers must never both receive the same sequence. The sequence is
-    /// `MAX(sequence)+1` over the session's rows, computed and inserted under
-    /// the single writer lock, so allocation is atomic and gapless regardless
+    /// `MAX(sequence)+1` over the session's rows, computed and inserted in
+    /// ONE writer-service transaction, so allocation is atomic and gapless regardless
     /// of what any caller guessed outside the store.
     ///
     /// `before_hash`/`after_hash` carry the side's content hash, or the empty
@@ -5328,7 +5823,11 @@ impl Store {
         after_hash: &str,
         after_cas_hash: Option<&str>,
     ) -> StoreResult<(i64, i64)> {
-        let conn = self.write();
+        let path = path.to_owned();
+        let before_hash = before_hash.to_owned();
+        let after_hash = after_hash.to_owned();
+        let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        self.writer.execute("insert_checkpoint", move |conn| {
         let tx = conn.unchecked_transaction()?;
         let prev: i64 = tx.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM checkpoint WHERE session_id = ?1",
@@ -5354,6 +5853,7 @@ impl Store {
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok((id, sequence))
+        })
     }
 
     /// Raw ROW-ONLY checkpoint insert at an explicit caller-chosen sequence
@@ -5371,7 +5871,11 @@ impl Store {
         after_hash: &str,
         after_cas_hash: Option<&str>,
     ) -> StoreResult<i64> {
-        let conn = self.write();
+        let path = path.to_owned();
+        let before_hash = before_hash.to_owned();
+        let after_hash = after_hash.to_owned();
+        let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        self.writer.execute("put_checkpoint", move |conn| {
         conn.execute(
             "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -5386,6 +5890,7 @@ impl Store {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+        })
     }
 
     pub fn checkpoints_of(&self, session_id: SessionId) -> StoreResult<Vec<CheckpointRow>> {
@@ -5419,21 +5924,25 @@ impl Store {
     /// Redo/undo marker: rollback sets restored_ms, redo clears it (a row
     /// must not read as "restored" after an unrevert; audit round 5).
     pub fn clear_checkpoint_restored(&self, id: i64) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "UPDATE checkpoint SET restored_ms = NULL WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
+        self.writer
+            .execute("clear_checkpoint_restored", move |conn| {
+                conn.execute(
+                    "UPDATE checkpoint SET restored_ms = NULL WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            })
     }
 
     pub fn mark_checkpoint_restored(&self, id: i64) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "UPDATE checkpoint SET restored_ms = ?2 WHERE id = ?1",
-            params![id, now_ms()],
-        )?;
-        Ok(())
+        self.writer
+            .execute("mark_checkpoint_restored", move |conn| {
+                conn.execute(
+                    "UPDATE checkpoint SET restored_ms = ?2 WHERE id = ?1",
+                    params![id, now_ms()],
+                )?;
+                Ok(())
+            })
     }
 
     // ---------------------------------------------------------------- artifacts
@@ -5447,8 +5956,11 @@ impl Store {
         summary: &str,
         size: i64,
     ) -> StoreResult<i64> {
-        let conn = self.write();
-        conn.execute(
+        let kind = kind.to_owned();
+        let cas_hash = cas_hash.to_owned();
+        let summary = summary.to_owned();
+        self.writer.execute("put_artifact", move |conn| {
+            conn.execute(
             "INSERT OR IGNORE INTO artifact(session_id, kind, cas_hash, summary, created_ms, size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -5460,7 +5972,8 @@ impl Store {
                 size
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+            Ok(conn.last_insert_rowid())
+        })
     }
 
     pub fn artifact(&self, cas_hash: &str) -> StoreResult<Option<(String, String)>> {
@@ -5488,56 +6001,59 @@ impl Store {
         session_id: SessionId,
         attachment: &AttachmentId,
     ) -> StoreResult<AttachmentId> {
-        let conn = self.write();
-        conn.execute(
-            "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
+        let attachment = attachment.to_owned();
+        self.writer.execute("put_attachment", move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                session_id.raw() as i64,
-                attachment.digest.to_hex(),
-                attachment.mime.as_str(),
-                attachment.filename.as_deref(),
-                attachment.size as i64,
-            ],
-        )?;
-        let stored = conn.query_row(
-            "SELECT digest, mime, filename, size FROM attachment
+                params![
+                    session_id.raw() as i64,
+                    attachment.digest.to_hex(),
+                    attachment.mime.as_str(),
+                    attachment.filename.as_deref(),
+                    attachment.size as i64,
+                ],
+            )?;
+            let stored = conn.query_row(
+                "SELECT digest, mime, filename, size FROM attachment
              WHERE session_id = ?1 AND digest = ?2",
-            params![session_id.raw() as i64, attachment.digest.to_hex()],
-            |r| {
-                let digest: String = r.get(0)?;
-                let mime: String = r.get(1)?;
-                let filename: Option<String> = r.get(2)?;
-                let size: i64 = r.get(3)?;
-                let digest = faktor_core::hash::FileHash::from_hex(&digest).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("attachment digest {digest:?} is not 32-byte hex"),
-                        )),
-                    )
-                })?;
-                if size < 0 {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Integer,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("attachment size {size} is negative"),
-                        )),
-                    ));
-                }
-                Ok(AttachmentId {
-                    digest,
-                    mime,
-                    filename,
-                    size: size as u64,
-                })
-            },
-        )?;
-        Ok(stored)
+                params![session_id.raw() as i64, attachment.digest.to_hex()],
+                |r| {
+                    let digest: String = r.get(0)?;
+                    let mime: String = r.get(1)?;
+                    let filename: Option<String> = r.get(2)?;
+                    let size: i64 = r.get(3)?;
+                    let digest =
+                        faktor_core::hash::FileHash::from_hex(&digest).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("attachment digest {digest:?} is not 32-byte hex"),
+                                )),
+                            )
+                        })?;
+                    if size < 0 {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("attachment size {size} is negative"),
+                            )),
+                        ));
+                    }
+                    Ok(AttachmentId {
+                        digest,
+                        mime,
+                        filename,
+                        size: size as u64,
+                    })
+                },
+            )?;
+            Ok(stored)
+        })
     }
 
     /// Resolve one durable attachment row by its digest (restart-safe: reads
@@ -5636,18 +6152,21 @@ impl Store {
         path: &str,
         branch: &str,
     ) -> StoreResult<i64> {
-        let conn = self.write();
-        conn.execute(
-            "INSERT OR IGNORE INTO worktree(workspace_id, path, branch, active)
+        let path = path.to_owned();
+        let branch = branch.to_owned();
+        self.writer.execute("put_worktree", move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO worktree(workspace_id, path, branch, active)
              VALUES (?1, ?2, ?3, 1)",
-            params![workspace_id.raw() as i64, path, branch],
-        )?;
-        conn.query_row(
-            "SELECT id FROM worktree WHERE path = ?1",
-            params![path],
-            |r| r.get(0),
-        )
-        .map_err(Into::into)
+                params![workspace_id.raw() as i64, path, branch],
+            )?;
+            conn.query_row(
+                "SELECT id FROM worktree WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+        })
     }
 
     pub fn worktrees_of(&self, workspace_id: WorkspaceId) -> StoreResult<Vec<WorktreeRow>> {
@@ -5672,9 +6191,11 @@ impl Store {
     }
 
     pub fn remove_worktree(&self, path: &str) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute("DELETE FROM worktree WHERE path = ?1", params![path])?;
-        Ok(())
+        let path = path.to_owned();
+        self.writer.execute("remove_worktree", move |conn| {
+            conn.execute("DELETE FROM worktree WHERE path = ?1", params![path])?;
+            Ok(())
+        })
     }
 
     // ---------------------------------------------------------------- memory facts
@@ -5686,13 +6207,18 @@ impl Store {
         key: &str,
         value: &str,
     ) -> StoreResult<()> {
-        let conn = self.write();
+        let fact_stamp = self.fact_timestamp();
+        let kind = kind.to_owned();
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.writer.execute("upsert_memory_fact", move |conn| {
         conn.execute(
             "INSERT INTO memory_fact(session_id, kind, key, value, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id, kind, key) DO UPDATE SET value = ?4, updated_ms = ?5",
-            params![session_id.raw() as i64, kind, key, value, self.fact_timestamp()],
+            params![session_id.raw() as i64, kind, key, value, fact_stamp],
         )?;
         Ok(())
+        })
     }
 
     /// Atomically upsert MANY memory facts of ONE session in ONE SQLite
@@ -5710,7 +6236,12 @@ impl Store {
         if facts.is_empty() {
             return Ok(());
         }
-        let conn = self.write();
+        let fact_stamp = self.fact_timestamp();
+        let facts: Vec<(String, String, String)> = facts
+            .iter()
+            .map(|(kind, key, value)| (kind.to_string(), key.to_string(), value.to_string()))
+            .collect();
+        self.writer.execute("upsert_memory_facts", move |conn| {
         let tx = conn.unchecked_transaction()?;
         for (kind, key, value) in facts {
             tx.execute(
@@ -5721,12 +6252,13 @@ impl Store {
                     kind,
                     key,
                     value,
-                    self.fact_timestamp()
+                    fact_stamp
                 ],
             )?;
         }
         tx.commit()?;
         Ok(())
+        })
     }
 
     /// Deterministic newest-first page over memory facts (paging is
@@ -5836,7 +6368,8 @@ impl Store {
         accepted: bool,
         strategy: &str,
     ) -> StoreResult<()> {
-        let conn = self.write();
+        let strategy = strategy.to_owned();
+        self.writer.execute("record_compaction", move |conn| {
         conn.execute(
             "INSERT INTO compaction(session_id, before_tokens, after_tokens, target_tokens, accepted, strategy, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -5851,6 +6384,7 @@ impl Store {
             ],
         )?;
         Ok(())
+        })
     }
 
     // ---------------------------------------------------------------- permissions
@@ -5870,19 +6404,21 @@ impl Store {
         op_id: OpId,
         capability: &str,
     ) -> StoreResult<(i64, i64)> {
-        let conn = self.write();
-        let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
-        conn.execute(
-            "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
+        let capability = capability.to_owned();
+        self.writer.execute("insert_permission", move |conn| {
+            let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
+            conn.execute(
+                "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
              VALUES (?1, ?2, ?3, 'pending', ?4)",
-            params![
-                session_id.raw() as i64,
-                op_id.raw() as i64,
-                capability,
-                expires_ms
-            ],
-        )?;
-        Ok((conn.last_insert_rowid(), expires_ms))
+                params![
+                    session_id.raw() as i64,
+                    op_id.raw() as i64,
+                    capability,
+                    expires_ms
+                ],
+            )?;
+            Ok((conn.last_insert_rowid(), expires_ms))
+        })
     }
 
     /// Resolve a pending, UNEXPIRED permission owned by `session_id`.
@@ -5901,28 +6437,30 @@ impl Store {
         session_id: SessionId,
         decision: &str,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let now = now_ms();
-        tx.execute(
-            "UPDATE permission SET decision = 'expired', resolved_ms = ?2
+        let decision = decision.to_owned();
+        self.writer.execute("resolve_permission", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = now_ms();
+            tx.execute(
+                "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
-            params![id, now],
-        )?;
-        let changed = tx.execute(
-            "UPDATE permission SET decision = ?2, resolved_ms = ?3
+                params![id, now],
+            )?;
+            let changed = tx.execute(
+                "UPDATE permission SET decision = ?2, resolved_ms = ?3
              WHERE id = ?1 AND session_id = ?4 AND decision = 'pending' AND expires_ms > ?3",
-            params![id, decision, now, session_id.raw() as i64],
-        )?;
-        // Commit BEFORE refusing: an expired row's terminalization must
-        // survive even though the resolution itself is refused.
-        tx.commit()?;
-        if changed != 1 {
-            return Err(StoreError::Conflict(format!(
-                "permission {id} is not pending"
-            )));
-        }
-        Ok(())
+                params![id, decision, now, session_id.raw() as i64],
+            )?;
+            // Commit BEFORE refusing: an expired row's terminalization must
+            // survive even though the resolution itself is refused.
+            tx.commit()?;
+            if changed != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "permission {id} is not pending"
+                )));
+            }
+            Ok(())
+        })
     }
 
     /// Every still-`pending` permission row of `session_id` whose durable
@@ -6006,7 +6544,14 @@ impl Store {
         agent: Option<&str>,
         requested_at: i64,
     ) -> StoreResult<i64> {
-        let conn = self.write();
+        let prompt = prompt.to_owned();
+        let files = files.to_owned();
+        let model = model.map(|v| v.to_owned());
+        let variant = variant.map(|v| v.to_owned());
+        let agent = agent.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the queue row's JSON columns.
+        let files_json = serde_json::to_string(&files).unwrap_or_else(|_| "[]".into());
+        self.writer.execute("enqueue_prompt", move |conn| {
         let tx = conn.unchecked_transaction()?;
         let prev: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM prompt_queue WHERE session_id = ?1",
@@ -6022,7 +6567,7 @@ impl Store {
                 seq,
                 op_id.raw() as i64,
                 prompt,
-                serde_json::to_string(files).unwrap_or_else(|_| "[]".into()),
+                files_json,
                 model,
                 variant,
                 agent,
@@ -6031,6 +6576,7 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(seq)
+        })
     }
 
     /// Oldest row that is not terminal (pending/claimed/running) — FIFO head.
@@ -6136,95 +6682,102 @@ impl Store {
             Option<String>,
             Option<String>,
         );
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let head: Option<QueueHeadRow> = tx
-            .query_row(
-                "SELECT seq, op_id, prompt, files, model, variant, agent FROM prompt_queue
+        let eligible_states: Vec<String> = eligible_states
+            .iter()
+            .map(|state| state.to_string())
+            .collect();
+        let target_state = target_state.to_owned();
+        self.writer.execute("admit_queue_head", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let head: Option<QueueHeadRow> = tx
+                .query_row(
+                    "SELECT seq, op_id, prompt, files, model, variant, agent FROM prompt_queue
                  WHERE session_id = ?1 AND status = 'pending' ORDER BY seq ASC LIMIT 1",
-                params![session.raw() as i64],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((queue_seq, op_id_raw, prompt, files_json, model, variant, agent)) = head else {
-            return Ok(None);
-        };
-        // Decode every persisted column BEFORE the first mutation: a corrupt
-        // row surfaces as a typed `Corrupt` naming the field and the
-        // transaction rolls back without claiming the prompt or materializing
-        // the message.
-        let op_id = id_field(
-            &format!("prompt_queue {session} seq {queue_seq} op_id"),
-            op_id_raw,
-        )?;
-        let files: Vec<String> = parse_json(
-            &format!("prompt_queue {session} seq {queue_seq} files"),
-            &files_json,
-        )?;
-        let state: String = tx
-            .query_row(
-                "SELECT state FROM session WHERE id = ?1",
+                    params![session.raw() as i64],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((queue_seq, op_id_raw, prompt, files_json, model, variant, agent)) = head
+            else {
+                return Ok(None);
+            };
+            // Decode every persisted column BEFORE the first mutation: a corrupt
+            // row surfaces as a typed `Corrupt` naming the field and the
+            // transaction rolls back without claiming the prompt or materializing
+            // the message.
+            let op_id = id_field(
+                &format!("prompt_queue {session} seq {queue_seq} op_id"),
+                op_id_raw,
+            )?;
+            let files: Vec<String> = parse_json(
+                &format!("prompt_queue {session} seq {queue_seq} files"),
+                &files_json,
+            )?;
+            let state: String = tx
+                .query_row(
+                    "SELECT state FROM session WHERE id = ?1",
+                    params![session.raw() as i64],
+                    |r| r.get(0),
+                )
+                .map_err(|e| StoreError::Migration(format!("session missing: {e}")))?;
+            let state_label: String = parse_json(&format!("session {session} state"), &state)?;
+            if !eligible_states.iter().any(|s| s == &state_label) {
+                return Ok(None);
+            }
+            tx.execute(
+                "UPDATE prompt_queue SET status = 'claimed', claimed_at = ?2
+             WHERE session_id = ?1 AND seq = ?3",
+                params![session.raw() as i64, now_ms(), queue_seq],
+            )?;
+            let prev_event: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM event WHERE session_id = ?1",
                 params![session.raw() as i64],
                 |r| r.get(0),
-            )
-            .map_err(|e| StoreError::Migration(format!("session missing: {e}")))?;
-        let state_label: String = parse_json(&format!("session {session} state"), &state)?;
-        if !eligible_states.contains(&state_label.as_str()) {
-            return Ok(None);
-        }
-        tx.execute(
-            "UPDATE prompt_queue SET status = 'claimed', claimed_at = ?2
-             WHERE session_id = ?1 AND seq = ?3",
-            params![session.raw() as i64, now_ms(), queue_seq],
-        )?;
-        let prev_event: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM event WHERE session_id = ?1",
-            params![session.raw() as i64],
-            |r| r.get(0),
-        )?;
-        let event_seq = prev_event + 1;
-        tx.execute(
-            "INSERT INTO message(session_id, seq, role, data, created_ms)
+            )?;
+            let event_seq = prev_event + 1;
+            tx.execute(
+                "INSERT INTO message(session_id, seq, role, data, created_ms)
              VALUES (?1, ?2, 'user', ?3, ?4)",
-            params![
-                session.raw() as i64,
+                params![
+                    session.raw() as i64,
+                    event_seq,
+                    serde_json::json!({ "text": prompt }).to_string(),
+                    now_ms()
+                ],
+            )?;
+            tx.execute(
+                "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![
+                    session.raw() as i64,
+                    serde_json::to_string(&target_state).unwrap(),
+                    now_ms()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(Some((
+                AdmittedPrompt {
+                    queue_seq,
+                    op_id,
+                    prompt,
+                    files,
+                    model,
+                    variant,
+                    agent,
+                    message_seq: event_seq,
+                },
                 event_seq,
-                serde_json::json!({ "text": prompt }).to_string(),
-                now_ms()
-            ],
-        )?;
-        tx.execute(
-            "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![
-                session.raw() as i64,
-                serde_json::to_string(target_state).unwrap(),
-                now_ms()
-            ],
-        )?;
-        tx.commit()?;
-        Ok(Some((
-            AdmittedPrompt {
-                queue_seq,
-                op_id,
-                prompt,
-                files,
-                model,
-                variant,
-                agent,
-                message_seq: event_seq,
-            },
-            event_seq,
-        )))
+            )))
+        })
     }
 
     pub fn mark_queue_status(
@@ -6233,13 +6786,15 @@ impl Store {
         queue_seq: i64,
         status: &str,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "UPDATE prompt_queue SET status = ?3, completed_at = ?4
+        let status = status.to_owned();
+        self.writer.execute("mark_queue_status", move |conn| {
+            conn.execute(
+                "UPDATE prompt_queue SET status = ?3, completed_at = ?4
              WHERE session_id = ?1 AND seq = ?2",
-            params![session.raw() as i64, queue_seq, status, now_ms()],
-        )?;
-        Ok(())
+                params![session.raw() as i64, queue_seq, status, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Op ids of all non-terminal queue rows for a session (abort(None)
@@ -6273,7 +6828,8 @@ impl Store {
     /// exactly the crash residue abort must be able to clear. Returns how
     /// many rows were cancelled.
     pub fn cancel_queued_ops(&self, session: SessionId, ops: &[OpId]) -> StoreResult<i64> {
-        let conn = self.write();
+        let ops = ops.to_owned();
+        self.writer.execute("cancel_queued_ops", move |conn| {
         let mut n = 0i64;
         for op in ops {
             n += conn.execute(
@@ -6283,6 +6839,7 @@ impl Store {
             )? as i64;
         }
         Ok(n)
+        })
     }
 
     /// Recovery pass over the durable queue of one session. Two distinct
@@ -6305,31 +6862,33 @@ impl Store {
     /// so the row can never spin forever and is never delivered twice.
     /// Returns the number of claimed rows returned to pending.
     pub fn recover_claimed_queue_rows(&self, session: SessionId) -> StoreResult<i64> {
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let reclaimed = tx.execute(
-            "UPDATE prompt_queue SET status = 'pending', claimed_at = NULL
+        self.writer
+            .execute("recover_claimed_queue_rows", move |conn| {
+                let tx = conn.unchecked_transaction()?;
+                let reclaimed = tx.execute(
+                    "UPDATE prompt_queue SET status = 'pending', claimed_at = NULL
              WHERE session_id = ?1 AND status = 'claimed'",
-            params![session.raw() as i64],
-        )? as i64;
-        let retired = tx.execute(
-            "UPDATE prompt_queue SET status = 'done', completed_at = ?2
+                    params![session.raw() as i64],
+                )? as i64;
+                let retired = tx.execute(
+                    "UPDATE prompt_queue SET status = 'done', completed_at = ?2
              WHERE session_id = ?1 AND status = 'running' AND NOT EXISTS (
                  SELECT 1 FROM turn_record tr
                   WHERE tr.session_id = prompt_queue.session_id
                     AND tr.turn_op_id = prompt_queue.op_id
                     AND tr.status = 'active')",
-            params![session.raw() as i64, now_ms()],
-        )? as i64;
-        tx.commit()?;
-        if retired > 0 {
-            tracing::warn!(
-                session = %session,
-                rows = retired,
-                "queue recovery retired running rows whose logical turn already ended"
-            );
-        }
-        Ok(reclaimed)
+                    params![session.raw() as i64, now_ms()],
+                )? as i64;
+                tx.commit()?;
+                if retired > 0 {
+                    tracing::warn!(
+                        session = %session,
+                        rows = retired,
+                        "queue recovery retired running rows whose logical turn already ended"
+                    );
+                }
+                Ok(reclaimed)
+            })
     }
 
     /// All session ids with non-terminal queue rows (startup kick list).
@@ -6366,41 +6925,44 @@ impl Store {
                 "loop signal key must be 1..=1024 bytes; threshold >= 2".into(),
             ));
         }
-        let conn = self.write();
-        let tx = conn.unchecked_transaction()?;
-        let prev: Option<i64> = tx
-            .query_row(
-                "SELECT count FROM loop_signal WHERE session_id = ?1 AND key = ?2",
-                params![session.raw() as i64, key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let count = prev.unwrap_or(0) + 1;
-        tx.execute(
-            "INSERT OR REPLACE INTO loop_signal(session_id, key, count, updated_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session.raw() as i64, key, count, ts_ms],
-        )?;
-        if count >= i64::from(threshold) {
+        let key = key.to_owned();
+        self.writer.execute("bump_loop_signal", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let prev: Option<i64> = tx
+                .query_row(
+                    "SELECT count FROM loop_signal WHERE session_id = ?1 AND key = ?2",
+                    params![session.raw() as i64, key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let count = prev.unwrap_or(0) + 1;
             tx.execute(
-                "DELETE FROM loop_signal WHERE session_id = ?1 AND key = ?2",
-                params![session.raw() as i64, key],
+                "INSERT OR REPLACE INTO loop_signal(session_id, key, count, updated_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+                params![session.raw() as i64, key, count, ts_ms],
             )?;
+            if count >= i64::from(threshold) {
+                tx.execute(
+                    "DELETE FROM loop_signal WHERE session_id = ?1 AND key = ?2",
+                    params![session.raw() as i64, key],
+                )?;
+                tx.commit()?;
+                return Ok(true);
+            }
             tx.commit()?;
-            return Ok(true);
-        }
-        tx.commit()?;
-        Ok(false)
+            Ok(false)
+        })
     }
 
     /// Clear every loop signal of the session (the task made progress).
     pub fn reset_loop_signals(&self, session: SessionId) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "DELETE FROM loop_signal WHERE session_id = ?1",
-            params![session.raw() as i64],
-        )?;
-        Ok(())
+        self.writer.execute("reset_loop_signals", move |conn| {
+            conn.execute(
+                "DELETE FROM loop_signal WHERE session_id = ?1",
+                params![session.raw() as i64],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn loop_signal_counts(&self, session: SessionId) -> StoreResult<Vec<(String, i64)>> {
@@ -6443,38 +7005,41 @@ impl Store {
                 "alloc_op_ids: count must be non-zero".into(),
             ));
         }
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let next: i64 = tx
-            .query_row(
-                "SELECT next_value FROM op_id_seq WHERE session_scope = 0",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                StoreError::Migration(
-                    "op_id_seq global row missing (migrations not applied?)".into(),
+        self.writer.execute("alloc_op_ids", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let next: i64 = tx
+                .query_row(
+                    "SELECT next_value FROM op_id_seq WHERE session_scope = 0",
+                    [],
+                    |r| r.get(0),
                 )
-            })?;
-        if next < 0 {
-            return Err(StoreError::Migration(format!(
-                "op_id_seq next_value corrupted: {next}"
-            )));
-        }
-        let start = next as u64;
-        // `next_value` lives in a signed INTEGER column: the sequence is
-        // exhausted once a reservation would cross i64::MAX.
-        let end = start
-            .checked_add(count)
-            .filter(|end| *end <= i64::MAX as u64)
-            .ok_or_else(|| StoreError::Conflict("alloc_op_ids: op-id sequence exhausted".into()))?;
-        tx.execute(
-            "UPDATE op_id_seq SET next_value = ?1 WHERE session_scope = 0",
-            params![end as i64],
-        )?;
-        tx.commit()?;
-        Ok((start, count))
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::Migration(
+                        "op_id_seq global row missing (migrations not applied?)".into(),
+                    )
+                })?;
+            if next < 0 {
+                return Err(StoreError::Migration(format!(
+                    "op_id_seq next_value corrupted: {next}"
+                )));
+            }
+            let start = next as u64;
+            // `next_value` lives in a signed INTEGER column: the sequence is
+            // exhausted once a reservation would cross i64::MAX.
+            let end = start
+                .checked_add(count)
+                .filter(|end| *end <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    StoreError::Conflict("alloc_op_ids: op-id sequence exhausted".into())
+                })?;
+            tx.execute(
+                "UPDATE op_id_seq SET next_value = ?1 WHERE session_scope = 0",
+                params![end as i64],
+            )?;
+            tx.commit()?;
+            Ok((start, count))
+        })
     }
 
     /// The sequence's current high-water mark: the first id NOT yet
@@ -6521,11 +7086,15 @@ impl Store {
 
     /// Online backup via the SQLite backup API (safe while the daemon runs).
     pub fn backup_to(&self, dest: &Path) -> StoreResult<()> {
-        let src = self.write();
+        // Preparation BEFORE enqueueing: opening/creating the destination
+        // database is filesystem work and must not run on the writer owner
+        // (nor stall other domains behind it).
         let mut dst = Connection::open(dest)?;
-        let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
-        backup.run_to_completion(50, std::time::Duration::from_millis(100), None)?;
-        Ok(())
+        self.writer.execute("backup_to", move |src| {
+            let backup = rusqlite::backup::Backup::new(src, &mut dst)?;
+            backup.run_to_completion(50, std::time::Duration::from_millis(100), None)?;
+            Ok(())
+        })
     }
 
     /// `doctor`-style diagnostic with the FULL integrity scan (`doctor
@@ -7028,9 +7597,10 @@ impl Store {
     /// CHILD session (migration v23): the child's state plus its blocker
     /// truth. The session layer validates the text bounds before calling.
     pub fn child_runtime_put(&self, row: &ChildRuntimeRow) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "INSERT INTO child_runtime(
+        let row = row.to_owned();
+        self.writer.execute("child_runtime_put", move |conn| {
+            conn.execute(
+                "INSERT INTO child_runtime(
                  session_id, child_id, state, blocker_kind, blocker_reason,
                  blocker_dependency, blocker_resolution, last_progress_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -7043,19 +7613,20 @@ impl Store {
                  blocker_resolution = excluded.blocker_resolution,
                  last_progress_ms = excluded.last_progress_ms,
                  updated_ms = excluded.updated_ms",
-            params![
-                row.session_id.raw() as i64,
-                row.child_id,
-                row.state,
-                row.blocker_kind,
-                row.blocker_reason,
-                row.blocker_dependency,
-                row.blocker_resolution,
-                row.last_progress_ms,
-                row.updated_ms,
-            ],
-        )?;
-        Ok(())
+                params![
+                    row.session_id.raw() as i64,
+                    row.child_id,
+                    row.state,
+                    row.blocker_kind,
+                    row.blocker_reason,
+                    row.blocker_dependency,
+                    row.blocker_resolution,
+                    row.last_progress_ms,
+                    row.updated_ms,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// The durable child-runtime projection row of one child session.
@@ -7087,12 +7658,13 @@ impl Store {
 
     /// Drop the child-runtime projection row (the blocker was cleared).
     pub fn child_runtime_delete(&self, session_id: SessionId) -> StoreResult<()> {
-        let conn = self.write();
-        conn.execute(
-            "DELETE FROM child_runtime WHERE session_id = ?1",
-            params![session_id.raw() as i64],
-        )?;
-        Ok(())
+        self.writer.execute("child_runtime_delete", move |conn| {
+            conn.execute(
+                "DELETE FROM child_runtime WHERE session_id = ?1",
+                params![session_id.raw() as i64],
+            )?;
+            Ok(())
+        })
     }
 
     // ------------------------------------------------- index state machine
@@ -7124,25 +7696,28 @@ impl Store {
         generation: i64,
         kind: &str,
     ) -> StoreResult<()> {
-        let mut conn = self.write();
-        let now = now_ms();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO index_state(workspace_id, state_json, generation, updated_ms)
+        let state_json = state_json.to_owned();
+        let kind = kind.to_owned();
+        self.writer.execute("index_state_put", move |conn| {
+            let now = now_ms();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO index_state(workspace_id, state_json, generation, updated_ms)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(workspace_id) DO UPDATE SET
                 state_json = excluded.state_json,
                 generation = excluded.generation,
                 updated_ms = excluded.updated_ms",
-            params![workspace_id.raw() as i64, state_json, generation, now],
-        )?;
-        tx.execute(
+                params![workspace_id.raw() as i64, state_json, generation, now],
+            )?;
+            tx.execute(
             "INSERT INTO index_state_log(workspace_id, kind, state_json, generation, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![workspace_id.raw() as i64, kind, state_json, generation, now],
         )?;
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Atomic compare-and-swap of the workspace's index state row: the row
@@ -7161,36 +7736,39 @@ impl Store {
         new_generation: i64,
         kind: &str,
     ) -> StoreResult<bool> {
-        let mut conn = self.write();
-        let now = now_ms();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT state_json, generation FROM index_state WHERE workspace_id = ?1",
-                params![workspace_id.raw() as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let matched = match current {
-            Some((state_json, generation)) => {
-                state_json == expected_state_json && generation == expected_generation
+        let expected_state_json = expected_state_json.to_owned();
+        let new_state_json = new_state_json.to_owned();
+        let kind = kind.to_owned();
+        self.writer.execute("index_state_cas", move |conn| {
+            let now = now_ms();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT state_json, generation FROM index_state WHERE workspace_id = ?1",
+                    params![workspace_id.raw() as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let matched = match current {
+                Some((state_json, generation)) => {
+                    state_json == expected_state_json && generation == expected_generation
+                }
+                None => false,
+            };
+            if !matched {
+                return Ok(false); // rollback on drop; nothing written
             }
-            None => false,
-        };
-        if !matched {
-            return Ok(false); // rollback on drop; nothing written
-        }
-        tx.execute(
-            "UPDATE index_state SET state_json = ?2, generation = ?3, updated_ms = ?4
+            tx.execute(
+                "UPDATE index_state SET state_json = ?2, generation = ?3, updated_ms = ?4
              WHERE workspace_id = ?1",
-            params![
-                workspace_id.raw() as i64,
-                new_state_json,
-                new_generation,
-                now
-            ],
-        )?;
-        tx.execute(
+                params![
+                    workspace_id.raw() as i64,
+                    new_state_json,
+                    new_generation,
+                    now
+                ],
+            )?;
+            tx.execute(
             "INSERT INTO index_state_log(workspace_id, kind, state_json, generation, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -7201,8 +7779,9 @@ impl Store {
                 now
             ],
         )?;
-        tx.commit()?;
-        Ok(true)
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     /// Append-only transition journal of one workspace (newest first,
@@ -7270,21 +7849,22 @@ impl Store {
         task_id: TaskId,
         max_cost_micro: Option<u64>,
     ) -> StoreResult<()> {
-        let conn = self.write();
-        let n = conn.execute(
-            "UPDATE task SET max_cost_micro = ?1 WHERE session_id = ?2 AND task_id = ?3",
-            params![
-                max_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
-                session_id.raw() as i64,
-                task_id.raw() as i64
-            ],
-        )?;
-        if n == 0 {
-            return Err(StoreError::Conflict(format!(
+        self.writer.execute("cost_task_cap_set", move |conn| {
+            let n = conn.execute(
+                "UPDATE task SET max_cost_micro = ?1 WHERE session_id = ?2 AND task_id = ?3",
+                params![
+                    max_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                    session_id.raw() as i64,
+                    task_id.raw() as i64
+                ],
+            )?;
+            if n == 0 {
+                return Err(StoreError::Conflict(format!(
                 "task {task_id} of session {session_id} has no row; the task machine owns creation"
             )));
-        }
-        Ok(())
+            }
+            Ok(())
+        })
     }
 
     /// Whether a task in `state` may begin a NEW paid provider operation.
@@ -7362,7 +7942,8 @@ impl Store {
         created_ms: i64,
         pricing_snapshot_json: Option<&str>,
     ) -> StoreResult<CostReserveOutcome> {
-        let mut conn = self.write();
+        let pricing_snapshot_json = pricing_snapshot_json.map(|v| v.to_owned());
+        self.writer.execute("cost_reserve_inner", move |conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row_opt: Option<(Option<i64>, String)> = tx
             .query_row(
@@ -7449,6 +8030,7 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(CostReserveOutcome::Granted(id))
+        })
     }
 
     /// [`Store::cost_reserve_priced`] for one PHYSICAL ATTEMPT (attempt
@@ -7470,80 +8052,83 @@ impl Store {
         created_ms: i64,
         pricing_snapshot_json: Option<&str>,
     ) -> StoreResult<CostReserveOutcome> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row_opt: Option<(Option<i64>, String)> = tx
-            .query_row(
-                "SELECT max_cost_micro, state FROM task WHERE session_id = ?1 AND task_id = ?2",
-                params![session_id.raw() as i64, task_id.raw() as i64],
-                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let (cap, state): (Option<i64>, TaskState) = match row_opt {
-            Some((cap, state_json)) => {
-                let state: TaskState = parse_json(
-                    &format!("cost reserve: task {task_id} of session {session_id} state"),
-                    &state_json,
-                )?;
-                (cap, state)
-            }
-            None => {
+        let attempt = attempt.to_owned();
+        let pricing_snapshot_json = pricing_snapshot_json.map(|v| v.to_owned());
+        self.writer.execute("cost_reserve_attempt", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row_opt: Option<(Option<i64>, String)> = tx
+                .query_row(
+                    "SELECT max_cost_micro, state FROM task WHERE session_id = ?1 AND task_id = ?2",
+                    params![session_id.raw() as i64, task_id.raw() as i64],
+                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let (cap, state): (Option<i64>, TaskState) = match row_opt {
+                Some((cap, state_json)) => {
+                    let state: TaskState = parse_json(
+                        &format!("cost reserve: task {task_id} of session {session_id} state"),
+                        &state_json,
+                    )?;
+                    (cap, state)
+                }
+                None => {
+                    tx.rollback()?;
+                    return Err(StoreError::Conflict(format!(
+                        "cost reserve: task {task_id} of session {session_id} has no row"
+                    )));
+                }
+            };
+            if !Self::task_state_permits_provider_operation(state) {
                 tx.rollback()?;
                 return Err(StoreError::Conflict(format!(
-                    "cost reserve: task {task_id} of session {session_id} has no row"
+                    "cost reserve: task state {} forbids a new provider operation",
+                    state.label()
                 )));
             }
-        };
-        if !Self::task_state_permits_provider_operation(state) {
-            tx.rollback()?;
-            return Err(StoreError::Conflict(format!(
-                "cost reserve: task state {} forbids a new provider operation",
-                state.label()
-            )));
-        }
-        let spent: i64 = tx.query_row(
-            "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
-            params![session_id.raw() as i64, task_id.raw() as i64],
-            |r| r.get(0),
-        )?;
-        let open_sum: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
+            let spent: i64 = tx.query_row(
+                "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
+                params![session_id.raw() as i64, task_id.raw() as i64],
+                |r| r.get(0),
+            )?;
+            let open_sum: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
              WHERE session_id = ?1 AND task_id = ?2
                AND status IN ('reserved', 'dispatched', 'uncertain')",
-            params![session_id.raw() as i64, task_id.raw() as i64],
-            |r| r.get(0),
-        )?;
-        let cap_limit = cap.unwrap_or(0);
-        let free = cap_limit
-            .max(0)
-            .saturating_sub(spent.max(0))
-            .saturating_sub(open_sum.max(0))
-            .max(0);
-        if cap_limit > 0 && i64::try_from(predicted_micro).unwrap_or(i64::MAX) > free {
-            tx.rollback()?;
-            return Ok(CostReserveOutcome::Exceeded { free: free as u64 });
-        }
-        let predicted = predicted_micro.min(i64::MAX as u64) as i64;
-        let id = tx.query_row(
-            "INSERT INTO cost_reservation
+                params![session_id.raw() as i64, task_id.raw() as i64],
+                |r| r.get(0),
+            )?;
+            let cap_limit = cap.unwrap_or(0);
+            let free = cap_limit
+                .max(0)
+                .saturating_sub(spent.max(0))
+                .saturating_sub(open_sum.max(0))
+                .max(0);
+            if cap_limit > 0 && i64::try_from(predicted_micro).unwrap_or(i64::MAX) > free {
+                tx.rollback()?;
+                return Ok(CostReserveOutcome::Exceeded { free: free as u64 });
+            }
+            let predicted = predicted_micro.min(i64::MAX as u64) as i64;
+            let id = tx.query_row(
+                "INSERT INTO cost_reservation
                 (session_id, task_id, op_id, attempt_op_id, parent_op_id,
                  predicted_micro, status, created_ms, pricing_snapshot_json,
                  estimated_cost_micro)
              VALUES (?1, ?2, ?3, ?3, ?4, ?5, 'reserved', ?6, ?7, ?5)
              RETURNING reservation_id",
-            params![
-                session_id.raw() as i64,
-                task_id.raw() as i64,
-                attempt.attempt_op_id.raw() as i64,
-                attempt.logical_op_id.raw() as i64,
-                predicted,
-                created_ms,
-                pricing_snapshot_json
-            ],
-            |r| r.get(0),
-        )?;
-        tx.commit()?;
-        Ok(CostReserveOutcome::Granted(id))
+                params![
+                    session_id.raw() as i64,
+                    task_id.raw() as i64,
+                    attempt.attempt_op_id.raw() as i64,
+                    attempt.logical_op_id.raw() as i64,
+                    predicted,
+                    created_ms,
+                    pricing_snapshot_json
+                ],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            Ok(CostReserveOutcome::Granted(id))
+        })
     }
 
     /// The current state of one reservation row (attempt-accounting
@@ -7600,62 +8185,64 @@ impl Store {
         route_decision_json: Option<&str>,
         settled_ms: i64,
     ) -> StoreResult<CostReservationState> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(i64, i64, String)> = tx
-            .query_row(
-                "SELECT session_id, task_id, status FROM cost_reservation
+        let route_decision_json = route_decision_json.map(|v| v.to_owned());
+        self.writer.execute("cost_settle", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row: Option<(i64, i64, String)> = tx
+                .query_row(
+                    "SELECT session_id, task_id, status FROM cost_reservation
                  WHERE reservation_id = ?1",
-                params![reservation_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let Some((session_id, task_id, status)) = row else {
-            tx.rollback()?;
-            return Ok(CostReservationState::Missing);
-        };
-        if status != "reserved" && status != "dispatched" {
-            tx.rollback()?;
-            return Ok(CostReservationState::NotOpen { current: status });
-        }
-        let actual = actual_micro.min(i64::MAX as u64) as i64;
-        let basis = if provider_reported_micro.is_some() {
-            COST_BASIS_PROVIDER_REPORTED
-        } else {
-            COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
-        };
-        tx.execute(
-            "UPDATE cost_reservation
+                    params![reservation_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((session_id, task_id, status)) = row else {
+                tx.rollback()?;
+                return Ok(CostReservationState::Missing);
+            };
+            if status != "reserved" && status != "dispatched" {
+                tx.rollback()?;
+                return Ok(CostReservationState::NotOpen { current: status });
+            }
+            let actual = actual_micro.min(i64::MAX as u64) as i64;
+            let basis = if provider_reported_micro.is_some() {
+                COST_BASIS_PROVIDER_REPORTED
+            } else {
+                COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
+            };
+            tx.execute(
+                "UPDATE cost_reservation
              SET status = 'settled', settled_ms = ?1, delivery_state = ?6,
                  provider_cost_micro = ?2, provider_reported_micro = ?3,
                  provider_reported_cost_micro = ?3, settled_cost_micro = ?7,
                  cost_basis = ?8,
                  route_decision_json = ?4
              WHERE reservation_id = ?5",
-            params![
-                settled_ms,
-                provider_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
-                provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
-                route_decision_json,
-                reservation_id,
-                DELIVERY_COMPLETED,
-                actual,
-                basis
-            ],
-        )?;
-        let n = tx.execute(
-            "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+                params![
+                    settled_ms,
+                    provider_cost_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                    provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
+                    route_decision_json,
+                    reservation_id,
+                    DELIVERY_COMPLETED,
+                    actual,
+                    basis
+                ],
+            )?;
+            let n = tx.execute(
+                "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
              WHERE session_id = ?2 AND task_id = ?3",
-            params![actual, session_id, task_id],
-        )?;
-        if n == 0 {
-            tx.rollback()?;
-            return Err(StoreError::Conflict(format!(
-                "cost settle: task {task_id} of session {session_id} has no row"
-            )));
-        }
-        tx.commit()?;
-        Ok(CostReservationState::Applied)
+                params![actual, session_id, task_id],
+            )?;
+            if n == 0 {
+                tx.rollback()?;
+                return Err(StoreError::Conflict(format!(
+                    "cost settle: task {task_id} of session {session_id} has no row"
+                )));
+            }
+            tx.commit()?;
+            Ok(CostReservationState::Applied)
+        })
     }
 
     /// Settle one RESERVED/DISPATCHED reservation from a provider usage
@@ -7689,132 +8276,134 @@ impl Store {
         route_decision_json: Option<&str>,
         settled_ms: i64,
     ) -> StoreResult<CostSettleOutcome> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(i64, i64, String, Option<String>)> = tx
-            .query_row(
-                "SELECT session_id, task_id, status, pricing_snapshot_json
+        let route_decision_json = route_decision_json.map(|v| v.to_owned());
+        self.writer.execute("cost_settle_usage", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row: Option<(i64, i64, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT session_id, task_id, status, pricing_snapshot_json
                  FROM cost_reservation WHERE reservation_id = ?1",
-                params![reservation_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((session_id, task_id, status, snapshot_json)) = row else {
-            tx.rollback()?;
-            return Ok(CostSettleOutcome::Missing);
-        };
-        if status != "reserved" && status != "dispatched" {
-            tx.rollback()?;
-            return Ok(CostSettleOutcome::NotOpen { current: status });
-        }
-        let snapshot = match snapshot_json {
-            Some(json) => Some(parse_json::<PricingSnapshot>(
-                &format!("reservation {reservation_id} pricing_snapshot_json"),
-                &json,
-            )?),
-            None => None,
-        };
-        // The locally calculated actual: categories x the frozen snapshot.
-        // Unknown/absent snapshot => no honest number exists.
-        let local = snapshot.and_then(|s| {
-            s.settle_cost(
-                uncached_input_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-                output_tokens,
-            )
-        });
-        let (local_i64, reported_i64) = (
-            local.map(|m| m.min(i64::MAX as u64) as i64),
-            provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
-        );
-        // The chosen actual: the provider-reported cost when the usage frame
-        // carried one (authoritative); else the locally calculated
-        // categories x snapshot. Unknown price + no reported cost: with a
-        // hard cap this is a typed refusal (the cap was protected by the
-        // reservation's prediction, but a fabricated actual must never
-        // land); with no cap the row closes as a documented Unknown spend.
-        let chosen_i64: i64 = match provider_reported_micro {
-            Some(_) => reported_i64.expect("reported Some maps to Some"),
-            None => match local_i64 {
-                Some(local) => local,
-                None => {
-                    let has_cap: bool = tx
-                        .query_row(
-                            "SELECT max_cost_micro > 0 FROM task
+                    params![reservation_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((session_id, task_id, status, snapshot_json)) = row else {
+                tx.rollback()?;
+                return Ok(CostSettleOutcome::Missing);
+            };
+            if status != "reserved" && status != "dispatched" {
+                tx.rollback()?;
+                return Ok(CostSettleOutcome::NotOpen { current: status });
+            }
+            let snapshot = match snapshot_json {
+                Some(json) => Some(parse_json::<PricingSnapshot>(
+                    &format!("reservation {reservation_id} pricing_snapshot_json"),
+                    &json,
+                )?),
+                None => None,
+            };
+            // The locally calculated actual: categories x the frozen snapshot.
+            // Unknown/absent snapshot => no honest number exists.
+            let local = snapshot.and_then(|s| {
+                s.settle_cost(
+                    uncached_input_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    output_tokens,
+                )
+            });
+            let (local_i64, reported_i64) = (
+                local.map(|m| m.min(i64::MAX as u64) as i64),
+                provider_reported_micro.map(|m| m.min(i64::MAX as u64) as i64),
+            );
+            // The chosen actual: the provider-reported cost when the usage frame
+            // carried one (authoritative); else the locally calculated
+            // categories x snapshot. Unknown price + no reported cost: with a
+            // hard cap this is a typed refusal (the cap was protected by the
+            // reservation's prediction, but a fabricated actual must never
+            // land); with no cap the row closes as a documented Unknown spend.
+            let chosen_i64: i64 = match provider_reported_micro {
+                Some(_) => reported_i64.expect("reported Some maps to Some"),
+                None => match local_i64 {
+                    Some(local) => local,
+                    None => {
+                        let has_cap: bool = tx
+                            .query_row(
+                                "SELECT max_cost_micro > 0 FROM task
                              WHERE session_id = ?1 AND task_id = ?2",
-                            params![session_id, task_id],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(false);
-                    if has_cap {
-                        tx.rollback()?;
-                        return Ok(CostSettleOutcome::UnknownPrice {
-                            reservation: reservation_id,
-                        });
-                    }
-                    // No cap: record the Unknown spend honestly — status
-                    // settled, both amount columns NULL, nothing folded,
-                    // cost_basis Unknown.
-                    tx.execute(
-                        "UPDATE cost_reservation
+                                params![session_id, task_id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(false);
+                        if has_cap {
+                            tx.rollback()?;
+                            return Ok(CostSettleOutcome::UnknownPrice {
+                                reservation: reservation_id,
+                            });
+                        }
+                        // No cap: record the Unknown spend honestly — status
+                        // settled, both amount columns NULL, nothing folded,
+                        // cost_basis Unknown.
+                        tx.execute(
+                            "UPDATE cost_reservation
                          SET status = 'settled', settled_ms = ?1, delivery_state = ?3,
                              provider_cost_micro = NULL, provider_reported_micro = NULL,
                              provider_reported_cost_micro = NULL, settled_cost_micro = NULL,
                              cost_basis = ?4,
                              route_decision_json = ?2
                          WHERE reservation_id = ?5",
-                        params![
-                            settled_ms,
-                            route_decision_json,
-                            DELIVERY_COMPLETED,
-                            COST_BASIS_UNKNOWN,
-                            reservation_id
-                        ],
-                    )?;
-                    tx.commit()?;
-                    return Ok(CostSettleOutcome::AppliedUnknown);
-                }
-            },
-        };
-        let basis = if provider_reported_micro.is_some() {
-            COST_BASIS_PROVIDER_REPORTED
-        } else {
-            COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
-        };
-        tx.execute(
-            "UPDATE cost_reservation
+                            params![
+                                settled_ms,
+                                route_decision_json,
+                                DELIVERY_COMPLETED,
+                                COST_BASIS_UNKNOWN,
+                                reservation_id
+                            ],
+                        )?;
+                        tx.commit()?;
+                        return Ok(CostSettleOutcome::AppliedUnknown);
+                    }
+                },
+            };
+            let basis = if provider_reported_micro.is_some() {
+                COST_BASIS_PROVIDER_REPORTED
+            } else {
+                COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE
+            };
+            tx.execute(
+                "UPDATE cost_reservation
              SET status = 'settled', settled_ms = ?1, delivery_state = ?6,
                  provider_cost_micro = ?2, provider_reported_micro = ?3,
                  provider_reported_cost_micro = ?3, settled_cost_micro = ?7,
                  cost_basis = ?8,
                  route_decision_json = ?4
              WHERE reservation_id = ?5",
-            params![
-                settled_ms,
-                local_i64,
-                reported_i64,
-                route_decision_json,
-                reservation_id,
-                DELIVERY_COMPLETED,
-                chosen_i64,
-                basis
-            ],
-        )?;
-        let n = tx.execute(
-            "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+                params![
+                    settled_ms,
+                    local_i64,
+                    reported_i64,
+                    route_decision_json,
+                    reservation_id,
+                    DELIVERY_COMPLETED,
+                    chosen_i64,
+                    basis
+                ],
+            )?;
+            let n = tx.execute(
+                "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
              WHERE session_id = ?2 AND task_id = ?3",
-            params![chosen_i64, session_id, task_id],
-        )?;
-        if n == 0 {
-            tx.rollback()?;
-            return Err(StoreError::Conflict(format!(
-                "cost settle: task {task_id} of session {session_id} has no row"
-            )));
-        }
-        tx.commit()?;
-        Ok(CostSettleOutcome::Applied {
-            actual_micro: chosen_i64.max(0) as u64,
+                params![chosen_i64, session_id, task_id],
+            )?;
+            if n == 0 {
+                tx.rollback()?;
+                return Err(StoreError::Conflict(format!(
+                    "cost settle: task {task_id} of session {session_id} has no row"
+                )));
+            }
+            tx.commit()?;
+            Ok(CostSettleOutcome::Applied {
+                actual_micro: chosen_i64.max(0) as u64,
+            })
         })
     }
 
@@ -7834,27 +8423,28 @@ impl Store {
         reservation_id: i64,
         dispatched_ms: i64,
     ) -> StoreResult<CostReservationState> {
-        let conn = self.write();
-        let status: Option<String> = conn
-            .query_row(
-                "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
-                params![reservation_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(status) = status else {
-            return Ok(CostReservationState::Missing);
-        };
-        if status != "reserved" && status != "dispatched" {
-            return Ok(CostReservationState::NotOpen { current: status });
-        }
-        conn.execute(
-            "UPDATE cost_reservation
+        self.writer.execute("cost_mark_dispatched", move |conn| {
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
+                    params![reservation_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(status) = status else {
+                return Ok(CostReservationState::Missing);
+            };
+            if status != "reserved" && status != "dispatched" {
+                return Ok(CostReservationState::NotOpen { current: status });
+            }
+            conn.execute(
+                "UPDATE cost_reservation
              SET status = 'dispatched', dispatched_ms = ?1, delivery_state = ?2
              WHERE reservation_id = ?3 AND status IN ('reserved', 'dispatched')",
-            params![dispatched_ms, DELIVERY_DISPATCHED, reservation_id],
-        )?;
-        Ok(CostReservationState::Applied)
+                params![dispatched_ms, DELIVERY_DISPATCHED, reservation_id],
+            )?;
+            Ok(CostReservationState::Applied)
+        })
     }
 
     /// Refund one pre-dispatch reservation (`reserved`/legacy `open` with a
@@ -7869,38 +8459,39 @@ impl Store {
     /// against a caller that mis-calls refund after dispatch (the agent
     /// runtime's current post-dispatch refund sites): the money stays put.
     pub fn cost_refund(&self, reservation_id: i64, settled_ms: i64) -> StoreResult<RefundOutcome> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<i64>)> = tx
-            .query_row(
-                "SELECT status, dispatched_ms FROM cost_reservation WHERE reservation_id = ?1",
-                params![reservation_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((status, dispatched_ms)) = row else {
-            tx.rollback()?;
-            return Ok(RefundOutcome::Missing);
-        };
-        let n = tx.execute(
-            "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?2
+        self.writer.execute("cost_refund", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row: Option<(String, Option<i64>)> = tx
+                .query_row(
+                    "SELECT status, dispatched_ms FROM cost_reservation WHERE reservation_id = ?1",
+                    params![reservation_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((status, dispatched_ms)) = row else {
+                tx.rollback()?;
+                return Ok(RefundOutcome::Missing);
+            };
+            let n = tx.execute(
+                "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?2
              WHERE reservation_id = ?1
                AND status IN ('reserved', 'open') AND dispatched_ms IS NULL",
-            params![reservation_id, settled_ms],
-        )?;
-        if n == 0 {
-            tx.rollback()?;
-            // The guarded UPDATE changed nothing: the row is no longer
-            // refundable pre-dispatch (dispatched / settled / refunded /
-            // uncertain, or a legacy reserved+marker row). Typed, nothing
-            // written, money untouched.
-            return Ok(RefundOutcome::Blocked {
-                current: status,
-                dispatched_ms,
-            });
-        }
-        tx.commit()?;
-        Ok(RefundOutcome::Applied)
+                params![reservation_id, settled_ms],
+            )?;
+            if n == 0 {
+                tx.rollback()?;
+                // The guarded UPDATE changed nothing: the row is no longer
+                // refundable pre-dispatch (dispatched / settled / refunded /
+                // uncertain, or a legacy reserved+marker row). Typed, nothing
+                // written, money untouched.
+                return Ok(RefundOutcome::Blocked {
+                    current: status,
+                    dispatched_ms,
+                });
+            }
+            tx.commit()?;
+            Ok(RefundOutcome::Applied)
+        })
     }
 
     /// Crash recovery (P0-6/12): every pre-dispatch reservation of a crashed
@@ -7940,20 +8531,22 @@ impl Store {
     ///   provider-call rows or the task-completion finalize charges the
     ///   estimate. `failure_reason_code` records the crash for forensics.
     pub fn cost_recover_open_reservations(&self, at_ms: i64) -> StoreResult<(u64, u64)> {
-        let conn = self.write();
-        let refunded = conn.execute(
-            "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?1
+        self.writer
+            .execute("cost_recover_open_reservations", move |conn| {
+                let refunded = conn.execute(
+                    "UPDATE cost_reservation SET status = 'refunded', settled_ms = ?1
              WHERE status IN ('reserved', 'open') AND dispatched_ms IS NULL",
-            params![at_ms],
-        )?;
-        let uncertain = conn.execute(
-            "UPDATE cost_reservation
+                    params![at_ms],
+                )?;
+                let uncertain = conn.execute(
+                    "UPDATE cost_reservation
              SET status = 'uncertain', settled_ms = ?1, failure_reason_code = ?2
              WHERE status = 'dispatched'
                 OR (status IN ('reserved', 'open') AND dispatched_ms IS NOT NULL)",
-            params![at_ms, "crash_recovery_post_dispatch_marker"],
-        )?;
-        Ok((refunded as u64, uncertain as u64))
+                    params![at_ms, "crash_recovery_post_dispatch_marker"],
+                )?;
+                Ok((refunded as u64, uncertain as u64))
+            })
     }
 
     /// P0-2 reconcile: every UNCERTAIN reservation of one task settles FROM
@@ -8009,123 +8602,128 @@ impl Store {
             out
         };
         for reservation_id in candidates {
-            let mut conn = self.write();
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Only a row still UNCERTAIN settles (concurrent recovery or a
-            // previous pass may have closed it).
-            let row: Option<(u64, Option<String>)> = tx
-                .query_row(
-                    "SELECT predicted_micro, pricing_snapshot_json FROM cost_reservation
-                     WHERE reservation_id = ?1 AND status = 'uncertain'",
-                    params![reservation_id],
-                    |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((_predicted, snapshot_json)) = row else {
-                tx.commit()?;
-                continue;
-            };
-            let snapshot = match snapshot_json {
-                Some(json) => Some(parse_json::<PricingSnapshot>(
-                    &format!("reservation {reservation_id} pricing_snapshot_json"),
-                    &json,
-                )?),
-                None => None,
-            };
-            // The completed provider-call row of THIS SAME attempt (or, for
-            // a legacy reservation, of its op) — never a sibling attempt's
-            // row. Audit-13 primary counters; cache/reasoning detail is not
-            // persisted on the provider-call row, so the settled basis is
-            // input + output.
-            let tokens: Option<(i64, i64)> = tx
-                .query_row(
-                    "SELECT COALESCE(p.tokens_in, 0), COALESCE(p.tokens_out, 0)
-                     FROM provider_call p
-                     JOIN cost_reservation cr ON cr.reservation_id = ?1
-                       AND p.session_id = cr.session_id
-                       AND p.status = 'completed'
-                       AND (
-                         (cr.attempt_op_id IS NOT NULL
-                          AND p.attempt_op_id = cr.attempt_op_id)
-                         OR
-                         (cr.attempt_op_id IS NULL AND p.attempt_op_id IS NULL
-                          AND p.op_id = cr.op_id))
-                     ORDER BY p.id DESC LIMIT 1",
-                    params![reservation_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((tokens_in, tokens_out)) = tokens else {
-                report.left_uncertain += 1;
-                tx.commit()?;
-                continue;
-            };
-            let actual = snapshot.and_then(|s| {
-                s.settle_cost(tokens_in.max(0) as u64, 0, 0, tokens_out.max(0) as u64)
-            });
-            match actual {
-                Some(cost) => {
-                    let cost = cost.min(i64::MAX as u64) as i64;
-                    tx.execute(
-                        "UPDATE cost_reservation
-                         SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
-                             provider_reported_micro = NULL,
-                             provider_reported_cost_micro = NULL,
-                             settled_cost_micro = ?2,
-                             estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
-                             cost_basis = ?3, delivery_state = NULL
-                         WHERE reservation_id = ?4",
-                        params![
-                            at_ms,
-                            cost,
-                            COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE,
-                            reservation_id
-                        ],
-                    )?;
-                    let n = tx.execute(
-                        "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
-                         WHERE session_id = ?2 AND task_id = ?3",
-                        params![cost, session_id.raw() as i64, task_id.raw() as i64],
-                    )?;
-                    if n == 0 {
-                        // The task row is gone: nothing can fold into it —
-                        // roll the row back for doctor's dangling scan.
-                        tx.rollback()?;
-                        report.left_uncertain += 1;
-                        continue;
-                    }
-                    report.settled += 1;
-                    report.charged_micro = report.charged_micro.saturating_add(cost.max(0) as u64);
-                }
-                None => {
-                    let has_cap: bool = tx
-                        .query_row(
-                            "SELECT max_cost_micro > 0 FROM task
-                             WHERE session_id = ?1 AND task_id = ?2",
-                            params![session_id.raw() as i64, task_id.raw() as i64],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(false);
-                    if has_cap {
-                        // Unpriced under a hard cap: cannot settle honestly —
-                        // the finalize (reserved estimate) is the backstop.
-                        report.left_uncertain += 1;
-                    } else {
+            // One prepared command per candidate: the transaction body runs
+            // on the writer owner; the report folds OUTSIDE it.
+            let outcome = self.writer.execute("cost_reconcile_uncertain", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                // Only a row still UNCERTAIN settles (concurrent recovery or
+                // a previous pass may have closed it).
+                let row: Option<(u64, Option<String>)> = tx
+                    .query_row(
+                        "SELECT predicted_micro, pricing_snapshot_json FROM cost_reservation
+                         WHERE reservation_id = ?1 AND status = 'uncertain'",
+                        params![reservation_id],
+                        |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((_predicted, snapshot_json)) = row else {
+                    tx.commit()?;
+                    return Ok(CostReconcileOutcome::Skipped);
+                };
+                let snapshot = match snapshot_json {
+                    Some(json) => Some(parse_json::<PricingSnapshot>(
+                        &format!("reservation {reservation_id} pricing_snapshot_json"),
+                        &json,
+                    )?),
+                    None => None,
+                };
+                // The completed provider-call row of THIS SAME attempt (or, for
+                // a legacy reservation, of its op) — never a sibling attempt's
+                // row. Audit-13 primary counters; cache/reasoning detail is not
+                // persisted on the provider-call row, so the settled basis is
+                // input + output.
+                let tokens: Option<(i64, i64)> = tx
+                    .query_row(
+                        "SELECT COALESCE(p.tokens_in, 0), COALESCE(p.tokens_out, 0)
+                         FROM provider_call p
+                         JOIN cost_reservation cr ON cr.reservation_id = ?1
+                           AND p.session_id = cr.session_id
+                           AND p.status = 'completed'
+                           AND (
+                             (cr.attempt_op_id IS NOT NULL
+                              AND p.attempt_op_id = cr.attempt_op_id)
+                             OR
+                             (cr.attempt_op_id IS NULL AND p.attempt_op_id IS NULL
+                              AND p.op_id = cr.op_id))
+                         ORDER BY p.id DESC LIMIT 1",
+                        params![reservation_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((tokens_in, tokens_out)) = tokens else {
+                    tx.commit()?;
+                    return Ok(CostReconcileOutcome::LeftUncertain);
+                };
+                let actual = snapshot.and_then(|s| {
+                    s.settle_cost(tokens_in.max(0) as u64, 0, 0, tokens_out.max(0) as u64)
+                });
+                let outcome = match actual {
+                    Some(cost) => {
+                        let cost = cost.min(i64::MAX as u64) as i64;
                         tx.execute(
                             "UPDATE cost_reservation
-                             SET status = 'settled', settled_ms = ?1,
-                                 provider_cost_micro = NULL, provider_reported_micro = NULL,
+                             SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
+                                 provider_reported_micro = NULL,
                                  provider_reported_cost_micro = NULL,
-                                 settled_cost_micro = NULL, cost_basis = ?3,
-                                 delivery_state = NULL
-                             WHERE reservation_id = ?2",
-                            params![at_ms, reservation_id, COST_BASIS_UNKNOWN],
+                                 settled_cost_micro = ?2,
+                                 estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
+                                 cost_basis = ?3, delivery_state = NULL
+                             WHERE reservation_id = ?4",
+                            params![at_ms, cost, COST_BASIS_ROUTE_SNAPSHOT_ESTIMATE, reservation_id],
                         )?;
-                        report.closed_unknown += 1;
+                        let n = tx.execute(
+                            "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+                             WHERE session_id = ?2 AND task_id = ?3",
+                            params![cost, session_id.raw() as i64, task_id.raw() as i64],
+                        )?;
+                        if n == 0 {
+                            // The task row is gone: nothing can fold into it —
+                            // roll the row back for doctor's dangling scan.
+                            tx.rollback()?;
+                            return Ok(CostReconcileOutcome::LeftUncertain);
+                        }
+                        CostReconcileOutcome::Settled(cost.max(0) as u64)
                     }
+                    None => {
+                        let has_cap: bool = tx
+                            .query_row(
+                                "SELECT max_cost_micro > 0 FROM task
+                                 WHERE session_id = ?1 AND task_id = ?2",
+                                params![session_id.raw() as i64, task_id.raw() as i64],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(false);
+                        if has_cap {
+                            // Unpriced under a hard cap: cannot settle honestly —
+                            // the finalize (reserved estimate) is the backstop.
+                            CostReconcileOutcome::LeftUncertain
+                        } else {
+                            tx.execute(
+                                "UPDATE cost_reservation
+                                 SET status = 'settled', settled_ms = ?1,
+                                     provider_cost_micro = NULL, provider_reported_micro = NULL,
+                                     provider_reported_cost_micro = NULL,
+                                     settled_cost_micro = NULL, cost_basis = ?3,
+                                     delivery_state = NULL
+                                 WHERE reservation_id = ?2",
+                                params![at_ms, reservation_id, COST_BASIS_UNKNOWN],
+                            )?;
+                            CostReconcileOutcome::ClosedUnknown
+                        }
+                    }
+                };
+                tx.commit()?;
+                Ok(outcome)
+            })?;
+            match outcome {
+                CostReconcileOutcome::Skipped => {}
+                CostReconcileOutcome::LeftUncertain => report.left_uncertain += 1,
+                CostReconcileOutcome::ClosedUnknown => report.closed_unknown += 1,
+                CostReconcileOutcome::Settled(cost) => {
+                    report.settled += 1;
+                    report.charged_micro = report.charged_micro.saturating_add(cost);
                 }
             }
-            tx.commit()?;
         }
         Ok(report)
     }
@@ -8165,54 +8763,65 @@ impl Store {
             out
         };
         for reservation_id in candidates {
-            let mut conn = self.write();
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let predicted: Option<u64> = tx
-                .query_row(
-                    "SELECT predicted_micro FROM cost_reservation
-                     WHERE reservation_id = ?1 AND status = 'uncertain'",
-                    params![reservation_id],
-                    |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64),
-                )
-                .optional()?;
-            let Some(predicted) = predicted else {
-                tx.commit()?;
-                continue;
-            };
-            let predicted_i64 = predicted.min(i64::MAX as u64) as i64;
-            tx.execute(
-                "UPDATE cost_reservation
-                 SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
-                     provider_reported_micro = NULL,
-                     provider_reported_cost_micro = NULL,
-                     settled_cost_micro = ?2,
-                     estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
-                     cost_basis = ?3,
-                     delivery_state = NULL
-                 WHERE reservation_id = ?4 AND status = 'uncertain'",
-                params![
-                    at_ms,
-                    predicted_i64,
-                    COST_BASIS_CONSERVATIVE_RESERVATION,
-                    reservation_id
-                ],
-            )?;
-            let n = tx.execute(
-                "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
-                 WHERE session_id = ?2 AND task_id = ?3",
-                params![predicted_i64, session_id.raw() as i64, task_id.raw() as i64],
-            )?;
-            if n == 0 {
-                // The task row is gone: nothing can fold — roll the row
-                // back so the finalize stays idempotent and doctor's
-                // dangling scan can see it.
-                tx.rollback()?;
-                report.left_uncertain += 1;
-                continue;
+            // One prepared command per candidate: the transaction body runs
+            // on the writer owner; the report folds OUTSIDE it.
+            let outcome = self
+                .writer
+                .execute("cost_finalize_uncertain", move |conn| {
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let predicted: Option<u64> = tx
+                        .query_row(
+                            "SELECT predicted_micro FROM cost_reservation
+                         WHERE reservation_id = ?1 AND status = 'uncertain'",
+                            params![reservation_id],
+                            |r| r.get::<_, i64>(0).map(|v| v.max(0) as u64),
+                        )
+                        .optional()?;
+                    let Some(predicted) = predicted else {
+                        tx.commit()?;
+                        return Ok(CostFinalizeOutcome::Skipped);
+                    };
+                    let predicted_i64 = predicted.min(i64::MAX as u64) as i64;
+                    tx.execute(
+                        "UPDATE cost_reservation
+                     SET status = 'settled', settled_ms = ?1, provider_cost_micro = ?2,
+                         provider_reported_micro = NULL,
+                         provider_reported_cost_micro = NULL,
+                         settled_cost_micro = ?2,
+                         estimated_cost_micro = COALESCE(estimated_cost_micro, predicted_micro),
+                         cost_basis = ?3,
+                         delivery_state = NULL
+                     WHERE reservation_id = ?4 AND status = 'uncertain'",
+                        params![
+                            at_ms,
+                            predicted_i64,
+                            COST_BASIS_CONSERVATIVE_RESERVATION,
+                            reservation_id
+                        ],
+                    )?;
+                    let n = tx.execute(
+                        "UPDATE task SET spent_cost_micro = spent_cost_micro + ?1
+                     WHERE session_id = ?2 AND task_id = ?3",
+                        params![predicted_i64, session_id.raw() as i64, task_id.raw() as i64],
+                    )?;
+                    if n == 0 {
+                        // The task row is gone: nothing can fold — roll the row
+                        // back so the finalize stays idempotent and doctor's
+                        // dangling scan can see it.
+                        tx.rollback()?;
+                        return Ok(CostFinalizeOutcome::LeftUncertain);
+                    }
+                    tx.commit()?;
+                    Ok(CostFinalizeOutcome::Settled(predicted))
+                })?;
+            match outcome {
+                CostFinalizeOutcome::Skipped => {}
+                CostFinalizeOutcome::LeftUncertain => report.left_uncertain += 1,
+                CostFinalizeOutcome::Settled(predicted) => {
+                    report.settled += 1;
+                    report.charged_micro = report.charged_micro.saturating_add(predicted);
+                }
             }
-            report.settled += 1;
-            report.charged_micro = report.charged_micro.saturating_add(predicted);
-            tx.commit()?;
         }
         Ok(report)
     }
@@ -8359,34 +8968,37 @@ impl Store {
         request_id: Option<&str>,
         at_ms: i64,
     ) -> StoreResult<CostReservationState> {
-        let conn = self.write();
-        let status: Option<String> = conn
-            .query_row(
-                "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
-                params![reservation_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(status) = status else {
-            return Ok(CostReservationState::Missing);
-        };
-        if status != "dispatched" {
-            return Ok(CostReservationState::NotOpen { current: status });
-        }
-        conn.execute(
-            "UPDATE cost_reservation
+        let reason_code = reason_code.to_owned();
+        let request_id = request_id.map(|v| v.to_owned());
+        self.writer.execute("cost_mark_uncertain", move |conn| {
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM cost_reservation WHERE reservation_id = ?1",
+                    params![reservation_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(status) = status else {
+                return Ok(CostReservationState::Missing);
+            };
+            if status != "dispatched" {
+                return Ok(CostReservationState::NotOpen { current: status });
+            }
+            conn.execute(
+                "UPDATE cost_reservation
              SET status = 'uncertain', settled_ms = ?1,
                  failure_reason_code = ?2, request_id = ?3, delivery_state = ?4
              WHERE reservation_id = ?5 AND status = 'dispatched'",
-            params![
-                at_ms,
-                reason_code,
-                request_id,
-                DELIVERY_FAILED,
-                reservation_id
-            ],
-        )?;
-        Ok(CostReservationState::Applied)
+                params![
+                    at_ms,
+                    reason_code,
+                    request_id,
+                    DELIVERY_FAILED,
+                    reservation_id
+                ],
+            )?;
+            Ok(CostReservationState::Applied)
+        })
     }
 }
 
@@ -8462,7 +9074,7 @@ impl Store {
     /// v18). The write is a single immediate transaction: the projection
     /// row is read, absorbed with the router registry's saturating rule,
     /// and written back — a crash can never leave a half-absorbed row, and
-    /// the writer lock serializes concurrent appenders. A success sample
+    /// the single-owner writer service serializes concurrent appenders. A success sample
     /// carries zero rework even when a hostile caller hands nonzero
     /// cost/turn values; `verified_success = false` records a FAILURE
     /// sample (rework was needed), never a success.
@@ -8475,53 +9087,57 @@ impl Store {
         risk_bucket: RiskBucket,
         sample: ModelOutcomeSample,
     ) -> StoreResult<()> {
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = tx
-            .query_row(
-                "SELECT successes_first_pass, failures_first_pass, rework_cost_micro_sum,
+        let provider = provider.to_owned();
+        let model = model.to_owned();
+        self.writer
+            .execute("model_outcome_stats_append", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let current = tx
+                    .query_row(
+                        "SELECT successes_first_pass, failures_first_pass, rework_cost_micro_sum,
                         rework_turns_sum, sample_count
                  FROM model_outcome_stats
                  WHERE provider = ?1 AND model = ?2 AND phase = ?3 AND task_class = ?4
                    AND risk_bucket = ?5",
-                params![
-                    provider,
-                    model,
-                    outcome_db_phase(phase),
-                    outcome_db_class(task_class),
-                    outcome_db_bucket(risk_bucket)
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let (mut successes, mut failures, mut cost_sum, mut turns_sum, mut count) = match current {
-            Some((s, f, c, t, n)) => (
-                s.max(0) as u64,
-                f.max(0) as u64,
-                c.max(0) as u64,
-                t.max(0) as u64,
-                n.max(0) as u64,
-            ),
-            None => (0, 0, 0, 0, 0),
-        };
-        count = count.saturating_add(1);
-        if sample.verified_success {
-            successes = successes.saturating_add(1);
-        } else {
-            failures = failures.saturating_add(1);
-            cost_sum = cost_sum.saturating_add(sample.rework_cost_micro);
-            turns_sum = turns_sum.saturating_add(sample.rework_turns);
-        }
-        tx.execute(
-            "INSERT INTO model_outcome_stats (
+                        params![
+                            provider,
+                            model,
+                            outcome_db_phase(phase),
+                            outcome_db_class(task_class),
+                            outcome_db_bucket(risk_bucket)
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let (mut successes, mut failures, mut cost_sum, mut turns_sum, mut count) =
+                    match current {
+                        Some((s, f, c, t, n)) => (
+                            s.max(0) as u64,
+                            f.max(0) as u64,
+                            c.max(0) as u64,
+                            t.max(0) as u64,
+                            n.max(0) as u64,
+                        ),
+                        None => (0, 0, 0, 0, 0),
+                    };
+                count = count.saturating_add(1);
+                if sample.verified_success {
+                    successes = successes.saturating_add(1);
+                } else {
+                    failures = failures.saturating_add(1);
+                    cost_sum = cost_sum.saturating_add(sample.rework_cost_micro);
+                    turns_sum = turns_sum.saturating_add(sample.rework_turns);
+                }
+                tx.execute(
+                    "INSERT INTO model_outcome_stats (
                 provider, model, phase, task_class, risk_bucket,
                 successes_first_pass, failures_first_pass, rework_cost_micro_sum,
                 rework_turns_sum, sample_count, updated_ms)
@@ -8534,22 +9150,23 @@ impl Store {
                 rework_turns_sum = ?9,
                 sample_count = ?10,
                 updated_ms = ?11",
-            params![
-                provider,
-                model,
-                outcome_db_phase(phase),
-                outcome_db_class(task_class),
-                outcome_db_bucket(risk_bucket),
-                outcome_clamp_i64(successes),
-                outcome_clamp_i64(failures),
-                outcome_clamp_i64(cost_sum),
-                outcome_clamp_i64(turns_sum),
-                outcome_clamp_i64(count),
-                now_ms()
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
+                    params![
+                        provider,
+                        model,
+                        outcome_db_phase(phase),
+                        outcome_db_class(task_class),
+                        outcome_db_bucket(risk_bucket),
+                        outcome_clamp_i64(successes),
+                        outcome_clamp_i64(failures),
+                        outcome_clamp_i64(cost_sum),
+                        outcome_clamp_i64(turns_sum),
+                        outcome_clamp_i64(count),
+                        now_ms()
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
     }
 
     /// The exact per-key projection row, or `None` when the key has no
@@ -8653,73 +9270,75 @@ impl Store {
                 row.revision
             )));
         }
-        let mut conn = self.write();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let id = if row.id == 0 {
-            tx.execute(
-                "INSERT INTO evidence (
+        let row = row.to_owned();
+        self.writer.execute("evidence_insert", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let id = if row.id == 0 {
+                tx.execute(
+                    "INSERT INTO evidence (
                     session_id, workspace_id, task_id, kind, revision,
                     provenance, compressibility, compression, retrieval,
                     compact, backing_cas_hash, completeness, created_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    row.session_id.raw() as i64,
-                    row.workspace_id.raw() as i64,
-                    row.task_id.map(|t| t as i64),
-                    row.kind,
-                    row.revision,
-                    row.provenance_json,
-                    row.compressibility,
-                    row.compression_json,
-                    row.retrieval_json,
-                    row.compact_json,
-                    row.backing_cas_hash,
-                    row.completeness,
-                    row.created_ms,
-                ],
-            )?;
-            tx.last_insert_rowid() as u64
-        } else {
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM evidence WHERE id = ?1",
-                    params![row.id as i64],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if existing.is_some() {
-                return Err(StoreError::Conflict(format!(
-                    "evidence {} already exists; refusing to overwrite a durable envelope",
-                    row.id
-                )));
-            }
-            tx.execute(
-                "INSERT INTO evidence (
+                    params![
+                        row.session_id.raw() as i64,
+                        row.workspace_id.raw() as i64,
+                        row.task_id.map(|t| t as i64),
+                        row.kind,
+                        row.revision,
+                        row.provenance_json,
+                        row.compressibility,
+                        row.compression_json,
+                        row.retrieval_json,
+                        row.compact_json,
+                        row.backing_cas_hash,
+                        row.completeness,
+                        row.created_ms,
+                    ],
+                )?;
+                tx.last_insert_rowid() as u64
+            } else {
+                let existing: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM evidence WHERE id = ?1",
+                        params![row.id as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if existing.is_some() {
+                    return Err(StoreError::Conflict(format!(
+                        "evidence {} already exists; refusing to overwrite a durable envelope",
+                        row.id
+                    )));
+                }
+                tx.execute(
+                    "INSERT INTO evidence (
                     id, session_id, workspace_id, task_id, kind, revision,
                     provenance, compressibility, compression, retrieval,
                     compact, backing_cas_hash, completeness, created_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    row.id as i64,
-                    row.session_id.raw() as i64,
-                    row.workspace_id.raw() as i64,
-                    row.task_id.map(|t| t as i64),
-                    row.kind,
-                    row.revision,
-                    row.provenance_json,
-                    row.compressibility,
-                    row.compression_json,
-                    row.retrieval_json,
-                    row.compact_json,
-                    row.backing_cas_hash,
-                    row.completeness,
-                    row.created_ms,
-                ],
-            )?;
-            row.id
-        };
-        tx.commit()?;
-        Ok(id)
+                    params![
+                        row.id as i64,
+                        row.session_id.raw() as i64,
+                        row.workspace_id.raw() as i64,
+                        row.task_id.map(|t| t as i64),
+                        row.kind,
+                        row.revision,
+                        row.provenance_json,
+                        row.compressibility,
+                        row.compression_json,
+                        row.retrieval_json,
+                        row.compact_json,
+                        row.backing_cas_hash,
+                        row.completeness,
+                        row.created_ms,
+                    ],
+                )?;
+                row.id
+            };
+            tx.commit()?;
+            Ok(id)
+        })
     }
 
     /// Read one evidence row by id. Unscoped: callers acting for a session
@@ -11680,7 +12299,7 @@ mod tests {
         // it as TEXT fails loudly. The newest 500 rows (seq 9501..=10000)
         // stay healthy.
         {
-            let conn = store.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE message SET data = x'FF' WHERE session_id = ?1 AND seq < 9501",
                 params![sid.raw() as i64],
@@ -11938,7 +12557,7 @@ mod tests {
                 .put_checkpoint(s.id, 3, "f.txt", "before", "after", Some("after-blob"))
                 .unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("ALTER TABLE checkpoint DROP COLUMN after_cas_hash", [])
                     .unwrap();
                 // The v6 existence columns are post-v2 too: drop them so the
@@ -12169,7 +12788,7 @@ mod tests {
                 .put_checkpoint(s.id, 1, "f.txt", "before", "after", Some("blob"))
                 .unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("ALTER TABLE checkpoint DROP COLUMN before_exists", [])
                     .unwrap();
                 conn.execute("ALTER TABLE checkpoint DROP COLUMN after_exists", [])
@@ -12330,7 +12949,7 @@ mod tests {
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         // Try to insert a duplicate (session, seq) by bypassing the API:
         // the PRIMARY KEY must reject it.
-        let conn = store.write();
+        let conn = store.raw_conn();
         let r = conn.execute(
             "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload) VALUES (1, ?1, NULL, 'model_started', '\"streaming\"', 0, NULL)",
             params![s.id.raw() as i64],
@@ -12400,7 +13019,7 @@ mod tests {
             .unwrap();
         // Force the durable deadline into the past (no sleeping in tests).
         store
-            .write()
+            .raw_conn()
             .execute(
                 "UPDATE permission SET expires_ms = ?2 WHERE id = ?1",
                 params![pid, now_ms() - 1],
@@ -12448,7 +13067,7 @@ mod tests {
     /// sleeping (the row stays `pending`: only reconciliation terminalizes it).
     fn force_permission_deadline_past(store: &Store, pid: i64) {
         store
-            .write()
+            .raw_conn()
             .execute(
                 "UPDATE permission SET expires_ms = expires_ms - 1000000000 WHERE id = ?1",
                 params![pid],
@@ -12661,15 +13280,20 @@ mod tests {
                 point: seam,
                 ordinal: 0,
             });
-            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = store.expire_pending_permissions_for_session(
+            // The deliberate in-transaction panic is caught by the writer
+            // service (durable authority) and surfaced typed: the caller sees
+            // a refusal, the daemon never panics, and the store stops
+            // admitting mutations. Reopening is the recovery path.
+            let err = store
+                .expire_pending_permissions_for_session(
                     s.id,
                     now_ms(),
                     AgentState::Idle,
                     permission_expiry_event(),
-                );
-            }));
-            assert!(caught.is_err(), "seam {seam} must fire");
+                )
+                .expect_err("seam must fire");
+            assert!(matches!(err, StoreError::WriterUnavailable(_)), "{err:?}");
+            assert!(!store.writer_available(), "seam {seam} must fire");
             drop(store);
             // Reopen from disk: exactly the old world or exactly the new one.
             let store = Store::open(dir.path(), true).unwrap();
@@ -12990,7 +13614,7 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE session SET state = ?1 WHERE id = ?2",
                 params!["\"not_a_state\"", s.id.raw() as i64],
@@ -13013,7 +13637,7 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
                  VALUES (2, ?1, NULL, 'bogus', '\"idle\"', 0, NULL)",
@@ -13033,7 +13657,7 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
                  VALUES (2, ?1, NULL, 'model_started', '\"not_a_state\"', 0, NULL)",
@@ -13053,7 +13677,7 @@ mod tests {
         let ws = store.create_workspace("/w").unwrap();
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload)
                  VALUES (2, ?1, NULL, 'model_started', '\"streaming\"', 0, 'not json at all')",
@@ -13079,7 +13703,7 @@ mod tests {
             .put_part(mid, "text", serde_json::json!({"t": "hi"}))
             .unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE message SET data = 'broken{' WHERE id = ?1",
                 params![mid],
@@ -13118,7 +13742,7 @@ mod tests {
             )
             .unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE tool_run SET args = 'broken{' WHERE session_id = ?1",
                 params![s.id.raw() as i64],
@@ -13130,7 +13754,7 @@ mod tests {
             other => panic!("corrupt tool_run args must error, not panic: {other:?}"),
         }
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE tool_run SET args = '{\"a\":1}', recovery = 'broken{' WHERE session_id = ?1",
                 params![s.id.raw() as i64],
@@ -13152,7 +13776,7 @@ mod tests {
             .put_task_ledger(s.id, serde_json::json!({"tasks": []}))
             .unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE task_ledger SET ledger = 'garbage' WHERE session_id = ?1",
                 params![s.id.raw() as i64],
@@ -13176,7 +13800,7 @@ mod tests {
         assert_eq!(row.lifecycle, faktor_core::state::SessionLifecycle::Open);
         // (1) Not valid JSON at all: fail closed, never silently Open.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE session SET lifecycle = 'garbage-not-json' WHERE id = ?1",
                 params![s.id.raw() as i64],
@@ -13190,7 +13814,7 @@ mod tests {
         // (2) Structurally valid JSON but an unknown variant: also fail
         // closed (a real Closed must not reopen as Open).
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE session SET lifecycle = '\"terminated\"' WHERE id = ?1",
                 params![s.id.raw() as i64],
@@ -13215,7 +13839,7 @@ mod tests {
         // NOT NULL DEFAULT 'open', so SQLite itself rejects a NULL write;
         // parse_lifecycle never sees None. Prove the constraint holds.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             let err = conn
                 .execute(
                     "UPDATE session SET lifecycle = NULL WHERE id = ?1",
@@ -13330,7 +13954,7 @@ mod tests {
 
     #[test]
     fn concurrent_end_session_races() {
-        // Two (well, eight) racers try to close one session. The writer lock
+        // Two (well, eight) racers try to close one session. The writer service
         // serializes the transactions; the expected_lifecycle guard means
         // exactly ONE wins and exactly ONE SessionEnded event exists.
         let (_d, store) = tmp_store();
@@ -13638,7 +14262,7 @@ mod tests {
                 )
                 .unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("ALTER TABLE tool_run DROP COLUMN replay_descriptor", [])
                     .unwrap();
                 conn.execute("ALTER TABLE tool_run DROP COLUMN attempt", [])
@@ -13807,7 +14431,7 @@ mod tests {
             let ws = store.create_workspace("/w").unwrap();
             let s = store.create_session(ws, "t", "p", "m").unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("ALTER TABLE session DROP COLUMN worktree_id", [])
                     .unwrap();
                 conn.execute("ALTER TABLE session DROP COLUMN task_id", [])
@@ -14072,7 +14696,7 @@ mod tests {
             let ws = store.create_workspace("/w").unwrap();
             let s = store.create_session(ws, "t", "p", "m").unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("DROP TABLE op_id_seq", []).unwrap();
                 // The v9/v10 task tables are post-this-version too: restore
                 // the legacy `task` layout so the migration chain past v10
@@ -14206,7 +14830,7 @@ mod tests {
             let ledger = serde_json::json!({"goal": "legacy ledger row", "tasks": []});
             store.put_task_ledger(s.id, ledger.clone()).unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 // Rewind the schema to the v9 layout: drop the migrated
                 // artifacts and rename the legacy table back to `task`.
                 conn.execute("DROP TABLE task", []).unwrap();
@@ -14414,7 +15038,7 @@ mod tests {
         assert_eq!(listed[0].task_id, TaskId::new(2), "oldest-created first");
         // Corrupt state strings fail closed as Corrupt, never a panic.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE task SET state = 'garbage' WHERE session_id = ?1 AND task_id = ?2",
                 params![s1.id.raw() as i64, 2],
@@ -14582,7 +15206,7 @@ mod tests {
                 Some(0.5),
             )
             .unwrap();
-        let conn = store.write();
+        let conn = store.raw_conn();
         // Truncated hash blob (7 bytes).
         conn.execute(
             "UPDATE provider_call SET prompt_prefix_hash = ?1 WHERE id = ?2",
@@ -14807,7 +15431,7 @@ mod tests {
                 Some(&segments_json(2, &[10, 20])),
             )
             .unwrap();
-        let conn = store.write();
+        let conn = store.raw_conn();
         let corrupt = |json: &str| {
             conn.execute(
                 "UPDATE provider_call SET prefix_segments_json = ?1 WHERE id = ?2",
@@ -14995,7 +15619,7 @@ mod tests {
                 .record_provider_call(s.id, OpId::new(1), "p", "m", "ok", Some(10), Some(5), None)
                 .unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 // Rewind to the v12 layout: drop the v13 columns and the
                 // schema cursor so the full chain past v13 replays.
                 conn.execute(
@@ -15266,7 +15890,7 @@ mod tests {
         assert!(store.journal_consistency_issues().unwrap().is_empty());
         // Torn session: raw session row with no journal (bypasses the API).
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "INSERT INTO session(workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms)
                  VALUES (?1, 'torn', 'p', 'm', '\"idle\"', 'open', 0, 0)",
@@ -15279,7 +15903,7 @@ mod tests {
         assert!(issues[0].contains("no events"));
         // A gap: delete the middle event of the healthy session.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "DELETE FROM event WHERE session_id = ?1 AND seq = 2",
                 params![s.id.raw() as i64],
@@ -16008,7 +16632,7 @@ mod typed_ledger_tests {
             };
             store.upsert_task(&row).unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("ALTER TABLE task DROP COLUMN revision", [])
                     .unwrap();
                 conn.execute("DROP TABLE verification_record", []).unwrap();
@@ -16122,7 +16746,7 @@ mod typed_ledger_tests {
             let tid = task.task_id;
             store.cost_task_cap_set(s.id, tid, Some(1_000)).unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 // Downgrade the post-v16 objects this rewind replays (the
                 // v18 attempt columns on provider_call; the v16 migration
                 // itself rebuilds cost_reservation from the v15 shape
@@ -16276,7 +16900,7 @@ mod typed_ledger_tests {
         // The new CHECK forbids the legacy vocabulary outright (both
         // 'abandoned' and 'open' are gone from the v18 vocabulary).
         for hostile in ["abandoned", "open"] {
-            let insert = store.write().execute(
+            let insert = store.raw_conn().execute(
                 "INSERT INTO cost_reservation
                     (session_id, task_id, op_id, predicted_micro, status, created_ms)
                  VALUES (1, 1, 9, 1, ?1, 1)",
@@ -16908,7 +17532,7 @@ mod typed_ledger_tests {
         let record = passing_record(&task, ws, WorktreeId::new(1));
         let rec_id = store.verification_record_put(&record).unwrap();
         store
-            .write()
+            .raw_conn()
             .execute(
                 "UPDATE task SET state = '{not-a-state}' WHERE session_id = ?1 AND task_id = ?2",
                 params![s.id.raw() as i64, task.task_id.raw() as i64],
@@ -16933,7 +17557,7 @@ mod typed_ledger_tests {
             "corrupt state must fail completion typed: {err}"
         );
         let raw: (String, i64) = store
-            .write()
+            .raw_conn()
             .query_row(
                 "SELECT state, revision FROM task WHERE session_id = ?1 AND task_id = ?2",
                 params![s.id.raw() as i64, task.task_id.raw() as i64],
@@ -16950,7 +17574,7 @@ mod typed_ledger_tests {
         // provider work): the reserve path works again — the failure was
         // the corruption, not a poisoned connection.
         store
-            .write()
+            .raw_conn()
             .execute(
                 "UPDATE task SET state = '\"running\"' WHERE session_id = ?1 AND task_id = ?2",
                 params![s.id.raw() as i64, task.task_id.raw() as i64],
@@ -17136,7 +17760,7 @@ mod typed_ledger_tests {
         // Verifying WITHOUT a revision bump) is caught by the machine on the
         // next completion attempt.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE task SET state = ?1 WHERE session_id = ?2 AND task_id = ?3",
                 params![
@@ -17216,7 +17840,7 @@ mod typed_ledger_tests {
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE task SET revision = 0 WHERE session_id = 1 AND task_id = 1",
                 [],
@@ -17237,7 +17861,7 @@ mod typed_ledger_tests {
         let s = store.create_session(ws, "t", "p", "m").unwrap();
         seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE task SET max_turns = ?1 WHERE session_id = ?2 AND task_id = 1",
                 params![i64::from(u32::MAX) + 1, s.id.raw() as i64],
@@ -17254,7 +17878,7 @@ mod typed_ledger_tests {
             other => panic!("oversize persisted max_turns must be a typed error: {other:?}"),
         }
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE task SET max_turns = NULL, spent_turns = -1
                  WHERE session_id = ?1 AND task_id = 1",
@@ -17315,7 +17939,7 @@ mod typed_ledger_tests {
             )
             .unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE prompt_queue SET files = 'not json' WHERE session_id = ?1",
                 params![s.id.raw() as i64],
@@ -17387,7 +18011,7 @@ mod typed_ledger_tests {
     /// a referenced id column behind the typed API's back is exactly the
     /// hand-corrupted database the read-time decodes must survive.
     fn corrupt_ignoring_fks(store: &Store, sql: &str, params: &[&dyn rusqlite::ToSql]) {
-        let conn = store.write();
+        let conn = store.raw_conn();
         conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
         conn.execute(sql, params).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
@@ -17858,7 +18482,7 @@ mod typed_ledger_tests {
         // Zero is structurally invalid: every read path refuses it typed and
         // admission changes nothing.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE prompt_queue SET op_id = 0 WHERE session_id = ?1 AND seq = 1",
                 params![s.id.raw() as i64],
@@ -17900,7 +18524,7 @@ mod typed_ledger_tests {
         for wanted in [u64::MAX, u64::MAX - 2, 2u64.pow(63)] {
             let bad = wanted as i64;
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute(
                     "UPDATE prompt_queue SET op_id = ?2 WHERE session_id = ?1 AND seq = 1",
                     params![s.id.raw() as i64, bad],
@@ -17922,7 +18546,7 @@ mod typed_ledger_tests {
         // Repair the row: the head still admits exactly once and the queue
         // then advances to the next row (the fix never wedges the FIFO).
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE prompt_queue SET op_id = ?2 WHERE session_id = ?1 AND seq = 1",
                 params![s.id.raw() as i64, 7i64],
@@ -17971,7 +18595,7 @@ mod typed_ledger_tests {
             .enqueue_prompt(s.id, OpId::new(13), "three", &[], None, None, None, 3)
             .unwrap();
         store
-            .write()
+            .raw_conn()
             .execute(
                 "UPDATE prompt_queue SET status = CASE seq
                      WHEN 1 THEN 'claimed'
@@ -18070,7 +18694,7 @@ mod typed_ledger_tests {
 
         // Zero is structurally invalid on every one of these columns.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE permission SET op_id = 0 WHERE id = ?1",
                 params![pid],
@@ -18099,7 +18723,7 @@ mod typed_ledger_tests {
         for wanted in [u64::MAX, u64::MAX - 2, 2u64.pow(63)] {
             let bad = wanted as i64;
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute(
                     "UPDATE permission SET op_id = ?2 WHERE id = ?1",
                     params![pid, bad],
@@ -18161,7 +18785,7 @@ mod typed_ledger_tests {
             .enqueue_prompt(s.id, OpId::new(1), "hi", &[], None, None, None, 1)
             .unwrap();
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE session SET state = 'not json' WHERE id = ?1",
                 params![s.id.raw() as i64],
@@ -18370,7 +18994,7 @@ mod typed_ledger_tests {
             let tid = task.task_id;
             store.cost_task_cap_set(s.id, tid, Some(1_000)).unwrap();
             {
-                let conn = store.write();
+                let conn = store.raw_conn();
                 conn.execute("DROP INDEX IF EXISTS idx_provider_call_session_attempt", [])
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN attempt_op_id", [])
@@ -19188,7 +19812,7 @@ mod typed_ledger_tests {
     #[test]
     fn model_outcome_stats_race_writers_never_lose_a_sample() {
         // N threads hammering the SAME key through the shared store: the
-        // single writer lock serializes the transactional read-modify-write,
+        // single writer owner serializes the transactional read-modify-write,
         // so every sample lands exactly once — no lost updates, no broken
         // invariant (adversarial duplicate-replay shape: each thread is a
         // distinct "caller" and 10 identical appends must count 10).
@@ -19619,7 +20243,7 @@ mod evidence_store_tests {
             .unwrap()
             .is_empty());
         // Corrupt revision refuses on read (a row injected behind the API).
-        let conn = store.write();
+        let conn = store.raw_conn();
         conn.execute(
             "UPDATE evidence SET revision = 0 WHERE id = ?1",
             params![ids[0] as i64],
@@ -19963,7 +20587,7 @@ mod verification_job_store_tests {
             )
             .unwrap());
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE verification_job SET state = 'bogus' WHERE check_id = 'bg'",
                 [],
@@ -19975,7 +20599,7 @@ mod verification_job_store_tests {
             other => panic!("unknown state must be malformed, got {other:?}"),
         }
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             // Repair the state so the NEXT corruption class is isolated.
             conn.execute(
                 "UPDATE verification_job SET state = 'queued' WHERE check_id = 'bg'",
@@ -19995,7 +20619,7 @@ mod verification_job_store_tests {
         // Force a non-positive identity on the attempt row: a corrupt row
         // reads loudly instead of being trusted.
         {
-            let conn = store.write();
+            let conn = store.raw_conn();
             conn.execute(
                 "UPDATE verification_attempt SET task_revision = 0 WHERE attempt_op_id = 20",
                 [],
@@ -20481,7 +21105,6 @@ mod legacy_verification_import_tests {
 
 #[cfg(test)]
 mod session_command_txn_tests {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -20690,7 +21313,7 @@ mod session_command_txn_tests {
     }
 
     fn world(store: &Store, sid: SessionId) -> World {
-        let conn = store.write();
+        let conn = store.raw_conn();
         let mut lines = Vec::new();
         let state: String = conn
             .query_row(
@@ -20747,11 +21370,20 @@ mod session_command_txn_tests {
             point: seam,
             ordinal: 0,
         });
-        let caught = catch_unwind(AssertUnwindSafe(|| {
+        // The seam's deliberate panic is caught at the durable-authority
+        // boundary and surfaced as the typed unavailable state: the test
+        // helper's `expect` then unwinds on THIS thread (never a daemon
+        // panic), and the writer stops admitting mutations.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut pid = pid;
             execute(&store, sid, cmd, &mut pid);
         }));
         assert!(caught.is_err(), "seam {seam} at {} must fire", cmd.name());
+        assert!(
+            !store.writer_available(),
+            "seam {seam} at {} must mark the durable authority unavailable",
+            cmd.name()
+        );
         drop(store);
         let reopened = Store::open(dir.path().join("store"), true).unwrap();
         let w = world(&reopened, sid);
@@ -20828,10 +21460,9 @@ mod session_command_txn_tests {
                 point: seam,
                 ordinal: 0,
             });
-            let caught = catch_unwind(AssertUnwindSafe(|| {
-                let _ = recovered(&store, sid);
-            }));
-            assert!(caught.is_err(), "seam {seam} must fire");
+            let err = recovered(&store, sid).expect_err("seam must fire");
+            assert!(matches!(err, StoreError::WriterUnavailable(_)), "{err:?}");
+            assert!(!store.writer_available(), "seam {seam} must fire");
             drop(store);
             let reopened = Store::open(dir.path().join("store"), true).unwrap();
             let durable = world(&reopened, sid);
@@ -21164,7 +21795,7 @@ mod session_command_txn_tests {
             matches!(loser, Err(StoreError::Conflict(_))),
             "the loser must refuse typed: {loser:?}"
         );
-        let conn = store.write();
+        let conn = store.raw_conn();
         let resolutions: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM event WHERE session_id = ?1
@@ -21183,5 +21814,411 @@ mod session_command_txn_tests {
             .unwrap();
         let winner = if r1.is_ok() { "allow" } else { "deny" };
         assert_eq!(decision, winner, "the durable decision matches the winner");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer service certification (audit item 7) and poisoning policy (item 8).
+//
+// These tests are adversarial: they inject slow transactions, saturation,
+// deliberate panics while locks are held, and concurrent multi-domain
+// writers, then assert the typed refusal/recovery contract — never a daemon
+// panic and never a wedged store.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod writer_service_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, MutexGuard};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn store_with_session() -> (tempfile::TempDir, Arc<Store>, WorkspaceId, SessionId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "writer", "fake", "m").unwrap().id;
+        (dir, store, ws, sid)
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// An injected slow transaction holds the single writer owner: reads and
+    /// another domain's PREPARATION (JSON serialization + enqueue) proceed
+    /// while it runs, and the queued writer commits only after it — queue
+    /// semantics, not a process-wide lock.
+    #[test]
+    fn slow_holder_does_not_block_reads_or_preparation() {
+        let (_d, store, _ws, sid) = store_with_session();
+        let holder_store = Arc::clone(&store);
+        let holders_started = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&holders_started);
+        let holder = thread::spawn(move || {
+            holder_store
+                .writer_debug_job("cert_slow_holder", move |_conn| {
+                    started.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(800));
+                })
+                .unwrap();
+        });
+        wait_until(|| holders_started.load(Ordering::SeqCst), "slow holder");
+
+        // Reads never take the writer owner: they complete while it sleeps.
+        let read_started = Instant::now();
+        let sessions = store.list_sessions(None).unwrap();
+        assert!(!sessions.is_empty());
+        assert!(
+            read_started.elapsed() < Duration::from_millis(400),
+            "read blocked behind the slow holder: {:?}",
+            read_started.elapsed()
+        );
+
+        // Another domain's write: a large payload is serialized on this
+        // thread BEFORE enqueueing, and the enqueue itself succeeds while
+        // the holder still runs (only execution waits).
+        let payload: serde_json::Value = serde_json::json!({ "blob": "x".repeat(512 * 1024) });
+        let queued_started = Instant::now();
+        store
+            .append_ledger_entry(sid, "cert_probe", 1, payload)
+            .unwrap();
+        let queued_elapsed = queued_started.elapsed();
+        assert!(
+            queued_elapsed >= Duration::from_millis(100),
+            "queued writer must wait for the owner, not run concurrently: {queued_elapsed:?}"
+        );
+        holder.join().unwrap();
+
+        let telemetry = store.writer_telemetry();
+        assert!(telemetry.available, "{telemetry:?}");
+        assert!(telemetry.jobs >= 2, "{telemetry:?}");
+        assert!(telemetry.slow_transactions >= 1, "{telemetry:?}");
+        assert!(
+            telemetry.transaction_max_ns >= Duration::from_millis(700).as_nanos() as u64,
+            "{telemetry:?}"
+        );
+        assert!(telemetry.queue_wait_max_ns >= Duration::from_millis(100).as_nanos() as u64);
+        assert!(telemetry.pending_max >= 1, "{telemetry:?}");
+    }
+
+    /// Sessions / messages / tasks / ledger / memory / evidence writers run
+    /// concurrently on one store: every prepared command commits, the
+    /// journal stays gapless and no domain can corrupt another's rows.
+    #[test]
+    fn concurrent_domain_writers_all_commit() {
+        let (_d, store, ws, sid) = store_with_session();
+        const N: usize = 16;
+        let mut handles = Vec::new();
+
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for _ in 0..N {
+                    store.create_session(ws, "t", "p", "m").unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..N {
+                    store
+                        .put_message(sid, i as i64 + 1, "user", serde_json::json!({"i": i}))
+                        .unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..N {
+                    store
+                        .put_task_ledger(sid, serde_json::json!({ "task": i }))
+                        .unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..N {
+                    store
+                        .append_ledger_entry(sid, "cert_domain", 1, serde_json::json!({ "i": i }))
+                        .unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..N {
+                    store
+                        .upsert_memory_fact(sid, "cert", &format!("k{i}"), "v")
+                        .unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..N {
+                    store
+                        .evidence_insert(&EvidenceRow {
+                            id: 0,
+                            session_id: sid,
+                            workspace_id: ws,
+                            task_id: None,
+                            kind: "cert".into(),
+                            revision: 1,
+                            provenance_json: "{}".into(),
+                            compressibility: "none".into(),
+                            compression_json: "{}".into(),
+                            retrieval_json: "{}".into(),
+                            compact_json: "{}".into(),
+                            backing_cas_hash: None,
+                            completeness: "complete".into(),
+                            created_ms: i as i64,
+                        })
+                        .unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..N {
+                    store
+                        .put_worktree(ws, &format!("/wt/{i}"), &format!("b{i}"))
+                        .unwrap();
+                }
+            }
+        }));
+        handles.push(thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for _ in 0..N {
+                    store
+                        .model_outcome_stats_append(
+                            "cert-provider",
+                            "cert-model",
+                            RouterPhase::Plan,
+                            TaskClass::Easy,
+                            RiskBucket::Low,
+                            ModelOutcomeSample {
+                                verified_success: true,
+                                rework_cost_micro: 0,
+                                rework_turns: 0,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+        }));
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1 + N);
+        assert_eq!(store.messages_before(sid, None, 100).unwrap().len(), N);
+        assert_eq!(store.ledger_entries(sid, None, 100).unwrap().len(), N);
+        assert_eq!(store.evidence_list_by_scope(sid, ws, 100).unwrap().len(), N);
+        // Journal seq is gapless after all cross-domain interleaving.
+        let events = store.events_range(sid, 1, None).unwrap();
+        for (idx, event) in events.iter().enumerate() {
+            assert_eq!(event.seq.raw(), idx as u64 + 1, "gapless journal");
+        }
+        assert!(store.writer_telemetry().jobs >= (N * 8) as u64);
+        assert_eq!(store.worktrees_of(ws).unwrap().len(), N);
+    }
+
+    /// The bounded queue refuses a command with a typed error once it is
+    /// saturated past the configured wait — never an unbounded wait, never
+    /// unbounded growth.
+    #[test]
+    fn bounded_queue_refusal_is_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open_with_writer_limits(dir.path(), true, 1, Duration::from_millis(150))
+                .unwrap(),
+        );
+        let started = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&started);
+        let holder_store = Arc::clone(&store);
+        let holder = thread::spawn(move || {
+            holder_store
+                .writer_debug_job("cert_hold", move |_conn| {
+                    s2.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(700));
+                })
+                .unwrap();
+        });
+        wait_until(|| started.load(Ordering::SeqCst), "holder");
+
+        let queued_store = Arc::clone(&store);
+        let queued =
+            thread::spawn(move || queued_store.writer_debug_job("cert_queued", |_conn| ()));
+        wait_until(
+            || store.writer_telemetry().pending_depth == 1,
+            "one queued command",
+        );
+
+        let refused = store.writer_debug_job("cert_refused", |_conn| ());
+        match refused {
+            Err(StoreError::WriterQueueFull {
+                operation,
+                pending,
+                capacity,
+            }) => {
+                assert_eq!(operation, "cert_refused");
+                assert_eq!(pending, 1);
+                assert_eq!(capacity, 1);
+            }
+            other => panic!("expected typed WriterQueueFull, got {other:?}"),
+        }
+        assert_eq!(store.writer_telemetry().queue_full_refusals, 1);
+        holder.join().unwrap();
+        queued.join().unwrap().unwrap();
+    }
+
+    /// A panic inside a command is caught at the durable-authority boundary:
+    /// the caller gets a typed refusal, every later mutation is refused with
+    /// the same typed error (never a daemon panic), and reopening the store
+    /// yields a fresh healthy authority.
+    #[test]
+    fn writer_panic_is_typed_unavailable_and_reopen_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let err = store
+            .writer_debug_job("cert_panic", |_conn| panic!("deliberate writer panic"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::WriterUnavailable(_)), "{err:?}");
+        assert!(!store.writer_available());
+        assert!(store.writer_unavailable_reason().is_some());
+
+        // The poisoned authority refuses mutations typed, reads still work.
+        let err = store.create_session(ws, "t", "p", "m").unwrap_err();
+        assert!(matches!(err, StoreError::WriterUnavailable(_)), "{err:?}");
+        assert!(store.list_sessions(None).is_ok());
+        let telemetry = store.writer_telemetry();
+        assert!(!telemetry.available);
+        assert!(telemetry.unavailable_reason.is_some());
+
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert!(store.writer_available());
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+        store
+            .append_ledger_entry(sid, "after_reopen", 1, serde_json::json!({}))
+            .unwrap();
+    }
+
+    /// Ephemeral store locks (reader-pool semaphore + connection cache,
+    /// crash-seam state) recover from a deliberate panic while held: later
+    /// reads/writes are healthy, never a panic and never a stuck store.
+    #[test]
+    fn panic_while_ephemeral_locks_held_recovers() {
+        let (_d, store) = {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path(), true).unwrap();
+            (dir, store)
+        };
+
+        let poison = |f: &dyn Fn(&Store)| {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&store)));
+            assert!(caught.is_err(), "the deliberate panic must fire");
+        };
+        // Hold + poison the reader-pool connection cache mutex.
+        poison(&|s: &Store| {
+            let _guard: MutexGuard<'_, Vec<Connection>> =
+                s.pool.conns.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison reader pool");
+        });
+        // Hold + poison the reader-pool semaphore permits mutex.
+        poison(&|s: &Store| {
+            let _guard = s.pool.sem.permits.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison reader semaphore");
+        });
+        // Hold + poison the crash-seam state mutex.
+        poison(&|s: &Store| {
+            let _guard = s.seam.state.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison crash seam");
+        });
+
+        // The writer service was never involved and stays healthy; ephemeral
+        // state recovered from poison instead of wedging.
+        assert!(store.writer_available());
+        let ws = store.create_workspace("/after_poison").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        store
+            .append_ledger_entry(sid, "after_poison", 1, serde_json::json!({}))
+            .unwrap();
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+        // The recovered seam arms and trips normally.
+        store.crash_arm(CrashArm {
+            point: "never_crossed",
+            ordinal: 0,
+        });
+        store.crash_arm(CrashArm {
+            point: "never_crossed",
+            ordinal: 0,
+        });
+    }
+
+    /// WAL checkpoint duration is instrumented on the owner.
+    #[test]
+    fn checkpoint_duration_is_instrumented() {
+        let (_d, store, _ws, _sid) = store_with_session();
+        let before = store.writer_telemetry().checkpoints;
+        store.wal_checkpoint_passive().unwrap();
+        let telemetry = store.writer_telemetry();
+        assert_eq!(telemetry.checkpoints, before + 1, "{telemetry:?}");
+        assert!(telemetry.jobs >= 1, "{telemetry:?}");
+    }
+
+    /// The writer thread never blocks reads even when the queue is saturated
+    /// with slow commands (bounded pending depth is observable).
+    #[test]
+    fn saturated_queue_still_serves_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open_with_writer_limits(dir.path(), true, 2, Duration::from_secs(5)).unwrap(),
+        );
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&started);
+        let holder_store = Arc::clone(&store);
+        let holder = thread::spawn(move || {
+            holder_store
+                .writer_debug_job("sat_holder", move |_conn| {
+                    s2.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(400));
+                })
+                .unwrap();
+        });
+        wait_until(|| started.load(Ordering::SeqCst), "holder");
+        let queued_a = thread::spawn({
+            let store = Arc::clone(&store);
+            move || store.writer_debug_job("sat_a", |_conn| ())
+        });
+        wait_until(|| store.writer_telemetry().pending_depth >= 1, "queued a");
+
+        let read_started = Instant::now();
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+        assert!(read_started.elapsed() < Duration::from_millis(200));
+        holder.join().unwrap();
+        queued_a.join().unwrap().unwrap();
+        let telemetry = store.writer_telemetry();
+        assert!(telemetry.pending_max >= 1, "{telemetry:?}");
+        let _ = sid;
     }
 }

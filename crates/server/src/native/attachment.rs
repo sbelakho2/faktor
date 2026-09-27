@@ -16,6 +16,17 @@
 //!   be advertised, the mime must be a deliverable image type, and the size
 //!   must fit the provider's per-image bound. A refusal keeps the draft and
 //!   the durable bytes intact; nothing is cleared.
+//! - The strict protocol base64 is CANONICAL: `data_base64` is decoded
+//!   directly from its own bytes into a single pre-sized destination and
+//!   whitespace or any non-canonical form (bad padding, non-zero trailing
+//!   bits, foreign alphabet) is a typed 400 — the protocol never accepts a
+//!   whitespace-tolerant variant of the canonical bytes.
+//! - DOCUMENT ADMISSION IS MODEL-AWARE like images: `application/pdf` and
+//!   `text/plain` attachments are admitted (stored) and then validated at
+//!   task admission against the CHOSEN model — the provider's
+//!   `document_capable` gate, the document MIME allowlist and the per-part
+//!   and request-wide byte bounds. Ordinary workspace source files stay on
+//!   the repository-context `files` path and are never uploaded blindly.
 //! - Hostile DTOs (unknown fields, non-string members, malformed base64,
 //!   traversal filenames, hostile mimes, oversized payloads) are typed
 //!   400/413s; an unknown digest resolves to a typed 404, never a phantom.
@@ -38,7 +49,7 @@ use crate::api::AppState;
 /// under the daemon's 10 MiB `MAX_BODY_BYTES` cap. Larger payloads are a
 /// typed 413 before any decode; the session/CAS ceiling
 /// (`MAX_ATTACHMENT_BYTES`) is unchanged for programmatic callers.
-pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 7 * 1024 * 1024;
+pub const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 7 * 1024 * 1024;
 
 /// Strict request DTO of one native attachment upload. `data_base64` is the
 /// standard-alphabet base64 of the raw bytes; unknown members, missing
@@ -82,12 +93,128 @@ fn media_model_unsupported(model: &str, reason: &str) -> ApiError {
     }
 }
 
+/// The typed wire refusal for a document the CHOSEN model cannot consume
+/// (`unsupported`, 400). Mirrors [`media_model_unsupported`]: nothing is
+/// cleared, so the client can retry with a document-capable model.
+fn document_model_unsupported(model: &str, reason: &str) -> ApiError {
+    ApiError {
+        code: "unsupported",
+        message: format!(
+            "document attachment cannot be delivered to model {model}: {reason}; the draft and attachment bytes were kept — select a document-capable model or remove the document"
+        ),
+        http_status: 400,
+        retryable: false,
+    }
+}
+
+/// The typed 400 refusal for one strict-protocol base64 payload.
+fn base64_refusal(message: String) -> ApiError {
+    ApiError {
+        code: "malformed",
+        message,
+        http_status: 400,
+        retryable: false,
+    }
+}
+
+/// Decoded length of a CANONICAL standard-alphabet base64 payload — or the
+/// typed refusal for whitespace/non-canonical input. ONE allocation-free
+/// pass: the strict protocol accepts exactly the canonical encoding
+/// (`len % 4 == 0`, alphabet bytes only, at most two trailing `=` with the
+/// unused trailing bits zero). Whitespace is refused explicitly (it is the
+/// classic tolerant variant) instead of being compacted away.
+fn canonical_decoded_len(encoded: &[u8]) -> Result<usize, ApiError> {
+    if let Some(offset) = encoded.iter().position(|b| b.is_ascii_whitespace()) {
+        return Err(base64_refusal(format!(
+            "attachment data_base64 is not canonical standard base64: whitespace at byte {offset} is not allowed"
+        )));
+    }
+    if !encoded.len().is_multiple_of(4) {
+        return Err(base64_refusal(format!(
+            "attachment data_base64 is not canonical standard base64: {} bytes is not a multiple of 4",
+            encoded.len()
+        )));
+    }
+    let mut padding = 0usize;
+    let mut last_value = 0u8;
+    for (index, byte) in encoded.iter().enumerate() {
+        let value = match *byte {
+            b'A'..=b'Z' => *byte - b'A',
+            b'a'..=b'z' => *byte - b'a' + 26,
+            b'0'..=b'9' => *byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                if padding > 2 {
+                    return Err(base64_refusal(format!(
+                        "attachment data_base64 is not canonical standard base64: more than two padding bytes (byte {index})"
+                    )));
+                }
+                continue;
+            }
+            other => {
+                return Err(base64_refusal(format!(
+                    "attachment data_base64 is not canonical standard base64: byte {other:#04x} at {index} is not in the standard alphabet"
+                )));
+            }
+        };
+        if padding > 0 {
+            return Err(base64_refusal(format!(
+                "attachment data_base64 is not canonical standard base64: data byte at {index} after padding"
+            )));
+        }
+        last_value = value;
+    }
+    // Canonical trailing bits: the unused low bits of the last data symbol
+    // must be zero (one pad byte leaves 2 bits, two pad bytes leave 4).
+    let trailing_mask = match padding {
+        0 => 0,
+        1 => 0b11,
+        _ => 0b1111,
+    };
+    if trailing_mask != 0 && last_value & trailing_mask != 0 {
+        return Err(base64_refusal(format!(
+            "attachment data_base64 is not canonical standard base64: non-zero trailing bits with {padding} padding byte(s)"
+        )));
+    }
+    Ok(encoded.len() / 4 * 3 - padding)
+}
+
+/// Decode ONE strict-protocol base64 payload DIRECTLY from its own bytes
+/// into a single pre-sized bounded destination: exactly one allocation of
+/// exactly the decoded length, with no compacted or intermediate copy.
+/// Whitespace and every non-canonical form are typed 400 refusals; the
+/// caller enforces the encoded/decoded byte ceilings before/after.
+///
+/// Public because the single-allocation property is certified by an
+/// integration test with a counting allocator
+/// (`crates/server/tests/attachment_decode_alloc.rs`).
+pub fn decode_attachment_base64(encoded: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let decoded_len = canonical_decoded_len(encoded)?;
+    let mut out = vec![0u8; decoded_len];
+    match base64::engine::general_purpose::STANDARD.decode_slice(encoded, &mut out) {
+        Ok(written) if written == decoded_len => Ok(out),
+        Ok(written) => Err(base64_refusal(format!(
+            "attachment data_base64 decoded to {written} bytes, not the canonical {decoded_len}"
+        ))),
+        Err(e) => Err(base64_refusal(format!(
+            "attachment data_base64 is not valid canonical base64: {e}"
+        ))),
+    }
+}
+
 /// The ONE wire admission rule for a task's binary attachment set: bounded
 /// count/structural validity/durable byte-identical resolution via the
-/// session layer, plus MODEL-AWARE media validation of every image against
-/// the chosen model's capabilities. Runs BEFORE any run/task row so a
-/// refused start leaves no partial durable admission (and never touches
-/// the stored bytes or the composer draft).
+/// session layer, plus MODEL-AWARE media validation of every image and
+/// deliverable document against the chosen model's capabilities. Runs
+/// BEFORE any run/task row so a refused start leaves no partial durable
+/// admission (and never touches the stored bytes or the composer draft).
+///
+/// Non-image attachments whose mime is not one of the daemon's deliverable
+/// document types (archives, opaque binaries) are NOT model content: they
+/// stay CAS-only and are never lowered into a prompt. Ordinary workspace
+/// source files arrive on the repository-context `files` path, not here.
 pub(crate) fn validate_wire_attachments(
     state: &AppState,
     handle: &faktor_session::SessionHandle,
@@ -98,7 +225,11 @@ pub(crate) fn validate_wire_attachments(
         .resolve_attachments(ids)
         .map_err(|e| admission_error(&e))?;
     let images: Vec<&AttachmentId> = ids.iter().filter(|id| id.is_image()).collect();
-    if images.is_empty() {
+    let documents: Vec<&AttachmentId> = ids
+        .iter()
+        .filter(|id| !id.is_image() && faktor_provider::is_supported_document_mime(&id.mime))
+        .collect();
+    if images.is_empty() && documents.is_empty() {
         return Ok(());
     }
     let provider = handle.provider().map_err(|e| admission_error(&e))?;
@@ -107,62 +238,107 @@ pub(crate) fn validate_wire_attachments(
         _ => handle.model().map_err(|e| admission_error(&e))?,
     };
     // Fail closed when the provider is not registered: a fabricated
-    // assume-vision default would claim delivery that cannot happen.
-    let (caps, provider_max) = state
+    // assume-capability default would claim delivery that cannot happen.
+    let entry = state
         .deps
         .agent
-        .provider_media_caps(&provider, &model)
+        .deps()
+        .providers
+        .get(&provider)
         .ok_or_else(|| ApiError {
             code: "unsupported",
             message: format!(
-                "provider {provider:?} of session {} is not registered; cannot validate image delivery to model {model}",
+                "provider {provider:?} of session {} is not registered; cannot validate attachment delivery to model {model}",
                 handle.id()
             ),
             http_status: 400,
             retryable: false,
         })?;
-    if !caps.vision {
-        return Err(media_model_unsupported(
-            &model,
-            "the model does not advertise vision capability",
-        ));
-    }
-    let per_image = provider_max.min(faktor_provider::MAX_MEDIA_BYTES_HARD);
-    let mut total: u64 = 0;
-    for id in images {
-        id.validate().map_err(|e| admission_error(&e))?;
-        if !faktor_provider::is_supported_image_mime(&id.mime) {
+    if !images.is_empty() {
+        let caps = entry.capabilities(&model);
+        if !caps.vision {
             return Err(media_model_unsupported(
                 &model,
-                &format!(
-                    "mime {:?} is not a deliverable image type ({})",
-                    id.mime,
-                    faktor_provider::SUPPORTED_IMAGE_MIMES.join(", ")
-                ),
+                "the model does not advertise vision capability",
             ));
         }
-        if id.size > per_image as u64 {
-            return Err(ApiError {
-                code: "oversized",
-                message: format!(
-                    "image attachment {} is {} bytes, over the {per_image} byte bound of provider {provider:?}",
-                    id.digest, id.size
-                ),
-                http_status: 413,
-                retryable: false,
-            });
+        let per_image = entry
+            .max_image_bytes()
+            .min(faktor_provider::MAX_MEDIA_BYTES_HARD);
+        let mut total: u64 = 0;
+        for id in images {
+            id.validate().map_err(|e| admission_error(&e))?;
+            if !faktor_provider::is_supported_image_mime(&id.mime) {
+                return Err(media_model_unsupported(
+                    &model,
+                    &format!(
+                        "mime {:?} is not a deliverable image type ({})",
+                        id.mime,
+                        faktor_provider::SUPPORTED_IMAGE_MIMES.join(", ")
+                    ),
+                ));
+            }
+            if id.size > per_image as u64 {
+                return Err(ApiError {
+                    code: "oversized",
+                    message: format!(
+                        "image attachment {} is {} bytes, over the {per_image} byte bound of provider {provider:?}",
+                        id.digest, id.size
+                    ),
+                    http_status: 413,
+                    retryable: false,
+                });
+            }
+            total = total.saturating_add(id.size);
+            if total > faktor_provider::MAX_REQUEST_IMAGE_BYTES as u64 {
+                return Err(ApiError {
+                    code: "oversized",
+                    message: format!(
+                        "image attachment set totals {total} bytes, over the {} byte request media bound",
+                        faktor_provider::MAX_REQUEST_IMAGE_BYTES
+                    ),
+                    http_status: 413,
+                    retryable: false,
+                });
+            }
         }
-        total = total.saturating_add(id.size);
-        if total > faktor_provider::MAX_REQUEST_IMAGE_BYTES as u64 {
-            return Err(ApiError {
-                code: "oversized",
-                message: format!(
-                    "image attachment set totals {total} bytes, over the {} byte request media bound",
-                    faktor_provider::MAX_REQUEST_IMAGE_BYTES
-                ),
-                http_status: 413,
-                retryable: false,
-            });
+    }
+    if !documents.is_empty() {
+        if !entry.document_capable(&model) {
+            return Err(document_model_unsupported(
+                &model,
+                "the model does not advertise document input",
+            ));
+        }
+        let per_document = entry
+            .max_document_bytes()
+            .min(faktor_provider::MAX_MEDIA_BYTES_HARD);
+        let mut total: u64 = 0;
+        for id in documents {
+            id.validate().map_err(|e| admission_error(&e))?;
+            if id.size > per_document as u64 {
+                return Err(ApiError {
+                    code: "oversized",
+                    message: format!(
+                        "document attachment {} is {} bytes, over the {per_document} byte bound of provider {provider:?}",
+                        id.digest, id.size
+                    ),
+                    http_status: 413,
+                    retryable: false,
+                });
+            }
+            total = total.saturating_add(id.size);
+            if total > faktor_provider::MAX_REQUEST_DOCUMENT_BYTES as u64 {
+                return Err(ApiError {
+                    code: "oversized",
+                    message: format!(
+                        "document attachment set totals {total} bytes, over the {} byte request document bound",
+                        faktor_provider::MAX_REQUEST_DOCUMENT_BYTES
+                    ),
+                    http_status: 413,
+                    retryable: false,
+                });
+            }
         }
     }
     Ok(())
@@ -209,9 +385,12 @@ pub(crate) async fn native_attachment_upload(
             return wire_status(admission_error(&e));
         }
     }
-    // Decode with an explicit ceiling BEFORE materializing: the base64 form
-    // is pre-checked (4/3 + padding) and the decoded length is checked
-    // twice (bounded form + absolute attachment ceiling).
+    // Decode with an explicit ceiling BEFORE materializing: the CANONICAL
+    // base64 form is pre-checked (4/3 + padding) and the decoded length is
+    // checked twice (bounded form + absolute attachment ceiling). The
+    // decoder reads `data_base64`'s own bytes directly into ONE pre-sized
+    // destination — no whitespace compaction, no intermediate copy; any
+    // whitespace or non-canonical input is a typed 400 refusal.
     let encoded = upload.data_base64.as_bytes();
     let max_encoded = MAX_ATTACHMENT_UPLOAD_BYTES.div_ceil(3) * 4 + 4;
     if encoded.len() > max_encoded {
@@ -226,21 +405,9 @@ pub(crate) async fn native_attachment_upload(
             retryable: false,
         });
     }
-    let compact: Vec<u8> = encoded
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    let bytes = match base64::engine::general_purpose::STANDARD.decode(&compact) {
-        Ok(b) => b,
-        Err(e) => {
-            return wire_status(ApiError {
-                code: "malformed",
-                message: format!("attachment data_base64 is not valid base64: {e}"),
-                http_status: 400,
-                retryable: false,
-            })
-        }
+    let bytes = match decode_attachment_base64(encoded) {
+        Ok(bytes) => bytes,
+        Err(e) => return wire_status(e),
     };
     if bytes.len() > MAX_ATTACHMENT_UPLOAD_BYTES || bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
         return wire_status(ApiError {
@@ -355,13 +522,16 @@ mod tests {
             crate::permission::ChannelPermissionRequester::new(std::time::Duration::from_secs(5));
         let mut registry = ProviderRegistry::new();
         registry
-            .try_register(Arc::new(FakeProvider::new(
-                "fake",
-                ModelCapabilities {
-                    vision: true,
-                    ..Default::default()
-                },
-            )))
+            .try_register(Arc::new(
+                FakeProvider::new(
+                    "fake",
+                    ModelCapabilities {
+                        vision: true,
+                        ..Default::default()
+                    },
+                )
+                .with_documents(),
+            ))
             .unwrap();
         registry
             .try_register(Arc::new(FakeProvider::new(
@@ -727,5 +897,229 @@ mod tests {
             validate_wire_attachments(&state, &novision, Some("m"), std::slice::from_ref(&image))
                 .expect_err("override cannot rescue a vision-less provider");
         assert_eq!(err.code, "unsupported");
+    }
+
+    #[test]
+    fn strict_protocol_base64_is_canonical_and_whitespace_refusing() {
+        use base64::engine::general_purpose::STANDARD;
+        // Every canonical encoding decodes byte-exact, including the empty
+        // payload (the session layer owns the empty-bytes refusal).
+        for bytes in [
+            b"".as_slice(),
+            b"x".as_slice(),
+            b"xy".as_slice(),
+            b"xyz".as_slice(),
+            b"\x00\xff\x10\x7f".as_slice(),
+        ] {
+            let encoded = STANDARD.encode(bytes);
+            assert_eq!(
+                decode_attachment_base64(encoded.as_bytes()).unwrap(),
+                bytes,
+                "canonical payload {encoded:?}"
+            );
+        }
+        let base = STANDARD.encode(b"hello");
+        // Whitespace is refused explicitly wherever it appears: the strict
+        // protocol never tolerates a compacted variant.
+        let mut internal = base.clone();
+        internal.insert(2, '\n');
+        for hostile in [
+            format!("{base}\n"),
+            format!("\n{base}"),
+            format!(" {base}"),
+            format!("{base} "),
+            format!("{base}\t"),
+            format!("{base}\r\n"),
+            internal,
+        ] {
+            let err = decode_attachment_base64(hostile.as_bytes())
+                .expect_err("whitespace must be refused");
+            assert_eq!(err.http_status, 400, "{hostile:?}");
+            assert_eq!(err.code, "malformed", "{hostile:?}");
+            assert!(err.message.contains("whitespace"), "{hostile:?}: {err:?}");
+        }
+        // Non-canonical forms: bad length, misplaced/short padding, more
+        // than two pad bytes, non-zero trailing bits, foreign alphabet.
+        let non_canonical = [
+            base.trim_end_matches('=').to_string(), // missing padding
+            "eA=".to_string(),                      // length not a multiple of 4
+            "eA===".to_string(),                    // length not a multiple of 4
+            "eA=A".to_string(),                     // data after padding
+            "=AAA".to_string(),                     // padding before data
+            "====".to_string(),                     // only padding
+            "eB==".to_string(),                     // non-zero trailing bits (4-bit)
+            "eB=".to_string(),                      // non-zero trailing bits (2-bit)
+            "eA-_".to_string(),                     // URL-safe alphabet
+            "eA+.".to_string(),                     // stray '.' byte
+            "éA==".to_string(),                     // non-ASCII byte
+        ];
+        for hostile in non_canonical {
+            let err = decode_attachment_base64(hostile.as_bytes())
+                .expect_err("non-canonical must be refused");
+            assert_eq!(err.http_status, 400, "{hostile:?}");
+            assert_eq!(err.code, "malformed", "{hostile:?}");
+            assert!(
+                err.message.contains("not canonical standard base64"),
+                "{hostile:?}: {err:?}"
+            );
+        }
+        // Exactly the canonical encoding of the non-zero trailing-bit case
+        // still decodes (only the zero-bits variant is canonical).
+        assert_eq!(
+            decode_attachment_base64(STANDARD.encode(b"xy").as_bytes()).unwrap(),
+            b"xy"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_documents_and_refuses_non_canonical_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, handle) = test_state(dir.path());
+        let sid = handle.id().to_string();
+        let headers = auth_headers(&state);
+        // application/pdf and text/plain uploads are accepted (storage is
+        // model-agnostic; the chosen model's document gate runs at start).
+        for (mime, name, bytes) in [
+            ("application/pdf", "spec.pdf", b"%PDF-1.4".as_slice()),
+            ("text/plain", "notes.txt", b"plain text".as_slice()),
+        ] {
+            let response = native_attachment_upload(
+                State(state.clone()),
+                headers.clone(),
+                Path(sid.clone()),
+                Ok(Json(upload(mime, Some(name), bytes))),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{mime}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let id: AttachmentId = serde_json::from_slice(&body).unwrap();
+            assert_eq!(id.mime, mime);
+            assert_eq!(id.size, bytes.len() as u64);
+            assert!(!id.is_image());
+        }
+        // A whitespace-padded base64 body is a typed 400 BEFORE any decode
+        // or CAS write (the strict protocol has no tolerant variant).
+        let mut spaced = upload("text/plain", Some("notes.txt"), b"plain");
+        spaced.data_base64.push('\n');
+        let response = native_attachment_upload(
+            State(state.clone()),
+            headers.clone(),
+            Path(sid.clone()),
+            Ok(Json(spaced)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["error"]["code"], "malformed");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("whitespace"),
+            "{err:?}"
+        );
+        let mut non_canonical = upload("text/plain", Some("notes.txt"), b"plain");
+        non_canonical.data_base64 = "eB==".into();
+        let response = native_attachment_upload(
+            State(state.clone()),
+            headers.clone(),
+            Path(sid.clone()),
+            Ok(Json(non_canonical)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // The refused payloads left exactly the two lawful document rows.
+        assert_eq!(handle.list_attachments(16).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wire_admission_validates_documents_against_the_chosen_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, handle) = test_state(dir.path());
+        // A non-document-capable session (registered provider, no documents).
+        let manager = state.deps.session.clone();
+        let ws = manager
+            .create_workspace(dir.path().to_str().unwrap())
+            .unwrap();
+        let created = manager
+            .create_session(ws, "novision-test", "novision", "m")
+            .unwrap();
+        let novision = manager.get_session(created.id()).unwrap().unwrap();
+        // The document-capable session admits PDF and text/plain.
+        let pdf = handle
+            .put_attachment("application/pdf", Some("spec.pdf"), b"%PDF-1.4")
+            .unwrap();
+        let text = handle
+            .put_attachment("text/plain", Some("notes.txt"), b"plain text")
+            .unwrap();
+        validate_wire_attachments(&state, &handle, None, &[pdf.clone(), text.clone()])
+            .expect("a document-capable model admits pdf + text");
+        // A non-document model refuses typedly and keeps everything durable.
+        novision
+            .inherit_attachment(&pdf)
+            .expect("inherit for the second session");
+        let err = validate_wire_attachments(&state, &novision, None, std::slice::from_ref(&pdf))
+            .expect_err("document-less model");
+        assert_eq!(err.code, "unsupported");
+        assert_eq!(err.http_status, 400);
+        assert!(err.message.contains("document"), "{err:?}");
+        assert_eq!(
+            novision.list_attachments(16).unwrap(),
+            vec![pdf.clone()],
+            "the refusal keeps the durable row"
+        );
+        assert_eq!(
+            novision.attachment_bytes(&pdf, 1 << 20).unwrap(),
+            b"%PDF-1.4",
+            "the refusal keeps the durable bytes"
+        );
+        // A document over the provider's per-document bound is a typed 413
+        // and stays durable (the upload succeeded; only admission refused).
+        let oversized = handle
+            .put_attachment(
+                "application/pdf",
+                None,
+                &vec![0u8; faktor_provider::MAX_MODEL_DOCUMENT_BYTES + 1],
+            )
+            .unwrap();
+        let err =
+            validate_wire_attachments(&state, &handle, None, std::slice::from_ref(&oversized))
+                .expect_err("oversized document");
+        assert_eq!(err.code, "oversized");
+        assert_eq!(err.http_status, 413);
+        assert_eq!(
+            handle.attachment(oversized.digest).unwrap(),
+            Some(oversized.clone())
+        );
+        // The request-wide document total is bounded: three 6 MiB documents
+        // exceed the 16 MiB request bound even though each fits its own.
+        let each = 6 * 1024 * 1024;
+        let docs: Vec<AttachmentId> = (0..3)
+            .map(|i| {
+                handle
+                    .put_attachment("application/pdf", None, &vec![i as u8; each])
+                    .unwrap()
+            })
+            .collect();
+        let err = validate_wire_attachments(&state, &handle, None, &docs)
+            .expect_err("request document total");
+        assert_eq!(err.code, "oversized");
+        assert_eq!(err.http_status, 413);
+        assert!(err.message.contains("totals"), "{err:?}");
+        // Opaque non-document binaries (archives) are NOT model content:
+        // they are never blind-delivered and never document-validated.
+        let zip = handle
+            .put_attachment("application/zip", Some("src.zip"), b"PK\x03\x04")
+            .unwrap();
+        novision
+            .inherit_attachment(&zip)
+            .expect("inherit the archive for the second session");
+        validate_wire_attachments(&state, &novision, None, std::slice::from_ref(&zip))
+            .expect("opaque binaries stay CAS-only on every model");
     }
 }

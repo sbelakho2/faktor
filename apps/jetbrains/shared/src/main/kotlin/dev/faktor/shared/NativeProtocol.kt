@@ -523,6 +523,28 @@ data class NativeSessionSummary(
     val state: String
 )
 
+data class NativeAttachmentMimeLimit(val mime: String, val maxBytes: Long)
+
+data class NativeAttachmentImageLimits(
+    val mimes: List<NativeAttachmentMimeLimit>,
+    val maxRequestBytes: Long
+)
+
+data class NativeAttachmentDocumentLimits(
+    val capable: Boolean,
+    val mimes: List<NativeAttachmentMimeLimit>,
+    val maxRequestBytes: Long
+)
+
+/** The daemon-advertised attachment admission contract of one model. */
+data class NativeAttachmentLimits(
+    val maxUploadBytes: Long,
+    val maxRequestBytes: Long,
+    val maxAttachmentBytes: Long,
+    val image: NativeAttachmentImageLimits,
+    val document: NativeAttachmentDocumentLimits
+)
+
 data class NativeModelInfo(
     val provider: String,
     val model: String,
@@ -530,12 +552,71 @@ data class NativeModelInfo(
     val maxOutput: Long,
     val tools: Boolean,
     val reasoning: Boolean,
-    val source: String
+    val source: String,
+    /** Document-delivery gate (false on a legacy daemon). */
+    val documentCapable: Boolean = false,
+    /** Advertised admission limits; null on a legacy daemon. */
+    val attachmentLimits: NativeAttachmentLimits? = null
 )
 
 data class NativePromptReceipt(val opId: String, val accepted: Boolean, val queued: Boolean)
 
 data class NativeAbortAck(val aborted: List<String>)
+
+/** Durable index coverage of one generation (audits 5/6). */
+data class NativeIndexCoverage(
+    val filesSeen: Long,
+    val filesIndexed: Long,
+    val bytesIndexed: Long,
+    val complete: Boolean,
+    val truncatedReason: String?
+)
+
+/** Durable fingerprint shard coverage (audit 6): a capped round is never
+ * reported fully clean, and `roundStart` rotates so no suffix of the tree is
+ * perpetually ignored. */
+data class NativeFingerprintCoverage(
+    val scanned: Long,
+    val complete: Boolean,
+    val shard: Int,
+    val roundStart: Int,
+    val shardsDone: Long,
+    val verify: Boolean,
+    val truncatedReason: String?
+)
+
+/** `GET /native/index/coverage?session=` snapshot (audits 5/6/16). */
+data class NativeIndexCoverageSnapshot(
+    val workspace: Long,
+    val state: String,
+    val generation: Long,
+    val publishedGeneration: Long?,
+    val coverage: NativeIndexCoverage,
+    val fingerprint: NativeFingerprintCoverage,
+    val freshness: String,
+    val serving: Boolean
+)
+
+/** Response of `GET /native/index/coverage`: the snapshot is null when the
+ * daemon never hosted an index service (reported honestly, never "current"). */
+data class NativeIndexCoverageResponse(
+    val sessionId: String,
+    val snapshot: NativeIndexCoverageSnapshot?
+)
+
+/**
+ * Compact status label (audits 5/6): a PARTIAL generation is named with its
+ * counters, never flattened into "ready"; a null snapshot is the honest
+ * "not reported" (the daemon never hosted an index service).
+ */
+fun indexCoverageLabel(snapshot: NativeIndexCoverageSnapshot?): String = when {
+    snapshot == null -> "index: not reported"
+    snapshot.freshness == "partial" ->
+        "index: partial ${snapshot.coverage.filesIndexed}/${snapshot.coverage.filesSeen} files"
+    snapshot.freshness == "stale_while_rebuilding" -> "index: stale while rebuilding"
+    snapshot.freshness == "current" -> "index: current"
+    else -> "index: unknown"
+}
 
 data class NativeActiveModel(val provider: String, val model: String, val variant: String?)
 
@@ -1345,6 +1426,28 @@ fun parseNativeSessionList(json: String): List<NativeSessionSummary> {
     }
 }
 
+private fun parseNativeAttachmentMimeLimits(v: JsonView): List<NativeAttachmentMimeLimit> =
+    v.array().map { NativeAttachmentMimeLimit(mime = it.field("mime").string(), maxBytes = it.field("maxBytes").long()) }
+
+private fun parseNativeAttachmentLimits(v: JsonView): NativeAttachmentLimits {
+    val image = v.field("image")
+    val document = v.field("document")
+    return NativeAttachmentLimits(
+        maxUploadBytes = v.field("maxUploadBytes").long(),
+        maxRequestBytes = v.field("maxRequestBytes").long(),
+        maxAttachmentBytes = v.field("maxAttachmentBytes").long(),
+        image = NativeAttachmentImageLimits(
+            mimes = parseNativeAttachmentMimeLimits(image.field("mimes")),
+            maxRequestBytes = image.field("maxRequestBytes").long()
+        ),
+        document = NativeAttachmentDocumentLimits(
+            capable = document.field("capable").bool(),
+            mimes = parseNativeAttachmentMimeLimits(document.field("mimes")),
+            maxRequestBytes = document.field("maxRequestBytes").long()
+        )
+    )
+}
+
 fun parseNativeModelCatalog(json: String): List<NativeModelInfo> {
     val v = JsonCodec.parse(json).view("GET /models")
     return v.array().map {
@@ -1355,7 +1458,13 @@ fun parseNativeModelCatalog(json: String): List<NativeModelInfo> {
             maxOutput = it.field("maxOutput").long(),
             tools = it.field("tools").bool(),
             reasoning = it.field("reasoning").bool(),
-            source = it.field("source").string()
+            source = it.field("source").string(),
+            // Additive contract: absent on a legacy daemon; a present but
+            // malformed value fails loudly (never coerced).
+            documentCapable = it.optionalField("documentCapable")?.bool() ?: false,
+            attachmentLimits = it.optionalField("attachmentLimits")?.let { limits ->
+                parseNativeAttachmentLimits(limits)
+            }
         )
     }
 }
@@ -1372,6 +1481,47 @@ fun parseNativePromptReceipt(json: String): NativePromptReceipt {
 fun parseNativeAbortAck(json: String): NativeAbortAck {
     val v = JsonCodec.parse(json).view("POST /native/session/{id}/abort")
     return NativeAbortAck(aborted = v.field("aborted").stringArray())
+}
+
+fun parseNativeIndexCoverage(json: String): NativeIndexCoverageResponse {
+    val root = JsonCodec.parse(json).view("GET /native/index/coverage").objectValue()
+    val sessionId = root.field("sessionId").string()
+    val raw = root.optionalField("index_coverage")
+        ?: return NativeIndexCoverageResponse(sessionId, null)
+    raw.objectValue()
+    val coverage = raw.field("coverage").objectValue()
+    val fingerprint = raw.field("fingerprint").objectValue()
+    val freshness = raw.field("freshness").string()
+    if (freshness != "current" && freshness != "stale_while_rebuilding" && freshness != "partial") {
+        raw.fail("unknown freshness \"$freshness\"")
+    }
+    return NativeIndexCoverageResponse(
+        sessionId = sessionId,
+        snapshot = NativeIndexCoverageSnapshot(
+            workspace = raw.field("workspace").long(),
+            state = raw.field("state").string(),
+            generation = raw.field("generation").long(),
+            publishedGeneration = raw.optionalField("published_generation")?.long(),
+            coverage = NativeIndexCoverage(
+                filesSeen = coverage.field("files_seen").long(),
+                filesIndexed = coverage.field("files_indexed").long(),
+                bytesIndexed = coverage.field("bytes_indexed").long(),
+                complete = coverage.field("complete").bool(),
+                truncatedReason = coverage.optionalField("truncated_reason")?.string()
+            ),
+            fingerprint = NativeFingerprintCoverage(
+                scanned = fingerprint.field("scanned").long(),
+                complete = fingerprint.field("complete").bool(),
+                shard = fingerprint.field("shard").int(),
+                roundStart = fingerprint.field("round_start").int(),
+                shardsDone = fingerprint.field("shards_done").long(),
+                verify = fingerprint.field("verify").bool(),
+                truncatedReason = fingerprint.optionalField("truncated_reason")?.string()
+            ),
+            freshness = freshness,
+            serving = raw.field("serving").bool()
+        )
+    )
 }
 
 private fun parseActiveModel(v: JsonView): NativeActiveModel = NativeActiveModel(

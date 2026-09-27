@@ -391,6 +391,39 @@ export interface NativeSessionSummary {
   readonly state: string;
 }
 
+/** One per-MIME entry of the daemon-advertised attachment limits. */
+export interface NativeAttachmentMimeLimit {
+  readonly mime: string;
+  readonly maxBytes: number;
+}
+
+/** The daemon-advertised image attachment admission contract. */
+export interface NativeAttachmentImageLimits {
+  readonly mimes: readonly NativeAttachmentMimeLimit[];
+  readonly maxRequestBytes: number;
+}
+
+/** The daemon-advertised document attachment admission contract. */
+export interface NativeAttachmentDocumentLimits {
+  readonly capable: boolean;
+  readonly mimes: readonly NativeAttachmentMimeLimit[];
+  readonly maxRequestBytes: number;
+}
+
+/**
+ * The complete attachment admission contract the daemon advertises per
+ * provider/model (`/models` + `/capabilities`). This is the ONE source of
+ * truth for the client's upload gates; the client keeps only a conservative
+ * emergency ceiling for the window before the catalog is read.
+ */
+export interface NativeAttachmentLimits {
+  readonly maxUploadBytes: number;
+  readonly maxRequestBytes: number;
+  readonly maxAttachmentBytes: number;
+  readonly image: NativeAttachmentImageLimits;
+  readonly document: NativeAttachmentDocumentLimits;
+}
+
 export interface NativeModelInfo {
   readonly provider: string;
   readonly model: string;
@@ -405,6 +438,10 @@ export interface NativeModelInfo {
   readonly embeddings: boolean;
   readonly streaming: boolean;
   readonly source: string;
+  /** Document-delivery gate of the model (false on a legacy daemon). */
+  readonly documentCapable: boolean;
+  /** Advertised admission limits; null on a legacy daemon that omits them. */
+  readonly attachmentLimits: NativeAttachmentLimits | null;
 }
 
 export interface NativeActiveModel {
@@ -1274,6 +1311,60 @@ export interface NativeSemanticStatus {
   readonly snapshotState: { readonly providers: string[]; readonly fallback: boolean };
 }
 
+/** Durable index coverage of one generation (audits 5/6). */
+export interface NativeIndexCoverage {
+  readonly files_seen: number;
+  readonly files_indexed: number;
+  readonly bytes_indexed: number;
+  readonly complete: boolean;
+  readonly truncated_reason: string | null;
+}
+
+/** Durable fingerprint shard coverage (audit 6): a capped round is never
+ * reported fully clean, and `round_start` rotates so no suffix of the tree
+ * is perpetually ignored. */
+export interface NativeFingerprintCoverage {
+  readonly scanned: number;
+  readonly complete: boolean;
+  readonly shard: number;
+  readonly round_start: number;
+  readonly shards_done: number;
+  readonly verify: boolean;
+  readonly truncated_reason: string | null;
+}
+
+/** `GET /native/index/coverage` snapshot (audits 5/6/16). */
+export interface NativeIndexCoverageSnapshot {
+  readonly workspace: number;
+  readonly state: string;
+  readonly generation: number;
+  readonly published_generation: number | null;
+  readonly coverage: NativeIndexCoverage;
+  readonly fingerprint: NativeFingerprintCoverage;
+  readonly freshness: 'current' | 'stale_while_rebuilding' | 'partial';
+  readonly serving: boolean;
+}
+
+/** Compact human label for the status bar / cockpit: the PARTIAL state is
+ * named with its counters, never flattened into "ready". `null` means the
+ * daemon never hosted an index service (reported honestly, not "current"). */
+export function indexCoverageLabel(snapshot: NativeIndexCoverageSnapshot | null): string {
+  if (snapshot === null) {
+    return 'index: not reported';
+  }
+  const counters = `${snapshot.coverage.files_indexed}/${snapshot.coverage.files_seen}`;
+  switch (snapshot.freshness) {
+    case 'partial':
+      return `index: partial ${counters} files`;
+    case 'stale_while_rebuilding':
+      return 'index: stale while rebuilding';
+    case 'current':
+      return 'index: current';
+    default:
+      return 'index: unknown';
+  }
+}
+
 export interface NativeAbortAck {
   readonly aborted: string[];
 }
@@ -1355,6 +1446,56 @@ function validateSessionSummary(object: JsonObject, path: string): NativeSession
   };
 }
 
+function validateAttachmentMimeLimits(json: Json, path: string): NativeAttachmentMimeLimit[] {
+  if (!Array.isArray(json)) {
+    fail(path, `expected an array, got ${describe(json)}`);
+  }
+  return json.map((entry, index) => {
+    const itemPath = `${path}[${index}]`;
+    const object = asObject(entry, itemPath);
+    checkResponseKeys(object, itemPath, ['mime', 'maxBytes']);
+    return {
+      mime: fString(object, 'mime', itemPath),
+      maxBytes: fInt(object, 'maxBytes', itemPath),
+    };
+  });
+}
+
+function validateAttachmentLimits(json: Json, path: string): NativeAttachmentLimits {
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, [
+    'maxUploadBytes',
+    'maxRequestBytes',
+    'maxAttachmentBytes',
+    'image',
+    'document',
+  ]);
+  const image = asObject(field(object, 'image', path), `${path}.image`);
+  checkResponseKeys(image, `${path}.image`, ['mimes', 'maxRequestBytes']);
+  const document = asObject(field(object, 'document', path), `${path}.document`);
+  checkResponseKeys(document, `${path}.document`, ['capable', 'mimes', 'maxRequestBytes']);
+  return {
+    maxUploadBytes: fInt(object, 'maxUploadBytes', path),
+    maxRequestBytes: fInt(object, 'maxRequestBytes', path),
+    maxAttachmentBytes: fInt(object, 'maxAttachmentBytes', path),
+    image: {
+      mimes: validateAttachmentMimeLimits(
+        field(image, 'mimes', `${path}.image`),
+        `${path}.image.mimes`,
+      ),
+      maxRequestBytes: fInt(image, 'maxRequestBytes', `${path}.image`),
+    },
+    document: {
+      capable: fBool(document, 'capable', `${path}.document`),
+      mimes: validateAttachmentMimeLimits(
+        field(document, 'mimes', `${path}.document`),
+        `${path}.document.mimes`,
+      ),
+      maxRequestBytes: fInt(document, 'maxRequestBytes', `${path}.document`),
+    },
+  };
+}
+
 export function validateModelCatalog(json: Json): NativeModelInfo[] {
   const path = 'GET /models';
   if (!Array.isArray(json)) {
@@ -1378,6 +1519,21 @@ export function validateModelCatalog(json: Json): NativeModelInfo[] {
       'streaming',
       'source',
     ]);
+    // Additive contract: a legacy daemon omits the attachment fields (the
+    // client then keeps its conservative emergency ceiling); a present but
+    // malformed value is a loud protocol refusal, never coerced.
+    const documentCapableRaw = object['documentCapable'];
+    if (documentCapableRaw !== undefined && typeof documentCapableRaw !== 'boolean') {
+      fail(
+        `${itemPath}.documentCapable`,
+        `expected a boolean, got ${describe(documentCapableRaw)}`,
+      );
+    }
+    const limitsRaw = object['attachmentLimits'];
+    const attachmentLimits =
+      limitsRaw === undefined || limitsRaw === null
+        ? null
+        : validateAttachmentLimits(limitsRaw, `${itemPath}.attachmentLimits`);
     return {
       provider: fString(object, 'provider', itemPath),
       model: fString(object, 'model', itemPath),
@@ -1392,6 +1548,8 @@ export function validateModelCatalog(json: Json): NativeModelInfo[] {
       embeddings: fBool(object, 'embeddings', itemPath),
       streaming: fBool(object, 'streaming', itemPath),
       source: fString(object, 'source', itemPath),
+      documentCapable: documentCapableRaw === true,
+      attachmentLimits,
     };
   });
 }
@@ -3332,6 +3490,89 @@ export function validateAbortAck(json: Json): NativeAbortAck {
   return { aborted: fStringArray(object, 'aborted', path) };
 }
 
+export function validateIndexCoverage(json: Json): NativeIndexCoverageSnapshot | null {
+  const path = 'GET /native/index/coverage';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['sessionId', 'index_coverage']);
+  fString(object, 'sessionId', path);
+  const raw = field(object, 'index_coverage', path);
+  if (raw === null) {
+    // The daemon never hosted an index service: an honest "not reported",
+    // never fabricated complete coverage.
+    return null;
+  }
+  return validateIndexCoverageSnapshot(raw, `${path}.index_coverage`);
+}
+
+export function validateIndexCoverageSnapshot(
+  json: Json,
+  path: string,
+): NativeIndexCoverageSnapshot {
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, [
+    'workspace',
+    'state',
+    'generation',
+    'published_generation',
+    'coverage',
+    'fingerprint',
+    'freshness',
+    'serving',
+  ]);
+  const coverageObject = asObject(field(object, 'coverage', path), `${path}.coverage`);
+  checkResponseKeys(coverageObject, `${path}.coverage`, [
+    'files_seen',
+    'files_indexed',
+    'bytes_indexed',
+    'complete',
+    'truncated_reason',
+  ]);
+  const fingerprintObject = asObject(field(object, 'fingerprint', path), `${path}.fingerprint`);
+  checkResponseKeys(fingerprintObject, `${path}.fingerprint`, [
+    'scanned',
+    'complete',
+    'shard',
+    'round_start',
+    'epoch',
+    'shards_done',
+    'verify',
+    'cursors',
+    'truncated_reason',
+  ]);
+  const freshness = fString(object, 'freshness', path);
+  if (freshness !== 'current' && freshness !== 'stale_while_rebuilding' && freshness !== 'partial') {
+    fail(`${path}.freshness`, `unknown freshness ${JSON.stringify(freshness)}`);
+  }
+  return {
+    workspace: fInt(object, 'workspace', path),
+    state: fString(object, 'state', path),
+    generation: fInt(object, 'generation', path),
+    published_generation: fNullableInt(object, 'published_generation', path),
+    coverage: {
+      files_seen: fInt(coverageObject, 'files_seen', `${path}.coverage`),
+      files_indexed: fInt(coverageObject, 'files_indexed', `${path}.coverage`),
+      bytes_indexed: fInt(coverageObject, 'bytes_indexed', `${path}.coverage`),
+      complete: fBool(coverageObject, 'complete', `${path}.coverage`),
+      truncated_reason: fNullableString(coverageObject, 'truncated_reason', `${path}.coverage`),
+    },
+    fingerprint: {
+      scanned: fInt(fingerprintObject, 'scanned', `${path}.fingerprint`),
+      complete: fBool(fingerprintObject, 'complete', `${path}.fingerprint`),
+      shard: fInt(fingerprintObject, 'shard', `${path}.fingerprint`),
+      round_start: fInt(fingerprintObject, 'round_start', `${path}.fingerprint`),
+      shards_done: fInt(fingerprintObject, 'shards_done', `${path}.fingerprint`),
+      verify: fBool(fingerprintObject, 'verify', `${path}.fingerprint`),
+      truncated_reason: fNullableString(
+        fingerprintObject,
+        'truncated_reason',
+        `${path}.fingerprint`,
+      ),
+    },
+    freshness,
+    serving: fBool(object, 'serving', path),
+  };
+}
+
 // -------------------------------------------------------------- the client
 
 interface RequestOptions<T> {
@@ -3974,6 +4215,15 @@ export class NativeClient {
 
   semanticStatus(): Promise<NativeSemanticStatus> {
     return this.request('GET', '/native/semantic/status', { validate: validateSemanticStatus });
+  }
+
+  /** Durable index coverage of the session's workspace (audits 5/6/16):
+   * `null` when the daemon never hosted an index service. */
+  indexCoverage(sessionId: string): Promise<NativeIndexCoverageSnapshot | null> {
+    return this.request('GET', '/native/index/coverage', {
+      query: { session: sessionId },
+      validate: validateIndexCoverage,
+    });
   }
 
   abortSession(sessionId: string, opId?: string): Promise<NativeAbortAck> {

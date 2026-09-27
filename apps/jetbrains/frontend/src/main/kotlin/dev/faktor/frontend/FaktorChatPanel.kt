@@ -27,6 +27,7 @@ import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativePermissionReplyRefusal
+import dev.faktor.shared.indexCoverageLabel
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
@@ -117,6 +118,10 @@ class FaktorChatPanel(
     private val verifyLabel = JLabel("verification: -")
 
     private val filesLabel = JLabel("files changed: 0")
+
+    /** Durable index coverage (audits 5/6): a PARTIAL generation / capped
+     * fingerprint round is named, never flattened to "ready". */
+    private val indexLabel = JLabel("index: -")
 
     private val goalField = JTextField(24)
 
@@ -284,6 +289,7 @@ class FaktorChatPanel(
         panel.add(usageLabel)
         panel.add(verifyLabel)
         panel.add(filesLabel)
+        panel.add(indexLabel)
         return panel
     }
 
@@ -415,6 +421,25 @@ class FaktorChatPanel(
     }
 
     /**
+     * The attachment admission policy of the ACTIVE session's chosen model,
+     * read from the daemon's advertised `/models` contract (the projection
+     * names the active model when a run holds one, else the session's). Any
+     * read failure falls back to the conservative emergency ceiling — the
+     * client never mirrors the daemon's live numbers.
+     */
+    private fun resolveAttachmentPolicy(): AttachmentImages.Policy = try {
+        val projection = service.projection()
+        val active = projection.activeModel
+        AttachmentImages.policyForModel(
+            service.modelCatalog(),
+            active?.provider ?: projection.provider,
+            active?.model ?: projection.model
+        )
+    } catch (e: Exception) {
+        AttachmentImages.emergencyPolicy()
+    }
+
+    /**
      * The Task composer's start path (also reachable from tests without an
      * EDT click): criteria, attachments, the settings mutation default and
      * the checked completion contract ride ONE native task-run request.
@@ -432,10 +457,13 @@ class FaktorChatPanel(
         val contract = completionContractFromControls()
         runAsync("start task") {
             // Image parity (same representation as the VS Code client): an
-            // allowlisted image is read (bounded) and uploaded as a durable
+            // image the ADVERTISED model contract allows is read (bounded by
+            // the advertised per-image ceiling) and uploaded as a durable
             // binary attachment; the run carries its typed id. Non-image
-            // paths keep the workspace-relative `files` vocabulary. An
-            // undeliverable image refuses loudly here, before any start.
+            // paths keep the workspace-relative `files` vocabulary (workspace
+            // source files are never blindly uploaded). An undeliverable
+            // image refuses loudly here, before any start.
+            val policy = resolveAttachmentPolicy()
             val binary = ArrayList<NativeAttachmentId>()
             val pathFiles = ArrayList<String>()
             for (path in files) {
@@ -445,10 +473,17 @@ class FaktorChatPanel(
                     continue
                 }
                 val file = java.io.File(path)
-                val bytes = AttachmentImages.readBounded(file)
+                if (!policy.imageMimes.contains(mime)) {
+                    throw IllegalStateException(
+                        "image attachment " + file.name + " has mime " + mime +
+                            " which the selected model does not advertise as deliverable (deliverable types: " +
+                            policy.imageMimes.joinToString(", ") + ")"
+                    )
+                }
+                val bytes = AttachmentImages.readBounded(file, policy.maxImageBytes)
                     ?: throw IllegalStateException(
                         "image attachment " + file.name + " is not a regular file or exceeds the " +
-                            AttachmentImages.MAX_IMAGE_BYTES + " byte per-image bound"
+                            "advertised " + policy.maxImageBytes + " byte per-image bound"
                     )
                 binary.add(
                     service.uploadAttachment(
@@ -1062,6 +1097,7 @@ class FaktorChatPanel(
         refreshUsagePanelBlocking()
         if (service.currentSessionId() == null) return
         refreshStatusBlocking()
+        refreshIndexCoverageBlocking()
         refreshMessagesBlocking()
         refreshTaskRunsBlocking()
         refreshAgentsBlocking()
@@ -1224,6 +1260,24 @@ class FaktorChatPanel(
     private fun refreshStatusBlocking() {
         val projection = service.projection()
         onEdt { applyProjection(projection) }
+    }
+
+    /**
+     * Durable index coverage of the current workspace (audits 5/6/16): read
+     * best-effort so an older daemon (404) or a never-hosted index service
+     * never breaks the status refresh; the label names the honest state
+     * (including "not reported").
+     */
+    private fun refreshIndexCoverageBlocking() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        try {
+            val response = service.indexCoverage()
+            onEdt { indexLabel.text = indexCoverageLabel(response.snapshot) }
+        } catch (e: NativeApiException) {
+            onEdt { indexLabel.text = "index: refused (${e.status} ${e.code})" }
+        } catch (e: Exception) {
+            onEdt { indexLabel.text = "index: read failed" }
+        }
     }
 
     private fun refreshMessagesBlocking() {

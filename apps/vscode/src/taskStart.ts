@@ -14,7 +14,9 @@
 import { NativeApiError } from './nativeClient.ts';
 import type {
   NativeAttachmentId,
+  NativeAttachmentLimits,
   NativeCompletionContract,
+  NativeModelInfo,
   NativeTaskRunStarted,
   StartTaskRunRequest,
 } from './nativeClient.ts';
@@ -66,16 +68,113 @@ export const SUPPORTED_PENDING_IMAGE_MIMES = [
 ] as const;
 
 /**
- * Decoded-byte ceiling of one image attachment (mirror of the daemon-wide
- * per-image model bound, `faktor_provider::MAX_MODEL_IMAGE_BYTES`; a
- * provider's documented API limit can only be tighter). A larger image is
- * refused before any upload.
+ * Decoded-byte ceiling of one image attachment (emergency fallback only:
+ * the daemon's advertised per-image bound is consumed when the model
+ * catalog is available; this mirrors `faktor_provider::MAX_MODEL_IMAGE_BYTES`,
+ * the daemon-wide default a documented provider limit can only tighten).
  */
 export const MAX_PENDING_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Document media types the daemon can deliver when the chosen model
+ * advertises document capability (mirror of the emergency fallback set;
+ * the advertised per-model list wins when the catalog is available).
+ */
+export const SUPPORTED_PENDING_DOCUMENT_MIMES = ['application/pdf', 'text/plain'] as const;
+
+/** Emergency per-document decoded-byte ceiling before the catalog is read. */
+export const MAX_PENDING_DOCUMENT_BYTES = 8 * 1024 * 1024;
 
 const MAX_PENDING_FILES = 64;
 const MAX_PENDING_ID_CHARS = 4096;
 const MAX_PENDING_BASE64_CHARS = Math.ceil(MAX_PENDING_ATTACHMENT_BYTES / 3) * 4 + 8;
+
+/**
+ * The client-side attachment admission policy. When the daemon model
+ * catalog is available the numbers are the daemon's ADVERTISED values
+ * (`source: 'advertised'`, from `NativeAttachmentLimits`); otherwise the
+ * client falls back to its conservative emergency ceiling so it never
+ * attempts an upload above a bound the daemon might refuse.
+ */
+export interface AttachmentAdmissionPolicy {
+  readonly source: 'advertised' | 'emergency';
+  readonly maxUploadBytes: number;
+  readonly maxAttachmentBytes: number;
+  readonly imageMimes: readonly string[];
+  /** Tightest advertised per-image bound across the deliverable MIMEs. */
+  readonly maxImageBytes: number;
+  readonly maxRequestImageBytes: number;
+  readonly documentCapable: boolean;
+  readonly documentMimes: readonly string[];
+  /** Tightest advertised per-document bound across the MIMEs. */
+  readonly maxDocumentBytes: number;
+  readonly maxRequestDocumentBytes: number;
+}
+
+/**
+ * The conservative emergency ceiling used until the model catalog is read:
+ * daemon-wide defaults (per-image 5 MiB, documents 8 MiB, upload 7 MiB,
+ * structural attachment 32 MiB). The advertised catalog values REPLACE
+ * these; this object exists only so a start is never attempted unbounded.
+ */
+export const EMERGENCY_ATTACHMENT_POLICY: AttachmentAdmissionPolicy = {
+  source: 'emergency',
+  maxUploadBytes: MAX_PENDING_ATTACHMENT_BYTES,
+  maxAttachmentBytes: 32 * 1024 * 1024,
+  imageMimes: SUPPORTED_PENDING_IMAGE_MIMES,
+  maxImageBytes: MAX_PENDING_IMAGE_BYTES,
+  maxRequestImageBytes: 16 * 1024 * 1024,
+  // Unknown until advertised: a legacy daemon still decides at admission,
+  // so the emergency policy never refuses documents on capability grounds.
+  documentCapable: false,
+  documentMimes: SUPPORTED_PENDING_DOCUMENT_MIMES,
+  maxDocumentBytes: MAX_PENDING_DOCUMENT_BYTES,
+  maxRequestDocumentBytes: 16 * 1024 * 1024,
+};
+
+/** Turn the daemon's advertised limits into the client admission policy. */
+export function attachmentPolicyFromLimits(
+  limits: NativeAttachmentLimits,
+): AttachmentAdmissionPolicy {
+  const imageMimes = limits.image.mimes.map((entry) => entry.mime);
+  const maxImageBytes =
+    limits.image.mimes.length === 0
+      ? MAX_PENDING_IMAGE_BYTES
+      : Math.min(...limits.image.mimes.map((entry) => entry.maxBytes));
+  const documentMimes = limits.document.mimes.map((entry) => entry.mime);
+  const maxDocumentBytes =
+    limits.document.mimes.length === 0
+      ? MAX_PENDING_DOCUMENT_BYTES
+      : Math.min(...limits.document.mimes.map((entry) => entry.maxBytes));
+  return {
+    source: 'advertised',
+    maxUploadBytes: limits.maxUploadBytes,
+    maxAttachmentBytes: limits.maxAttachmentBytes,
+    imageMimes,
+    maxImageBytes,
+    maxRequestImageBytes: limits.image.maxRequestBytes,
+    documentCapable: limits.document.capable,
+    documentMimes,
+    maxDocumentBytes,
+    maxRequestDocumentBytes: limits.document.maxRequestBytes,
+  };
+}
+
+/**
+ * The admission policy for one provider/model from the fetched catalog. A
+ * missing entry (unknown model) or a legacy entry without advertised limits
+ * falls back to the conservative emergency ceiling — never to an unbounded
+ * assumption.
+ */
+export function attachmentPolicyForModel(
+  catalog: readonly NativeModelInfo[],
+  provider: string,
+  model: string,
+): AttachmentAdmissionPolicy {
+  const entry = catalog.find((row) => row.provider === provider && row.model === model);
+  const limits = entry?.attachmentLimits ?? null;
+  return limits === null ? EMERGENCY_ATTACHMENT_POLICY : attachmentPolicyFromLimits(limits);
+}
 
 function pendingString(value: unknown, max = MAX_PENDING_ID_CHARS): string | null {
   if (typeof value !== 'string') {
@@ -523,14 +622,15 @@ export interface AttachmentUploadClient {
 export type AdmitFailureStage = 'upload' | 'start';
 
 /**
- * One admission failure. `kind` `image_unsupported` is the LOUD refusal of
- * an image the daemon can never deliver to a model (a mime outside the
- * closed allowlist or an image over the per-image bound); `upload` covers a
- * refused/failed byte upload; the remaining kinds are the task-start
- * classifications ([`StartFailureKind`]).
+ * One admission failure. `kind` `image_unsupported` / `document_unsupported`
+ * is the LOUD refusal of media the daemon can never deliver to the CHOSEN
+ * model (a mime outside the advertised allowlist, a model without the
+ * capability, or a part over an advertised bound); `upload` covers an
+ * over-ceiling or refused byte upload; the remaining kinds are the
+ * task-start classifications ([`StartFailureKind`]).
  */
 export interface AdmitFailure {
-  readonly kind: StartFailureKind | 'upload' | 'image_unsupported';
+  readonly kind: StartFailureKind | 'upload' | 'image_unsupported' | 'document_unsupported';
   readonly stage: AdmitFailureStage;
   readonly status: number | null;
   readonly code: string | null;
@@ -567,22 +667,24 @@ function uploadFailureOf(error: unknown, sessionId: string): AdmitFailure {
 
 /**
  * The typed refusal for attachments that can never reach a model as an
- * image part: a mime outside [`SUPPORTED_PENDING_IMAGE_MIMES`] or an image
- * over [`MAX_PENDING_IMAGE_BYTES`]. Returns `null` when every attachment is
+ * image part: a mime outside the ADVERTISED image allowlist (the emergency
+ * list before the catalog is read) or an image over the advertised per-image
+ * or request-wide image bound. Returns `null` when every attachment is
  * deliverable — a supported image is NOT refused (it uploads to the durable
  * artifact store like any other attachment, and the daemon's own admission
- * validates it against the chosen model's vision capability). Document and
- * text-only submissions are untouched.
+ * re-validates it against the chosen model's vision capability).
  */
 export function pendingImageRefusal(
   attachments: readonly PendingBinaryAttachment[],
+  policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
 ): AdmitFailure | null {
+  let total = 0;
   for (const attachment of attachments) {
     if (!attachment.isImage && !attachment.mime.startsWith('image/')) {
       continue;
     }
     const name = attachment.filename ?? '(unnamed)';
-    if (!(SUPPORTED_PENDING_IMAGE_MIMES as readonly string[]).includes(attachment.mime)) {
+    if (!policy.imageMimes.includes(attachment.mime)) {
       return {
         kind: 'image_unsupported',
         stage: 'upload',
@@ -590,10 +692,10 @@ export function pendingImageRefusal(
         code: 'unsupported_image_type',
         message:
           `image attachment ${name} has unsupported mime ${JSON.stringify(attachment.mime)}; ` +
-          `deliverable types: ${SUPPORTED_PENDING_IMAGE_MIMES.join(', ')}`,
+          `deliverable types: ${policy.imageMimes.join(', ')}`,
       };
     }
-    if (attachment.bytes > MAX_PENDING_IMAGE_BYTES) {
+    if (attachment.bytes > policy.maxImageBytes) {
       return {
         kind: 'image_unsupported',
         stage: 'upload',
@@ -601,7 +703,95 @@ export function pendingImageRefusal(
         code: 'oversized_image',
         message:
           `image attachment ${name} of ${attachment.bytes} bytes exceeds the ` +
-          `${MAX_PENDING_IMAGE_BYTES} byte per-image bound`,
+          `${policy.maxImageBytes} byte per-image bound`,
+      };
+    }
+    total += attachment.bytes;
+    if (total > policy.maxRequestImageBytes) {
+      return {
+        kind: 'image_unsupported',
+        stage: 'upload',
+        status: 413,
+        code: 'oversized_image',
+        message:
+          `image attachments total ${total} bytes, over the ${policy.maxRequestImageBytes} ` +
+          'byte request image bound',
+      };
+    }
+  }
+  return null;
+}
+
+/** TRUE for a mime the daemon defines as a deliverable document type. */
+function isPendingDocumentMime(mime: string): boolean {
+  return (SUPPORTED_PENDING_DOCUMENT_MIMES as readonly string[]).includes(mime);
+}
+
+/**
+ * The typed refusal for DOCUMENT attachments the advertised contract cannot
+ * deliver to the chosen model: the model does not advertise document input,
+ * the mime is outside the advertised document allowlist, or the part/total
+ * exceeds the advertised document bounds. A legacy daemon without an
+ * advertised contract gets `null`: it decides at admission (the emergency
+ * policy never refuses documents on capability grounds). Unknown non-image,
+ * non-document mimes are opaque CAS-only artifacts and pass untouched.
+ */
+export function pendingDocumentRefusal(
+  attachments: readonly PendingBinaryAttachment[],
+  policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
+): AdmitFailure | null {
+  let total = 0;
+  for (const attachment of attachments) {
+    if (attachment.isImage || attachment.mime.startsWith('image/')) {
+      continue;
+    }
+    if (!isPendingDocumentMime(attachment.mime)) {
+      continue;
+    }
+    const name = attachment.filename ?? '(unnamed)';
+    if (policy.source === 'advertised' && !policy.documentCapable) {
+      return {
+        kind: 'document_unsupported',
+        stage: 'upload',
+        status: 400,
+        code: 'unsupported_document_type',
+        message:
+          `document attachment ${name} (${attachment.mime}) cannot be delivered: the selected ` +
+          'model does not advertise document input; remove it or select a document-capable model',
+      };
+    }
+    if (policy.source === 'advertised' && !policy.documentMimes.includes(attachment.mime)) {
+      return {
+        kind: 'document_unsupported',
+        stage: 'upload',
+        status: 400,
+        code: 'unsupported_document_type',
+        message:
+          `document attachment ${name} has unsupported mime ${JSON.stringify(attachment.mime)}; ` +
+          `deliverable document types: ${policy.documentMimes.join(', ')}`,
+      };
+    }
+    if (attachment.bytes > policy.maxDocumentBytes) {
+      return {
+        kind: 'document_unsupported',
+        stage: 'upload',
+        status: 413,
+        code: 'oversized_document',
+        message:
+          `document attachment ${name} of ${attachment.bytes} bytes exceeds the ` +
+          `${policy.maxDocumentBytes} byte per-document bound`,
+      };
+    }
+    total += attachment.bytes;
+    if (total > policy.maxRequestDocumentBytes) {
+      return {
+        kind: 'document_unsupported',
+        stage: 'upload',
+        status: 413,
+        code: 'oversized_document',
+        message:
+          `document attachments total ${total} bytes, over the ` +
+          `${policy.maxRequestDocumentBytes} byte request document bound`,
       };
     }
   }
@@ -609,11 +799,42 @@ export function pendingImageRefusal(
 }
 
 /**
- * Admit ONE pending submission through the daemon: gate every image against
- * the bounded mime/size allowlist FIRST (an undeliverable image refuses the
- * whole submission before any upload, so it leaves no partial bytes in the
- * durable store), then upload every binary attachment — images included —
- * and start ONE task run carrying the durable typed ids. The bytes live in
+ * The complete pre-upload gate: the advertised upload ceiling first, then
+ * the image and document delivery contracts. Returns `null` when every
+ * attachment may be uploaded; the daemon's own model-aware admission remains
+ * the authority after upload.
+ */
+export function pendingAttachmentRefusal(
+  attachments: readonly PendingBinaryAttachment[],
+  policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
+): AdmitFailure | null {
+  for (const attachment of attachments) {
+    if (attachment.bytes > policy.maxUploadBytes) {
+      return {
+        kind: 'upload',
+        stage: 'upload',
+        status: 413,
+        code: 'oversized_upload',
+        message:
+          `attachment ${attachment.filename ?? '(unnamed)'} of ${attachment.bytes} bytes exceeds ` +
+          `the ${policy.maxUploadBytes} byte upload bound`,
+      };
+    }
+  }
+  const image = pendingImageRefusal(attachments, policy);
+  if (image !== null) {
+    return image;
+  }
+  return pendingDocumentRefusal(attachments, policy);
+}
+
+/**
+ * Admit ONE pending submission through the daemon: gate every attachment
+ * against the ADVERTISED upload/image/document contract FIRST (an
+ * undeliverable part refuses the whole submission before any upload, so it
+ * leaves no partial bytes in the durable store), then upload every binary
+ * attachment — images and documents included — and start ONE task run
+ * carrying the durable typed ids. The bytes live in
  * the daemon's content-addressed attachment store; the run carries artifact
  * ids only, never base64 through the model/tool layer. The pending envelope
  * is retained by the caller for the entire call; `restore` is invoked
@@ -627,12 +848,21 @@ export async function admitPendingSubmission(input: {
   readonly sessionId: string;
   readonly pending: PendingSubmission;
   readonly settings: Omit<StartTaskSettings, 'attachments'>;
+  /**
+   * The daemon-advertised admission policy for the session's chosen model
+   * (see [`attachmentPolicyForModel`]). Omitted = the conservative
+   * emergency ceiling.
+   */
+  readonly attachmentLimits?: AttachmentAdmissionPolicy;
   readonly onStarted: (started: NativeTaskRunStarted) => void;
   readonly onFailure: (failure: AdmitFailure) => void;
   readonly restore: (failure: AdmitFailure) => void;
 }): Promise<AdmitOutcome> {
   const uploaded: TaskAttachmentId[] = [];
-  const refusal = pendingImageRefusal(input.pending.attachments);
+  const refusal = pendingAttachmentRefusal(
+    input.pending.attachments,
+    input.attachmentLimits ?? EMERGENCY_ATTACHMENT_POLICY,
+  );
   if (refusal !== null) {
     input.onFailure(refusal);
     input.restore(refusal);
