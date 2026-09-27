@@ -1,12 +1,17 @@
 //! `connection`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
+
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 
 /// Max concurrent read connections. This is a concurrency limit (semaphore
 /// permits), not just a retention limit.
 pub(crate) const READER_POOL: usize = 4;
+
+/// Hard bound on the retained per-read permit-wait receipt ring (mirrors the
+/// writer's receipt bound; evictions are counted, never silent).
+pub(crate) const READER_RECEIPT_CAPACITY: usize = 4096;
 
 /// Hard bound on one `memory_fact` kind scan (`doctor --deep` orphan
 /// checks): beyond this the scan refuses loudly instead of truncating.
@@ -107,6 +112,17 @@ pub(crate) struct ReaderPool {
     pub(crate) sem: Arc<Semaphore>,
     /// Connections ever opened (doctor/test probe: proves the cap held).
     pub(crate) created: AtomicU64,
+    /// Read calls that acquired a permit (monotonic).
+    pub(crate) reads: AtomicU64,
+    /// Cumulative + peak time callers waited for a reader-pool permit. This
+    /// is deliberately NOT the caller's read duration: `read()` only ever
+    /// blocks on the permit, while `messages_page()` also pays query, JSON
+    /// and part-load time that this pool never sees.
+    pub(crate) permit_wait_total_ns: AtomicU64,
+    pub(crate) permit_wait_max_ns: AtomicU64,
+    /// Bounded per-read permit-wait receipts (ns), oldest first.
+    pub(crate) receipts: Mutex<VecDeque<u64>>,
+    pub(crate) receipts_dropped: AtomicU64,
 }
 
 impl ReaderPool {
@@ -115,8 +131,48 @@ impl ReaderPool {
             conns: Mutex::new(Vec::with_capacity(READER_POOL)),
             sem: Arc::new(Semaphore::new(READER_POOL)),
             created: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            permit_wait_total_ns: AtomicU64::new(0),
+            permit_wait_max_ns: AtomicU64::new(0),
+            receipts: Mutex::new(VecDeque::new()),
+            receipts_dropped: AtomicU64::new(0),
         }
     }
+
+    /// Record one completed permit acquisition (audit-5 read instrumentation).
+    pub(crate) fn record_read(&self, wait: Duration) {
+        let ns = wait.as_nanos().min(u64::MAX as u128) as u64;
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.permit_wait_total_ns.fetch_add(ns, Ordering::Relaxed);
+        self.permit_wait_max_ns.fetch_max(ns, Ordering::Relaxed);
+        // Ephemeral diagnostic ring: recover on poison (see the crate's
+        // poisoning policy) and evict the oldest receipt at the bound.
+        let mut ring = self.receipts.lock().unwrap_or_else(|p| p.into_inner());
+        if ring.len() >= READER_RECEIPT_CAPACITY {
+            ring.pop_front();
+            self.receipts_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        ring.push_back(ns);
+    }
+}
+
+/// One completed read's permit-wait receipt: how long `Store::read` blocked
+/// on the reader-pool semaphore before borrowing a connection. End-to-end
+/// call latency (`messages_page()`) is a separate measurement on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderPermitReceipt {
+    pub permit_wait_ns: u64,
+}
+
+/// Typed cumulative read-path instrumentation (audit-5): reads completed,
+/// permit wait total/max and receipt-ring drops. The full caller duration is
+/// not tracked here — measure around your own call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReaderTelemetry {
+    pub reads: u64,
+    pub permit_wait_total_ns: u64,
+    pub permit_wait_max_ns: u64,
+    pub receipts_dropped: u64,
 }
 
 /// A borrowed read connection; returned to the pool on drop. The semaphore
@@ -252,6 +308,107 @@ impl CrashSeam {
     }
 }
 
+/// One active maintenance task: its cancellation token plus the SQLite
+/// interrupt handle of its dedicated connection. `cancel` alone is enough for
+/// the page-batched backup loop (SQLite's backup API does not poll
+/// `sqlite3_interrupt`); the handle is delivered too so any VM work on the
+/// maintenance connection aborts immediately.
+struct ActiveMaintenance {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+    interrupt: rusqlite::InterruptHandle,
+}
+
+/// Bounded registry of active maintenance tasks (audit item 6/7): the store
+/// keeps weak bookkeeping — id, cancellation token, interrupt handle — for
+/// every online backup running on its own snapshot connection. Shutdown
+/// cancels every task and waits (bounded) for the registry to drain; a task
+/// that misses its bound is not joined (its caller still receives the typed
+/// cancellation), so shutdown can never hang on maintenance.
+#[derive(Default)]
+pub(crate) struct MaintenanceRegistry {
+    active: Mutex<Vec<ActiveMaintenance>>,
+    next_id: AtomicU64,
+    idle: Condvar,
+}
+
+impl std::fmt::Debug for MaintenanceRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintenanceRegistry")
+            .field(
+                "active",
+                &self.active.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl MaintenanceRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one task; the returned id deregisters it when the task ends.
+    fn register(&self, cancel: Arc<AtomicBool>, interrupt: rusqlite::InterruptHandle) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(ActiveMaintenance {
+                id,
+                cancel,
+                interrupt,
+            });
+        id
+    }
+
+    fn unregister(&self, id: u64) {
+        self.active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|task| task.id != id);
+        self.idle.notify_all();
+    }
+
+    /// Signal cancellation to every task (flag + SQLite interrupt) and report
+    /// how many were active. Idempotent: already-cancelled tasks overwrite the
+    /// flag.
+    pub(crate) fn cancel_all(&self) -> usize {
+        let active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        for task in active.iter() {
+            task.cancel.store(true, Ordering::Release);
+            task.interrupt.interrupt();
+        }
+        active.len()
+    }
+
+    /// Number of active maintenance tasks (tests/doctor probe).
+    pub(crate) fn active_count(&self) -> usize {
+        self.active.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Wait, bounded by `deadline`, until every registered task deregisters.
+    /// `false` means at least one task is still winding down — the caller
+    /// proceeds (its backup was cancelled and fails typed) without joining it.
+    pub(crate) fn wait_idle(&self, deadline: Instant) -> bool {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if active.is_empty() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, _) = self
+                .idle
+                .wait_timeout(active, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            active = guard;
+        }
+    }
+}
+
 /// The daemon's durable store. Mutations are prepared on the caller's thread
 /// and submitted to the single-owner [`WriterService`] (bounded queue, one
 /// SQL transaction at a time); `read` borrows a connection from a small pool
@@ -263,6 +420,11 @@ pub struct Store {
     pub(crate) writer: WriterService,
     pub(crate) pool: Arc<ReaderPool>,
     pub(crate) seam: Arc<CrashSeam>,
+    /// Long-running maintenance tasks (online backups, audit item 6) on their
+    /// own dedicated connections/threads — NEVER the mutation owner. The
+    /// registry carries each task's cancellation token so a store shutdown
+    /// can cancel it and wait (bounded) for it to stop.
+    pub(crate) maintenance: Arc<MaintenanceRegistry>,
     /// Last `updated_ms` issued to a memory-fact row. Fact order is the
     /// paging contract ("an upsert only moves a row toward the NEWEST
     /// end"), so fact stamps are MONOTONIC: two writes inside the same
@@ -270,6 +432,23 @@ pub struct Store {
     /// row can tie the cursor's millisecond and sort BELOW an ongoing walk
     /// (kind/key tie-breaks can put it on the already-consumed side).
     pub(crate) fact_seq: AtomicU64,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Cancel every maintenance task non-blockingly (audit items 6/7):
+        // each backup observes the token between page batches and fails its
+        // caller typed. The writer's own `Drop` is the bounded stop (drain →
+        // interrupt → reject → detach); it never joins unboundedly.
+        let cancelled = self.maintenance.cancel_all();
+        if cancelled > 0 {
+            tracing::info!(
+                target: "faktor_store::maintenance",
+                cancelled,
+                "cancelling maintenance tasks on store drop"
+            );
+        }
+    }
 }
 
 /// One grouped hot write (the `faktor-session` `DbActor` request surface).
@@ -454,6 +633,55 @@ pub(crate) fn configure(conn: &Connection) -> StoreResult<()> {
          PRAGMA wal_autocheckpoint = 0;",
     )?;
     Ok(())
+}
+
+/// Pages copied per `sqlite3_backup_step` on the maintenance thread. A small
+/// batch bounds how long one step holds the source read lock and how quickly
+/// a cancellation is observed (checked before every batch).
+const BACKUP_PAGES_PER_STEP: std::ffi::c_int = 64;
+
+/// Pause between backup page batches: yields the source lock so concurrent
+/// writer commits proceed, and bounds cancellation latency between batches.
+const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(10);
+
+/// The page-batched copy of one online backup, running on the maintenance
+/// thread with its own dedicated source connection (audit item 6).
+///
+/// The copy pins ONE WAL read snapshot for its whole duration. Without an
+/// explicit read transaction on the source, SQLite restarts the backup
+/// whenever an external connection commits (its pager cache is reset while
+/// the backup is attached), so under continuous writes a large copy could
+/// never finish. A held read transaction gives the copy a stable source;
+/// WAL readers never block the writer, so mutations keep committing at full
+/// speed while the snapshot is copied. The cancellation token is checked
+/// before every batch; a cancelled copy removes its partial destination so a
+/// half-written file can never be mistaken for a complete backup.
+fn run_backup(src: Connection, dest: &Path, cancel: &AtomicBool) -> StoreResult<()> {
+    let mut dst = Connection::open(dest)?;
+    let snapshot = src.unchecked_transaction()?;
+    // Force the read transaction to actually start (a deferred transaction
+    // alone does not pin a snapshot).
+    let _: i64 = snapshot.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?;
+    let backup = rusqlite::backup::Backup::new(&snapshot, &mut dst)?;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            drop(backup);
+            drop(snapshot);
+            drop(dst);
+            let _ = std::fs::remove_file(dest);
+            return Err(StoreError::Maintenance(
+                "online backup cancelled by store shutdown".into(),
+            ));
+        }
+        match backup.step(BACKUP_PAGES_PER_STEP)? {
+            rusqlite::backup::StepResult::Done => {
+                drop(backup);
+                snapshot.rollback()?;
+                return Ok(());
+            }
+            _ => std::thread::sleep(BACKUP_STEP_PAUSE),
+        }
+    }
 }
 
 pub(crate) fn check_integrity(conn: &Connection) -> StoreResult<Vec<String>> {
@@ -957,6 +1185,302 @@ mod writer_service_tests {
         assert!(telemetry.pending_max >= 1, "{telemetry:?}");
         let _ = sid;
     }
+
+    /// Audit 5: writer-wait accounting is PER JOB (label + queue wait +
+    /// execution), drained explicitly, never inferred from before/after
+    /// deltas of cumulative counters that mix every concurrent thread's jobs.
+    #[test]
+    fn writer_receipts_account_each_job_and_drain_once() {
+        let (_d, store, _ws, sid) = store_with_session();
+        store.take_writer_receipts(); // discard open-time receipts
+        let before = store.writer_telemetry();
+        store
+            .append_ledger_entry(sid, "receipt_probe", 1, serde_json::json!({"i": 1}))
+            .unwrap();
+        let receipts = store.take_writer_receipts();
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        let receipt = &receipts[0];
+        assert_eq!(receipt.label, "append_ledger_entry");
+        assert!(receipt.run_ns > 0, "a committed transaction takes time");
+        assert!(
+            receipt.run_ns < Duration::from_secs(30).as_nanos() as u64,
+            "bogus execution duration: {receipt:?}"
+        );
+        // Drain-once: a second drain observes nothing until a new job runs.
+        assert!(store.take_writer_receipts().is_empty());
+        let after = store.writer_telemetry();
+        assert_eq!(after.jobs, before.jobs + 1);
+        assert_eq!(after.receipts_dropped, 0, "one job never evicts");
+    }
+
+    /// The receipt ring is a BOUNDED diagnostic: a consumer that never drains
+    /// loses the oldest receipts, and the loss is COUNTED (never a silently
+    /// truncated series that passes as complete).
+    #[test]
+    fn writer_receipt_ring_is_bounded_and_counts_evictions() {
+        let (_d, store, _ws, _sid) = store_with_session();
+        store.take_writer_receipts();
+        let overflow = WRITER_RECEIPT_CAPACITY + 8;
+        for _ in 0..overflow {
+            store
+                .writer_debug_job("receipt_ring_probe", |_conn| ())
+                .unwrap();
+        }
+        let receipts = store.take_writer_receipts();
+        assert_eq!(receipts.len(), WRITER_RECEIPT_CAPACITY);
+        assert!(receipts.iter().all(|r| r.label == "receipt_ring_probe"));
+        let telemetry = store.writer_telemetry();
+        assert_eq!(
+            telemetry.receipts_dropped as usize,
+            overflow - WRITER_RECEIPT_CAPACITY
+        );
+        assert!(store.take_writer_receipts().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Bounded shutdown (audit item 7)
+    // ------------------------------------------------------------------
+
+    /// A statement that runs for seconds on the owner: a recursive CTE the
+    /// progress handler / SQLite interrupt can abort mid-VM.
+    const SLOW_SQL: &str = "WITH RECURSIVE cnt(x) AS (
+            SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000000
+        ) SELECT COUNT(*) FROM cnt";
+
+    /// Slow SQL on the owner => `shutdown` returns within the bound with the
+    /// typed `Interrupted` outcome: the SQLite interrupt + progress handler
+    /// abort the runaway statement, the caller of that job gets a typed
+    /// error, and admissions stop (later mutations fail typed).
+    #[test]
+    fn shutdown_interrupts_slow_sql_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        store.create_session(ws, "t", "p", "m").unwrap();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&started);
+        let saw_interrupt = Arc::clone(&interrupted);
+        let job_store = Arc::clone(&store);
+        let slow = thread::spawn(move || {
+            job_store.writer_debug_job("slow_sql", move |conn| {
+                s2.store(true, Ordering::SeqCst);
+                let mut stmt = conn.prepare(SLOW_SQL).unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                loop {
+                    match rows.next() {
+                        Ok(Some(row)) => {
+                            let _: i64 = row.get(0).unwrap();
+                        }
+                        Ok(None) => break,
+                        // The shutdown interrupt aborts the statement here:
+                        // the job observes it and returns normally.
+                        Err(_) => {
+                            saw_interrupt.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+        wait_until(|| started.load(Ordering::SeqCst), "slow SQL job");
+
+        let bounded = Duration::from_millis(300);
+        let at = Instant::now();
+        let outcome = store.shutdown(bounded);
+        let elapsed = at.elapsed();
+        assert!(
+            elapsed < bounded + WRITER_SHUTDOWN_INTERRUPT_GRACE + Duration::from_secs(2),
+            "shutdown must return within the documented bound: {elapsed:?}"
+        );
+        // The interrupt lands: the owner joins inside the grace period.
+        assert_eq!(
+            outcome.unwrap(),
+            WriterShutdownOutcome::Interrupted { rejected: 0 }
+        );
+        // The job observed the SQLite interrupt and its caller never hangs.
+        slow.join().unwrap().unwrap();
+        assert!(
+            interrupted.load(Ordering::SeqCst),
+            "the slow statement must be aborted by the shutdown interrupt"
+        );
+        // Admissions stopped; the stop is observable and typed.
+        assert!(!store.writer_available());
+        assert!(store.writer_stopped());
+        match store.create_session(ws, "after", "p", "m") {
+            Err(StoreError::WriterUnavailable(_)) => {}
+            other => panic!("post-shutdown mutation must be typed unavailable: {other:?}"),
+        }
+    }
+
+    /// A clean shutdown DRAINS every queued mutation deterministically: the
+    /// slow holder finishes, all queued jobs commit with their own outcomes,
+    /// and only then does the service stop admitting new work.
+    #[test]
+    fn shutdown_drains_queued_mutations_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+
+        // A slow (but non-interruptible) holder, then queued mutations behind
+        // it. Drain semantics must run them all, in FIFO order.
+        let entered = Arc::new(AtomicBool::new(false));
+        let e2 = Arc::clone(&entered);
+        let holder_store = Arc::clone(&store);
+        let holder = thread::spawn(move || {
+            holder_store.writer_debug_job("drain_holder", move |_conn| {
+                e2.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(250));
+            })
+        });
+        wait_until(|| entered.load(Ordering::SeqCst), "drain holder");
+
+        let mut queued = Vec::new();
+        for i in 0..5 {
+            let queued_store = Arc::clone(&store);
+            queued.push(thread::spawn(move || {
+                queued_store.append_ledger_entry(
+                    sid,
+                    "drain_queued",
+                    1,
+                    serde_json::json!({ "i": i }),
+                )
+            }));
+        }
+        wait_until(
+            || store.writer_telemetry().pending_depth >= 5,
+            "five queued mutations",
+        );
+
+        let outcome = store.shutdown(Duration::from_secs(5)).unwrap();
+        assert_eq!(outcome, WriterShutdownOutcome::Drained);
+        holder.join().unwrap().unwrap();
+        for (i, handle) in queued.into_iter().enumerate() {
+            let seq = handle
+                .join()
+                .unwrap()
+                .unwrap_or_else(|e| panic!("queued mutation {i} must drain, got {e:?}"));
+            assert!(seq >= 1, "drained ledger entry has a real seq: {seq}");
+        }
+        // Drained mutations are durable and the stop is typed for new work.
+        assert_eq!(store.ledger_entries(sid, None, 100).unwrap().len(), 5);
+        assert!(store.writer_stopped());
+        match store.append_ledger_entry(sid, "after_shutdown", 1, serde_json::json!({})) {
+            Err(StoreError::WriterUnavailable(_)) => {}
+            other => panic!("post-shutdown mutation must be typed unavailable: {other:?}"),
+        }
+    }
+
+    /// A job that cannot be interrupted (sleeping outside SQLite) forces the
+    /// timeout path: `shutdown` returns the typed timeout, every queued
+    /// mutation is REJECTED with the typed unavailable error, and the owner
+    /// thread is detached — never joined unboundedly.
+    #[test]
+    fn shutdown_timeout_rejects_queued_mutations_and_detaches_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let e2 = Arc::clone(&entered);
+        let holder_store = Arc::clone(&store);
+        let holder = thread::spawn(move || {
+            holder_store.writer_debug_job("uninterruptible_holder", move |_conn| {
+                e2.store(true, Ordering::SeqCst);
+                // No SQL: the interrupt cannot reach a plain sleep. Bounded,
+                // deterministic non-interruptibility for the test.
+                thread::sleep(Duration::from_millis(1500));
+            })
+        });
+        wait_until(|| entered.load(Ordering::SeqCst), "holder");
+
+        let mut queued = Vec::new();
+        for i in 0..2 {
+            let queued_store = Arc::clone(&store);
+            queued.push(thread::spawn(move || {
+                queued_store.writer_debug_job("rejected_queued", move |_conn| {
+                    let _ = i;
+                })
+            }));
+        }
+        wait_until(
+            || store.writer_telemetry().pending_depth >= 2,
+            "two queued mutations",
+        );
+
+        let at = Instant::now();
+        let err = store.shutdown(Duration::from_millis(150)).unwrap_err();
+        let elapsed = at.elapsed();
+        assert!(
+            elapsed
+                < Duration::from_millis(150)
+                    + WRITER_SHUTDOWN_INTERRUPT_GRACE
+                    + Duration::from_secs(2),
+            "shutdown must stay bounded: {elapsed:?}"
+        );
+        match err {
+            StoreError::WriterShutdownTimeout { rejected } => assert_eq!(rejected, 2),
+            other => panic!("expected typed WriterShutdownTimeout, got {other:?}"),
+        }
+        // Deterministic rejection: both queued callers wake typed.
+        for (i, handle) in queued.into_iter().enumerate() {
+            match handle.join().unwrap() {
+                Err(StoreError::WriterUnavailable(_)) => {}
+                other => panic!("queued mutation {i} must be rejected typed: {other:?}"),
+            }
+        }
+        // The detached owner still finishes its uninterruptible job (bounded)
+        // and then stops on its own.
+        holder.join().unwrap().unwrap();
+        wait_until(|| store.writer_stopped(), "detached owner stop");
+    }
+
+    /// Audit item 6/7 seam: a large backup running on the maintenance thread
+    /// is cancelled by `shutdown` within the bound; its caller receives the
+    /// typed maintenance cancellation and the writer still stops typed.
+    #[test]
+    fn shutdown_cancels_a_running_backup_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let mid = store
+            .put_message(s.id, 1, "user", serde_json::json!({"text": "seed"}))
+            .unwrap();
+        super::tests::seed_padded_parts(&store, mid, 200_000);
+
+        let backup_path = dir.path().join("cancelled.db");
+        let backup_store = Arc::clone(&store);
+        let backup_path_for_thread = backup_path.clone();
+        let backup = thread::spawn(move || backup_store.backup_to(&backup_path_for_thread));
+        wait_until(
+            || store.maintenance_active_count() == 1,
+            "backup maintenance task",
+        );
+
+        let bounded = Duration::from_millis(500);
+        let at = Instant::now();
+        let outcome = store.shutdown(bounded);
+        let elapsed = at.elapsed();
+        assert!(
+            elapsed < bounded + WRITER_SHUTDOWN_INTERRUPT_GRACE + Duration::from_secs(2),
+            "shutdown with a running backup must stay bounded: {elapsed:?}"
+        );
+        assert_eq!(outcome.unwrap(), WriterShutdownOutcome::Drained);
+        // The maintenance cancellation is typed for the backup caller.
+        let backup_result = backup.join().unwrap();
+        match backup_result {
+            Err(StoreError::Maintenance(msg)) => {
+                assert!(msg.contains("cancelled"), "typed cancellation: {msg}");
+            }
+            other => panic!("cancelled backup must fail typed: {other:?}"),
+        }
+        // Cancellation removed the partial destination: a half-written file
+        // can never be mistaken for a complete backup.
+        assert!(!backup_path.exists(), "partial backup file must be removed");
+        assert_eq!(store.maintenance_active_count(), 0);
+    }
 }
 
 impl Store {
@@ -1092,6 +1616,7 @@ impl Store {
             pool,
             seam: Arc::new(CrashSeam::default()),
             fact_seq,
+            maintenance: Arc::new(MaintenanceRegistry::new()),
         }
     }
 
@@ -1151,6 +1676,43 @@ impl Store {
         self.writer.telemetry()
     }
 
+    /// Drain the writer service's per-job receipts (audit-5 additive
+    /// telemetry): the label, queue wait and execution duration of every
+    /// command the owner thread completed since the last drain, oldest first.
+    /// This is the honest per-command accounting — a caller never has to
+    /// difference global cumulative counters (which mix every other thread's
+    /// jobs into the same interval). Bounded ring: at most
+    /// [`WRITER_RECEIPT_CAPACITY`] receipts are retained and any eviction is
+    /// counted in [`WriterTelemetry::receipts_dropped`].
+    pub fn take_writer_receipts(&self) -> Vec<WriterJobReceipt> {
+        self.writer.take_receipts()
+    }
+
+    /// Typed reader-pool instrumentation snapshot (audit-5 additive
+    /// surface): reads completed, cumulative/peak permit wait, and how many
+    /// per-read receipts the bounded ring had to evict. The permit wait is
+    /// the time `read()` blocks on the pool semaphore — it is NOT the
+    /// caller's end-to-end duration (`messages_page()` also pays query, JSON
+    /// and part-load time and must be measured by the caller).
+    pub fn reader_telemetry(&self) -> ReaderTelemetry {
+        ReaderTelemetry {
+            reads: self.pool.reads.load(Ordering::Relaxed),
+            permit_wait_total_ns: self.pool.permit_wait_total_ns.load(Ordering::Relaxed),
+            permit_wait_max_ns: self.pool.permit_wait_max_ns.load(Ordering::Relaxed),
+            receipts_dropped: self.pool.receipts_dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Drain one permit-wait receipt per read completed since the last drain,
+    /// oldest first. Bounded by the reader receipt ring; detect evictions
+    /// through [`ReaderTelemetry::receipts_dropped`].
+    pub fn take_reader_receipts(&self) -> Vec<ReaderPermitReceipt> {
+        let mut ring = self.pool.receipts.lock().unwrap_or_else(|p| p.into_inner());
+        ring.drain(..)
+            .map(|permit_wait_ns| ReaderPermitReceipt { permit_wait_ns })
+            .collect()
+    }
+
     /// Run a raw closure on the single writer owner. `#[doc(hidden)]` test
     /// seam (the same pattern as [`Store::crash_arm`]): adversarial tests
     /// inject slow transactions and deliberate panics to certify the
@@ -1178,15 +1740,81 @@ impl Store {
         self.writer.unavailable_reason()
     }
 
+    /// Bounded, idempotent store shutdown (audit items 6/7):
+    ///
+    /// 1. every active maintenance task (online backup) is CANCELLED — its
+    ///    token is set and its connection interrupted — and the registry is
+    ///    given the remaining time (bounded) to drain;
+    /// 2. the writer stops admissions, DRAINS the queued mutations FIFO
+    ///    within the remaining bound, and on expiry interrupts the in-flight
+    ///    statement and REJECTS whatever is still queued with the typed
+    ///    [`StoreError::WriterUnavailable`];
+    /// 3. the owner thread is joined within the finite bound; a thread that
+    ///    survives the interrupt grace is detached and this returns
+    ///    [`StoreError::WriterShutdownTimeout`] (it exits on its own — never
+    ///    an unbounded join).
+    ///
+    /// Always returns within `timeout + WRITER_SHUTDOWN_INTERRUPT_GRACE`.
+    #[doc(hidden)]
+    pub fn shutdown(&self, timeout: Duration) -> StoreResult<WriterShutdownOutcome> {
+        let deadline = Instant::now() + timeout;
+        // Stop admissions FIRST: while maintenance winds down, no new
+        // mutation may be admitted.
+        self.writer.begin_shutdown();
+        let cancelled = self.maintenance.cancel_all();
+        if cancelled > 0 {
+            tracing::info!(
+                target: "faktor_store::maintenance",
+                cancelled,
+                "cancelling active maintenance tasks for shutdown"
+            );
+        }
+        let maintenance_drained = self.maintenance.wait_idle(deadline);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let outcome = self.writer.shutdown(remaining);
+        if !maintenance_drained {
+            tracing::warn!(
+                target: "faktor_store::maintenance",
+                active = self.maintenance.active_count(),
+                "maintenance did not drain inside the shutdown bound; its caller \
+                 still receives the typed cancellation"
+            );
+        }
+        match outcome {
+            WriterShutdownOutcome::Detached { rejected } => {
+                Err(StoreError::WriterShutdownTimeout { rejected })
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Active maintenance tasks (online backups) right now. `#[doc(hidden)]`
+    /// test probe: proves a backup runs off the mutation owner.
+    #[doc(hidden)]
+    pub fn maintenance_active_count(&self) -> usize {
+        self.maintenance.active_count()
+    }
+
+    /// True once the writer owner thread recorded its stop. `#[doc(hidden)]`
+    /// test probe for bounded shutdown.
+    #[doc(hidden)]
+    pub fn writer_stopped(&self) -> bool {
+        self.writer.is_stopped()
+    }
+
     /// Borrow a read connection. A semaphore permit is acquired first, so at
     /// most `READER_POOL` connections exist concurrently: 20 simultaneous
     /// readers use at most 4 connections and the rest wait on the permit,
-    /// bounded by the busy timeout (`StoreError::Busy`).
+    /// bounded by the busy timeout (`StoreError::Busy`). The permit wait is
+    /// recorded separately from the caller's query time (see
+    /// [`Store::reader_telemetry`]).
     pub(crate) fn read(&self) -> StoreResult<ReadConn> {
+        let queued_at = Instant::now();
         let permit = self
             .pool
             .sem
             .acquire_timeout(Instant::now() + BUSY_TIMEOUT)?;
+        self.pool.record_read(queued_at.elapsed());
         // Ephemeral connection cache: recover on poison (see Semaphore).
         let mut conns = self.pool.conns.lock().unwrap_or_else(|p| p.into_inner());
         let conn = match conns.pop() {
@@ -1253,10 +1881,13 @@ impl Store {
 
     pub fn create_workspace(&self, root: &str) -> StoreResult<WorkspaceId> {
         let root = root.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let created_ms = now_ms();
         self.writer.execute("create_workspace", move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO workspace(root, created_ms) VALUES (?1, ?2)",
-                params![root, now_ms()],
+                params![root, created_ms],
             )?;
             let id: i64 = conn.query_row(
                 "SELECT id FROM workspace WHERE root = ?1",
@@ -1521,16 +2152,55 @@ impl Store {
     }
 
     /// Online backup via the SQLite backup API (safe while the daemon runs).
+    ///
+    /// Audit item 6: the copy NEVER runs on the mutation-owner connection. It
+    /// opens a dedicated read/snapshot connection (read-write without CREATE,
+    /// like the pooled readers, so it participates in WAL snapshotting) and
+    /// runs the page-batched copy on a dedicated maintenance thread. Writers
+    /// keep committing through the single writer owner while the snapshot is
+    /// copied, so a large backup cannot stall any domain's mutation queue.
+    /// The call blocks the CALLER until the snapshot completes — schedule it
+    /// on a blocking pool, never a runtime worker.
+    ///
+    /// Cancellation (bounded shutdown): the maintenance thread checks its
+    /// token before every page batch, so `Store::shutdown`/drop cancels a
+    /// running backup and this call returns the typed
+    /// [`StoreError::Maintenance`] instead of hanging.
     pub fn backup_to(&self, dest: &Path) -> StoreResult<()> {
-        // Preparation BEFORE enqueueing: opening/creating the destination
-        // database is filesystem work and must not run on the writer owner
-        // (nor stall other domains behind it).
-        let mut dst = Connection::open(dest)?;
-        self.writer.execute("backup_to", move |src| {
-            let backup = rusqlite::backup::Backup::new(src, &mut dst)?;
-            backup.run_to_completion(50, std::time::Duration::from_millis(100), None)?;
-            Ok(())
-        })
+        let dest = dest.to_path_buf();
+        // The snapshot connection is opened on the caller's thread (the CLI
+        // backup task already runs on a blocking pool); `configure` plus the
+        // read-write/no-CREATE flags make it a WAL-participating reader.
+        let src = Connection::open_with_flags(
+            self.path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        configure(&src)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupt = src.get_interrupt_handle();
+        let registry = Arc::clone(&self.maintenance);
+        let task_registry = Arc::clone(&registry);
+        let id = registry.register(Arc::clone(&cancel), interrupt);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("faktor-store-backup".into())
+            .spawn(move || {
+                let result = run_backup(src, &dest, &cancel);
+                task_registry.unregister(id);
+                // The caller may have gone away with the store; a failed send
+                // is not an error here.
+                let _ = result_tx.send(result);
+            })
+            .map_err(|e| {
+                registry.unregister(id);
+                StoreError::Maintenance(format!("failed to spawn the backup thread: {e}"))
+            })?;
+        match result_rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(StoreError::Maintenance(
+                "backup maintenance thread terminated without a result".into(),
+            )),
+        }
     }
 
     /// `doctor`-style diagnostic with the FULL integrity scan (`doctor
@@ -1659,6 +2329,102 @@ mod tests {
         );
     }
 
+    /// Seed `rows` padded `part` rows for one message through the writer
+    /// (prepared statement, one transaction) so a backup has a page-dense
+    /// source that takes real time to copy.
+    pub(crate) fn seed_padded_parts(store: &Store, message_id: i64, rows: i64) {
+        let padding = "x".repeat(200);
+        store
+            .sql_execute(&format!(
+                "WITH RECURSIVE cnt(x) AS (
+                     SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < {rows}
+                 )
+                 INSERT INTO part(message_id, kind, data, created_ms)
+                 SELECT {message_id}, 'text', '{{\"text\":\"{padding}\"}}', 1 FROM cnt;"
+            ))
+            .unwrap();
+    }
+
+    /// Audit item 6: `backup_to` must not hold the single writer owner for the
+    /// whole copy. The snapshot runs on a dedicated maintenance thread with
+    /// its own read/snapshot connection; continuous mutations keep committing
+    /// through the single writer owner while it copies, so the writer-queue
+    /// latency stays bounded (p95 asserted) instead of stalling for the whole
+    /// backup. The resulting snapshot verifies.
+    #[test]
+    fn backup_overlaps_continuous_writes_without_stalling_the_writer_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let mid = store
+            .put_message(s.id, 1, "user", serde_json::json!({"text": "seed"}))
+            .unwrap();
+        // ~200k padded part rows: the copy takes long enough (the page-batched
+        // maintenance loop pauses between steps) for continuous writes to
+        // overlap it.
+        seed_padded_parts(&store, mid, 200_000);
+
+        let backup_path = dir.path().join("backup.db");
+        let backup_store = std::sync::Arc::clone(&store);
+        let backup_path_for_thread = backup_path.clone();
+        let backup = std::thread::spawn(move || backup_store.backup_to(&backup_path_for_thread));
+
+        // Wait (bounded) until the maintenance thread is registered: the copy
+        // runs OFF the mutation owner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while store.maintenance_active_count() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backup maintenance thread never registered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // Continuous writes while the snapshot is copied: each one is
+        // prepared on this thread, enqueued and committed by the owner.
+        let mut latencies: Vec<std::time::Duration> = Vec::new();
+        let mut overlapped = false;
+        let mut i = 0i64;
+        loop {
+            let active = store.maintenance_active_count() > 0;
+            overlapped |= active;
+            if !active && latencies.len() >= 25 {
+                break;
+            }
+            let started = std::time::Instant::now();
+            store
+                .append_ledger_entry(s.id, "backup_overlap", 1, serde_json::json!({"i": i}))
+                .unwrap();
+            latencies.push(started.elapsed());
+            i += 1;
+            // Bounded safety: never spin forever if the copy is stuck.
+            assert!(i < 20_000, "backup never completed: {latencies:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            overlapped,
+            "the backup completed before any mutation overlapped it"
+        );
+        let mut sorted = latencies.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[sorted.len() * 95 / 100];
+        assert!(
+            p95 < std::time::Duration::from_millis(250),
+            "writer queue latency p95 {p95:?} exceeded the bound while a large \
+             backup was copying (backup must not hold the writer owner); \
+             latencies={latencies:?}"
+        );
+        backup.join().unwrap().unwrap();
+
+        // The snapshot verifies: openable, intact, complete for the seed.
+        let restored_dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&backup_path, restored_dir.path().join("faktor-plus.db")).unwrap();
+        let restored = Store::open(restored_dir.path(), true).unwrap();
+        assert_eq!(restored.message_count(s.id).unwrap(), 1);
+        assert!(restored.integrity_check().unwrap().is_empty());
+    }
+
     #[test]
     fn integrity_check_survives_normal_use_and_flags_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -1770,6 +2536,53 @@ mod tests {
         assert!(!late.is_finished(), "5th reader must wait for a permit");
         drop(held);
         late.join().unwrap();
+    }
+
+    /// Audit 5: the reader-pool permit wait is instrumented on its own axis
+    /// (cumulative + bounded per-read receipts) and is deliberately NOT the
+    /// caller's read duration: a read that waited for a permit reports the
+    /// wait even though the caller's SQL finishes instantly afterwards.
+    #[test]
+    fn reader_permit_wait_is_instrumented_separately_from_call_duration() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let _s = store.create_session(ws, "t", "p", "m").unwrap();
+        let store = std::sync::Arc::new(store);
+        store.take_reader_receipts(); // discard setup reads
+        let before = store.reader_telemetry();
+
+        // Hold every permit; a late reader must wait for a permit (and the
+        // wait is what gets recorded — its own query is trivial).
+        let held: Vec<ReadConn> = (0..READER_POOL).map(|_| store.read().unwrap()).collect();
+        let store2 = store.clone();
+        let late = std::thread::spawn(move || {
+            let conn = store2.read().unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1);
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        drop(held);
+        late.join().unwrap();
+
+        let after = store.reader_telemetry();
+        assert_eq!(after.reads, before.reads + READER_POOL as u64 + 1);
+        assert!(
+            after.permit_wait_max_ns >= Duration::from_millis(40).as_nanos() as u64,
+            "the late reader's permit wait must be recorded: {after:?}"
+        );
+        assert_eq!(after.receipts_dropped, 0);
+        let receipts = store.take_reader_receipts();
+        assert_eq!(receipts.len(), READER_POOL + 1);
+        assert!(
+            receipts
+                .iter()
+                .any(|r| r.permit_wait_ns >= Duration::from_millis(40).as_nanos() as u64),
+            "one receipt must carry the contended wait: {receipts:?}"
+        );
+        // Drain-once.
+        assert!(store.take_reader_receipts().is_empty());
     }
 
     #[test]

@@ -676,6 +676,7 @@ mod tests {
             context_tokens: 1,
             estimated_output_tokens: 0,
             quality_floor: 0,
+            quality_target: None,
             task_budget_remaining_micro: remaining,
             latency_preference_ms: None,
             task_class: faktor_core::model::TaskClass::Medium,

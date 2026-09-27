@@ -392,10 +392,10 @@ fn descriptor_for(provider_id: &str, entry: &ModelCatalogEntry) -> ModelDescript
     let caps = &entry.capabilities;
     let qp = &entry.quality_prior;
     let economics = faktor_core::model::ModelEconomics {
-        tool_reliability: qp.tool_reliability,
-        reasoning_reliability: qp.reasoning_reliability,
-        coding_reliability: qp.coding_reliability,
-        context_reliability: qp.context_reliability,
+        tool_reliability: qp.tool.value,
+        reasoning_reliability: qp.reasoning.value,
+        coding_reliability: qp.coding.value,
+        context_reliability: qp.context.value,
         availability: qp.availability,
         estimated_latency_ms: qp.estimated_latency_ms,
         ..Default::default()
@@ -733,7 +733,7 @@ mod tests {
     use super::*;
     use faktor_core::model::{
         MicroUsdPerMillionTokens, ModelCapabilities, ModelEconomics, PriceAuthority, PriceQuote,
-        PricingSnapshot, QualityAuthority,
+        PricingSnapshot,
     };
     use faktor_provider::catalog::{
         ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
@@ -1551,15 +1551,7 @@ mod tests {
     }
 
     fn prior(coding: u8, context_rel: u8, latency_ms: u64) -> QualityPrior {
-        QualityPrior {
-            tool_reliability: coding,
-            reasoning_reliability: coding,
-            coding_reliability: coding,
-            context_reliability: context_rel,
-            availability: 100,
-            estimated_latency_ms: latency_ms,
-            authority: QualityAuthority::BuiltInPrior,
-        }
+        QualityPrior::built_in(coding, coding, coding, context_rel, latency_ms)
     }
 
     #[test]
@@ -2852,10 +2844,16 @@ mod tests {
         assert!(
             undeclared_entry
                 .quality_prior
+                .coding
                 .authority
                 .is_conservative_unknown(),
             "an undeclared endpoint keeps the ConservativeUnknown placeholder"
         );
+        assert!(undeclared_entry
+            .quality_prior
+            .context
+            .authority
+            .is_conservative_unknown());
         let policy = empty_store_policy(&registry, RoutingMode::Economy).unwrap();
         assert!(matches!(
             policy.route(&req),
@@ -2880,13 +2878,21 @@ mod tests {
             .try_register(declared.build(open_transport()).unwrap())
             .unwrap();
         let entry = registry.get("local").unwrap().catalog_entry("default");
-        assert_eq!(entry.quality_prior.coding_reliability, 70);
-        match &entry.quality_prior.authority {
+        assert_eq!(entry.quality_prior.coding.value, 70);
+        match &entry.quality_prior.coding.authority {
             faktor_core::model::QualityAuthority::UserConfigured { source, .. } => {
                 assert_eq!(source, "providers.local.quality");
             }
             other => panic!("expected UserConfigured, got {other:?}"),
         }
+        assert!(
+            entry
+                .quality_prior
+                .context
+                .authority
+                .is_conservative_unknown(),
+            "the undeclared context dimension stays ConservativeUnknown"
+        );
         let policy = empty_store_policy(&registry, RoutingMode::Economy).unwrap();
         let decision = policy
             .route(&req)
@@ -2894,6 +2900,16 @@ mod tests {
         assert_eq!(decision.provider, "local");
         assert_eq!(decision.model, "default");
         assert!(decision.pricing_snapshot.unwrap().is_local_zero());
+        // ... but the SAME coding-only declaration never authorizes the
+        // compaction context floor: the context metric is still the
+        // ConservativeUnknown placeholder (item 1, per-dimension authority).
+        let compact_intent = ModelCallIntent::compact();
+        assert_eq!(compact_intent.quality_floor(), 50);
+        let compact = compact_intent.route_request(1_000, 100, 0);
+        assert!(matches!(
+            policy.route(&compact),
+            Err(RouteFailure::NoCapableModel)
+        ));
     }
 
     #[test]

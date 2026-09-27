@@ -1,7 +1,5 @@
 //! `index`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// One durable per-workspace repository-index state row (schema v12, audits

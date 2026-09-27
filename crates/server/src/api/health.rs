@@ -1,7 +1,5 @@
 //! `api::health`: cohesive slice of the api module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Bound of the worker-plane health message surfaced by `/native/health`: a

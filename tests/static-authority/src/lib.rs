@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Fourteen structural invariants are locked by scanning the repository's
+//! Fifteen structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -124,6 +124,15 @@
 //!     explicitly named module is exempt: the manual adapter-contract
 //!     certification, whose setter use is asserted load-bearing and
 //!     non-stale.
+//! 15. **Prepared writer jobs execute SQL only** (audit item 8) — a
+//!     production writer job closure (`.writer.execute` / `execute_raw` /
+//!     `Store::writer_debug_job`) must not contain filesystem I/O,
+//!     serialization (`serde_json`, `to_vec`/`from_str`/`.json`), hashing or
+//!     sleeps: those run on the single writer owner and stall every domain's
+//!     mutations (and the bounded shutdown). Preparation happens on the
+//!     caller's thread BEFORE enqueueing. Grandfathered call sites are
+//!     exact-line allowlisted, asserted load-bearing and non-stale, and a
+//!     planted violation in every family fails the scan.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -580,8 +589,26 @@ mod scans {
     /// failure: the supervisor's own spawns and `egress.rs` itself were
     /// scanned). Every rel that enters a matcher or a comparison is
     /// normalized here; on unix this is exactly the identity.
+    /// Normalize a repo-relative path: Windows separators become `/` and
+    /// `.`/`..` segments are collapsed lexically, so a `#[path = "../x.rs"]`
+    /// out-of-line test module resolves to the same key the file walk
+    /// produces (audit-17 module splits keep tests next to or beside the
+    /// module they cover).
     fn normalize_rel(rel: &str) -> String {
-        rel.replace('\\', "/")
+        let rel = rel.replace('\\', "/");
+        let mut out: Vec<&str> = Vec::new();
+        for seg in rel.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if out.pop().is_none() {
+                        out.push("..");
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out.join("/")
     }
 
     /// Every `crates/<crate>/src/**/*.rs` file (test dirs excluded).
@@ -1960,10 +1987,10 @@ mod scans {
             "DurableBudgetLedger::new",
             &[
                 ("crates/cli/src/daemon/builder.rs", 1),
-                ("crates/orchestrator/src/task_executor.rs", 2),
+                ("crates/orchestrator/src/task_executor/mod.rs", 2),
                 ("crates/server/src/api/deps.rs", 1),
                 ("crates/session/src/manager.rs", 1),
-                ("crates/session/src/task.rs", 2),
+                ("crates/session/src/task/mod.rs", 2),
             ],
         ),
         (
@@ -1995,7 +2022,7 @@ mod scans {
             "ProcessSupervisor::try_shared",
             &[
                 ("crates/hooks/src/lib.rs", 1),
-                ("crates/index/src/service.rs", 1),
+                ("crates/index/src/service/mod.rs", 1),
                 ("crates/verify/src/exec.rs", 1),
                 ("crates/verify/src/inventory.rs", 1),
                 ("crates/cli/src/main.rs", 1),
@@ -3770,7 +3797,7 @@ fn prod_only() {}
         "crates/hooks/src/lib.rs",
         "crates/git/src/lib.rs",
         "crates/orchestrator/src/runtime.rs",
-        "crates/orchestrator/src/task_executor.rs",
+        "crates/orchestrator/src/task_executor/mod.rs",
         "crates/orchestrator/src/merge.rs",
         "crates/server/src/permission.rs",
     ];
@@ -3878,10 +3905,13 @@ fn prod_only() {}
         "crates/core/src/state.rs",
         "crates/verify/src/criteria.rs",
         "crates/verify/src/lib.rs",
-        "crates/session/src/task.rs",
-        "crates/session/src/ledger.rs",
+        "crates/session/src/task/mod.rs",
+        "crates/session/src/ledger/mod.rs",
         "crates/orchestrator/src/merge.rs",
-        "crates/orchestrator/src/task_executor.rs",
+        "crates/orchestrator/src/task_executor/mod.rs",
+        "crates/orchestrator/src/task_executor/settlement.rs",
+        "crates/orchestrator/src/task_executor/integration.rs",
+        "crates/orchestrator/src/task_executor/verification.rs",
         "crates/orchestrator/src/shadow.rs",
         "crates/memory/src/lib.rs",
         // Included so any NEW FNV fold in the tournament criterion identity
@@ -3902,11 +3932,11 @@ fn prod_only() {}
     ///   keeps it from spreading to any other line.
     const AUTHORITY_DIGEST_ALLOWLIST: &[(&str, &str)] = &[
         (
-            "crates/session/src/task.rs",
+            "crates/session/src/task/mod.rs",
             "const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;",
         ),
         (
-            "crates/session/src/task.rs",
+            "crates/session/src/task/mod.rs",
             "const PRIME: u64 = 0x0000_0100_0000_01b3;",
         ),
         (
@@ -3970,11 +4000,11 @@ fn prod_only() {}
             1
         );
         let allowlisted = synthetic_file(
-            "crates/session/src/task.rs",
+            "crates/session/src/task/mod.rs",
             "        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;\n",
         );
         assert!(
-            authority_digest_offenders("crates/session/src/task.rs", &allowlisted).is_empty(),
+            authority_digest_offenders("crates/session/src/task/mod.rs", &allowlisted).is_empty(),
             "the justified legacy-decode line is allowlisted"
         );
         let list = synthetic_file(
@@ -5848,6 +5878,347 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     }
 
     // ------------------------------------------------------------------
+    // scan 15: writer job closures execute SQL only (audit item 8)
+    // ------------------------------------------------------------------
+
+    /// Call shapes that hand a command closure to the durable writer service
+    /// (or its `#[doc(hidden)]` test seam). Anything inside that call's
+    /// parentheses runs on the SINGLE writer owner thread, where it stalls
+    /// every domain's mutations and the bounded shutdown.
+    const WRITER_JOB_CALL_MARKERS: &[&str] = &[
+        ".writer.execute(",
+        ".writer.execute_raw(",
+        ".writer_debug_job(",
+        // Receiver spelled without a leading dot (`store.writer.execute(`),
+        // and chains rustfmt may unfold.
+        "writer.execute(",
+        "writer.execute_raw(",
+        "writer_debug_job(",
+    ];
+
+    /// Work a writer job closure must never perform — it belongs on the
+    /// caller's thread BEFORE enqueueing. Three families:
+    ///
+    /// * filesystem I/O (`std::fs`, `OpenOptions`, `File::open/create`,
+    ///   temp files, read/write/remove helpers),
+    /// * serialization (`serde_json`, `to_vec`, `from_str`, `.json(`),
+    /// * hashing (`Sha256`/`sha2`/`blake3`/`Digest`/`Hasher`) and sleeps.
+    ///
+    /// Markers are matched on the code mask (strings/comments invisible) and
+    /// must begin at a non-identifier boundary, so `faktor_fs::` and
+    /// `cas_hash` identifiers do not fire.
+    const WRITER_JOB_FORBIDDEN_MARKERS: &[&str] = &[
+        // filesystem I/O
+        "std::fs::",
+        "fs::",
+        "OpenOptions",
+        "File::open",
+        "File::create",
+        "File::options",
+        "read_to_string",
+        "write_all",
+        "create_dir",
+        "remove_file",
+        "remove_dir",
+        "canonicalize",
+        "NamedTempFile",
+        "sync_all",
+        "sync_data",
+        // serialization
+        "serde_json",
+        ".to_vec(",
+        "::to_vec(",
+        ".from_str(",
+        "::from_str(",
+        ".json(",
+        "json!(",
+        // hashing
+        "Sha256",
+        "Sha512",
+        "sha2::",
+        "blake3::",
+        "Digest",
+        "Hasher",
+        ".digest(",
+        // sleeps
+        "thread::sleep",
+        "sleep(",
+    ];
+
+    /// Grandfathered writer-job closures that still prepare nothing: every
+    /// entry is an EXACT (file, trimmed line) pair, kept load-bearing and
+    /// non-stale by the tests below. The audit-item-8 target is a typed
+    /// prepared-write API; until those call sites migrate, a NEW forbidden
+    /// call anywhere (including inside an allowlisted file) is a red scan.
+    /// `crates/store/src/connection.rs` and `writer.rs` (the owned writer
+    /// core) are deliberately absent — their jobs must stay prepared.
+    const WRITER_JOB_ALLOWLIST: &[(&str, &str)] = &[
+        // crates/store/src/ledger.rs — the queue-admission closure serializes
+        // the materialized prompt message and the target state instead of
+        // capturing both before enqueue. Follow-up: prepare `message_json`
+        // and `state_json` on the caller's thread.
+        (
+            "crates/store/src/ledger.rs",
+            "serde_json::json!({ \"text\": prompt }).to_string(),",
+        ),
+        (
+            "crates/store/src/ledger.rs",
+            "serde_json::to_string(&target_state).unwrap(),",
+        ),
+        // crates/store/src/sessions.rs — create_session / lifecycle-state
+        // setters / transition_session / insert_checkpoint_and_event
+        // serialize in-process enums inside the job. Follow-up: serialize the
+        // four fixed strings on the caller's thread and pass them prepared.
+        (
+            "crates/store/src/sessions.rs",
+            "serde_json::to_string(&AgentState::Idle).unwrap(),",
+        ),
+        (
+            "crates/store/src/sessions.rs",
+            "serde_json::to_string(&lifecycle).unwrap(),",
+        ),
+        (
+            "crates/store/src/sessions.rs",
+            "serde_json::to_string(&state).unwrap(),",
+        ),
+        (
+            "crates/store/src/sessions.rs",
+            "serde_json::to_string(&expected).unwrap(),",
+        ),
+        (
+            "crates/store/src/sessions.rs",
+            "serde_json::to_string(&new).unwrap(),",
+        ),
+        (
+            "crates/store/src/sessions.rs",
+            "let state_json = serde_json::to_string(&t.new_state).unwrap();",
+        ),
+        ("crates/store/src/sessions.rs", "serde_json::json!({"),
+        // crates/store/src/tasks.rs — task_complete_verified serializes the
+        // terminal state inside the job. Follow-up: capture the constant JSON
+        // before enqueue.
+        (
+            "crates/store/src/tasks.rs",
+            "serde_json::to_string(&TaskState::VerifiedComplete).unwrap(),",
+        ),
+    ];
+
+    /// True for bytes that continue a Rust identifier (used to keep marker
+    /// matches from firing inside longer paths/identifiers).
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// The byte span of every writer-job call in one file: from the call
+    /// marker through the matching `)` of the call (parens balanced over the
+    /// code mask, so strings/comments cannot unbalance it).
+    fn writer_job_spans(f: &File<'_>) -> Vec<(usize, usize)> {
+        let bytes = f.src.as_bytes();
+        let mut spans = Vec::new();
+        for &marker in WRITER_JOB_CALL_MARKERS {
+            for at in find_marker_offsets(f, marker) {
+                let open = at + marker.len() - 1;
+                debug_assert_eq!(bytes[open], b'(');
+                let mut depth = 0usize;
+                let mut i = open;
+                while i < bytes.len() {
+                    if f.code[i] {
+                        match bytes[i] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+                spans.push((at, (i + 1).min(bytes.len())));
+            }
+        }
+        spans
+    }
+
+    /// Every scan-15 offender of one production file: a forbidden marker
+    /// inside a writer-job call span, minus the exact-line allowlist.
+    fn writer_job_offenders(f: &File<'_>) -> Vec<String> {
+        let spans = writer_job_spans(f);
+        if spans.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<(usize, String, &'static str)> = Vec::new();
+        for &marker in WRITER_JOB_FORBIDDEN_MARKERS {
+            let mb = marker.as_bytes();
+            let mut pos = 0usize;
+            while let Some(rel) = f.src[pos..].find(marker) {
+                let at = pos + rel;
+                let in_span = spans.iter().any(|(a, z)| at >= *a && at + mb.len() <= *z);
+                let in_code = f.code[at..at + mb.len()].iter().all(|c| *c);
+                // Identifier-boundary rule applies only to markers that start
+                // with an identifier byte (`fs::`, `serde_json`, `sleep(`);
+                // method markers (`.to_vec(`, `::from_str(`) legitimately
+                // follow an identifier.
+                let starts_ident = is_ident_byte(mb[0]);
+                let boundary = at == 0 || !starts_ident || !is_ident_byte(f.src.as_bytes()[at - 1]);
+                if in_span && in_code && boundary {
+                    let line = line_of(f.src, at);
+                    let text = trim_line(f.src, at);
+                    let allowlisted = WRITER_JOB_ALLOWLIST
+                        .iter()
+                        .any(|(p, t)| *p == f.rel && *t == text);
+                    if !allowlisted {
+                        hits.push((line, text, marker));
+                    }
+                }
+                pos = at + mb.len();
+            }
+        }
+        hits.sort();
+        hits.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        hits.into_iter()
+            .map(|(line, text, marker)| {
+                format!(
+                    "{}:{line}: {text}  [forbidden `{marker}` runs on the single writer \
+                     owner; prepare it BEFORE enqueueing]",
+                    f.rel
+                )
+            })
+            .collect()
+    }
+
+    /// Audit item 8: production writer job closures execute SQLite work only.
+    /// Serialization, filesystem I/O, hashing and sleeps all belong on the
+    /// caller's thread BEFORE the command is enqueued; inside the closure
+    /// they stall every other domain (and the bounded shutdown) behind the
+    /// single owner thread.
+    #[test]
+    fn prepared_writer_jobs_never_do_fs_serialization_hashing_or_sleeps() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue; // out-of-line test bodies are invisible
+            }
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            scanned += 1;
+            offenders.extend(writer_job_offenders(&f));
+        }
+        assert_no_offenders(
+            "writer-job scan: a production writer job closure (.writer.execute / \
+             .writer.execute_raw / .writer_debug_job) contains filesystem I/O, \
+             serialization, hashing or a sleep; prepare inputs on the caller's thread \
+             and keep the closure SQL-only",
+            &offenders,
+            scanned,
+            50,
+        );
+    }
+
+    /// Planted-fixture proof: every forbidden family fires inside a writer
+    /// job, the call-shape variants are all covered, and the prepared shapes
+    /// (work before the call, SQL inside) plus `#[cfg(test)]` code pass. The
+    /// machinery is not vacuously green.
+    #[test]
+    fn writer_job_scan_fires_on_planted_unprepared_work() {
+        for (family, src) in [
+            (
+                "fs write",
+                "fn f() { self.writer.execute(\"x\", move |conn| { std::fs::write(\"/tmp/z\", b\"y\")?; Ok(()) }) }\n",
+            ),
+            (
+                "fs open options",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let _ = OpenOptions::new().write(true).open(\"/tmp/z\"); Ok(()) }) }\n",
+            ),
+            (
+                "serde_json",
+                "fn f(v: Value) { self.writer.execute(\"x\", move |conn| { let s = serde_json::to_string(&v)?; Ok(s) }) }\n",
+            ),
+            (
+                "to_vec",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let b = v.to_vec(); Ok(b) }) }\n",
+            ),
+            (
+                "from_str",
+                "fn f(s: String) { self.writer.execute(\"x\", move |conn| { let t: T = T::from_str(&s)?; Ok(t) }) }\n",
+            ),
+            (
+                "json macro",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let v = serde_json::json!({\"a\": 1}); Ok(v) }) }\n",
+            ),
+            (
+                "hash",
+                "fn f(b: Vec<u8>) { self.writer.execute(\"x\", move |conn| { let d = Sha256::digest(&b); Ok(d) }) }\n",
+            ),
+            (
+                "sleep",
+                "fn f() { self.writer.execute(\"x\", move |conn| { std::thread::sleep(Duration::from_millis(5)); Ok(()) }) }\n",
+            ),
+            (
+                "debug seam",
+                "fn f() { store.writer_debug_job(\"x\", move |conn| { std::fs::write(\"/tmp/z\", b\"y\"); }) }\n",
+            ),
+            (
+                "raw seam",
+                "fn f(s: String) { self.writer.execute_raw(\"x\", move |conn| { serde_json::from_str::<T>(&s).unwrap() }) }\n",
+            ),
+        ] {
+            let f = synthetic_file("crates/store/src/evil.rs", src);
+            assert!(
+                !writer_job_offenders(&f).is_empty(),
+                "the planted {family} violation must fire: {src}"
+            );
+        }
+        for src in [
+            // Preparation BEFORE the call: serialized JSON captured outside.
+            "fn f(v: Value) { let json = v.to_string(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![json])?; Ok(()) }) }\n",
+            // Hashing before the call, digest bytes only inside.
+            "fn f(b: Vec<u8>) { let d = Sha256::digest(&b); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![d])?; Ok(()) }) }\n",
+            // Filesystem work before the call, SQL-only inside.
+            "fn f() -> std::io::Result<()> { std::fs::create_dir_all(\"/tmp\")?; self.writer.execute(\"x\", move |conn| { conn.execute(\"DELETE FROM t\", [])?; Ok(()) }) }\n",
+            // cfg(test) code can never certify production: invisible.
+            "#[cfg(test)]\nmod tests { fn t() { self.writer.execute(\"x\", move |conn| { std::fs::read_to_string(\"/tmp/z\") }); } }\n",
+            // A writer call with no forbidden work anywhere.
+            "fn f() { self.writer.execute(\"x\", move |conn| { conn.execute(\"DELETE FROM t\", [])?; Ok(()) }) }\n",
+        ] {
+            let f = synthetic_file("crates/store/src/good.rs", src);
+            assert!(
+                writer_job_offenders(&f).is_empty(),
+                "the prepared fixture must pass: {src} -> {:?}",
+                writer_job_offenders(&f)
+            );
+        }
+    }
+
+    /// Every grandfathered writer-job allowlist entry must still name a real
+    /// line (a dead entry means the residual moved and must be re-audited),
+    /// and the owned writer core may never be allowlisted.
+    #[test]
+    fn writer_job_allowlist_entries_stay_load_bearing_and_non_stale() {
+        for (rel, text) in WRITER_JOB_ALLOWLIST {
+            let src = std::fs::read_to_string(repo_root().join(rel))
+                .unwrap_or_else(|_| panic!("allowlisted writer file missing: {rel}"));
+            assert!(
+                src.lines().any(|l| l.trim() == *text),
+                "stale writer-job allowlist entry {rel}: {text:?} — the residual moved \
+                 or was fixed; update the allowlist"
+            );
+            assert_ne!(
+                *rel, "crates/store/src/connection.rs",
+                "the owned writer core must stay prepared: {text:?}"
+            );
+            assert_ne!(
+                *rel, "crates/store/src/writer.rs",
+                "the writer service itself must stay prepared: {text:?}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
     // scan N: unsafe / OS-boundary policy (Phase D item 22)
     // ------------------------------------------------------------------
 
@@ -5879,7 +6250,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/terminal/src/sandbox/linux.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
         // --- function-level allows in mixed files ---
-        ("crates/terminal/src/lib.rs", 13),
+        ("crates/terminal/src/lib.rs", 10),
         ("crates/fs/src/tree_manifest.rs", 3),
         ("crates/git/src/guard.rs", 3),
         ("crates/session/src/actor.rs", 1),
@@ -5890,6 +6261,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/cloud/tests/durability_memory.rs", 1),
         ("crates/server/tests/attachment_decode_alloc.rs", 1),
         ("crates/orchestrator/src/shadow_tests.rs", 1),
+        // The terminal unix test module (moved out of lib.rs by the audit-17
+        // split): the three libc probes keep their per-site SAFETY comments.
+        ("crates/terminal/src/tests.rs", 3),
         // The CLI's test-gated out-of-line modules (the module-decomposition
         // move out of main.rs): the two libc::kill zero-signal probes.
         ("crates/cli/src/main_acp_tests.rs", 1),
@@ -6982,25 +7356,17 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     /// (recorded counts). This list can only shrink.
     const GRANDFATHERED_OVER_CEILING: &[(&str, usize)] = &[
         ("crates/acp/src/lib.rs", 4465),
-        ("crates/agent/src/lib.rs", 6698),
         ("crates/cli/src/tools_market.rs", 5555),
         ("crates/git/src/lib.rs", 4269),
-        ("crates/index/src/service.rs", 6044),
         ("crates/ollama/src/lib.rs", 4107),
         ("crates/openai/src/lib.rs", 4234),
         ("crates/orchestrator/src/completion_steps.rs", 4631),
         ("crates/orchestrator/src/runtime.rs", 4262),
         ("crates/orchestrator/src/runtime_tests.rs", 5259),
-        ("crates/orchestrator/src/task_executor.rs", 7367),
-        ("crates/orchestrator/src/task_executor_tests.rs", 9594),
         ("crates/provider/src/egress.rs", 5699),
-        ("crates/router/src/lib.rs", 5305),
         ("crates/scheduler/src/lib.rs", 4176),
         ("crates/server/src/native/terminal_authority.rs", 5189),
         ("crates/session/src/budget.rs", 4010),
-        ("crates/session/src/ledger.rs", 7281),
-        ("crates/session/src/task.rs", 7067),
-        ("crates/terminal/src/lib.rs", 6845),
     ];
 
     /// Every Rust source in scope for the ceiling: `crates/**` plus
@@ -7214,9 +7580,13 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         );
     }
 
-    /// Audit 27: the reproducible contention benchmark exists, is #[ignore]d
-    /// (normal PR runs stay fast) and is assigned to a wired nightly lane
-    /// (the trusted perf lane selects the package too).
+    /// Audit 27 (+audit 5): the reproducible contention benchmark exists, is
+    /// #[ignore]d (normal PR runs stay fast) and is assigned to a wired
+    /// nightly lane (the trusted perf lane selects the package too). The
+    /// audit-5 wiring is pinned too: session-keyed event timing, per-job
+    /// writer receipts, the separately instrumented reader-pool permit wait,
+    /// and REAL on-disk IndexService generations driven through
+    /// request_build/reconcile.
     #[test]
     fn contention_benchmark_is_wired_into_nightly_and_trusted() {
         let root = repo_root();
@@ -7229,13 +7599,32 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         for axis in [
             "sse_lag",
             "event_lag",
-            "writer_wait",
-            "reader_wait",
+            "writer_queue_wait",
+            "writer_exec",
+            "messages_page",
+            "reader_pool_wait",
             "index_rebuild",
             "wal_peak_bytes",
             "rss_end_kb",
         ] {
             assert!(bench.contains(axis), "benchmark misses the {axis} axis");
+        }
+        // Audit-5 wiring: the bug classes must not silently regress back to
+        // the shapes this item removed (seq-only lag keys, global writer
+        // deltas, in-memory index toys, mislabeled page duration).
+        for needle in [
+            "(SessionId, u64)",
+            "take_writer_receipts",
+            "take_reader_receipts",
+            "IndexService::open",
+            "request_build",
+            "reconcile_now",
+            "write_bench_files",
+        ] {
+            assert!(
+                bench.contains(needle),
+                "benchmark misses the audit-5 wiring marker `{needle}`"
+            );
         }
         let registry =
             std::fs::read_to_string(root.join("scripts/certification/ignored-tests.json"))
@@ -7357,6 +7746,353 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert!(
             certify.contains("[ \"$VISUAL_PLATFORMS_STATUS\" = \"pass\" ]"),
             "the visual platform records must gate the release preconditions"
+        );
+    }
+
+    // ------------------------------------------------- audit 16: allow(unused*)
+    //
+    // Audit item 16: the module decomposition left file-wide
+    // `#![allow(unused_imports)]` masks across the runtime/store/server/cli
+    // split modules. They are removed and every submodule imports only what
+    // it uses. This scan keeps the masks from coming back: production Rust
+    // (test-gated modules and out-of-line test files are never scanned, as
+    // are comments and string literals) must not carry ANY `allow(unused*)`
+    // attribute. The exception list is empty by design — target-specific
+    // mutability is expressed with `#[cfg]` bindings, not a lint mask. A
+    // non-empty entry must name the exact file and trimmed line and is
+    // asserted live, so a stale entry can never excuse a new mask.
+
+    /// Exact production sites exempt from the ban (rel, trimmed line).
+    const ALLOW_UNUSED_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// True when `lint` (one comma-separated element of an `allow(...)`
+    /// body) names a plain rustc lint starting with `unused` (`unused`,
+    /// `unused_imports`, ...). Namespaced lints (`clippy::unused_*`) belong
+    /// to another lint namespace and never fire.
+    fn is_unused_lint(lint: &str) -> bool {
+        let lint = lint.trim();
+        !lint.contains("::") && lint.starts_with("unused")
+    }
+
+    /// `allow(unused*)` attribute sites in the production text of `f`
+    /// (1-based line, trimmed line text).
+    fn allow_unused_sites(f: &File<'_>) -> Vec<(usize, String)> {
+        let mut hits = Vec::new();
+        let mut pos = 0usize;
+        while let Some(rel) = f.src[pos..].find("allow(") {
+            let at = pos + rel;
+            pos = at + "allow(".len();
+            let in_kept = f
+                .kept
+                .iter()
+                .any(|(a, z)| at >= *a && at + "allow(".len() <= *z);
+            let in_code = f.code[at..at + "allow(".len()].iter().all(|c| *c);
+            if !in_kept || !in_code {
+                continue;
+            }
+            let before = f.src[..at].trim_end();
+            if !(before.ends_with("#[") || before.ends_with("#![")) {
+                continue;
+            }
+            // Attribute body up to the matching (possibly nested) `)`.
+            let bytes = f.src.as_bytes();
+            let mut depth = 1usize;
+            let mut j = at + "allow(".len();
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                continue;
+            }
+            let body = &f.src[at + "allow(".len()..j - 1];
+            if body.split(',').any(is_unused_lint) {
+                hits.push((line_of(f.src, at), trim_line(f.src, at)));
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
+    fn allow_unused_offenders(f: &File<'_>) -> Vec<String> {
+        allow_unused_sites(f)
+            .into_iter()
+            .filter(|(_, text)| {
+                !ALLOW_UNUSED_EXCEPTIONS
+                    .iter()
+                    .any(|(rel, t)| *rel == f.rel.as_str() && *t == text)
+            })
+            .map(|(line, text)| format!("{}:{line}: {text}", f.rel))
+            .collect()
+    }
+
+    #[test]
+    fn no_production_allow_unused_masks() {
+        let mut scanned = 0usize;
+        let mut offenders = Vec::new();
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else { continue };
+            scanned += 1;
+            offenders.extend(allow_unused_offenders(&f));
+        }
+        assert_no_offenders("allow(unused*) ban", &offenders, scanned, 150);
+        for (rel, text) in ALLOW_UNUSED_EXCEPTIONS {
+            let f = load(rel).unwrap_or_else(|| panic!("exception file {rel} missing"));
+            assert!(
+                allow_unused_sites(&f).iter().any(|(_, t)| t == text),
+                "stale allow(unused*) exception entry {rel}: {text:?} — remove it"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_unused_ban_fires_on_planted_violations() {
+        let synthetic = |src: &str| -> File<'static> {
+            let src = leak(src);
+            let code = code_mask(src);
+            let kept = kept_ranges(src, &code);
+            File {
+                rel: "tests/planted_fixture.rs".to_string(),
+                src,
+                code,
+                kept,
+            }
+        };
+        for planted in [
+            "#![allow(unused_imports)]\nfn t() {}\n",
+            "#[allow(unused_mut)]\nfn t() { let mut x = 0; let _ = x; }\n",
+            "#[allow(dead_code, unused_variables)]\nfn t() {}\n",
+            "#[allow(unused)]\nfn t() {}\n",
+        ] {
+            let f = synthetic(planted);
+            assert_eq!(
+                allow_unused_offenders(&f).len(),
+                1,
+                "planted mask must fire: {planted}"
+            );
+        }
+        let test_only =
+            "#[cfg(test)]\nmod tests {\n    #[allow(unused_imports)]\n    use super::*;\n}\n";
+        assert!(
+            allow_unused_offenders(&synthetic(test_only)).is_empty(),
+            "test-gated masks are not production code"
+        );
+        let mentions = "// #[allow(unused_imports)]\nconst DOC: &str = \"#[allow(unused_mut)]\";\n\
+                        fn allow(unused_imports) {}\n";
+        assert!(
+            allow_unused_offenders(&synthetic(mentions)).is_empty(),
+            "comments, strings and non-attribute mentions never fire"
+        );
+        let clippy = "#[allow(clippy::unused_io_amount)]\nfn t() { let _ = 1; }\n";
+        assert!(
+            allow_unused_offenders(&synthetic(clippy)).is_empty(),
+            "a namespaced clippy lint is not a rustc unused* allow"
+        );
+    }
+
+    // ------------------------------------------- audit 22/23 forge wiring --
+
+    /// Audit 22/23: the repository description is the Faktor-owned UI
+    /// positioning and certification verifies it (plus the exact-SHA commit
+    /// status) through the GitHub API; the trusted workflow publishes the
+    /// result on success AND failure with a fail-closed token.
+    #[test]
+    fn forge_metadata_and_status_publication_are_wired() {
+        let root = repo_root();
+        let certify = std::fs::read_to_string(root.join("scripts/certify.sh")).expect("certify.sh");
+        for needle in [
+            "check_forge_metadata",
+            "FAKTOR_REPO_DESCRIPTION=\"Faktor — native Rust engineering runtime with Faktor-owned IDE UIs\"",
+            "forge-status-absent",
+            "forge-status-pending",
+            "forge-status-sha-mismatch",
+            "external, non-source",
+            "certification/publish-status.mjs publish",
+        ] {
+            assert!(
+                certify.contains(needle),
+                "certify.sh misses the audit-22/23 marker `{needle}`"
+            );
+        }
+        let trusted = std::fs::read_to_string(root.join(".woodpecker/trusted/trusted.yaml"))
+            .expect("trusted workflow");
+        for needle in [
+            "  - name: status-publish",
+            "status: [success, failure]",
+            "publish-status.mjs selftest",
+            "publish-status.mjs publish",
+            "faktor_github_status_token",
+        ] {
+            assert!(
+                trusted.contains(needle),
+                "trusted workflow misses the audit-23 marker `{needle}`"
+            );
+        }
+        let publish =
+            std::fs::read_to_string(root.join("scripts/certification/publish-status.mjs"))
+                .expect("publish-status.mjs");
+        assert!(
+            publish.contains("github-status-token-missing"),
+            "publish-status.mjs must refuse a missing token"
+        );
+        assert!(
+            publish.contains("/^[0-9a-f]{40}$/"),
+            "publish-status.mjs must bind the exact 40-hex commit"
+        );
+        let branding =
+            std::fs::read_to_string(root.join("scripts/branding-scan.sh")).expect("branding scan");
+        assert!(
+            branding.contains("GitHub API by `scripts/certify.sh` gate 11"),
+            "the branding scan note must point at the gate-11 API check"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 8: audit-15 migrated native DTOs stay generated
+    // ------------------------------------------------------------------
+
+    /// The migrated attachment/task-run DTOs must stay in the canonical
+    /// schema, both IDE clients must delegate to the GENERATED decoders, and
+    /// the codegen inventory must keep its shrink-only frozen set and the
+    /// migrated routes. A reappearing hand-rolled parse of these fields is a
+    /// regression, not a label change.
+    fn migrated_native_dto_delegation_offenders(
+        vscode_ts: &str,
+        jetbrains_kt: &str,
+        schema_json: &str,
+        codegen_mjs: &str,
+        codegen_md: &str,
+    ) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for needle in [
+            "type NativeTaskRun = ProtocolTaskRun",
+            "validateProtocolTaskRun(",
+            "validateProtocolAttachmentId(",
+        ] {
+            if !vscode_ts.contains(needle) {
+                offenders.push(format!(
+                    "apps/vscode/src/nativeClient.ts lost the generated delegation `{needle}`"
+                ));
+            }
+        }
+        for needle in [
+            "typealias NativeTaskRun = ProtocolTaskRun",
+            "typealias NativeAttachmentId = ProtocolAttachmentId",
+            "parseProtocolTaskRun(it)",
+            "parseProtocolAttachmentId(",
+        ] {
+            if !jetbrains_kt.contains(needle) {
+                offenders.push(format!(
+                    "NativeProtocol.kt lost the generated delegation `{needle}`"
+                ));
+            }
+        }
+        if vscode_ts.contains("item_ids: fStringArray(object") {
+            offenders.push(
+                "nativeClient.ts hand-parses TaskRun.item_ids again (delegate to \
+                 validateProtocolTaskRun)"
+                    .to_string(),
+            );
+        }
+        if jetbrains_kt.contains("NativeTaskRun(\n")
+            || jetbrains_kt.contains("NativeTaskRunStarted(\n")
+            || jetbrains_kt.contains("NativeTaskRunCancelled(\n")
+        {
+            offenders.push(
+                "NativeProtocol.kt hand-constructs a migrated task-run DTO again (delegate to \
+                 parseProtocolTaskRun*)"
+                    .to_string(),
+            );
+        }
+        for name in [
+            "AttachmentId",
+            "AttachmentUpload",
+            "TaskRun",
+            "TaskRunStarted",
+            "TaskRunCancelled",
+            "TaskRunWorkItem",
+            "TaskRunStartRequest",
+        ] {
+            if !schema_json.contains(&format!("\"name\": \"{name}\"")) {
+                offenders.push(format!(
+                    "the canonical schema lost `{name}` (crates/protocol/src/schema.rs)"
+                ));
+            }
+        }
+        for route in [
+            "/native/session/{id}/attachments",
+            "/native/session/{id}/task-runs",
+        ] {
+            if !codegen_mjs.contains(route) {
+                offenders.push(format!(
+                    "protocol-codegen.mjs lost the migrated route `{route}`"
+                ));
+            }
+        }
+        if !codegen_mjs.contains("HANDWRITTEN_FROZEN") {
+            offenders.push(
+                "protocol-codegen.mjs lost the shrink-only HANDWRITTEN_FROZEN set".to_string(),
+            );
+        }
+        if !codegen_md.contains("SHRINK-ONLY") {
+            offenders.push(
+                "crates/protocol/schema/CODEGEN.md lost the shrink-only inventory contract"
+                    .to_string(),
+            );
+        }
+        offenders
+    }
+
+    #[test]
+    fn migrated_native_dtos_stay_generated_with_delegating_ide_parsers() {
+        let root = repo_root();
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+        let offenders = migrated_native_dto_delegation_offenders(
+            &read("apps/vscode/src/nativeClient.ts"),
+            &read("apps/jetbrains/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt"),
+            &read("crates/protocol/schema/faktor-protocol.schema.json"),
+            &read("scripts/protocol-codegen.mjs"),
+            &read("crates/protocol/schema/CODEGEN.md"),
+        );
+        assert_no_offenders(
+            "audit-15 scan: the migrated attachment/task-run DTOs must stay generated and both \
+             IDE clients must delegate to the generated decoders",
+            &offenders,
+            5,
+            5,
+        );
+    }
+
+    #[test]
+    fn migrated_native_dto_tripwire_fires_on_a_planted_regression() {
+        let root = repo_root();
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+        let vscode = read("apps/vscode/src/nativeClient.ts")
+            .replace(
+                "type NativeTaskRun = ProtocolTaskRun",
+                "interface NativeTaskRun {}",
+            )
+            .replace("validateProtocolTaskRun(", "handRollTaskRun(");
+        let offenders = migrated_native_dto_delegation_offenders(
+            &vscode,
+            &read("apps/jetbrains/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt"),
+            &read("crates/protocol/schema/faktor-protocol.schema.json"),
+            &read("scripts/protocol-codegen.mjs"),
+            &read("crates/protocol/schema/CODEGEN.md"),
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|offender| offender.contains("nativeClient.ts")),
+            "the audit-15 tripwire must fire on a planted VS Code regression: {offenders:?}"
         );
     }
 }

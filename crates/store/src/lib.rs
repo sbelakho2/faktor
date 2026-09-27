@@ -45,6 +45,28 @@
 //! [`StoreError::WriterQueueFull`] backpressure), results are typed oneshots,
 //! and queue wait / transaction duration / pending depth / checkpoint
 //! duration / slow transactions are instrumented ([`WriterTelemetry`]).
+//! The prepared-write contract is statically enforced (audit item 8): test
+//! `faktor-tests-static-authority` refuses filesystem I/O, serialization,
+//! hashing and sleeps inside production writer job closures.
+//!
+//! Shutdown is bounded ([`WriterShutdownOutcome`]): admissions stop, queued
+//! mutations drain, and at the bound in-flight SQL is interrupted (SQLite
+//! interrupt + progress handler) and what is left is rejected with the typed
+//! [`StoreError::WriterUnavailable`]; the owner thread is joined only after
+//! its finite stop signal (a straggler is detached and `Store::shutdown`
+//! reports the typed [`StoreError::WriterShutdownTimeout`]). Drop uses the
+//! same finite path — there is no unbounded join anywhere.
+//!
+//! Online backups (`Store::backup_to`) run on a dedicated maintenance thread
+//! with their own read/snapshot connection (audit item 6): the single writer
+//! owner is never held for a copy, and a store shutdown cancels a running
+//! backup through its bounded maintenance token.
+//!
+//! Per-job receipts ([`WriterJobReceipt`], drained with
+//! [`Store::take_writer_receipts`]) carry the label + queue wait + execution
+//! of each completed command, and the reader pool's permit wait is exposed
+//! separately ([`ReaderTelemetry`], [`Store::take_reader_receipts`]) from any
+//! caller's end-to-end read duration.
 //!
 //! # Stability rule
 //!
@@ -65,8 +87,9 @@
 mod writer;
 
 pub use writer::{
-    WriterTelemetry, DEFAULT_WRITER_ENQUEUE_TIMEOUT, DEFAULT_WRITER_QUEUE_DEPTH,
-    SLOW_QUEUE_WAIT_THRESHOLD, SLOW_TRANSACTION_THRESHOLD,
+    WriterJobReceipt, WriterShutdownOutcome, WriterTelemetry, DEFAULT_WRITER_ENQUEUE_TIMEOUT,
+    DEFAULT_WRITER_QUEUE_DEPTH, DEFAULT_WRITER_SHUTDOWN_TIMEOUT, SLOW_QUEUE_WAIT_THRESHOLD,
+    SLOW_TRANSACTION_THRESHOLD, WRITER_RECEIPT_CAPACITY, WRITER_SHUTDOWN_INTERRUPT_GRACE,
 };
 
 use std::path::{Path, PathBuf};
@@ -124,6 +147,21 @@ pub enum StoreError {
     /// validated writer.
     #[error("durable store writer unavailable: {0}")]
     WriterUnavailable(String),
+    /// Typed bounded-shutdown expiry (audit item 7): the writer owner did not
+    /// stop within the shutdown bound plus the interrupt grace. The in-flight
+    /// statement was interrupted, `rejected` queued mutations were refused
+    /// with [`StoreError::WriterUnavailable`], and the owner thread was
+    /// detached — it exits on its own once the interrupt is observed.
+    #[error(
+        "writer shutdown timed out: {rejected} queued mutations rejected; owner thread detached"
+    )]
+    WriterShutdownTimeout { rejected: usize },
+    /// Typed maintenance failure (audit item 6): the online-backup
+    /// maintenance thread could not be spawned, died without a result, or was
+    /// cancelled because the store is shutting down. Online backups never run
+    /// on the mutation-owner connection.
+    #[error("store maintenance failed: {0}")]
+    Maintenance(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;

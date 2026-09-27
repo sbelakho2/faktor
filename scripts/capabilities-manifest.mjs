@@ -8,18 +8,47 @@
 //
 //   target/certification/capabilities.json
 //
-// The same manifest carries the per-capability CERTIFICATION AXES
-// (`axes.<capability>.{wired, adapter_certified, daemon_e2e_certified,
-// platforms_certified, external_dependency}`), derived from production
-// construction markers and the `tests/production-wiring` suite (whose tests
-// drive the executable's own `build_daemon_core` with fake external seams),
-// plus the Woodpecker lanes that actually run the workspace tests. Prose
-// never moves a field: the README claims block is compared field-by-field
-// against this manifest.
+// The same manifest carries the per-capability CERTIFICATION AXES, split
+// into a STRUCTURAL half and an EVIDENTIARY half:
+//
+//   structural (derived from the tree alone):
+//     wired                   every required production construction marker
+//                             exists (explicit `allOf`; deleting one marker
+//                             makes the capability unwired — `--selftest`
+//                             proves it);
+//     adapter_test_defined    the adapter/contract-mock TEST exists;
+//     daemon_e2e_test_defined the `tests/production-wiring` daemon-core TEST
+//                             exists;
+//     platform_lane_defined   the Woodpecker lanes that run the workspace
+//                             tests, parsed from the trusted workflow.
+//
+//   evidentiary (a merely defined test NEVER sets these):
+//     adapter_certified        the adapter test is defined AND a
+//                              HEAD/tree-bound successful trusted-workflow
+//                              certificate exists;
+//     daemon_e2e_certified     the daemon-e2e test is defined AND the same
+//                              evidence holds;
+//     platforms_certified      the platforms of those HEAD/tree-bound
+//                              successful certificates.
+//
+// Evidence is consumed exactly as the trusted workflow already produces it:
+// `faktor-ci-certification/v2` objects (`ci-certification.json` and the
+// per-platform `ci-certification-{darwin,windows}.json`) that aggregate the
+// verified `faktor-woodpecker-lane/v2` markers at the exact commit AND tree.
+// No local run, no marker alone, and no prose can set a certified field.
+//
+// Prose never moves a field: the README claims block is compared to this
+// manifest (structural fields exactly, certified fields without over-claim),
+// and every path-like token in an IMPLEMENTED evidence cell must resolve
+// unless the cell annotates it `(external)`, `(generated)` or `(legacy)`.
 //
 // Usage:
 //   node scripts/capabilities-manifest.mjs                 generate + drift check
 //   node scripts/capabilities-manifest.mjs --generate-only  skip the docs check
+//   node scripts/capabilities-manifest.mjs --check-claims   only the README/docs claim check
+//   node scripts/capabilities-manifest.mjs --selftest      prove the probe algebra,
+//                                                          the load-bearing wiring
+//                                                          markers and the evidence gate
 //
 // Env:
 //   CAPABILITIES_OUT_DIR  output directory (default target/certification)
@@ -35,6 +64,7 @@ const MANIFEST_PATH = resolve(ROOT, OUT_DIR, 'capabilities.json');
 const DOC_PATH = resolve(ROOT, 'docs/certification.md');
 const GENERATE_ONLY = process.argv.includes('--generate-only');
 const CHECK_CLAIMS = process.argv.includes('--check-claims');
+const SELFTEST = process.argv.includes('--selftest');
 
 const file = (rel) => existsSync(resolve(ROOT, rel));
 
@@ -100,7 +130,18 @@ function headCommit() {
   }
 }
 
+// The documented tree-hash command (`git rev-parse 'HEAD^{tree}'`); the same
+// binding the certification evidence objects and trusted certificates use.
+function headTree() {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: ROOT, encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
+}
+
 const HEAD = headCommit();
+const HEAD_TREE = headTree();
 
 // The Faktor-owned UI migration retired every vendored upstream UI corpus and
 // its pin manifest: ui/ carries only the historical attribution directory and
@@ -391,44 +432,101 @@ const SURFACES = {
 
 // ------------------------------------------- capability certification axes
 //
-// The five axes of every capability are DERIVED, never written:
+// Every axis is DERIVED, never written:
 //
-//   * wired                 — the production construction markers exist (the
-//                             daemon really assembles this capability);
-//   * adapter_certified     — the adapter/contract-mock test exists;
-//   * daemon_e2e_certified  — a `tests/production-wiring` test drives the
-//                             executable's own `build_daemon_core` graph for
-//                             this capability (the suite is the source);
-//   * platforms_certified   — the Woodpecker lanes whose commands really run
-//                             the workspace tests (derived from the workflow
-//                             files, not asserted);
-//   * external_dependency   — `faked` when the certification substitutes an
-//                             external seam (loopback/fake server, fake
-//                             transport) for this capability's tests, `none`
-//                             when the capability runs over durable local
-//                             state only.
+//   STRUCTURAL (tree-only; recomputable on any checkout):
+//     * wired                  — EVERY required production construction
+//                                marker exists (explicit `allOf`; a missing
+//                                marker makes the capability unwired, and
+//                                `--selftest` proves each marker is
+//                                load-bearing);
+//     * adapter_test_defined   — the adapter/contract-mock test fn exists;
+//     * daemon_e2e_test_defined— a `tests/production-wiring` test drives the
+//                                executable's own `build_daemon_core` graph;
+//     * platform_lane_defined  — the Woodpecker lanes whose commands really
+//                                run the workspace tests (parsed from the
+//                                trusted workflow, never asserted).
+//
+//   EVIDENTIARY (HEAD/tree-bound successful evidence ONLY):
+//     * adapter_certified      — adapter_test_defined AND a successful
+//                                trusted-workflow certificate exists for the
+//                                exact HEAD commit AND tree;
+//     * daemon_e2e_certified   — daemon_e2e_test_defined AND the same;
+//     * platforms_certified    — the platforms of those certificates.
+//     * external_dependency    — `faked` when the certification substitutes
+//                                an external seam (loopback/fake server, fake
+//                                transport), `none` when the capability runs
+//                                over durable local state only.
+//
+// A merely DEFINED test never certifies: without the certificate objects the
+// certified fields stay false/empty even when every marker exists.
 //
 // tests/production-wiring is the daemon-e2e source: its tests compile the
 // faktor-cli binary as a library and call `build_production_graph*`, so a
-// certified axis is an executed daemon path, never a hand-built rig.
+// defined axis is an executed daemon path, never a hand-built rig.
 
 const PW_ROOT = 'tests/production-wiring';
 const PW_TESTS = `${PW_ROOT}/tests`;
 
-/** The exact test file(s) whose fn must exist for a daemon-e2e axis. */
-function hasTestFunction(rel, fn) {
-  return hasText(rel, `fn ${fn}(`);
+// ------------------------------------------------------------ probe algebra
+//
+// Every probe is an explicit `{ allOf: [...] }` or `{ anyOf: [...] }` list of
+// `[file, marker]` entries. Required wiring ALWAYS uses `allOf`: every listed
+// marker is load-bearing, so deleting one turns the capability false (proved
+// by `--selftest`). `anyOf` is only for genuinely alternative evidence (and
+// must say so explicitly). A probe with both keys, neither key, or an empty
+// list is a hard error, never a silently-false default.
+
+function probeEntries(probe) {
+  if (probe === null || typeof probe !== 'object' || Array.isArray(probe)) {
+    throw new Error(`probe must be an explicit allOf/anyOf object, got ${JSON.stringify(probe)}`);
+  }
+  const kinds = ['allOf', 'anyOf'].filter((kind) => Array.isArray(probe[kind]));
+  if (kinds.length !== 1) {
+    throw new Error(
+      `probe must declare exactly one of allOf/anyOf: ${JSON.stringify(probe)}`,
+    );
+  }
+  const entries = probe[kinds[0]];
+  if (entries.length === 0) {
+    throw new Error(`probe must not be empty: ${JSON.stringify(probe)}`);
+  }
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string') {
+      throw new Error(`probe entry must be [file, marker]: ${JSON.stringify(entry)}`);
+    }
+  }
+  return { kind: kinds[0], entries };
 }
 
-function anyProbe(probes) {
-  return probes.some(([rel, needle]) =>
-    needle === undefined ? hasText(rel, 'fn ') : hasText(rel, needle),
-  );
+/** `marker === undefined` means "the file contains any test fn". */
+function markerPresent(rel, marker) {
+  return marker === undefined ? hasText(rel, 'fn ') : hasText(rel, marker);
+}
+
+function evaluateProbe(probe, readMarker = markerPresent) {
+  const { kind, entries } = probeEntries(probe);
+  const results = entries.map(([rel, marker]) => readMarker(rel, marker));
+  return kind === 'allOf' ? results.every(Boolean) : results.some(Boolean);
+}
+
+/** A reader that hides the given markers: `allOf` probes built on any hidden
+ *  marker go false, proving the marker is load-bearing (the deletion
+ *  self-test). */
+function maskedMarkerReader(maskedMarkers, baseReader = markerPresent) {
+  const hidden = new Set(maskedMarkers.map(([rel, marker]) => `${rel}\u0000${marker}`));
+  return (rel, marker) => {
+    if (hidden.has(`${rel}\u0000${marker}`)) {
+      return false;
+    }
+    return baseReader(rel, marker);
+  };
 }
 
 /** Platform lanes that run the workspace tests (derived from the trusted
- *  workflow's lane blocks, so an unexecuted platform can never appear). */
-function platformsCertified() {
+ *  workflow's lane blocks, so an unexecuted platform can never appear).
+ *  STRUCTURAL: this says a lane is defined, never that it passed. */
+function platformLaneDefined() {
   const workflow = file('.woodpecker/trusted/trusted.yaml')
     ? readText('.woodpecker/trusted/trusted.yaml')
     : '';
@@ -444,113 +542,176 @@ function platformsCertified() {
   return [...platforms].sort();
 }
 
+// ------------------------------------------------- trusted-workflow evidence
+//
+// The certified axes consume ONLY the trusted workflow's own certificate
+// objects: `faktor-ci-certification/v2` files whose aggregation step has
+// already verified every `faktor-woodpecker-lane/v2` marker (command-set
+// drift, lane set, commit AND tree binding, pipeline status). A missing,
+// failed, foreign-commit or foreign-tree certificate contributes nothing.
+
+const CI_CERTIFICATES = [
+  ['target/certification/ci-certification.json', 'linux'],
+  ['target/certification/ci-certification-darwin.json', 'darwin'],
+  ['target/certification/ci-certification-windows.json', 'windows'],
+];
+
+/** Pure evidence gate: `records` maps certificate file -> parsed object (or
+ *  null). Returns the certified platforms of every record bound to the exact
+ *  head commit AND tree, plus the source files. */
+function certificatePlatforms(records, head, tree) {
+  const platforms = new Set();
+  const sources = [];
+  for (const [rel, platform] of CI_CERTIFICATES) {
+    const record = records.get(rel);
+    if (!record || typeof record !== 'object') {
+      continue;
+    }
+    if (record.schema !== 'faktor-ci-certification/v2') continue;
+    if (record.workflow !== 'trusted') continue;
+    if (record.status !== 'pass') continue;
+    if (head === null || tree === null) continue;
+    if (record.commit !== head || record.tree !== tree) continue;
+    if (record.platform !== undefined && record.platform !== platform) continue;
+    platforms.add(platform);
+    sources.push(rel);
+  }
+  return { platforms: [...platforms].sort(), sources };
+}
+
+function trustedCertificateEvidence() {
+  const records = new Map();
+  for (const [rel] of CI_CERTIFICATES) {
+    records.set(rel, readJson(rel));
+  }
+  return certificatePlatforms(records, HEAD, HEAD_TREE);
+}
+
 const AXIS_SPECS = {
   acquisition_planner: {
-    wired: [
-      ['crates/cli/src/daemon/builder.rs', 'build_daemon_with_acquisition_planner'],
-      ['crates/cli/src/daemon/builder.rs', 'open_commerce_service_with_planner'],
-    ],
-    adapter_certified: [
-      [`${PW_TESTS}/marketplace_auth.rs`, 'fn signed_alibaba_request_is_verified_by_the_contract_mock('],
-    ],
-    daemon_e2e_certified: [
-      [`${PW_TESTS}/commerce.rs`, 'fn daemon_tool_quote_runs_the_production_planner_decisions('],
-      [`${PW_TESTS}/commerce.rs`, 'struct SpyPlanner'],
-    ],
+    wired: {
+      allOf: [
+        ['crates/cli/src/daemon/builder.rs', 'build_daemon_with_acquisition_planner'],
+        ['crates/cli/src/daemon/builder.rs', 'open_commerce_service_with_planner'],
+      ],
+    },
+    adapter_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/marketplace_auth.rs`, 'fn signed_alibaba_request_is_verified_by_the_contract_mock('],
+      ],
+    },
+    daemon_e2e_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/commerce.rs`, 'fn daemon_tool_quote_runs_the_production_planner_decisions('],
+        [`${PW_TESTS}/commerce.rs`, 'struct SpyPlanner'],
+      ],
+    },
   },
   identity_cache: {
-    wired: [
-      ['crates/commerce/src/service.rs', 'fn cache_identity('],
-      ['crates/commerce/src/service.rs', 'fn observation_identity('],
-    ],
-    adapter_certified: [
-      [`${PW_TESTS}/commerce.rs`, 'fn configured_account_scope_reaches_cache_identity('],
-    ],
-    daemon_e2e_certified: [
-      [`${PW_TESTS}/commerce.rs`, 'fn configured_account_scope_reaches_cache_identity('],
-      [`${PW_TESTS}/commerce.rs`, 'fn authenticated_prices_never_enter_the_public_cache('],
-    ],
+    wired: {
+      allOf: [
+        ['crates/commerce/src/service.rs', 'fn cache_identity('],
+        ['crates/commerce/src/service.rs', 'fn observation_identity('],
+      ],
+    },
+    adapter_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/commerce.rs`, 'fn configured_account_scope_reaches_cache_identity('],
+      ],
+    },
+    daemon_e2e_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/commerce.rs`, 'fn configured_account_scope_reaches_cache_identity('],
+        [`${PW_TESTS}/commerce.rs`, 'fn authenticated_prices_never_enter_the_public_cache('],
+      ],
+    },
   },
   vision: {
-    wired: [
-      ['crates/provider/src/lib.rs', 'pub const SUPPORTED_IMAGE_MIMES'],
-      ['crates/provider/src/lib.rs', 'pub struct ContentPart'],
-    ],
-    adapter_certified: [
-      [`${PW_TESTS}/vision.rs`, 'fn adapter_serializes_ordered_media_parts_byte_exact('],
-    ],
-    daemon_e2e_certified: [
-      [`${PW_TESTS}/vision.rs`, 'fn vision_turn_routes_through_the_agent_and_sends_ordered_media('],
-      [`${PW_TESTS}/vision.rs`, 'fn non_vision_model_refuses_before_dispatch('],
-    ],
+    wired: {
+      allOf: [
+        ['crates/provider/src/lib.rs', 'pub const SUPPORTED_IMAGE_MIMES'],
+        ['crates/provider/src/lib.rs', 'pub struct ContentPart'],
+      ],
+    },
+    adapter_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/vision.rs`, 'fn adapter_serializes_ordered_media_parts_byte_exact('],
+      ],
+    },
+    daemon_e2e_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/vision.rs`, 'fn vision_turn_routes_through_the_agent_and_sends_ordered_media('],
+        [`${PW_TESTS}/vision.rs`, 'fn non_vision_model_refuses_before_dispatch('],
+      ],
+    },
   },
   retrieval: {
-    wired: [
-      ['crates/agent/src/runtime.rs', 'fn index_service('],
-      ['crates/cli/src/daemon/builder.rs', 'IndexService::open_with_supervisor('],
-    ],
-    adapter_certified: [
-      [
-        'crates/agent/src/runtime/retrieval_tests.rs',
-        'fn configured_embedder_fuses_semantically_matched_evidence_into_the_request(',
+    wired: {
+      allOf: [
+        // The agent runtime is runtime/mod.rs + submodules; the retrieval
+        // submodule owns index_service (the retired runtime.rs path must
+        // never reappear as a marker).
+        ['crates/agent/src/runtime/retrieval.rs', 'fn index_service('],
+        ['crates/cli/src/daemon/builder.rs', 'IndexService::open_with_supervisor('],
       ],
-    ],
-    daemon_e2e_certified: null, // probed generically: see retrievalDaemonE2e()
+    },
+    adapter_test_defined: {
+      allOf: [
+        [
+          'crates/agent/src/runtime/retrieval_tests.rs',
+          'fn configured_embedder_fuses_semantically_matched_evidence_into_the_request(',
+        ],
+      ],
+    },
+    daemon_e2e_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/retrieval.rs`, 'build_production_graph'],
+        [
+          `${PW_TESTS}/retrieval.rs`,
+          'fn ordinary_turn_retrieves_a_symbol_absent_from_the_conversation(',
+        ],
+        [`${PW_TESTS}/retrieval.rs`, 'fn no_match_never_fabricates_an_evidence_section('],
+      ],
+    },
   },
   scm: {
-    wired: [
-      ['crates/cli/src/daemon/wiring.rs', 'fn wire_completion_scm('],
-      ['crates/scm/src/completion.rs', 'pub struct GitHubCompletionScm'],
-    ],
-    adapter_certified: [
-      [
-        `${PW_TESTS}/completion_scm_adapter_contract.rs`,
-        'fn manual_completion_scm_adapter_contract_and_embedded_host_injection(',
+    wired: {
+      allOf: [
+        ['crates/cli/src/daemon/wiring.rs', 'fn wire_completion_scm('],
+        ['crates/scm/src/completion.rs', 'pub struct GitHubCompletionScm'],
       ],
-    ],
-    daemon_e2e_certified: [
-      [`${PW_TESTS}/completion_scm.rs`, 'fn completion_pr_goes_through_the_production_github_app_adapter('],
-    ],
+    },
+    adapter_test_defined: {
+      allOf: [
+        [
+          `${PW_TESTS}/completion_scm_adapter_contract.rs`,
+          'fn manual_completion_scm_adapter_contract_and_embedded_host_injection(',
+        ],
+      ],
+    },
+    daemon_e2e_test_defined: {
+      allOf: [
+        [`${PW_TESTS}/completion_scm.rs`, 'fn completion_pr_goes_through_the_production_github_app_adapter('],
+      ],
+    },
   },
   jobs: {
-    wired: [
-      ['crates/commerce/src/service.rs', 'pub struct CommerceSourceService'],
-    ],
-    adapter_certified: null,
-    daemon_e2e_certified: [
-      [`${PW_TESTS}/commerce.rs`, 'fn job_status_is_requester_scoped('],
-    ],
+    wired: {
+      allOf: [['crates/commerce/src/service.rs', 'pub struct CommerceSourceService']],
+    },
+    adapter_test_defined: null,
+    daemon_e2e_test_defined: {
+      allOf: [[`${PW_TESTS}/commerce.rs`, 'fn job_status_is_requester_scoped(']],
+    },
   },
 };
 
-/** The daemon-e2e retrieval certification: any `tests/production-wiring`
- *  test file that both reaches the production builder and names a retrieval
- *  test function. A sibling may land it in its own file; when absent the
- *  axis stays false with an explicit reason (never a guessed label). */
-function retrievalDaemonE2e() {
-  if (!dir(PW_TESTS)) {
-    return { ok: false, detail: 'tests/production-wiring/tests is absent' };
+/** The exact files a probe names (for the evidence/file inventory). */
+function probeFiles(probe) {
+  if (probe === null) {
+    return [];
   }
-  for (const name of readdirSync(resolve(ROOT, PW_TESTS)).sort()) {
-    if (!name.endsWith('.rs')) {
-      continue;
-    }
-    const rel = `${PW_TESTS}/${name}`;
-    const src = readText(rel);
-    if (
-      src.includes('build_production_graph') &&
-      /fn [a-z0-9_]*retriev[a-z0-9_]*\(/i.test(src) &&
-      /evidence/i.test(src)
-    ) {
-      return { ok: true, evidence: [rel], detail: `daemon-core retrieval test in ${rel}` };
-    }
-  }
-  return {
-    ok: false,
-    detail:
-      'no tests/production-wiring test drives retrieval through build_production_graph (the ' +
-      'daemon-core retrieval behaviors are certified only at the agent runtime today)',
-  };
+  return probeEntries(probe).entries.map(([rel]) => rel);
 }
 
 /** The external seams a capability's certification substitutes, phrased as a
@@ -571,45 +732,56 @@ function externalDependency(files) {
 }
 
 function buildAxes() {
-  const platforms = platformsCertified();
+  const lanes = platformLaneDefined();
+  const evidence = trustedCertificateEvidence();
   const axes = {};
   for (const [key, spec] of Object.entries(AXIS_SPECS)) {
-    const wired = anyProbe(spec.wired);
-    const adapterCertified = spec.adapter_certified === null ? false : anyProbe(spec.adapter_certified);
-    let daemonE2e = false;
-    let daemonE2eDetail = 'no daemon-e2e probe';
-    let daemonE2eFiles = [];
-    if (spec.daemon_e2e_certified === null) {
-      const probe = retrievalDaemonE2e();
-      daemonE2e = probe.ok;
-      daemonE2eDetail = probe.detail;
-      daemonE2eFiles = probe.evidence || [];
-    } else {
-      daemonE2e = anyProbe(spec.daemon_e2e_certified);
-      daemonE2eFiles = [...new Set(spec.daemon_e2e_certified.map(([rel]) => rel))];
-      daemonE2eDetail = daemonE2e
-        ? `production-wiring tests: ${daemonE2eFiles.join(', ')}`
-        : 'no tests/production-wiring test drives the production builder for this capability';
-    }
+    const wired = evaluateProbe(spec.wired);
+    const adapterTestDefined =
+      spec.adapter_test_defined === null ? false : evaluateProbe(spec.adapter_test_defined);
+    const daemonE2eTestDefined =
+      spec.daemon_e2e_test_defined === null ? false : evaluateProbe(spec.daemon_e2e_test_defined);
+    const hasDefinedTest = adapterTestDefined || daemonE2eTestDefined;
+    // A lane is per-capability coverage only when the capability actually
+    // has a defined test the lane can run.
+    const platformLaneDefined = hasDefinedTest ? lanes : [];
+    const platformsCertified = evidence.platforms.filter((platform) =>
+      platformLaneDefined.includes(platform),
+    );
+    const adapterCertified = adapterTestDefined && platformsCertified.length > 0;
+    const daemonE2eCertified = daemonE2eTestDefined && platformsCertified.length > 0;
     const testFiles = [
       ...new Set([
-        ...(spec.adapter_certified || []).map(([rel]) => rel),
-        ...daemonE2eFiles,
+        ...probeFiles(spec.adapter_test_defined),
+        ...probeFiles(spec.daemon_e2e_test_defined),
       ]),
     ];
     const external = externalDependency(testFiles);
+    const detail =
+      `wired=${wired} adapter_test=${adapterTestDefined} daemon_e2e_test=${daemonE2eTestDefined}; ` +
+      (evidence.sources.length > 0
+        ? `trusted certificates at ${HEAD}: ${evidence.sources.join(', ')}; certified platforms: ${
+            platformsCertified.join(', ') || 'none'
+          }`
+        : 'no HEAD/tree-bound trusted certificate; certified axes stay false');
     axes[key] = {
       wired,
+      adapter_test_defined: adapterTestDefined,
+      daemon_e2e_test_defined: daemonE2eTestDefined,
+      platform_lane_defined: platformLaneDefined,
       adapter_certified: adapterCertified,
-      daemon_e2e_certified: daemonE2e,
-      platforms_certified: daemonE2e || (wired && adapterCertified) ? platforms : [],
+      daemon_e2e_certified: daemonE2eCertified,
+      platforms_certified: platformsCertified,
       external_dependency: external.value,
-      detail: daemonE2eDetail,
+      detail,
       external_dependency_detail: external.detail,
       evidence: [
         ...new Set([
-          ...spec.wired.filter(([rel]) => file(rel)).map(([rel]) => rel),
+          ...probeEntries(spec.wired)
+            .entries.filter(([rel]) => file(rel))
+            .map(([rel]) => rel),
           ...testFiles.filter((rel) => file(rel)),
+          ...evidence.sources.filter((rel) => file(rel)),
         ]),
       ],
     };
@@ -620,14 +792,31 @@ function buildAxes() {
 // ------------------------------------------------- README capability claims
 //
 // README carries ONE machine-checkable claims table between the
-// `<-- capability-axes:start/end -->` markers: the five derived fields per
-// capability, in a fixed order. A hand-written binary/status claim outside
-// this table is rejected: the fields are compared to the manifest above, so
-// prose can never drift from the tree.
+// `<-- capability-axes:start/end -->` markers: the EIGHT derived fields per
+// capability (four structural, three evidentiary, external_dependency) in a
+// fixed order. A hand-written binary/status claim outside this table is
+// rejected.
+//
+// Comparison rule:
+//   * structural fields and external_dependency are compared EXACTLY;
+//   * certified fields may never OVER-claim: a `true` requires the evidence
+//     derivation to be true, and a platform list must be a subset of the
+//     derived platforms. `false`/`none` is always a valid conservative
+//     in-tree claim (target/certification evidence is host state, not a
+//     committed artifact), so the committed README under-claims and the
+//     generated manifest stays authoritative.
 
 const CLAIMS_START = '<!-- capability-axes:start -->';
 const CLAIMS_END = '<!-- capability-axes:end -->';
 const CLAIMS_DOCS = ['README.md', 'docs/certification.md'];
+const STRUCTURAL_CLAIM_FIELDS = [
+  'wired',
+  'adapter_test_defined',
+  'daemon_e2e_test_defined',
+  'platform_lane_defined',
+];
+const EVIDENTIARY_CLAIM_FIELDS = ['adapter_certified', 'daemon_e2e_certified', 'platforms_certified'];
+const CLAIM_FIELDS = [...STRUCTURAL_CLAIM_FIELDS, ...EVIDENTIARY_CLAIM_FIELDS, 'external_dependency'];
 
 function parseClaimsBlock(doc) {
   const lines = readText(doc).split('\n');
@@ -646,19 +835,16 @@ function parseClaimsBlock(doc) {
       continue;
     }
     const cells = match[2].split('|').map((cell) => cell.trim());
-    if (cells.length !== 5) {
+    if (cells.length !== CLAIM_FIELDS.length) {
       throw new Error(
-        `${doc}: capability '${match[1]}' must carry the five derived fields ` +
-          '(wired, adapter_certified, daemon_e2e_certified, platforms_certified, external_dependency)',
+        `${doc}: capability '${match[1]}' must carry the ${CLAIM_FIELDS.length} derived fields ` +
+          `(${CLAIM_FIELDS.join(', ')})`,
       );
     }
-    rows.set(match[1], {
-      wired: cells[0],
-      adapter_certified: cells[1],
-      daemon_e2e_certified: cells[2],
-      platforms_certified: cells[3],
-      external_dependency: cells[4],
-    });
+    rows.set(
+      match[1],
+      Object.fromEntries(CLAIM_FIELDS.map((field, index) => [field, cells[index]])),
+    );
   }
   return { lines, rows, start, end };
 }
@@ -666,7 +852,10 @@ function parseClaimsBlock(doc) {
 /** The only place a binary capability claim may appear is the marked table:
  *  a `wired=true` / `adapter_certified: false` / ... shape in prose is
  *  rejected, so a hand-written claim can never drift from the manifest. */
-const BINARY_CLAIM = /\b(wired|adapter_certified|daemon_e2e_certified|platforms_certified|external_dependency)\b\s*[:=]\s*(true|false)/i;
+const BINARY_CLAIM = new RegExp(
+  `\\b(${CLAIM_FIELDS.join('|')})\\b\\s*[:=]\\s*(true|false)`,
+  'i',
+);
 
 function manualBinaryProseErrors(doc, lines, start, end) {
   const errors = [];
@@ -682,6 +871,39 @@ function manualBinaryProseErrors(doc, lines, start, end) {
     }
   });
   return errors;
+}
+
+/** One claim/derived comparison per field (see the rule above). */
+function claimFieldErrors(doc, key, field, claim, axis) {
+  if (field === 'platforms_certified') {
+    const claimed = claim === '' || claim === 'none' ? [] : claim.split(',').map((p) => p.trim()).filter(Boolean);
+    const derived = axis.platforms_certified;
+    for (const platform of claimed) {
+      if (!derived.includes(platform)) {
+        return [
+          `${doc}: ${key}.${field} claims '${platform}' but the derived evidence certifies ` +
+            `'${derived.join(',') || 'none'}'`,
+        ];
+      }
+    }
+    return [];
+  }
+  const derived =
+    field === 'platform_lane_defined'
+      ? axis.platform_lane_defined.join(',')
+      : field === 'external_dependency'
+        ? axis.external_dependency
+        : String(axis[field]);
+  if (EVIDENTIARY_CLAIM_FIELDS.includes(field)) {
+    // Under-claiming is always allowed; over-claiming is rejected.
+    if (claim === 'true' && derived !== 'true') {
+      return [`${doc}: ${key}.${field} claims 'true' but no HEAD/tree-bound evidence certifies it`];
+    }
+    return [];
+  }
+  return claim === derived
+    ? []
+    : [`${doc}: ${key}.${field} claims '${claim}' but the tree derives '${derived}'`];
 }
 
 function claimsDriftErrors(axes) {
@@ -708,19 +930,8 @@ function claimsDriftErrors(axes) {
         errors.push(`${doc}: capability claims table is missing '${key}'`);
         continue;
       }
-      const expected = {
-        wired: String(axis.wired),
-        adapter_certified: String(axis.adapter_certified),
-        daemon_e2e_certified: String(axis.daemon_e2e_certified),
-        platforms_certified: axis.platforms_certified.join(','),
-        external_dependency: axis.external_dependency,
-      };
-      for (const [field, want] of Object.entries(expected)) {
-        if (row[field] !== want) {
-          errors.push(
-            `${doc}: ${key}.${field} claims '${row[field]}' but the tree derives '${want}'`,
-          );
-        }
+      for (const field of CLAIM_FIELDS) {
+        errors.push(...claimFieldErrors(doc, key, field, row[field], axis));
       }
     }
     for (const key of rows.keys()) {
@@ -752,8 +963,9 @@ function buildManifest() {
     };
   }
   return {
-    schema: 'faktor-capabilities-manifest/v1',
+    schema: 'faktor-capabilities-manifest/v2',
     commit,
+    tree: HEAD_TREE,
     generated_from: 'repository files/scripts (scripts/capabilities-manifest.mjs)',
     surfaces,
     axes: buildAxes(),
@@ -811,6 +1023,28 @@ function selfCheck(manifest) {
       problems.push(
         `ui_parity claims IMPLEMENTED but an executable axis is not: ${axes.join(', ')}`,
       );
+    }
+  }
+  // Axis honesty: a certified field can never be true without the matching
+  // DEFINED test, and the platform lists can never name a platform whose lane
+  // is not defined. A merely defined test must NOT certify.
+  const evidence = trustedCertificateEvidence();
+  for (const [key, axis] of Object.entries(manifest.axes)) {
+    if (axis.adapter_certified && !axis.adapter_test_defined) {
+      problems.push(`${key}: adapter_certified without adapter_test_defined`);
+    }
+    if (axis.daemon_e2e_certified && !axis.daemon_e2e_test_defined) {
+      problems.push(`${key}: daemon_e2e_certified without daemon_e2e_test_defined`);
+    }
+    for (const platform of axis.platforms_certified) {
+      if (!axis.platform_lane_defined.includes(platform)) {
+        problems.push(`${key}: platform ${platform} certified without a defined lane`);
+      }
+    }
+    if (evidence.sources.length === 0) {
+      if (axis.adapter_certified || axis.daemon_e2e_certified || axis.platforms_certified.length > 0) {
+        problems.push(`${key}: certified axes set without any HEAD/tree-bound trusted certificate`);
+      }
     }
   }
   if (problems.length > 0) {
@@ -876,9 +1110,29 @@ function checkDocs(manifest) {
   }
 }
 
-// A doc row that claims IMPLEMENTED must carry at least one real artifact:
-// a backticked path/symbol that exists in the tree. Prose-only claims fail.
+// A doc row that claims IMPLEMENTED must carry real artifacts: EVERY
+// backticked path-like token in the row must resolve in the tree, and at
+// least one of them must be a real (non-annotated) file/dir. Tokens that are
+// legitimately outside the tree — external references, generated-at-runtime
+// artifacts, retained legacy artifacts — must be annotated in the SAME cell
+// with `(external)`, `(generated)` or `(legacy)`; a stale path can therefore
+// never hide behind an adjacent symbol. Schema identifiers such as
+// `faktor-cert-evidence/v1` are versions, not paths, and are ignored.
 const IMPLEMENTED_CLAIM_DOCS = ['docs/certification.md', 'README.md'];
+const EVIDENCE_ANNOTATIONS = ['(external)', '(generated)', '(legacy)'];
+const SCHEMA_ID_TOKEN = /^[a-z][a-z0-9-]*\/v\d+$/i;
+const SOURCE_FILE_TOKEN =
+  /\.(rs|ts|tsx|js|mjs|cjs|kt|kts|sh|bash|json|jsonc|md|yaml|yml|css|html|toml|xml|gradle|lock)$/i;
+
+function isPathLikeToken(token) {
+  if (/\s/.test(token)) {
+    return false;
+  }
+  if (SCHEMA_ID_TOKEN.test(token)) {
+    return false;
+  }
+  return token.includes('/') || SOURCE_FILE_TOKEN.test(token);
+}
 
 function implementedClaimErrors() {
   const errors = [];
@@ -891,18 +1145,43 @@ function implementedClaimErrors() {
       if (!/^\s*\|/.test(line) || !/\bIMPLEMENTED\b/.test(line)) {
         return;
       }
-      const tokens = [...line.matchAll(/`([^`]+)`/g)]
-        .map((match) => match[1].trim())
-        .filter((token) => /[./]/.test(token) && !/\s/.test(token));
-      if (tokens.length === 0) {
+      let considered = 0;
+      let resolved = 0;
+      const unresolved = [];
+      const exemplars = [];
+      for (const cell of line.split('|')) {
+        const annotated = EVIDENCE_ANNOTATIONS.some((annotation) =>
+          cell.toLowerCase().includes(annotation),
+        );
+        for (const match of cell.matchAll(/`([^`]+)`/g)) {
+          const token = match[1].trim();
+          if (!isPathLikeToken(token)) {
+            continue;
+          }
+          considered += 1;
+          exemplars.push(token);
+          if (file(token) || dir(token)) {
+            resolved += 1;
+          } else if (!annotated) {
+            unresolved.push(token);
+          }
+        }
+      }
+      if (considered === 0) {
         errors.push(
           `${doc}:${index + 1} claims IMPLEMENTED without a backticked code/test evidence path`,
         );
         return;
       }
-      if (!tokens.some((token) => file(token) || dir(token))) {
+      if (resolved === 0) {
         errors.push(
-          `${doc}:${index + 1} claims IMPLEMENTED but none of its evidence paths exist: ${tokens.join(', ')}`,
+          `${doc}:${index + 1} claims IMPLEMENTED but none of its evidence paths exist: ${exemplars.join(', ')}`,
+        );
+      }
+      for (const token of unresolved) {
+        errors.push(
+          `${doc}:${index + 1} evidence path '${token}' does not resolve; fix it or annotate its ` +
+            'cell (external)/(generated)/(legacy)',
         );
       }
     });
@@ -910,7 +1189,190 @@ function implementedClaimErrors() {
   return errors;
 }
 
+// ---------------------------------------------------------------- self-test
+//
+// Executable proof that the derivations are load-bearing:
+//   * probe algebra: allOf needs every marker, anyOf needs one, malformed
+//     probes are rejected;
+//   * REQUIRED WIRING uses allOf and every wiring marker is load-bearing on
+//     the real tree — masking any single required marker makes the
+//     capability's wiring false;
+//   * adapter/daemon-e2e probes are explicit allOf/anyOf objects whose
+//     markers are equally load-bearing;
+//   * certified axes come ONLY from HEAD/tree-bound successful trusted
+//     certificates: failed, foreign-commit, foreign-tree, wrong-schema,
+//     untrusted-workflow or platform-mismatched objects certify nothing,
+//     and with no certificate at all every certified axis stays false even
+//     though every test is defined.
+function selftestErrors() {
+  const problems = [];
+  const fail = (message) => problems.push(message);
+
+  // 1. probe algebra.
+  const synthetic = new Map([
+    ['a.rs', 'fn alpha('],
+    ['b.rs', 'fn beta('],
+  ]);
+  const syntheticRead = (rel) => synthetic.get(rel);
+  const all = { allOf: [['a.rs', 'fn alpha('], ['b.rs', 'fn beta(']] };
+  const any = { anyOf: [['a.rs', 'fn alpha('], ['b.rs', 'fn beta(']] };
+  if (!evaluateProbe(all, syntheticRead)) fail('allOf must hold when every marker exists');
+  if (!evaluateProbe(any, syntheticRead)) fail('anyOf must hold when one marker exists');
+  if (evaluateProbe(all, maskedMarkerReader([['a.rs', 'fn alpha(']], syntheticRead))) {
+    fail('allOf must fail when one marker is masked');
+  }
+  if (!evaluateProbe(any, maskedMarkerReader([['a.rs', 'fn alpha(']], syntheticRead))) {
+    fail('anyOf must still hold when one alternative is masked');
+  }
+  if (
+    evaluateProbe(
+      any,
+      maskedMarkerReader([['a.rs', 'fn alpha('], ['b.rs', 'fn beta(']], syntheticRead),
+    )
+  ) {
+    fail('anyOf must fail when every alternative is masked');
+  }
+  for (const malformed of [
+    ['missing both keys', {}],
+    ['empty allOf', { allOf: [] }],
+    ['both keys', { allOf: [['a.rs', null]], anyOf: [['b.rs', null]] }],
+    ['bare list', [['a.rs', null]]],
+    ['short entry', { allOf: [['a.rs']] }],
+  ]) {
+    let threw = false;
+    try {
+      probeEntries(malformed[1]);
+    } catch {
+      threw = true;
+    }
+    if (!threw) fail(`probe ${malformed[0]} must be rejected`);
+  }
+
+  // 2. Real-tree wiring: allOf, holds, and every marker load-bearing.
+  for (const [key, spec] of Object.entries(AXIS_SPECS)) {
+    if (!spec.wired || !Array.isArray(spec.wired.allOf)) {
+      fail(`${key}: required wiring must be an explicit allOf probe`);
+      continue;
+    }
+    if (!evaluateProbe(spec.wired)) {
+      fail(`${key}: wiring probe does not hold on this tree`);
+    }
+    for (const marker of probeEntries(spec.wired).entries) {
+      if (evaluateProbe(spec.wired, maskedMarkerReader([marker]))) {
+        fail(`${key}: deleting required wiring marker ${JSON.stringify(marker)} leaves wired=true`);
+      }
+    }
+    for (const [field, probe] of [
+      ['adapter_test_defined', spec.adapter_test_defined],
+      ['daemon_e2e_test_defined', spec.daemon_e2e_test_defined],
+    ]) {
+      if (probe === null) {
+        continue;
+      }
+      const { kind, entries } = probeEntries(probe); // throws on malformed probes
+      if (!evaluateProbe(probe)) {
+        fail(`${key}: ${field} probe does not hold on this tree`);
+      }
+      if (kind === 'allOf') {
+        for (const marker of entries) {
+          if (evaluateProbe(probe, maskedMarkerReader([marker]))) {
+            fail(`${key}: deleting ${field} marker ${JSON.stringify(marker)} leaves it true`);
+          }
+        }
+      } else if (evaluateProbe(probe, maskedMarkerReader(entries))) {
+        fail(`${key}: masking every ${field} alternative still leaves it true`);
+      }
+    }
+  }
+
+  // 3. The evidence gate: only HEAD/tree-bound successful trusted
+  //    certificates, and a merely defined test never certifies.
+  const head = 'a'.repeat(40);
+  const tree = 'b'.repeat(40);
+  const record = (overrides = {}) => ({
+    schema: 'faktor-ci-certification/v2',
+    workflow: 'trusted',
+    status: 'pass',
+    commit: head,
+    tree,
+    ...overrides,
+  });
+  const verdictFor = (rel, value) => certificatePlatforms(new Map([[rel, value]]), head, tree);
+  if (verdictFor('target/certification/ci-certification.json', record()).platforms.join(',') !== 'linux') {
+    fail('a matching trusted linux certificate must certify linux');
+  }
+  if (
+    verdictFor(
+      'target/certification/ci-certification-darwin.json',
+      record({ platform: 'darwin' }),
+    ).platforms.join(',') !== 'darwin'
+  ) {
+    fail('a matching platform certificate must certify its own platform');
+  }
+  for (const [label, bad] of [
+    ['failed status', record({ status: 'fail' })],
+    ['foreign commit', record({ commit: 'c'.repeat(40) })],
+    ['foreign tree', record({ tree: 'd'.repeat(40) })],
+    ['wrong schema', record({ schema: 'faktor-ci-certification/v1' })],
+    ['untrusted workflow', record({ workflow: 'pr' })],
+    ['missing object', null],
+  ]) {
+    if (verdictFor('target/certification/ci-certification.json', bad).platforms.length > 0) {
+      fail(`a certificate with ${label} must certify nothing`);
+    }
+  }
+  if (
+    verdictFor(
+      'target/certification/ci-certification-darwin.json',
+      record({ platform: 'windows' }),
+    ).platforms.length > 0
+  ) {
+    fail('a platform-mismatched certificate must certify nothing');
+  }
+  if (certificatePlatforms(new Map(), head, tree).platforms.length > 0) {
+    fail('no certificate must certify nothing');
+  }
+
+  // 4. Real manifest consistency: with no certificate on this host, every
+  //    certified field stays false even though the tests are defined, and a
+  //    certified platform always has a defined lane.
+  const manifest = buildManifest();
+  const evidence = trustedCertificateEvidence();
+  for (const [key, axis] of Object.entries(manifest.axes)) {
+    if (evidence.sources.length === 0) {
+      if (
+        axis.adapter_certified ||
+        axis.daemon_e2e_certified ||
+        axis.platforms_certified.length > 0
+      ) {
+        fail(`${key}: defined tests must not certify without HEAD/tree-bound evidence`);
+      }
+    }
+    for (const platform of axis.platforms_certified) {
+      if (!axis.platform_lane_defined.includes(platform)) {
+        fail(`${key}: certified platform ${platform} has no defined lane`);
+      }
+    }
+  }
+  return problems;
+}
+
 // --------------------------------------------------------------------- main
+
+if (SELFTEST) {
+  const problems = selftestErrors();
+  if (problems.length > 0) {
+    for (const problem of problems) {
+      console.error(`capabilities selftest: ${problem}`);
+    }
+    process.exit(1);
+  }
+  console.log(
+    'capabilities selftest: PASS (probe algebra; every required wiring marker is load-bearing; ' +
+      'adapter/daemon-e2e probes explicit; certified axes only from HEAD/tree-bound trusted certificates).',
+  );
+  process.exit(0);
+}
 
 const manifest = buildManifest();
 selfCheck(manifest);
@@ -952,8 +1414,10 @@ console.log(
   `axes: ${Object.entries(manifest.axes)
     .map(
       ([key, axis]) =>
-        `${key}[wired=${axis.wired} adapter=${axis.adapter_certified} ` +
-        `daemon_e2e=${axis.daemon_e2e_certified} platforms=${axis.platforms_certified.join('+') || 'none'} ` +
+        `${key}[wired=${axis.wired} adapter_test=${axis.adapter_test_defined} ` +
+        `daemon_e2e_test=${axis.daemon_e2e_test_defined} lanes=${axis.platform_lane_defined.join('+') || 'none'} ` +
+        `adapter_certified=${axis.adapter_certified} daemon_e2e_certified=${axis.daemon_e2e_certified} ` +
+        `platforms_certified=${axis.platforms_certified.join('+') || 'none'} ` +
         `external=${axis.external_dependency}]`,
     )
     .join(' ')}`,

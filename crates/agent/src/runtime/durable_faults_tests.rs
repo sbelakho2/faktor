@@ -1,13 +1,5 @@
 //! `runtime::durable_faults_tests`: fault-injection test support.
 
-#![allow(unused_imports)]
-
-use super::*;
-
-use crate::runtime::fixtures_tests::*;
-use crate::runtime::tests::*;
-use crate::*;
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};

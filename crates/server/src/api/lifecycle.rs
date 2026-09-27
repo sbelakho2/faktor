@@ -1,7 +1,5 @@
 //! `api::lifecycle`: cohesive slice of the api module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The startup line the daemon prints after binding (frozen stdout

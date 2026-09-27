@@ -1648,81 +1648,172 @@ pub struct ModelPerformanceProfile {
     pub benchmark_version: String,
 }
 
-/// The four reliability dimensions of one quality statement plus its
-/// explicit provenance. This is the authority-carrying sibling of the
-/// non-monetary [`ModelPerformance`] projection: the router qualification
-/// path reads THIS so an undeclared placeholder can never masquerade as a
-/// measured value, while reporting/settlement keep the numeric view.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct QualityStatement {
-    pub tool_reliability: u8,
-    pub reasoning_reliability: u8,
-    pub coding_reliability: u8,
-    pub context_reliability: u8,
+/// ONE reliability dimension of a [`QualityStatement`]: the 0..=100 value
+/// plus the authority THAT value rests on. Authority is tracked PER
+/// dimension (quality-authority audit item 1): a declaration of one
+/// dimension can never launder an undeclared dimension's placeholder into a
+/// declared value, and qualification reads the authority of exactly the
+/// metric the phase judges.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct QualityMetric {
+    /// The 0..=100 reliability value (inspectable even when semantically
+    /// unknown — an unknown 50 is NOT a measured 50).
+    pub value: u8,
+    /// What the value RESTS on — never inferred from the number.
     pub authority: QualityAuthority,
 }
 
-impl QualityStatement {
-    /// A statement from one [`ModelPerformance`] view under an explicit
-    /// authority.
-    pub fn from_performance(p: &ModelPerformance, authority: QualityAuthority) -> Self {
+impl QualityMetric {
+    /// A 0..=100 value under an explicit authority.
+    pub const fn new(value: u8, authority: QualityAuthority) -> Self {
+        Self { value, authority }
+    }
+
+    /// The no-knowledge placeholder: a neutral 50 that is NOT a measured
+    /// 50. It never clears a positive floor on its own.
+    pub const fn conservative_unknown() -> Self {
         Self {
-            tool_reliability: p.coding_reliability,
-            reasoning_reliability: p.coding_reliability,
-            coding_reliability: p.coding_reliability,
-            context_reliability: p.context_reliability,
-            authority,
+            value: 50,
+            authority: QualityAuthority::ConservativeUnknown,
+        }
+    }
+
+    /// True when this dimension carries no knowledge at all.
+    pub const fn is_conservative_unknown(&self) -> bool {
+        self.authority.is_conservative_unknown()
+    }
+
+    /// True when durable verified outcomes measured this dimension.
+    pub const fn is_measured(&self) -> bool {
+        self.authority.is_measured()
+    }
+}
+
+impl Default for QualityMetric {
+    /// The conservative-unknown placeholder (50, no knowledge).
+    fn default() -> Self {
+        Self::conservative_unknown()
+    }
+}
+
+/// The four reliability dimensions of one quality statement, EACH carrying
+/// its own authority. This is the authority-carrying sibling of the
+/// non-monetary [`ModelPerformance`] projection: the router qualification
+/// path reads THIS so an undeclared placeholder can never masquerade as a
+/// measured value, while reporting/settlement keep the numeric view.
+///
+/// Authority is PER DIMENSION: declaring coding authorizes the coding floor
+/// only — a user who declared nothing about context leaves the context
+/// metric `ConservativeUnknown`, so the compaction/summarize context floor
+/// is never authorized by a coding declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct QualityStatement {
+    pub tool: QualityMetric,
+    pub reasoning: QualityMetric,
+    pub coding: QualityMetric,
+    pub context: QualityMetric,
+}
+
+impl Default for QualityStatement {
+    /// The all-placeholder statement: every dimension is the
+    /// ConservativeUnknown 50 (which authorizes nothing above floor 0).
+    /// Also the fail-closed decode of legacy JSON whose shape predates
+    /// per-dimension metrics: missing/unknown fields never authorize.
+    fn default() -> Self {
+        Self {
+            tool: QualityMetric::default(),
+            reasoning: QualityMetric::default(),
+            coding: QualityMetric::default(),
+            context: QualityMetric::default(),
+        }
+    }
+}
+
+impl QualityStatement {
+    /// LOSSY COMPAT CONSTRUCTOR (quality-authority audit item 21): a
+    /// statement from the LEGACY descriptor-only [`ModelPerformance`] view
+    /// under an explicit authority. [`ModelPerformance`] has no
+    /// tool/reasoning dimensions, so BOTH ARE FABRICATED FROM CODING here.
+    ///
+    /// This is deliberately named `from_legacy_performance` so no future
+    /// production path can mistake it for an authority-carrying
+    /// constructor: production code must build each dimension explicitly
+    /// ([`QualityMetric::new`]) or use [`QualityStatement::measured`].
+    /// The only sanctioned caller is the descriptor-only router
+    /// compatibility path (`RouteCandidate::new`) whose numeric behavior
+    /// predates per-dimension authority.
+    pub fn from_legacy_performance(p: &ModelPerformance, authority: QualityAuthority) -> Self {
+        Self {
+            tool: QualityMetric::new(p.coding_reliability, authority.clone()),
+            reasoning: QualityMetric::new(p.coding_reliability, authority.clone()),
+            coding: QualityMetric::new(p.coding_reliability, authority.clone()),
+            context: QualityMetric::new(p.context_reliability, authority),
         }
     }
 
     /// The conservative-unknown placeholder: the numeric values are
     /// INSPECTABLE but semantically unknown — a floor is never cleared by
-    /// them.
+    /// them. Shares the LEGACY lossy shape of
+    /// [`QualityStatement::from_legacy_performance`] (tool/reasoning are
+    /// fabricated from coding); new production code builds each metric
+    /// explicitly.
     pub fn conservative_unknown(p: &ModelPerformance) -> Self {
-        Self::from_performance(p, QualityAuthority::ConservativeUnknown)
+        Self::from_legacy_performance(p, QualityAuthority::ConservativeUnknown)
     }
 
     /// A MEASURED statement from durable verified outcomes: every
     /// reliability dimension carries the conservative verified-success
-    /// confidence (ppm scaled to 0..=100) and the authority payload names
-    /// the exact evidence. Measured supersedes every declared value.
+    /// confidence (ppm scaled to 0..=100) AND its own `Measured` authority
+    /// whose payload names the exact evidence. Measured supersedes every
+    /// declared dimension (per metric: an undeclared placeholder never
+    /// survives a measurement).
     pub fn measured(success_ppm: u32, evidence: VerifiedOutcome) -> Self {
         let value = u8::try_from(success_ppm.min(1_000_000) / 10_000).unwrap_or(100);
+        let metric = QualityMetric::new(value, QualityAuthority::Measured(evidence));
         Self {
-            tool_reliability: value,
-            reasoning_reliability: value,
-            coding_reliability: value,
-            context_reliability: value,
-            authority: QualityAuthority::Measured(evidence),
+            tool: metric.clone(),
+            reasoning: metric.clone(),
+            coding: metric.clone(),
+            context: metric,
         }
     }
 
-    /// The phase quality metric qualification applies: heavy phases
+    /// The quality metric qualification applies for one phase: heavy phases
     /// (Implement/Review/Debug) judge the coding reliability; every other
     /// phase judges context reliability. Mirrors the router's documented
     /// per-phase floor metric exactly.
-    pub fn phase_value(&self, phase: RouterPhase) -> u8 {
+    pub fn phase_metric(&self, phase: RouterPhase) -> &QualityMetric {
         match phase {
-            RouterPhase::Implement | RouterPhase::Review | RouterPhase::Debug => {
-                self.coding_reliability
-            }
-            _ => self.context_reliability,
+            RouterPhase::Implement | RouterPhase::Review | RouterPhase::Debug => &self.coding,
+            _ => &self.context,
         }
     }
 
-    /// Authority-aware floor decision. Floor `0` means "no quality
-    /// requirement" and always clears. A [`QualityAuthority::
-    /// ConservativeUnknown`] statement clears NOTHING above zero: its
-    /// numeric placeholder is not a measured 50, so it can only be
-    /// authorized by a user declaration (or by measured outcomes).
+    /// The numeric value of the phase's metric (the router's legacy
+    /// reporting view; authority decisions go through
+    /// [`QualityStatement::clears_floor`]).
+    pub fn phase_value(&self, phase: RouterPhase) -> u8 {
+        self.phase_metric(phase).value
+    }
+
+    /// Authority-aware floor decision over the RELEVANT metric's OWN
+    /// authority and value. Floor `0` means "no quality requirement" and
+    /// always clears. A [`QualityAuthority::ConservativeUnknown`] phase
+    /// metric clears NOTHING above zero: its numeric placeholder is not a
+    /// measured 50, so it can only be authorized by a user declaration (or
+    /// by measured outcomes).
     pub fn clears_floor(&self, phase: RouterPhase, floor: u8) -> bool {
         if floor == 0 {
             return true;
         }
-        if self.authority.is_conservative_unknown() {
+        let metric = self.phase_metric(phase);
+        if metric.is_conservative_unknown() {
             return false;
         }
-        self.phase_value(phase) >= floor
+        metric.value >= floor
     }
 }
 

@@ -1,7 +1,5 @@
 //! `config::mcp`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

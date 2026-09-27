@@ -1,7 +1,5 @@
 //! `runtime::turn::state`: cohesive slice of the turn module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Default stall-silence budget (see [`StallTracker`]): total silence
@@ -1401,6 +1399,10 @@ pub(crate) async fn independent_completion_review(
     //    RouterUnavailable → local signals stand (warned); every other
     //    failure or an oversized package → fail-closed blocking reason.
     let mut review_model = serde_json::json!({ "attempted": false });
+    // Audit item 3: the live reviewer output (raw text + trust class + the
+    // physical call's durable id) is captured so the final review value can
+    // be stamped with its provenance before it leaves this function.
+    let mut reviewer_output: Option<ModelOutput> = None;
     if evidence.risk.level == faktor_verify::review::RiskLevel::High || semantic_high {
         review_model["attempted"] = serde_json::json!(true);
         review_model["semantic_risk"] =
@@ -1479,6 +1481,7 @@ pub(crate) async fn independent_completion_review(
         }
         review_model["provider"] = serde_json::json!(outcome.provider);
         review_model["model"] = serde_json::json!(outcome.model);
+        reviewer_output = outcome.output().cloned();
     }
     // 5. Write back the merged verdict + structured evidence.
     if let Some(obj) = review.as_object_mut() {
@@ -1508,7 +1511,28 @@ pub(crate) async fn independent_completion_review(
             evidence_obj.insert("structured".into(), structured);
         }
     }
-    Some(review)
+    // Audit item 3: stamp the review value's provenance BEFORE it crosses
+    // out of this function. A live reviewer verdict is admitted through its
+    // verification-opinion output (the same gate the criterion/proof
+    // writers consume); a review with no reviewer output is
+    // deterministic-local and must not claim a reviewer attempt. If neither
+    // admission holds (a claimed reviewer attempt with no admitted output),
+    // the value is returned UNSTAMPED so no consumer can ever admit it as
+    // evidence — its blocking findings still gate the turn.
+    let stamp = match &reviewer_output {
+        Some(output) => ReviewEvidence::from_review_output(output, review.clone()),
+        None => ReviewEvidence::from_deterministic_local(review.clone()),
+    };
+    match stamp {
+        Ok(evidence) => Some(evidence.into_value()),
+        Err(refusal) => {
+            tracing::error!(
+                session = %handle.id(),
+                "completion review evidence refused by the output-trust gate: {refusal}"
+            );
+            Some(review)
+        }
+    }
 }
 
 /// String entries of a review array field (bounded, hostile-safe).

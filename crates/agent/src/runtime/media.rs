@@ -1,7 +1,5 @@
 //! `runtime::media`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 impl AgentRuntime {

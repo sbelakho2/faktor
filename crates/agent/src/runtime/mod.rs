@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 //! The agent runtime: the durable turn loop that drives the session with
 //! commands, streams providers, schedules tools, and keeps context bounded.
 //!
@@ -91,13 +89,13 @@ use crate::tool::{
 };
 use crate::tool_json::ToolCallMode;
 use crate::{
-    RiskBucket, RouteDecision, RouterPhase, SettledCallOutcome, TaskClass, VerifiedCallAttribution,
+    FactSource, ModelOutput, OutputTrust, RiskBucket, RouteDecision, RouterPhase,
+    SettledCallOutcome, TaskClass, TrustRefusal, VerifiedCallAttribution,
 };
 
 mod request;
 pub use request::*;
 mod media;
-pub(crate) use media::*;
 mod retrieval;
 pub use retrieval::*;
 mod routing;
@@ -107,7 +105,6 @@ pub use provider_loop::*;
 mod tool_loop;
 pub use tool_loop::*;
 mod retry;
-pub(crate) use retry::*;
 mod settlement;
 pub(crate) use settlement::*;
 mod compaction;

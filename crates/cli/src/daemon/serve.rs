@@ -1,7 +1,5 @@
 //! `daemon::serve`: cohesive slice of the daemon construction.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Bounded graceful window of the daemon's detached orchestrated drives at
@@ -2152,5 +2150,3 @@ impl faktor_acp::TerminalHandle for DaemonTerminalHandle {
         self.handle.kill().map_err(map_terminal_registry_error)
     }
 }
-
-use faktor_learning::LearningStore as _;

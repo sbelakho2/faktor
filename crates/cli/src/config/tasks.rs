@@ -1,7 +1,5 @@
 //! `config::tasks`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[tasks]` section (P0 mutation isolation; wave-24 policy).

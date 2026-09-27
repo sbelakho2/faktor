@@ -1,7 +1,5 @@
 //! `config::worker_node`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[worker_node]` section: THIS host acting as a remote worker

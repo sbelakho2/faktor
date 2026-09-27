@@ -1,7 +1,5 @@
 //! `runtime::turn::queue`: cohesive slice of the turn module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 impl AgentRuntime {

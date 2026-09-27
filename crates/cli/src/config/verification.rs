@@ -1,9 +1,5 @@
 //! `config::verification`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
-use super::*;
-
 /// The additive `[verification]` section (daemon verification policy).
 /// Strictly additive with `serde(default)`: an absent section (or absent
 /// keys inside it) keep the crate defaults (quick ≤ 60 s, unit ≤ 600 s

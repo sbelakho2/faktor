@@ -418,6 +418,403 @@
           }
         ]
       }
+    },
+    {
+      "name": "AttachmentId",
+      "doc": "One durable typed binary attachment: BLAKE3 digest (64 lowercase hex), mime, optional original filename and decompressed size. Decoders ignore unknown fields (the native additive-response contract); the daemon's own request DTO rejects them.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "digest",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "mime",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "filename",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "size",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "AttachmentUpload",
+      "doc": "Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime.",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mime",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "filename",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "data_base64",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRun",
+      "doc": "One durable task run projection (native task-run list/state reads; additive: decoders ignore unknown fields).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "task_id",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "run_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "mode",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "state",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "goal",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "item_ids",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "model",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRunStarted",
+      "doc": "Response of a native task-run start: the durable run identity and its current state (additive: unknown fields ignored).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "task_id",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "run_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "state",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRunCancelled",
+      "doc": "Response of a native task-run cancel (additive: unknown fields ignored).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "run_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "cancelled",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRunWorkItem",
+      "doc": "One wire work item of a native task-run start (the orchestrator's own JSON vocabulary).",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "kind",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "summary",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "depends_on",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "acceptance_checks",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "ownership",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "required_capabilities",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "TaskRunStartRequest",
+      "doc": "Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here.",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "goal",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "criteria",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "work_items",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "TaskRunWorkItem"
+              }
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "ownership",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "model",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "max_tokens",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "max_cost_micro",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "mutation_mode",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "routing_mode",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "files",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "attachments",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "AttachmentId"
+              }
+            },
+            "nullable": true,
+            "optional": true
+          },
+          {
+            "name": "completion_contract",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": true
+          }
+        ]
+      }
     }
   ],
   "constants": {

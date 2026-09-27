@@ -1,7 +1,5 @@
 //! `config::workers`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[workers]` section: the remote/VPC worker plane.

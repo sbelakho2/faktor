@@ -1,7 +1,5 @@
 //! `runtime::provider_loop`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// One live model chunk (audit round 11 "session.next.* frames"): the
@@ -166,6 +164,13 @@ pub(crate) struct StreamingSummarizer {
     /// (REFUNDED) from "the provider may have billed" (UNCERTAIN). `None` =
     /// unbudgeted (test graphs that never reserve).
     pub(crate) budget_marker: Option<BudgetDispatchMarker>,
+    /// Audit item 3: the ACCEPTED summary as a typed
+    /// [`crate::OutputTrust::ContextCompression`] [`ModelOutput`] (raw text
+    /// + trust class + this call's durable op id), captured at the moment
+    ///   the completion protocol accepts the text. The compaction site reads
+    ///   it to record durable compaction provenance; it is never admitted to
+    ///   a fact/evidence writer (those refuse this class typed).
+    pub(crate) output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>>,
 }
 
 impl StreamingSummarizer {
@@ -297,6 +302,18 @@ impl StreamingSummarizer {
             return None;
         }
         text.truncate(SUMMARY_MAX_CHARS);
+        // Audit item 3: capture the ACCEPTED summary as a typed
+        // context-compression output (raw text + trust + durable call id)
+        // so the compaction site can record its provenance. Nothing was
+        // accepted unless the completion protocol above held, so the slot
+        // is only ever filled by a clean end.
+        if let Ok(mut slot) = self.output_slot.lock() {
+            *slot = Some(ModelOutput::new(
+                text.clone(),
+                OutputTrust::ContextCompression,
+                self.op_id.raw(),
+            ));
+        }
         Some(text)
     }
 }

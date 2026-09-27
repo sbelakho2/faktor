@@ -1,7 +1,5 @@
 //! `attachments`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// One CAS blob hash the store schema references (artifact rows by content

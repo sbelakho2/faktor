@@ -238,17 +238,28 @@ for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
         "describes the Faktor-owned UI as BLOCKED_EXTERNAL although its executable axes exist"
 done
 
-# 6. Capability axes (audit 18): target/certification/capabilities.json is the
-#    machine-readable source of truth for the per-capability certification
-#    axes (wired / adapter_certified / daemon_e2e_certified /
-#    platforms_certified / external_dependency). The README's
-#    capability-axes block is compared field-by-field against the derived
-#    fields; a manual binary claim anywhere else in README/docs is rejected.
-#    The derivation lives in scripts/capabilities-manifest.mjs (node); when
-#    node is unavailable on this host the check is SKIPPED loudly — the
-#    certificate lanes that carry node (and `scripts/certify-local.sh`)
-#    re-derive and enforce the same fields.
+# 6. Capability axes (audits 12/13): target/certification/capabilities.json is
+#    the machine-readable source of truth for the per-capability certification
+#    axes, split into STRUCTURAL fields (wired / adapter_test_defined /
+#    daemon_e2e_test_defined / platform_lane_defined) and EVIDENTIARY fields
+#    (adapter_certified / daemon_e2e_certified / platforms_certified) that a
+#    merely defined test can NEVER set — they require the trusted workflow's
+#    HEAD/tree-bound `faktor-ci-certification/v2` objects. The README's
+#    capability-axes block is compared against the derived fields (structural
+#    exactly, certified without over-claim); a manual binary claim anywhere
+#    else in README/docs is rejected, and every path-like evidence token must
+#    resolve unless annotated (external)/(generated)/(legacy). The derivation
+#    lives in scripts/capabilities-manifest.mjs (node); when node is
+#    unavailable on this host the check is SKIPPED loudly — the certificate
+#    lanes that carry node (and `scripts/certify-local.sh`) re-derive and
+#    enforce the same fields.
 if command -v node >/dev/null 2>&1; then
+    if node scripts/capabilities-manifest.mjs --selftest; then
+        echo "capability axes: probe algebra + load-bearing wiring markers proven"
+    else
+        echo "CONTRADICTION: the capability probe self-test failed (a required marker is not load-bearing)" >&2
+        fail=1
+    fi
     if node scripts/capabilities-manifest.mjs --check-claims; then
         echo "capability axes: README claims match target/certification/capabilities.json"
     else

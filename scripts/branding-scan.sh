@@ -43,7 +43,11 @@
 #
 # Note: the GitHub repository name/description are EXTERNAL metadata and
 # cannot be renamed from inside this repository; in-repo package/manifest
-# metadata is authoritative and is what this scan enforces.
+# metadata is authoritative and is what this scan enforces. The description
+# was set to the Faktor-owned UI positioning (audit 22) and is verified
+# through the GitHub API by `scripts/certify.sh` gate 11
+# (`check_forge_metadata`), which refuses the legacy compatibility claim
+# when certification runs with a token.
 #
 # No external dependencies beyond find/grep. Run from anywhere; the repo
 # root is derived from the script location.
@@ -199,7 +203,8 @@ fi
 
 echo "branding scan: clean ($MODE mode; no legacy wordmark tokens or metadata outside the exemption set)"
 if [ "$MODE" = source ]; then
-  echo "note: the GitHub repository name/description are external metadata and cannot be changed"
-  echo "      from this repository; in-repo package/manifest metadata is authoritative here."
+  echo "note: the GitHub repository name/description are external metadata; the description is"
+  echo "      set to the Faktor-owned UI positioning and verified by certify.sh gate 11 when a"
+  echo "      token is available; in-repo package/manifest metadata is authoritative here."
 fi
 exit 0

@@ -1,7 +1,5 @@
 //! `daemon::wiring`: cohesive slice of the daemon construction.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Transform the strict `[cloud.github_app]` section into the executor's
@@ -569,5 +567,3 @@ pub(crate) fn enabled_section_db_path(
     resolved
         .ok_or_else(|| format!("{section} config: the enabled section resolved no database path"))
 }
-
-use faktor_learning::LearningStore as _;

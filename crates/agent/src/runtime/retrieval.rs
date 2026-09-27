@@ -1,7 +1,5 @@
 //! `runtime::retrieval`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Classify one tool's output for the evidence layer. Producer-side

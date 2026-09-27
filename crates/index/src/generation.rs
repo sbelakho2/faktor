@@ -54,7 +54,8 @@ pub struct GenerationFile {
     pub data: WorkspaceData,
     /// Durable index coverage of this generation (audit 5): what the batch
     /// walker saw/indexed and whether the generation is complete. Absent on
-    /// legacy envelopes -> [`IndexCoverage::complete`].
+    /// pre-coverage envelopes -> [`IndexCoverage::legacy_unknown`] (UNKNOWN
+    /// completeness, never complete).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<IndexCoverage>,
     /// Continuation cursor of the CONTENT batch walk (audit 5). `Some` while
@@ -62,7 +63,8 @@ pub struct GenerationFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<ScanCursor>,
     /// Durable fingerprint coverage (audit 6): shard round state; a capped
-    /// fingerprint is never fully clean. Absent -> complete (legacy).
+    /// fingerprint is never fully clean. Absent -> [`FingerprintCoverage::legacy_unknown`]
+    /// (never fully clean); a rebuild re-establishes the baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint_coverage: Option<FingerprintCoverage>,
     /// In-progress fingerprint "next" map of an unfinished round: entries
@@ -210,14 +212,21 @@ impl GenerationFile {
         }
     }
 
-    /// The generation's durable coverage (legacy envelopes = complete).
+    /// The generation's durable coverage. A pre-coverage envelope without a
+    /// record is LEGACY-UNKNOWN (incomplete): its completeness was never
+    /// established, so it must never be reported complete.
     pub fn coverage(&self) -> IndexCoverage {
-        self.coverage.clone().unwrap_or_default()
+        self.coverage
+            .clone()
+            .unwrap_or_else(IndexCoverage::legacy_unknown)
     }
 
-    /// The generation's fingerprint coverage (legacy envelopes = complete).
+    /// The generation's fingerprint coverage. A pre-coverage envelope
+    /// without a record is LEGACY-UNKNOWN (incomplete, never fully clean).
     pub fn fingerprint_coverage(&self) -> FingerprintCoverage {
-        self.fingerprint_coverage.clone().unwrap_or_default()
+        self.fingerprint_coverage
+            .clone()
+            .unwrap_or_else(FingerprintCoverage::legacy_unknown)
     }
 
     /// Workspace CONTENT identity of this generation: a BLAKE3 digest over
@@ -501,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_and_continuation_roundtrip_and_legacy_defaults_are_complete() {
+    fn coverage_and_continuation_roundtrip_and_legacy_defaults_are_unknown() {
         use crate::coverage::{FingerprintCoverage, IndexCoverage, ScanCursor, ScanFrame};
         let (idx, ws) = sample();
         let mut cov = IndexCoverage::empty();
@@ -550,7 +559,8 @@ mod tests {
         });
         assert_ne!(other.identity(), back.identity());
         assert_ne!(other.fingerprint_identity(), back.fingerprint_identity());
-        // Legacy envelope (no coverage members) decodes as COMPLETE.
+        // Pre-coverage envelope (no coverage members) decodes as
+        // LEGACY-UNKNOWN: never complete, fallback-eligible on misses.
         let legacy = GenerationFile::capture(ws, 2, &idx, vec![]);
         let mut value: serde_json::Value =
             serde_json::from_slice(&legacy.to_bytes().unwrap()).unwrap();
@@ -561,9 +571,16 @@ mod tests {
             .unwrap()
             .remove("fingerprint_coverage");
         let decoded = GenerationFile::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(decoded.coverage().complete);
+        assert!(!decoded.coverage().complete);
+        assert!(decoded.coverage().is_legacy_unknown());
+        assert!(decoded.coverage().needs_fallback_on_miss());
         assert!(decoded.cursor.is_none());
-        assert!(decoded.fingerprint_coverage().complete);
+        assert!(!decoded.fingerprint_coverage().complete);
+        assert!(decoded.fingerprint_coverage().is_legacy_unknown());
+        assert_eq!(
+            decoded.coverage().truncated_reason.as_deref(),
+            Some("legacy_unknown")
+        );
     }
 
     #[test]

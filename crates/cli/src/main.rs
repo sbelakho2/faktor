@@ -1548,8 +1548,9 @@ pub(crate) struct DoctorGenerationStatus {
     pub(crate) workspace: u64,
     pub(crate) generation: u64,
     pub(crate) data: DoctorGenerationData,
-    /// Durable index coverage (audits 5/6): absent on legacy envelopes
-    /// (one-shot full builds, honestly treated as complete elsewhere).
+    /// Durable index coverage (audits 5/6): absent on pre-coverage
+    /// envelopes, which decode as legacy-unknown (INCOMPLETE, never
+    /// complete) and are reported as such below.
     #[serde(default)]
     pub(crate) coverage: Option<faktor_index::IndexCoverage>,
     /// Durable fingerprint shard coverage (audit 6).
@@ -1786,9 +1787,10 @@ pub(crate) fn read_published_embedding_status(
 }
 
 /// One additive doctor line per workspace: the durable index coverage
-/// (audits 5/6). A legacy envelope without a coverage record is NAMED as
-/// such (the old one-shot semantics), never silently reported as covered;
-/// an incomplete generation names its batch reason and counters.
+/// (audits 5/6). A pre-coverage envelope without a coverage record is NAMED
+/// as legacy-unknown INCOMPLETE (its completeness is UNKNOWN and a resumable
+/// rebuild is pending), never silently reported as covered; an incomplete
+/// generation names its batch reason and counters.
 pub(crate) fn format_index_coverage_line(
     raw: u64,
     generation: u64,
@@ -1796,7 +1798,7 @@ pub(crate) fn format_index_coverage_line(
     fingerprint: Option<&faktor_index::FingerprintCoverage>,
 ) -> String {
     let coverage_text = match coverage {
-        None => "coverage=legacy (no record; treated complete)".to_string(),
+        None => "coverage=legacy_unknown (no record; INCOMPLETE, rebuild pending)".to_string(),
         Some(c) if c.complete => format!(
             "coverage=complete files_seen={} files_indexed={} bytes_indexed={}",
             c.files_seen, c.files_indexed, c.bytes_indexed
@@ -1810,7 +1812,7 @@ pub(crate) fn format_index_coverage_line(
         ),
     };
     let fingerprint_text = match fingerprint {
-        None => "fingerprint=legacy".to_string(),
+        None => "fingerprint=legacy_unknown (no record; PARTIAL, not a clean baseline)".to_string(),
         Some(f) if f.complete => "fingerprint=complete".to_string(),
         Some(f) => format!(
             "fingerprint=PARTIAL shard={}/{} round_start={} reason={}",
@@ -1952,15 +1954,20 @@ pub(crate) fn push_shell_class_line(
 /// per-process spawn backend this platform has, what a spawn has PROVEN at
 /// runtime in this process, and the exact isolation every browser launch
 /// selects. Purely informational and never config-gated: no backend on this
-/// platform is a documented platform fact (spawns are refused typed), not a
-/// doctor issue. The wording never presents app-level proxy configuration as
-/// confinement.
+/// platform is a documented platform fact (macOS/Windows are a typed
+/// platform boundary — every DenyAll/BrokerOnly spawn is refused typed
+/// before any child exists), never a doctor issue. The wording names the
+/// platform and never presents app-level proxy configuration as confinement.
 pub(crate) fn doctor_network_isolation_line(lines: &mut Vec<String>) {
     let backend = if faktor_terminal::broker_only_supported() {
-        "deny_all+broker_only_available"
+        "deny_all+broker_only_available".to_string()
     } else {
-        "unavailable (no per-process backend on this platform; DenyAll and BrokerOnly spawns \
-         are refused typed, proxy flags are application configuration only)"
+        format!(
+            "unavailable (typed platform boundary: no per-process network-isolation backend \
+             on {}; DenyAll and BrokerOnly spawns are refused typed, proxy flags are \
+             application configuration only)",
+            std::env::consts::OS
+        )
     };
     let proof = faktor_terminal::platform_network_enforcement();
     lines.push(format!(

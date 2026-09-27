@@ -1,8 +1,7 @@
 //! `runtime::verification_attribution_tests`: out-of-line tests.
 
-#![allow(unused_imports)]
-
 use super::*;
+
 use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
 use crate::*;
@@ -3742,4 +3741,94 @@ async fn verification_job_resolve_loss_is_marked_and_reconstructed_on_reopen() {
         "the resolve was not reconstructed: {rows:?}"
     );
     assert!(marker_files(manager2.store().root()).is_empty());
+}
+
+/// Audit item 3: verification evidence is a TYPED admission. Only a
+/// VerificationOpinion model output can author review evidence; a
+/// context-compression summary or an ephemeral output is refused typed,
+/// and a durable row is only admitted when it carries an evidence-authoring
+/// provenance tag.
+#[test]
+fn review_evidence_admits_only_verification_opinion_and_tagged_durable_rows() {
+    let compaction = ModelOutput::new("summary", OutputTrust::ContextCompression, 41);
+    let ephemeral = ModelOutput::new("title", OutputTrust::Ephemeral, 42);
+    let opinion = ModelOutput::new(
+        "{\"verdict\":\"pass\"}",
+        OutputTrust::VerificationOpinion,
+        43,
+    );
+    let implementation = ModelOutput::new("patch", OutputTrust::Implementation, 44);
+
+    // Negative: compression/ephemeral/implementation can never author
+    // review evidence.
+    for refused in [&compaction, &ephemeral, &implementation] {
+        let err = ReviewEvidence::from_review_output(refused, serde_json::json!({}))
+            .expect_err("only a verification opinion may author review evidence");
+        assert_eq!(err.trust, refused.trust);
+        assert!(err.to_string().contains(refused.trust.provenance_tag()));
+    }
+    // Positive: the opinion is admitted and the provenance is stamped so a
+    // durable round-trip can re-admit it.
+    let admitted =
+        ReviewEvidence::from_review_output(&opinion, serde_json::json!({"verdict":"pass"}))
+            .expect("verification opinion is evidence");
+    assert_eq!(
+        admitted
+            .as_value()
+            .get(ReviewEvidence::OUTPUT_TRUST_KEY)
+            .and_then(|v| v.as_str()),
+        Some("verification_opinion")
+    );
+    assert_eq!(
+        admitted
+            .as_value()
+            .get("output_call_id")
+            .and_then(|v| v.as_u64()),
+        Some(43)
+    );
+    let durable = ReviewEvidence::from_durable(admitted.clone().into_value())
+        .expect("stamped durable row re-admits");
+    assert_eq!(durable.as_value(), admitted.as_value());
+
+    // Durable negatives: untagged rows and compression-tagged rows refuse.
+    assert!(ReviewEvidence::from_durable(serde_json::json!({"verdict":"pass"})).is_err());
+    assert!(ReviewEvidence::from_durable(serde_json::json!({
+        ReviewEvidence::OUTPUT_TRUST_KEY: "context_compression",
+        "verdict": "pass",
+    }))
+    .is_err());
+    assert!(ReviewEvidence::from_durable(serde_json::json!({
+        ReviewEvidence::OUTPUT_TRUST_KEY: "ephemeral",
+    }))
+    .is_err());
+
+    // Deterministic-local evidence is admitted only when it does not claim
+    // a reviewer attempt; a claimed reviewer needs the admitted output.
+    let local = ReviewEvidence::from_deterministic_local(serde_json::json!({
+        "verdict": "pass",
+        "evidence": {"structured": {"review_model": {"attempted": false}}},
+    }))
+    .expect("local evidence without a reviewer attempt is admitted");
+    assert_eq!(
+        local
+            .as_value()
+            .get(ReviewEvidence::OUTPUT_TRUST_KEY)
+            .and_then(|v| v.as_str()),
+        Some(ReviewEvidence::DETERMINISTIC_LOCAL_TAG)
+    );
+    assert!(ReviewEvidence::from_deterministic_local(serde_json::json!({
+        "verdict": "pass",
+        "evidence": {"structured": {"review_model": {"attempted": true}}},
+    }))
+    .is_err());
+    assert!(ReviewEvidence::from_durable(serde_json::json!({
+        ReviewEvidence::OUTPUT_TRUST_KEY: ReviewEvidence::DETERMINISTIC_LOCAL_TAG,
+        "evidence": {"structured": {"review_model": {"attempted": true}}},
+    }))
+    .is_err());
+
+    // The raw-admission helper drops untrusted values (findings-only), so a
+    // compaction summary can never back criterion verdicts.
+    assert!(admit_review_evidence(Some(&serde_json::json!({"verdict":"pass"}))).is_none());
+    assert!(admit_review_evidence(Some(admitted.as_value())).is_some());
 }

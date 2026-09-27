@@ -476,11 +476,12 @@ class FaktorChatPanel(
             val policy = resolveAttachmentPolicy()
             val plan = planAttachments(files, attachments.binaryAttachments(), policy)
             // Upload plan in ENTRY order: binaries first, then image and
-            // document paths. The retry key binds path + size + mtime + mime
-            // (binaries: the exact SHA-256), so a changed file uploads again
-            // (different bytes = different identity) while an unchanged
-            // retry resolves the retained id first and uploads only absent
-            // attachments (audit 29, CAS dedupe foundation).
+            // document paths. The retry key binds kind + mime + SHA-256 of
+            // the exact bytes (the path is metadata only, never identity),
+            // so a file whose bytes changed under the same path/size/mtime
+            // uploads again, while an unchanged retry resolves the retained
+            // id first and uploads only absent attachments (audit 29, CAS
+            // dedupe foundation).
             val sessionId = try {
                 service.projection().sessionId
             } catch (e: Exception) {

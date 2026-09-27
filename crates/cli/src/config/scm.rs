@@ -1,9 +1,5 @@
 //! `config::scm`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
-use super::*;
-
 /// The `[cloud.github_app]` section: the real GitHub App wiring. Disabled by
 /// default; while disabled no adapter/sync/webhook sink is built and the
 /// daemon keeps its pre-existing SCM surface byte-identical.

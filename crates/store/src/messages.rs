@@ -1,7 +1,5 @@
 //! `messages`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 #[derive(Debug, Clone)]

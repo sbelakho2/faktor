@@ -49,7 +49,7 @@ use std::sync::Arc;
 
 use faktor_core::model::{
     BillingOrigin, EffectivePriceState, MicroUsdPerMillionTokens, ModelCapabilities,
-    ModelPerformance, PriceAuthority, PriceQuote, PricingSnapshot, QualityAuthority,
+    ModelPerformance, PriceAuthority, PriceQuote, PricingSnapshot, QualityAuthority, QualityMetric,
     QualityStatement, RoutingMode,
 };
 
@@ -174,84 +174,80 @@ pub enum Provenance {
     Composite,
 }
 
-/// Reliability/availability priors of one catalog row. Field shape and
-/// semantics mirror the reliability fields of the legacy V1
+/// Reliability/availability priors of one catalog row. The four reliability
+/// dimensions each carry their OWN [`QualityMetric`] (value + authority,
+/// quality-authority audit item 1): an undeclared dimension keeps
+/// [`QualityAuthority::ConservativeUnknown`] (or its adapter/built-in
+/// authority) even when a user declares a sibling dimension, so a
+/// coding-only declaration can never authorize the context floor.
+/// `[providers.*.quality]` declarations carry `UserConfigured` on exactly
+/// the declared dimensions; documented built-in priors carry
+/// [`QualityAuthority::BuiltInPrior`]; durable verified outcomes supersede
+/// each metric at qualification. The numeric shape mirrors the legacy V1
 /// [`faktor_core::model::ModelEconomics`] the router consumes
-/// (`coding_quality()`/`context_reliability`); priors live there today, so
-/// this type is a catalog-side view of the same dimensions, not a new
-/// invented prior model.
-///
-/// The `authority` field is the quality-authority audit's provenance: an
-/// undeclared row carries [`QualityAuthority::ConservativeUnknown`] with
-/// the neutral 50 placeholder — inspectable numbers that are NOT a measured
-/// 50 and never clear a quality floor on their own; documented built-in
-/// priors carry [`QualityAuthority::BuiltInPrior`]; `[providers.*.quality]`
-/// declarations carry `UserConfigured`; durable verified outcomes supersede
-/// all of them at qualification.
+/// (`coding_quality()`/`context_reliability`), so router-visible behavior
+/// is unchanged.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(default)]
 pub struct QualityPrior {
-    pub tool_reliability: u8,
-    pub reasoning_reliability: u8,
-    pub coding_reliability: u8,
-    pub context_reliability: u8,
+    pub tool: QualityMetric,
+    pub reasoning: QualityMetric,
+    pub coding: QualityMetric,
+    pub context: QualityMetric,
     pub availability: u8,
     /// Estimated one-call latency (ms); the conservative default is the
     /// legacy 1000 ms, built-in performance priors carry their documented
     /// Faktor estimate.
     pub estimated_latency_ms: u64,
-    /// Why the numeric values are what they are (never inferred from the
-    /// numbers themselves).
-    pub authority: QualityAuthority,
 }
 
 impl QualityPrior {
     /// The conservative generic prior: exactly the reliability/availability
     /// numbers the routing graph produced before catalogs existed
     /// (`ModelEconomics::default()` — neutral 50 reliability on every
-    /// dimension, 100 availability, 1000 ms), carrying the explicit
-    /// [`QualityAuthority::ConservativeUnknown`] provenance. Exposed as a
-    /// named constant so the default is inspectable and never re-invented
-    /// per call site.
+    /// dimension, 100 availability, 1000 ms), with EVERY dimension carrying
+    /// the explicit [`QualityAuthority::ConservativeUnknown`] provenance.
+    /// Exposed as a named constant so the default is inspectable and never
+    /// re-invented per call site.
     pub const fn conservative_generic() -> Self {
         Self {
-            tool_reliability: 50,
-            reasoning_reliability: 50,
-            coding_reliability: 50,
-            context_reliability: 50,
+            tool: QualityMetric::conservative_unknown(),
+            reasoning: QualityMetric::conservative_unknown(),
+            coding: QualityMetric::conservative_unknown(),
+            context: QualityMetric::conservative_unknown(),
             availability: 100,
             estimated_latency_ms: 1000,
-            authority: QualityAuthority::ConservativeUnknown,
         }
     }
 
     /// The non-monetary performance projection of this prior.
     pub fn performance(&self) -> ModelPerformance {
         ModelPerformance {
-            context_reliability: self.context_reliability,
-            coding_reliability: self.coding_reliability,
+            context_reliability: self.context.value,
+            coding_reliability: self.coding.value,
             estimated_latency_ms: self.estimated_latency_ms,
             rate_limit_state: faktor_core::model::RateLimitState::Healthy,
         }
     }
 
-    /// The authority-carrying statement of this prior (coding/context/tool/
-    /// reasoning reliability + provenance): what router qualification
-    /// consumes so an unknown placeholder is never read as measured.
+    /// The authority-carrying statement of this prior (tool/reasoning/
+    /// coding/context reliability, each with its OWN authority): what
+    /// router qualification consumes so an unknown placeholder is never
+    /// read as measured and a mixed declaration is judged per dimension.
     pub fn statement(&self) -> QualityStatement {
         QualityStatement {
-            tool_reliability: self.tool_reliability,
-            reasoning_reliability: self.reasoning_reliability,
-            coding_reliability: self.coding_reliability,
-            context_reliability: self.context_reliability,
-            authority: self.authority.clone(),
+            tool: self.tool.clone(),
+            reasoning: self.reasoning.clone(),
+            coding: self.coding.clone(),
+            context: self.context.clone(),
         }
     }
 
     /// A documented built-in prior (Faktor's own routing estimate) with the
-    /// explicit [`QualityAuthority::BuiltInPrior`] provenance.
+    /// explicit [`QualityAuthority::BuiltInPrior`] provenance on every
+    /// dimension.
     pub fn built_in(
         tool_reliability: u8,
         reasoning_reliability: u8,
@@ -260,13 +256,12 @@ impl QualityPrior {
         estimated_latency_ms: u64,
     ) -> Self {
         Self {
-            tool_reliability,
-            reasoning_reliability,
-            coding_reliability,
-            context_reliability,
+            tool: QualityMetric::new(tool_reliability, QualityAuthority::BuiltInPrior),
+            reasoning: QualityMetric::new(reasoning_reliability, QualityAuthority::BuiltInPrior),
+            coding: QualityMetric::new(coding_reliability, QualityAuthority::BuiltInPrior),
+            context: QualityMetric::new(context_reliability, QualityAuthority::BuiltInPrior),
             availability: 100,
             estimated_latency_ms,
-            authority: QualityAuthority::BuiltInPrior,
         }
     }
 }
@@ -736,21 +731,24 @@ impl Provider for PricingOverrideProvider {
 
 /// User-configured quality declaration for ONE provider instance (the
 /// `[providers.<id>.quality]` config surface, quality-authority audit
-/// item 1). The declaration rewrites the row's reliability dimensions and
-/// stamps the explicit provenance
-/// [`QualityAuthority::UserConfigured`] — it is what AUTHORIZES a row whose
-/// quality would otherwise be [`QualityAuthority::ConservativeUnknown`]
-/// (e.g. a local endpoint with no built-in prior) to clear quality floors
-/// without any magic number.
+/// item 1). The declaration rewrites ONLY the explicitly declared
+/// dimensions — each declared dimension gets its declared 0..=100 value
+/// AND its own `UserConfigured` authority; undeclared dimensions keep
+/// their previous value and authority (a ConservativeUnknown placeholder
+/// STAYS ConservativeUnknown: it is NEVER laundered into a user-declared
+/// value). This is what AUTHORIZES a row whose quality would otherwise be
+/// [`QualityAuthority::ConservativeUnknown`] (e.g. a local endpoint with
+/// no built-in prior) to clear quality floors without any magic number,
+/// dimension by dimension.
 ///
 /// Semantics:
 ///
 /// - declared dimensions take the declared 0..=100 values (callers
-///   validate before constructing);
-/// - undeclared dimensions keep the adapter/built-in values but the
-///   statement authority is `UserConfigured` — the user owns the
-///   declaration;
-/// - durable VERIFIED routing outcomes supersede the declaration at
+///   validate before constructing) with `UserConfigured` authority;
+/// - undeclared dimensions keep their adapter/built-in values and their
+///   own authority (ConservativeUnknown placeholders stay unknown, so a
+///   coding-only declaration cannot authorize the context floor);
+/// - durable VERIFIED routing outcomes supersede each metric at
 ///   qualification/scoring time: measured evidence always wins;
 /// - an empty declaration is a no-op (the sentinel for "not configured").
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -775,30 +773,32 @@ impl QualityOverrides {
         format!("providers.{instance_id}.quality")
     }
 
-    /// Apply this declaration to one adapter-produced entry. Only the
-    /// declared dimensions are rewritten; the authority becomes
-    /// `UserConfigured{source, version}` with `source` naming the exact
-    /// configured instance.
+    /// Apply this declaration to one adapter-produced entry. ONLY the
+    /// declared dimensions are rewritten (value + `UserConfigured`
+    /// authority, `source` naming the exact configured instance); every
+    /// undeclared dimension keeps its existing value AND authority — the
+    /// ConservativeUnknown placeholder is never laundered into a declared
+    /// value, and an adapter/built-in prior keeps its own authority.
     pub fn apply(&self, mut entry: ModelCatalogEntry) -> ModelCatalogEntry {
         if self.is_empty() {
             return entry;
         }
-        if let Some(v) = self.coding_reliability {
-            entry.quality_prior.coding_reliability = v;
-        }
-        if let Some(v) = self.context_reliability {
-            entry.quality_prior.context_reliability = v;
-        }
-        if let Some(v) = self.tool_reliability {
-            entry.quality_prior.tool_reliability = v;
-        }
-        if let Some(v) = self.reasoning_reliability {
-            entry.quality_prior.reasoning_reliability = v;
-        }
-        entry.quality_prior.authority = QualityAuthority::UserConfigured {
+        let authority = QualityAuthority::UserConfigured {
             source: Self::source_for(&entry.provider),
             version: USER_QUALITY_SOURCE_ID.to_string(),
         };
+        if let Some(v) = self.coding_reliability {
+            entry.quality_prior.coding = QualityMetric::new(v, authority.clone());
+        }
+        if let Some(v) = self.context_reliability {
+            entry.quality_prior.context = QualityMetric::new(v, authority.clone());
+        }
+        if let Some(v) = self.tool_reliability {
+            entry.quality_prior.tool = QualityMetric::new(v, authority.clone());
+        }
+        if let Some(v) = self.reasoning_reliability {
+            entry.quality_prior.reasoning = QualityMetric::new(v, authority);
+        }
         entry
     }
 }
@@ -1006,25 +1006,36 @@ impl Provider for BillingOriginProvider {
         if !adapter_declared {
             if let Some(profile) = builtin::performance_prior(self.origin, model) {
                 entry.quality_prior = QualityPrior {
-                    tool_reliability: profile.prior.coding_reliability,
-                    reasoning_reliability: profile.prior.coding_reliability,
-                    coding_reliability: profile.prior.coding_reliability,
-                    context_reliability: profile.prior.context_reliability,
+                    tool: QualityMetric::new(
+                        profile.prior.coding_reliability,
+                        QualityAuthority::BuiltInPrior,
+                    ),
+                    reasoning: QualityMetric::new(
+                        profile.prior.coding_reliability,
+                        QualityAuthority::BuiltInPrior,
+                    ),
+                    coding: QualityMetric::new(
+                        profile.prior.coding_reliability,
+                        QualityAuthority::BuiltInPrior,
+                    ),
+                    context: QualityMetric::new(
+                        profile.prior.context_reliability,
+                        QualityAuthority::BuiltInPrior,
+                    ),
                     availability: entry.quality_prior.availability,
                     estimated_latency_ms: profile.prior.estimated_latency_ms,
-                    // A documented built-in prior is a PRIOR with explicit
-                    // provenance — never a silent "measured" statement and
-                    // never an unknown placeholder.
-                    authority: QualityAuthority::BuiltInPrior,
                 };
             }
         } else if entry.quality_prior != QualityPrior::default() {
             // An adapter that declared real (non-default) prior values IS
-            // declaring knowledge: mark it as a built-in prior, never as a
-            // measured statement. The default placeholder stays
-            // ConservativeUnknown so undeclared rows are never authorized
-            // by a magic number.
-            entry.quality_prior.authority = QualityAuthority::BuiltInPrior;
+            // declaring knowledge: mark every dimension as a built-in
+            // prior, never as a measured statement. The default placeholder
+            // stays ConservativeUnknown so undeclared rows are never
+            // authorized by a magic number.
+            entry.quality_prior.tool.authority = QualityAuthority::BuiltInPrior;
+            entry.quality_prior.reasoning.authority = QualityAuthority::BuiltInPrior;
+            entry.quality_prior.coding.authority = QualityAuthority::BuiltInPrior;
+            entry.quality_prior.context.authority = QualityAuthority::BuiltInPrior;
         }
         self.overrides.apply(entry)
     }
@@ -1121,15 +1132,19 @@ mod tests {
         // exposes that SAME prior as a named inspectable default — router
         // quality behavior of an unpriced candidate is unchanged.
         let p = QualityPrior::default();
-        assert_eq!(p.tool_reliability, 50);
-        assert_eq!(p.reasoning_reliability, 50);
-        assert_eq!(p.coding_reliability, 50);
-        assert_eq!(p.context_reliability, 50);
+        assert_eq!(p.tool.value, 50);
+        assert_eq!(p.reasoning.value, 50);
+        assert_eq!(p.coding.value, 50);
+        assert_eq!(p.context.value, 50);
+        assert!(p.tool.authority.is_conservative_unknown());
+        assert!(p.reasoning.authority.is_conservative_unknown());
+        assert!(p.coding.authority.is_conservative_unknown());
+        assert!(p.context.authority.is_conservative_unknown());
         assert_eq!(p.availability, 100);
         assert_eq!(p, QualityPrior::conservative_generic());
         let e = ModelEconomics::default();
-        assert_eq!(p.coding_reliability, e.coding_reliability);
-        assert_eq!(p.context_reliability, e.context_reliability);
+        assert_eq!(p.coding.value, e.coding_reliability);
+        assert_eq!(p.context.value, e.context_reliability);
         assert_eq!(p.availability, e.availability);
     }
 
@@ -1779,8 +1794,12 @@ mod tests {
         assert_eq!(q.output, MicroUsdPerMillionTokens(10_000_000));
         assert_eq!(e.pricing_snapshot().source_id, BUILTIN_SOURCE_ID);
         assert_eq!(
-            e.quality_prior.coding_reliability, 90,
+            e.quality_prior.coding.value, 90,
             "official rows carry the documented Faktor routing prior"
+        );
+        assert_eq!(
+            e.quality_prior.coding.authority,
+            QualityAuthority::BuiltInPrior
         );
         for endpoint in [&custom, &gateway] {
             let e = endpoint.catalog_entry("gpt-4o");
@@ -2076,10 +2095,12 @@ mod quality_authority_tests {
 
     #[test]
     fn quality_overrides_are_instance_scoped_with_explicit_provenance() {
-        // The declaration rewrites only its OWN configured instance and
-        // stamps `UserConfigured{source, version}`; the same adapter under
-        // another (or no) instance keeps its ConservativeUnknown
-        // placeholder. Undeclared dimensions keep the adapter value.
+        // The declaration rewrites only its OWN configured instance AND
+        // only its declared dimensions: each declared metric gets
+        // `UserConfigured{source, version}`; the undeclared tool metric
+        // keeps the ConservativeUnknown placeholder (its numeric 50 is not
+        // authorized). The same adapter under another (or no) instance
+        // keeps its full placeholder.
         let declared = QualityOverrideProvider::wrap(
             plain("ollama"),
             "local-a",
@@ -2092,22 +2113,32 @@ mod quality_authority_tests {
         );
         let e = declared.catalog_entry("m");
         assert_eq!(e.provider, "local-a");
-        assert_eq!(e.quality_prior.coding_reliability, 72);
-        assert_eq!(e.quality_prior.context_reliability, 80);
-        assert_eq!(e.quality_prior.reasoning_reliability, 55);
+        assert_eq!(e.quality_prior.coding.value, 72);
+        assert_eq!(e.quality_prior.context.value, 80);
+        assert_eq!(e.quality_prior.reasoning.value, 55);
         assert_eq!(
-            e.quality_prior.tool_reliability, 50,
+            e.quality_prior.tool.value, 50,
             "an undeclared dimension keeps the adapter value"
         );
-        match &e.quality_prior.authority {
-            QualityAuthority::UserConfigured { source, version } => {
-                assert_eq!(source, "providers.local-a.quality");
-                assert_eq!(version, USER_QUALITY_SOURCE_ID);
+        for (name, metric) in [
+            ("coding", &e.quality_prior.coding),
+            ("context", &e.quality_prior.context),
+            ("reasoning", &e.quality_prior.reasoning),
+        ] {
+            match &metric.authority {
+                QualityAuthority::UserConfigured { source, version } => {
+                    assert_eq!(source, "providers.local-a.quality", "{name}");
+                    assert_eq!(version, USER_QUALITY_SOURCE_ID, "{name}");
+                }
+                other => panic!("expected UserConfigured on {name}, got {other:?}"),
             }
-            other => panic!("expected UserConfigured, got {other:?}"),
+            // The wrapped value is a declaration, never a measurement.
+            assert!(!metric.authority.is_measured(), "{name}");
         }
-        // The wrapped value is a declaration, never a measurement.
-        assert!(!e.quality_prior.authority.is_measured());
+        assert!(
+            e.quality_prior.tool.authority.is_conservative_unknown(),
+            "the undeclared tool metric stays ConservativeUnknown"
+        );
         // Another instance of the SAME adapter without a declaration is
         // untouched: the override never leaks across instances.
         let other =
@@ -2115,10 +2146,186 @@ mod quality_authority_tests {
         let o = other.catalog_entry("m");
         assert_eq!(o.provider, "local-b");
         assert_eq!(o.quality_prior, QualityPrior::conservative_generic());
-        assert!(o.quality_prior.authority.is_conservative_unknown());
+        assert!(o.quality_prior.coding.authority.is_conservative_unknown());
+        assert!(o.quality_prior.context.authority.is_conservative_unknown());
         // And the raw adapter keeps the placeholder too.
         let raw = plain("ollama").catalog_entry("m");
-        assert!(raw.quality_prior.authority.is_conservative_unknown());
+        assert!(raw.quality_prior.coding.authority.is_conservative_unknown());
+        assert!(raw
+            .quality_prior
+            .context
+            .authority
+            .is_conservative_unknown());
+    }
+
+    /// One placeholder entry with nothing declared: every metric unknown.
+    fn placeholder_entry() -> ModelCatalogEntry {
+        entry("ollama", "m")
+    }
+
+    #[test]
+    fn coding_only_declaration_leaves_other_metrics_unknown_and_cannot_authorize_compaction() {
+        // Item 1 adversarial: declaring ONLY coding authorizes the hard
+        // Implement floor but can never authorize Compact's context floor.
+        // The context/tool/reasoning metrics stay ConservativeUnknown —
+        // their numeric 50 is NOT a declared value.
+        let applied = QualityOverrides {
+            coding_reliability: Some(72),
+            ..QualityOverrides::default()
+        }
+        .apply(placeholder_entry());
+        assert_eq!(applied.quality_prior.coding.value, 72);
+        for (name, metric) in [
+            ("tool", &applied.quality_prior.tool),
+            ("reasoning", &applied.quality_prior.reasoning),
+            ("context", &applied.quality_prior.context),
+        ] {
+            assert!(
+                metric.authority.is_conservative_unknown(),
+                "{name} stays ConservativeUnknown after a coding-only declaration"
+            );
+        }
+        let st = applied.quality_statement();
+        assert!(
+            st.clears_floor(RouterPhase::Implement, 60),
+            "the coding declaration authorizes the implement floor"
+        );
+        assert!(
+            !st.clears_floor(RouterPhase::Compact, 50),
+            "the context floor is NOT authorized by a coding declaration"
+        );
+        assert!(
+            !st.clears_floor(RouterPhase::Summarize, 50),
+            "the summarize context floor is NOT authorized either"
+        );
+        assert!(st.clears_floor(RouterPhase::Compact, 0), "floor 0 clears");
+        assert_eq!(
+            st.phase_value(RouterPhase::Compact),
+            50,
+            "the placeholder number is inspectable but unauthorized"
+        );
+    }
+
+    #[test]
+    fn context_only_declaration_cannot_authorize_the_implement_coding_floor() {
+        // Item 1 adversarial: the mirror case — a context-only declaration
+        // authorizes Compact but leaves coding ConservativeUnknown, so the
+        // hard Implement floor still refuses the row.
+        let applied = QualityOverrides {
+            context_reliability: Some(80),
+            ..QualityOverrides::default()
+        }
+        .apply(placeholder_entry());
+        assert_eq!(applied.quality_prior.context.value, 80);
+        assert!(applied
+            .quality_prior
+            .coding
+            .authority
+            .is_conservative_unknown());
+        let st = applied.quality_statement();
+        assert!(st.clears_floor(RouterPhase::Compact, 80));
+        assert!(!st.clears_floor(RouterPhase::Implement, 60));
+        assert!(!st.clears_floor(RouterPhase::Review, 60));
+        assert!(!st.clears_floor(RouterPhase::Debug, 60));
+    }
+
+    #[test]
+    fn mixed_declaration_is_authorized_per_metric_not_per_statement() {
+        // Item 1 adversarial: a mixed declaration (coding declared low,
+        // context declared high) is judged by the phase's OWN metric and
+        // authority, never by one global statement authority.
+        let applied = QualityOverrides {
+            coding_reliability: Some(40),
+            context_reliability: Some(90),
+            ..QualityOverrides::default()
+        }
+        .apply(placeholder_entry());
+        let st = applied.quality_statement();
+        assert!(st.clears_floor(RouterPhase::Implement, 40));
+        assert!(
+            !st.clears_floor(RouterPhase::Implement, 41),
+            "the implement floor reads the CODING metric"
+        );
+        assert!(st.clears_floor(RouterPhase::Compact, 90));
+        assert!(
+            !st.clears_floor(RouterPhase::Compact, 91),
+            "the compact floor reads the CONTEXT metric"
+        );
+        // The undeclared tool/reasoning metrics never acquire authority.
+        assert!(
+            st.tool.authority.is_conservative_unknown()
+                && st.reasoning.authority.is_conservative_unknown()
+        );
+    }
+
+    #[test]
+    fn all_four_declared_metrics_work_and_rank_at_user_configured() {
+        // Item 1: the all-four declaration still works — every metric
+        // carries UserConfigured authority at its declared value.
+        let applied = QualityOverrides {
+            tool_reliability: Some(61),
+            reasoning_reliability: Some(62),
+            coding_reliability: Some(63),
+            context_reliability: Some(64),
+        }
+        .apply(placeholder_entry());
+        let st = applied.quality_statement();
+        assert_eq!(
+            (
+                st.tool.value,
+                st.reasoning.value,
+                st.coding.value,
+                st.context.value
+            ),
+            (61, 62, 63, 64)
+        );
+        for (name, metric) in [
+            ("tool", &st.tool),
+            ("reasoning", &st.reasoning),
+            ("coding", &st.coding),
+            ("context", &st.context),
+        ] {
+            assert_eq!(
+                metric.authority.rank(),
+                2,
+                "{name} is UserConfigured, rank 2"
+            );
+            assert!(!metric.authority.is_measured(), "{name} is not measured");
+        }
+        assert!(st.clears_floor(RouterPhase::Implement, 63));
+        assert!(st.clears_floor(RouterPhase::Compact, 64));
+        assert!(!st.clears_floor(RouterPhase::Implement, 64));
+    }
+
+    #[test]
+    fn declaration_never_launders_a_builtin_prior_dimension() {
+        // Item 1: a coding-only declaration on a row with a documented
+        // built-in prior leaves the undeclared context metric at its
+        // BuiltInPrior value+authority (not downgraded, not laundered).
+        let mut e = entry("openai", "m");
+        e.quality_prior = QualityPrior::built_in(70, 70, 70, 88, 500);
+        let applied = QualityOverrides {
+            coding_reliability: Some(99),
+            ..QualityOverrides::default()
+        }
+        .apply(e);
+        assert_eq!(applied.quality_prior.coding.value, 99);
+        assert_eq!(
+            applied.quality_prior.coding.authority,
+            QualityAuthority::UserConfigured {
+                source: "providers.openai.quality".into(),
+                version: USER_QUALITY_SOURCE_ID.into(),
+            }
+        );
+        assert_eq!(applied.quality_prior.context.value, 88);
+        assert_eq!(
+            applied.quality_prior.context.authority,
+            QualityAuthority::BuiltInPrior,
+            "the undeclared context dimension keeps its built-in prior"
+        );
+        assert!(applied
+            .quality_statement()
+            .clears_floor(RouterPhase::Compact, 88));
     }
 
     #[test]
@@ -2132,12 +2339,20 @@ mod quality_authority_tests {
         assert!(!unknown.clears_floor(RouterPhase::Compact, 50));
         assert!(unknown.clears_floor(RouterPhase::Implement, 0));
         let declared = QualityPrior {
-            coding_reliability: 50,
-            context_reliability: 50,
-            authority: QualityAuthority::UserConfigured {
-                source: "providers.x.quality".into(),
-                version: USER_QUALITY_SOURCE_ID.into(),
-            },
+            coding: QualityMetric::new(
+                50,
+                QualityAuthority::UserConfigured {
+                    source: "providers.x.quality".into(),
+                    version: USER_QUALITY_SOURCE_ID.into(),
+                },
+            ),
+            context: QualityMetric::new(
+                50,
+                QualityAuthority::UserConfigured {
+                    source: "providers.x.quality".into(),
+                    version: USER_QUALITY_SOURCE_ID.into(),
+                },
+            ),
             ..QualityPrior::default()
         }
         .statement();
@@ -2148,12 +2363,12 @@ mod quality_authority_tests {
         let built_in = QualityPrior::built_in(50, 50, 50, 50, 1000).statement();
         assert!(built_in.clears_floor(RouterPhase::Compact, 50));
         assert_eq!(
-            built_in.authority.rank(),
+            built_in.coding.authority.rank(),
             QualityAuthority::BuiltInPrior.rank()
         );
         // Authority ranking is explicit and monotone.
-        assert!(QualityAuthority::ConservativeUnknown.rank() < built_in.authority.rank());
-        assert!(built_in.authority.rank() < declared.authority.rank());
+        assert!(QualityAuthority::ConservativeUnknown.rank() < built_in.coding.authority.rank());
+        assert!(built_in.coding.authority.rank() < declared.coding.authority.rank());
     }
 
     #[test]
@@ -2167,17 +2382,22 @@ mod quality_authority_tests {
             observed_at_ms: 7,
         };
         let st = QualityStatement::measured(850_000, evidence.clone());
-        assert_eq!(st.coding_reliability, 85);
-        assert_eq!(st.context_reliability, 85);
-        assert_eq!(st.tool_reliability, 85);
-        assert_eq!(st.reasoning_reliability, 85);
-        assert!(st.authority.is_measured());
-        match st.authority {
+        assert_eq!(st.coding.value, 85);
+        assert_eq!(st.context.value, 85);
+        assert_eq!(st.tool.value, 85);
+        assert_eq!(st.reasoning.value, 85);
+        assert!(st.coding.authority.is_measured());
+        assert!(st.context.authority.is_measured());
+        assert!(st.tool.authority.is_measured());
+        assert!(st.reasoning.authority.is_measured());
+        match st.coding.authority {
             QualityAuthority::Measured(ref found) => assert_eq!(found, &evidence),
             other => panic!("expected Measured, got {other:?}"),
         }
         assert!(st.clears_floor(RouterPhase::Implement, 85));
         assert!(!st.clears_floor(RouterPhase::Implement, 86));
+        assert!(st.clears_floor(RouterPhase::Compact, 85));
+        assert!(!st.clears_floor(RouterPhase::Compact, 86));
     }
 
     #[test]

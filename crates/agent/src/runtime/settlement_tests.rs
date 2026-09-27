@@ -1,7 +1,5 @@
 //! `runtime::settlement_tests`: out-of-line tests.
 
-#![allow(unused_imports)]
-
 use super::*;
 use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
@@ -1334,4 +1332,108 @@ async fn corrupt_task_ledger_row_is_marked_and_reconstructed_on_reopen() {
         marker_files(manager2.store().root()).is_empty(),
         "the consumed marker is removed after reconstruction"
     );
+}
+
+/// Audit item 3 negative coverage: a context-compression summary or an
+/// ephemeral title can NEVER write a completion fact or immutable task
+/// fact — the writer refuses the trust class typed and NOTHING reaches the
+/// store — while an Implementation output keeps its existing authority.
+#[tokio::test]
+async fn compression_and_ephemeral_outputs_cannot_write_completion_facts() {
+    let (deps_, _dir) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let runtime = AgentRuntime::new(deps_).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let compaction = ModelOutput::new("summary", OutputTrust::ContextCompression, 31);
+    let ephemeral = ModelOutput::new("title", OutputTrust::Ephemeral, 32);
+
+    for (i, output) in [&compaction, &ephemeral].iter().enumerate() {
+        let propagated = runtime
+            .guarded_upsert_memory_fact(
+                &handle,
+                FactSource::Model(output),
+                "task_state",
+                &format!("refused_{i}"),
+                "{}",
+                "test.trust_gate",
+            )
+            .unwrap_err();
+        assert_eq!(propagated.kind, faktor_core::error::ErrorKind::Permission);
+        runtime.dw_note_upsert_memory_fact(
+            &handle,
+            FactSource::Model(output),
+            "task_state",
+            &format!("refused_note_{i}"),
+            "{}",
+            "test.trust_gate",
+        );
+    }
+    let facts = handle.memory_facts().unwrap();
+    assert!(
+        !facts.iter().any(|(k, key, _)| k == "task_state"
+            && (key.starts_with("refused_") || key.starts_with("refused_note_"))),
+        "a refused trust class must leave NO durable row: {facts:?}"
+    );
+
+    // Existing behavior is unchanged: an Implementation output may author a
+    // completion fact, and a durable projection still writes.
+    let implementation = ModelOutput::new("code", OutputTrust::Implementation, 33);
+    runtime
+        .guarded_upsert_memory_fact(
+            &handle,
+            FactSource::Model(&implementation),
+            "task_state",
+            "written",
+            "{\"ok\":true}",
+            "test.trust_gate",
+        )
+        .unwrap();
+    runtime
+        .guarded_upsert_memory_fact(
+            &handle,
+            FactSource::Durable,
+            "task_state",
+            "durable",
+            "{}",
+            "test.trust_gate",
+        )
+        .unwrap();
+    let facts = handle.memory_facts().unwrap();
+    assert!(facts
+        .iter()
+        .any(|(k, key, v)| k == "task_state" && key == "written" && v == "{\"ok\":true}"));
+    assert!(facts
+        .iter()
+        .any(|(k, key, _)| k == "task_state" && key == "durable"));
+
+    // Provenance is the ONLY durable write a compression output may make:
+    // the compression author is admitted there, while an implementation
+    // output (not a compression artifact) is refused and writes nothing.
+    runtime.dw_note_upsert_provenance_fact(
+        &handle,
+        FactSource::Model(&implementation),
+        "compaction",
+        "provenance_refused",
+        "{}",
+        "test.trust_gate",
+    );
+    let facts = handle.memory_facts().unwrap();
+    assert!(
+        !facts
+            .iter()
+            .any(|(k, key, _)| k == "compaction" && key == "provenance_refused"),
+        "a non-compression author must not write provenance: {facts:?}"
+    );
+    runtime.dw_note_upsert_provenance_fact(
+        &handle,
+        FactSource::Model(&compaction),
+        "compaction",
+        "provenance_admitted",
+        "{\"provenance\":\"context_compression\"}",
+        "test.trust_gate",
+    );
+    let facts = handle.memory_facts().unwrap();
+    assert!(facts
+        .iter()
+        .any(|(k, key, _)| k == "compaction" && key == "provenance_admitted"));
 }

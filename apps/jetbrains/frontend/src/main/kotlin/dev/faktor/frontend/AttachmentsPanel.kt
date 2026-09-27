@@ -25,6 +25,7 @@ import java.awt.Toolkit
 import java.awt.datatransfer.Clipboard
 import java.awt.datatransfer.DataFlavor
 import java.awt.event.ActionEvent
+import java.awt.event.KeyEvent
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -361,7 +362,7 @@ fun planAttachments(
             }
             uploads.add(
                 PlannedAttachmentUpload(
-                    key = pathUploadKey("image", path, file, imageMime),
+                    key = pathUploadKey("image", imageMime, bytes),
                     mime = imageMime,
                     filename = name,
                     base64 = Base64.getEncoder().encodeToString(bytes)
@@ -407,7 +408,7 @@ fun planAttachments(
             }
             uploads.add(
                 PlannedAttachmentUpload(
-                    key = pathUploadKey("document", path, file, documentMime),
+                    key = pathUploadKey("document", documentMime, bytes),
                     mime = documentMime,
                     filename = name,
                     base64 = Base64.getEncoder().encodeToString(bytes)
@@ -422,9 +423,9 @@ fun planAttachments(
     return AttachmentPlan(pathFiles, uploads)
 }
 
-/** The retry key of one path upload (path + size + mtime + mime). */
-private fun pathUploadKey(kind: String, path: String, file: File, mime: String): String =
-    kind + ":" + path + ":" + file.length() + ":" + file.lastModified() + ":" + mime
+/** The retry key of one path upload: kind + mime + SHA-256 of the EXACT bytes. */
+internal fun pathUploadKey(kind: String, mime: String, bytes: ByteArray): String =
+    kind + ":" + mime + ":" + sha256Hex(bytes)
 
 /** Lowercase SHA-256 of the exact bytes (the retry identity of a binary). */
 private fun sha256Hex(bytes: ByteArray): String {
@@ -438,6 +439,18 @@ private fun sha256Hex(bytes: ByteArray): String {
 }
 
 private const val HEX = "0123456789abcdef"
+
+/** The ActionMap key of the paste binding shared by every focus target. */
+private const val PASTE_ACTION = "faktor-paste-image"
+
+/**
+ * The ONE platform menu-shortcut paste stroke: `KeyStroke.getKeyStroke(
+ * KeyEvent.VK_V, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx)` —
+ * Command+V on macOS, Ctrl+V on Windows/Linux, decided by the toolkit and
+ * never by a hardcoded Ctrl binding.
+ */
+private fun menuShortcutV(): KeyStroke =
+    KeyStroke.getKeyStroke(KeyEvent.VK_V, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx)
 
 /**
  * Bounded LOCAL pending-upload state for the Task composer (audit 29,
@@ -716,16 +729,28 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
         }
     }
 
-    /** Ctrl+V pastes an image from the clipboard wherever this panel has focus. */
+    /**
+     * The platform menu shortcut pastes an image from the clipboard wherever
+     * this panel has focus: Command+V on macOS, Ctrl+V on Windows/Linux —
+     * the toolkit's own menu-shortcut mask, never a hardcoded Ctrl.
+     */
     private fun bindPaste(target: JComponent) {
-        val action = object : AbstractAction("faktor-paste-image") {
+        val action = object : AbstractAction(PASTE_ACTION) {
             override fun actionPerformed(e: ActionEvent?) {
                 requestPasteFromClipboard()
             }
         }
-        target.actionMap.put("faktor-paste-image", action)
-        target.inputMap.put(KeyStroke.getKeyStroke("ctrl V"), "faktor-paste-image")
+        target.actionMap.put(PASTE_ACTION, action)
+        target.inputMap.put(menuShortcutV(), PASTE_ACTION)
     }
+
+    /**
+     * The paste binding actually installed on this panel (Command+V on
+     * macOS, Ctrl+V elsewhere), exposed so tests assert the platform
+     * abstraction without assuming one platform's mask.
+     */
+    internal fun pasteKeyStroke(): KeyStroke? =
+        inputMap.allKeys().firstOrNull { stroke -> inputMap.get(stroke) == PASTE_ACTION }
 
     private fun updateBinaryVisibility() {
         binaryScroll.isVisible = binaries.size() > 0

@@ -42,12 +42,16 @@ import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.view
+import java.awt.Toolkit
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.math.BigInteger
 import java.nio.file.Files
 import java.nio.file.Paths
 import javax.imageio.ImageIO
+import javax.swing.KeyStroke
 
 // ----------------------------------------------------------------- fixtures
 
@@ -1900,6 +1904,75 @@ object FrontendSmoke {
             retry.retain("9", "k3", id("f"))
             assertEquals(2, retry.size(), "pending retry state is bounded")
             assertEquals(null, retry.reusable("9", "k1"), "the oldest pending upload was evicted")
+        }
+
+        // Audit 9/10: the path-attachment retry identity is the ACTUAL byte
+        // digest (kind + mime + SHA-256(bytes)); path/length/mtime are
+        // metadata only, so same-size same-mtime different bytes upload fresh.
+        step("path attachment identity is the byte digest, never path+size+mtime") {
+            val dir = Files.createTempDirectory("faktor-attach-identity-")
+            val file = Paths.get(dir.toString(), "doc.txt")
+            val bytesA = "AAAA".toByteArray()
+            val bytesB = "BBBB".toByteArray()
+            val stamp = 1_700_000_000_000L
+            val policy = AttachmentImages.emergencyPolicy()
+            Files.write(file, bytesA)
+            file.toFile().setLastModified(stamp)
+            val keyA = planAttachments(listOf(file.toString()), emptyList(), policy)
+                .uploads.single().key
+            // Same path, same length, same mtime; different bytes => fresh identity.
+            Files.write(file, bytesB)
+            file.toFile().setLastModified(stamp)
+            val keyB = planAttachments(listOf(file.toString()), emptyList(), policy)
+                .uploads.single().key
+            assertTrue(
+                keyA != keyB,
+                "same-size same-mtime changed bytes must not reuse the old identity"
+            )
+            // Identical bytes at a different path/time keep the SAME identity.
+            val twin = Paths.get(dir.toString(), "twin.txt")
+            Files.write(twin, bytesB)
+            twin.toFile().setLastModified(stamp + 1)
+            val keyTwin = planAttachments(listOf(twin.toString()), emptyList(), policy)
+                .uploads.single().key
+            assertEquals(keyB, keyTwin, "identity is content, not path or mtime")
+            // The identity is exactly kind:mime:sha256(bytes); path never appears.
+            val digestHex = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(bytesB).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            assertEquals("document:text/plain:$digestHex", keyB, "the retry key shape")
+            assertTrue(!keyB.contains(file.toString()), "the path stays metadata only")
+        }
+
+        // Audit 11: the paste binding is the platform menu shortcut (the
+        // toolkit's own mask: Command+V on macOS, Ctrl+V elsewhere), never a
+        // hardcoded Ctrl stroke.
+        step("paste shortcut binds the platform menu-shortcut mask") {
+            val panel = AttachmentsPanel()
+            val mask = Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
+            val bound = panel.pasteKeyStroke() ?: fail("the panel must install a paste binding")
+            assertEquals(
+                KeyStroke.getKeyStroke(KeyEvent.VK_V, mask),
+                bound,
+                "the binding is VK_V with the toolkit's menu-shortcut mask"
+            )
+            assertEquals(KeyEvent.VK_V, bound.keyCode)
+            assertEquals(false, bound.isOnKeyRelease)
+            assertTrue(
+                (bound.modifiers and mask) == mask,
+                "the bound stroke carries the platform menu-shortcut mask"
+            )
+            // Where the menu shortcut is NOT Ctrl (macOS: Command), the old
+            // hardcoded `ctrl V` stroke must not be what is installed.
+            if (mask != InputEvent.CTRL_DOWN_MASK) {
+                assertTrue(
+                    bound != KeyStroke.getKeyStroke(KeyEvent.VK_V, InputEvent.CTRL_DOWN_MASK),
+                    "a non-Ctrl platform must not bind plain Ctrl+V"
+                )
+            }
+            assertTrue(
+                panel.actionMap.get("faktor-paste-image") != null,
+                "the paste action is wired to the bound stroke"
+            )
         }
 
         // Clipboard images (audit 12): a BufferedImage converts to bounded

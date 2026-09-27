@@ -1,7 +1,5 @@
 //! `api::deps`: cohesive slice of the api module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Handle to the daemon's evidence store: an evidence store behind a

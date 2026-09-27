@@ -1,7 +1,5 @@
 //! `runtime::compaction_tests`: out-of-line tests.
 
-#![allow(unused_imports)]
-
 use super::*;
 use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
@@ -515,6 +513,7 @@ async fn compaction_summary_timeout_discards_partial_text_and_falls_back() {
         cancellation: CancellationToken::new(),
         summary_timeout: Duration::from_millis(150),
         budget_marker: None,
+        output_slot: Arc::new(std::sync::Mutex::new(None)),
     });
     // Run the summary request on a task; once the provider's stream is
     // open (request recorded), push ONE sentence and then stall forever
@@ -1457,4 +1456,107 @@ async fn producer_evidence_archives_into_the_durable_authority() {
         3,
         "re-archiving identical producer output must not grow the table"
     );
+}
+
+/// Audit item 3: an ACCEPTED LLM summary records durable
+/// context-compression provenance (trust class, durable call id, transcript
+/// deltas, routed pair) and NEVER replaces or deletes an existing durable
+/// fact — compaction has no authority over durable rows.
+#[tokio::test]
+async fn accepted_llm_summary_records_compression_provenance_and_never_replaces_facts() {
+    let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+    let (manager, session) = shared_session(&seed_deps);
+    seed_long_history(&manager, session, 5, 1500).await;
+    let handle = manager.get_session(session).unwrap().unwrap();
+    // The durable facts that exist BEFORE the compaction: none of them may
+    // be replaced, rewritten or deleted by the compression path.
+    let before = handle.memory_facts().unwrap();
+    assert!(!before.is_empty(), "the seeded history has durable facts");
+
+    let compactor = Arc::new(FakeProvider::with_script(
+        "compacto",
+        ModelCapabilities {
+            streaming: true,
+            context: 64_000,
+            ..Default::default()
+        },
+        vec![
+            ScriptedResponse::Text("COMPACTION SUMMARY: faithful state transfer.".into()),
+            ScriptedResponse::End,
+        ],
+    ));
+    let main_caps = ModelCapabilities {
+        tools: true,
+        context: 200_000,
+        ..Default::default()
+    };
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(FakeProvider::with_script(
+            "fake",
+            main_caps.clone(),
+            vec![ScriptedResponse::End],
+        )))
+        .unwrap();
+    registry.try_register(compactor).unwrap();
+    let (mut final_deps, _dir) = deps_sharing_session(
+        manager.clone(),
+        Arc::new(FakeProvider::with_script(
+            "fake",
+            main_caps,
+            vec![ScriptedResponse::End],
+        )),
+        vec![],
+    );
+    final_deps.providers = Arc::new(registry);
+    final_deps.compact_at_usage = 0.0;
+    final_deps.compaction_model = Some("compacto/summary-model".into());
+    let runtime = AgentRuntime::new(final_deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "do the thing", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert!(
+        outcome.compacted,
+        "the short LLM summary must be accepted by the reduction invariant"
+    );
+
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let facts = handle.memory_facts().unwrap();
+    let provenance = facts
+        .iter()
+        .find(|(k, key, _)| k == "compaction" && key == "provenance")
+        .unwrap_or_else(|| panic!("compaction provenance row missing: {facts:?}"));
+    let value: serde_json::Value = serde_json::from_str(&provenance.2).unwrap();
+    assert_eq!(value["provenance"], "context_compression");
+    assert_eq!(value["strategy"], "llm_summary");
+    assert_eq!(value["provider"], "compacto");
+    assert_eq!(value["model"], "summary-model");
+    assert!(
+        value["call_id"].as_u64().unwrap() > 0,
+        "provenance names the physical call: {value}"
+    );
+    // Fail-closed negative: the provenance row can NEVER be completion
+    // evidence — the completion-fact writer refuses that trust class.
+    let compaction = ModelOutput::new("summary", OutputTrust::ContextCompression, 21);
+    assert!(runtime
+        .guarded_upsert_memory_fact(
+            &handle,
+            FactSource::Model(&compaction),
+            "task_state",
+            "state",
+            "{}",
+            "test.provenance_negative",
+        )
+        .is_err());
+    // Every pre-existing durable fact survived byte-identically.
+    for (kind, key, value) in &before {
+        assert!(
+            facts
+                .iter()
+                .any(|(k, key2, v)| k == kind && key2 == key && v == value),
+            "pre-existing durable fact {kind}/{key} was replaced by compaction"
+        );
+    }
 }

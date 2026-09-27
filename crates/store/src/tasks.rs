@@ -1,7 +1,5 @@
 //! `tasks`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 // ------------------------------------------- verification job bounds (v22)

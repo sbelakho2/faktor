@@ -1,7 +1,5 @@
 //! `config::cloud`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[cloud]` section: the commercial control plane (identity,

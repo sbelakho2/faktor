@@ -1,7 +1,5 @@
 //! `daemon::builder`: cohesive slice of the daemon construction.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The injectable EXTERNAL seams of the daemon's GitHub App surface — the

@@ -1,7 +1,5 @@
 //! `api::router`: cohesive slice of the api module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The daemon's bounded request-body limit (`pub(crate)`: the dedicated

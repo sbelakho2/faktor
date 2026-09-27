@@ -37,11 +37,15 @@ use serde::{Deserialize, Serialize};
 /// shard and only completes when every shard was visited to exhaustion.
 pub const FINGERPRINT_SHARDS: u32 = 8;
 
+/// Reason spelling of a pre-coverage envelope: the generation carries no
+/// coverage metadata, so its completeness is UNKNOWN — never complete.
+pub const LEGACY_UNKNOWN_REASON: &str = "legacy_unknown";
+
 /// Durable coverage of one workspace index generation: what the scan saw,
 /// what it indexed, and whether the generation is complete. Persisted in the
 /// generation envelope (`GenerationFile::coverage`); a missing record on a
-/// legacy envelope decodes as COMPLETE (those builds were one-shot full
-/// builds under the old caps and are grandfathered honestly as complete).
+/// pre-coverage envelope decodes as [`IndexCoverage::legacy_unknown`] —
+/// completeness is UNKNOWN, never silently complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexCoverage {
@@ -62,9 +66,10 @@ pub struct IndexCoverage {
 
 impl Default for IndexCoverage {
     /// The LEGACY default: an envelope with no coverage record was built by
-    /// the pre-coverage one-shot scan and is treated as complete.
+    /// the pre-coverage scan and its completeness is UNKNOWN, never a
+    /// silently complete value.
     fn default() -> Self {
-        Self::complete()
+        Self::legacy_unknown()
     }
 }
 
@@ -101,6 +106,20 @@ impl IndexCoverage {
             complete: false,
             truncated_reason: Some(reason.into()),
         }
+    }
+
+    /// The LEGACY-UNKNOWN record: a pre-coverage envelope carries no
+    /// coverage metadata, so the generation is SERVED as stale data but its
+    /// misses must consult the bounded direct fallback until a rebuild
+    /// replaces it. NEVER complete.
+    pub fn legacy_unknown() -> Self {
+        Self::partial(LEGACY_UNKNOWN_REASON)
+    }
+
+    /// True when this record is the legacy-unknown marker (see
+    /// [`IndexCoverage::legacy_unknown`]).
+    pub fn is_legacy_unknown(&self) -> bool {
+        !self.complete && self.truncated_reason.as_deref() == Some(LEGACY_UNKNOWN_REASON)
     }
 
     /// Retarget the record at a full scan that has not started.
@@ -193,10 +212,11 @@ fn verify_default() -> bool {
 }
 
 impl Default for FingerprintCoverage {
-    /// Legacy envelopes (no fingerprint coverage) are complete: their
-    /// fingerprint list was one bounded full walk under the old caps.
+    /// Legacy envelopes (no fingerprint coverage) are NEVER fully clean:
+    /// their fingerprint list has UNKNOWN completeness (see
+    /// [`FingerprintCoverage::legacy_unknown`]).
     fn default() -> Self {
-        Self::complete()
+        Self::legacy_unknown()
     }
 }
 
@@ -214,6 +234,24 @@ impl FingerprintCoverage {
             cursors: Vec::new(),
             truncated_reason: None,
         }
+    }
+
+    /// A pre-coverage fingerprint: the envelope carries no shard round
+    /// state, so the fingerprint is NEVER fully clean until a fresh baseline
+    /// round re-establishes it (`verify: false`: the one-shot legacy list is
+    /// not a trustworthy verification baseline).
+    pub fn legacy_unknown() -> Self {
+        Self {
+            verify: false,
+            truncated_reason: Some(LEGACY_UNKNOWN_REASON.to_string()),
+            ..Self::round(0)
+        }
+    }
+
+    /// True when this record is the legacy-unknown marker (see
+    /// [`FingerprintCoverage::legacy_unknown`]).
+    pub fn is_legacy_unknown(&self) -> bool {
+        !self.complete && self.truncated_reason.as_deref() == Some(LEGACY_UNKNOWN_REASON)
     }
 
     /// The generation's FIRST round: the fingerprint baseline is being
@@ -320,6 +358,10 @@ pub enum EvidenceFreshness {
     StaleWhileRebuilding,
     /// The package's generation (or fingerprint) coverage is incomplete.
     Partial,
+    /// The package's generation predates coverage metadata: its
+    /// completeness is UNKNOWN. Served as stale data with fallback on
+    /// misses until a rebuild replaces it.
+    LegacyUnknown,
 }
 
 impl EvidenceFreshness {
@@ -328,6 +370,41 @@ impl EvidenceFreshness {
             EvidenceFreshness::Current => "current",
             EvidenceFreshness::StaleWhileRebuilding => "stale_while_rebuilding",
             EvidenceFreshness::Partial => "partial",
+            EvidenceFreshness::LegacyUnknown => "legacy_unknown",
+        }
+    }
+
+    /// Classify a generation from its coverage records: a pre-coverage
+    /// envelope (legacy-unknown record) is [`EvidenceFreshness::LegacyUnknown`];
+    /// any incomplete record is [`EvidenceFreshness::Partial`]; a complete
+    /// generation with a rebuild in flight is
+    /// [`EvidenceFreshness::StaleWhileRebuilding`]; otherwise
+    /// [`EvidenceFreshness::Current`].
+    pub fn classify(
+        coverage: &IndexCoverage,
+        fingerprint: &FingerprintCoverage,
+        rebuilding: bool,
+    ) -> Self {
+        if coverage.is_legacy_unknown() || fingerprint.is_legacy_unknown() {
+            EvidenceFreshness::LegacyUnknown
+        } else if !coverage.complete || !fingerprint.complete {
+            EvidenceFreshness::Partial
+        } else if rebuilding {
+            EvidenceFreshness::StaleWhileRebuilding
+        } else {
+            EvidenceFreshness::Current
+        }
+    }
+
+    /// Wire-safe freshness for the strict IDE-panel contract (the panels
+    /// reject any value outside `current`/`stale_while_rebuilding`/`partial`):
+    /// the legacy-unknown state surfaces through the coverage record's
+    /// `truncated_reason` ("legacy_unknown") while the freshness field stays
+    /// `partial` — never `current`.
+    pub fn wire(self) -> Self {
+        match self {
+            EvidenceFreshness::LegacyUnknown => EvidenceFreshness::Partial,
+            other => other,
         }
     }
 }
@@ -393,19 +470,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_defaults_are_complete_and_partial_helpers_are_honest() {
-        assert!(IndexCoverage::default().complete);
-        assert_eq!(IndexCoverage::default().truncated_reason, None);
-        assert!(FingerprintCoverage::default().complete);
+    fn legacy_defaults_are_unknown_never_complete_and_partial_helpers_are_honest() {
+        // Absence of coverage metadata is UNKNOWN completeness, never a
+        // silently complete generation: misses must fall back and a rebuild
+        // is due.
+        let legacy = IndexCoverage::default();
+        assert!(!legacy.complete);
+        assert!(legacy.is_legacy_unknown());
+        assert_eq!(legacy.truncated_reason.as_deref(), Some("legacy_unknown"));
+        assert!(legacy.needs_fallback_on_miss());
+        assert_eq!(IndexCoverage::legacy_unknown(), legacy);
+        let legacy_fp = FingerprintCoverage::default();
+        assert!(!legacy_fp.complete);
+        assert!(legacy_fp.is_legacy_unknown());
+        assert!(!legacy_fp.verify, "the legacy list is not a baseline");
+        assert_eq!(legacy_fp.shards_done, 0);
+        assert_eq!(FingerprintCoverage::legacy_unknown(), legacy_fp);
+        // The EXPLICIT complete records stay complete.
+        assert!(IndexCoverage::complete().complete);
+        assert!(!IndexCoverage::complete().is_legacy_unknown());
+        assert!(FingerprintCoverage::complete().complete);
         assert_eq!(
-            FingerprintCoverage::default().shards_done,
+            FingerprintCoverage::complete().shards_done,
             FingerprintCoverage::all_shards()
         );
         let partial = IndexCoverage::partial("batch_files");
         assert!(!partial.complete);
+        assert!(!partial.is_legacy_unknown());
         assert!(partial.needs_fallback_on_miss());
         assert!(!IndexCoverage::complete().needs_fallback_on_miss());
         assert_eq!(partial.truncated_reason.as_deref(), Some("batch_files"));
+        // Freshness classification: legacy -> LegacyUnknown; incomplete ->
+        // Partial; complete + rebuild -> StaleWhileRebuilding; else Current.
+        assert_eq!(
+            EvidenceFreshness::classify(&legacy, &FingerprintCoverage::complete(), false),
+            EvidenceFreshness::LegacyUnknown
+        );
+        assert_eq!(
+            EvidenceFreshness::classify(&IndexCoverage::complete(), &legacy_fp, false),
+            EvidenceFreshness::LegacyUnknown
+        );
+        assert_eq!(
+            EvidenceFreshness::classify(&partial, &FingerprintCoverage::complete(), true),
+            EvidenceFreshness::Partial
+        );
+        assert_eq!(
+            EvidenceFreshness::classify(
+                &IndexCoverage::complete(),
+                &FingerprintCoverage::complete(),
+                true
+            ),
+            EvidenceFreshness::StaleWhileRebuilding
+        );
+        assert_eq!(
+            EvidenceFreshness::classify(
+                &IndexCoverage::complete(),
+                &FingerprintCoverage::complete(),
+                false
+            ),
+            EvidenceFreshness::Current
+        );
+        assert_eq!(EvidenceFreshness::LegacyUnknown.as_str(), "legacy_unknown");
+        // The strict IDE-panel wire contract only accepts the three
+        // established values: legacy-unknown must map to partial, never
+        // current.
+        assert_eq!(
+            EvidenceFreshness::LegacyUnknown.wire(),
+            EvidenceFreshness::Partial
+        );
+        assert_eq!(
+            EvidenceFreshness::Current.wire(),
+            EvidenceFreshness::Current
+        );
     }
 
     #[test]

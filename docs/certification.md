@@ -455,30 +455,53 @@ from prose or a bare file name — and writes
 `bash scripts/certify-local.sh fast`) is the drift test: it exits non-zero
 when the table below disagrees with the derived manifest, when a surface row
 is missing, or when the table lists an unknown surface. Declared-but-unproven
-claims fail: an IMPLEMENTED row without an existing backticked evidence path
-is rejected, and the parity labels cannot claim IMPLEMENTED without a real
-matrix. The manifest is bound to the commit it was generated on; a stale
-file from a different SHA is not evidence. Any change to the probed
+claims fail: in every IMPLEMENTED table row, EVERY backticked path-like token
+in the evidence cells must resolve in the tree unless its cell annotates it
+`(external)`, `(generated)` or `(legacy)` — a stale path cannot hide behind
+an adjacent symbol — and at least one real artifact must exist. The parity
+labels cannot claim IMPLEMENTED without a real matrix, and
+`node scripts/capabilities-manifest.mjs --selftest` proves the probe algebra,
+that every required wiring marker is load-bearing (deleting one makes the
+capability unwired) and that a merely defined test never certifies. The
+manifest is bound to the commit AND tree it was generated on; a stale file
+from a different SHA is not evidence. Any change to the probed
 symbols/tests/files that moves a status must update this table in the same
 commit.
 
 The same manifest carries the per-capability **certification axes**
 (`axes.<capability>`) for `acquisition_planner`, `identity_cache`, `vision`,
-`retrieval`, `scm` and `jobs`:
+`retrieval`, `scm` and `jobs`, split into a STRUCTURAL half (what the tree
+defines) and an EVIDENTIARY half (what HEAD/tree-bound successful evidence
+certifies):
 
-| Axis | Derived from |
-| --- | --- |
-| `wired` | production construction markers (the daemon really assembles the capability) |
-| `adapter_certified` | the adapter/contract-mock test exists |
-| `daemon_e2e_certified` | a `tests/production-wiring` test drives the executable's own `build_daemon_core` graph (the suite is the source; a sibling test file must call `build_production_graph` and name the capability's test function) |
-| `platforms_certified` | the Woodpecker lanes whose commands actually run the workspace tests (parsed from `.woodpecker/trusted/trusted.yaml`) |
-| `external_dependency` | `faked` when the certification substitutes an external seam (fake/loopback server or transport), `none` when the capability's authority is durable local state |
+| Axis | Kind | Derived from |
+| --- | --- | --- |
+| `wired` | structural | EVERY required production construction marker exists (explicit `allOf`; masking one required marker makes the capability unwired, proved by `node scripts/capabilities-manifest.mjs --selftest`) |
+| `adapter_test_defined` | structural | the adapter/contract-mock test fn exists |
+| `daemon_e2e_test_defined` | structural | a `tests/production-wiring` test drives the executable's own `build_production_graph` daemon-core graph |
+| `platform_lane_defined` | structural | the Woodpecker lanes whose commands actually run the workspace tests (parsed from `.woodpecker/trusted/trusted.yaml`) |
+| `adapter_certified` | evidentiary | `adapter_test_defined` AND a successful `faktor-ci-certification/v2` trusted-workflow certificate for the exact HEAD commit AND tree |
+| `daemon_e2e_certified` | evidentiary | `daemon_e2e_test_defined` AND the same certificate evidence |
+| `platforms_certified` | evidentiary | the platforms of those HEAD/tree-bound successful certificates |
+| `external_dependency` | fact | `faked` when the certification substitutes an external seam (fake/loopback server or transport), `none` when the capability's authority is durable local state |
+
+A merely DEFINED test never certifies: without the trusted workflow's own
+`ci-certification*.json` objects (which already aggregate the verified
+`faktor-woodpecker-lane/v2` markers), the certified fields stay
+`false`/`none` even when every marker exists. Evidence from a failed,
+foreign-commit, foreign-tree, wrong-schema or untrusted-workflow object is
+ignored.
 
 The README's machine-checked capability-axes block (between the two
 `capability-axes` HTML comment markers) is the ONE place these fields may
 appear: `scripts/capabilities-manifest.mjs --check-claims` compares every
-cell against the derived manifest and rejects a raw boolean assignment for
-any axis field anywhere else in README/docs ("no manual binary prose").
+structural cell exactly against the derived manifest, accepts a certified
+cell only when it does not over-claim (a `true` needs derived `true`; a
+platform list must be a subset of the derived list), and rejects a raw
+boolean assignment for any axis field anywhere else in README/docs ("no
+manual binary prose"). The committed README under-claims
+`false`/`none` because certificate objects are host state, never committed
+artifacts; the generated manifest is the authority.
 `bash scripts/check-docs-sync.sh` runs that comparison on hosts with node;
 when node is unavailable the check prints an explicit SKIPPED line (the
 certificate lanes and `certify-local.sh` carry node and enforce the same
@@ -490,10 +513,10 @@ field is a non-zero drift failure, never a warning.
 | `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` (`export class`, typed validators) + adversarial `apps/vscode/scripts/selftest.mjs` assertions |
 | `vscode_webview` | IMPLEMENTED | Faktor-owned panel: `apps/vscode/src/webview.ts` (`class ChatViewProvider`) + hand-written `apps/vscode/media/chat.js` (local-resource-only CSP, nonce, text-only rendering) + adversarial `apps/vscode/scripts/selftest.mjs` / `apps/vscode/scripts/verify-vsix.mjs` gates |
 | `jetbrains_native_bridge` | IMPLEMENTED | `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt` (`class NativeClient`), `apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt` (`class NativeEventStream`), `apps/jetbrains/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt` (`NATIVE SMOKE PASS`) |
-| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend operates: `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt`, `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` (`FRONTEND SMOKE PASS`), `plugin.xml`, `build.gradle.kts`. No vendored upstream IDE source exists |
-| `jetbrains_behavioral_parity` | IMPLEMENTED | executable parity matrix `target/certification/jetbrains-parity.json` (`faktor-jetbrains-parity/v1`, written by `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`): 11 behavioral rows (task mode, agent tree, criterion proofs incl. all 7 binding kinds, permissions, terminal, review/tournament, evidence, settings, provider selection, history, restart/reconnect), each run against canned native frames AND the fake daemon, HEAD-bound |
+| `jetbrains_frontend` | IMPLEMENTED | Faktor-owned Swing frontend operates: `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt`, `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` (`FRONTEND SMOKE PASS`), `apps/jetbrains/frontend/src/main/resources/META-INF/plugin.xml`, `apps/jetbrains/frontend/build.gradle.kts`. No vendored upstream IDE source exists |
+| `jetbrains_behavioral_parity` | IMPLEMENTED | executable parity matrix `target/certification/jetbrains-parity.json` (generated) (`faktor-jetbrains-parity/v1`, written by `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`): 11 behavioral rows (task mode, agent tree, criterion proofs incl. all 7 binding kinds, permissions, terminal, review/tournament, evidence, settings, provider selection, history, restart/reconnect), each run against canned native frames AND the fake daemon, HEAD-bound |
 | `jetbrains_visual_parity` | IMPLEMENTED | the same artifact's visual axis: 8 panels rendered offscreen (`offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline`), component-tree/state digest compared against pinned baselines in `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; a missing/mismatching baseline fails the run |
-| `ui_parity` | IMPLEMENTED | executable axes only: the Faktor-owned VS Code panel (`apps/vscode/src/webview.ts` + `apps/vscode/media/chat.js`, selftest/VSIX gates), `target/certification/jetbrains-parity.json` (JetBrains behavioral + visual); vendored files never participate |
+| `ui_parity` | IMPLEMENTED | executable axes only: the Faktor-owned VS Code panel (`apps/vscode/src/webview.ts` + `apps/vscode/media/chat.js`, selftest/VSIX gates), `target/certification/jetbrains-parity.json` (generated) (JetBrains behavioral + visual); vendored files never participate |
 | `acp_subset` | IMPLEMENTED | `crates/acp` (`AcpMethod::Initialize`) + `crates/acp/tests/interop.rs` + official `agent-client-protocol` client crate in `tests/acp-official` |
 | `openai_responses` | IMPLEMENTED | `crates/openai/src/lib.rs`: `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` codecs + the adversarial `responses_*` stream tests |
 | `windows_job_containment` | IMPLEMENTED | `crates/winjob/src/lib.rs` (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `KILL_ON_JOB_CLOSE`) + `crates/pty/src/windows.rs` (`CREATE_SUSPENDED`, `assign_strict`, kill-on-close spawn test) |
@@ -693,11 +716,35 @@ artifacts.
 --check-gate-parity` also asserts the forge-side contract that makes the
 required main-push check fail closed: the trusted workflow's top-level
 `when` must include the `push` event (every main push creates the trusted
-pipeline that publishes `ci/woodpecker/push/trusted`) and the `certificate`
-step must run with `when.status: [success, failure]`. A pipeline that fails
-to start therefore never yields a successful required context — branch
-protection keeps the check pending/non-success (see
-`scripts/woodpecker/setup.md` §7).
+pipeline that publishes `ci/woodpecker/push/trusted`), the `certificate`
+step must run with `when.status: [success, failure]`, and (audit 23) the
+workflow must carry a `status-publish` step that calls
+`scripts/certification/publish-status.mjs publish` with
+`when.status: [success, failure]`. A pipeline that fails to start therefore
+never yields a successful required context — branch protection keeps the
+check pending/non-success (see `scripts/woodpecker/setup.md` §7).
+
+**Gate 11 — forge metadata + exact-SHA commit status (audit 22/23).** When
+a GitHub token is configured (`CERTIFY_GITHUB_TOKEN`, `GH_TOKEN` or
+`GITHUB_TOKEN`; `CERTIFY_GITHUB_API` overrides the API base), `scripts/
+certify.sh` queries the forge for two facts that source control cannot
+prove: the repository description must be the Faktor-owned UI positioning
+(`Faktor — native Rust engineering runtime with Faktor-owned IDE UIs`; a
+legacy compatibility description is a typed refusal
+`forge-metadata-description-mismatch`), and the EXACT shipped SHA must
+carry a status for the certified context (`ci/woodpecker/push/trusted` on
+main pushes) that is CONCLUSIVE — a missing (`forge-status-absent`),
+pending (`forge-status-pending`), foreign-SHA (`forge-status-sha-mismatch`)
+or non-success (`forge-status-not-success`) status refuses certification.
+Without a token the gate reports `external, non-source` (documented, never
+verified). The `status-publish` workflow step posts the trusted result on
+`success` AND `failure`; failures before any step can run (workflow
+config/startup errors) are published by Woodpecker's own forge integration
+as the pipeline's error status for the same context, which gate 11 then
+observes through the API. `node scripts/certification/publish-status.mjs
+selftest` covers missing-token/malformed-input refusals, exact-SHA posting,
+failure-state posting and non-2xx refusals; the certify selftest plants
+every gate-11 reject case hermetically.
 
 `bash scripts/certify.sh --selftest` proves the whole matrix hermetically
 against the mock API in
@@ -711,10 +758,13 @@ pipeline-id, unsigned and absent attestations, pr-context upgrade by a
 trusted attestation plus trusted-project identity/config/class re-fetch
 spoofs, the CI certification manifest matrix (absent/matching/schema/
 workflow/status/commit/tree/malformed/duplicate-keys), the CI status
-contract (dropped push event, missing failure status, real workflow), the
-`--verify-ci-evidence` wording, the `--ci-only` rejection, certificate-class
-truth-table checks, manifest field binding/determinism and the temp-name
-migration. The same suites run from
+contract (dropped push event, missing failure status, missing
+status-publish, real workflow), the gate-11 forge matrix (matching
+description + success status, legacy description, absent/pending/error/
+foreign-SHA status, malformed metadata, documented no-token external
+case), the `--verify-ci-evidence` wording, the `--ci-only` rejection,
+certificate-class truth-table checks, manifest field binding/determinism
+and the temp-name migration. The same suites run from
 `bash scripts/certification/tests/selftests.sh`.
 
 **Commit-message claims are not evidence.** A commit message, PR
@@ -843,29 +893,29 @@ profile).
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code Faktor panel | hand-written panel (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`) + provider (`apps/vscode/src/webview.ts`) | `node scripts/selftest.mjs` + `node scripts/verify-vsix.mjs` + Woodpecker `vscode` job; §2.10 | CI-LANE (Faktor-owned, no vendored closure; a real-IDE screenshot comparison stays a host capability not claimed offline) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (lifecycle + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
-| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
-| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json`, visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here) |
+| JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) (generated) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
+| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here) |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
 | Real-time soak (12–24h) | excluded by owner decision | no release gate and no CI workflow consumes a wall-clock soak; the `[soak]`-ignored longrun suites remain runnable manually | OUT OF SCOPE (by decision) |
-| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree; Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
-| Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools, native `GET/POST /native/session/{id}/board`, both IDE board panels | `crates/session/src/board.rs` + `crates/session/src/ledger.rs`; `crates/server/src/native/board.rs`; `apps/vscode/src/nativeClient.ts`; JetBrains `BoardPanel.kt` | IMPLEMENTED (fast tests green; native GET/POST round-trip in both IDE smokes; unavailable state recorded truthfully) |
-| Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup, cross-IDE controls | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints; VS Code cockpit + JetBrains `TournamentPanel.kt` (decide gated on every candidate settled) | IMPLEMENTED (fast tests green + both IDE smokes; integration stays the explicit approved-merge path) |
+| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task/`, `crates/session/src/ledger/`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime/settlement.rs`); adversarial gate/step tests in-tree (`crates/agent/src/runtime/verification_attribution_tests.rs`); Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
+| Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools, native `GET/POST /native/session/{id}/board`, both IDE board panels | `crates/session/src/board.rs` + `crates/session/src/ledger/`; `crates/server/src/native/board.rs`; `apps/vscode/src/nativeClient.ts`; JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt` | IMPLEMENTED (fast tests green; native GET/POST round-trip in both IDE smokes; unavailable state recorded truthfully) |
+| Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup, cross-IDE controls | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints; VS Code cockpit + JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt` (decide gated on every candidate settled) | IMPLEMENTED (fast tests green + both IDE smokes; integration stays the explicit approved-merge path) |
 | Pixel agents | deterministic per-ChildId avatars (VS Code + JetBrains, identical FNV-1a hashes) | `apps/vscode/src/pixelAgents.ts`, `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt` | IMPLEMENTED (UI layers; daemon exposes the durable child ids/state they render) |
 | Canonical child lifecycle + typed blockers | typed core `ChildBlocker` (kind/dependency/resolution/last-progress) with `blocked <=> blocker` decode invariants; corrupt rows fail loudly; canonical child-state projection | `crates/core/src/blocker.rs`, `crates/session/src/child.rs` (`child_runtime` v23 row) + native agent projection (`state`/`blocker` fields) | IMPLEMENTED (fast tests green) |
-| Presentation continuity | durable foreground/background fold + native `POST /native/session/{id}/agents/{child}/presentation` | `crates/session/src/child.rs` (`set_child_presentation`/`child_presentation`), `crates/session/src/ledger.rs` (`child_presentation_changed`), strict DTO + `presentation` field in the native agent projection | IMPLEMENTED (fast tests green; presentation-only, same ChildId/lineage) |
+| Presentation continuity | durable foreground/background fold + native `POST /native/session/{id}/agents/{child}/presentation` | `crates/session/src/child.rs` (`set_child_presentation`/`child_presentation`), `crates/session/src/ledger/` (`child_presentation_changed`), strict DTO + `presentation` field in the native agent projection | IMPLEMENTED (fast tests green; presentation-only, same ChildId/lineage) |
 | Durable execution phase | `ExecutionPhase` persisted at child drive boundaries and projected additively (`execution_phase`) on native child payloads; unknown/hostile values fail loud | `crates/core/src/blocker.rs` (`ExecutionPhase`), `crates/session/src/child.rs` (`set_execution_phase`/`execution_phase`), `crates/server/src/native/agents.rs` | IMPLEMENTED (fast tests green; purely a projection, never scheduling) |
-| Control ack discipline | every acknowledged control transition is durable before the ACK; a persistence failure is a retriable typed 503 (`persistence_failed`), never a swallowed ack | `crates/agent/src/runtime.rs`, `crates/session/src/handle.rs`, `crates/server/src/native/agents.rs` | IMPLEMENTED (fast tests green) |
-| Provider identity on children | the child session's durable `provider` rides the native entry; `(provider, model)` is the only catalog join key in both IDEs (a provider-less entry never guesses by model) | `crates/server/src/native/agents.rs`, `apps/vscode/src/state.ts` (`summarizeAgents`), JetBrains `TaskTreeModel.kt` | IMPLEMENTED (dual-provider smoke pins the join) |
-| Accessibility parity | reduced-motion handling for every pixel/state animation (VS Code CSS + JetBrains `PixelMotion`), static terminal cues, identical deterministic identities | `apps/vscode/media/chat.css`, `apps/vscode/media/chat.js`, JetBrains `PixelAgents.kt` + `FrontendSmoke.kt` reduced-motion matrix | IMPLEMENTED (both IDE smokes adversarial) |
+| Control ack discipline | every acknowledged control transition is durable before the ACK; a persistence failure is a retriable typed 503 (`persistence_failed`), never a swallowed ack | `crates/agent/src/runtime/turn/drive.rs`, `crates/session/src/handle.rs`, `crates/server/src/native/agents.rs` | IMPLEMENTED (fast tests green) |
+| Provider identity on children | the child session's durable `provider` rides the native entry; `(provider, model)` is the only catalog join key in both IDEs (a provider-less entry never guesses by model) | `crates/server/src/native/agents.rs`, `apps/vscode/src/state.ts` (`summarizeAgents`), JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt` | IMPLEMENTED (dual-provider smoke pins the join) |
+| Accessibility parity | reduced-motion handling for every pixel/state animation (VS Code CSS + JetBrains `PixelMotion`), static terminal cues, identical deterministic identities | `apps/vscode/media/chat.css`, `apps/vscode/media/chat.js`, JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt` reduced-motion matrix | IMPLEMENTED (both IDE smokes adversarial) |
 | Board provenance + delivery view | durable `BoardDeliveryView` folded from posts/reads/receipts/lifecycle; board tools emit `AgentCoordination` provenance so a sibling post never gains instruction authority | `crates/session/src/board.rs`, `crates/evidence/src/provenance.rs`, `crates/agent/src/tool.rs` (`BOARD_TOOL_PROVENANCE`) | IMPLEMENTED (malicious-post E2E green) |
 | Panel message discipline | every inbound composer/webview message is typed and bounded at the host boundary; malformed values are refused loudly and never coerce a start | `apps/vscode/src/webview.ts`, `apps/vscode/src/taskStart.ts`, `apps/vscode/scripts/selftest.mjs` | IMPLEMENTED (adversarial panel selftests green) |
-| Attachment durability | workspace-relative file paths + content-addressed binary refs; per-message durable `data.files` rows and the run's immutable `files` set persisted before the drive (byte-identical after reopen); malformed entries refused individually (never a whole-message drop) | `crates/session/src/handle.rs` (`submit_prompt` `data.files`), `crates/session/src/task.rs` + `crates/orchestrator/src/task_executor.rs` (run `files`), `apps/vscode/src/taskStart.ts` (`boundedWebviewFiles`), JetBrains `AttachmentsPanel.kt` | IMPLEMENTED (both IDEs; panel + native smokes green) |
+| Attachment durability | workspace-relative file paths + content-addressed binary refs; per-message durable `data.files` rows and the run's immutable `files` set persisted before the drive (byte-identical after reopen); malformed entries refused individually (never a whole-message drop) | `crates/session/src/handle.rs` (`submit_prompt` `data.files`), `crates/session/src/task/` + `crates/orchestrator/src/task_executor.rs` (run `files`), `apps/vscode/src/taskStart.ts` (`boundedWebviewFiles`), JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/AttachmentsPanel.kt` | IMPLEMENTED (both IDEs; panel + native smokes green) |
 | Unified run settlement | one `settle_run` for both execution shapes (`InSession`/`Orchestrated`), idempotent replay after every step-status write seam | `crates/orchestrator/src/task_executor.rs` (`settle_run`), `crates/orchestrator/src/task_executor_tests.rs` | IMPLEMENTED (fast tests green) |
-| Materialize → verify → land | isolated child candidates materialize through a durable `IntegrationRecord` (`IntegrationRecorded`), land with real final-root verification, snapshot-pinned record/step statuses; owner edits invalidate the record and a wrong synthetic PASS is rejected | `crates/session/src/ledger.rs` (`IntegrationRecordRow`, `final_root`), `crates/orchestrator/src/task_executor.rs` | IMPLEMENTED (fast tests green; the previous synthetic-PASS test was rewritten) |
+| Materialize → verify → land | isolated child candidates materialize through a durable `IntegrationRecord` (`IntegrationRecorded`), land with real final-root verification, snapshot-pinned record/step statuses; owner edits invalidate the record and a wrong synthetic PASS is rejected | `crates/session/src/ledger/` (`IntegrationRecordRow`, `final_root`), `crates/orchestrator/src/task_executor.rs` | IMPLEMENTED (fast tests green; the previous synthetic-PASS test was rewritten) |
 | Typed criterion proofs | a mutating no-op disposition default (`NoOpDisposition::RequiresCriterionProof`) completes only through an independent reviewer port's validated criterion proof or an explicit disposition; completion steps refuse execution without a validated proof | `crates/core/src/state.rs` (`NoOpDisposition::RequiresCriterionProof`), `crates/orchestrator/src/task_executor.rs` (`run_completion_steps_against_proof`), `crates/orchestrator/src/task_executor_tests.rs` | IMPLEMENTED (fast tests green) |
 | OpenAI Responses family | first-class Responses dispatch (`OpenAiFamily::Responses`), native item serializer + SSE stream parser, CLI `api=chat\|responses` with the modern endpoint default; strict parsing and adversarial streaming/deadline/retry/terminal tests | `crates/openai/src/lib.rs` (`responses_body`, `responses_stream`, `responses_*` tests), `crates/cli/src/config.rs` (`OpenAiApi`) | IMPLEMENTED (fast tests green) |
 | Windows containment (Job Objects + ConPTY) | `faktor-winjob` creates `KILL_ON_JOB_CLOSE` jobs; the terminal supervisor assigns every child (`JobGuard`) and `faktor-pty` creates ConPTY children `CREATE_SUSPENDED`, assigns them to the job, then resumes before exposure; `taskkill /T` remains the escalation path | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs`, `crates/pty/src/windows.rs` (`spawn_assigns_the_child_to_the_kill_on_close_job_before_returning`) | IMPLEMENTED (Windows-targeted code + spawn-order test; CI `windows-*` lane owns the real host run) |
-| Certification evidence chain | `faktor-cert-evidence/v1` objects + `faktor-woodpecker-lane/v2` markers, verifier rejection matrix, signed release gates; capability labels derive from hard code/test markers | `scripts/certification/evidence.mjs`, `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), `.woodpecker/*.yaml` | IMPLEMENTED (verifier selftest proves every rejection; see §6) |
+| Certification evidence chain | `faktor-cert-evidence/v1` objects + `faktor-woodpecker-lane/v2` markers, verifier rejection matrix, signed release gates; capability labels derive from hard code/test markers | `scripts/certification/evidence.mjs`, `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), `.woodpecker/untrusted/pr.yaml` | IMPLEMENTED (verifier selftest proves every rejection; see §6) |
 | VSIX packaging (P0) | Faktor-owned panel surface only (allowlisted `media/` + `out/`); extensionUri-only resolution; package → unzip → surface verify → packaged selftest → IDE-load record | `apps/vscode/scripts/verify-vsix.mjs`, `apps/vscode/scripts/selftest.mjs`, Woodpecker `vscode` job | CLOSED (self-contained VSIX; the IDE-load step records its exact skip when no `code` CLI exists) |
 | Repo rename (faktor) | external GitHub repository name/description | `gh repo rename` performed; in-tree metadata was already Faktor-branded and is unchanged | DONE (external; no in-tree evidence beyond branding scan) |
 
@@ -963,21 +1013,21 @@ Implementation map:
   (`StartTaskRunRequest::completion_contract`, `deny_unknown_fields`; a
   non-default contract on the plain-prompt path is a typed 400, never a
   silent drop).
-- Durable contract + step status: `crates/session/src/ledger.rs`
+- Durable contract + step status: `crates/session/src/ledger/`
   (`LedgerPayload::CompletionContractSet` / `CompletionStepStatus`,
   `entry_tag_of`, strict decode, head fold, pinned across compaction) with
-  the public accessors in `crates/session/src/task.rs`
+  the public accessors in `crates/session/src/task/`
   (`set_completion_contract`, `set_completion_step_status`). An all-false
   contract is refused (the default path carries no row); a contract is
   immutable per `(task, revision)`; a step status without a recorded
   contract is a typed Conflict.
-- Gate at completion: `crates/session/src/task.rs`
+- Gate at completion: `crates/session/src/task/`
   (`SessionHandle::complete_verified_task` → `completion_contract_gate`).
   A missing step row is `CompletionStepMissing`, a failed row is
   `CompletionStepFailed`, a latest non-succeeded row is
   `CompletionStepNotSucceeded`; the task STAYS `Verifying` and no
   `VerifiedComplete` is written. The only production `VerifiedComplete`
-  producer (`crates/agent/src/runtime.rs`) surfaces that refusal.
+  producer (`crates/agent/src/runtime/settlement.rs`) surfaces that refusal.
 - Executor seam: `crates/orchestrator/src/task_executor.rs`
   (`TaskRunRequest.completion_contract`, `record_completion_contract`
   recorded BEFORE the first model call; `run_completion_steps` drives the
@@ -1038,11 +1088,11 @@ durable rows fail closed with a typed 500 naming the component):
   `apps/vscode/scripts/selftest.mjs` and `FrontendSmoke.kt`.
 
 Adversarial coverage in-tree: non-succeeded step refuses `VerifiedComplete`
-and succeeded steps do not gate (`crates/session/src/task.rs`), contract
+and succeeded steps do not gate (`crates/session/src/task/`), contract
 default parity is byte-identical and the immutable-per-revision Conflict is
 enforced (`crates/orchestrator/src/task_executor.rs`
 `completion_contract_executor_tests`), the agent path refuses the verified
-completion until the step succeeds (`crates/agent/src/runtime.rs`
+completion until the step succeeds (`crates/agent/src/runtime/verification_attribution_tests.rs`
 `completion_contract_gate_refuses_verified_complete_until_step_succeeds`),
 the runner's ordering/idempotency/clean-tree/skipped-after-failure paths are
 covered in `crates/orchestrator/src/completion_steps.rs`, and the IDE

@@ -76,6 +76,13 @@ function dtoString(object: ProtocolJsonObject, key: string, path: string): strin
   return value;
 }
 
+function dtoStringElement(value: ProtocolJson, path: string): string {
+  if (typeof value !== 'string') {
+    dtoFail(path, `expected a string, got ${dtoDescribe(value)}`);
+  }
+  return value;
+}
+
 function dtoBool(object: ProtocolJsonObject, key: string, path: string): boolean {
   const value = dtoRequired(object, key, path);
   if (typeof value !== 'boolean') {
@@ -151,6 +158,37 @@ function dtoOptionalNullableI64(
   return value;
 }
 
+function dtoOptionalNullableString(
+  object: ProtocolJsonObject,
+  key: string,
+  path: string,
+): string | null {
+  const value = dtoOptional(object, key);
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    dtoFail(`${path}.${key}`, `expected a string or null, got ${dtoDescribe(value)}`);
+  }
+  return value;
+}
+
+function dtoOptionalNullableJson(object: ProtocolJsonObject, key: string): ProtocolJson | null {
+  const value = dtoOptional(object, key);
+  return value === undefined ? null : value;
+}
+
+function dtoOptionalNullableList(
+  object: ProtocolJsonObject,
+  key: string,
+  path: string,
+): ProtocolJson[] | null {
+  const value = dtoOptional(object, key);
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) {
+    dtoFail(`${path}.${key}`, `expected an array or null, got ${dtoDescribe(value)}`);
+  }
+  return value;
+}
+
 // --------------------------------------------------------- DTO shapes
 
 /** One conversation message row (parts nested). (unknown_fields: ignore) */
@@ -214,6 +252,72 @@ export interface ProtocolAgentStateView {
   readonly terminal: boolean;
 }
 
+/** One durable typed binary attachment: BLAKE3 digest (64 lowercase hex), mime, optional original filename and decompressed size. Decoders ignore unknown fields (the native additive-response contract); the daemon's own request DTO rejects them. (unknown_fields: ignore) */
+export interface ProtocolAttachmentId {
+  readonly digest: string;
+  readonly mime: string;
+  readonly filename: string | null;
+  readonly size: number;
+}
+
+/** Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime. (unknown_fields: reject) */
+export interface ProtocolAttachmentUpload {
+  readonly mime: string;
+  readonly filename: string | null;
+  readonly data_base64: string;
+}
+
+/** One durable task run projection (native task-run list/state reads; additive: decoders ignore unknown fields). (unknown_fields: ignore) */
+export interface ProtocolTaskRun {
+  readonly task_id: number;
+  readonly run_id: string;
+  readonly mode: string;
+  readonly state: string;
+  readonly goal: string | null;
+  readonly item_ids: readonly string[];
+  readonly model: string | null;
+}
+
+/** Response of a native task-run start: the durable run identity and its current state (additive: unknown fields ignored). (unknown_fields: ignore) */
+export interface ProtocolTaskRunStarted {
+  readonly task_id: number;
+  readonly run_id: string;
+  readonly state: string;
+}
+
+/** Response of a native task-run cancel (additive: unknown fields ignored). (unknown_fields: ignore) */
+export interface ProtocolTaskRunCancelled {
+  readonly run_id: string;
+  readonly cancelled: boolean;
+}
+
+/** One wire work item of a native task-run start (the orchestrator's own JSON vocabulary). (unknown_fields: reject) */
+export interface ProtocolTaskRunWorkItem {
+  readonly id: string;
+  readonly kind: string;
+  readonly summary: string | null;
+  readonly depends_on: readonly string[] | null;
+  readonly acceptance_checks: readonly string[] | null;
+  readonly ownership: ProtocolJson | null;
+  readonly required_capabilities: ProtocolJson | null;
+}
+
+/** Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. (unknown_fields: reject) */
+export interface ProtocolTaskRunStartRequest {
+  readonly goal: string;
+  readonly criteria: readonly string[] | null;
+  readonly work_items: readonly ProtocolTaskRunWorkItem[] | null;
+  readonly ownership: ProtocolJson | null;
+  readonly model: string | null;
+  readonly max_tokens: number | null;
+  readonly max_cost_micro: ProtocolJson | null;
+  readonly mutation_mode: string | null;
+  readonly routing_mode: string | null;
+  readonly files: readonly string[] | null;
+  readonly attachments: readonly ProtocolAttachmentId[] | null;
+  readonly completion_contract: ProtocolJson | null;
+}
+
 // ------------------------------------------------------------ defaults
 
 function dtoDefaultProtocolPageMeta(): ProtocolPageMeta {
@@ -239,9 +343,7 @@ export function validateProtocolMessage(value: ProtocolJson, path = "ProtocolMes
     session_id: dtoString(object, "session_id", path),
     seq: dtoI64(object, "seq", path),
     created_ms: dtoI64(object, "created_ms", path),
-    parts: dtoList(object, "parts", path).map((item, index) =>
-      validateProtocolPart(item, path + ".parts[" + index + "]"),
-    ),
+    parts: dtoList(object, "parts", path).map((item, index) => validateProtocolPart(item, path + ".parts[" + index + "]")),
   };
 }
 
@@ -331,9 +433,7 @@ export function validateProtocolMessagesPage(value: ProtocolJson, path = "Protoc
   }
   return {
     session_id: dtoString(object, "session_id", path),
-    messages: dtoList(object, "messages", path).map((item, index) =>
-      validateProtocolMessage(item, path + ".messages[" + index + "]"),
-    ),
+    messages: dtoList(object, "messages", path).map((item, index) => validateProtocolMessage(item, path + ".messages[" + index + "]")),
     has_more: dtoBool(object, "has_more", path),
     next_before: dtoNullableI64(object, "next_before", path),
     page: object["page"] === undefined
@@ -369,6 +469,117 @@ export function validateProtocolAgentStateView(value: ProtocolJson, path = "Prot
     label: dtoString(object, "label", path),
     active: dtoBool(object, "active", path),
     terminal: dtoBool(object, "terminal", path),
+  };
+}
+
+export function validateProtocolAttachmentId(value: ProtocolJson, path = "ProtocolAttachmentId"): ProtocolAttachmentId {
+  const object = dtoObject(value, path);
+  const required = ["digest","mime","filename","size"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    digest: dtoString(object, "digest", path),
+    mime: dtoString(object, "mime", path),
+    filename: dtoNullableString(object, "filename", path),
+    size: dtoI64(object, "size", path),
+  };
+}
+
+export function validateProtocolAttachmentUpload(value: ProtocolJson, path = "ProtocolAttachmentUpload"): ProtocolAttachmentUpload {
+  const object = dtoObject(value, path);
+  const required = ["mime","data_base64"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["mime","filename","data_base64"]);
+  return {
+    mime: dtoString(object, "mime", path),
+    filename: dtoOptionalNullableString(object, "filename", path),
+    data_base64: dtoString(object, "data_base64", path),
+  };
+}
+
+export function validateProtocolTaskRun(value: ProtocolJson, path = "ProtocolTaskRun"): ProtocolTaskRun {
+  const object = dtoObject(value, path);
+  const required = ["task_id","run_id","mode","state","goal","item_ids","model"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    task_id: dtoI64(object, "task_id", path),
+    run_id: dtoString(object, "run_id", path),
+    mode: dtoString(object, "mode", path),
+    state: dtoString(object, "state", path),
+    goal: dtoNullableString(object, "goal", path),
+    item_ids: dtoList(object, "item_ids", path).map((item, index) => dtoStringElement(item, path + ".item_ids[" + index + "]")),
+    model: dtoNullableString(object, "model", path),
+  };
+}
+
+export function validateProtocolTaskRunStarted(value: ProtocolJson, path = "ProtocolTaskRunStarted"): ProtocolTaskRunStarted {
+  const object = dtoObject(value, path);
+  const required = ["task_id","run_id","state"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    task_id: dtoI64(object, "task_id", path),
+    run_id: dtoString(object, "run_id", path),
+    state: dtoString(object, "state", path),
+  };
+}
+
+export function validateProtocolTaskRunCancelled(value: ProtocolJson, path = "ProtocolTaskRunCancelled"): ProtocolTaskRunCancelled {
+  const object = dtoObject(value, path);
+  const required = ["run_id","cancelled"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    run_id: dtoString(object, "run_id", path),
+    cancelled: dtoBool(object, "cancelled", path),
+  };
+}
+
+export function validateProtocolTaskRunWorkItem(value: ProtocolJson, path = "ProtocolTaskRunWorkItem"): ProtocolTaskRunWorkItem {
+  const object = dtoObject(value, path);
+  const required = ["id","kind"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["id","kind","summary","depends_on","acceptance_checks","ownership","required_capabilities"]);
+  return {
+    id: dtoString(object, "id", path),
+    kind: dtoString(object, "kind", path),
+    summary: dtoOptionalNullableString(object, "summary", path),
+    depends_on: dtoOptionalNullableList(object, "depends_on", path)?.map((item, index) => dtoStringElement(item, path + ".depends_on[" + index + "]")) ?? null,
+    acceptance_checks: dtoOptionalNullableList(object, "acceptance_checks", path)?.map((item, index) => dtoStringElement(item, path + ".acceptance_checks[" + index + "]")) ?? null,
+    ownership: dtoOptionalNullableJson(object, "ownership"),
+    required_capabilities: dtoOptionalNullableJson(object, "required_capabilities"),
+  };
+}
+
+export function validateProtocolTaskRunStartRequest(value: ProtocolJson, path = "ProtocolTaskRunStartRequest"): ProtocolTaskRunStartRequest {
+  const object = dtoObject(value, path);
+  const required = ["goal"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["goal","criteria","work_items","ownership","model","max_tokens","max_cost_micro","mutation_mode","routing_mode","files","attachments","completion_contract"]);
+  return {
+    goal: dtoString(object, "goal", path),
+    criteria: dtoOptionalNullableList(object, "criteria", path)?.map((item, index) => dtoStringElement(item, path + ".criteria[" + index + "]")) ?? null,
+    work_items: dtoOptionalNullableList(object, "work_items", path)?.map((item, index) => validateProtocolTaskRunWorkItem(item, path + ".work_items[" + index + "]")) ?? null,
+    ownership: dtoOptionalNullableJson(object, "ownership"),
+    model: dtoOptionalNullableString(object, "model", path),
+    max_tokens: dtoOptionalNullableI64(object, "max_tokens", path),
+    max_cost_micro: dtoOptionalNullableJson(object, "max_cost_micro"),
+    mutation_mode: dtoOptionalNullableString(object, "mutation_mode", path),
+    routing_mode: dtoOptionalNullableString(object, "routing_mode", path),
+    files: dtoOptionalNullableList(object, "files", path)?.map((item, index) => dtoStringElement(item, path + ".files[" + index + "]")) ?? null,
+    attachments: dtoOptionalNullableList(object, "attachments", path)?.map((item, index) => validateProtocolAttachmentId(item, path + ".attachments[" + index + "]")) ?? null,
+    completion_contract: dtoOptionalNullableJson(object, "completion_contract"),
   };
 }
 

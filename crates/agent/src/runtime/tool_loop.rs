@@ -1,7 +1,5 @@
 //! `runtime::tool_loop`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Tool output at or above this byte count is archived through the durable

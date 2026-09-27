@@ -212,6 +212,16 @@ const TS_HELPER_DECLS = [
 }`,
   },
   {
+    name: 'dtoStringElement',
+    deps: ['ProtocolJson', 'dtoFail', 'dtoDescribe'],
+    text: `function dtoStringElement(value: ProtocolJson, path: string): string {
+  if (typeof value !== 'string') {
+    dtoFail(path, \`expected a string, got \${dtoDescribe(value)}\`);
+  }
+  return value;
+}`,
+  },
+  {
     name: 'dtoBool',
     deps: ['ProtocolJsonObject', 'dtoRequired', 'dtoFail', 'dtoDescribe'],
     text: `function dtoBool(object: ProtocolJsonObject, key: string, path: string): boolean {
@@ -318,6 +328,46 @@ const TS_HELPER_DECLS = [
   return value;
 }`,
   },
+  {
+    name: 'dtoOptionalNullableString',
+    deps: ['ProtocolJsonObject', 'dtoOptional', 'dtoFail', 'dtoDescribe'],
+    text: `function dtoOptionalNullableString(
+  object: ProtocolJsonObject,
+  key: string,
+  path: string,
+): string | null {
+  const value = dtoOptional(object, key);
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    dtoFail(\`\${path}.\${key}\`, \`expected a string or null, got \${dtoDescribe(value)}\`);
+  }
+  return value;
+}`,
+  },
+  {
+    name: 'dtoOptionalNullableJson',
+    deps: ['ProtocolJson', 'ProtocolJsonObject', 'dtoOptional'],
+    text: `function dtoOptionalNullableJson(object: ProtocolJsonObject, key: string): ProtocolJson | null {
+  const value = dtoOptional(object, key);
+  return value === undefined ? null : value;
+}`,
+  },
+  {
+    name: 'dtoOptionalNullableList',
+    deps: ['ProtocolJson', 'ProtocolJsonObject', 'dtoOptional', 'dtoFail', 'dtoDescribe'],
+    text: `function dtoOptionalNullableList(
+  object: ProtocolJsonObject,
+  key: string,
+  path: string,
+): ProtocolJson[] | null {
+  const value = dtoOptional(object, key);
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) {
+    dtoFail(\`\${path}.\${key}\`, \`expected an array or null, got \${dtoDescribe(value)}\`);
+  }
+  return value;
+}`,
+  },
 ];
 
 /** Only the helpers the generated body actually references (tsc runs with
@@ -382,20 +432,29 @@ function tsExpr(field, objectExpr, pathExpr) {
   const optional = field.optional;
   switch (field.type.kind) {
     case 'string':
+      if (optional && nullable) return `dtoOptionalNullableString(${base})`;
+      if (optional) fail(`unsupported optional non-null string field ${field.name}`);
       if (nullable) return `dtoNullableString(${base})`;
       return `dtoString(${base})`;
     case 'bool':
+      if (optional) fail(`unsupported optional bool field ${field.name}`);
       return `dtoBool(${base})`;
     case 'i64':
       if (optional && nullable) return `dtoOptionalNullableI64(${base})`;
+      if (optional) fail(`unsupported optional non-null i64 field ${field.name}`);
       if (nullable) return `dtoNullableI64(${base})`;
       return `dtoI64(${base})`;
     case 'i32':
+      if (optional) fail(`unsupported optional i32 field ${field.name}`);
       return nullable ? `dtoNullableI32(${base})` : `dtoI32(${base})`;
     case 'json':
+      if (optional) return `dtoOptionalNullableJson(${objectExpr}, ${JSON.stringify(key)})`;
       return `dtoRequired(${objectExpr}, ${JSON.stringify(key)}, ${pathExpr})`;
     case 'named': {
       const validate = `validateProtocol${pascal(field.type.name)}`;
+      if (optional && nullable) {
+        fail(`unsupported optional nullable named field ${field.name}`);
+      }
       if (optional && !nullable) {
         return `${objectExpr}[${JSON.stringify(key)}] === undefined
         ? dtoDefaultProtocol${pascal(field.type.name)}()
@@ -410,13 +469,27 @@ function tsExpr(field, objectExpr, pathExpr) {
     }
     case 'list': {
       const inner = field.type.of;
-      if (inner.kind !== 'named') {
+      const named = inner.kind === 'named';
+      const validate = named ? `validateProtocol${pascal(inner.name)}` : null;
+      // String elements are validated individually (the wire contract is a
+      // string array, not "an array of whatever").
+      const element =
+        validate !== null
+          ? (item, index) => `${validate}(${item}, ${pathExpr} + ".${key}[" + ${index} + "]")`
+          : inner.kind === 'string'
+            ? (item, index) => `dtoStringElement(${item}, ${pathExpr} + ".${key}[" + ${index} + "]")`
+            : null;
+      if (optional) {
+        const collection = `dtoOptionalNullableList(${base})`;
+        if (element === null) {
+          return collection;
+        }
+        return `${collection}?.map((item, index) => ${element('item', 'index')}) ?? null`;
+      }
+      if (element === null) {
         return `dtoList(${base})`;
       }
-      const validate = `validateProtocol${pascal(inner.name)}`;
-      return `dtoList(${base}).map((item, index) =>
-      ${validate}(item, ${pathExpr} + ".${key}[" + index + "]"),
-    )`;
+      return `dtoList(${base}).map((item, index) => ${element('item', 'index')})`;
     }
     default:
       fail(`unknown type kind ${field.type.kind}`);
@@ -632,6 +705,21 @@ function ktCamel(name) {
   return name.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 }
 
+function ktListElement(inner) {
+  switch (inner.kind) {
+    case 'string':
+      return 'it.string()';
+    case 'i64':
+      return 'it.long()';
+    case 'i32':
+      return 'it.int()';
+    case 'bool':
+      return 'it.bool()';
+    default:
+      return 'it.value';
+  }
+}
+
 function ktExpr(field, view, types) {
   const key = JSON.stringify(field.name);
   switch (field.type.kind) {
@@ -666,11 +754,18 @@ function ktExpr(field, view, types) {
     }
     case 'list': {
       const inner = field.type.of;
-      if (inner.kind !== 'named') {
-        return `${view}.field(${key}).array().map { it.value }`;
+      const parse = inner.kind === 'named' ? `parseProtocol${pascal(inner.name)}` : null;
+      const element = parse === null ? ktListElement(inner) : `${parse}(it)`;
+      const mapping = `?.map { ${element} }`;
+      if (field.optional) {
+        // Absent OR JSON null read as null (serde Option semantics).
+        const collection = `${view}.optionalField(${key})?.array()${mapping}`;
+        return field.nullable ? collection : `${collection} ?: emptyList()`;
       }
-      const parse = `parseProtocol${pascal(inner.name)}`;
-      return `${view}.field(${key}).array().map { ${parse}(it) }`;
+      if (field.nullable) {
+        return `${view}.optionalField(${key})?.array()${mapping}`;
+      }
+      return `${view}.field(${key}).array().map { ${element} }`;
     }
     default:
       fail(`unknown type kind ${field.type.kind}`);
@@ -842,6 +937,265 @@ function genKotlin(schema) {
   return out.join('\n');
 }
 
+// ------------------------------------------------------- native inventory
+//
+// Audit 15: EVERY public native endpoint is classified in CODEGEN.md as
+// generated | handwritten-grandfathered | no-body | streaming-special-case.
+// The check is shrink-only: the table must cover the router exactly (both
+// directions) and the handwritten set must equal the frozen audited list
+// below. Migrating a surface DELETES its frozen entry in the same commit;
+// adding a new handwritten DTO surface requires editing the frozen list,
+// which is a review-visible change.
+
+const INVENTORY_DOC = 'crates/protocol/schema/CODEGEN.md';
+const ROUTER_SOURCES = [
+  'crates/server/src/api/lifecycle.rs',
+  'crates/server/src/worker_plane.rs',
+];
+const INVENTORY_CLASSIFICATIONS = [
+  'generated',
+  'handwritten-grandfathered',
+  'no-body',
+  'streaming-special-case',
+];
+
+// The audited handwritten surface (audit 15). ONLY remove lines from this
+// list (after a migration); never add one without a review-visible change.
+const HANDWRITTEN_FROZEN = new Set([
+  '/capabilities',
+  '/models',
+  '/native/agents',
+  '/native/agents/{child_id}/budget',
+  '/native/agents/{child_id}/model',
+  '/native/agents/{child_id}/steer',
+  '/native/approvals',
+  '/native/approvals/{id}/decide',
+  '/native/credits/grant',
+  '/native/enterprise/artifacts',
+  '/native/enterprise/audit',
+  '/native/enterprise/deletion-jobs',
+  '/native/enterprise/deletion-jobs/{id}',
+  '/native/enterprise/effective-config',
+  '/native/enterprise/retention/gc',
+  '/native/enterprise/settings',
+  '/native/enterprise/status',
+  '/native/enterprise/tombstones/{scope_key}',
+  '/native/entitlements',
+  '/native/evidence/{id}',
+  '/native/evidence/{id}/retrieve',
+  '/native/health',
+  '/native/identity',
+  '/native/index/coverage',
+  '/native/jobs/{id}',
+  '/native/jobs/{id}/result',
+  '/native/jobs/claim',
+  '/native/messages',
+  '/native/orchestrator/graph',
+  '/native/orgs',
+  '/native/orgs/{id}/members',
+  '/native/permission/reply',
+  '/native/permissions',
+  '/native/providers',
+  '/native/ready',
+  '/native/repositories',
+  '/native/semantic/capabilities',
+  '/native/semantic/status',
+  '/native/session',
+  '/native/session/{id}/abort',
+  '/native/session/{id}/agents',
+  '/native/session/{id}/agents/{child}/presentation',
+  '/native/session/{id}/board',
+  '/native/session/{id}/checkpoints',
+  '/native/session/{id}/prompt',
+  '/native/session/{id}/tasks',
+  '/native/session/{id}/tasks/{task_id}/verification',
+  '/native/session/{id}/terminal',
+  '/native/session/{id}/terminals/{terminal_id}/input',
+  '/native/session/{id}/terminals/{terminal_id}/kill',
+  '/native/session/{id}/terminals/{terminal_id}/reconcile',
+  '/native/session/{id}/terminals/{terminal_id}/resize',
+  '/native/session/{id}/tournament',
+  '/native/session/{id}/tournament/{tournament_id}',
+  '/native/session/{id}/tournaments',
+  '/native/session/{id}/tournaments/{tournament_id}/abort',
+  '/native/session/{id}/tournaments/{tournament_id}/decide',
+  '/native/session/{id}/turns',
+  '/native/session/{id}/usage',
+  '/native/session/{id}/verification',
+  '/native/sessions',
+  '/native/sso/callback',
+  '/native/sso/logout',
+  '/native/sso/start',
+  '/native/tasks/{id}/completion-steps',
+  '/native/tasks/{id}/proof',
+  '/native/terminals',
+  '/native/updater/apply',
+  '/native/updater/check',
+  '/native/updater/downgrade',
+  '/native/updater/rollback',
+  '/native/updater/stage',
+  '/native/updater/status',
+  '/native/usage',
+  '/native/workers',
+  '/native/workers/{id}/heartbeat',
+  '/native/workers/register',
+  '/native/workers/tokens',
+  '/session/{id}/projection',
+]);
+
+/** The audit-15 migrated routes: they must STAY `generated`. */
+const MIGRATED_ROUTES = [
+  '/native/session/{id}/attachments',
+  '/native/session/{id}/attachments/{digest}',
+  '/native/session/{id}/task-runs',
+  '/native/session/{id}/task-runs/{run_id}',
+  '/native/session/{id}/task-runs/{run_id}/cancel',
+];
+
+/** The balanced argument list of one `.route(` call (paren-aware, strings
+ *  skipped), so trailing middleware code cannot contribute methods. */
+function routeExpression(chunk) {
+  let depth = 1;
+  for (let i = 0; i < chunk.length; i += 1) {
+    const ch = chunk[i];
+    if (ch === '"') {
+      i += 1;
+      while (i < chunk.length && chunk[i] !== '"') i += 1;
+      continue;
+    }
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) return chunk.slice(0, i);
+    }
+  }
+  return chunk;
+}
+
+/** Every route in the daemon routers: path -> sorted METHOD set. */
+function extractNativeRoutes() {
+  const routes = new Map();
+  for (const rel of ROUTER_SOURCES) {
+    const full = resolve(ROOT, rel);
+    if (!existsSync(full)) continue;
+    const text = readFileSync(full, 'utf8');
+    for (const chunk of text.split('.route(').slice(1)) {
+      const expression = routeExpression(chunk);
+      const match = /^\s*"([^"]+)"/.exec(expression);
+      if (!match) continue;
+      const methods = routes.get(match[1]) || new Set();
+      for (const found of expression.matchAll(/\b(get|post|put|patch|delete)\(/g)) {
+        methods.add(found[1].toUpperCase());
+      }
+      routes.set(match[1], methods);
+    }
+  }
+  return routes;
+}
+
+const INVENTORY_ROW = /^\|\s*`([A-Z,]+)\s+(\S+)`\s*\|\s*([a-z-]+)\s*\|(.*)\|\s*$/;
+
+/** Parse the inventory table: path -> {methods, classification, dtos}. */
+function parseInventory() {
+  const full = resolve(ROOT, INVENTORY_DOC);
+  if (!existsSync(full)) {
+    fail(`${INVENTORY_DOC} does not exist (the native endpoint inventory)`);
+  }
+  const table = new Map();
+  for (const line of readFileSync(full, 'utf8').split('\n')) {
+    const match = INVENTORY_ROW.exec(line);
+    if (!match) continue;
+    const [, methods, path, classification, dtoCell] = match;
+    if (table.has(path)) {
+      fail(`${INVENTORY_DOC}: route ${path} is classified twice`);
+    }
+    table.set(path, {
+      methods: methods.split(',').sort(),
+      classification,
+      dtos: [...dtoCell.matchAll(/`([^`]+)`/g)].map((entry) => entry[1].trim()),
+    });
+  }
+  return table;
+}
+
+/** Pure comparator (selftestable): routes x table x schema types x frozen. */
+function inventoryErrors(routes, table, schemaTypes, frozen, migrated = MIGRATED_ROUTES) {
+  const errors = [];
+  for (const [path, methods] of routes) {
+    const row = table.get(path);
+    if (row === undefined) {
+      errors.push(
+        `route ${[...methods].sort().join(',')} ${path} is not classified in ${INVENTORY_DOC}`,
+      );
+      continue;
+    }
+    const declared = [...methods].sort();
+    if (row.methods.join(',') !== declared.join(',')) {
+      errors.push(
+        `${path}: methods ${row.methods.join(',')} in ${INVENTORY_DOC} != router ${declared.join(',')}`,
+      );
+    }
+  }
+  for (const [path, row] of table) {
+    if (!routes.has(path)) {
+      errors.push(`${INVENTORY_DOC} classifies ${path}, which no router serves`);
+    }
+    if (!INVENTORY_CLASSIFICATIONS.includes(row.classification)) {
+      errors.push(`${path}: unknown classification '${row.classification}'`);
+    }
+    if (row.classification !== 'generated' && row.dtos.length > 0) {
+      errors.push(`${path}: only a generated route may list DTO names`);
+    }
+    for (const dto of row.dtos) {
+      if (!schemaTypes.includes(dto)) {
+        errors.push(`${path}: generated DTO ${dto} is not in the canonical schema`);
+      }
+    }
+  }
+  for (const path of migrated) {
+    if (table.get(path)?.classification !== 'generated') {
+      errors.push(`${path}: audit-15 migrated route must stay 'generated'`);
+    }
+  }
+  const handwritten = new Set(
+    [...table]
+      .filter(([, row]) => row.classification === 'handwritten-grandfathered')
+      .map(([path]) => path),
+  );
+  for (const path of handwritten) {
+    if (!frozen.has(path)) {
+      errors.push(
+        `${path} is handwritten-grandfathered but not in HANDWRITTEN_FROZEN; ` +
+          'new handwritten DTO surfaces are refused (migrate it or classify it no-body/streaming)',
+      );
+    }
+  }
+  for (const path of frozen) {
+    if (!handwritten.has(path)) {
+      errors.push(
+        `${path} left HANDWRITTEN_FROZEN but the table no longer classes it handwritten; ` +
+          'tighten the frozen list in the same commit (shrink-only)',
+      );
+    }
+  }
+  return errors;
+}
+
+function checkInventory(schema) {
+  const errors = inventoryErrors(
+    extractNativeRoutes(),
+    parseInventory(),
+    schema.types.map((def) => def.name),
+    HANDWRITTEN_FROZEN,
+  );
+  if (errors.length > 0) {
+    for (const error of errors) {
+      console.error(`protocol-codegen: inventory: ${error}`);
+    }
+    fail('native endpoint inventory drift (audit 15)');
+  }
+}
+
 // ------------------------------------------------------------------- modes
 
 function checkClients(schema) {
@@ -871,6 +1225,7 @@ function modeCheckFull() {
     let drifted = compare(ARTIFACT, readFileSync(resolve(ROOT, ARTIFACT), 'utf8'), readFileSync(emitted, 'utf8'));
     const { schema } = readSchema();
     drifted = checkClients(schema) || drifted;
+    checkInventory(schema);
     if (drifted) {
       console.error(
         'protocol-codegen: drift detected; run `node scripts/protocol-codegen.mjs --write` and commit the result',
@@ -887,12 +1242,13 @@ function modeCheckFull() {
 
 function modeCheckClients() {
   const { schema } = readSchema();
+  checkInventory(schema);
   if (checkClients(schema)) {
     console.error('protocol-codegen: client drift detected (artifact checked in)');
     process.exit(1);
   }
   console.log(
-    `protocol-codegen: OK (clients match ${ARTIFACT}: ${schema.types.length} types, ${schema.constants.error_codes.length} error codes)`,
+    `protocol-codegen: OK (clients match ${ARTIFACT}: ${schema.types.length} types, ${schema.constants.error_codes.length} error codes; inventory classified)`,
   );
 }
 
@@ -926,6 +1282,14 @@ function modeSelftest() {
     ['Kotlin data class', kt.includes('data class ProtocolMessage(')],
     ['Kotlin sealed enum', kt.includes('sealed class ProtocolPart')],
     ['Kotlin error parser', kt.includes('fun parseProtocolErrorEnvelope(')],
+    // Audit 15 migrated surfaces must be generated, never hand-rolled again.
+    ['TS attachment validator', ts.includes('export function validateProtocolAttachmentId(')],
+    ['TS task-run validator', ts.includes('export function validateProtocolTaskRun(')],
+    ['TS task-run start validator', ts.includes('export function validateProtocolTaskRunStartRequest(')],
+    ['TS optional-nullable list helper', ts.includes('function dtoOptionalNullableList(')],
+    ['Kotlin attachment parser', kt.includes('fun parseProtocolAttachmentId(')],
+    ['Kotlin task-run parser', kt.includes('fun parseProtocolTaskRun(')],
+    ['Kotlin optional list parse', kt.includes('optionalField("attachments")?.array()')],
   ];
   let failed = 0;
   for (const [label, ok] of checks) {
@@ -942,12 +1306,60 @@ function modeSelftest() {
     failed += 1;
   }
   // The schema only needs one type list and one constant table.
-  if (schema.types.length < 7 || schema.constants.error_codes.length < 14) {
+  if (schema.types.length < 14 || schema.constants.error_codes.length < 14) {
     console.error('protocol-codegen selftest: FAIL schema surface shrank unexpectedly');
     failed += 1;
   }
+  // The inventory comparator: every drift direction must be detected.
+  const types = ['Dto'];
+  const baseRoutes = new Map([
+    ['/a', new Set(['GET'])],
+    ['/b', new Set(['POST'])],
+  ]);
+  const baseTable = new Map([
+    ['/a', { methods: ['GET'], classification: 'generated', dtos: ['Dto'] }],
+    ['/b', { methods: ['POST'], classification: 'no-body', dtos: [] }],
+  ]);
+  const mutationCases = [
+    [
+      'unclassified route',
+      new Map([...baseRoutes, ['/c', new Set(['GET'])]]),
+      baseTable,
+      types,
+      new Set(),
+    ],
+    ['stale table row', baseRoutes, new Map([...baseTable, ['/gone', { methods: ['GET'], classification: 'no-body', dtos: [] }]]), types, new Set()],
+    ['method drift', baseRoutes, new Map([['/a', { methods: ['POST'], classification: 'generated', dtos: ['Dto'] }], ['/b', baseTable.get('/b')]]), types, new Set()],
+    ['unknown classification', baseRoutes, new Map([['/a', { methods: ['GET'], classification: 'sorcery', dtos: [] }], ['/b', baseTable.get('/b')]]), types, new Set()],
+    ['generated DTO absent from schema', baseRoutes, baseTable, [], new Set()],
+    ['unfrozen handwritten growth', baseRoutes, new Map([['/a', { methods: ['GET'], classification: 'handwritten-grandfathered', dtos: [] }], ['/b', baseTable.get('/b')]]), types, new Set()],
+    ['stale frozen entry', baseRoutes, baseTable, types, new Set(['/gone'])],
+  ];
+  for (const [label, routes, table, schemaTypes, frozen] of mutationCases) {
+    if (inventoryErrors(routes, table, schemaTypes, frozen, []).length === 0) {
+      console.error(`protocol-codegen selftest: FAIL inventory mutation not detected: ${label}`);
+      failed += 1;
+    }
+  }
+  if (inventoryErrors(baseRoutes, baseTable, types, new Set(), []).length > 0) {
+    console.error('protocol-codegen selftest: FAIL clean inventory flagged');
+    failed += 1;
+  }
+  checkInventory(schema);
+  const handwritten = [...parseInventory()].filter(
+    ([, row]) => row.classification === 'handwritten-grandfathered',
+  ).length;
+  if (handwritten !== HANDWRITTEN_FROZEN.size) {
+    console.error(
+      `protocol-codegen selftest: FAIL frozen handwritten set ${HANDWRITTEN_FROZEN.size} != table ${handwritten}`,
+    );
+    failed += 1;
+  }
   if (failed > 0) process.exit(1);
-  console.log('protocol-codegen selftest: PASS');
+  console.log(
+    `protocol-codegen selftest: PASS (generators, drift comparator, inventory shrink-only: ` +
+      `${handwritten} handwritten / ${parseInventory().size} endpoints, ${HANDWRITTEN_FROZEN.size} frozen)`,
+  );
 }
 
 const mode = process.argv[2] || '--check';
