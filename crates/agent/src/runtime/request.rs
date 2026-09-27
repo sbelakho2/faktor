@@ -1,7 +1,5 @@
 //! `runtime::request`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// History retrieval bound (audit 29: the conversation window is chosen by

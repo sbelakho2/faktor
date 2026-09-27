@@ -1,16 +1,12 @@
 //! `runtime::tests`: shared test fixtures (part 1).
 
-#![allow(unused_imports)]
-
 use super::*;
 use crate::runtime::fixtures_tests::*;
 use crate::*;
 
-pub(crate) use super::*;
-
 pub(crate) use crate::tool::Tool;
 
-pub(crate) use crate::{empty_passthrough_decision, RouteFailure, RoutingMode, RoutingPolicy};
+pub(crate) use crate::{empty_passthrough_decision, RoutingPolicy};
 
 pub(crate) use faktor_core::id::SessionId;
 
@@ -1397,8 +1393,6 @@ impl faktor_provider::Provider for GatedStreamProvider {
 // P0 recovery invariants (turn records, idempotent replay,
 // workspace-aware write postconditions).
 // ============================================================
-
-use faktor_core::hash::FileHash;
 
 pub(crate) use faktor_core::id::{TaskId, WorkspaceId, WorktreeId};
 

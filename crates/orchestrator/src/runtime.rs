@@ -4010,7 +4010,7 @@ pub(crate) mod graph;
 /// events, wrapped with a durable task-linkage row); a multi-item task
 /// spawns real child sessions through [`OrchestratorRuntime::execute_task`]
 /// (wave 12). There is no second execution architecture.
-#[path = "task_executor.rs"]
+#[path = "task_executor/mod.rs"]
 pub mod task_executor;
 
 /// Shadow mutation roots (P0-48): daemon-owned isolated candidates of the

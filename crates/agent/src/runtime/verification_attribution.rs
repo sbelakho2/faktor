@@ -1,7 +1,5 @@
 //! `runtime::verification_attribution`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// Verification-tier escalation (audit 54): a High/Unknown semantic risk
@@ -693,29 +691,181 @@ pub(crate) struct IndependentReviewOutcome {
     pub(crate) refused: Option<String>,
     pub(crate) provider: String,
     pub(crate) model: String,
+    /// The accepted reviewer output (audit item 3): the raw verdict text
+    /// under its explicit [`crate::OutputTrust::VerificationOpinion`] class
+    /// and the physical call's durable id. `None` on every refusal — no
+    /// evidence value exists when no verdict was authored.
+    pub(crate) output: Option<ModelOutput>,
 }
 
 impl IndependentReviewOutcome {
+    /// A completed review with its typed verdict AND the admitted reviewer
+    /// output that authored it. The output MUST carry
+    /// [`crate::OutputTrust::VerificationOpinion`]; anything else is a
+    /// typed [`TrustRefusal`] (fail closed: the caller refuses the review).
     pub(crate) fn with_verdict(
         provider: &str,
         model: &str,
         verdict: faktor_verify::review::ReviewVerdict,
-    ) -> Self {
-        Self {
+        output: ModelOutput,
+    ) -> Result<Self, TrustRefusal> {
+        output.verification_evidence()?;
+        Ok(Self {
             verdict: Some(verdict),
             refused: None,
             provider: provider.into(),
             model: model.into(),
-        }
+            output: Some(output),
+        })
     }
+
     pub(crate) fn refused(provider: &str, model: &str, reason: impl Into<String>) -> Self {
         Self {
             verdict: None,
             refused: Some(reason.into()),
             provider: provider.into(),
             model: model.into(),
+            output: None,
         }
     }
+
+    /// The admitted reviewer output, when this outcome carries one.
+    pub(crate) fn output(&self) -> Option<&ModelOutput> {
+        self.output.as_ref()
+    }
+}
+
+/// Verification evidence authored by a model call (audit item 3): the
+/// review value a [`crate::OutputTrust::VerificationOpinion`] output
+/// produced. The only two admittance paths are the LIVE reviewer output
+/// ([`ReviewEvidence::from_review_output`]) and a DURABLE review row that
+/// carries the same provenance tag ([`ReviewEvidence::from_durable`]) — a
+/// context-compression summary or an ephemeral output can take neither, so
+/// it can never author criterion/review evidence. Every consumer of review
+/// evidence (criterion verdicts, proof rows, reviewer ports) takes THIS
+/// type, never a raw JSON value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReviewEvidence {
+    value: serde_json::Value,
+}
+
+impl ReviewEvidence {
+    /// The provenance tag key recorded in the review value at authoring
+    /// time (`output_trust`: the authoring class's
+    /// [`crate::OutputTrust::provenance_tag`]).
+    pub(crate) const OUTPUT_TRUST_KEY: &'static str = "output_trust";
+
+    /// The provenance tag of deterministic LOCAL review evidence (the
+    /// bounded head scan + structured diff package, no model-authored
+    /// verdict).
+    pub(crate) const DETERMINISTIC_LOCAL_TAG: &'static str = "deterministic_local";
+
+    /// Admit deterministic LOCAL review evidence: a value that carries NO
+    /// model-authored reviewer verdict. A value that CLAIMS a reviewer
+    /// attempt (`evidence.structured.review_model.attempted == true`) is a
+    /// typed refusal — that claim requires the admitted reviewer output
+    /// through [`ReviewEvidence::from_review_output`].
+    pub(crate) fn from_deterministic_local(
+        mut value: serde_json::Value,
+    ) -> Result<Self, TrustRefusal> {
+        if review_claims_reviewer_attempt(&value) {
+            return Err(TrustRefusal {
+                trust: OutputTrust::Ephemeral,
+                required: "the admitted reviewer output that authored this review \
+                           (a claimed reviewer attempt cannot ride local evidence)",
+            });
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                Self::OUTPUT_TRUST_KEY.into(),
+                serde_json::json!(Self::DETERMINISTIC_LOCAL_TAG),
+            );
+        }
+        Ok(Self { value })
+    }
+
+    /// Admit a LIVE reviewer output: enforces the verification-opinion trust
+    /// class, then stamps the provenance tag + call id onto the value so any
+    /// durable round-trip re-admits through [`ReviewEvidence::from_durable`].
+    pub(crate) fn from_review_output(
+        output: &ModelOutput,
+        mut value: serde_json::Value,
+    ) -> Result<Self, TrustRefusal> {
+        output.verification_evidence()?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                Self::OUTPUT_TRUST_KEY.into(),
+                serde_json::json!(output.trust.provenance_tag()),
+            );
+            obj.insert("output_call_id".into(), serde_json::json!(output.call_id));
+        }
+        Ok(Self { value })
+    }
+
+    /// Admit a durable review row: it must carry the provenance tag written
+    /// by [`ReviewEvidence::from_review_output`], and the tag must name an
+    /// evidence-authoring class. A row without the tag (legacy/foreign) or
+    /// with a non-authoring tag is a typed refusal — the review contributes
+    /// NOTHING rather than being trusted.
+    pub(crate) fn from_durable(value: serde_json::Value) -> Result<Self, TrustRefusal> {
+        let tag = value.get(Self::OUTPUT_TRUST_KEY).and_then(|v| v.as_str());
+        if tag == Some(Self::DETERMINISTIC_LOCAL_TAG) {
+            // Same claim check as the live local path: a durable row cannot
+            // claim a reviewer attempt it never proved with an output.
+            if review_claims_reviewer_attempt(&value) {
+                return Err(TrustRefusal {
+                    trust: OutputTrust::Ephemeral,
+                    required: "the admitted reviewer output that authored this review",
+                });
+            }
+            return Ok(Self { value });
+        }
+        let trust = tag.and_then(OutputTrust::from_provenance_tag);
+        match trust {
+            Some(trust) if trust.may_author_verification_evidence() => Ok(Self { value }),
+            _ => Err(TrustRefusal {
+                trust: trust.unwrap_or(OutputTrust::Ephemeral),
+                required: "a durable review row authored by a verification opinion \
+                           (output_trust = verification_opinion)",
+            }),
+        }
+    }
+
+    pub(crate) fn as_value(&self) -> &serde_json::Value {
+        &self.value
+    }
+
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        self.value
+    }
+}
+
+/// Whether a review value claims a reviewer-model attempt
+/// (`evidence.structured.review_model.attempted == true`). A value making
+/// that claim may only be admitted alongside its reviewer output.
+fn review_claims_reviewer_attempt(value: &serde_json::Value) -> bool {
+    value
+        .get("evidence")
+        .and_then(|e| e.get("structured"))
+        .and_then(|s| s.get("review_model"))
+        .and_then(|m| m.get("attempted"))
+        .and_then(|a| a.as_bool())
+        == Some(true)
+}
+
+/// Admit a review value that crossed a durable/raw boundary: the
+/// provenance tag must name an evidence-authoring class (audit item 3).
+/// Untrusted or untagged values yield `None` — the caller then treats the
+/// value as findings only (reviewer-dependent criteria stay unresolved,
+/// fail closed) and NEVER as evidence.
+pub(crate) fn admit_review_evidence(review: Option<&serde_json::Value>) -> Option<ReviewEvidence> {
+    review.and_then(|value| match ReviewEvidence::from_durable(value.clone()) {
+        Ok(evidence) => Some(evidence),
+        Err(refusal) => {
+            tracing::warn!("review evidence refused by the output-trust gate: {refusal}");
+            None
+        }
+    })
 }
 
 /// The real separate review-model call (P0-13): route the Review phase
@@ -1129,7 +1279,19 @@ pub(crate) async fn run_independent_review_call(
                 latency_ms: 0,
                 verified: None,
             });
-            IndependentReviewOutcome::with_verdict(&provider_id, &model, verdict)
+            // Audit item 3: the reviewer output is admitted as a
+            // verification-opinion `ModelOutput` (raw text + trust class +
+            // the physical call's durable id). A trust refusal here is a
+            // fail-closed refusal of the review itself.
+            let output = ModelOutput::new(
+                text.clone(),
+                crate::OutputTrust::VerificationOpinion,
+                attempt_identity.attempt_op_id.raw(),
+            );
+            IndependentReviewOutcome::with_verdict(&provider_id, &model, verdict, output)
+                .unwrap_or_else(|refusal| {
+                    IndependentReviewOutcome::refused(&provider_id, &model, refusal.to_string())
+                })
         }
         None => {
             // Clean completion but no typed verdict: the exchange WAS paid
@@ -1613,13 +1775,16 @@ pub(crate) async fn criterion_verdicts_from_attempt(
     unavailable: &[(String, String)],
     changed: &[String],
     ws: &faktor_fs::WorkspaceHandle,
-    review: Option<&serde_json::Value>,
+    // Audit item 3: review evidence is ADMITTED (typed) before it can feed
+    // any criterion verdict — a caller cannot hand raw model text here.
+    review: Option<&ReviewEvidence>,
     candidate_snapshot: &str,
     goal: &str,
 ) -> Vec<CriterionVerification> {
     if criteria.is_empty() {
         return Vec::new();
     }
+    let review = review.map(ReviewEvidence::as_value);
     let typed = decode_criteria(criteria);
     let mut resolver = AttemptEvidenceResolver::new(candidate_snapshot);
     let mut check_rows: Vec<CheckOutcomeRow> = Vec::new();
@@ -1777,7 +1942,10 @@ pub(crate) async fn verification_proof_from_attempt(
     runs: &[ExecutedCheck],
     changed: &[String],
     ws: &faktor_fs::WorkspaceHandle,
-    review: Option<&serde_json::Value>,
+    // Audit item 3: the review value must already be ADMITTED evidence
+    // (verification-opinion provenance); a raw model value cannot reach the
+    // proof.
+    review: Option<&ReviewEvidence>,
 ) -> VerificationProof {
     let mut executions = Vec::new();
     for run in runs {
@@ -1832,7 +2000,7 @@ pub(crate) async fn verification_proof_from_attempt(
             });
         }
     }
-    let reviewer = match review {
+    let reviewer = match review.map(ReviewEvidence::as_value) {
         Some(v)
             if serde_json::to_string(v)
                 .is_ok_and(|s| s.len() <= faktor_session::MAX_VERIFICATION_REVIEWER_JSON_BYTES) =>
@@ -2231,7 +2399,9 @@ impl AgentRuntime {
         // Typed criterion verdicts (P0): evaluated through each criterion's
         // OWN binding. The blanket `passed = integrated checks passed`
         // mapping is GONE; a criterion without a binding the evaluator can
-        // resolve is Unavailable, never Passed.
+        // resolve is Unavailable, never Passed. Audit item 3: the review
+        // value is ADMITTED before it can back any criterion verdict.
+        let review_evidence = admit_review_evidence(review.as_ref());
         let criteria_rows = criterion_verdicts_from_attempt(
             criteria,
             &checks,
@@ -2239,7 +2409,7 @@ impl AgentRuntime {
             &unavailable,
             changed,
             &ws,
-            review.as_ref(),
+            review_evidence.as_ref(),
             &candidate_snapshot,
             &goal,
         )
@@ -2629,6 +2799,7 @@ impl AgentRuntime {
                 faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
                 faktor_verify::Acceptance::Pending => VerificationStatus::Unavailable,
             };
+            let review_evidence = admit_review_evidence(review.as_ref());
             let criteria_rows = criterion_verdicts_from_attempt(
                 criteria,
                 &checks,
@@ -2636,7 +2807,7 @@ impl AgentRuntime {
                 &unavailable,
                 changed,
                 ws,
-                review.as_ref(),
+                review_evidence.as_ref(),
                 candidate_snapshot,
                 goal,
             )
@@ -2761,6 +2932,21 @@ impl AgentRuntime {
             faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
             faktor_verify::Acceptance::Pending => VerificationStatus::Unavailable,
         };
+        // Audit item 3: a durable review row is re-ADMITTED here (its
+        // provenance tag must name an evidence-authoring class). A row that
+        // cannot be admitted contributes NOTHING — the reviewer-dependent
+        // criteria stay unresolved (fail closed), never a trusted pass.
+        let review = review.and_then(|v| match ReviewEvidence::from_durable(v.clone()) {
+            Ok(evidence) => Some(evidence),
+            Err(refusal) => {
+                tracing::warn!(
+                    "durable review evidence refused by output trust ({}); reviewer-dependent \
+                     criteria stay unresolved",
+                    refusal
+                );
+                None
+            }
+        });
         let criteria_rows = criterion_verdicts_from_attempt(
             criteria,
             &mirrors,
@@ -2768,7 +2954,7 @@ impl AgentRuntime {
             &unavailable,
             changed,
             ws,
-            review,
+            review.as_ref(),
             candidate_snapshot,
             goal,
         )
@@ -2786,7 +2972,9 @@ impl AgentRuntime {
                 unavailable.len(),
                 root.display()
             ),
-            review_model_identity: review.and_then(review_model_identity_of),
+            review_model_identity: review
+                .as_ref()
+                .and_then(|r| review_model_identity_of(r.as_value())),
         }
     }
 
@@ -2836,6 +3024,15 @@ impl AgentRuntime {
             cancel,
         )
         .await;
+        // Audit item 3: the no-op review evidence is admitted through the
+        // LIVE reviewer output (verification opinion). Capture it before
+        // the verdict moves out of the outcome; without an admitted output
+        // there is no evidence to evaluate — a typed refusal.
+        let Some(output) = outcome.output().cloned() else {
+            return Err(
+                "the no-op reviewer verdict carried no admitted verification-opinion output".into(),
+            );
+        };
         let Some(verdict) = outcome.verdict else {
             return Err(format!(
                 "no independent reviewer verdict for the no-op root: {}",
@@ -2851,11 +3048,19 @@ impl AgentRuntime {
                 verdict.findings.iter().take(4).collect::<Vec<_>>()
             ));
         }
-        let review = serde_json::json!({
+        let raw = serde_json::json!({
             "verdict": "pass",
             "findings": [],
             "evidence": [format!("no-op:{candidate_snapshot}")],
         });
+        let review = match ReviewEvidence::from_review_output(&output, raw) {
+            Ok(evidence) => evidence,
+            Err(refusal) => {
+                return Err(format!(
+                    "the no-op reviewer output was refused by the trust gate: {refusal}"
+                ))
+            }
+        };
         let criteria_rows = criterion_verdicts_from_attempt(
             criteria,
             &[],
@@ -2951,6 +3156,7 @@ impl AgentRuntime {
         // lost row is recorded (marker + audit) and replayed on next open.
         self.dw_note_upsert_memory_fact(
             handle,
+            FactSource::Durable,
             "task_state",
             "state",
             &state,
@@ -2967,6 +3173,7 @@ impl AgentRuntime {
         let last = truncate(&serde_json::to_string(&last).unwrap_or_default(), 4000);
         self.dw_note_upsert_memory_fact(
             handle,
+            FactSource::Durable,
             "verification",
             "last",
             &last,
@@ -2985,6 +3192,7 @@ impl AgentRuntime {
             if !seeded {
                 self.dw_note_upsert_memory_fact(
                     handle,
+                    FactSource::Durable,
                     "criteria",
                     "0",
                     &text,

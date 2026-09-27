@@ -1,9 +1,5 @@
 //! `config::embedding`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
-use super::*;
-
 /// The additive `[embeddings]` section: ONE selected semantic embedding
 /// provider. Strict by construction (map-only parsing: unknown keys,
 /// duplicate keys, non-object shapes and wrong value types are parse

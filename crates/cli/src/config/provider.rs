@@ -1,7 +1,5 @@
 //! `config::provider`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The wire family of an `open_ai` provider entry.
@@ -339,14 +337,21 @@ impl ProviderPricingCfg {
 /// each range-checked `0..=100`. Example:
 /// `{"quality": {"coding_reliability": 72, "context_reliability": 80}}`.
 ///
+/// Authority is PER DECLARED DIMENSION: each declared dimension carries
+/// `UserConfigured` provenance at its declared value; every dimension the
+/// user did NOT declare keeps its previous value and authority — above all
+/// the `ConservativeUnknown` placeholder, which is NEVER laundered into a
+/// user-declared value. A coding-only declaration therefore cannot
+/// authorize a context floor (compaction/summarize), and vice versa.
+///
 /// This is what AUTHORIZES a row whose quality would otherwise be
 /// `ConservativeUnknown` (a local/unknown endpoint) to clear quality
 /// floors — the dead-end removal: without a declaration, an unknown row's
 /// neutral placeholder never clears a floor and the operator has no
 /// declared way to authorize it. Durable verified routing outcomes
-/// supersede the declaration; the declaration never applies to another
-/// instance, and it never manufactures a measurement (provenance stays
-/// `UserConfigured`).
+/// supersede each declared metric; the declaration never applies to
+/// another instance, and it never manufactures a measurement (provenance
+/// stays `UserConfigured`).
 ///
 /// Unknown keys are parse errors; an empty table or any out-of-range value
 /// is a typed validation error.
@@ -809,8 +814,10 @@ impl ProviderCfg {
         // A configured `pricing` section: exact prices -> UserOverride
         // rows, ceiling -> Composite rows for Unknown-priced models only;
         // both bump the pricing epoch. The `quality` section stamps
-        // `UserConfigured` provenance and authorizes unknown-quality rows
-        // (durable verified outcomes still supersede it). The
+        // `UserConfigured` on exactly its DECLARED dimensions and
+        // authorizes unknown-quality rows per dimension (undeclared
+        // dimensions keep their authority; durable verified outcomes still
+        // supersede each metric). The
         // local-runtime (ollama) pricing gate also holds on the raw
         // `build` path (the daemon's warm-up path builds ollama separately,
         // where `Config::validate`/`load_strict` refuse such a config

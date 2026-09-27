@@ -3210,6 +3210,7 @@ async function pendingSubmissionTests() {
   await test('hostile already-uploaded records are refused at the envelope boundary', () => {
     const validUpload = {
       sessionId: '7',
+      contentDigest: ts.pendingAttachmentContentDigest(binaryAttachment()),
       attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
     };
     const parsed = ts.parsePendingSubmission({
@@ -3221,6 +3222,10 @@ async function pendingSubmissionTests() {
     for (const uploaded of [
       'nope',
       { sessionId: '7' },
+      { ...validUpload, contentDigest: undefined },
+      { ...validUpload, contentDigest: 'not-hex' },
+      { ...validUpload, contentDigest: 'A'.repeat(64) },
+      { ...validUpload, contentDigest: 'a'.repeat(63) },
       { sessionId: '7', attachment: { digest: 'not-hex', mime: 'application/pdf', filename: null, size: 3 } },
       { sessionId: '', attachment: validUpload.attachment },
       { sessionId: '7', attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: -1 } },
@@ -3232,25 +3237,26 @@ async function pendingSubmissionTests() {
           attachments: [{ ...binaryAttachment(), uploaded }],
         }),
         null,
-        JSON.stringify(uploaded).slice(0, 120),
+        JSON.stringify(uploaded).slice(0, 160),
       );
     }
   });
 
-  await test('the retainer bounds retry state and merges uploads only by identity', () => {
+  await test('the retainer bounds retry state and merges uploads only by content identity', () => {
     const retainer = new ts.PendingSubmissionRetainer(2);
-    const envelope = (messageId) =>
+    const envelope = (messageId, bytes = '%PDF') =>
       ts.parsePendingSubmission({
         text: 'ship it',
         sessionId: '7',
         messageId,
         draftId: null,
         files: [],
-        attachments: [binaryAttachment()],
+        attachments: [binaryAttachment({ dataBase64: Buffer.from(bytes).toString('base64') })],
       });
     const withUpload = (pending, digest) =>
       ts.withPendingUpload(pending, 0, {
         sessionId: '7',
+        contentDigest: ts.pendingAttachmentContentDigest(pending.attachments[0]),
         attachment: { digest, mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
       });
     const first = withUpload(envelope('m1'), 'a'.repeat(64));
@@ -3270,6 +3276,119 @@ async function pendingSubmissionTests() {
       undefined,
       'the oldest identity was evicted',
     );
+  });
+
+  await test('retry reuse matches content identity, never array index', async () => {
+    // Same draft identity, same attachment count, same slot: the bytes
+    // changed, so the retained upload must NOT be reused and a fresh upload
+    // runs; unchanged bytes DO reuse the durable id.
+    const retainer = new ts.PendingSubmissionRetainer();
+    const envelope = (bytes) =>
+      ts.parsePendingSubmission({
+        text: 'ship it',
+        sessionId: '7',
+        messageId: 'same-draft',
+        draftId: null,
+        files: [],
+        attachments: [binaryAttachment({ dataBase64: Buffer.from(bytes).toString('base64') })],
+      });
+    const before = envelope('BBBB');
+    const unchanged = envelope('BBBB');
+    const changed = envelope('CCCC');
+    assertEqual(unchanged.attachments.length, changed.attachments.length, 'same attachment count');
+    retainer.retain(
+      ts.withPendingUpload(before, 0, {
+        sessionId: '7',
+        contentDigest: ts.pendingAttachmentContentDigest(before.attachments[0]),
+        attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
+      }),
+    );
+    assertEqual(
+      retainer.restore(changed).attachments[0].uploaded,
+      undefined,
+      'changed bytes under the same draft identity must not reuse the old id',
+    );
+    assertEqual(
+      retainer.restore(unchanged).attachments[0].uploaded.attachment.digest,
+      'a'.repeat(64),
+      'unchanged bytes reuse the retained id',
+    );
+
+    // The same rule holds at admission time when an envelope carries a
+    // stale `uploaded` record whose content digest no longer matches.
+    const uploads = [];
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        uploads.push(request.data_base64);
+        return {
+          digest: 'f'.repeat(64),
+          mime: request.mime,
+          filename: request.filename ?? null,
+          size: request.data_base64.length,
+        };
+      },
+      startTaskRun: async () => taskRunStartedJson,
+    };
+    const changedParsed = ts.parsePendingSubmission({
+      text: 'ship it',
+      sessionId: '7',
+      messageId: 'same-draft',
+      draftId: null,
+      files: [],
+      attachments: [{ ...binaryAttachment({ dataBase64: Buffer.from('CCCC').toString('base64') }) }],
+    });
+    const stalePending = {
+      ...changedParsed,
+      attachments: [
+        {
+          ...changedParsed.attachments[0],
+          uploaded: {
+            sessionId: '7',
+            contentDigest: ts.pendingAttachmentContentDigest(unchanged.attachments[0]),
+            attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
+          },
+        },
+      ],
+    };
+    const staleOutcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: stalePending,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {},
+    });
+    assertEqual(staleOutcome.ok, true);
+    assertEqual(uploads.length, 1, 'stale content digest forces a fresh upload');
+
+    const matchingPending = {
+      ...changedParsed,
+      attachments: [
+        {
+          ...changedParsed.attachments[0],
+          uploaded: {
+            sessionId: '7',
+            contentDigest: ts.pendingAttachmentContentDigest(changedParsed.attachments[0]),
+            attachment: { digest: 'b'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
+          },
+        },
+      ],
+    };
+    const matchingOutcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: matchingPending,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {
+        throw new Error('a reuse admission must succeed');
+      },
+    });
+    assertEqual(matchingOutcome.ok, true);
+    assertEqual(uploads.length, 1, 'matching content digest reuses the id and uploads nothing');
+    assertEqual(matchingOutcome.attachmentIds[0], 'b'.repeat(64));
   });
 
   await test('documents upload as durable attachments when the advertised model supports them', async () => {

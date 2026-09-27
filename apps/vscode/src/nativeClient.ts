@@ -33,7 +33,16 @@ import {
 } from './money.ts';
 import {
   parseProtocolErrorEnvelope,
+  validateProtocolAttachmentId,
+  validateProtocolTaskRun,
+  validateProtocolTaskRunCancelled,
+  validateProtocolTaskRunStarted,
+  ProtocolDtoError,
+  type ProtocolAttachmentId,
   type ProtocolJson,
+  type ProtocolTaskRun,
+  type ProtocolTaskRunCancelled,
+  type ProtocolTaskRunStarted,
 } from './generated/protocolDto.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -644,40 +653,26 @@ export interface NativeVerificationView {
   readonly failedChecks: NativeVerificationFact[];
 }
 
-export interface NativeTaskRun {
-  /** Numeric durable task id (the daemon's `task_id` is a u64, not a string). */
-  readonly task_id: number;
-  readonly run_id: string;
-  readonly mode: string;
-  readonly state: string;
-  readonly goal: string | null;
-  readonly item_ids: string[];
-  readonly model: string | null;
-}
+/**
+ * One durable task run (native task-run list/state reads). The shape and the
+ * strict decoder are GENERATED from the canonical schema
+ * (`crates/protocol/src/schema.rs` -> `generated/protocolDto.ts`); the
+ * hand-written `Native*` name stays as an alias for existing call sites.
+ */
+export type NativeTaskRun = ProtocolTaskRun;
 
-export interface NativeTaskRunStarted {
-  readonly task_id: number;
-  readonly run_id: string;
-  readonly state: string;
-}
+export type NativeTaskRunStarted = ProtocolTaskRunStarted;
 
-export interface NativeTaskRunCancelled {
-  readonly run_id: string;
-  readonly cancelled: boolean;
-}
+export type NativeTaskRunCancelled = ProtocolTaskRunCancelled;
 
 /**
  * One durable typed binary attachment (`POST /native/session/{id}/attachments`).
  * `digest` is the daemon's BLAKE3 CAS address (64 hex chars), `size` the
  * decompressed byte count. This is the ONLY identity accepted by a task
- * start's additive `attachments` member — never a workspace path.
+ * start's additive `attachments` member — never a workspace path. Generated
+ * from the canonical schema (`ProtocolAttachmentId`).
  */
-export interface NativeAttachmentId {
-  readonly digest: string;
-  readonly mime: string;
-  readonly filename: string | null;
-  readonly size: number;
-}
+export type NativeAttachmentId = ProtocolAttachmentId;
 
 export interface NativeAgentEntry {
   readonly agent_id: string;
@@ -1994,77 +1989,65 @@ export function validateVerificationView(json: Json): NativeVerificationView {
   };
 }
 
+/** Re-throw a generated-decoder violation as the client's own typed error so
+ *  callers see ONE error class across handwritten and generated parsers. */
+function asNativeProtocol<T>(parse: () => T): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof ProtocolDtoError) {
+      throw new NativeProtocolError(error.path, error.detail);
+    }
+    throw error;
+  }
+}
+
 export function validateTaskRuns(json: Json): NativeTaskRun[] {
   const path = 'GET /native/session/{id}/task-runs';
   if (!Array.isArray(json)) {
     fail(path, `expected an array, got ${describe(json)}`);
   }
-  return json.map((entry, index) => {
-    const itemPath = `${path}[${index}]`;
-    const object = asObject(entry, itemPath);
-    checkResponseKeys(object, itemPath, [
-      'task_id',
-      'run_id',
-      'mode',
-      'state',
-      'goal',
-      'item_ids',
-      'model',
-    ]);
-    return {
-      task_id: fInt(object, 'task_id', itemPath),
-      run_id: fString(object, 'run_id', itemPath),
-      mode: fString(object, 'mode', itemPath),
-      state: fString(object, 'state', itemPath),
-      goal: fNullableString(object, 'goal', itemPath),
-      item_ids: fStringArray(object, 'item_ids', itemPath),
-      model: fNullableString(object, 'model', itemPath),
-    };
-  });
+  // Generated decoder (ProtocolTaskRun): required members and exact types,
+  // unknown additive fields ignored per the native v1 contract.
+  return asNativeProtocol(() =>
+    json.map((entry, index) => validateProtocolTaskRun(entry, `${path}[${index}]`)),
+  );
 }
 
 export function validateTaskRun(json: Json): NativeTaskRun {
-  const entries = validateTaskRuns([json]);
-  return entries[0] as NativeTaskRun;
+  return asNativeProtocol(() =>
+    validateProtocolTaskRun(json, 'GET /native/session/{id}/task-runs/{run_id}'),
+  );
 }
 
 export function validateTaskRunStarted(json: Json): NativeTaskRunStarted {
-  const path = 'POST /native/session/{id}/task-runs';
-  const object = asObject(json, path);
-  checkResponseKeys(object, path, ['task_id', 'run_id', 'state']);
-  return {
-    task_id: fInt(object, 'task_id', path),
-    run_id: fString(object, 'run_id', path),
-    state: fString(object, 'state', path),
-  };
+  return asNativeProtocol(() =>
+    validateProtocolTaskRunStarted(json, 'POST /native/session/{id}/task-runs'),
+  );
 }
 
 export function validateTaskRunCancelled(json: Json): NativeTaskRunCancelled {
-  const path = 'POST /native/session/{id}/task-runs/{run_id}/cancel';
-  const object = asObject(json, path);
-  checkResponseKeys(object, path, ['run_id', 'cancelled']);
-  return { run_id: fString(object, 'run_id', path), cancelled: fBool(object, 'cancelled', path) };
+  return asNativeProtocol(() =>
+    validateProtocolTaskRunCancelled(
+      json,
+      'POST /native/session/{id}/task-runs/{run_id}/cancel',
+    ),
+  );
 }
 
-/** Strict decode of one durable attachment id (the upload response). */
+/** Strict decode of one durable attachment id (the upload response).
+ *  The generated decoder owns the shape; the digest/size invariants the
+ *  native surface additionally promises are checked here. */
 export function validateAttachmentId(json: Json): NativeAttachmentId {
   const path = 'POST /native/session/{id}/attachments';
-  const object = asObject(json, path);
-  checkResponseKeys(object, path, ['digest', 'mime', 'filename', 'size']);
-  const digest = fString(object, 'digest', path);
-  if (!/^[0-9a-f]{64}$/.test(digest)) {
-    fail(path, `expected a 64-char lowercase hex digest, got ${JSON.stringify(digest)}`);
+  const id = asNativeProtocol(() => validateProtocolAttachmentId(json, path));
+  if (!/^[0-9a-f]{64}$/.test(id.digest)) {
+    fail(path, `expected a 64-char lowercase hex digest, got ${JSON.stringify(id.digest)}`);
   }
-  const size = fInt(object, 'size', path);
-  if (size < 0) {
-    fail(path, `expected a non-negative size, got ${size}`);
+  if (id.size < 0) {
+    fail(path, `expected a non-negative size, got ${id.size}`);
   }
-  return {
-    digest,
-    mime: fString(object, 'mime', path),
-    filename: fNullableString(object, 'filename', path),
-    size,
-  };
+  return id;
 }
 
 function presentationTag(object: JsonObject, key: string, path: string): 'foreground' | 'background' {

@@ -1,7 +1,5 @@
 //! `runtime::settlement`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 // ------------------------------------------------- durable-write failure guard
@@ -123,6 +121,8 @@ pub(crate) const DW_SITE_GATE_LAST_FACT: &str = "persist_gate_facts.verification
 pub(crate) const DW_SITE_GATE_CRITERIA_FACT: &str = "persist_gate_facts.criteria";
 
 pub(crate) const DW_SITE_GATE_BUDGET_FACT: &str = "finish_logical_turn.budget_blocked_fact";
+
+pub(crate) const DW_SITE_COMPACTION_PROVENANCE: &str = "try_compact.provenance_fact";
 
 pub(crate) const DW_SITE_GATE_BUDGET_DECISION: &str = "finish_logical_turn.budget_refusal_decision";
 
@@ -800,6 +800,7 @@ impl AgentRuntime {
                 // propagated.
                 self.dw_note_upsert_memory_fact(
                     handle,
+                    FactSource::Durable,
                     "verification",
                     &check.id,
                     &format!("unavailable:{}", check.command),
@@ -816,6 +817,7 @@ impl AgentRuntime {
                     // not propagated.
                     self.dw_note_upsert_memory_fact(
                         handle,
+                        FactSource::Durable,
                         "verification",
                         &check.id,
                         &format!("failed:{}", check.command),
@@ -1099,6 +1101,7 @@ impl AgentRuntime {
             // drive re-heals), so the write error propagates typed.
             self.guarded_upsert_memory_fact(
                 handle,
+                FactSource::Durable,
                 "task",
                 "goal",
                 &truncate(&healed.goal, 200),
@@ -1112,6 +1115,7 @@ impl AgentRuntime {
         if state_fact.as_deref() != Some(&state_str) {
             self.guarded_upsert_memory_fact(
                 handle,
+                FactSource::Durable,
                 "task_state",
                 "state",
                 &state_str,
@@ -1127,6 +1131,7 @@ impl AgentRuntime {
             if criteria_fact.as_deref() != Some(canonical.as_str()) {
                 self.guarded_upsert_memory_fact(
                     handle,
+                    FactSource::Durable,
                     "criteria",
                     "0",
                     &canonical,
@@ -2212,14 +2217,29 @@ impl AgentRuntime {
 
     // ---- propagating wrap helpers (caller fails safely; typed error out) --
 
+    /// Durable immutable-task-fact write with an explicit SOURCE (audit
+    /// item 3): [`FactSource::Durable`] asserts the bytes are a projection
+    /// of durable rows/gate results, while [`FactSource::Model`] carries a
+    /// [`ModelOutput`] whose trust class must be completion capable —
+    /// ContextCompression/Ephemeral outputs are refused typed with NOTHING
+    /// written.
     pub(crate) fn guarded_upsert_memory_fact(
         &self,
         handle: &faktor_session::SessionHandle,
+        source: FactSource<'_>,
         kind: &str,
         key: &str,
         value: &str,
         site: &'static str,
     ) -> faktor_core::Result<()> {
+        if let Err(refusal) = source.check_completion_fact() {
+            tracing::error!(
+                session = %handle.id(),
+                site,
+                "memory-fact write refused by output trust: {refusal}"
+            );
+            return Err(FactSource::refusal_error(&refusal));
+        }
         if let Some(err) = self.take_durable_write_fault(site) {
             tracing::error!(session = %handle.id(), site, "durable memory-fact write failed (propagating): {err}");
             return Err(err);
@@ -2453,7 +2473,78 @@ impl AgentRuntime {
         }
     }
 
+    /// The infallible companion of [`Self::guarded_upsert_memory_fact`]:
+    /// same explicit source and same trust gate (audit item 3). A refused
+    /// source writes NOTHING — the refusal is surfaced loudly here because
+    /// this path cannot propagate an error (a completion-fact write from a
+    /// context-compression summary is a programming violation, never a
+    /// durable row).
     pub(crate) fn dw_note_upsert_memory_fact(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        source: FactSource<'_>,
+        kind: &str,
+        key: &str,
+        value: &str,
+        site: &'static str,
+    ) {
+        if let Err(refusal) = source.check_completion_fact() {
+            tracing::error!(
+                session = %handle.id(),
+                site,
+                kind,
+                key,
+                "memory-fact write refused by output trust: {refusal}"
+            );
+            return;
+        }
+        self.dw_note_memory_fact_record(handle, kind, key, value, site);
+    }
+
+    /// Durable PROVENANCE of one non-authoritative model artifact (audit
+    /// item 3): only a [`OutputTrust::ContextCompression`] output may author
+    /// a provenance row — every other class is refused loudly with nothing
+    /// written. This is the only durable write a compression output has:
+    /// [`Self::dw_note_upsert_memory_fact`] (and every completion/task-fact
+    /// writer) refuses that class typed, so provenance can never replace a
+    /// durable fact.
+    pub(crate) fn dw_note_upsert_provenance_fact(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        source: FactSource<'_>,
+        kind: &str,
+        key: &str,
+        value: &str,
+        site: &'static str,
+    ) {
+        let output = match source {
+            FactSource::Model(output) => output,
+            // Provenance names a model call: a durable projection has no
+            // call to point at.
+            FactSource::Durable => {
+                tracing::error!(
+                    session = %handle.id(),
+                    site,
+                    "provenance write refused: no model output named"
+                );
+                return;
+            }
+        };
+        if output.trust != OutputTrust::ContextCompression {
+            tracing::error!(
+                session = %handle.id(),
+                site,
+                trust = output.trust.provenance_tag(),
+                "provenance write refused: the author is not a context-compression output"
+            );
+            return;
+        }
+        self.dw_note_memory_fact_record(handle, kind, key, value, site);
+    }
+
+    /// The shared best-effort memory-fact row write (marker + fault
+    /// injection + typed failure intent); callers decide the trust gate.
+    fn dw_note_memory_fact_record(
         &self,
         handle: &faktor_session::SessionHandle,
         kind: &str,

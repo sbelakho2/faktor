@@ -1,7 +1,5 @@
 //! `runtime::turn::drive`: cohesive slice of the turn module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 impl AgentRuntime {
@@ -2396,6 +2394,7 @@ impl AgentRuntime {
                 // each lost write is recorded (marker + audit) and replayed.
                 self.dw_note_upsert_memory_fact(
                     handle,
+                    FactSource::Durable,
                     "task_state",
                     "state",
                     "blocked",
@@ -2440,6 +2439,7 @@ impl AgentRuntime {
                     // one; replay reconstructs the mirror rows.
                     self.dw_note_upsert_memory_fact(
                         handle,
+                        FactSource::Durable,
                         "task_state",
                         "state",
                         "blocked",
@@ -2477,6 +2477,7 @@ impl AgentRuntime {
                 // propagated — the refusal is the genuine outcome.
                 self.dw_note_upsert_memory_fact(
                     handle,
+                    FactSource::Durable,
                     "task_state",
                     "state",
                     "blocked",
@@ -2541,6 +2542,7 @@ impl AgentRuntime {
             // propagated — the typed refusal is the genuine outcome.
             self.dw_note_upsert_memory_fact(
                 handle,
+                FactSource::Durable,
                 "task_state",
                 "state",
                 "blocked",
@@ -3269,6 +3271,7 @@ impl AgentRuntime {
                     // (marker + audit) rather than failing the turn.
                     self.dw_note_upsert_memory_fact(
                         handle,
+                        FactSource::Durable,
                         "verification",
                         id,
                         &format!("unavailable:{command}"),
@@ -3308,6 +3311,7 @@ impl AgentRuntime {
                     // function: recorded (marker + audit), never propagated.
                     self.dw_note_upsert_memory_fact(
                         handle,
+                        FactSource::Durable,
                         "verification",
                         &check.id,
                         &format!("failed:{}", check.command),
@@ -3321,6 +3325,7 @@ impl AgentRuntime {
             // (recorded, not propagated: this verdict function is infallible).
             self.dw_note_upsert_memory_fact(
                 handle,
+                FactSource::Durable,
                 "verification",
                 id,
                 &format!("unavailable:{}", command),
@@ -3367,6 +3372,11 @@ impl AgentRuntime {
         // digests the same repo state the checks ran against. Attempts whose
         // required checks produced NO verdict (only unavailable ones) carry
         // no proof — there is nothing a record could certify.
+        // Audit item 3: only ADMITTED review evidence may back the durable
+        // proof (a compaction summary or an ephemeral output can never be
+        // admitted); the raw review value still gates through
+        // `review_blocking_reasons` above.
+        let review_evidence = admit_review_evidence(review.as_ref());
         let proof = if executed.is_empty() {
             None
         } else {
@@ -3379,7 +3389,7 @@ impl AgentRuntime {
                     &executed,
                     changed,
                     &ws,
-                    review.as_ref(),
+                    review_evidence.as_ref(),
                 )
                 .await,
             )

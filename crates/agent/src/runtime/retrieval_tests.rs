@@ -1,7 +1,5 @@
 //! `runtime::retrieval_tests`: out-of-line tests.
 
-#![allow(unused_imports)]
-
 use super::*;
 use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;

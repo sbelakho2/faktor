@@ -1,31 +1,6 @@
 //! `main_doctor_tests`: out-of-line slice of the CLI test module.
 
-#![allow(unused_imports)]
-
 use super::*;
-
-use super::*;
-
-use faktor_core::model::ModelCapabilities;
-
-use faktor_core::state::AgentState;
-
-use faktor_core::CancellationToken;
-
-use faktor_core::{Capability, CapabilitySet, OpId};
-
-use faktor_provider::testing::{sse_body, MockAction, MockServer};
-
-use faktor_provider::{
-    ContentPart, FakeProvider, GenericAgentRequest, ProviderChunk, ProviderError, RequestMessage,
-    RequestMeta, Role, ScriptedResponse, ToolSpec,
-};
-
-use faktor_terminal::{EnvSpec, ProcessOwner, SpawnConfig};
-
-use futures::StreamExt;
-
-use std::pin::Pin;
 
 #[test]
 fn doctor_plain_passes_on_a_healthy_store_and_fails_on_corruption() {
@@ -96,6 +71,15 @@ fn doctor_reports_network_isolation_strength_honestly() {
     } else {
         assert!(sandbox.contains("backend=unavailable"), "{sandbox}");
         assert!(sandbox.contains("refused typed"), "{sandbox}");
+        // Audit 18/19(a): the missing backend is reported as a TYPED
+        // platform boundary for THIS OS, with the honest reason — never a
+        // silently healthy state and never app-level proxy presented as
+        // confinement.
+        assert!(
+            sandbox.contains("typed platform boundary"),
+            "the refusal must read as a typed platform boundary: {sandbox}"
+        );
+        assert!(sandbox.contains(std::env::consts::OS), "{sandbox}");
         assert!(browser.contains("NOT OS-confined"), "{browser}");
         assert!(browser.contains(std::env::consts::OS), "{browser}");
         assert!(!browser.contains("OS-confined per child"), "{browser}");
@@ -596,10 +580,19 @@ fn doctor_reports_index_coverage_and_partial_fingerprint() {
     assert!(line.contains("files_indexed=5"), "{line}");
     assert!(line.contains("fingerprint=PARTIAL shard=3/"), "{line}");
     assert!(line.contains("reason=fingerprint_files"), "{line}");
-    // Legacy envelopes are NAMED, never silently reported complete.
+    // Pre-coverage envelopes are NAMED as legacy-unknown INCOMPLETE, never
+    // silently reported complete: absence of coverage metadata can never
+    // mean "clean".
     let legacy = format_index_coverage_line(ws.raw(), 1, None, None);
     assert!(
-        legacy.contains("coverage=legacy") && legacy.contains("fingerprint=legacy"),
+        legacy.contains("coverage=legacy_unknown")
+            && legacy.contains("fingerprint=legacy_unknown")
+            && legacy.contains("INCOMPLETE")
+            && legacy.contains("PARTIAL"),
+        "{legacy}"
+    );
+    assert!(
+        !legacy.contains("treated complete") && !legacy.contains("coverage=complete"),
         "{legacy}"
     );
 }
@@ -1447,5 +1440,3 @@ fn doctor_deep_flags_orphan_child_rows_and_a_missing_worktree_dir() {
     );
     let _ = wt_row_id;
 }
-
-use faktor_learning::LearningStore as _;

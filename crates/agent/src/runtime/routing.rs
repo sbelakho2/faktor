@@ -1,7 +1,5 @@
 //! `runtime::routing`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// True when a semantic risk level escalates risk-driven decisions (audits

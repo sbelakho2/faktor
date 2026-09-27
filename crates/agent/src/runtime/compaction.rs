@@ -1,7 +1,5 @@
 //! `runtime::compaction`: cohesive slice of the agent runtime.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The compaction model's dedicated system contract (P0 audit, round 11):
@@ -431,6 +429,11 @@ impl AgentRuntime {
         // fail-closed matrix: only RouterUnavailable may degrade to the
         // ledger summarizer (warned); every other refusal is a typed error
         // on the turn — compaction never silently substitutes a model.
+        // Audit item 3: the accepted summarizer text is captured here as a
+        // typed context-compression output so the provenance row below can
+        // name its trust class + durable call id.
+        let compaction_output_slot: Arc<std::sync::Mutex<Option<ModelOutput>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let (summarizer, _reservation, machine, trace): BudgetedSummarizer = if let Some(model) =
             self.deps.compaction_model.as_deref()
         {
@@ -445,6 +448,7 @@ impl AgentRuntime {
                     cancellation: cancel.child(),
                     summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
                     budget_marker: None,
+                    output_slot: compaction_output_slot.clone(),
                 }),
                 Err(e) => {
                     tracing::warn!(
@@ -475,6 +479,7 @@ impl AgentRuntime {
                             cancellation: cancel.child(),
                             summary_timeout: DEFAULT_SUMMARY_TIMEOUT,
                             budget_marker: None,
+                            output_slot: compaction_output_slot.clone(),
                         }),
                         None => {
                             return Err(Error::new(
@@ -630,6 +635,11 @@ impl AgentRuntime {
         //     a reconcile or the task-end finalize — never a refund;
         //   - never dispatched (summarizer never ran / not stream-capable)
         //     => refund the prediction.
+        // The provenance identity survives the attempt-machine block (which
+        // consumes `trace`): the real summarizer pair this call routed.
+        let compaction_identity: Option<(String, String)> = trace
+            .as_ref()
+            .map(|t| (t.provider.clone(), t.model.clone()));
         if let (Some(trace), Some(machine)) = (trace, machine) {
             let settled = plan.accepted
                 && matches!(
@@ -786,6 +796,42 @@ impl AgentRuntime {
             // CompactRejected is journaled by record_compaction.
             return Ok(None);
         }
+        // Audit item 3: an accepted LLM summary records its durable
+        // PROVENANCE — the context-compression trust class, the physical
+        // call id, the transcript deltas and the routed pair. The row is
+        // namespaced `compaction`/`provenance`: it is NOT a task fact, the
+        // completion/task-fact writers refuse this trust class typed, and
+        // nothing in this path touches the task_state/criteria/verification
+        // facts (compaction never rewrites durable authority).
+        if matches!(
+            plan.strategy,
+            faktor_context::CompactionStrategy::LlmSummary
+        ) {
+            let output = compaction_output_slot
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(output) = output {
+                if let Err(refusal) = self.record_compaction_provenance(
+                    handle,
+                    &output,
+                    &plan,
+                    compaction_identity
+                        .as_ref()
+                        .map(|(p, m)| (p.as_str(), m.as_str())),
+                ) {
+                    tracing::error!(
+                        session = %handle.id(),
+                        "compaction provenance refused by the trust gate: {refusal}"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    session = %handle.id(),
+                    "accepted LLM summary carried no captured model output; provenance not recorded"
+                );
+            }
+        }
         handle.put_task_ledger(serde_json::to_value(&plan.ledger)?)?;
         // Typed ledger watermark compaction (audit 27): an accepted
         // compaction also prunes the typed entry stream below the
@@ -848,6 +894,54 @@ impl AgentRuntime {
             }
         }
         Ok(Some(plan))
+    }
+
+    /// Record the durable provenance of one ACCEPTED context-compression
+    /// output (audit item 3). Only a
+    /// [`crate::OutputTrust::ContextCompression`] output may author a
+    /// provenance row — any other class is a typed [`TrustRefusal`]. The row
+    /// is namespaced `compaction`/`provenance` and is the ONLY durable write
+    /// a compression output can make: completion/immutable-task-fact writers
+    /// refuse this class typed, so provenance can never replace durable
+    /// facts.
+    pub(crate) fn record_compaction_provenance(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        output: &ModelOutput,
+        plan: &CompactionPlan,
+        identity: Option<(&str, &str)>,
+    ) -> Result<(), TrustRefusal> {
+        if output.trust != OutputTrust::ContextCompression {
+            return Err(TrustRefusal {
+                trust: output.trust,
+                required: "a context-compression output (only compression authors provenance)",
+            });
+        }
+        let strategy = match plan.strategy {
+            faktor_context::CompactionStrategy::LlmSummary => "llm_summary",
+            faktor_context::CompactionStrategy::DeterministicPruning => "deterministic",
+            faktor_context::CompactionStrategy::Rejected => "rejected",
+        };
+        let value = serde_json::json!({
+            "provenance": output.trust.provenance_tag(),
+            "call_id": output.call_id,
+            "strategy": strategy,
+            "before_tokens": plan.before_tokens,
+            "after_tokens": plan.after_tokens,
+            "target_tokens": plan.target_tokens,
+            "provider": identity.map(|(p, _)| p),
+            "model": identity.map(|(_, m)| m),
+        })
+        .to_string();
+        self.dw_note_upsert_provenance_fact(
+            handle,
+            FactSource::Model(output),
+            "compaction",
+            "provenance",
+            &value,
+            DW_SITE_COMPACTION_PROVENANCE,
+        );
+        Ok(())
     }
 
     /// Reserve the budget of one compaction summarizer BEFORE it streams and

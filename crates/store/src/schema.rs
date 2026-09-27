@@ -1,7 +1,6 @@
 //! `schema`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
+#[cfg(test)]
 use super::*;
 
 pub(crate) const MIGRATIONS: &[&str] = &[

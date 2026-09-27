@@ -1,7 +1,5 @@
 //! `config::billing`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[billing]` section: the Wave 3 commercial metering service

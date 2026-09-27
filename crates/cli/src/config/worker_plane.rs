@@ -1,7 +1,5 @@
 //! `config::worker_plane`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[worker_plane]` section: the DEPLOYMENT BOUNDARY of the

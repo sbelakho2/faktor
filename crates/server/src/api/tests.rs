@@ -1,9 +1,5 @@
 //! `api::tests`: shared fixtures for the api test modules.
 
-#![allow(unused_imports)]
-
-use super::super::*;
-
 pub(crate) use super::*;
 
 pub(crate) use crate::native::terminal_authority::TerminalService;

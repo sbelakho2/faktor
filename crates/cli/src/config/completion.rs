@@ -1,7 +1,6 @@
 //! `config::completion`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
+#[cfg(test)]
 use super::*;
 
 /// The additive `[completion]` section (P2 follow-up): how a contracted

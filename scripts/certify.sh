@@ -128,6 +128,13 @@
 # root for the ReleaseArtifactSet); CERTIFY_CI_CERTIFICATION (path of the
 # trusted workflow's certificate; default target/certification/ci-certification.json);
 # CERTIFY_RELEASE=1 is the env form of --release.
+# CERTIFY_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN (optional, gate 11): when
+# set, the GitHub API is queried for the repository description (must be the
+# Faktor-owned UI positioning) and for a CONCLUSIVE exact-SHA commit status of
+# the certified context; mismatches and missing/pending/non-success statuses
+# are violations. Without a token both facts are reported as external,
+# non-source (documented), never verified. CERTIFY_GITHUB_API overrides the
+# API base (hermetic fixtures / GitHub Enterprise).
 #
 # Release preconditions (all mandatory for RELEASE CERTIFICATE: PASS):
 #   * required_artifacts > 0 and matched == required and attested == required
@@ -287,8 +294,171 @@ check_ci_status_contract() { # [workflow_path] -> 0 ok, 1 violation
         bad "CI status contract: $workflow certificate must run with when.status: [success, failure] so a failed lane still publishes the required status"
         rc=1
     fi
+    # Audit 23: the workflow itself must publish the exact-SHA commit status
+    # (status-publish step, success AND failure) so a lane/certificate
+    # failure is visible on the shipped commit; startup/config failures are
+    # covered by Woodpecker's native pipeline-error status and re-verified by
+    # gate 11 through the GitHub API.
+    if ! grep -q '^  - name: status-publish$' "$workflow"; then
+        bad "CI status contract: $workflow must carry a status-publish step that publishes the exact-SHA commit status"
+        rc=1
+    elif ! grep -q 'scripts/certification/publish-status.mjs publish' "$workflow"; then
+        bad "CI status contract: $workflow status-publish must call scripts/certification/publish-status.mjs publish"
+        rc=1
+    elif ! awk '
+        /^  - name: status-publish$/ { in_step = 1; next }
+        in_step && /^  - name:/ { in_step = 0 }
+        in_step && /status: \[success, failure\]/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$workflow"; then
+        bad "CI status contract: $workflow status-publish must run with when.status: [success, failure]"
+        rc=1
+    fi
     [ "$rc" -eq 0 ] && ok "CI status contract: $workflow creates a trusted pipeline on every push and certificates run on success/failure"
     return "$rc"
+}
+
+# --------------------------------------- forge metadata + exact-SHA status --
+# Audit 22/23: the GitHub repository description and the commit status of the
+# EXACT shipped SHA are FORGE-SIDE facts, not source facts. When a GitHub
+# token is configured the check is live and fail-closed:
+#   * the repository description must be the Faktor-owned UI positioning
+#     (the same claim README.md makes); a mismatch is a violation — the
+#     legacy "foreign-compatible IDE UX" description must never certify;
+#   * the exact SHA must carry a status for the certified context
+#     (`ci/woodpecker/push/trusted` on main pushes) and that status must be
+#     CONCLUSIVE, not pending. A startup/config failure is published by
+#     Woodpecker's own forge integration as a non-success status for the
+#     same context, which refuses certification here; a pending status means
+#     no run ever concluded and also refuses.
+# Without a token (or when the API answers 401/403/404/reachability errors)
+# the check is reported as `external` — documented, non-source, never
+# silently treated as verified. CERTIFY_GITHUB_API points the check at a
+# fixture/enterprise endpoint; CERTIFY_TEST_GITHUB_REPO_JSON /
+# CERTIFY_TEST_GITHUB_STATUS_JSON plant hermetic responses for --selftest.
+FORGE_METADATA_STATUS="not-run"
+FORGE_METADATA_DETAIL=""
+FAKTOR_REPO_DESCRIPTION="Faktor — native Rust engineering runtime with Faktor-owned IDE UIs"
+
+check_forge_metadata() { # commit [context] -> 0 verified, 1 violation, 2 external
+    local commit="$1"
+    local context="${2:-ci/woodpecker/push/trusted}"
+    FORGE_METADATA_STATUS="not-run"
+    FORGE_METADATA_DETAIL=""
+    local token="${CERTIFY_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+    local api="${CERTIFY_GITHUB_API:-https://api.github.com}"
+    local expect="${CERTIFY_EXPECTED_REPO_DESCRIPTION:-$FAKTOR_REPO_DESCRIPTION}"
+    if [ -z "$commit" ]; then
+        FORGE_METADATA_STATUS="external"
+        FORGE_METADATA_DETAIL="no shipped commit resolved; forge metadata is external, non-source"
+        return 2
+    fi
+    if [ -z "$token" ] || [ -z "$REPO_FULL_NAME" ]; then
+        FORGE_METADATA_STATUS="external"
+        FORGE_METADATA_DETAIL="GitHub repo description and exact-SHA commit status are external, non-source facts; set CERTIFY_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN (and --repo) to verify them live"
+        return 2
+    fi
+    local tmp repo_file status_file code
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/faktor-cert-forge.XXXXXX")"
+    repo_file="$tmp/repo.json"
+    status_file="$tmp/status.json"
+    if [ -n "${CERTIFY_TEST_GITHUB_REPO_JSON:-}" ]; then
+        printf '%s' "$CERTIFY_TEST_GITHUB_REPO_JSON" >"$repo_file"
+        code="${CERTIFY_TEST_GITHUB_REPO_CODE:-200}"
+    else
+        code="$(curl -sS -o "$repo_file" -w '%{http_code}' \
+            -H "Authorization: Bearer $token" -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: faktor-certification' \
+            "$api/repos/$REPO_FULL_NAME" 2>/dev/null)" || code="000"
+    fi
+    if [ "$code" != "200" ]; then
+        FORGE_METADATA_STATUS="external"
+        FORGE_METADATA_DETAIL="GitHub repo metadata unreadable (HTTP $code); external, non-source — not verified"
+        rm -rf "$tmp"
+        return 2
+    fi
+    local description
+    description="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get("description"); print(v if isinstance(v,str) else "")' "$repo_file" 2>/dev/null)" || {
+        FORGE_METADATA_STATUS="mismatch"
+        FORGE_METADATA_DETAIL="GitHub repo metadata unreadable (malformed JSON)"
+        rm -rf "$tmp"
+        return 1
+    }
+    if [ "$description" != "$expect" ]; then
+        FORGE_METADATA_STATUS="mismatch"
+        FORGE_METADATA_DETAIL="forge-metadata-description-mismatch: got ${description:0:120}"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if [ -n "${CERTIFY_TEST_GITHUB_STATUS_JSON:-}" ]; then
+        printf '%s' "$CERTIFY_TEST_GITHUB_STATUS_JSON" >"$status_file"
+        code="${CERTIFY_TEST_GITHUB_STATUS_CODE:-200}"
+    else
+        code="$(curl -sS -o "$status_file" -w '%{http_code}' \
+            -H "Authorization: Bearer $token" -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: faktor-certification' \
+            "$api/repos/$REPO_FULL_NAME/commits/$commit/status" 2>/dev/null)" || code="000"
+    fi
+    if [ "$code" != "200" ]; then
+        FORGE_METADATA_STATUS="external"
+        FORGE_METADATA_DETAIL="GitHub commit status unreadable (HTTP $code); external, non-source — not verified"
+        rm -rf "$tmp"
+        return 2
+    fi
+    local verdict detail
+    if verdict="$(python3 - "$status_file" "$commit" "$context" <<'PY'
+import json
+import sys
+
+path, commit, context = sys.argv[1:4]
+try:
+    with open(path) as fh:
+        doc = json.load(fh)
+except Exception:
+    print("violation|forge-status-unreadable")
+    sys.exit(0)
+if not isinstance(doc, dict):
+    print("violation|forge-status-unreadable")
+    sys.exit(0)
+sha = doc.get("sha")
+if isinstance(sha, str) and sha != commit:
+    print("violation|forge-status-sha-mismatch")
+    sys.exit(0)
+statuses = doc.get("statuses")
+if not isinstance(statuses, list):
+    statuses = []
+matching = [s for s in statuses if isinstance(s, dict) and s.get("context") == context]
+if not matching:
+    print("violation|forge-status-absent")
+    sys.exit(0)
+latest = max(matching, key=lambda s: str(s.get("updated_at") or ""))
+state = str(latest.get("state") or "unknown")
+if state == "pending":
+    print("violation|forge-status-pending")
+elif state == "success":
+    print("ok|forge-status-success")
+elif state in ("failure", "error"):
+    print("violation|forge-status-not-success")
+else:
+    print("violation|forge-status-unknown")
+PY
+    )"; then
+        local kind="${verdict%%|*}" pdetail="${verdict#*|}"
+        if [ "$kind" = "ok" ]; then
+            FORGE_METADATA_STATUS="match"
+            FORGE_METADATA_DETAIL="description matches; $context state=success at $commit"
+            rm -rf "$tmp"
+            return 0
+        fi
+        FORGE_METADATA_STATUS="mismatch"
+        FORGE_METADATA_DETAIL="$pdetail ($context at $commit)"
+        rm -rf "$tmp"
+        return 1
+    fi
+    FORGE_METADATA_STATUS="mismatch"
+    FORGE_METADATA_DETAIL="forge-status-check-failed"
+    rm -rf "$tmp"
+    return 1
 }
 
 # ---------------------------------------------------------------- arguments --
@@ -2892,6 +3062,83 @@ YAML
         echo "selftest FAIL: the real trusted workflow violates the CI status contract" >&2
         failures=$((failures + 1))
     fi
+    # --- Audit 23: the status-publish step is load-bearing: a workflow
+    # without it fails the contract even when the certificate step runs on
+    # success/failure.
+    cat >"$tmp/status-no-publish.yaml" <<'YAML'
+when:
+  - event: [push, tag]
+steps:
+  - name: certificate
+    when:
+      status: [success, failure]
+YAML
+    if check_ci_status_contract "$tmp/status-no-publish.yaml" >/dev/null 2>&1; then
+        echo "selftest FAIL: a trusted workflow without status-publish must violate the CI status contract" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: a workflow without status-publish violates the CI status contract"
+    fi
+
+    # --- Audit 22/23: forge metadata + exact-SHA commit status matrix. All
+    # responses are hermetic fixtures (CERTIFY_TEST_GITHUB_*), so the matrix
+    # never touches the network; the live path is the same code with curl.
+    forge_sha="$(git rev-parse HEAD)"
+    forge_desc="Faktor — native Rust engineering runtime with Faktor-owned IDE UIs"
+    forge_repo_ok="$(python3 -c 'import json,sys; print(json.dumps({"full_name":sys.argv[1],"description":sys.argv[2]}))' acme/widgets "$forge_desc")"
+    forge_status_ok="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"success","statuses":[{"context":"ci/woodpecker/push/trusted","state":"success","updated_at":"2026-01-01T00:00:00Z"}]}))' "$forge_sha")"
+    forge_case() { # name want_rc repo_json status_json token -> asserts status/detail
+        local name="$1" want_rc="$2" repo="$3" status="$4" token="$5" rc
+        FORGE_METADATA_STATUS="not-run"
+        FORGE_METADATA_DETAIL=""
+        CERTIFY_GITHUB_TOKEN="$token" \
+        CERTIFY_TEST_GITHUB_REPO_JSON="$repo" \
+        CERTIFY_TEST_GITHUB_STATUS_JSON="$status" \
+            check_forge_metadata "$forge_sha" "ci/woodpecker/push/trusted" >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -eq "$want_rc" ]; then
+            echo "selftest ok: forge case $name -> rc=$rc status=$FORGE_METADATA_STATUS"
+        else
+            echo "selftest FAIL: forge case $name -> rc=$rc status=$FORGE_METADATA_STATUS (want $want_rc)" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    forge_case match 0 "$forge_repo_ok" "$forge_status_ok" selftest-token
+    [ "$FORGE_METADATA_STATUS" = "match" ] || { echo "selftest FAIL: forge match status=$FORGE_METADATA_STATUS" >&2; failures=$((failures + 1)); }
+    forge_repo_legacy="$(python3 -c 'import json,sys; print(json.dumps({"full_name":sys.argv[1],"description":sys.argv[2]}))' acme/widgets "Faktor — native Rust coding-agent runtime with foreign-compatible IDE UX")"
+    forge_case description-mismatch 1 "$forge_repo_legacy" "$forge_status_ok" selftest-token
+    case "$FORGE_METADATA_DETAIL" in
+    *forge-metadata-description-mismatch*)
+        echo "selftest ok: legacy compatibility description is a typed forge refusal" ;;
+    *)
+        echo "selftest FAIL: description mismatch detail=$FORGE_METADATA_DETAIL" >&2
+        failures=$((failures + 1)) ;;
+    esac
+    forge_status_absent="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"success","statuses":[{"context":"ci/other","state":"success"}]}))' "$forge_sha")"
+    forge_case status-absent 1 "$forge_repo_ok" "$forge_status_absent" selftest-token
+    forge_status_pending="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"pending","statuses":[{"context":"ci/woodpecker/push/trusted","state":"pending"}]}))' "$forge_sha")"
+    forge_case status-pending 1 "$forge_repo_ok" "$forge_status_pending" selftest-token
+    forge_status_failure="$(python3 -c 'import json,sys; print(json.dumps({"sha":sys.argv[1],"state":"failure","statuses":[{"context":"ci/woodpecker/push/trusted","state":"error"}]}))' "$forge_sha")"
+    forge_case status-error 1 "$forge_repo_ok" "$forge_status_failure" selftest-token
+    forge_status_sha="$(python3 -c 'import json,sys; print(json.dumps({"sha":"ffffffffffffffffffffffffffffffffffffffff","statuses":[{"context":"ci/woodpecker/push/trusted","state":"success"}]}))' )"
+    forge_case status-sha-mismatch 1 "$forge_repo_ok" "$forge_status_sha" selftest-token
+    forge_case repo-malformed 1 'not json' "$forge_status_ok" selftest-token
+    saved_gh="${GH_TOKEN:-}"
+    saved_github="${GITHUB_TOKEN:-}"
+    saved_certify_gh="${CERTIFY_GITHUB_TOKEN:-}"
+    unset CERTIFY_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN CERTIFY_TEST_GITHUB_REPO_JSON CERTIFY_TEST_GITHUB_STATUS_JSON
+    check_forge_metadata "$forge_sha" "ci/woodpecker/push/trusted" >/dev/null 2>&1
+    forge_rc=$?
+    if [ "$forge_rc" -eq 2 ] && [ "$FORGE_METADATA_STATUS" = "external" ] \
+        && printf '%s' "$FORGE_METADATA_DETAIL" | grep -q 'external, non-source'; then
+        echo "selftest ok: without a token the forge check is documented external, non-source"
+    else
+        echo "selftest FAIL: no-token forge check -> rc=$forge_rc status=$FORGE_METADATA_STATUS detail=$FORGE_METADATA_DETAIL" >&2
+        failures=$((failures + 1))
+    fi
+    [ -n "$saved_gh" ] && GH_TOKEN="$saved_gh"
+    [ -n "$saved_github" ] && GITHUB_TOKEN="$saved_github"
+    [ -n "$saved_certify_gh" ] && CERTIFY_GITHUB_TOKEN="$saved_certify_gh"
 
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -2918,7 +3165,22 @@ release_class="none"
 
 if [ "$SELFTEST" -eq 1 ]; then
     step "hermetic CI-verification selftest (mock Woodpecker API)"
-    if run_ci_selftest; then exit 0; else exit 1; fi
+    # Audit 12/13/15: the hermetic selftest also proves the capability probe
+    # algebra / load-bearing wiring markers and the shrink-only native DTO
+    # inventory, so `certify.sh --selftest` fails when those derivations rot.
+    capability_selftest=0
+    if command -v node >/dev/null 2>&1; then
+        if node scripts/capabilities-manifest.mjs --selftest &&
+            node scripts/protocol-codegen.mjs --selftest; then
+            printf 'selftest ok: capability axes + native DTO inventory self-tests\n'
+        else
+            printf 'selftest FAIL: capability axes or native DTO inventory self-test\n' >&2
+            capability_selftest=1
+        fi
+    else
+        printf 'NOTE: node unavailable; capability axes + native DTO inventory self-tests skipped\n' >&2
+    fi
+    if run_ci_selftest && [ "$capability_selftest" -eq 0 ]; then exit 0; else exit 1; fi
 fi
 
 if [ "$VERIFY_CI" -eq 0 ]; then
@@ -3042,6 +3304,23 @@ else
             fi
         fi
     fi
+    # Gate 11 (audit 22/23): forge-side repository description + exact-SHA
+    # commit status through the GitHub API. Without a token this is reported
+    # as external, non-source (documented, never treated as verified); with a
+    # token every mismatch and every missing/pending/non-success status for
+    # the exact shipped SHA is a violation.
+    if [ -n "$commit_sha" ]; then
+        step "gate 11/11: forge metadata + exact-SHA commit status (GitHub API)"
+        check_forge_metadata "$commit_sha" "$CONTEXT"
+        case "$?" in
+        0) ok "forge metadata verified: $FORGE_METADATA_DETAIL" ;;
+        2) ok "forge metadata external, non-source (documented, not verified): $FORGE_METADATA_DETAIL" ;;
+        *)
+            bad "forge metadata violation: $FORGE_METADATA_DETAIL"
+            status=1
+            ;;
+        esac
+    fi
 fi
 
 if [ "$ci_ran" -eq 1 ] && [ "$ci_status" -eq 0 ]; then
@@ -3068,6 +3347,7 @@ fi
 if [ "$LOCAL_ONLY" -eq 0 ]; then
     summary_gates+=("Woodpecker context $CONTEXT at the exact shipped commit")
     summary_gates+=("CI certification manifest ($CI_CERT_FILE): $CI_CERT_STATUS${CI_CERT_PROBLEM:+ ($CI_CERT_PROBLEM)}")
+    summary_gates+=("forge metadata + exact-SHA commit status: $FORGE_METADATA_STATUS${FORGE_METADATA_DETAIL:+ ($FORGE_METADATA_DETAIL)}")
 fi
 if [ "$release_class" = "release" ]; then
     summary_gates+=("release-class evidence: trusted context or verified signed attestation")

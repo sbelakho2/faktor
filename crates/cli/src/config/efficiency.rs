@@ -1,9 +1,5 @@
 //! `config::efficiency`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
-use super::*;
-
 /// The additive `[efficiency]` section (audit 86 + the efficiency-variant
 /// production flags): five independent boolean feature switches. In
 /// PRODUCTION every flag defaults ON — the efficiency system is active —

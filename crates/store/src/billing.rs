@@ -1,7 +1,5 @@
 //! `billing`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// One cost-reservation row whose task row is gone (P0-97 `doctor --deep`

@@ -1,7 +1,6 @@
 //! `config::commerce`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
+#[cfg(test)]
 use super::*;
 
 // --------------------------------------------------------------------------

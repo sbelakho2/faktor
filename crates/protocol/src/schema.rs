@@ -282,6 +282,163 @@ fn type_defs() -> Vec<TypeDef> {
                 ],
             },
         },
+        // ------------------------------------------------ native wire DTOs
+        //
+        // Audit 15 migration step 1: the attachment and task-run wire DTOs.
+        // Each type mirrors the daemon's own serde/JSON shape exactly; the
+        // Rust structs (`faktor_core::attachment::AttachmentId`, the
+        // orchestrator's durable run rows / the native handlers) stay the
+        // behavioral authority, and the generated TS/Kotlin clients consume
+        // these shapes instead of hand-rolled parsers.
+        TypeDef {
+            name: "AttachmentId",
+            doc: "One durable typed binary attachment: BLAKE3 digest (64 lowercase hex), mime, optional original filename and decompressed size. Decoders ignore unknown fields (the native additive-response contract); the daemon's own request DTO rejects them.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("digest"),
+                    text_field("mime"),
+                    nullable("filename", Ty::String),
+                    req("size", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "AttachmentUpload",
+            doc: "Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime.",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("mime"),
+                    field("filename", Ty::String, true, true),
+                    text_field("data_base64"),
+                ],
+            },
+        },
+        TypeDef {
+            name: "TaskRun",
+            doc: "One durable task run projection (native task-run list/state reads; additive: decoders ignore unknown fields).",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("task_id", Ty::I64),
+                    text_field("run_id"),
+                    text_field("mode"),
+                    text_field("state"),
+                    nullable("goal", Ty::String),
+                    req(
+                        "item_ids",
+                        Ty::List {
+                            of: Box::new(Ty::String),
+                        },
+                    ),
+                    nullable("model", Ty::String),
+                ],
+            },
+        },
+        TypeDef {
+            name: "TaskRunStarted",
+            doc: "Response of a native task-run start: the durable run identity and its current state (additive: unknown fields ignored).",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("task_id", Ty::I64),
+                    text_field("run_id"),
+                    text_field("state"),
+                ],
+            },
+        },
+        TypeDef {
+            name: "TaskRunCancelled",
+            doc: "Response of a native task-run cancel (additive: unknown fields ignored).",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![text_field("run_id"), req("cancelled", Ty::Bool)],
+            },
+        },
+        TypeDef {
+            name: "TaskRunWorkItem",
+            doc: "One wire work item of a native task-run start (the orchestrator's own JSON vocabulary).",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("id"),
+                    text_field("kind"),
+                    field("summary", Ty::String, true, true),
+                    field(
+                        "depends_on",
+                        Ty::List {
+                            of: Box::new(Ty::String),
+                        },
+                        true,
+                        true,
+                    ),
+                    field(
+                        "acceptance_checks",
+                        Ty::List {
+                            of: Box::new(Ty::String),
+                        },
+                        true,
+                        true,
+                    ),
+                    field("ownership", Ty::Json, true, true),
+                    field("required_capabilities", Ty::Json, true, true),
+                ],
+            },
+        },
+        TypeDef {
+            name: "TaskRunStartRequest",
+            doc: "Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here.",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("goal"),
+                    field(
+                        "criteria",
+                        Ty::List {
+                            of: Box::new(Ty::String),
+                        },
+                        true,
+                        true,
+                    ),
+                    field(
+                        "work_items",
+                        Ty::List {
+                            of: Box::new(Ty::Named {
+                                name: "TaskRunWorkItem",
+                            }),
+                        },
+                        true,
+                        true,
+                    ),
+                    field("ownership", Ty::Json, true, true),
+                    field("model", Ty::String, true, true),
+                    field("max_tokens", Ty::I64, true, true),
+                    field("max_cost_micro", Ty::Json, true, true),
+                    field("mutation_mode", Ty::String, true, true),
+                    field("routing_mode", Ty::String, true, true),
+                    field(
+                        "files",
+                        Ty::List {
+                            of: Box::new(Ty::String),
+                        },
+                        true,
+                        true,
+                    ),
+                    field(
+                        "attachments",
+                        Ty::List {
+                            of: Box::new(Ty::Named {
+                                name: "AttachmentId",
+                            }),
+                        },
+                        true,
+                        true,
+                    ),
+                    field("completion_contract", Ty::Json, true, true),
+                ],
+            },
+        },
     ]
 }
 
@@ -450,5 +607,86 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(value["schema"], SCHEMA_ID);
         assert_eq!(value["generator"], GENERATOR);
+    }
+
+    /// Audit 15: the migrated native wire DTOs must STAY in the canonical
+    /// schema — removing one is a generated-client regression, not a label
+    /// change.
+    #[test]
+    fn migrated_native_dtos_are_in_the_canonical_schema() {
+        let names: Vec<&str> = type_defs().iter().map(|def| def.name).collect();
+        for name in [
+            "AttachmentId",
+            "AttachmentUpload",
+            "TaskRun",
+            "TaskRunStarted",
+            "TaskRunCancelled",
+            "TaskRunWorkItem",
+            "TaskRunStartRequest",
+        ] {
+            assert!(
+                names.contains(&name),
+                "audit 15 migration: {name} must stay in the canonical schema"
+            );
+        }
+    }
+
+    /// The `AttachmentId` schema entry mirrors the REAL serde struct
+    /// (`faktor_core::attachment::AttachmentId`) field-for-field, including
+    /// the `deny_unknown_fields` strictness: a schema/wire mismatch is a
+    /// generated-client bug.
+    #[test]
+    fn attachment_id_schema_mirrors_the_real_serde_shape() {
+        use faktor_core::attachment::AttachmentId;
+        use faktor_core::hash::FileHash;
+
+        let value = AttachmentId {
+            digest: FileHash::from([7u8; 32]),
+            mime: "image/png".into(),
+            filename: Some("shot.png".into()),
+            size: 4,
+        };
+        let json = serde_json::to_value(&value).unwrap();
+        let object = json
+            .as_object()
+            .expect("AttachmentId serializes to an object");
+        let mut wire_keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        wire_keys.sort_unstable();
+        let def = type_defs()
+            .into_iter()
+            .find(|def| def.name == "AttachmentId")
+            .expect("AttachmentId is part of the canonical schema");
+        let Shape::Struct { fields } = def.shape else {
+            panic!("AttachmentId must be a struct")
+        };
+        let mut schema_keys: Vec<&str> = fields.iter().map(|f| f.name).collect();
+        schema_keys.sort_unstable();
+        assert_eq!(
+            wire_keys, schema_keys,
+            "schema must mirror every serde field"
+        );
+        assert!(
+            object["digest"].is_string(),
+            "digest is the hex wire string"
+        );
+        let without_name = AttachmentId {
+            digest: FileHash::from([7u8; 32]),
+            mime: "image/png".into(),
+            filename: None,
+            size: 4,
+        };
+        let without_name = serde_json::to_value(&without_name).unwrap();
+        assert!(
+            without_name["filename"].is_null(),
+            "an absent filename serializes as an explicit null (the nullable schema field)"
+        );
+        // `deny_unknown_fields` on the real type and the decoder contract
+        // differ BY DESIGN: the daemon's request DTO rejects a foreign member,
+        // while the generated decoders ignore unknown fields (the native
+        // additive-response contract). Both facts are pinned here.
+        let mut with_extra = object.clone();
+        with_extra.insert("extra".into(), serde_json::json!(1));
+        assert!(serde_json::from_value::<AttachmentId>(with_extra.into()).is_err());
+        assert_eq!(def.unknown_fields, "ignore");
     }
 }

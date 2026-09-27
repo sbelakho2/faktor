@@ -1,25 +1,10 @@
 //! `main_acp_tests`: out-of-line slice of the CLI test module.
 
-#![allow(unused_imports)]
-
-use super::*;
-
 use super::*;
 
 use faktor_core::model::ModelCapabilities;
 
-use faktor_core::state::AgentState;
-
-use faktor_core::CancellationToken;
-
-use faktor_core::{Capability, CapabilitySet, OpId};
-
-use faktor_provider::testing::{sse_body, MockAction, MockServer};
-
-use faktor_provider::{
-    ContentPart, FakeProvider, GenericAgentRequest, ProviderChunk, ProviderError, RequestMessage,
-    RequestMeta, Role, ScriptedResponse, ToolSpec,
-};
+use faktor_provider::{FakeProvider, GenericAgentRequest, ProviderChunk, ScriptedResponse};
 
 use faktor_terminal::{EnvSpec, ProcessOwner, SpawnConfig};
 
@@ -1461,5 +1446,3 @@ async fn acp_terminal_methods_are_method_not_found_when_not_negotiated() {
     drop(client);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 }
-
-use faktor_learning::LearningStore as _;

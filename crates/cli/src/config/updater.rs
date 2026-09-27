@@ -1,7 +1,5 @@
 //! `config::updater`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[updater]` section: the signed updater/distribution

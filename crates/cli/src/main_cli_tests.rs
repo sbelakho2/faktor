@@ -1,29 +1,16 @@
 //! `main_cli_tests`: out-of-line slice of the CLI test module.
 
-#![allow(unused_imports)]
-
-use super::*;
-
 use super::*;
 
 use faktor_core::model::ModelCapabilities;
 
 use faktor_core::state::AgentState;
 
-use faktor_core::CancellationToken;
-
-use faktor_core::{Capability, CapabilitySet, OpId};
-
-use faktor_provider::testing::{sse_body, MockAction, MockServer};
+use faktor_provider::testing::{MockAction, MockServer};
 
 use faktor_provider::{
-    ContentPart, FakeProvider, GenericAgentRequest, ProviderChunk, ProviderError, RequestMessage,
-    RequestMeta, Role, ScriptedResponse, ToolSpec,
+    FakeProvider, GenericAgentRequest, ProviderChunk, ProviderError, ScriptedResponse,
 };
-
-use faktor_terminal::{EnvSpec, ProcessOwner, SpawnConfig};
-
-use futures::StreamExt;
 
 use std::pin::Pin;
 
@@ -1313,5 +1300,3 @@ fn the_build_report_names_the_running_artifact_honestly() {
     assert!(cheap["self_sha256"].is_null());
     assert_eq!(cheap["version"], faktor_core::VERSION);
 }
-
-use faktor_learning::LearningStore as _;

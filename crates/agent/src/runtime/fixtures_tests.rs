@@ -1,7 +1,5 @@
 //! `runtime::fixtures_tests`: shared test fixtures (part 2).
 
-#![allow(unused_imports)]
-
 use super::*;
 use crate::runtime::tests::*;
 use crate::*;

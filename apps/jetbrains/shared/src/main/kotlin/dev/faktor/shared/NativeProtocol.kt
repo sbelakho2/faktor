@@ -761,33 +761,27 @@ data class NativeTaskCompletion(
     val steps: List<NativeCompletionStepStatus>
 )
 
-data class NativeTaskRun(
-    val taskId: Long,
-    val runId: String,
-    val mode: String,
-    val state: String,
-    val goal: String?,
-    val itemIds: List<String>,
-    val model: String?
-)
+/**
+ * One durable task run (`GET /native/session/{id}/task-runs...`). The shape
+ * and parser are GENERATED from the canonical schema
+ * (`crates/protocol/src/schema.rs` -> `GeneratedProtocolDto.kt`); the
+ * `Native*` name stays as an alias for existing call sites.
+ */
+typealias NativeTaskRun = ProtocolTaskRun
 
-data class NativeTaskRunStarted(val taskId: Long, val runId: String, val state: String)
+typealias NativeTaskRunStarted = ProtocolTaskRunStarted
 
-data class NativeTaskRunCancelled(val runId: String, val cancelled: Boolean)
+typealias NativeTaskRunCancelled = ProtocolTaskRunCancelled
 
 /**
  * One durable typed binary attachment (`POST /native/session/{id}/attachments`
  * and a task run's additive `attachments` member). `digest` is the daemon's
  * BLAKE3 CAS address (64 hex chars), `size` the decompressed byte count.
  * This is the ONLY identity an image attachment reaches the model through:
- * bytes live in the daemon store, never in the request DTO.
+ * bytes live in the daemon store, never in the request DTO. Generated from
+ * the canonical schema (`ProtocolAttachmentId`).
  */
-data class NativeAttachmentId(
-    val digest: String,
-    val mime: String,
-    val filename: String?,
-    val size: Long
-)
+typealias NativeAttachmentId = ProtocolAttachmentId
 
 /**
  * One durable run-family board post (`GET/POST /native/session/{id}/board`).
@@ -1746,45 +1740,32 @@ fun parseNativeBoardPost(json: String): NativeBoardPost =
 
 fun parseNativeTaskRuns(json: String): List<NativeTaskRun> {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/task-runs")
-    return v.array().map {
-        NativeTaskRun(
-            taskId = it.field("task_id").long(),
-            runId = it.field("run_id").string(),
-            mode = it.field("mode").string(),
-            state = it.field("state").string(),
-            goal = it.optionalField("goal")?.string(),
-            itemIds = it.optionalField("item_ids")?.stringArray() ?: emptyList(),
-            model = it.optionalField("model")?.string()
-        )
-    }
+    // Generated decoder (ProtocolTaskRun): required members and exact types,
+    // unknown additive fields ignored per the native v1 contract.
+    return v.array().map { parseProtocolTaskRun(it) }
 }
 
-fun parseNativeTaskRunStarted(json: String): NativeTaskRunStarted {
-    val v = JsonCodec.parse(json).view("POST /native/session/{id}/task-runs")
-    return NativeTaskRunStarted(
-        taskId = v.field("task_id").long(),
-        runId = v.field("run_id").string(),
-        state = v.field("state").string()
+fun parseNativeTaskRunStarted(json: String): NativeTaskRunStarted =
+    parseProtocolTaskRunStarted(JsonCodec.parse(json).view("POST /native/session/{id}/task-runs"))
+
+fun parseNativeTaskRunCancelled(json: String): NativeTaskRunCancelled =
+    parseProtocolTaskRunCancelled(
+        JsonCodec.parse(json).view("POST /native/session/{id}/task-runs/{run_id}/cancel")
     )
-}
 
-fun parseNativeTaskRunCancelled(json: String): NativeTaskRunCancelled {
-    val v = JsonCodec.parse(json).view("POST /native/session/{id}/task-runs/{run_id}/cancel")
-    return NativeTaskRunCancelled(
-        runId = v.field("run_id").string(),
-        cancelled = v.field("cancelled").bool()
-    )
-}
-
-/** Strict parse of one durable attachment id (`POST .../attachments`). */
+/** Strict parse of one durable attachment id (`POST .../attachments`); the
+ *  generated decoder owns the shape, the digest/size invariants the native
+ *  surface additionally promises are checked here. */
 fun parseNativeAttachmentId(json: String): NativeAttachmentId {
     val v = JsonCodec.parse(json).view("POST /native/session/{id}/attachments")
-    return NativeAttachmentId(
-        digest = v.field("digest").string(),
-        mime = v.field("mime").string(),
-        filename = v.optionalField("filename")?.string(),
-        size = v.field("size").long()
-    )
+    val id = parseProtocolAttachmentId(v)
+    if (!Regex("^[0-9a-f]{64}$").matches(id.digest)) {
+        missing("POST /native/session/{id}/attachments", "expected a 64-char lowercase hex digest")
+    }
+    if (id.size < 0) {
+        missing("POST /native/session/{id}/attachments", "expected a non-negative size")
+    }
+    return id
 }
 
 fun parseNativeAgents(json: String): List<NativeAgent> {

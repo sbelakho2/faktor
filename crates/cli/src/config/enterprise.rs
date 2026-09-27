@@ -1,7 +1,5 @@
 //! `config::enterprise`: schema domain of the daemon config.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// The additive `[enterprise]` section: the enterprise retention/audit/

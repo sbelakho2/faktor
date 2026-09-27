@@ -110,6 +110,15 @@ field is a **quoted decimal string**, never a JSON number:
 
 Implemented (this revision of the daemon):
 
+The codegen classification of EVERY endpoint below (`generated` |
+`handwritten-grandfathered` | `no-body` | `streaming-special-case`) and the
+shrink-only handwritten budget live in
+`crates/protocol/schema/CODEGEN.md`; `node scripts/protocol-codegen.mjs
+--check` fails when a route is added without classification, when a
+`generated` DTO leaves the canonical schema, or when the audited
+handwritten set grows. The migrated attachment and task-run DTOs are
+generated into both IDE clients (`ProtocolAttachmentId`, `ProtocolTaskRun*`).
+
 - `GET /session/{id}/projection` — one JSON snapshot of the session's
   state for UI badges/polling:
   `{ session: {id,title,provider,model,lifecycle}, state:

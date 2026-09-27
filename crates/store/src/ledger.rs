@@ -1,7 +1,5 @@
 //! `ledger`: cohesive slice of the mechanically decomposed parent module.
 
-#![allow(unused_imports)]
-
 use super::*;
 
 /// One memory-fact row including its durable `updated_ms` (the paging
@@ -2098,10 +2096,6 @@ impl Store {
 mod tests {
     use super::*;
 
-    use super::*;
-
-    use faktor_core::state::TaskState;
-
     pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path(), true).unwrap();
@@ -2662,8 +2656,6 @@ mod tests {
 
 #[cfg(test)]
 mod typed_ledger_tests {
-    use super::*;
-
     use super::*;
 
     pub(crate) fn tmp_store() -> (tempfile::TempDir, Store) {

@@ -88,6 +88,72 @@ data class ProtocolAgentStateView(
     val terminal: Boolean
 )
 
+/** One durable typed binary attachment: BLAKE3 digest (64 lowercase hex), mime, optional original filename and decompressed size. Decoders ignore unknown fields (the native additive-response contract); the daemon's own request DTO rejects them. (unknown_fields: ignore) */
+data class ProtocolAttachmentId(
+    val digest: String,
+    val mime: String,
+    val filename: String?,
+    val size: Long
+)
+
+/** Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime. (unknown_fields: reject) */
+data class ProtocolAttachmentUpload(
+    val mime: String,
+    val filename: String?,
+    val dataBase64: String
+)
+
+/** One durable task run projection (native task-run list/state reads; additive: decoders ignore unknown fields). (unknown_fields: ignore) */
+data class ProtocolTaskRun(
+    val taskId: Long,
+    val runId: String,
+    val mode: String,
+    val state: String,
+    val goal: String?,
+    val itemIds: List<String>,
+    val model: String?
+)
+
+/** Response of a native task-run start: the durable run identity and its current state (additive: unknown fields ignored). (unknown_fields: ignore) */
+data class ProtocolTaskRunStarted(
+    val taskId: Long,
+    val runId: String,
+    val state: String
+)
+
+/** Response of a native task-run cancel (additive: unknown fields ignored). (unknown_fields: ignore) */
+data class ProtocolTaskRunCancelled(
+    val runId: String,
+    val cancelled: Boolean
+)
+
+/** One wire work item of a native task-run start (the orchestrator's own JSON vocabulary). (unknown_fields: reject) */
+data class ProtocolTaskRunWorkItem(
+    val id: String,
+    val kind: String,
+    val summary: String?,
+    val dependsOn: List<String>?,
+    val acceptanceChecks: List<String>?,
+    val ownership: JsonValue?,
+    val requiredCapabilities: JsonValue?
+)
+
+/** Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. (unknown_fields: reject) */
+data class ProtocolTaskRunStartRequest(
+    val goal: String,
+    val criteria: List<String>?,
+    val workItems: List<ProtocolTaskRunWorkItem>?,
+    val ownership: JsonValue?,
+    val model: String?,
+    val maxTokens: Long?,
+    val maxCostMicro: JsonValue?,
+    val mutationMode: String?,
+    val routingMode: String?,
+    val files: List<String>?,
+    val attachments: List<ProtocolAttachmentId>?,
+    val completionContract: JsonValue?
+)
+
 // -------------------------------------------------------- parse functions
 
 fun parseProtocolMessage(v: JsonView): ProtocolMessage {
@@ -218,6 +284,97 @@ fun parseProtocolAgentStateView(v: JsonView): ProtocolAgentStateView {
         label = v.field("label").string(),
         active = v.field("active").bool(),
         terminal = v.field("terminal").bool(),
+    )
+}
+
+fun parseProtocolAttachmentId(v: JsonView): ProtocolAttachmentId {
+    return ProtocolAttachmentId(
+        digest = v.field("digest").string(),
+        mime = v.field("mime").string(),
+        filename = v.optionalField("filename")?.string(),
+        size = v.field("size").long(),
+    )
+}
+
+fun parseProtocolAttachmentUpload(v: JsonView): ProtocolAttachmentUpload {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("mime", "filename", "data_base64")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolAttachmentUpload(
+        mime = v.field("mime").string(),
+        filename = v.optionalField("filename")?.string(),
+        dataBase64 = v.field("data_base64").string(),
+    )
+}
+
+fun parseProtocolTaskRun(v: JsonView): ProtocolTaskRun {
+    return ProtocolTaskRun(
+        taskId = v.field("task_id").long(),
+        runId = v.field("run_id").string(),
+        mode = v.field("mode").string(),
+        state = v.field("state").string(),
+        goal = v.optionalField("goal")?.string(),
+        itemIds = v.field("item_ids").array().map { it.string() },
+        model = v.optionalField("model")?.string(),
+    )
+}
+
+fun parseProtocolTaskRunStarted(v: JsonView): ProtocolTaskRunStarted {
+    return ProtocolTaskRunStarted(
+        taskId = v.field("task_id").long(),
+        runId = v.field("run_id").string(),
+        state = v.field("state").string(),
+    )
+}
+
+fun parseProtocolTaskRunCancelled(v: JsonView): ProtocolTaskRunCancelled {
+    return ProtocolTaskRunCancelled(
+        runId = v.field("run_id").string(),
+        cancelled = v.field("cancelled").bool(),
+    )
+}
+
+fun parseProtocolTaskRunWorkItem(v: JsonView): ProtocolTaskRunWorkItem {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("id", "kind", "summary", "depends_on", "acceptance_checks", "ownership", "required_capabilities")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolTaskRunWorkItem(
+        id = v.field("id").string(),
+        kind = v.field("kind").string(),
+        summary = v.optionalField("summary")?.string(),
+        dependsOn = v.optionalField("depends_on")?.array()?.map { it.string() },
+        acceptanceChecks = v.optionalField("acceptance_checks")?.array()?.map { it.string() },
+        ownership = v.optionalField("ownership")?.value,
+        requiredCapabilities = v.optionalField("required_capabilities")?.value,
+    )
+}
+
+fun parseProtocolTaskRunStartRequest(v: JsonView): ProtocolTaskRunStartRequest {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("goal", "criteria", "work_items", "ownership", "model", "max_tokens", "max_cost_micro", "mutation_mode", "routing_mode", "files", "attachments", "completion_contract")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolTaskRunStartRequest(
+        goal = v.field("goal").string(),
+        criteria = v.optionalField("criteria")?.array()?.map { it.string() },
+        workItems = v.optionalField("work_items")?.array()?.map { parseProtocolTaskRunWorkItem(it) },
+        ownership = v.optionalField("ownership")?.value,
+        model = v.optionalField("model")?.string(),
+        maxTokens = v.optionalField("max_tokens")?.long(),
+        maxCostMicro = v.optionalField("max_cost_micro")?.value,
+        mutationMode = v.optionalField("mutation_mode")?.string(),
+        routingMode = v.optionalField("routing_mode")?.string(),
+        files = v.optionalField("files")?.array()?.map { it.string() },
+        attachments = v.optionalField("attachments")?.array()?.map { parseProtocolAttachmentId(it) },
+        completionContract = v.optionalField("completion_contract")?.value,
     )
 }
 

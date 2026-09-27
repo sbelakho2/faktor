@@ -230,37 +230,46 @@ authoritative surface and is scan-enforced.
   the adapters' own contract suites and the `[soak]`/`[fault]` lanes.
 
 <!-- capability-axes:start -->
-| Capability | wired | adapter_certified | daemon_e2e_certified | platforms_certified | external_dependency |
-| --- | --- | --- | --- | --- | --- |
-| `acquisition_planner` | true | true | true | darwin,linux,windows | faked |
-| `identity_cache` | true | true | true | darwin,linux,windows | faked |
-| `vision` | true | true | true | darwin,linux,windows | faked |
-| `retrieval` | true | true | true | darwin,linux,windows | faked |
-| `scm` | true | true | true | darwin,linux,windows | faked |
-| `jobs` | true | false | true | darwin,linux,windows | faked |
+| Capability | wired | adapter_test_defined | daemon_e2e_test_defined | platform_lane_defined | adapter_certified | daemon_e2e_certified | platforms_certified | external_dependency |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `acquisition_planner` | true | true | true | darwin,linux,windows | false | false | none | faked |
+| `identity_cache` | true | true | true | darwin,linux,windows | false | false | none | faked |
+| `vision` | true | true | true | darwin,linux,windows | false | false | none | faked |
+| `retrieval` | true | true | true | darwin,linux,windows | false | false | none | faked |
+| `scm` | true | true | true | darwin,linux,windows | false | false | none | faked |
+| `jobs` | true | false | true | darwin,linux,windows | false | false | none | faked |
 <!-- capability-axes:end -->
 
-The five fields above are DERIVED, not written: `scripts/capabilities-manifest.mjs`
+The eight fields above are DERIVED, not written: `scripts/capabilities-manifest.mjs`
 probes the production constructors and the `tests/production-wiring` suite and
-writes `target/certification/capabilities.json`. `bash scripts/check-docs-sync.sh`
-compares this table field-by-field against that manifest and rejects any
-hand-written binary capability claim outside the marked block.
+writes `target/certification/capabilities.json`. The first four columns are
+STRUCTURAL (they only say what exists in the tree: production wiring, a
+defined adapter test, a defined daemon-e2e test, and the trusted-workflow
+lanes that run the workspace tests). The certified columns are EVIDENTIARY
+and stay `false`/`none` until the trusted workflow writes its own HEAD- and
+tree-bound `faktor-ci-certification/v2` certificates at this exact commit —
+a merely defined test never certifies. The committed README under-claims
+(`false`/`none`) because certificate objects are host state, not committed
+artifacts; `bash scripts/check-docs-sync.sh` compares this table against the
+derived manifest (structural fields exactly, certified fields never
+over-claimed) and rejects any hand-written binary capability claim outside
+the marked block.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| PR/CI-fix completion contract | IMPLEMENTED (gate + ordered step execution; native PR via the canonical GitHub App adapter) | `crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/orchestrator/src/completion_steps.rs`, `crates/scm/src/completion.rs`, `crates/cli/src/main.rs` (`[cloud.github_app]` wiring), §3.3 |
+| PR/CI-fix completion contract | IMPLEMENTED (gate + ordered step execution; native PR via the canonical GitHub App adapter) | `crates/session/src/task/`, `crates/session/src/ledger/`, `crates/orchestrator/src/task_executor.rs`, `crates/orchestrator/src/completion_steps.rs`, `crates/scm/src/completion.rs`, `crates/cli/src/main.rs` (`[cloud.github_app]` wiring), §3.3 |
 | Coordination board | IMPLEMENTED (durable ledger rows + native `GET/POST /native/session/{id}/board` + both IDE board panels with truthful unavailable state) | `crates/session/src/board.rs`, `crates/server/src/native/board.rs`, `apps/vscode/src/nativeClient.ts`, `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt` |
 | Multi-candidate tournament | IMPLEMENTED | `crates/orchestrator/src/tournament.rs` + native start/state/list endpoints; integration stays an explicit approved merge |
-| Pixel agents | IMPLEMENTED | `apps/vscode/src/pixelAgents.ts` + JetBrains `PixelAgents.kt` (identical FNV-1a hashes) |
+| Pixel agents | IMPLEMENTED | `apps/vscode/src/pixelAgents.ts` + JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt` (identical FNV-1a hashes) |
 | Canonical child blockers | IMPLEMENTED | `crates/session/src/child.rs` (`child_runtime` v23 row) + native agent projection |
 | Presentation continuity | IMPLEMENTED | durable `child_presentation_changed` fold + `POST /native/session/{id}/agents/{child}/presentation` (`crates/session/src/child.rs`, `crates/server/src/native/agents.rs`; presentation only, same ChildId/lineage) |
-| Materialize → verify → land | IMPLEMENTED | durable `IntegrationRecord` with real final-root verification (`crates/session/src/ledger.rs` `IntegrationRecordRow`, `crates/orchestrator/src/task_executor.rs`); owner edits invalidate |
+| Materialize → verify → land | IMPLEMENTED | durable `IntegrationRecord` with real final-root verification (`crates/session/src/ledger/` `IntegrationRecordRow`, `crates/orchestrator/src/task_executor.rs`); owner edits invalidate |
 | Typed criterion proofs | IMPLEMENTED | `NoOpDisposition::RequiresCriterionProof` (`crates/core/src/state.rs`) + independent reviewer proof validated before completion steps run (`crates/orchestrator/src/task_executor.rs` `run_completion_steps_against_proof`) |
 | OpenAI Responses family | IMPLEMENTED | native `OpenAiFamily::Responses` dispatch + `responses_body`/`responses_stream` (`crates/openai/src/lib.rs`), CLI `api=chat\|responses` (`crates/cli/src/config.rs` `OpenAiApi`) |
 | Windows containment (Job Objects + ConPTY) | IMPLEMENTED | `crates/winjob/src/lib.rs`, `crates/terminal/src/lib.rs` (`JobGuard`), `crates/pty/src/windows.rs` (spawn suspended → assign → resume; no taskkill guarantee) |
 | Certification evidence chain | IMPLEMENTED | `scripts/certification/evidence.mjs` (`faktor-cert-evidence/v1`, `verify-markers`), `scripts/certification/evidence.schema.json`, `scripts/certify-local.sh` (`evidence_gate`), v2 lane markers in `.woodpecker/untrusted/pr.yaml` |
 | VS Code Faktor panel | IMPLEMENTED | `apps/vscode/src/webview.ts` + `apps/vscode/media/chat.js` (`apps/vscode/scripts/selftest.mjs`, `apps/vscode/scripts/verify-vsix.mjs`) |
-| JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json`: 11/11 rows against canned frames and the fake daemon |
-| JetBrains visual parity | IMPLEMENTED (offscreen render vs pinned baselines) | same matrix: 8 rendered panels against `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json` |
-| UI parity (`ui_parity`) | IMPLEMENTED (derived in `target/certification/capabilities.json`) | Faktor-owned VS Code panel + JetBrains behavioral/visual axes |
+| JetBrains behavioral parity | IMPLEMENTED (HEAD-bound executable matrix) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` writes `target/certification/jetbrains-parity.json` (generated): 11/11 rows against canned frames and the fake daemon |
+| JetBrains visual parity | IMPLEMENTED (offscreen render vs pinned per-platform baselines; certification is per platform, never inherited) | same matrix: 8 rendered panels compared against THIS platform's own record in `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json` — a platform with no record reads not certified on that platform (Windows today) and the release claim stays refused by `scripts/check-visual-platforms.mjs --release` until every required record exists |
+| UI parity (`ui_parity`) | IMPLEMENTED (derived in `target/certification/capabilities.json` (generated)) | Faktor-owned VS Code panel + JetBrains behavioral/visual axes |
 | Repo rename (faktor) | DONE (external) | `gh repo rename`; in-tree branding was already Faktor and is unchanged |
