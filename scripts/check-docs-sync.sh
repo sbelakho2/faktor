@@ -238,10 +238,31 @@ for doc in "$DOC" "${TRUTH_DOCS[@]}"; do
         "describes the Faktor-owned UI as BLOCKED_EXTERNAL although its executable axes exist"
 done
 
+# 6. Capability axes (audit 18): target/certification/capabilities.json is the
+#    machine-readable source of truth for the per-capability certification
+#    axes (wired / adapter_certified / daemon_e2e_certified /
+#    platforms_certified / external_dependency). The README's
+#    capability-axes block is compared field-by-field against the derived
+#    fields; a manual binary claim anywhere else in README/docs is rejected.
+#    The derivation lives in scripts/capabilities-manifest.mjs (node); when
+#    node is unavailable on this host the check is SKIPPED loudly — the
+#    certificate lanes that carry node (and `scripts/certify-local.sh`)
+#    re-derive and enforce the same fields.
+if command -v node >/dev/null 2>&1; then
+    if node scripts/capabilities-manifest.mjs --check-claims; then
+        echo "capability axes: README claims match target/certification/capabilities.json"
+    else
+        echo "CONTRADICTION: the README/docs capability-axes block disagrees with the derived capabilities.json" >&2
+        fail=1
+    fi
+else
+    echo "SKIPPED: node is unavailable; the capability-axes claims were not re-derived on this host" >&2
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "$DOC / ${TRUTH_DOCS[*]} are out of sync with the code — fix the items listed above before merging." >&2
     exit 1
 fi
 
 echo "docs/architecture.md is in sync: no stale identifiers, current API names present."
-echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, Faktor-owned UI, real apps/ panels)."
+echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, Faktor-owned UI, real apps/ panels, capability axes)."

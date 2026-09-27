@@ -8,10 +8,14 @@
 //
 //   target/certification/capabilities.json
 //
-// and verifies that the capability table in docs/certification.md carries
-// the exact same status for every surface (`--check`, the drift test). A
-// mismatch — a stale prose label, a missing row, or a status that no longer
-// matches the tree — exits non-zero.
+// The same manifest carries the per-capability CERTIFICATION AXES
+// (`axes.<capability>.{wired, adapter_certified, daemon_e2e_certified,
+// platforms_certified, external_dependency}`), derived from production
+// construction markers and the `tests/production-wiring` suite (whose tests
+// drive the executable's own `build_daemon_core` with fake external seams),
+// plus the Woodpecker lanes that actually run the workspace tests. Prose
+// never moves a field: the README claims block is compared field-by-field
+// against this manifest.
 //
 // Usage:
 //   node scripts/capabilities-manifest.mjs                 generate + drift check
@@ -30,6 +34,7 @@ const OUT_DIR = process.env.CAPABILITIES_OUT_DIR || 'target/certification';
 const MANIFEST_PATH = resolve(ROOT, OUT_DIR, 'capabilities.json');
 const DOC_PATH = resolve(ROOT, 'docs/certification.md');
 const GENERATE_ONLY = process.argv.includes('--generate-only');
+const CHECK_CLAIMS = process.argv.includes('--check-claims');
 
 const file = (rel) => existsSync(resolve(ROOT, rel));
 
@@ -384,6 +389,349 @@ const SURFACES = {
   }),
 };
 
+// ------------------------------------------- capability certification axes
+//
+// The five axes of every capability are DERIVED, never written:
+//
+//   * wired                 — the production construction markers exist (the
+//                             daemon really assembles this capability);
+//   * adapter_certified     — the adapter/contract-mock test exists;
+//   * daemon_e2e_certified  — a `tests/production-wiring` test drives the
+//                             executable's own `build_daemon_core` graph for
+//                             this capability (the suite is the source);
+//   * platforms_certified   — the Woodpecker lanes whose commands really run
+//                             the workspace tests (derived from the workflow
+//                             files, not asserted);
+//   * external_dependency   — `faked` when the certification substitutes an
+//                             external seam (loopback/fake server, fake
+//                             transport) for this capability's tests, `none`
+//                             when the capability runs over durable local
+//                             state only.
+//
+// tests/production-wiring is the daemon-e2e source: its tests compile the
+// faktor-cli binary as a library and call `build_production_graph*`, so a
+// certified axis is an executed daemon path, never a hand-built rig.
+
+const PW_ROOT = 'tests/production-wiring';
+const PW_TESTS = `${PW_ROOT}/tests`;
+
+/** The exact test file(s) whose fn must exist for a daemon-e2e axis. */
+function hasTestFunction(rel, fn) {
+  return hasText(rel, `fn ${fn}(`);
+}
+
+function anyProbe(probes) {
+  return probes.some(([rel, needle]) =>
+    needle === undefined ? hasText(rel, 'fn ') : hasText(rel, needle),
+  );
+}
+
+/** Platform lanes that run the workspace tests (derived from the trusted
+ *  workflow's lane blocks, so an unexecuted platform can never appear). */
+function platformsCertified() {
+  const workflow = file('.woodpecker/trusted/trusted.yaml')
+    ? readText('.woodpecker/trusted/trusted.yaml')
+    : '';
+  const platforms = new Set();
+  for (const block of workflow.split(/\n  - name: /).slice(1)) {
+    if (!/cargo test --workspace\b/.test(block)) {
+      continue;
+    }
+    for (const match of block.matchAll(/platform: (linux|darwin|windows)\//g)) {
+      platforms.add(match[1]);
+    }
+  }
+  return [...platforms].sort();
+}
+
+const AXIS_SPECS = {
+  acquisition_planner: {
+    wired: [
+      ['crates/cli/src/daemon/builder.rs', 'build_daemon_with_acquisition_planner'],
+      ['crates/cli/src/daemon/builder.rs', 'open_commerce_service_with_planner'],
+    ],
+    adapter_certified: [
+      [`${PW_TESTS}/marketplace_auth.rs`, 'fn signed_alibaba_request_is_verified_by_the_contract_mock('],
+    ],
+    daemon_e2e_certified: [
+      [`${PW_TESTS}/commerce.rs`, 'fn daemon_tool_quote_runs_the_production_planner_decisions('],
+      [`${PW_TESTS}/commerce.rs`, 'struct SpyPlanner'],
+    ],
+  },
+  identity_cache: {
+    wired: [
+      ['crates/commerce/src/service.rs', 'fn cache_identity('],
+      ['crates/commerce/src/service.rs', 'fn observation_identity('],
+    ],
+    adapter_certified: [
+      [`${PW_TESTS}/commerce.rs`, 'fn configured_account_scope_reaches_cache_identity('],
+    ],
+    daemon_e2e_certified: [
+      [`${PW_TESTS}/commerce.rs`, 'fn configured_account_scope_reaches_cache_identity('],
+      [`${PW_TESTS}/commerce.rs`, 'fn authenticated_prices_never_enter_the_public_cache('],
+    ],
+  },
+  vision: {
+    wired: [
+      ['crates/provider/src/lib.rs', 'pub const SUPPORTED_IMAGE_MIMES'],
+      ['crates/provider/src/lib.rs', 'pub struct ContentPart'],
+    ],
+    adapter_certified: [
+      [`${PW_TESTS}/vision.rs`, 'fn adapter_serializes_ordered_media_parts_byte_exact('],
+    ],
+    daemon_e2e_certified: [
+      [`${PW_TESTS}/vision.rs`, 'fn vision_turn_routes_through_the_agent_and_sends_ordered_media('],
+      [`${PW_TESTS}/vision.rs`, 'fn non_vision_model_refuses_before_dispatch('],
+    ],
+  },
+  retrieval: {
+    wired: [
+      ['crates/agent/src/runtime.rs', 'fn index_service('],
+      ['crates/cli/src/daemon/builder.rs', 'IndexService::open_with_supervisor('],
+    ],
+    adapter_certified: [
+      [
+        'crates/agent/src/runtime/retrieval_tests.rs',
+        'fn configured_embedder_fuses_semantically_matched_evidence_into_the_request(',
+      ],
+    ],
+    daemon_e2e_certified: null, // probed generically: see retrievalDaemonE2e()
+  },
+  scm: {
+    wired: [
+      ['crates/cli/src/daemon/wiring.rs', 'fn wire_completion_scm('],
+      ['crates/scm/src/completion.rs', 'pub struct GitHubCompletionScm'],
+    ],
+    adapter_certified: [
+      [
+        `${PW_TESTS}/completion_scm_adapter_contract.rs`,
+        'fn manual_completion_scm_adapter_contract_and_embedded_host_injection(',
+      ],
+    ],
+    daemon_e2e_certified: [
+      [`${PW_TESTS}/completion_scm.rs`, 'fn completion_pr_goes_through_the_production_github_app_adapter('],
+    ],
+  },
+  jobs: {
+    wired: [
+      ['crates/commerce/src/service.rs', 'pub struct CommerceSourceService'],
+    ],
+    adapter_certified: null,
+    daemon_e2e_certified: [
+      [`${PW_TESTS}/commerce.rs`, 'fn job_status_is_requester_scoped('],
+    ],
+  },
+};
+
+/** The daemon-e2e retrieval certification: any `tests/production-wiring`
+ *  test file that both reaches the production builder and names a retrieval
+ *  test function. A sibling may land it in its own file; when absent the
+ *  axis stays false with an explicit reason (never a guessed label). */
+function retrievalDaemonE2e() {
+  if (!dir(PW_TESTS)) {
+    return { ok: false, detail: 'tests/production-wiring/tests is absent' };
+  }
+  for (const name of readdirSync(resolve(ROOT, PW_TESTS)).sort()) {
+    if (!name.endsWith('.rs')) {
+      continue;
+    }
+    const rel = `${PW_TESTS}/${name}`;
+    const src = readText(rel);
+    if (
+      src.includes('build_production_graph') &&
+      /fn [a-z0-9_]*retriev[a-z0-9_]*\(/i.test(src) &&
+      /evidence/i.test(src)
+    ) {
+      return { ok: true, evidence: [rel], detail: `daemon-core retrieval test in ${rel}` };
+    }
+  }
+  return {
+    ok: false,
+    detail:
+      'no tests/production-wiring test drives retrieval through build_production_graph (the ' +
+      'daemon-core retrieval behaviors are certified only at the agent runtime today)',
+  };
+}
+
+/** The external seams a capability's certification substitutes, phrased as a
+ *  suite FACT: `faked` when the tests use a loopback/fake server or fake
+ *  transport, `none` when the capability's own authority is durable local
+ *  state. */
+function externalDependency(files) {
+  const markers = ['fake', 'Fake', 'mock', 'Mock', 'loopback', '127.0.0.1'];
+  const seams = files.filter(
+    (rel) =>
+      rel.startsWith(`${PW_ROOT}/`) &&
+      file(rel) &&
+      markers.some((marker) => readText(rel).includes(marker)),
+  );
+  return seams.length > 0
+    ? { value: 'faked', detail: `certification substitutes external seams (${seams.join(', ')})` }
+    : { value: 'none', detail: 'certification uses no external seam' };
+}
+
+function buildAxes() {
+  const platforms = platformsCertified();
+  const axes = {};
+  for (const [key, spec] of Object.entries(AXIS_SPECS)) {
+    const wired = anyProbe(spec.wired);
+    const adapterCertified = spec.adapter_certified === null ? false : anyProbe(spec.adapter_certified);
+    let daemonE2e = false;
+    let daemonE2eDetail = 'no daemon-e2e probe';
+    let daemonE2eFiles = [];
+    if (spec.daemon_e2e_certified === null) {
+      const probe = retrievalDaemonE2e();
+      daemonE2e = probe.ok;
+      daemonE2eDetail = probe.detail;
+      daemonE2eFiles = probe.evidence || [];
+    } else {
+      daemonE2e = anyProbe(spec.daemon_e2e_certified);
+      daemonE2eFiles = [...new Set(spec.daemon_e2e_certified.map(([rel]) => rel))];
+      daemonE2eDetail = daemonE2e
+        ? `production-wiring tests: ${daemonE2eFiles.join(', ')}`
+        : 'no tests/production-wiring test drives the production builder for this capability';
+    }
+    const testFiles = [
+      ...new Set([
+        ...(spec.adapter_certified || []).map(([rel]) => rel),
+        ...daemonE2eFiles,
+      ]),
+    ];
+    const external = externalDependency(testFiles);
+    axes[key] = {
+      wired,
+      adapter_certified: adapterCertified,
+      daemon_e2e_certified: daemonE2e,
+      platforms_certified: daemonE2e || (wired && adapterCertified) ? platforms : [],
+      external_dependency: external.value,
+      detail: daemonE2eDetail,
+      external_dependency_detail: external.detail,
+      evidence: [
+        ...new Set([
+          ...spec.wired.filter(([rel]) => file(rel)).map(([rel]) => rel),
+          ...testFiles.filter((rel) => file(rel)),
+        ]),
+      ],
+    };
+  }
+  return axes;
+}
+
+// ------------------------------------------------- README capability claims
+//
+// README carries ONE machine-checkable claims table between the
+// `<-- capability-axes:start/end -->` markers: the five derived fields per
+// capability, in a fixed order. A hand-written binary/status claim outside
+// this table is rejected: the fields are compared to the manifest above, so
+// prose can never drift from the tree.
+
+const CLAIMS_START = '<!-- capability-axes:start -->';
+const CLAIMS_END = '<!-- capability-axes:end -->';
+const CLAIMS_DOCS = ['README.md', 'docs/certification.md'];
+
+function parseClaimsBlock(doc) {
+  const lines = readText(doc).split('\n');
+  const start = lines.findIndex((line) => line.includes(CLAIMS_START));
+  const end = lines.findIndex((line) => line.includes(CLAIMS_END));
+  if (start === -1 && end === -1) {
+    return { lines, rows: null, start: -1, end: -1 };
+  }
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error(`${doc}: unbalanced capability-axes claim markers`);
+  }
+  const rows = new Map();
+  for (const line of lines.slice(start + 1, end)) {
+    const match = /^\|\s*`([a-z0-9_]+)`\s*\|(.+)\|\s*$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const cells = match[2].split('|').map((cell) => cell.trim());
+    if (cells.length !== 5) {
+      throw new Error(
+        `${doc}: capability '${match[1]}' must carry the five derived fields ` +
+          '(wired, adapter_certified, daemon_e2e_certified, platforms_certified, external_dependency)',
+      );
+    }
+    rows.set(match[1], {
+      wired: cells[0],
+      adapter_certified: cells[1],
+      daemon_e2e_certified: cells[2],
+      platforms_certified: cells[3],
+      external_dependency: cells[4],
+    });
+  }
+  return { lines, rows, start, end };
+}
+
+/** The only place a binary capability claim may appear is the marked table:
+ *  a `wired=true` / `adapter_certified: false` / ... shape in prose is
+ *  rejected, so a hand-written claim can never drift from the manifest. */
+const BINARY_CLAIM = /\b(wired|adapter_certified|daemon_e2e_certified|platforms_certified|external_dependency)\b\s*[:=]\s*(true|false)/i;
+
+function manualBinaryProseErrors(doc, lines, start, end) {
+  const errors = [];
+  lines.forEach((line, index) => {
+    if (start !== -1 && index > start && index < end) {
+      return;
+    }
+    if (BINARY_CLAIM.test(line)) {
+      errors.push(
+        `${doc}:${index + 1} carries a manual binary capability claim outside the machine-checked ` +
+          `table (${line.trim().slice(0, 80)}); move it into the capability-axes block`,
+      );
+    }
+  });
+  return errors;
+}
+
+function claimsDriftErrors(axes) {
+  const errors = [];
+  for (const doc of CLAIMS_DOCS) {
+    if (!file(doc)) {
+      continue;
+    }
+    let parsed;
+    try {
+      parsed = parseClaimsBlock(doc);
+    } catch (error) {
+      errors.push(String(error.message || error));
+      continue;
+    }
+    errors.push(...manualBinaryProseErrors(doc, parsed.lines, parsed.start, parsed.end));
+    const rows = parsed.rows;
+    if (rows === null) {
+      continue;
+    }
+    for (const [key, axis] of Object.entries(axes)) {
+      const row = rows.get(key);
+      if (row === undefined) {
+        errors.push(`${doc}: capability claims table is missing '${key}'`);
+        continue;
+      }
+      const expected = {
+        wired: String(axis.wired),
+        adapter_certified: String(axis.adapter_certified),
+        daemon_e2e_certified: String(axis.daemon_e2e_certified),
+        platforms_certified: axis.platforms_certified.join(','),
+        external_dependency: axis.external_dependency,
+      };
+      for (const [field, want] of Object.entries(expected)) {
+        if (row[field] !== want) {
+          errors.push(
+            `${doc}: ${key}.${field} claims '${row[field]}' but the tree derives '${want}'`,
+          );
+        }
+      }
+    }
+    for (const key of rows.keys()) {
+      if (!(key in axes)) {
+        errors.push(`${doc}: claims table lists unknown capability '${key}'`);
+      }
+    }
+  }
+  return errors;
+}
+
 function buildManifest() {
   let commit = 'unknown';
   try {
@@ -408,6 +756,7 @@ function buildManifest() {
     commit,
     generated_from: 'repository files/scripts (scripts/capabilities-manifest.mjs)',
     surfaces,
+    axes: buildAxes(),
   };
 }
 
@@ -515,6 +864,7 @@ function checkDocs(manifest) {
     }
   }
   errors.push(...implementedClaimErrors());
+  errors.push(...claimsDriftErrors(manifest.axes));
   if (errors.length > 0) {
     for (const error of errors) {
       console.error(`capabilities drift: ${error}`);
@@ -567,6 +917,28 @@ selfCheck(manifest);
 mkdirSync(resolve(ROOT, OUT_DIR), { recursive: true });
 writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
 
+if (CHECK_CLAIMS) {
+  // The docs-sync mode: validate ONLY the README/docs capability-axes claims
+  // against the derived fields. Surface labels that depend on executable
+  // artifacts (the JetBrains matrices) are checked by the full mode /
+  // certify-local, so a host without those artifacts still enforces the
+  // capability claims it can derive.
+  const errors = claimsDriftErrors(manifest.axes);
+  if (errors.length > 0) {
+    for (const error of errors) {
+      console.error(`capability-axes drift: ${error}`);
+    }
+    console.error(
+      'fix the README/docs capability-axes table (or the derivation) so it matches ' +
+        'target/certification/capabilities.json',
+    );
+    process.exit(1);
+  }
+  console.log(`capabilities manifest: ${MANIFEST_PATH}`);
+  console.log('capability-axes claims: README/docs match the derived manifest.');
+  process.exit(0);
+}
+
 if (!GENERATE_ONLY) {
   checkDocs(manifest);
 }
@@ -577,8 +949,18 @@ const summary = Object.entries(manifest.surfaces)
 console.log(`capabilities manifest: ${MANIFEST_PATH}`);
 console.log(`surfaces: ${summary}`);
 console.log(
+  `axes: ${Object.entries(manifest.axes)
+    .map(
+      ([key, axis]) =>
+        `${key}[wired=${axis.wired} adapter=${axis.adapter_certified} ` +
+        `daemon_e2e=${axis.daemon_e2e_certified} platforms=${axis.platforms_certified.join('+') || 'none'} ` +
+        `external=${axis.external_dependency}]`,
+    )
+    .join(' ')}`,
+);
+console.log(
   'capabilities self-check: probes ok; Faktor-owned UI (no vendored corpus) and every label carries its earned status (matrix labels only from executable matrices).',
 );
 if (!GENERATE_ONLY) {
-  console.log('docs/certification.md capability table in sync.');
+  console.log('docs/certification.md capability table + README/docs capability-axes claims in sync.');
 }

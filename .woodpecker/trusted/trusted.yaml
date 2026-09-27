@@ -302,6 +302,10 @@ steps:
       # No apt: the digest-pinned node:24 baseline already ships unzip and
       # ca-certificates (verified: `unzip`, `python3`, curl and
       # /etc/ssl/certs/ca-certificates.crt are present).
+      # Audit 25: the generated protocol DTO/parsers must match the checked-in
+      # canonical schema artifact (the artifact-vs-emitter half runs in the
+      # cargo lane via `cargo test -p faktor-protocol`).
+      - node scripts/protocol-codegen.mjs --check-clients
       - cd apps/vscode
       - npm ci
       - npm run build
@@ -317,6 +321,7 @@ steps:
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
+        node scripts/protocol-codegen.mjs --check-clients
         cd apps/vscode
         npm ci
         npm run build

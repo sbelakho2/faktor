@@ -3043,6 +3043,376 @@ async function pendingSubmissionTests() {
       { digest: 'd'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 8 },
     ]);
   });
+
+  await test('a failed start keeps the uploaded id in local pending state and the retry uploads nothing', async () => {
+    const uploads = [];
+    const starts = [];
+    let failStart = true;
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        uploads.push(request.filename);
+        return { digest: 'f'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 3 };
+      },
+      startTaskRun: async (sessionId, request) => {
+        starts.push(request.attachments);
+        if (failStart) {
+          throw new nc.NativeApiError(409, 'conflict', 'session already has a live run', false);
+        }
+        return taskRunStartedJson;
+      },
+    };
+    const restores = [];
+    const first = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({ attachments: [binaryAttachment()] }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure, enriched) => restores.push({ failure, enriched }),
+    });
+    assertEqual(first.ok, false);
+    assertEqual(uploads.length, 1, 'exactly one upload on the first attempt');
+    assertEqual(restores.length, 1, 'the failed start restores with the enriched envelope');
+    const retained = restores[0].enriched;
+    assert(retained.attachments[0].uploaded !== undefined, 'the durable id is retained in pending state');
+    assertEqual(retained.attachments[0].uploaded.sessionId, '7');
+    assertEqual(retained.attachments[0].uploaded.attachment.digest, 'f'.repeat(64));
+    assertEqual(first.pending.attachments[0].uploaded.attachment.digest, 'f'.repeat(64));
+
+    failStart = false;
+    const retry = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: retained,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {
+        throw new Error('a successful retry must not restore');
+      },
+    });
+    assertEqual(retry.ok, true);
+    assertEqual(uploads.length, 1, 'the retry resolves the durable id first and uploads no bytes');
+    assertDeepEqual(starts[1], [
+      { digest: 'f'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+    ]);
+  });
+
+  await test('an upload retained for one session is never reused by another session', async () => {
+    const uploads = [];
+    const starts = [];
+    let firstRun = true;
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        uploads.push({ sessionId, filename: request.filename });
+        return {
+          digest: (sessionId === '7' ? 'a' : 'b').repeat(64),
+          mime: request.mime,
+          filename: request.filename ?? null,
+          size: 3,
+        };
+      },
+      startTaskRun: async (sessionId, request) => {
+        starts.push({ sessionId, attachments: request.attachments });
+        if (firstRun) {
+          firstRun = false;
+          throw new Error('socket closed');
+        }
+        return taskRunStartedJson;
+      },
+    };
+    const restores = [];
+    await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({ attachments: [binaryAttachment()] }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure, enriched) => restores.push(enriched),
+    });
+    const retained = restores[0];
+    assertEqual(retained.attachments[0].uploaded.sessionId, '7');
+    const retry = await ts.admitPendingSubmission({
+      client,
+      sessionId: '8',
+      pending: retained,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {},
+    });
+    assertEqual(retry.ok, true);
+    assertEqual(uploads.length, 2, 'the foreign-session id must not be reused');
+    assertEqual(uploads[1].sessionId, '8');
+    assertDeepEqual(starts[1].attachments, [
+      { digest: 'b'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+    ]);
+  });
+
+  await test('a partial upload failure retries only the absent attachments', async () => {
+    let calls = 0;
+    const uploadedNames = [];
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        calls += 1;
+        if (calls === 2) {
+          throw new nc.NativeApiError(413, 'oversized', 'attachment exceeds the bound', false);
+        }
+        uploadedNames.push(request.filename);
+        return {
+          digest: String(calls).padStart(64, '0'),
+          mime: request.mime,
+          filename: request.filename ?? null,
+          size: 3,
+        };
+      },
+      startTaskRun: async () => taskRunStartedJson,
+    };
+    const restores = [];
+    const first = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({
+        attachments: [binaryAttachment(), binaryAttachment({ filename: 'second.pdf' })],
+      }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure, enriched) => restores.push(enriched),
+    });
+    assertEqual(first.ok, false);
+    assertEqual(first.failure.code, 'oversized');
+    assertEqual(uploadedNames.length, 1, 'the first attachment uploaded before the refusal');
+    const retained = restores[0];
+    assert(retained.attachments[0].uploaded !== undefined, 'the first upload is retained');
+    assertEqual(retained.attachments[1].uploaded, undefined, 'the failed attachment is not retained');
+    const retry = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: retained,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {
+        throw new Error('the retry must succeed');
+      },
+    });
+    assertEqual(retry.ok, true);
+    assertEqual(calls, 3, 'the retry uploads only the second attachment');
+    assertEqual(uploadedNames.length, 2);
+    assertEqual(retry.attachmentIds.length, 2);
+    assertEqual(retry.pending.attachments[0].uploaded.attachment.digest, '1'.padStart(64, '0'));
+    assertEqual(retry.pending.attachments[1].uploaded.attachment.digest, '3'.padStart(64, '0'));
+  });
+
+  await test('hostile already-uploaded records are refused at the envelope boundary', () => {
+    const validUpload = {
+      sessionId: '7',
+      attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+    };
+    const parsed = ts.parsePendingSubmission({
+      ...pendingEnvelope(),
+      attachments: [{ ...binaryAttachment(), uploaded: validUpload }],
+    });
+    assert(parsed !== null, 'a strict uploaded record is accepted');
+    assertDeepEqual(parsed.attachments[0].uploaded, validUpload);
+    for (const uploaded of [
+      'nope',
+      { sessionId: '7' },
+      { sessionId: '7', attachment: { digest: 'not-hex', mime: 'application/pdf', filename: null, size: 3 } },
+      { sessionId: '', attachment: validUpload.attachment },
+      { sessionId: '7', attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: -1 } },
+      { sessionId: '7', attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 9, size: 3 } },
+    ]) {
+      assertEqual(
+        ts.parsePendingSubmission({
+          ...pendingEnvelope(),
+          attachments: [{ ...binaryAttachment(), uploaded }],
+        }),
+        null,
+        JSON.stringify(uploaded).slice(0, 120),
+      );
+    }
+  });
+
+  await test('the retainer bounds retry state and merges uploads only by identity', () => {
+    const retainer = new ts.PendingSubmissionRetainer(2);
+    const envelope = (messageId) =>
+      ts.parsePendingSubmission({
+        text: 'ship it',
+        sessionId: '7',
+        messageId,
+        draftId: null,
+        files: [],
+        attachments: [binaryAttachment()],
+      });
+    const withUpload = (pending, digest) =>
+      ts.withPendingUpload(pending, 0, {
+        sessionId: '7',
+        attachment: { digest, mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+      });
+    const first = withUpload(envelope('m1'), 'a'.repeat(64));
+    retainer.retain(first);
+    assertEqual(retainer.size(), 1);
+    const restored = retainer.restore(envelope('m1'));
+    assertEqual(restored.attachments[0].uploaded.attachment.digest, 'a'.repeat(64));
+    assertEqual(retainer.restore(envelope('m2')).attachments[0].uploaded, undefined);
+    retainer.release(first);
+    assertEqual(retainer.size(), 0, 'a durable acceptance releases the entry');
+    retainer.retain(withUpload(envelope('m1'), 'a'.repeat(64)));
+    retainer.retain(withUpload(envelope('m2'), 'b'.repeat(64)));
+    retainer.retain(withUpload(envelope('m3'), 'c'.repeat(64)));
+    assertEqual(retainer.size(), 2, 'the retry state is bounded');
+    assertEqual(
+      retainer.restore(envelope('m1')).attachments[0].uploaded,
+      undefined,
+      'the oldest identity was evicted',
+    );
+  });
+
+  await test('documents upload as durable attachments when the advertised model supports them', async () => {
+    const calls = [];
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        calls.push({ kind: 'upload', mime: request.mime, filename: request.filename });
+        return {
+          digest: (request.mime === 'application/pdf' ? 'a' : 'b').repeat(64),
+          mime: request.mime,
+          filename: request.filename ?? null,
+          size: 3,
+        };
+      },
+      startTaskRun: async (sessionId, request) => {
+        calls.push({ kind: 'start', request });
+        return taskRunStartedJson;
+      },
+    };
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({
+        attachments: [
+          binaryAttachment({ mime: 'application/pdf', filename: 'spec.pdf' }),
+          binaryAttachment({
+            mime: 'text/plain',
+            filename: 'notes.txt',
+            dataBase64: Buffer.from('txt').toString('base64'),
+          }),
+        ],
+      }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      attachmentLimits: ts.attachmentPolicyFromLimits(clone(attachmentLimitsJson)),
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {
+        throw new Error('an accepted document must not restore');
+      },
+    });
+    assertEqual(outcome.ok, true);
+    assertDeepEqual(
+      calls.filter((call) => call.kind === 'upload').map((call) => call.mime),
+      ['application/pdf', 'text/plain'],
+      'both advertised document types upload',
+    );
+    const start = calls.find((call) => call.kind === 'start');
+    assertDeepEqual(
+      start.request.attachments.map((id) => id.mime),
+      ['application/pdf', 'text/plain'],
+      'the run carries the durable document ids in entry order',
+    );
+    assertEqual(start.request.files, undefined, 'documents never ride the workspace path vocabulary');
+  });
+
+  await test('an advertised-unavailable document refuses before any upload', async () => {
+    const calls = [];
+    const client = {
+      uploadAttachment: async () => {
+        calls.push('upload');
+        throw new Error('a refused attachment must not upload');
+      },
+      startTaskRun: async () => {
+        calls.push('start');
+        throw new Error('a refused attachment must not start');
+      },
+    };
+    const incapable = clone(attachmentLimitsJson);
+    incapable.document.capable = false;
+    const pdfOnly = clone(attachmentLimitsJson);
+    pdfOnly.document.mimes = [{ mime: 'application/pdf', maxBytes: 8388608 }];
+    const tinyDocs = clone(attachmentLimitsJson);
+    tinyDocs.document.mimes = tinyDocs.document.mimes.map((entry) => ({ ...entry, maxBytes: 2 }));
+    const tinyUpload = clone(attachmentLimitsJson);
+    tinyUpload.maxUploadBytes = 1;
+    for (const [label, limits, attachment, code] of [
+      ['capability', incapable, binaryAttachment(), 'unsupported_document_type'],
+      ['mime', pdfOnly, binaryAttachment({ mime: 'text/plain' }), 'unsupported_document_type'],
+      ['size', tinyDocs, binaryAttachment({ bytes: 3 }), 'oversized_document'],
+      ['upload', tinyUpload, binaryAttachment({ bytes: 3 }), 'oversized_upload'],
+    ]) {
+      const failures = [];
+      let restored = 0;
+      let started = 0;
+      const outcome = await ts.admitPendingSubmission({
+        client,
+        sessionId: '7',
+        pending: pendingEnvelope({ attachments: [attachment] }),
+        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+        attachmentLimits: ts.attachmentPolicyFromLimits(limits),
+        onStarted: () => {
+          started += 1;
+        },
+        onFailure: (failure) => failures.push(failure),
+        restore: () => {
+          restored += 1;
+        },
+      });
+      assertEqual(outcome.ok, false, label);
+      assertEqual(outcome.failure.code, code, label);
+      assertEqual(failures.length, 1, `${label}: exactly one typed failure`);
+      assertEqual(started, 0, `${label}: no run starts`);
+      assertEqual(restored, 1, `${label}: the draft is restored exactly once`);
+    }
+    assertEqual(calls.length, 0, 'a refused attachment never reaches the wire');
+  });
+
+  await test('workspace source files stay on the repository-context path and are never uploaded', async () => {
+    const uploads = [];
+    const starts = [];
+    const client = {
+      uploadAttachment: async () => {
+        uploads.push('upload');
+        throw new Error('source files must not upload');
+      },
+      startTaskRun: async (sessionId, request) => {
+        starts.push(request);
+        return taskRunStartedJson;
+      },
+    };
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({ files: ['src/a.ts', 'crates/b.rs'], attachments: [] }),
+      settings: {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0n,
+        files: ['src/a.ts', 'crates/b.rs'],
+      },
+      onStarted: () => {},
+      onFailure: () => {
+        throw new Error('a source-only start must not fail');
+      },
+      restore: () => {
+        throw new Error('a source-only start must not restore');
+      },
+    });
+    assertEqual(outcome.ok, true);
+    assertEqual(uploads.length, 0, 'no upload for workspace source files');
+    assertDeepEqual(starts[0].files, ['src/a.ts', 'crates/b.rs'], 'paths stay repository-context');
+    assertEqual(starts[0].attachments, undefined, 'source files never become binary attachments');
+  });
 }
 
 // -------------- 7c. board state projection + webview forwarding hardening

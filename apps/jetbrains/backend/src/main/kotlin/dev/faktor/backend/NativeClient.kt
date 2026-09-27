@@ -110,6 +110,7 @@ import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeUsage
 import dev.faktor.shared.parseNativeVerificationView
+import dev.faktor.shared.parseProtocolErrorEnvelope
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -788,20 +789,17 @@ class NativeClient(
         return String(out.toByteArray(), Charsets.UTF_8)
     }
 
-    /** Maps a non-2xx body onto the daemon's typed error envelope. */
+    /** Maps a non-2xx body onto the daemon's typed error envelope. The
+     * canonical envelope shape is generated from faktor-protocol (audit 25):
+     * this method no longer duplicates the field checks. */
     private fun apiError(status: Int, body: String, path: String): NativeApiException {
         val parsed = try {
             JsonCodec.parse(body)
         } catch (e: NativeProtocolException) {
             return NativeApiException(status, "http_error", body.take(REQUEST_ERROR_SNIPPET), false)
         }
-        val error = (parsed as? JsonValue.Obj)?.fields?.get("error") as? JsonValue.Obj
-        val code = ((error?.fields?.get("code")) as? JsonValue.Str)?.value
-        val message = ((error?.fields?.get("message")) as? JsonValue.Str)?.value
-        val retryable = ((error?.fields?.get("retryable")) as? JsonValue.Bool)?.value
-        if (code == null || message == null) {
-            return NativeApiException(status, "http_error", body.take(REQUEST_ERROR_SNIPPET), false)
-        }
-        return NativeApiException(status, code, message, retryable == true)
+        val envelope = parseProtocolErrorEnvelope(parsed)
+            ?: return NativeApiException(status, "http_error", body.take(REQUEST_ERROR_SNIPPET), false)
+        return NativeApiException(status, envelope.code, envelope.message, envelope.retryable)
     }
 }

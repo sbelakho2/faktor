@@ -1,0 +1,518 @@
+{
+  "schema": "faktor-protocol-schema/v1",
+  "generator": "crates/protocol/src/schema.rs",
+  "types": [
+    {
+      "name": "Message",
+      "doc": "One conversation message row (parts nested).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "role",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "seq",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "created_ms",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "parts",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "Part"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Part",
+      "doc": "A typed message part: text, reasoning, tool call, tool result or summary.",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "tagged_enum",
+        "tag": "type",
+        "rename_all": "snake_case",
+        "variants": [
+          {
+            "name": "Text",
+            "tag": "text",
+            "fields": [
+              {
+                "name": "text",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              }
+            ]
+          },
+          {
+            "name": "Reasoning",
+            "tag": "reasoning",
+            "fields": [
+              {
+                "name": "text",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              }
+            ]
+          },
+          {
+            "name": "ToolCall",
+            "tag": "tool_call",
+            "fields": [
+              {
+                "name": "tool_call_id",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              },
+              {
+                "name": "name",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              },
+              {
+                "name": "input",
+                "type": {
+                  "kind": "json"
+                },
+                "nullable": false,
+                "optional": false
+              },
+              {
+                "name": "state",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              }
+            ]
+          },
+          {
+            "name": "ToolResult",
+            "tag": "tool_result",
+            "fields": [
+              {
+                "name": "tool_call_id",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              },
+              {
+                "name": "result",
+                "type": {
+                  "kind": "named",
+                  "name": "ToolResultBody"
+                },
+                "nullable": false,
+                "optional": false
+              }
+            ]
+          },
+          {
+            "name": "Summary",
+            "tag": "summary",
+            "fields": [
+              {
+                "name": "text",
+                "type": {
+                  "kind": "string"
+                },
+                "nullable": false,
+                "optional": false
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ToolResultBody",
+      "doc": "Bounded tool result: excerpt, exit code, artifact pointer and slice hint.",
+      "unknown_fields": "reject",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "excerpt",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "exit_code",
+            "type": {
+              "kind": "i32"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "artifact",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "slice_hint",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "PageMeta",
+      "doc": "Additive paging metadata: applied size, next cursor, has_more, total estimate.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "size",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "cursor",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "has_more",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "total_estimate",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": true,
+            "optional": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "MessagesPage",
+      "doc": "One bounded page of conversation messages.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "messages",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "Message"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "has_more",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "next_before",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "page",
+            "type": {
+              "kind": "named",
+              "name": "PageMeta"
+            },
+            "nullable": false,
+            "optional": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "SessionState",
+      "doc": "The durable session state projection.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "session_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "state",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "title",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "last_event_seq",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "agent_state",
+            "type": {
+              "kind": "named",
+              "name": "AgentStateView"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "task_ledger",
+            "type": {
+              "kind": "json"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "AgentStateView",
+      "doc": "The agent state machine view folded into a session state row.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "state",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "label",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "active",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "terminal",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    }
+  ],
+  "constants": {
+    "error_envelope": {
+      "fields": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "error_codes": [
+      {
+        "core_kind": "not_found",
+        "code": "not_found",
+        "http_status": 404,
+        "retryable": false
+      },
+      {
+        "core_kind": "conflict",
+        "code": "conflict",
+        "http_status": 409,
+        "retryable": false
+      },
+      {
+        "core_kind": "invalid_state",
+        "code": "invalid_state",
+        "http_status": 409,
+        "retryable": false
+      },
+      {
+        "core_kind": "permission",
+        "code": "permission_denied",
+        "http_status": 403,
+        "retryable": false
+      },
+      {
+        "core_kind": "timeout",
+        "code": "timeout",
+        "http_status": 504,
+        "retryable": true
+      },
+      {
+        "core_kind": "cancelled",
+        "code": "cancelled",
+        "http_status": 499,
+        "retryable": false
+      },
+      {
+        "core_kind": "store",
+        "code": "store_error",
+        "http_status": 500,
+        "retryable": true
+      },
+      {
+        "core_kind": "network",
+        "code": "network_error",
+        "http_status": 502,
+        "retryable": true
+      },
+      {
+        "core_kind": "provider",
+        "code": "provider_error",
+        "http_status": 502,
+        "retryable": true
+      },
+      {
+        "core_kind": "malformed",
+        "code": "malformed",
+        "http_status": 400,
+        "retryable": false
+      },
+      {
+        "core_kind": "oversized",
+        "code": "oversized",
+        "http_status": 413,
+        "retryable": false
+      },
+      {
+        "core_kind": "rate_limited",
+        "code": "rate_limited",
+        "http_status": 429,
+        "retryable": true
+      },
+      {
+        "core_kind": "deadlock",
+        "code": "deadlock",
+        "http_status": 409,
+        "retryable": true
+      },
+      {
+        "core_kind": "internal",
+        "code": "internal_error",
+        "http_status": 500,
+        "retryable": false
+      }
+    ]
+  }
+}

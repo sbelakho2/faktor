@@ -39,10 +39,18 @@
 //!    the runtime whose allocation the daemon graph clones and the native
 //!    server receives); no CLI/server site may construct a parallel
 //!    authority over the same rows.
-//! 6. **Constructor-site authority** — `DurableBudgetLedger::new` and
-//!    `ProcessSupervisor::new` additionally have documented production
-//!    sites with exact per-file occurrence counts: a new (or stale)
-//!    construction site anywhere is a red test, never a review nit.
+//! 6. **Constructor-site authority** (audits 30/57/83) — every daemon
+//!    authority has exactly ONE canonical production construction in the
+//!    canonical daemon builder (`crates/cli/src/graph.rs` or the
+//!    `build_daemon*` functions in `crates/cli/src/main.rs`): the router
+//!    service, acquisition planner/service, index service, process
+//!    supervisor, semantic registry, budget ledger, SCM completion provider
+//!    and TaskExecutor. Every other production site is an explicitly
+//!    documented embedded-host/standalone entry; a new (or stale)
+//!    construction site anywhere is a red test, never a review nit. Tests
+//!    may build isolated units (test bodies and test-gated out-of-line
+//!    modules are invisible), and planted-violation fixtures prove the
+//!    exact-count rule fires.
 //! 7. **Retired product-name authority** — the retired product name and its
 //!    version tokens appear ONLY in the historical attribution directory
 //!    (`ui/LICENSES/`). The scan covers every regular file (source AND
@@ -121,10 +129,11 @@
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
 //! non-test build (`#[cfg(test)]`, `#[cfg(all(test, unix))]`, …) is
 //! removed with brace-matched ranges, so markers in tests, docs or
-//! examples can never certify production code. Out-of-line
-//! `#[cfg(test)] mod` bodies (`tests.rs`, `*_tests.rs`) are skipped by the
-//! production scans. The machinery is itself adversarially tested against
-//! synthetic sources.
+//! examples can never certify production code. Out-of-line modules declared
+//! ONLY as test-gated `mod`/`#[path]` modules (any name: `tests.rs`,
+//! `*_tests.rs`, `acquire_certification.rs`, `test_http.rs`,
+//! `modelcheck.rs`) are skipped by the production scans. The machinery is
+//! itself adversarially tested against synthetic sources.
 
 #[cfg(test)]
 mod scans {
@@ -514,7 +523,14 @@ mod scans {
         let path = root.join(rel);
         let src = std::fs::read_to_string(&path).ok()?;
         let code = code_mask(&src);
-        let kept = kept_ranges(&src, &code);
+        // Test-only out-of-line modules carry no production ranges: the
+        // module-decomposition move keeps test code out-of-line, so the
+        // `#[cfg(test)] mod` masking inside a file is not enough.
+        let kept = if is_test_file(rel) {
+            Vec::new()
+        } else {
+            kept_ranges(&src, &code)
+        };
         Some(File {
             rel: rel.to_string(),
             src: leak(&src),
@@ -613,12 +629,15 @@ mod scans {
     ///
     /// 1. A file under a `/tests/` path component is test code by Cargo's
     ///    integration-test layout.
-    /// 2. A file named `tests.rs` or ending in `_tests.rs` is test code only
-    ///    when a sibling `*.rs` in the same directory actually INCLUDES it
-    ///    as a test module: a test-gated `#[cfg(...)]` attribute attached to
-    ///    `mod <stem>;` or to `#[path = "<file>"]` (the via-`#[path]` shape
-    ///    `shadow_tests.rs` uses). The include is verified on disk, so a
-    ///    production-compiled `*_tests.rs` stays scanned.
+    /// 2. Any OTHER file is test code only when every out-of-line `mod`
+    ///    declaration that includes it carries a test-gated `#[cfg(...)]`
+    ///    attribute (`mod <stem>;` with only test-gated declarations, or
+    ///    `#[path = "<file>"]` with test-gated declarations). The include is
+    ///    verified on disk, so a production-compiled module stays scanned
+    ///    even when its name ends in `_tests.rs`; the same rule now covers
+    ///    test-gated out-of-line modules with ordinary names
+    ///    (`acquire_certification.rs`, `test_http.rs`, `modelcheck.rs`),
+    ///    which the historical name check mis-scanned as production.
     ///
     /// Windows separators never matter: `rel` is normalized before any
     /// comparison and `repo_root().join` accepts `/` on every platform.
@@ -627,31 +646,102 @@ mod scans {
         if rel.contains("/tests/") {
             return true;
         }
-        let name = rel.rsplit('/').next().unwrap_or(&rel);
-        if name != "tests.rs" && !name.ends_with("_tests.rs") {
-            return false;
-        }
-        let path = repo_root().join(&rel);
-        let Some(dir) = path.parent() else {
-            return false;
-        };
-        let stem = name.strip_suffix(".rs").unwrap_or(name);
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for entry in entries.flatten() {
-            let sibling = entry.path();
-            if sibling == path || sibling.extension().and_then(|e| e.to_str()) != Some("rs") {
+        test_only_out_of_line_modules().contains(&rel)
+    }
+
+    /// The repo-relative files that are declared ONLY as test-gated
+    /// out-of-line modules, computed once from the declaring sources (every
+    /// declaring file is itself inside the walk). A file with at least one
+    /// non-test declaration stays production code.
+    fn test_only_out_of_line_modules() -> &'static std::collections::HashSet<String> {
+        static SET: std::sync::OnceLock<std::collections::HashSet<String>> =
+            std::sync::OnceLock::new();
+        SET.get_or_init(|| {
+            let mut states: std::collections::HashMap<String, (bool, bool)> =
+                std::collections::HashMap::new();
+            for rel in walk_crate_sources() {
+                let Ok(src) = std::fs::read_to_string(repo_root().join(&rel)) else {
+                    continue;
+                };
+                for (at, stem) in out_of_line_mods(&src) {
+                    let attrs = declaration_attrs(&src, at);
+                    let declared = declared_file_path(&rel, &stem, &attrs);
+                    let entry = states.entry(declared).or_insert((false, false));
+                    if has_test_gated_cfg(&attrs) {
+                        entry.0 = true;
+                    } else {
+                        entry.1 = true;
+                    }
+                }
+            }
+            states
+                .into_iter()
+                .filter(|(_, (test_gated, production))| *test_gated && !*production)
+                .map(|(file, _)| file)
+                .collect()
+        })
+    }
+
+    /// `(attribute offset, module stem)` for every out-of-line `mod <stem>;`
+    /// declaration (comments/strings masked; inline `mod <stem> { … }` bodies
+    /// are not declarations of separate files and are skipped).
+    fn out_of_line_mods(src: &str) -> Vec<(usize, String)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        for at in code_needle_offsets(src, "mod ") {
+            if at > 0 {
+                let prev = bytes[at - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    continue;
+                }
+            }
+            let mut end = at + "mod ".len();
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end == at + "mod ".len() {
                 continue;
             }
-            let Ok(src) = std::fs::read_to_string(&sibling) else {
-                continue;
-            };
-            if declares_test_include(&src, name, stem) {
-                return true;
+            let stem = std::str::from_utf8(&bytes[at + "mod ".len()..end])
+                .unwrap_or("")
+                .to_string();
+            let mut k = end;
+            while k < bytes.len() && (bytes[k] as char).is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b';' {
+                out.push((at, stem));
             }
         }
-        false
+        out
+    }
+
+    /// The `path = "<file>"` value of an attribute run, when present.
+    fn attr_path_value(attrs: &str) -> Option<String> {
+        let at = attrs.find("path = \"")?;
+        let rest = &attrs[at + "path = \"".len()..];
+        let end = rest.find('"')?;
+        Some(normalize_rel(&rest[..end]))
+    }
+
+    /// Resolve the file a declaration refers to (Rust module rules):
+    /// `#[path = "…"]` is relative to the declaring file's directory; a
+    /// plain `mod <stem>;` in a crate root (`main.rs`/`lib.rs`/`mod.rs`)
+    /// resolves next to it, and in any other module file (`foo.rs`)
+    /// resolves into its module directory (`foo/<stem>.rs`).
+    fn declared_file_path(declaring_rel: &str, stem: &str, attrs: &str) -> String {
+        let Some((dir, name)) = declaring_rel.rsplit_once('/') else {
+            return normalize_rel(&format!("{stem}.rs"));
+        };
+        if let Some(path) = attr_path_value(attrs) {
+            return normalize_rel(&format!("{dir}/{path}"));
+        }
+        if name == "main.rs" || name == "lib.rs" || name == "mod.rs" {
+            normalize_rel(&format!("{dir}/{stem}.rs"))
+        } else {
+            let module_dir = name.strip_suffix(".rs").unwrap_or(name);
+            normalize_rel(&format!("{dir}/{module_dir}/{stem}.rs"))
+        }
     }
 
     /// Byte offsets of `needle` in `src` at un-masked (code) positions, so a
@@ -708,6 +798,63 @@ mod scans {
         out
     }
 
+    /// The attribute run of one declaration whose `at` points at the `mod`
+    /// keyword: a visibility qualifier (`pub`, `pub(crate)`, `pub(in path)`)
+    /// between the attributes and `mod` is skipped, so
+    /// `#[cfg(test)] #[path = "x.rs"] pub(crate) mod tests;` is recognized
+    /// as test-gated (the historical helper looked at the text before `mod`
+    /// only and missed the visibility form).
+    fn declaration_attrs(src: &str, at: usize) -> String {
+        let bytes = src.as_bytes();
+        let mut end = src[..at].trim_end().len();
+        if end > 0 && bytes[end - 1] == b')' {
+            let mut depth = 0i32;
+            let mut i = end;
+            let mut open = None;
+            while i > 0 {
+                i -= 1;
+                match bytes[i] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(open) = open {
+                let mut j = open;
+                while j > 0 && (bytes[j - 1] as char).is_ascii_whitespace() {
+                    j -= 1;
+                }
+                let word_end = j;
+                while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+                    j -= 1;
+                }
+                if &src[j..word_end] == "pub" {
+                    end = j;
+                }
+            }
+        } else {
+            let mut j = end;
+            while j > 0 && (bytes[j - 1] as char).is_ascii_whitespace() {
+                j -= 1;
+            }
+            let word_end = j;
+            while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+                j -= 1;
+            }
+            if &src[j..word_end] == "pub" {
+                end = j;
+            }
+        }
+        let tail = src[..end].trim_end();
+        preceding_attributes(src, tail.len())
+    }
+
     /// True when the attribute run carries a `#[cfg(...)]` that can never be
     /// present in a non-test build (the same predicate the cfg stripper
     /// uses).
@@ -726,30 +873,6 @@ mod scans {
                 return true;
             }
             rest = &rest[body_start + end + 2..];
-        }
-        false
-    }
-
-    /// Does `src` include `file_name`/`stem` as a test module (see
-    /// [`is_test_file`])? Both declaration shapes are recognized:
-    /// `mod <stem>;` (code-masked, so a comment/string mention never
-    /// counts) and `#[path = "<file>"]` (which lives inside the attribute's
-    /// string, so it is matched raw) — each only when the immediately
-    /// preceding attribute run is test-gated.
-    fn declares_test_include(src: &str, file_name: &str, stem: &str) -> bool {
-        for at in code_needle_offsets(src, &format!("mod {stem};")) {
-            if has_test_gated_cfg(&preceding_attributes(src, at)) {
-                return true;
-            }
-        }
-        let path_attr = format!("#[path = \"{file_name}\"]");
-        let mut pos = 0usize;
-        while let Some(rel) = src[pos..].find(&path_attr) {
-            let at = pos + rel;
-            if has_test_gated_cfg(&preceding_attributes(src, at)) {
-                return true;
-            }
-            pos = at + path_attr.len();
         }
         false
     }
@@ -1787,7 +1910,21 @@ mod scans {
     // ------------------------------------------------------------------
 
     /// Each daemon-lifetime constructor has exactly the DOCUMENTED
-    /// production sites, with exact per-file occurrence counts:
+    /// production sites, with exact per-file occurrence counts.
+    ///
+    /// Audit 30 adds the eight authorities whose ONE canonical construction
+    /// must live in the canonical daemon builder (`crates/cli/src/graph.rs`
+    /// / the `build_daemon*` functions in `crates/cli/src/main.rs`): router
+    /// service, acquisition planner/service, index service, supervisor,
+    /// semantic registry, budget ledger, SCM completion provider and
+    /// TaskExecutor. Tests may build isolated units (test bodies and
+    /// test-gated out-of-line modules are invisible to this scan); a
+    /// production module outside the builder may only construct one through
+    /// an explicitly documented embedded-host/standalone entry, and a new
+    /// (or stale) site anywhere is a red test, never a review nit.
+    /// `one_production_constructor_per_daemon_authority` below asserts the
+    /// canonical-builder half and proves the scan fires on planted
+    /// violations.
     ///
     /// - `DurableEvidenceAuthority::for_store`: ONE site — the agent
     ///   runtime, whose allocation the daemon graph clones into
@@ -1817,14 +1954,14 @@ mod scans {
     const CONSTRUCTOR_SITES: &[(&str, &[(&str, usize)])] = &[
         (
             "DurableEvidenceAuthority::for_store",
-            &[("crates/agent/src/runtime.rs", 1)],
+            &[("crates/agent/src/runtime/turn/state.rs", 1)],
         ),
         (
             "DurableBudgetLedger::new",
             &[
-                ("crates/cli/src/main.rs", 1),
+                ("crates/cli/src/daemon/builder.rs", 1),
                 ("crates/orchestrator/src/task_executor.rs", 2),
-                ("crates/server/src/api.rs", 1),
+                ("crates/server/src/api/deps.rs", 1),
                 ("crates/session/src/manager.rs", 1),
                 ("crates/session/src/task.rs", 2),
             ],
@@ -1839,7 +1976,7 @@ mod scans {
         (
             "ProcessSupervisor::new",
             &[
-                ("crates/cli/src/main.rs", 2),
+                ("crates/cli/src/daemon/builder.rs", 2),
                 // Faktor Acquire `commerce login` (docs/acquire.md §14): the
                 // LOCAL admin command opens the headed dedicated profile
                 // browser through a short-lived supervisor over its own CAS.
@@ -1864,6 +2001,86 @@ mod scans {
                 ("crates/cli/src/main.rs", 1),
             ],
         ),
+        // --------------------------------------------- the eight daemon authorities
+        // (audit 30). For every authority the ONE canonical production
+        // construction happens in the daemon builder (crates/cli/src/main.rs
+        // or crates/cli/src/graph.rs); every other production site is an
+        // explicitly documented embedded-host/standalone entry. A zero-site
+        // marker pins a compatibility constructor that production must never
+        // use (tests may).
+        //
+        // Router service: the canonical builder's two mode arms
+        // (`build_router_service_with_outcomes`); no production site may
+        // construct the legacy variants (`new`, `with_pricing`,
+        // `with_outcomes`, `with_pricing_and_outcomes` are test-only there).
+        (
+            "RouterService::with_route_candidates",
+            &[("crates/cli/src/graph.rs", 1)],
+        ),
+        (
+            "RouterService::with_pinned_route_candidates",
+            &[("crates/cli/src/graph.rs", 1)],
+        ),
+        ("RouterService::new", &[]),
+        ("RouterService::with_pricing(", &[]),
+        ("RouterService::with_outcomes(", &[]),
+        ("RouterService::with_pricing_and_outcomes(", &[]),
+        // Acquisition planner/service: the planner's default is constructed
+        // ONLY by the commerce service's own disabled/open constructors
+        // (`disabled_with_planner` and the defaulted `open_with_planner`
+        // argument); the daemon wires the service through the canonical
+        // `open_commerce_service_with_planner`, and the marketplace login
+        // command uses the explicit `open` (no planner seam) path. The
+        // planner's `new` is test-only in production terms.
+        ("AcquisitionPlanner::new", &[]),
+        (
+            "AcquisitionPlanner::default",
+            &[("crates/commerce/src/service.rs", 2)],
+        ),
+        (
+            "CommerceSourceService::open_with_planner",
+            &[("crates/cli/src/daemon/builder.rs", 1)],
+        ),
+        (
+            "CommerceSourceService::open(",
+            &[("crates/cli/src/tools_market.rs", 1)],
+        ),
+        ("CommerceSourceService::disabled_with_planner", &[]),
+        // Index service: the canonical daemon builder constructs it in
+        // crates/cli/src/main.rs; the ONLY other production site is the
+        // agent runtime's embedded-host path (`index_service()`), which
+        // falls back to a standalone `open` when no supervisor is injected.
+        (
+            "IndexService::open_with_supervisor",
+            &[
+                ("crates/agent/src/runtime/retrieval.rs", 1),
+                ("crates/cli/src/daemon/builder.rs", 1),
+            ],
+        ),
+        (
+            "IndexService::open(",
+            &[("crates/agent/src/runtime/retrieval.rs", 1)],
+        ),
+        ("IndexService::new", &[]),
+        // SCM completion provider: exactly ONE production site — the
+        // canonical builder's `wire_completion_scm` (the adapter's own
+        // contract tests construct it; production must not).
+        (
+            "GitHubCompletionScm::new",
+            &[("crates/cli/src/daemon/wiring.rs", 1)],
+        ),
+        // TaskExecutor: the canonical daemon builder constructs ONE executor
+        // and hands it to the graph; the server crate's `ServerDeps::new`
+        // embedded-host seam is the only other production construction. The
+        // direct test-harness constructor must never appear in production.
+        (
+            "TaskExecutor::new(",
+            &[
+                ("crates/cli/src/daemon/builder.rs", 1),
+                ("crates/server/src/api/deps.rs", 1),
+            ],
+        ),
+        ("TaskExecutor::new_owner_direct_for_test_harness(", &[]),
     ];
 
     /// Every production file that constructs `marker`, with the exact
@@ -1930,6 +2147,195 @@ mod scans {
             1,
             "production DurableEvidenceAuthority::for_store occurrences must be exactly 1"
         );
+    }
+
+    /// Audit 30: exactly ONE canonical production construction per daemon
+    /// authority, in the canonical daemon builder (`crates/cli/src/graph.rs`
+    /// or a `build_daemon*` function in `crates/cli/src/main.rs`), with the
+    /// exact-count scan (scan 4) as the enforcement. Tests may build
+    /// isolated units: a test body or a test-gated out-of-line module is
+    /// invisible, while a production module that constructs an authority
+    /// outside its documented sites is a red test. The planted fixtures
+    /// below prove the offender rule fires (and does not fire on the
+    /// sanctioned shapes), so the invariant can never pass vacuously.
+    #[test]
+    fn one_production_constructor_per_daemon_authority() {
+        const AUTHORITIES: &[(&str, &[&str])] = &[
+            (
+                "router_service",
+                &[
+                    "RouterService::with_route_candidates",
+                    "RouterService::with_pinned_route_candidates",
+                    "RouterService::new",
+                    "RouterService::with_pricing(",
+                    "RouterService::with_outcomes(",
+                    "RouterService::with_pricing_and_outcomes(",
+                ],
+            ),
+            (
+                "acquisition_planner_service",
+                &[
+                    "AcquisitionPlanner::new",
+                    "AcquisitionPlanner::default",
+                    "CommerceSourceService::open_with_planner",
+                    "CommerceSourceService::open(",
+                    "CommerceSourceService::disabled_with_planner",
+                ],
+            ),
+            (
+                "index_service",
+                &[
+                    "IndexService::open_with_supervisor",
+                    "IndexService::open(",
+                    "IndexService::new",
+                ],
+            ),
+            ("process_supervisor", &["ProcessSupervisor::new"]),
+            ("semantic_registry", &["SemanticProviderRegistry::new"]),
+            ("budget_ledger", &["DurableBudgetLedger::new"]),
+            ("scm_completion_provider", &["GitHubCompletionScm::new"]),
+            (
+                "task_executor",
+                &[
+                    "TaskExecutor::new(",
+                    "TaskExecutor::new_owner_direct_for_test_harness(",
+                ],
+            ),
+        ];
+        const CANONICAL_BUILDER: &[&str] = &[
+            "crates/cli/src/main.rs",
+            "crates/cli/src/graph.rs",
+            "crates/cli/src/daemon/builder.rs",
+            "crates/cli/src/daemon/wiring.rs",
+        ];
+
+        for (authority, markers) in AUTHORITIES {
+            for marker in markers.iter().copied() {
+                assert!(
+                    CONSTRUCTOR_SITES
+                        .iter()
+                        .any(|(documented, _)| *documented == marker),
+                    "{authority}: marker '{marker}' has no documented site in \
+                     CONSTRUCTOR_SITES (the exact-count scan would never fire for it)"
+                );
+            }
+            let canonical = markers.iter().copied().any(|marker| {
+                let sites = CONSTRUCTOR_SITES
+                    .iter()
+                    .find(|(documented, _)| *documented == marker)
+                    .map(|(_, sites)| *sites)
+                    .unwrap_or(&[]);
+                sites
+                    .iter()
+                    .any(|(file, _)| CANONICAL_BUILDER.contains(file))
+            });
+            assert!(
+                canonical,
+                "{authority}: no documented construction site in the canonical daemon \
+                 builder ({CANONICAL_BUILDER:?}); every daemon authority must be assembled \
+                 by the one canonical builder"
+            );
+        }
+
+        // Planted violation: a production module outside the documented
+        // sites constructing the authority is an offender (the exact-count
+        // rule of scan 4, applied to a synthetic source).
+        let planted = "pub fn shadow() -> TaskExecutor {\n    \
+                       let executor = TaskExecutor::new();\n    executor\n}\n";
+        let offenders = constructor_site_offenders(
+            "crates/session/src/planted_authority.rs",
+            planted,
+            "TaskExecutor::new(",
+            &[
+                ("crates/cli/src/daemon/builder.rs", 1),
+                ("crates/server/src/api/deps.rs", 1),
+            ],
+        );
+        assert!(
+            !offenders.is_empty(),
+            "a production construction outside the documented sites must fire"
+        );
+        // The sanctioned shape (the canonical builder file, exact count) is
+        // clean.
+        let sanctioned = constructor_site_offenders(
+            "crates/cli/src/daemon/builder.rs",
+            "fn build() { let _ = TaskExecutor::new(); }\n",
+            "TaskExecutor::new(",
+            &[
+                ("crates/cli/src/daemon/builder.rs", 1),
+                ("crates/server/src/api/deps.rs", 1),
+            ],
+        );
+        assert!(
+            sanctioned.is_empty(),
+            "the canonical builder's own construction is not an offender: {sanctioned:?}"
+        );
+        // Tests may build isolated units: a test body and a test-gated
+        // out-of-line module are invisible to the production scan, while the
+        // same marker in production text is visible.
+        let test_gated = "pub fn build() {}\n#[cfg(test)]\nmod tests {\n    \
+                          fn t() { let _ = TaskExecutor::new_owner_direct_for_test_harness(); }\n}\n";
+        let f = synthetic_file("crates/session/src/planted_authority.rs", test_gated);
+        assert!(
+            find_markers(&f, &["TaskExecutor::new_owner_direct_for_test_harness("]).is_empty(),
+            "#[cfg(test)] bodies build isolated units and must stay invisible"
+        );
+        let commented = "// TaskExecutor::new( in a comment\n\
+                         pub fn note() -> &'static str { \"TaskExecutor::new( in a string\" }\n";
+        let f = synthetic_file("crates/session/src/planted_authority.rs", commented);
+        assert!(
+            find_markers(&f, &["TaskExecutor::new("]).is_empty(),
+            "comments and string literals can never instantiate an authority"
+        );
+
+        assert!(
+            is_test_file("crates/cli/src/acquire_certification.rs"),
+            "test-gated #[path] modules with ordinary names are test-only"
+        );
+        assert!(
+            is_test_file("crates/cli/src/test_http.rs"),
+            "test-gated out-of-line modules are test-only"
+        );
+        assert!(
+            is_test_file("crates/scheduler/src/modelcheck.rs"),
+            "test-gated out-of-line modules are test-only"
+        );
+        assert!(!is_test_file("crates/cli/src/main.rs"));
+        assert!(!is_test_file("crates/cli/src/tools_market.rs"));
+        assert!(!is_test_file("crates/orchestrator/src/shadow.rs"));
+        assert_eq!(
+            out_of_line_mods("pub fn f() {}\n#[cfg(test)]\nmod helpers;\n").len(),
+            1,
+            "the test-gated out-of-line declaration must be recognized"
+        );
+        assert_eq!(
+            out_of_line_mods("pub mod x;\nmod y;\n").len(),
+            2,
+            "production out-of-line declarations must be recognized"
+        );
+    }
+
+    /// The exact-count offender rule of scan 4, reusable on synthetic
+    /// sources (the planted-violation proof): the documented count applies
+    /// to the source's own path; a source with no documented entry is an
+    /// offender on every hit.
+    fn constructor_site_offenders(
+        rel: &str,
+        src: &str,
+        marker: &str,
+        documented: &[(&str, usize)],
+    ) -> Vec<String> {
+        let f = synthetic_file(rel, src);
+        let want = documented
+            .iter()
+            .find(|(file, _)| *file == rel)
+            .map(|(_, want)| *want)
+            .unwrap_or(0);
+        find_markers(&f, &[marker])
+            .iter()
+            .skip(want)
+            .map(|(line, text)| format!("{rel}:{line}: {text} [undocumented {marker}]"))
+            .collect()
     }
 
     // ------------------------------------------------------------------
@@ -5484,7 +5890,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/cloud/tests/durability_memory.rs", 1),
         ("crates/server/tests/attachment_decode_alloc.rs", 1),
         ("crates/orchestrator/src/shadow_tests.rs", 1),
-        ("crates/cli/src/main.rs", 2),
+        // The CLI's test-gated out-of-line modules (the module-decomposition
+        // move out of main.rs): the two libc::kill zero-signal probes.
+        ("crates/cli/src/main_acp_tests.rs", 1),
+        ("crates/cli/src/main_serve_tests.rs", 1),
         ("tests/coding-benchmark/src/daemon.rs", 1),
         ("tests/coding-benchmark/src/process.rs", 1),
     ];
@@ -6270,7 +6679,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
 
     /// Top-level daemon subsystem services a production-wiring test must
     /// never construct: the production graph owns each one exactly once, so
-    /// a test-local construction is a parallel authority.
+    /// a test-local construction is a parallel authority. Audit 30 extends
+    /// this with the remaining authority constructors (router service,
+    /// acquisition planner/service, index service, SCM completion provider)
+    /// so tests cannot instantiate a competing authority either; the planner
+    /// default stays allowed because the documented spy seam wraps it and
+    /// injects it through the production builder.
     const PRODUCTION_WIRING_FORBIDDEN_CONSTRUCTORS: &[&str] = &[
         "ProcessSupervisor::new",
         "TaskExecutor::new(",
@@ -6285,8 +6699,17 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         "SessionManager::open(",
         "SessionManager::open_quick(",
         "IndexService::open_with_supervisor(",
+        "IndexService::open(",
+        "IndexService::new",
         "SqliteScmStore::open(",
         "MemoryScmStore::new(",
+        "RouterService::new",
+        "RouterService::with_route_candidates",
+        "RouterService::with_pinned_route_candidates",
+        "AcquisitionPlanner::new",
+        "CommerceSourceService::open_with_planner(",
+        "CommerceSourceService::open(",
+        "GitHubCompletionScm::new",
     ];
 
     /// Every `.rs` file under `tests/production-wiring/{src,tests}`.
@@ -6502,6 +6925,20 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert_eq!(offenders.len(), 1, "{offenders:?}");
         assert!(offenders[0].contains("TaskExecutor::new("), "{offenders:?}");
 
+        // Audit 30 planted authorities: a test-local router/acquisition/index
+        // construction fires exactly like the executor one.
+        for planted in [
+            "fn t() { let _ = RouterService::with_route_candidates(candidates); }\n",
+            "fn t() { let _ = AcquisitionPlanner::new(SubstitutionPolicy::default()); }\n",
+            "fn t() { let _ = IndexService::open_with_supervisor(sup, ws, cfg); }\n",
+            "fn t() { let _ = GitHubCompletionScm::new(app, store, tenant); }\n",
+        ] {
+            assert!(
+                !authority_replacement_offenders(non_exempt, planted).is_empty(),
+                "a test-local authority construction must fire: {planted}"
+            );
+        }
+
         let comment_and_string = "// graph.tasks.set_completion_scm_provider(Some(x))\n\
              const DOC: &str = \"replace_scm_store(TaskExecutor::new())\";\nfn t() {}\n";
         assert!(
@@ -6524,6 +6961,402 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             )
             .is_empty(),
             "the explicitly named manual adapter-contract module is the one exemption"
+        );
+    }
+
+    // ---------------------------------------------------------------- source-size ceiling
+    //
+    // Audit item 9/23/24: the former giants (`agent/runtime.rs`,
+    // `store/lib.rs`, `cli/main.rs`, `server/api.rs`, `cli/config.rs`) were
+    // decomposed into cohesive modules. This scan keeps the workspace from
+    // regrowing: every Rust source under `crates/` and `tests/` (except the
+    // enforcing crate itself and fixture trees) must fit the ceiling. The
+    // recorded grandfather list is NON-GROWABLE — a file may never exceed
+    // its recorded count, an entry must be deleted the moment the file fits
+    // under the ceiling, and no new file may join the list.
+
+    /// The per-file source ceiling, in lines.
+    const SOURCE_SIZE_CEILING_LINES: usize = 4000;
+
+    /// Files that were already over the ceiling when it was introduced
+    /// (recorded counts). This list can only shrink.
+    const GRANDFATHERED_OVER_CEILING: &[(&str, usize)] = &[
+        ("crates/acp/src/lib.rs", 4465),
+        ("crates/agent/src/lib.rs", 6698),
+        ("crates/cli/src/tools_market.rs", 5555),
+        ("crates/git/src/lib.rs", 4269),
+        ("crates/index/src/service.rs", 6044),
+        ("crates/ollama/src/lib.rs", 4107),
+        ("crates/openai/src/lib.rs", 4234),
+        ("crates/orchestrator/src/completion_steps.rs", 4631),
+        ("crates/orchestrator/src/runtime.rs", 4262),
+        ("crates/orchestrator/src/runtime_tests.rs", 5259),
+        ("crates/orchestrator/src/task_executor.rs", 7367),
+        ("crates/orchestrator/src/task_executor_tests.rs", 9594),
+        ("crates/provider/src/egress.rs", 5699),
+        ("crates/router/src/lib.rs", 5305),
+        ("crates/scheduler/src/lib.rs", 4176),
+        ("crates/server/src/native/terminal_authority.rs", 5189),
+        ("crates/session/src/budget.rs", 4010),
+        ("crates/session/src/ledger.rs", 7281),
+        ("crates/session/src/task.rs", 7067),
+        ("crates/terminal/src/lib.rs", 6845),
+    ];
+
+    /// Every Rust source in scope for the ceiling: `crates/**` plus
+    /// `tests/**`, excluding the enforcing crate and fixture trees.
+    fn walk_ceiling_sources() -> Vec<String> {
+        let mut out = walk_crate_sources();
+        let tests = repo_root().join("tests");
+        let mut stack = vec![tests];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                let name = entry.file_name().to_string_lossy().to_string();
+                if ft.is_dir() {
+                    if name == "target" || name == "fixtures" || name.starts_with('.') {
+                        continue;
+                    }
+                    if path.ends_with("tests/static-authority") {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let rel = path
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string();
+                    out.push(normalize_rel(&rel));
+                }
+            }
+        }
+        out
+    }
+
+    fn source_size_violations(counts: &[(String, usize)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, lines) in counts {
+            match GRANDFATHERED_OVER_CEILING.iter().find(|(f, _)| f == rel) {
+                Some((_, recorded)) => {
+                    if lines > recorded {
+                        out.push(format!(
+                            "{rel}: {lines} lines exceeds its recorded grandfather count \
+                             {recorded} (the list can only shrink)"
+                        ));
+                    }
+                    if *lines <= SOURCE_SIZE_CEILING_LINES {
+                        out.push(format!(
+                            "{rel}: {lines} lines now fit under the {SOURCE_SIZE_CEILING_LINES}-line \
+                             ceiling; remove the grandfather entry"
+                        ));
+                    }
+                }
+                None => {
+                    if lines > &SOURCE_SIZE_CEILING_LINES {
+                        out.push(format!(
+                            "{rel}: {lines} lines exceeds the {SOURCE_SIZE_CEILING_LINES}-line \
+                             source ceiling: split the file or record a documented grandfather count"
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn source_files_stay_under_the_size_ceiling_or_their_recorded_count() {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for rel in walk_ceiling_sources() {
+            let Ok(src) = std::fs::read_to_string(repo_root().join(&rel)) else {
+                continue;
+            };
+            counts.push((rel, src.lines().count()));
+        }
+        assert!(
+            counts.len() >= 200,
+            "ceiling walk found only {} files",
+            counts.len()
+        );
+        let violations = source_size_violations(&counts);
+        assert!(
+            violations.is_empty(),
+            "source-size ceiling violations:\n  {}\n",
+            violations.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn size_ceiling_fires_on_planted_violations() {
+        let at_cap = vec![(
+            "crates/planted/src/lib.rs".to_string(),
+            SOURCE_SIZE_CEILING_LINES,
+        )];
+        assert!(
+            source_size_violations(&at_cap).is_empty(),
+            "a file exactly at the ceiling is allowed"
+        );
+        let planted = vec![(
+            "crates/planted/src/lib.rs".to_string(),
+            SOURCE_SIZE_CEILING_LINES + 1,
+        )];
+        let fired = source_size_violations(&planted);
+        assert_eq!(fired.len(), 1, "one planted violation: {fired:?}");
+        assert!(fired[0].contains("exceeds"), "{fired:?}");
+
+        let (grandfathered, recorded) = GRANDFATHERED_OVER_CEILING[0];
+        let grown = vec![(grandfathered.to_string(), recorded + 1)];
+        let fired = source_size_violations(&grown);
+        assert_eq!(
+            fired.len(),
+            1,
+            "growth of a grandfathered file fires: {fired:?}"
+        );
+        assert!(fired[0].contains("can only shrink"), "{fired:?}");
+
+        let shrunk = vec![(grandfathered.to_string(), SOURCE_SIZE_CEILING_LINES)];
+        let fired = source_size_violations(&shrunk);
+        assert_eq!(
+            fired.len(),
+            1,
+            "a shrunk file must leave the list: {fired:?}"
+        );
+        assert!(
+            fired[0].contains("remove the grandfather entry"),
+            "{fired:?}"
+        );
+    }
+
+    // ------------------------------------------- audit 25/27/28 wiring --
+
+    /// Audit 25: the canonical protocol schema artifact, the generated
+    /// clients and the drift gate are all present and wired into CI.
+    #[test]
+    fn protocol_codegen_surface_is_canonical_and_wired() {
+        let root = repo_root();
+        let artifact_rel = "crates/protocol/schema/faktor-protocol.schema.json";
+        let artifact =
+            std::fs::read_to_string(root.join(artifact_rel)).expect("canonical schema artifact");
+        assert!(
+            artifact.contains("\"schema\": \"faktor-protocol-schema/v1\""),
+            "artifact schema id drifted"
+        );
+        for required in [
+            "Message",
+            "Part",
+            "ToolResultBody",
+            "PageMeta",
+            "MessagesPage",
+            "SessionState",
+            "AgentStateView",
+        ] {
+            assert!(
+                artifact.contains(&format!("\"name\": \"{required}\"")),
+                "artifact misses {required}"
+            );
+        }
+        let code_rows = artifact.matches("\"code\":").count();
+        assert!(code_rows >= 14, "error code table shrank: {code_rows} rows");
+
+        for (rel, language) in [
+            ("apps/vscode/src/generated/protocolDto.ts", "TypeScript"),
+            (
+                "apps/jetbrains/shared/src/main/kotlin/dev/faktor/shared/GeneratedProtocolDto.kt",
+                "Kotlin",
+            ),
+        ] {
+            let src = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{language} generated file missing: {e}"));
+            assert!(
+                src.starts_with("// GENERATED FILE - DO NOT EDIT BY HAND."),
+                "{rel}: generated header missing"
+            );
+            assert!(
+                src.contains("protocol-codegen.mjs --write"),
+                "{rel}: regeneration command missing"
+            );
+            assert!(
+                src.contains("CODEGEN.md"),
+                "{rel}: generated-vs-handwritten pointer missing"
+            );
+        }
+        assert!(
+            root.join("scripts/protocol-codegen.mjs").is_file(),
+            "codegen script missing"
+        );
+        assert!(
+            root.join("crates/protocol/schema/CODEGEN.md").is_file(),
+            "generated-vs-handwritten list missing"
+        );
+        let schema_rs = std::fs::read_to_string(root.join("crates/protocol/src/schema.rs"))
+            .expect("schema emitter");
+        assert!(
+            schema_rs.contains("pub fn canonical_json"),
+            "schema emitter lost its canonical JSON entry point"
+        );
+        let bin =
+            std::fs::read_to_string(root.join("crates/protocol/src/bin/faktor-protocol-schema.rs"))
+                .expect("schema emitter binary");
+        assert!(
+            bin.contains("--check"),
+            "schema emitter lost its --check drift mode"
+        );
+        let vscode_lane = std::fs::read_to_string(root.join(".woodpecker/trusted/trusted.yaml"))
+            .expect("trusted workflow");
+        assert!(
+            vscode_lane.contains("node scripts/protocol-codegen.mjs --check-clients"),
+            "the trusted vscode lane must run the client drift check"
+        );
+    }
+
+    /// Audit 27: the reproducible contention benchmark exists, is #[ignore]d
+    /// (normal PR runs stay fast) and is assigned to a wired nightly lane
+    /// (the trusted perf lane selects the package too).
+    #[test]
+    fn contention_benchmark_is_wired_into_nightly_and_trusted() {
+        let root = repo_root();
+        let bench = std::fs::read_to_string(root.join("tests/performance/tests/contention.rs"))
+            .expect("contention benchmark");
+        assert!(
+            bench.contains("#[ignore = \"[perf] multi-agent contention"),
+            "the benchmark must stay #[ignore]d so PR runs stay fast"
+        );
+        for axis in [
+            "sse_lag",
+            "event_lag",
+            "writer_wait",
+            "reader_wait",
+            "index_rebuild",
+            "wal_peak_bytes",
+            "rss_end_kb",
+        ] {
+            assert!(bench.contains(axis), "benchmark misses the {axis} axis");
+        }
+        let registry =
+            std::fs::read_to_string(root.join("scripts/certification/ignored-tests.json"))
+                .expect("ignored-test registry");
+        assert!(
+            registry.contains("\"contention\""),
+            "the contention lane must be registered"
+        );
+        assert!(
+            registry.contains("tests/performance/tests/contention.rs"),
+            "the benchmark must be assigned to a lane"
+        );
+        let nightly = std::fs::read_to_string(root.join(".woodpecker/trusted/nightly.yaml"))
+            .expect("nightly workflow");
+        assert!(
+            nightly.contains("  - name: contention"),
+            "the nightly contention lane step is missing"
+        );
+        assert!(
+            nightly.contains(
+                "cargo test -p faktor-tests-performance --release --test contention -- --ignored"
+            ),
+            "the nightly contention lane command drifted"
+        );
+        let trusted = std::fs::read_to_string(root.join(".woodpecker/trusted/trusted.yaml"))
+            .expect("trusted workflow");
+        assert!(
+            trusted.contains("cargo test -p faktor-tests-performance --release -- --ignored"),
+            "the trusted perf lane must keep selecting the performance package"
+        );
+    }
+
+    /// Audit 28: the visual baseline carries DISTINCT per-platform records,
+    /// the checker never inherits a canonical digest, and its policy
+    /// self-test runs in the JetBrains smoke.
+    #[test]
+    fn visual_certification_is_environment_specific() {
+        let root = repo_root();
+        let baseline_rel =
+            "apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json";
+        let baseline = std::fs::read_to_string(root.join(baseline_rel)).expect("baseline");
+        assert!(
+            baseline.contains("\"schema\": \"faktor-parity-visual-baselines/v3\""),
+            "baseline schema drifted"
+        );
+        for platform in ["linux", "macos", "windows"] {
+            assert!(
+                baseline.contains(&format!("\"{platform}\"")),
+                "release platform {platform} missing from the baseline"
+            );
+        }
+        assert!(
+            !baseline.contains("panelDigests") && !baseline.contains("environmentDigests"),
+            "the v2 canonical digest pool must not survive in the v3 baseline"
+        );
+        assert!(
+            baseline.contains("\"linux\": {") && baseline.contains("\"macos\": {"),
+            "per-platform records missing"
+        );
+        // Each present platform record carries an environment fingerprint and
+        // exactly the pinned 64-hex panel digest values.
+        let environments = baseline.matches("\"environment\":").count();
+        assert!(
+            environments >= 2,
+            "only {environments} platform records carry an environment fingerprint"
+        );
+        let digests: Vec<&str> = baseline
+            .lines()
+            .filter_map(|line| line.split_once(": ").map(|(_, value)| value))
+            .map(|value| value.trim().trim_end_matches(',').trim_matches('"'))
+            .filter(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        assert!(
+            digests.len() >= 16,
+            "only {} pinned 64-hex panel digests in the baseline",
+            digests.len()
+        );
+        let matrix_rel =
+            "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt";
+        let matrix = std::fs::read_to_string(root.join(matrix_rel)).expect("parity matrix");
+        assert!(
+            matrix.contains("not certified on platform"),
+            "the checker must surface missing platforms as not certified"
+        );
+        for forbidden in [
+            "field(\"panelDigests\")",
+            "optionalField(\"environmentDigests\")",
+            "field(\"environmentDigests\")",
+        ] {
+            assert!(
+                !matrix.contains(forbidden),
+                "the checker must never parse the canonical {forbidden} digest pool"
+            );
+        }
+        assert!(
+            matrix.contains("visualCoverageOf") && matrix.contains("visualResultsFor"),
+            "the per-platform checker core is missing"
+        );
+        assert!(
+            matrix.contains("visualCertificationPolicySelfTest"),
+            "the adversarial policy self-test is missing"
+        );
+        let smoke_rel =
+            "apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt";
+        let smoke = std::fs::read_to_string(root.join(smoke_rel)).expect("parity smoke");
+        assert!(
+            smoke.contains("visualCertificationPolicySelfTest"),
+            "the smoke must run the visual certification policy self-test"
+        );
+        assert!(
+            root.join("scripts/check-visual-platforms.mjs").is_file(),
+            "platform-record checker missing"
+        );
+        let certify = std::fs::read_to_string(root.join("scripts/certify.sh")).expect("certify.sh");
+        assert!(
+            certify.contains("check-visual-platforms.mjs"),
+            "certify.sh must consume the platform-record checker"
+        );
+        assert!(
+            certify.contains("[ \"$VISUAL_PLATFORMS_STATUS\" = \"pass\" ]"),
+            "the visual platform records must gate the release preconditions"
         );
     }
 }

@@ -30,7 +30,7 @@ use faktor_scm::{ManualClock, StaticTokenSource};
 use faktor_session::{Task, TaskBudget};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use faktor_tests_production_wiring::wiring::{self, CloudGithubAppCfg, Config, GithubAppSeams};
+use faktor_tests_production_wiring::harness::{self, CloudGithubAppCfg, Config, GithubAppSeams};
 
 const TENANT: &str = "tenant-a";
 const NOW_MS: i64 = 1_700_000_000_000;
@@ -262,7 +262,7 @@ fn repository_row(owner: &str, name: &str, installation_id: i64) -> RepositoryRo
 /// at the current revision, and the durable PASSED verification record that
 /// authorizes the step.
 fn seed_contract_task(
-    graph: &wiring::DaemonGraph,
+    graph: &harness::DaemonGraph,
     parent: faktor_core::SessionId,
     goal: &str,
 ) -> VerificationRecordId {
@@ -377,7 +377,7 @@ async fn completion_pr_goes_through_the_production_github_app_adapter() {
         organization: Some(TENANT.to_string()),
         ..Default::default()
     });
-    let graph = wiring::build_production_graph_with_scm_seams(
+    let graph = harness::build_production_graph_with_scm_seams(
         &data,
         config,
         GithubAppSeams {

@@ -462,6 +462,29 @@ file from a different SHA is not evidence. Any change to the probed
 symbols/tests/files that moves a status must update this table in the same
 commit.
 
+The same manifest carries the per-capability **certification axes**
+(`axes.<capability>`) for `acquisition_planner`, `identity_cache`, `vision`,
+`retrieval`, `scm` and `jobs`:
+
+| Axis | Derived from |
+| --- | --- |
+| `wired` | production construction markers (the daemon really assembles the capability) |
+| `adapter_certified` | the adapter/contract-mock test exists |
+| `daemon_e2e_certified` | a `tests/production-wiring` test drives the executable's own `build_daemon_core` graph (the suite is the source; a sibling test file must call `build_production_graph` and name the capability's test function) |
+| `platforms_certified` | the Woodpecker lanes whose commands actually run the workspace tests (parsed from `.woodpecker/trusted/trusted.yaml`) |
+| `external_dependency` | `faked` when the certification substitutes an external seam (fake/loopback server or transport), `none` when the capability's authority is durable local state |
+
+The README's machine-checked capability-axes block (between the two
+`capability-axes` HTML comment markers) is the ONE place these fields may
+appear: `scripts/capabilities-manifest.mjs --check-claims` compares every
+cell against the derived manifest and rejects a raw boolean assignment for
+any axis field anywhere else in README/docs ("no manual binary prose").
+`bash scripts/check-docs-sync.sh` runs that comparison on hosts with node;
+when node is unavailable the check prints an explicit SKIPPED line (the
+certificate lanes and `certify-local.sh` carry node and enforce the same
+fields). A row, a missing capability, an unknown capability or a moved
+field is a non-zero drift failure, never a warning.
+
 | Capability | Status | Derived from |
 | --- | --- | --- |
 | `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` (`export class`, typed validators) + adversarial `apps/vscode/scripts/selftest.mjs` assertions |
@@ -647,6 +670,35 @@ PASS — NOT A RELEASE CERTIFICATE` and the manifest records
 `release_certificate: false`. No flag weakens checks while preserving the
 certificate class.
 
+**Gate 10 — the trusted workflow's certificate artifact (audit 19).**
+`target/certification/ci-certification.json` (written by the trusted
+workflow's linux `certificate` step, `--ci-certification PATH` /
+`CERTIFY_CI_CERTIFICATION` override) is the trusted workflow's own
+`faktor-ci-certification/v2` object. Before any release class is possible
+the gate compares it against the EXACT shipped commit and tree and requires
+`schema == faktor-ci-certification/v2`, `workflow == trusted`,
+`status == pass`, matching `commit` and matching `tree`; duplicate JSON
+keys, malformed objects and every mismatch are typed refusals
+(`ci-certification-absent`, `ci-certification-unreadable`,
+`ci-certification-schema`, `ci-certification-workflow`,
+`ci-certification-status`, `ci-certification-commit-mismatch`,
+`ci-certification-tree-mismatch`). A non-matching certificate **refuses the
+ReleaseArtifactSet** (`ReleaseArtifactSet: status=refused`): the local
+artifacts can never appear in a RELEASE CERTIFICATE, and `--release` fails
+outright. The darwin/windows platform certificates
+(`ci-certification-{darwin,windows}.json`) remain their own lanes'
+artifacts.
+
+**CI status contract (audit 19).** `scripts/certify.sh
+--check-gate-parity` also asserts the forge-side contract that makes the
+required main-push check fail closed: the trusted workflow's top-level
+`when` must include the `push` event (every main push creates the trusted
+pipeline that publishes `ci/woodpecker/push/trusted`) and the `certificate`
+step must run with `when.status: [success, failure]`. A pipeline that fails
+to start therefore never yields a successful required context — branch
+protection keeps the check pending/non-success (see
+`scripts/woodpecker/setup.md` §7).
+
 `bash scripts/certify.sh --selftest` proves the whole matrix hermetically
 against the mock API in
 `scripts/certification/fixtures/woodpecker-api/mock_server.py`: success,
@@ -657,7 +709,9 @@ attestation success plus failures for tampered, foreign-signature,
 allowlisted-identity-with-foreign-key, other-repository, unconditional-
 pipeline-id, unsigned and absent attestations, pr-context upgrade by a
 trusted attestation plus trusted-project identity/config/class re-fetch
-spoofs, the
+spoofs, the CI certification manifest matrix (absent/matching/schema/
+workflow/status/commit/tree/malformed/duplicate-keys), the CI status
+contract (dropped push event, missing failure status, real workflow), the
 `--verify-ci-evidence` wording, the `--ci-only` rejection, certificate-class
 truth-table checks, manifest field binding/determinism and the temp-name
 migration. The same suites run from
@@ -1130,6 +1184,11 @@ Concretely, to ship:
    `--verify-ci-evidence` and `--local-only` never print a release
    certificate. Missing API credentials are an operator error (exit 2),
    never a pass; commit-message claims and local flags are not evidence.
+   Since audit 19 the run ALSO requires the trusted workflow's own
+   certificate artifact (`target/certification/ci-certification.json`; gate
+   10 in §2.12) to match the exact shipped commit/tree: a missing, stale,
+   foreign, failed or malformed certificate refuses the ReleaseArtifactSet
+   and, with `--release`, fails the run.
 
 Any new commit — including a docs-only change — invalidates the previous
 certificate and requires a fresh run.

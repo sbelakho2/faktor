@@ -375,20 +375,23 @@ mod tests {
                         assert!(!raw.contains(banned), "banned block {banned} in {raw}");
                     }
                     let msgs = body["messages"].as_array().unwrap();
-                    assert_eq!(msgs.len(), 2);
-                    assert_eq!(msgs[0]["role"], "assistant");
+                    // The cacheable prefix is the first message; the
+                    // reasoning/tool exchange follows.
+                    assert_eq!(msgs.len(), 3);
+                    assert_eq!(msgs[0]["role"], "system");
+                    assert_eq!(msgs[1]["role"], "assistant");
                     assert_eq!(
-                        msgs[0]["reasoning_content"], "think about it",
+                        msgs[1]["reasoning_content"], "think about it",
                         "reasoning must replay at message level"
                     );
-                    assert_eq!(msgs[0]["content"], "", "no text → empty string content");
-                    assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_1");
+                    assert_eq!(msgs[1]["content"], "", "no text → empty string content");
+                    assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
                     assert_eq!(
-                        msgs[0]["tool_calls"][0]["function"]["arguments"],
+                        msgs[1]["tool_calls"][0]["function"]["arguments"],
                         r#"{"x":1}"#
                     );
-                    assert_eq!(msgs[1]["role"], "tool");
-                    assert_eq!(msgs[1]["tool_call_id"], "call_1");
+                    assert_eq!(msgs[2]["role"], "tool");
+                    assert_eq!(msgs[2]["tool_call_id"], "call_1");
                 }),
             },
         );

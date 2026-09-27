@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod native;
+pub mod schema;
 
 pub use error::ApiError;
 pub use native::*;

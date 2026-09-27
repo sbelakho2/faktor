@@ -83,6 +83,19 @@ def main() -> int:
                     else:
                         self.reply(200, repo)
                     return
+                if len(segments) == 4 and segments[1] == "logs":
+                    # /api/repos/<id>/logs/<number>/<step> — the route
+                    # scripts/certify.sh actually fetches (attestation log
+                    # lookup). Kept alongside the legacy pipelines/<number>/
+                    # logs shape below so both verifier generations stay
+                    # exercisable.
+                    step = segments[3]
+                    logs = state.get("logs") or {}
+                    if step in logs:
+                        self.reply(200, logs[step])
+                    else:
+                        self.reply(404, {"message": "log not found"})
+                    return
                 if len(segments) >= 2 and segments[1] == "pipelines":
                     if len(segments) == 2:
                         self.reply(200, state.get("pipelines") or [])

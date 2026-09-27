@@ -2382,7 +2382,20 @@ mod tests {
 
     #[test]
     fn construction_order_markers_rise_strictly_inside_the_core_builder() {
-        let src = include_str!("main.rs");
+        // The daemon construction was decomposed into `daemon/` modules
+        // (audit 9/23/24); the scan concatenates the crate root with the
+        // daemon modules in construction order.
+        let src = concat!(
+            include_str!("main.rs"),
+            "\n",
+            include_str!("daemon/mod.rs"),
+            "\n",
+            include_str!("daemon/builder.rs"),
+            "\n",
+            include_str!("daemon/wiring.rs"),
+            "\n",
+            include_str!("daemon/serve.rs"),
+        );
         let lines: Vec<&str> = src.lines().collect();
         // The core builder is the ONE inline construction region for steps
         // 4-16; helper definitions above/below it are outside the scanned
@@ -2535,11 +2548,75 @@ mod tests {
         let files: &[(&str, &str)] = &[
             ("main.rs", include_str!("main.rs")),
             ("graph.rs", include_str!("graph.rs")),
-            ("config.rs", include_str!("config.rs")),
+            (
+                "config.rs",
+                concat!(
+                    include_str!("config.rs"),
+                    "\n",
+                    include_str!("config/core.rs"),
+                    "\n",
+                    include_str!("config/completion.rs"),
+                    "\n",
+                    include_str!("config/tasks.rs"),
+                    "\n",
+                    include_str!("config/efficiency.rs"),
+                    "\n",
+                    include_str!("config/cloud.rs"),
+                    "\n",
+                    include_str!("config/scm.rs"),
+                    "\n",
+                    include_str!("config/updater.rs"),
+                    "\n",
+                    include_str!("config/billing.rs"),
+                    "\n",
+                    include_str!("config/workers.rs"),
+                    "\n",
+                    include_str!("config/worker_plane.rs"),
+                    "\n",
+                    include_str!("config/worker_node.rs"),
+                    "\n",
+                    include_str!("config/enterprise.rs"),
+                    "\n",
+                    include_str!("config/embedding.rs"),
+                    "\n",
+                    include_str!("config/verification.rs"),
+                    "\n",
+                    include_str!("config/sandbox.rs"),
+                    "\n",
+                    include_str!("config/mcp.rs"),
+                    "\n",
+                    include_str!("config/provider.rs"),
+                    "\n",
+                    include_str!("config/commerce.rs"),
+                ),
+            ),
+            (
+                "daemon/builder.rs",
+                concat!(
+                    include_str!("daemon/mod.rs"),
+                    "\n",
+                    include_str!("daemon/builder.rs")
+                ),
+            ),
+            ("daemon/wiring.rs", include_str!("daemon/wiring.rs")),
+            ("daemon/serve.rs", include_str!("daemon/serve.rs")),
             ("evidence.rs", include_str!("evidence.rs")),
             ("mcp_bridge.rs", include_str!("mcp_bridge.rs")),
             ("tools.rs", include_str!("tools.rs")),
-            ("server api.rs", include_str!("../../server/src/api.rs")),
+            (
+                "server api.rs",
+                concat!(
+                    include_str!("../../server/src/api.rs"),
+                    "\n",
+                    include_str!("../../server/src/api/deps.rs"),
+                    "\n",
+                    include_str!("../../server/src/api/lifecycle.rs"),
+                    "\n",
+                    include_str!("../../server/src/api/router.rs"),
+                    "\n",
+                    include_str!("../../server/src/api/health.rs"),
+                ),
+            ),
         ];
         for (name, src) in files.iter().copied() {
             let lines: Vec<&str> = src.lines().collect();
@@ -2547,15 +2624,17 @@ mod tests {
             if name == "graph.rs" {
                 regions.push((0, lines.len())); // the graph module itself
             }
-            if name == "main.rs" {
+            if name == "main.rs" || name == "daemon/builder.rs" {
                 // The graph construction region: every daemon builder entry.
                 let mut i = 0;
                 while i < lines.len() {
                     let t = lines[i].trim_start();
                     let is_header = (t.starts_with("fn build_daemon")
                         || t.starts_with("pub fn build_daemon")
+                        || t.starts_with("pub(crate) fn build_daemon")
                         || t.starts_with("async fn build_daemon")
-                        || t.starts_with("pub async fn build_daemon"))
+                        || t.starts_with("pub async fn build_daemon")
+                        || t.starts_with("pub(crate) async fn build_daemon"))
                         && t.ends_with('(');
                     if is_header {
                         let (s, e) = span_of(&lines, t);

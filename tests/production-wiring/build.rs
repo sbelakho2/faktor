@@ -1,8 +1,10 @@
-//! Copies the `faktor-cli` binary source into `OUT_DIR` so it can be spliced
-//! into this crate at the CRATE ROOT (via `include!`) with the exact same
-//! module topology it has in the binary. Copying preserves the included
-//! file's directory for `mod <name>;` resolution, so `crates/cli/src/*.rs`
-//! land in `OUT_DIR/*.rs` and every `mod` declaration resolves to its copy.
+//! Copies the `faktor-cli` binary source tree into `OUT_DIR` so it can be
+//! spliced into this crate at the CRATE ROOT (via `include!`) with the exact
+//! same module topology it has in the binary. Copying preserves each
+//! included file's directory for `mod <name>;` resolution, so the whole
+//! `crates/cli/src` tree (top-level `.rs` files AND module SUBDIRECTORIES,
+//! e.g. `config/cloud.rs`) lands at the mirrored path under `OUT_DIR` and
+//! every `mod` declaration resolves to its copy.
 //!
 //! The ONLY transformation is on `main.rs`: its leading `//!` inner doc
 //! block is converted to ordinary `//` comments, because rustc rejects inner
@@ -19,27 +21,45 @@ fn main() {
     println!("cargo:rerun-if-changed={}", cli_src.display());
 
     let mut copied = 0usize;
-    for entry in std::fs::read_dir(&cli_src).expect("cli src dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path.file_name().expect("file name");
-        let text = std::fs::read_to_string(&path).expect("read cli source");
-        let text = absolutize_includes(&text, &cli_src);
-        let rendered = if name == "main.rs" {
-            strip_leading_inner_docs(&text)
-        } else {
-            text
-        };
-        std::fs::write(out_dir.join(name), rendered).expect("write cli source copy");
-        copied += 1;
-    }
+    copy_tree(&cli_src, &out_dir, Path::new(""), &mut copied);
     assert!(
         copied > 0,
         "no cli sources copied from {}",
         cli_src.display()
     );
+}
+
+/// Recursively mirror `src_dir` under `out_dir`, preserving relative
+/// directories so nested `mod` resolution keeps working.
+fn copy_tree(src_dir: &Path, out_dir: &Path, rel: &Path, copied: &mut usize) {
+    for entry in std::fs::read_dir(src_dir).expect("cli src dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let name = path.file_name().expect("file name");
+        let child_rel = rel.join(name);
+        let file_type = entry.file_type().expect("dir entry type");
+        if file_type.is_dir() {
+            std::fs::create_dir_all(out_dir.join(&child_rel)).expect("create module dir");
+            copy_tree(&path, out_dir, &child_rel, copied);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read cli source");
+        let text = absolutize_includes(&text, src_dir);
+        let rendered = if child_rel == Path::new("main.rs") {
+            widen_root_daemon_exports(&strip_leading_inner_docs(&text))
+        } else {
+            text
+        };
+        let dest = out_dir.join(&child_rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).expect("create module dir");
+        }
+        std::fs::write(dest, rendered).expect("write cli source copy");
+        *copied += 1;
+    }
 }
 
 /// Rewrite relative `include_str!`/`include_bytes!` paths to absolute paths
@@ -75,6 +95,23 @@ fn absolutize_includes(text: &str, cli_src: &Path) -> String {
         }
     }
     rendered
+}
+
+/// Widen the binary root's private `use daemon::*;` re-export to a public
+/// one in the COPY only. The harness crate and its integration tests name
+/// the daemon builder API (`build_daemon*`, `GithubAppSeams`, ...) as the
+/// pre-split binary root exposed it; with the module split those items live
+/// behind `daemon`, and a private root re-export would make them crate-only.
+/// A `pub use daemon::*;` already present is left byte-untouched.
+fn widen_root_daemon_exports(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if line.trim() == "use daemon::*;" {
+            out.push_str("pub ");
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Convert the leading `//!` inner-doc run into `//` comments (the rest of

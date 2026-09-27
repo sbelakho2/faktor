@@ -8,7 +8,7 @@
 //! The only substituted seam is the network transport (the connector's
 //! injected `HttpTransport`): the connector, the registration, the identity
 //! injection, the credential resolution and the tool/service path are the
-//! production ones built over `wiring::build_production_graph`. A
+//! production ones built over `harness::build_production_graph`. A
 //! missing/expired access token must be the typed `AuthenticationRequired`
 //! with zero requests and zero browser consultations.
 
@@ -28,11 +28,11 @@ use faktor_commerce_connectors::{
     BrowserExtraction, CaptureBundle, SecretGuard, SharedBrowserExtraction,
 };
 use faktor_core::ErrorKind;
-use faktor_tests_production_wiring::wiring::CommerceSeams;
+use faktor_tests_production_wiring::harness::CommerceSeams;
 use hmac::Mac as _;
 use serde_json::json;
 
-use faktor_tests_production_wiring::wiring::{self, CommerceCfg, Config};
+use faktor_tests_production_wiring::harness::{self, CommerceCfg, Config};
 
 const NOW_MS: u64 = 1_700_000_000_000;
 
@@ -323,19 +323,19 @@ fn api_block(with_token: bool) -> serde_json::Value {
 async fn signed_alibaba_request_is_verified_by_the_contract_mock() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = alibaba_config(Some(api_block(true)));
-    let graph = wiring::build_production_graph(dir.path(), bare_commerce_config())
+    let graph = harness::build_production_graph(dir.path(), bare_commerce_config())
         .expect("production daemon graph");
-    let service = wiring::commerce_service(&graph).expect("commerce enabled");
+    let service = harness::commerce_service(&graph).expect("commerce enabled");
 
     let fixture = faktor_commerce_connectors::testing::fixture("alibaba/api_product.json")
         .expect("sanitized alibaba fixture");
     let mock = ContractMock::new(APP_SECRET, &fixture);
     let browser = Arc::new(CountingBrowser::default());
     let seams = seams_with(mock.clone(), Arc::new(credentials(true)), browser.clone());
-    let registration = wiring::register_production_connectors(&service, &cfg, &seams);
+    let registration = harness::register_production_connectors(&service, &cfg, &seams);
     assert_eq!(registration.registered(), 1, "{registration:?}");
 
-    let tool = wiring::daemon_tool(&graph, "source_market");
+    let tool = harness::daemon_tool(&graph, "source_market");
     let outcome = (tool.execute)(tool_ctx(), product_args())
         .await
         .expect("the signed product request must validate and replay");
@@ -363,17 +363,17 @@ async fn signed_alibaba_request_is_verified_by_the_contract_mock() {
 async fn missing_access_token_is_typed_with_no_request_and_no_browser() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = alibaba_config(Some(api_block(false)));
-    let graph = wiring::build_production_graph(dir.path(), bare_commerce_config())
+    let graph = harness::build_production_graph(dir.path(), bare_commerce_config())
         .expect("production daemon graph");
-    let service = wiring::commerce_service(&graph).expect("commerce enabled");
+    let service = harness::commerce_service(&graph).expect("commerce enabled");
 
     let mock = ContractMock::new(APP_SECRET, "{}");
     let browser = Arc::new(CountingBrowser::default());
     let seams = seams_with(mock.clone(), Arc::new(credentials(false)), browser.clone());
-    let registration = wiring::register_production_connectors(&service, &cfg, &seams);
+    let registration = harness::register_production_connectors(&service, &cfg, &seams);
     assert_eq!(registration.registered(), 1, "{registration:?}");
 
-    let tool = wiring::daemon_tool(&graph, "source_market");
+    let tool = harness::daemon_tool(&graph, "source_market");
     let error = (tool.execute)(tool_ctx(), product_args())
         .await
         .expect_err("a missing access token must refuse typed");
@@ -399,9 +399,9 @@ async fn missing_access_token_is_typed_with_no_request_and_no_browser() {
 async fn expired_access_token_is_typed_with_no_request() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = alibaba_config(Some(api_block(true)));
-    let graph = wiring::build_production_graph(dir.path(), bare_commerce_config())
+    let graph = harness::build_production_graph(dir.path(), bare_commerce_config())
         .expect("production daemon graph");
-    let service = wiring::commerce_service(&graph).expect("commerce enabled");
+    let service = harness::commerce_service(&graph).expect("commerce enabled");
 
     let expired = MapCredentials::new()
         .with(KEY_ENV, APP_KEY)
@@ -411,10 +411,10 @@ async fn expired_access_token_is_typed_with_no_request() {
     let mock = ContractMock::new(APP_SECRET, "{}");
     let browser = Arc::new(CountingBrowser::default());
     let seams = seams_with(mock.clone(), Arc::new(expired), browser.clone());
-    let registration = wiring::register_production_connectors(&service, &cfg, &seams);
+    let registration = harness::register_production_connectors(&service, &cfg, &seams);
     assert_eq!(registration.registered(), 1, "{registration:?}");
 
-    let tool = wiring::daemon_tool(&graph, "source_market");
+    let tool = harness::daemon_tool(&graph, "source_market");
     let error = (tool.execute)(tool_ctx(), product_args())
         .await
         .expect_err("an expired token must refuse typed");

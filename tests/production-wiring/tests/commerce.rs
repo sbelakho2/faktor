@@ -1,9 +1,9 @@
 //! Cross-layer production-wiring certification: Faktor Acquire
 //! (`source_market`) from the DAEMON'S graph.
 //!
-//! Every test builds the graph with `wiring::build_production_graph` (the
+//! Every test builds the graph with `harness::build_production_graph` (the
 //! executable's own `build_daemon` -> `build_daemon_core`) and then drives
-//! the tool the daemon's OWN registry holds (`wiring::daemon_tool`) against
+//! the tool the daemon's OWN registry holds (`harness::daemon_tool`) against
 //! the daemon's OWN `CommerceSourceService`. The only substitution is the
 //! external site adapter, registered through the production
 //! `Registered<SiteConnector>` bridge with the production identity injection
@@ -41,7 +41,7 @@ use faktor_core::id::{OpId, SessionId, TaskId, WorkspaceId, WorktreeId};
 use faktor_core::WorkspaceIdentity;
 use serde_json::{json, Value};
 
-use faktor_tests_production_wiring::wiring::{self, CommerceCfg, Config};
+use faktor_tests_production_wiring::harness::{self, CommerceCfg, Config};
 
 const NOW_MS: u64 = 1_700_000_000_000;
 const SOURCE: &str = "mouser";
@@ -317,7 +317,7 @@ fn quote_args(freshness: &str) -> Value {
 /// one test.
 struct Daemon {
     _dir: tempfile::TempDir,
-    graph: wiring::DaemonGraph,
+    graph: harness::DaemonGraph,
     service: Arc<CommerceSourceService>,
 }
 
@@ -334,9 +334,10 @@ fn daemon_with_planner(
     planner: Option<Arc<dyn faktor_acquire::AcquisitionPlanning>>,
 ) -> (Daemon, FixtureSite) {
     let dir = tempfile::tempdir().unwrap();
-    let graph = wiring::build_production_graph_with_planner(dir.path(), commerce_config(), planner)
-        .expect("the production daemon graph must build");
-    let service = wiring::commerce_service(&graph).expect("commerce is enabled by config");
+    let graph =
+        harness::build_production_graph_with_planner(dir.path(), commerce_config(), planner)
+            .expect("the production daemon graph must build");
+    let service = harness::commerce_service(&graph).expect("commerce is enabled by config");
     let site = register_fixture(&service, identity);
     (
         Daemon {
@@ -368,7 +369,7 @@ async fn daemon_tool_quote_runs_the_production_planner_decisions() {
             inner: faktor_acquire::AcquisitionPlanner::default(),
         })),
     );
-    let tool = wiring::daemon_tool(&daemon.graph, "source_market");
+    let tool = harness::daemon_tool(&daemon.graph, "source_market");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
@@ -437,7 +438,7 @@ async fn configured_account_scope_reaches_cache_identity() {
     let account = AccountScope::new("acct-a").unwrap();
     let identity = ConnectorIdentity::anonymous().with_account_scope(account.clone());
     let (daemon, site) = daemon(identity);
-    let tool = wiring::daemon_tool(&daemon.graph, "source_market");
+    let tool = harness::daemon_tool(&daemon.graph, "source_market");
 
     let live = call_tool(&tool, tool_ctx(1, 1), quote_args("live"))
         .await
@@ -525,7 +526,7 @@ async fn authenticated_prices_never_enter_the_public_cache() {
     let account = AccountScope::new("acct-a").unwrap();
     let identity = ConnectorIdentity::anonymous().with_account_scope(account.clone());
     let (daemon, site) = daemon(identity);
-    let tool = wiring::daemon_tool(&daemon.graph, "source_market");
+    let tool = harness::daemon_tool(&daemon.graph, "source_market");
     let _ = call_tool(&tool, tool_ctx(1, 1), quote_args("live"))
         .await
         .expect("live account-scoped quote");
@@ -598,7 +599,7 @@ async fn authenticated_prices_never_enter_the_public_cache() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn variant_and_packaging_survive_tool_service_connector() {
     let (daemon, site) = daemon(ConnectorIdentity::anonymous());
-    let tool = wiring::daemon_tool(&daemon.graph, "source_market");
+    let tool = harness::daemon_tool(&daemon.graph, "source_market");
     let mut args = quote_args("live");
     args["variant"] = json!("package=tape_and_reel");
     args["packaging"] = json!("tape_and_reel");
@@ -629,7 +630,7 @@ async fn variant_and_packaging_survive_tool_service_connector() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn job_status_is_requester_scoped() {
     let (daemon, site) = daemon(ConnectorIdentity::anonymous());
-    let tool = wiring::daemon_tool(&daemon.graph, "source_market");
+    let tool = harness::daemon_tool(&daemon.graph, "source_market");
 
     let bom = call_tool(
         &tool,
