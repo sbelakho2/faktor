@@ -97,6 +97,17 @@
 #     verifies OR the signed remote attestation covers the gates). No flag
 #     weakens checks while preserving the certificate class.
 #
+# Gate 10 (additive, audit 19): the trusted workflow's own certificate
+# artifact. `target/certification/ci-certification.json` (written by the
+# trusted workflow's linux `certificate` step; `--ci-certification PATH` /
+# CERTIFY_CI_CERTIFICATION override) must be the SUCCESSFUL `trusted`
+# workflow's `faktor-ci-certification/v2` object for the EXACT shipped
+# commit + tree. Missing/stale/foreign/failed certificates REFUSE the
+# ReleaseArtifactSet: the local artifacts can never appear in a RELEASE
+# CERTIFICATE, and under `--release` the run fails. The darwin/windows
+# platform certificates (`ci-certification-{darwin,windows}.json`) are their
+# own lanes' artifacts and stay out of this check.
+#
 # Usage:
 #   bash scripts/certify.sh                       # local gates + required CI evidence (auto class)
 #   bash scripts/certify.sh --commit <sha>        # certify an exact shipped SHA
@@ -114,14 +125,17 @@
 # FAKTOR_ATTEST_KEYS / --attestation-keys (ed25519 allowlist JSON; required
 # to verify signed attestations); --artifact PATH (repeatable; packaged
 # outputs auto-discovered when omitted); CERTIFY_ARTIFACT_ROOT (discovery
-# root for the ReleaseArtifactSet); CERTIFY_RELEASE=1 is the env form of
-# --release.
+# root for the ReleaseArtifactSet); CERTIFY_CI_CERTIFICATION (path of the
+# trusted workflow's certificate; default target/certification/ci-certification.json);
+# CERTIFY_RELEASE=1 is the env form of --release.
 #
 # Release preconditions (all mandatory for RELEASE CERTIFICATE: PASS):
 #   * required_artifacts > 0 and matched == required and attested == required
 #     (every required local artifact digest-covered by the signed attestation);
 #   * every required packaged artifact passed the branding/scanner gate;
-#   * the fault campaign ran and executed > 0 `[fault]` tests without failure.
+#   * the fault campaign ran and executed > 0 `[fault]` tests without failure;
+#   * the trusted workflow's certificate exists for the exact commit/tree
+#     (audit 19; a missing/mismatching certificate refuses release artifacts).
 # Any missing precondition yields SOURCE CERTIFICATE (or FAIL under --release).
 #
 # Exits non-zero on the first failing gate (exit 2 = operator/setup error:
@@ -245,6 +259,38 @@ check_gate_parity() { # canonical_file ci_yaml...
     return "$rc"
 }
 
+# ---------------------------------------------------- CI status contract --
+# Audit 19: the forge integration publishes one required commit status per
+# workflow. For every main push the trusted workflow must actually create a
+# pipeline (its top-level `when` includes the push event) and its certificate
+# step must run on `success` AND `failure` — so a pipeline that fails to
+# start, or a lane that fails, can never leave `ci/woodpecker/push/trusted`
+# silently green (branch protection keeps the required check pending/failed
+# until a trusted workflow reports). `check_ci_status_contract` is offline
+# and takes an optional workflow path so the selftest can plant violations.
+check_ci_status_contract() { # [workflow_path] -> 0 ok, 1 violation
+    local workflow="${1:-.woodpecker/trusted/trusted.yaml}" rc=0
+    if [ ! -f "$workflow" ]; then
+        bad "CI status contract: $workflow is missing"
+        return 1
+    fi
+    if ! awk '
+        /^when:/ { in_when = 1; next }
+        in_when && /^[^ #]/ { in_when = 0 }
+        in_when && /event: \[push/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$workflow"; then
+        bad "CI status contract: $workflow top-level when must include the push event (every main push must create the trusted pipeline that publishes ci/woodpecker/push/trusted)"
+        rc=1
+    fi
+    if ! grep -q 'status: \[success, failure\]' "$workflow"; then
+        bad "CI status contract: $workflow certificate must run with when.status: [success, failure] so a failed lane still publishes the required status"
+        rc=1
+    fi
+    [ "$rc" -eq 0 ] && ok "CI status contract: $workflow creates a trusted pipeline on every push and certificates run on success/failure"
+    return "$rc"
+}
+
 # ---------------------------------------------------------------- arguments --
 COMMIT=""
 CONTEXT="${CERTIFY_CI_CONTEXT:-ci/woodpecker/pr/pr}"
@@ -263,6 +309,11 @@ PIPELINE=""
 REPO_FULL_NAME="${CERTIFY_REPO:-${WOODPECKER_REPO:-}}"
 ARTIFACTS=()
 ATT_KEYS="${CERTIFY_ATTEST_KEYS:-${FAKTOR_ATTEST_KEYS:-}}"
+# Gate 10 (audit 19): the trusted workflow's own certificate artifact.
+CI_CERT_FILE="${CERTIFY_CI_CERTIFICATION:-target/certification/ci-certification.json}"
+CI_CERT_STATUS="unknown"
+CI_CERT_PROBLEM=""
+CI_CERT_DETAIL=""
 
 usage() {
     sed -n '2,/^set -/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -317,6 +368,11 @@ while [ "$#" -gt 0 ]; do
     --manifest-out)
         [ "$#" -ge 2 ] || { echo "certify: --manifest-out needs a value" >&2; exit 2; }
         MANIFEST_OUT="$2"
+        shift 2
+        ;;
+    --ci-certification)
+        [ "$#" -ge 2 ] || { echo "certify: --ci-certification needs a path" >&2; exit 2; }
+        CI_CERT_FILE="$2"
         shift 2
         ;;
     --pipeline)
@@ -387,8 +443,12 @@ if [ "$GATE_PARITY" -eq 1 ]; then
     fi
     if check_gate_parity "$parity_canonical" "${parity_files[@]}"; then
         [ -n "$parity_tmp" ] && rm -f "$parity_tmp"
-        printf '\nGATE PARITY: PASS\n'
-        exit 0
+        if check_ci_status_contract; then
+            printf '\nGATE PARITY: PASS\n'
+            exit 0
+        fi
+        printf '\nGATE PARITY: FAIL (CI status contract violated)\n' >&2
+        exit 1
     fi
     [ -n "$parity_tmp" ] && rm -f "$parity_tmp"
     printf '\nGATE PARITY: FAIL (local and CI gate lists diverged)\n' >&2
@@ -457,6 +517,15 @@ FAULT_STATUS="not-run"
 FAULT_COUNT=0
 FAULT_DIGEST=""
 FAULT_RECORD="${CERTIFY_FAULT_RECORD:-target/certification/fault-tests.txt}"
+
+# Audit 28: environment-specific visual certification. A release claim is
+# coverable only when DISTINCT linux/macos/windows baseline records exist in
+# the JetBrains visual parity baseline; a missing platform is "not certified
+# on platform <p>" and is never inherited from another platform's (or a
+# canonical) digest. Computed by scripts/check-visual-platforms.mjs.
+VISUAL_PLATFORMS_STATUS="not-run"
+VISUAL_PLATFORMS_DETAIL=""
+VISUAL_PLATFORMS_BASELINE="${CERTIFY_VISUAL_BASELINE:-apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json}"
 
 fault_crate_present() {
     cargo metadata --no-deps --format-version 1 2>/dev/null \
@@ -1732,6 +1801,92 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
     esac
 }
 
+# ------------------------------------------------- CI certification manifest --
+# Gate 10 (audit 19). The trusted workflow's linux `certificate` step writes
+# `target/certification/ci-certification.json` (`faktor-ci-certification/v2`;
+# the darwin/windows siblings carry their own platform objects under
+# `ci-certification-{darwin,windows}.json`). This check requires the LOCAL
+# artifact to be that successful trusted certificate for the EXACT shipped
+# commit/tree; a missing, stale, foreign, failed or malformed object leaves
+# `CI_CERT_STATUS != match`, which refuses every local ReleaseArtifact as a
+# release artifact and fails `--release`.
+ci_cert_manifest_check() { # manifest_path commit tree -> "status|problem|detail"
+    local file="$1" commit="$2" tree="$3"
+    if [ ! -f "$file" ]; then
+        printf 'absent|ci-certification-absent|no CI certification manifest at %s' "$file"
+        return 0
+    fi
+    python3 - "$file" "$commit" "$tree" <<'PY'
+import json
+import sys
+
+path, commit, tree = sys.argv[1:4]
+
+
+def reject_duplicates(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        manifest = json.loads(fh.read(), object_pairs_hook=reject_duplicates)
+except Exception as exc:  # pragma: no cover - exercised by the selftest
+    print(f"malformed|ci-certification-unreadable|{exc}")
+    raise SystemExit(0)
+if not isinstance(manifest, dict):
+    print("malformed|ci-certification-unreadable|not a JSON object")
+    raise SystemExit(0)
+schema = manifest.get("schema")
+workflow = manifest.get("workflow")
+status = manifest.get("status")
+file_commit = manifest.get("commit")
+file_tree = manifest.get("tree")
+pipeline = manifest.get("pipeline") or manifest.get("run_id") or ""
+if schema != "faktor-ci-certification/v2":
+    print(f"mismatch|ci-certification-schema|schema={schema!r}")
+elif workflow != "trusted":
+    print(f"mismatch|ci-certification-workflow|workflow={workflow!r}")
+elif status not in ("pass", "passed"):
+    print(f"mismatch|ci-certification-status|status={status!r}")
+elif file_commit != commit:
+    print(f"mismatch|ci-certification-commit-mismatch|manifest={file_commit} shipped={commit}")
+elif file_tree != tree:
+    print(f"mismatch|ci-certification-tree-mismatch|manifest={file_tree} shipped={tree}")
+else:
+    print(f"match||pipeline={pipeline}")
+PY
+}
+
+verify_ci_certification_manifest() { # commit tree -> 0 match, 1 not verified
+    local commit="$1" tree="$2" out
+    if ! command -v python3 >/dev/null 2>&1; then
+        CI_CERT_STATUS="unreadable"
+        CI_CERT_PROBLEM="ci-certification-python3-missing"
+        CI_CERT_DETAIL="python3 is required to validate $CI_CERT_FILE"
+        bad "CI certification manifest NOT verified: $CI_CERT_DETAIL"
+        return 1
+    fi
+    out="$(ci_cert_manifest_check "$CI_CERT_FILE" "$commit" "$tree")"
+    CI_CERT_STATUS="${out%%|*}"
+    CI_CERT_PROBLEM="$(printf '%s' "$out" | cut -d'|' -f2)"
+    CI_CERT_DETAIL="$(printf '%s' "$out" | cut -d'|' -f3-)"
+    case "$CI_CERT_STATUS" in
+    match)
+        ok "CI certification manifest $CI_CERT_FILE certifies $commit ($CI_CERT_DETAIL)"
+        return 0
+        ;;
+    *)
+        bad "CI certification manifest $CI_CERT_FILE does not certify $commit ($CI_CERT_PROBLEM: $CI_CERT_DETAIL)"
+        return 1
+        ;;
+    esac
+}
+
 # P1 completeness: release preconditions beyond context/attestation. Every
 # one is mandatory for RELEASE CERTIFICATE; SOURCE CERTIFICATE can never
 # print the release class.
@@ -1743,6 +1898,8 @@ release_preconditions_met() {
     [ "$RA_BRANDING" = "pass" ] || return 1
     [ "$FAULT_STATUS" = "pass" ] || return 1
     [ "$FAULT_COUNT" -gt 0 ] || return 1
+    [ "$CI_CERT_STATUS" = "match" ] || return 1
+    [ "$VISUAL_PLATFORMS_STATUS" = "pass" ] || return 1
     return 0
 }
 
@@ -1756,7 +1913,47 @@ release_denial_reasons() {
     [ "$RA_BRANDING" = "pass" ] || reasons+=("required-artifact branding/scanner: $RA_BRANDING")
     [ "$FAULT_STATUS" = "pass" ] || reasons+=("fault campaign: $FAULT_STATUS")
     [ "$FAULT_COUNT" -gt 0 ] || reasons+=("fault campaign executed 0 [fault] tests")
+    if [ "$CI_CERT_STATUS" != "match" ]; then
+        reasons+=("CI certification manifest ($CI_CERT_FILE): ${CI_CERT_PROBLEM:-not verified}${CI_CERT_DETAIL:+ — $CI_CERT_DETAIL}")
+    fi
+    if [ "$VISUAL_PLATFORMS_STATUS" != "pass" ]; then
+        reasons+=("visual platform certification: $VISUAL_PLATFORMS_STATUS${VISUAL_PLATFORMS_DETAIL:+ — $VISUAL_PLATFORMS_DETAIL}")
+    fi
     printf '%s\n' ${reasons[@]+"${reasons[@]}"}
+}
+
+# Audit 28: the release claim check. `--check` validates the baseline and
+# prints the coverage table (a missing platform is reported, not a schema
+# error); `--release` refuses any platform without its own certified record.
+# Fail closed when node is unavailable: a release claim needs the proof.
+check_visual_platforms() {
+    if [ ! -f "$VISUAL_PLATFORMS_BASELINE" ]; then
+        VISUAL_PLATFORMS_STATUS="missing"
+        VISUAL_PLATFORMS_DETAIL="no baseline at $VISUAL_PLATFORMS_BASELINE"
+        return 1
+    fi
+    if ! command -v node >/dev/null 2>&1; then
+        VISUAL_PLATFORMS_STATUS="unverifiable"
+        VISUAL_PLATFORMS_DETAIL="node unavailable; cannot evaluate platform records"
+        return 1
+    fi
+    local out rc
+    out="$(node "$ROOT/scripts/check-visual-platforms.mjs" --check "$VISUAL_PLATFORMS_BASELINE" 2>&1)"
+    rc=$?
+    printf '%s\n' "$out"
+    if [ "$rc" -ne 0 ]; then
+        VISUAL_PLATFORMS_STATUS="malformed"
+        VISUAL_PLATFORMS_DETAIL="$(printf '%s' "$out" | tr '\n' ' ')"
+        return 1
+    fi
+    if out="$(node "$ROOT/scripts/check-visual-platforms.mjs" --release "$VISUAL_PLATFORMS_BASELINE" 2>&1)"; then
+        VISUAL_PLATFORMS_STATUS="pass"
+        VISUAL_PLATFORMS_DETAIL="all required platforms certified"
+        return 0
+    fi
+    VISUAL_PLATFORMS_STATUS="not-certified"
+    VISUAL_PLATFORMS_DETAIL="$(printf '%s' "$out" | tr '\n' ' ')"
+    return 1
 }
 
 # P1-K/P1 completeness: the only rule that yields a release certificate.
@@ -2299,7 +2496,8 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
     fi
 
     # --- certificate class rule (P1-K + P1 completeness): only local pass
-    # AND (trusted or signed attestation) AND every release precondition.
+    # AND (trusted or signed attestation) AND every release precondition,
+    # including the trusted workflow's certificate artifact (audit 19).
     release_facts_on() {
         RA_STATUS="complete"
         RA_REQUIRED=3
@@ -2308,6 +2506,11 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         RA_BRANDING="pass"
         FAULT_STATUS="pass"
         FAULT_COUNT=3
+        CI_CERT_STATUS="match"
+        CI_CERT_PROBLEM=""
+        CI_CERT_DETAIL="pipeline=21"
+        VISUAL_PLATFORMS_STATUS="pass"
+        VISUAL_PLATFORMS_DETAIL="selftest fixture"
     }
     release_facts_off() {
         RA_STATUS="empty"
@@ -2317,6 +2520,8 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         RA_BRANDING="not-applicable"
         FAULT_STATUS="crate-absent"
         FAULT_COUNT=0
+        VISUAL_PLATFORMS_STATUS="not-run"
+        VISUAL_PLATFORMS_DETAIL=""
     }
     check_class() { # local ci class att want
         local got
@@ -2338,8 +2543,70 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
     check_class 0 0 trusted verified none
     check_class 1 1 trusted verified none
 
+    # --- Gate 10 (audit 19): the trusted workflow's certificate artifact.
+    # A matching object certifies the exact commit/tree; every deviation is a
+    # typed refusal; a refused certificate can never yield a release class.
+    ci_fixture() { # name json_body
+        mkdir -p "$tmp/ci-cert"
+        printf '%s\n' "$2" >"$tmp/ci-cert/$1.json"
+        CI_CERT_FILE="$tmp/ci-cert/$1.json"
+    }
+    ci_expect() { # name want_status want_problem
+        local out status problem
+        out="$(ci_cert_manifest_check "$CI_CERT_FILE" "$sha" "$tree")"
+        status="${out%%|*}"
+        problem="$(printf '%s' "$out" | cut -d'|' -f2)"
+        if [ "$status" = "$2" ] && [ "$problem" = "$3" ]; then
+            echo "selftest ok: CI certification $1 -> $status/$problem"
+        else
+            echo "selftest FAIL: CI certification $1 -> $status/$problem (want $2/$3)" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    CI_CERT_FILE="$tmp/ci-cert/missing.json"
+    ci_expect missing absent ci-certification-absent
+    ci_fixture match "{\"schema\":\"faktor-ci-certification/v2\",\"workflow\":\"trusted\",\"commit\":\"$sha\",\"tree\":\"$tree\",\"status\":\"pass\",\"pipeline\":\"21\"}"
+    ci_expect match match ''
+    if verify_ci_certification_manifest "$sha" "$tree" >/dev/null 2>&1; then
+        echo "selftest ok: a matching trusted certificate verifies"
+    else
+        echo "selftest FAIL: a matching trusted certificate did not verify" >&2
+        failures=$((failures + 1))
+    fi
+    ci_fixture other-sha "{\"schema\":\"faktor-ci-certification/v2\",\"workflow\":\"trusted\",\"commit\":\"ffffffffffffffffffffffffffffffffffffffff\",\"tree\":\"$tree\",\"status\":\"pass\"}"
+    ci_expect other-sha mismatch ci-certification-commit-mismatch
+    ci_fixture other-tree "{\"schema\":\"faktor-ci-certification/v2\",\"workflow\":\"trusted\",\"commit\":\"$sha\",\"tree\":\"0000000000000000000000000000000000000000\",\"status\":\"pass\"}"
+    ci_expect other-tree mismatch ci-certification-tree-mismatch
+    ci_fixture wrong-workflow "{\"schema\":\"faktor-ci-certification/v2\",\"workflow\":\"pr\",\"commit\":\"$sha\",\"tree\":\"$tree\",\"status\":\"pass\"}"
+    ci_expect wrong-workflow mismatch ci-certification-workflow
+    ci_fixture failed "{\"schema\":\"faktor-ci-certification/v2\",\"workflow\":\"trusted\",\"commit\":\"$sha\",\"tree\":\"$tree\",\"status\":\"fail\"}"
+    ci_expect failed mismatch ci-certification-status
+    ci_fixture old-schema "{\"schema\":\"faktor-ci-certification/v1\",\"workflow\":\"trusted\",\"commit\":\"$sha\",\"tree\":\"$tree\",\"status\":\"pass\"}"
+    ci_expect old-schema mismatch ci-certification-schema
+    printf 'not json\n' >"$tmp/ci-cert/malformed.json"
+    CI_CERT_FILE="$tmp/ci-cert/malformed.json"
+    ci_expect malformed malformed ci-certification-unreadable
+    printf '{"schema":"faktor-ci-certification/v2","commit":"%s","commit":"%s"}\n' "$sha" "$sha" >"$tmp/ci-cert/duplicate.json"
+    CI_CERT_FILE="$tmp/ci-cert/duplicate.json"
+    ci_expect duplicate-keys malformed ci-certification-unreadable
+    # The class rule consumes CI_CERT_STATUS: without a match, no release.
+    release_facts_on
+    CI_CERT_STATUS="mismatch"
+    CI_CERT_PROBLEM="ci-certification-commit-mismatch"
+    CI_CERT_DETAIL="manifest=... shipped=..."
+    check_class 1 0 untrusted verified source
+    check_class 1 0 trusted absent source
+    release_denial_reasons | grep -q 'CI certification manifest' \
+        && echo "selftest ok: release denial names the CI certification manifest" \
+        || { echo "selftest FAIL: release denial omits the CI certification manifest" >&2; failures=$((failures + 1)); }
+    release_facts_on
+
     # --- CLI wording (P1-K): --verify-ci-evidence never certifies a release.
     real_sha="$(git rev-parse HEAD)"
+    real_tree="$(git rev-parse 'HEAD^{tree}')"
+    mkdir -p "$tmp/ci-cert"
+    printf '{"schema":"faktor-ci-certification/v2","workflow":"trusted","commit":"%s","tree":"%s","status":"pass","pipeline":"99"}\n' \
+        "$real_sha" "$real_tree" >"$tmp/ci-cert/real.json"
     CERTIFY_TEST_PIPELINES="[$(list_json 31 311 success "$real_sha" pull_request)]" \
         CERTIFY_TEST_DETAIL="$(detail_json 31 311 success "$real_sha" pull_request 'pr=success')" \
         set_state
@@ -2347,6 +2614,7 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         FAKTOR_ATTEST_KEYS='' WOODPECKER_HOST="http://127.0.0.1:$port" WOODPECKER_TOKEN=selftest-token \
             bash "$ROOT/scripts/certify.sh" --verify-ci-evidence --repo acme/widgets \
             --context ci/woodpecker/pr/pr --commit "$real_sha" \
+            --ci-certification "$tmp/ci-cert/real.json" \
             --manifest-out "$tmp/cli-ci-manifest.json" 2>&1
     )"
     code=$?
@@ -2376,6 +2644,7 @@ assert m["local_gates"] == "skipped", m
         FAKTOR_ATTEST_KEYS='' WOODPECKER_HOST="http://127.0.0.1:$port" WOODPECKER_TOKEN=selftest-token \
             bash "$ROOT/scripts/certify.sh" --verify-ci-evidence --repo acme/widgets \
             --context ci/woodpecker/pr/pr --commit "$real_sha" \
+            --ci-certification "$tmp/ci-cert/real.json" \
             --manifest-out "$tmp/cli-ci-fail-manifest.json" 2>&1
     )"
     code=$?
@@ -2585,12 +2854,51 @@ STUB
     canonical_gate_commands >"$tmp/canonical-gates.txt"
     check_parity real-workflows 0 "$tmp/canonical-gates.txt" "$ROOT/.woodpecker/trusted/trusted.yaml" "$ROOT/.woodpecker/untrusted/pr.yaml"
 
+    # --- Audit 19 CI status contract: a trusted workflow whose top-level
+    # `when` drops the push event never creates the main-push pipeline, and a
+    # certificate that does not run on failure can leave the required context
+    # missing — both are violations; the real workflow passes.
+    cat >"$tmp/status-no-push.yaml" <<'YAML'
+when:
+  - event: tag
+steps:
+  - name: certificate
+    when:
+      status: [success, failure]
+YAML
+    cat >"$tmp/status-no-failure.yaml" <<'YAML'
+when:
+  - event: [push, tag]
+steps:
+  - name: certificate
+    when:
+      status: [success]
+YAML
+    if check_ci_status_contract "$tmp/status-no-push.yaml" >/dev/null 2>&1; then
+        echo "selftest FAIL: a trusted workflow without the push event must violate the CI status contract" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: a workflow dropping the push event violates the CI status contract"
+    fi
+    if check_ci_status_contract "$tmp/status-no-failure.yaml" >/dev/null 2>&1; then
+        echo "selftest FAIL: a certificate without success/failure must violate the CI status contract" >&2
+        failures=$((failures + 1))
+    else
+        echo "selftest ok: a certificate that skips failed lanes violates the CI status contract"
+    fi
+    if check_ci_status_contract "$ROOT/.woodpecker/trusted/trusted.yaml" >/dev/null 2>&1; then
+        echo "selftest ok: the real trusted workflow satisfies the CI status contract"
+    else
+        echo "selftest FAIL: the real trusted workflow violates the CI status contract" >&2
+        failures=$((failures + 1))
+    fi
+
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     rm -rf "$tmp"
 
     if [ "$failures" -eq 0 ]; then
-        echo "certify selftest: PASS (context registry + observed-value matrix, attestation fetch/verification matrix, ReleaseArtifactSet matrix, gate parity, fault-campaign gate, certificate classes, temp-name migration)"
+        echo "certify selftest: PASS (context registry + observed-value matrix, attestation fetch/verification matrix, ReleaseArtifactSet matrix, gate parity + CI status contract, CI certification manifest gate, fault-campaign gate, certificate classes, temp-name migration)"
     else
         echo "certify selftest: FAIL ($failures case(s))" >&2
         return 1
@@ -2634,6 +2942,12 @@ if [ "$VERIFY_CI" -eq 0 ]; then
             status=1
             bad "gate parity failed: local and CI gate lists diverged"
         fi
+        if check_ci_status_contract; then
+            ok "CI status contract clean: every push creates the trusted pipeline and certificates run on success/failure"
+        else
+            status=1
+            bad "CI status contract violated: a main push could miss the required trusted status"
+        fi
     else
         ok "gate parity not applicable: CI workflow files absent from this checkout"
     fi
@@ -2647,6 +2961,24 @@ if [ "$VERIFY_CI" -eq 0 ]; then
 
     step "gate 8/9: doctor --deep after the fault campaign (release certification)"
     if run_doctor_deep "post-campaign doctor --deep"; then ok "post-campaign doctor --deep clean"; else status=1; fi
+
+    step "gate 8b: environment-specific visual certification (linux/macos/windows records)"
+    if check_visual_platforms; then
+        ok "visual platform certification: all required platforms have distinct certified records"
+    else
+        case "$VISUAL_PLATFORMS_STATUS" in
+        not-certified)
+            # Honest, visible gap: the release class stays impossible until
+            # the missing platform records its own baseline. Not a local gate
+            # failure (the current platform's own parity still ran).
+            bad "visual platform certification incomplete: $VISUAL_PLATFORMS_DETAIL"
+            ;;
+        *)
+            status=1
+            bad "visual platform certification unusable ($VISUAL_PLATFORMS_STATUS): $VISUAL_PLATFORMS_DETAIL"
+            ;;
+        esac
+    fi
 
     step "gate 9/9: ReleaseArtifactSet + required-artifact branding scan"
     if prepare_artifacts; then
@@ -2695,6 +3027,21 @@ else
             bad "CI certification NOT verified (exit $ci_status)"
         fi
     fi
+    # Gate 10 (audit 19): the trusted workflow's own certificate artifact for
+    # the exact shipped commit/tree. This is independent of the context
+    # verification above, and it is the gate that REFUSES local release
+    # artifacts when no matching successful trusted workflow exists.
+    if [ -n "$commit_sha" ] && [ -n "$tree_sha" ]; then
+        step "gate 10/10: CI certification manifest $CI_CERT_FILE"
+        verify_ci_certification_manifest "$commit_sha" "$tree_sha" || true
+        if [ "$RA_STATUS" = "complete" ] && [ "$CI_CERT_STATUS" != "match" ]; then
+            RA_STATUS="refused"
+            bad "release artifacts REFUSED: the ReleaseArtifactSet requires a matching successful trusted workflow certificate"
+            if [ "$RELEASE_REQUIRED" -eq 1 ]; then
+                status=1
+            fi
+        fi
+    fi
 fi
 
 if [ "$ci_ran" -eq 1 ] && [ "$ci_status" -eq 0 ]; then
@@ -2720,6 +3067,7 @@ if [ "$VERIFY_CI" -eq 0 ] && [ "$local_ran" -eq 1 ]; then
 fi
 if [ "$LOCAL_ONLY" -eq 0 ]; then
     summary_gates+=("Woodpecker context $CONTEXT at the exact shipped commit")
+    summary_gates+=("CI certification manifest ($CI_CERT_FILE): $CI_CERT_STATUS${CI_CERT_PROBLEM:+ ($CI_CERT_PROBLEM)}")
 fi
 if [ "$release_class" = "release" ]; then
     summary_gates+=("release-class evidence: trusted context or verified signed attestation")

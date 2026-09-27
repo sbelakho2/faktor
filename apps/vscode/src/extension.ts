@@ -86,6 +86,7 @@ import {
   AttachmentAdmissionPolicy,
   EMERGENCY_ATTACHMENT_POLICY,
   PendingSubmission,
+  PendingSubmissionRetainer,
   StartFailure,
   StartTaskSettings,
   admitPendingSubmission,
@@ -192,6 +193,10 @@ const active: ActiveSession = {
 const store = new FaktorStore();
 let chatProvider: ChatViewProvider | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
+// Bounded local pending state for submission retries (audit 29): uploaded
+// attachment ids survive a failed start and a retry resolves them first,
+// uploading only the attachments still absent.
+const pendingSubmissionRetainer = new PendingSubmissionRetainer();
 
 // ------------------------------------------------------------------ helpers
 
@@ -1461,11 +1466,15 @@ async function startTask(
   context: vscode.ExtensionContext,
   pending: PendingSubmission,
 ): Promise<void> {
-  const restore = (failure: AdmitFailure): void => {
+  const restore = (failure: AdmitFailure, enriched: PendingSubmission): void => {
+    // Audit 29: the enriched envelope keeps every successful upload, so a
+    // retry resolves the durable ids first and uploads only absent
+    // attachments. ONLY a durable acceptance may release the retained state.
+    pendingSubmissionRetainer.retain(enriched);
     reportError(new Error(failure.message));
     // NEVER clear before acceptance: the restore callback carries the
     // original text back to the composer and rebuilds the draft.
-    chatProvider?.postSendMessageFailed(pending, failure.message);
+    chatProvider?.postSendMessageFailed(enriched, failure.message);
   };
   try {
     if (!active.client || !active.sessionId) {
@@ -1474,13 +1483,16 @@ async function startTask(
     const client = active.client;
     const sessionId = active.sessionId;
     if (!client || !sessionId) {
-      restore({
-        kind: 'transport',
-        stage: 'start',
-        status: null,
-        code: null,
-        message: 'daemon/session unavailable; the draft and attachments were kept',
-      });
+      restore(
+        {
+          kind: 'transport',
+          stage: 'start',
+          status: null,
+          code: null,
+          message: 'daemon/session unavailable; the draft and attachments were kept',
+        },
+        pending,
+      );
       return;
     }
     // Attachment admission numbers come from the daemon's advertised model
@@ -1549,7 +1561,9 @@ async function startTask(
       restore,
     });
     if (outcome.ok) {
-      // Durable acceptance: ONLY now may the pending envelope be dropped.
+      // Durable acceptance: ONLY now may the pending envelope (and its
+      // retained uploads) be dropped.
+      pendingSubmissionRetainer.release(outcome.pending);
       chatProvider?.postStartResult(goal, true);
     }
   } catch (error) {
@@ -2094,7 +2108,7 @@ async function handleWebviewMessage(
           chatProvider?.postStartResult(goal, false);
           return;
         }
-        pending = parsed;
+        pending = pendingSubmissionRetainer.restore(parsed);
       }
       await startTask(goal, files, contract.contract, context, pending);
       return;

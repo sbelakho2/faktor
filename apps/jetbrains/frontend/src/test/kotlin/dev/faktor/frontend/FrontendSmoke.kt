@@ -43,9 +43,11 @@ import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.view
 import java.awt.image.BufferedImage
+import java.io.ByteArrayInputStream
 import java.math.BigInteger
 import java.nio.file.Files
 import java.nio.file.Paths
+import javax.imageio.ImageIO
 
 // ----------------------------------------------------------------- fixtures
 
@@ -1857,6 +1859,202 @@ object FrontendSmoke {
             panel.shutdown()
         }
 
+        // Audit 29: the JetBrains pending-upload state reuses durable ids on a
+        // retry, uploads only absent attachments, and never reuses an entry
+        // across sessions.
+        step("pending attachment retry reuses uploads per session and only uploads absent entries") {
+            val retry = PendingAttachmentRetry(maxEntries = 2)
+            val id = { seed: String ->
+                NativeAttachmentId(
+                    digest = seed.repeat(64),
+                    mime = "image/png",
+                    filename = "shot.png",
+                    size = 4
+                )
+            }
+            var uploads = 0
+            val keys = listOf("image:/w/a.png:4:1:image/png", "image:/w/b.png:4:1:image/png")
+            val first = retry.resolve("7", keys) { index ->
+                uploads++
+                id(if (index == 0) "a" else "b")
+            }
+            assertEquals(2, first.size)
+            assertEquals(2, uploads, "the first attempt uploads every absent entry")
+            assertEquals("a".repeat(64), first[0].digest)
+            val retryIds = retry.resolve("7", keys) {
+                uploads++
+                id("z")
+            }
+            assertEquals(2, uploads, "the retry resolves retained ids and uploads nothing")
+            assertEquals("b".repeat(64), retryIds[1].digest)
+            retry.resolve("8", keys) {
+                uploads++
+                id("c")
+            }
+            assertEquals(4, uploads, "an entry retained for session 7 is never reused by session 8")
+            assertEquals("c".repeat(64), retry.reusable("8", keys[0])?.digest)
+            retry.release("8", keys)
+            assertEquals(0, retry.size(), "durable acceptance releases the pending ids")
+            retry.retain("9", "k1", id("d"))
+            retry.retain("9", "k2", id("e"))
+            retry.retain("9", "k3", id("f"))
+            assertEquals(2, retry.size(), "pending retry state is bounded")
+            assertEquals(null, retry.reusable("9", "k1"), "the oldest pending upload was evicted")
+        }
+
+        // Clipboard images (audit 12): a BufferedImage converts to bounded
+        // PNG bytes IN MEMORY (no filesystem path, no temp file) and stages
+        // separately from the file-path list as a pending binary.
+        step("clipboard image: BufferedImage converts to bounded in-memory PNG (never a file)") {
+            val image = BufferedImage(3, 2, BufferedImage.TYPE_INT_ARGB)
+            image.setRGB(0, 0, 0xFF112233.toInt())
+            image.setRGB(1, 1, 0xFF445566.toInt())
+            val bytes = AttachmentImages.pngBytes(image) ?: fail("the PNG conversion refused")
+            assertTrue(bytes.size > 8, "PNG bytes must carry the signature + payload")
+            assertEquals(0x89.toByte(), bytes[0], "PNG signature byte 0")
+            assertEquals('P'.code.toByte(), bytes[1], "PNG signature byte 1")
+            assertEquals('N'.code.toByte(), bytes[2], "PNG signature byte 2")
+            assertEquals('G'.code.toByte(), bytes[3], "PNG signature byte 3")
+            val decoded = ImageIO.read(ByteArrayInputStream(bytes))
+                ?: fail("the in-memory PNG must decode")
+            assertEquals(3, decoded.width)
+            assertEquals(2, decoded.height)
+            // The bounded encoder refuses above the byte bound and the pixel
+            // bound; a hostile huge Image is refused before any allocation.
+            assertEquals(null, AttachmentImages.pngBytes(image, 8L), "over-bound PNG bytes refuse")
+            val huge = object : java.awt.Image() {
+                override fun getWidth(observer: java.awt.image.ImageObserver?): Int = 100_000
+                override fun getHeight(observer: java.awt.image.ImageObserver?): Int = 100_000
+                override fun getSource(): java.awt.image.ImageProducer =
+                    throw IllegalStateException("no source")
+                override fun getGraphics(): java.awt.Graphics =
+                    throw IllegalStateException("no graphics")
+                override fun getProperty(name: String, observer: java.awt.image.ImageObserver?): Any = ""
+                override fun getScaledInstance(w: Int, h: Int, hints: Int): java.awt.Image = this
+            }
+            assertEquals(null, AttachmentImages.pngBytes(huge), "the pixel bound refuses a huge Image")
+            // The panel stages the bytes separately from paths and never
+            // creates a file for them.
+            val panel = AttachmentsPanel()
+            assertTrue(panel.addClipboardImage(image, "clip-shot.png"))
+            assertEquals(1, panel.binaryCount())
+            assertEquals(1, panel.count())
+            assertEquals(0, panel.files().size, "binaries never enter the path list")
+            val staged = panel.binaryAttachments()[0]
+            assertEquals("image/png", staged.mime)
+            assertEquals("clip-shot.png", staged.filename)
+            val stagedBase64 = staged.base64()
+            assertEquals(
+                true,
+                java.util.Base64.getDecoder().decode(stagedBase64).contentEquals(bytes),
+                "the staged bytes are the exact in-memory PNG"
+            )
+            assertEquals(false, panel.addBinary("image/png", "empty.png", ByteArray(0)))
+            panel.clear()
+            assertEquals(0, panel.count())
+            assertEquals(0, panel.binaryCount())
+        }
+
+        // Document delivery (audit 13): the advertised document contract
+        // drives the plan; source files stay repository paths; unsupported
+        // MIME / oversize entries are typed refusals before any upload.
+        step("attachment plan: documents upload when advertised, source files stay paths") {
+            val root = System.getProperty("faktor.repo.root")
+            val fixturePath =
+                if (root.isNullOrBlank()) Paths.get("fixtures", "attachment-limits.json")
+                else Paths.get(root, "fixtures", "attachment-limits.json")
+            val fixture = JsonCodec.parse(Files.readString(fixturePath)).view("fixture")
+            val canonical = fixture.field("canonical").rawJson()
+            val catalog = parseNativeModelCatalog(
+                "[{\"provider\":\"fake\",\"model\":\"m\",\"context\":1000,\"maxOutput\":100," +
+                    "\"tools\":true,\"parallelTools\":false,\"reasoning\":true,\"thinking\":true," +
+                    "\"vision\":true,\"structuredOutput\":false,\"embeddings\":false," +
+                    "\"streaming\":true,\"source\":\"conservativeDefault\"," +
+                    "\"documentCapable\":true,\"attachmentLimits\":" + canonical + "}]"
+            )
+            val policy = AttachmentImages.policyForModel(catalog, "fake", "m")
+            val dir = Files.createTempDirectory("faktor-plan-smoke-")
+            val pdf = Paths.get(dir.toString(), "spec.pdf")
+            Files.write(pdf, "%PDF-1.4".toByteArray())
+            val txt = Paths.get(dir.toString(), "notes.txt")
+            Files.write(txt, "hello".toByteArray())
+            val source = Paths.get(dir.toString(), "Main.kt")
+            Files.write(source, "fun main() {}".toByteArray())
+            val image = BufferedImage(2, 2, BufferedImage.TYPE_INT_ARGB)
+            val binary = PendingBinaryAttachment(
+                "image/png", "clip.png", AttachmentImages.pngBytes(image)!!
+            )
+            val plan = planAttachments(
+                listOf(pdf.toString(), txt.toString(), source.toString(), "Makefile"),
+                listOf(binary),
+                policy
+            )
+            assertEquals(
+                listOf(binary.mime, "application/pdf", "text/plain"),
+                plan.uploads.map { it.mime },
+                "binaries first, then deliverable documents (images must exist on disk)"
+            )
+            assertEquals(listOf(source.toString(), "Makefile"), plan.pathFiles)
+            assertTrue(
+                plan.uploads.all { it.base64.isNotEmpty() && it.key.isNotEmpty() },
+                "every upload is keyed and base64-ready"
+            )
+            // A legacy (emergency) policy still uploads documents: the daemon
+            // decides admission until the catalog is advertised.
+            val emergency = planAttachments(
+                listOf(pdf.toString(), txt.toString()), emptyList(),
+                AttachmentImages.emergencyPolicy()
+            )
+            assertEquals(2, emergency.uploads.size)
+            assertEquals(0, emergency.pathFiles.size)
+            // Unsupported document MIME: the advertised list lacks text/plain.
+            val pdfOnly = policy.copy(documentMimes = listOf("application/pdf"))
+            val mimeRefusal = refusalOf {
+                planAttachments(listOf(txt.toString()), emptyList(), pdfOnly)
+            }
+            assertEquals("unsupported_document_type", mimeRefusal.code)
+            assertTrue(
+                mimeRefusal.message!!.contains("deliverable document types"),
+                mimeRefusal.message ?: "no message"
+            )
+            // Advertised model without document input.
+            val incapable = refusalOf {
+                planAttachments(listOf(pdf.toString()), emptyList(), policy.copy(documentCapable = false))
+            }
+            assertEquals("unsupported_document_type", incapable.code)
+            assertTrue(
+                incapable.message!!.contains("does not advertise document input"),
+                incapable.message ?: "no message"
+            )
+            // Oversized document: refused above the advertised bound.
+            val oversized = refusalOf {
+                planAttachments(
+                    listOf(pdf.toString()), emptyList(),
+                    policy.copy(maxDocumentBytes = 4L)
+                )
+            }
+            assertEquals("oversized_document", oversized.code)
+            assertTrue(
+                oversized.message!!.contains("per-document bound"),
+                oversized.message ?: "no message"
+            )
+            // Unsupported image MIME under the advertised allowlist.
+            val noPng = policy.copy(imageMimes = listOf("image/jpeg"))
+            val imageRefusal = refusalOf {
+                planAttachments(emptyList(), listOf(binary), noPng)
+            }
+            assertEquals("unsupported_image_type", imageRefusal.code)
+            // An oversize UNDELIVERABLE entry refuses before any upload, so
+            // the plan builder never returns a partial plan.
+            val partial = runCatching {
+                planAttachments(
+                    listOf(pdf.toString(), txt.toString()), emptyList(),
+                    policy.copy(maxDocumentBytes = 4L)
+                )
+            }
+            assertTrue(partial.isFailure, "a refused entry fails the whole plan")
+        }
+
         if (args.isEmpty()) {
             println("FRONTEND SMOKE PASS (canned only: no daemon binary argument)")
             kotlin.system.exitProcess(if (failures == 0) 0 else 1)
@@ -2086,6 +2284,16 @@ object FrontendSmoke {
             println("FAIL $name: ${e.message}")
         }
     }
+}
+
+/** The typed refusal raised by one attachment-plan call (smoke helper). */
+private fun refusalOf(body: () -> Unit): AttachmentRefusal {
+    try {
+        body()
+    } catch (e: AttachmentRefusal) {
+        return e
+    }
+    throw AssertionError("expected an AttachmentRefusal, nothing was thrown")
 }
 
 // Audits 5/6/16: a PARTIAL generation with a capped fingerprint round and a

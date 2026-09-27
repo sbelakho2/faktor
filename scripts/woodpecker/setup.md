@@ -348,11 +348,28 @@ campaign lanes are cut off at the cap) until that changes.
 
 ## 7. Branch protection / required status checks
 
-Woodpecker reports one commit status per workflow, so the required check for
-PRs is the `pr` workflow context:
+Woodpecker reports one commit status per workflow, so branch protection
+must require BOTH the PR context and the main-push context:
+
+- the PR check `ci/woodpecker/pr/pr` (untrusted project), and
+- the main-push check `ci/woodpecker/push/trusted` (trusted project).
+
+Requiring the push context is what makes a main push fail closed: every
+push creates the trusted workflow because its top-level `when` includes the
+`push` event (enforced by `bash scripts/certify.sh --check-gate-parity`,
+which fails when the push event is filtered out), and the workflow's
+`certificate` step runs on `success` **and** `failure` status. A pipeline
+that **fails to start** (for example a config-parse error) never becomes a
+successful status: GitHub keeps the required `ci/woodpecker/push/trusted`
+check pending/non-success, so the commit cannot be treated as green by any
+consumer that checks the required context. The same applies to the tag
+context `ci/woodpecker/tag/trusted`; darwin/windows certificates run inside
+the trusted workflow, so their failure also fails
+`ci/woodpecker/push/trusted`.
 
 - GitHub UI: Settings → Branches → Add branch protection rule for `main` →
-  *Require status checks to pass* → search for and add `ci/woodpecker/pr/pr`.
+  *Require status checks to pass* → search for and add
+  `ci/woodpecker/pr/pr` and `ci/woodpecker/push/trusted`.
 - API:
 
   ```sh
@@ -360,7 +377,7 @@ PRs is the `pr` workflow context:
   {
     "required_status_checks": {
       "strict": true,
-      "contexts": ["ci/woodpecker/pr/pr"]
+      "contexts": ["ci/woodpecker/pr/pr", "ci/woodpecker/push/trusted"]
     },
     "enforce_admins": false,
     "required_pull_request_reviews": null,
@@ -369,11 +386,11 @@ PRs is the `pr` workflow context:
   JSON
   ```
 
-`activate.sh` prints the same instructions after activation. The push/tag
-contexts (`ci/woodpecker/push/trusted`, `ci/woodpecker/tag/trusted`) can be
-required too if you want the post-merge trusted evidence checked before other
-work lands; the darwin/windows per-platform certificates run inside that same
-`trusted` workflow, so their failure also fails `ci/woodpecker/push/trusted`.
+`activate.sh` prints the same instructions after activation. Server
+overrides of `WOODPECKER_STATUS_CONTEXT(_FORMAT)` rename every context; use
+the resulting strings in branch protection. The default status context is
+derived from the workflow file, so a workflow that fails to load can never
+switch the required context to something else.
 
 ## 8. Linux agent
 

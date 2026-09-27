@@ -303,6 +303,12 @@ impl GoogleProvider {
             "contents": contents,
             "generationConfig": { "temperature": 0.7 },
         });
+        // Gemini carries the cacheable system prefix in its own TOP-LEVEL
+        // `systemInstruction` field (a SystemInstruction of ordered parts),
+        // never as a contents turn.
+        if !req.system.is_empty() {
+            body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": req.system }] });
+        }
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
         }
@@ -661,6 +667,11 @@ mod tests {
                 body: "data: {}\n\n".into(),
                 assert: Arc::new(|body: &serde_json::Value| {
                     assert_eq!(body["contents"][0]["role"], "user");
+                    assert_eq!(
+                        body["systemInstruction"],
+                        serde_json::json!({ "parts": [{ "text": "sys" }] }),
+                        "the cacheable prefix must ride the top-level systemInstruction field"
+                    );
                     assert!(body["tools"].is_array());
                     assert_eq!(
                         body["tools"][0]["functionDeclarations"][0]["name"],
@@ -673,7 +684,6 @@ mod tests {
                         "attempt",
                         "deadline_ms",
                         "cancellation",
-                        "system",
                     ] {
                         assert!(
                             !body.as_object().unwrap().contains_key(leaked),

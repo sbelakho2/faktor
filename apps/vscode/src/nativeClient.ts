@@ -31,6 +31,10 @@ import {
   MICRO_ZERO,
   type MicroMoney,
 } from './money.ts';
+import {
+  parseProtocolErrorEnvelope,
+  type ProtocolJson,
+} from './generated/protocolDto.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -4246,16 +4250,12 @@ function apiError(status: number, body: string, label: string): NativeApiError {
   } catch {
     return new NativeApiError(status, 'http_error', body.slice(0, 200) || `HTTP ${status}`, false);
   }
-  if (typeof parsed === 'object' && parsed !== null) {
-    const error = (parsed as { error?: unknown }).error;
-    if (typeof error === 'object' && error !== null) {
-      const code = (error as { code?: unknown }).code;
-      const message = (error as { message?: unknown }).message;
-      const retryable = (error as { retryable?: unknown }).retryable;
-      if (typeof code === 'string' && typeof message === 'string') {
-        return new NativeApiError(status, code, message, retryable === true);
-      }
-    }
+  // The canonical `{error:{code,message,retryable}}` shape is generated from
+  // faktor-protocol (audit 25): the envelope check is no longer duplicated
+  // here. A non-conforming body keeps the http_error fallback below.
+  const envelope = parseProtocolErrorEnvelope(parsed as ProtocolJson);
+  if (envelope !== null) {
+    return new NativeApiError(status, envelope.code, envelope.message, envelope.retryable);
   }
   throw new NativeProtocolError(label, `non-JSON error body with HTTP ${status}`);
 }

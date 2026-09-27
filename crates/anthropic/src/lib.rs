@@ -337,6 +337,12 @@ impl AnthropicProvider {
             "max_tokens": req.max_output.unwrap_or(4096),
             "stream": true,
         });
+        // The Messages API carries the cacheable system prefix in its own
+        // TOP-LEVEL `system` field (string or text blocks), never as a
+        // message in the conversation.
+        if !req.system.is_empty() {
+            body["system"] = serde_json::json!(req.system);
+        }
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
         }
@@ -778,6 +784,11 @@ mod tests {
                 assert: Arc::new(|body: &serde_json::Value| {
                     assert_eq!(body["model"], "claude-x");
                     assert_eq!(body["max_tokens"], 512);
+                    assert_eq!(
+                        body["system"], "sys",
+                        "the cacheable prefix must ride the top-level system field"
+                    );
+                    assert_eq!(body["messages"][0]["role"], "user");
                     assert_eq!(body["tools"][0]["name"], "read_file");
                     assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
                     for leaked in [
@@ -786,7 +797,6 @@ mod tests {
                         "attempt",
                         "deadline_ms",
                         "cancellation",
-                        "system",
                     ] {
                         assert!(
                             !body.as_object().unwrap().contains_key(leaked),

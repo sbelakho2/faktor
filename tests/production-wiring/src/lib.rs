@@ -29,4 +29,4 @@
 
 include!(concat!(env!("OUT_DIR"), "/main.rs"));
 
-pub mod wiring;
+pub mod harness;

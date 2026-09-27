@@ -25,6 +25,18 @@ import { microWireValue, type MicroMoney } from './money.ts';
 /** One durable typed attachment id a task start accepts (native DTO mirror). */
 export type TaskAttachmentId = NativeAttachmentId;
 
+/**
+ * One already-uploaded attachment retained in LOCAL pending state, bound to
+ * the session it was uploaded under: a retry may reuse the durable id ONLY
+ * while it addresses the same session (a cross-session retry must upload
+ * again; the daemon would refuse the foreign id and the client must never
+ * silently carry bytes across sessions).
+ */
+export interface PendingUploadedAttachment {
+  readonly sessionId: string;
+  readonly attachment: TaskAttachmentId;
+}
+
 /** One binary attachment of a pending submission: exact bytes as base64. */
 export interface PendingBinaryAttachment {
   readonly mime: string;
@@ -32,6 +44,15 @@ export interface PendingBinaryAttachment {
   readonly bytes: number;
   readonly dataBase64: string;
   readonly isImage: boolean;
+  /**
+   * The durable id of a PRIOR successful upload of these exact bytes under
+   * `uploaded.sessionId` (CAS dedupe foundation): a retry resolves it first
+   * and uploads only the attachments that are still absent. Set by
+   * [`withPendingUpload`] after a successful upload; never trusted from the
+   * webview without the strict shape validation in
+   * [`parsePendingSubmission`].
+   */
+  readonly uploaded?: PendingUploadedAttachment;
 }
 
 /**
@@ -187,6 +208,75 @@ function pendingString(value: unknown, max = MAX_PENDING_ID_CHARS): string | nul
   return trimmed;
 }
 
+/** Strict decode of one durable attachment id (the upload response shape). */
+function parsePendingAttachmentId(raw: unknown): TaskAttachmentId | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const digest =
+    typeof record.digest === 'string' && /^[0-9a-f]{64}$/.test(record.digest)
+      ? record.digest
+      : null;
+  const mime = pendingString(record.mime, 128);
+  const filename =
+    record.filename === undefined || record.filename === null
+      ? null
+      : pendingString(record.filename, 255);
+  const size =
+    typeof record.size === 'number' && Number.isInteger(record.size) && record.size >= 0
+      ? record.size
+      : null;
+  if (digest === null || mime === null || size === null) {
+    return null;
+  }
+  if (filename === null && record.filename !== undefined && record.filename !== null) {
+    return null;
+  }
+  return { digest, mime, filename, size };
+}
+
+/** `null` = absent (optional by design); `'invalid'` = a hostile shape that
+ *  must reject the whole envelope rather than fabricate a reusable upload. */
+function parsePendingUploadedAttachment(
+  raw: unknown,
+): PendingUploadedAttachment | null | 'invalid' {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return 'invalid';
+  }
+  const record = raw as Record<string, unknown>;
+  const sessionId = pendingString(record.sessionId);
+  const attachment = parsePendingAttachmentId(record.attachment);
+  if (sessionId === null || attachment === null) {
+    return 'invalid';
+  }
+  return { sessionId, attachment };
+}
+
+/**
+ * The immutable retention step: one pending attachment replaced with its
+ * successful upload record. A retry over the returned envelope resolves the
+ * id first and uploads only the absent entries.
+ */
+export function withPendingUpload(
+  pending: PendingSubmission,
+  index: number,
+  uploaded: PendingUploadedAttachment,
+): PendingSubmission {
+  if (!Number.isInteger(index) || index < 0 || index >= pending.attachments.length) {
+    return pending;
+  }
+  return {
+    ...pending,
+    attachments: pending.attachments.map((attachment, at) =>
+      at === index ? { ...attachment, uploaded } : attachment,
+    ),
+  };
+}
+
 /**
  * Defensive re-validation of one pending envelope arriving from the
  * webview layer. Returns `null` for any hostile/oversized shape so the
@@ -252,12 +342,17 @@ export function parsePendingSubmission(raw: unknown): PendingSubmission | null {
       ) {
         return null;
       }
+      const uploaded = parsePendingUploadedAttachment(item.uploaded);
+      if (uploaded === 'invalid') {
+        return null;
+      }
       attachments.push({
         mime,
         filename,
         bytes,
         dataBase64,
         isImage: typeof item.isImage === 'boolean' ? item.isImage : mime.startsWith('image/'),
+        ...(uploaded !== null ? { uploaded } : {}),
       });
     }
   }
@@ -642,6 +737,12 @@ export interface AdmitOutcome {
   readonly runId: string | null;
   /** The durable typed ids the run was admitted with (empty on failure). */
   readonly attachmentIds: readonly string[];
+  /**
+   * The pending envelope with every successful upload retained (the caller
+   * keeps THIS as its local pending state: a retry over it resolves the ids
+   * first and uploads only the absent attachments).
+   */
+  readonly pending: PendingSubmission;
   readonly failure: AdmitFailure | null;
 }
 
@@ -832,16 +933,22 @@ export function pendingAttachmentRefusal(
  * Admit ONE pending submission through the daemon: gate every attachment
  * against the ADVERTISED upload/image/document contract FIRST (an
  * undeliverable part refuses the whole submission before any upload, so it
- * leaves no partial bytes in the durable store), then upload every binary
- * attachment — images and documents included — and start ONE task run
- * carrying the durable typed ids. The bytes live in
- * the daemon's content-addressed attachment store; the run carries artifact
- * ids only, never base64 through the model/tool layer. The pending envelope
- * is retained by the caller for the entire call; `restore` is invoked
- * EXACTLY ONCE on any failure (allowlist refusal, upload,
- * validation/model/conflict/transport start failure) and never on success —
- * the draft is restored through the composer contract, never silently lost.
- * A failure before the start request leaves no daemon-side admission at all.
+ * leaves no partial bytes in the durable store), then resolve every
+ * attachment that was ALREADY uploaded for this session (the envelope's
+ * `uploaded` record) and upload only the absent ones — a retry never
+ * uploads the same bytes twice (CAS dedupe foundation). After each
+ * successful upload the durable id is retained into the returned envelope
+ * ([`withPendingUpload`], plus the optional `onAttachmentUploaded`
+ * callback), so the caller's local pending state survives a start failure
+ * verbatim; the start runs ONCE carrying the durable typed ids in entry
+ * order. The bytes live in the daemon's content-addressed attachment store;
+ * the run carries artifact ids only, never base64 through the model/tool
+ * layer. `restore` is invoked EXACTLY ONCE on any failure (allowlist
+ * refusal, upload, validation/model/conflict/transport start failure) with
+ * the enriched pending envelope, and never on success — the draft is
+ * restored through the composer contract with its uploads kept, never
+ * silently lost. A failure before the start request leaves no daemon-side
+ * admission at all.
  */
 export async function admitPendingSubmission(input: {
   readonly client: StartRunClient & AttachmentUploadClient;
@@ -856,19 +963,33 @@ export async function admitPendingSubmission(input: {
   readonly attachmentLimits?: AttachmentAdmissionPolicy;
   readonly onStarted: (started: NativeTaskRunStarted) => void;
   readonly onFailure: (failure: AdmitFailure) => void;
-  readonly restore: (failure: AdmitFailure) => void;
+  /** Observes every NEW upload (never a reused id) so the host can retain it. */
+  readonly onAttachmentUploaded?: (index: number, uploaded: PendingUploadedAttachment) => void;
+  readonly restore: (failure: AdmitFailure, pending: PendingSubmission) => void;
 }): Promise<AdmitOutcome> {
+  let pending = input.pending;
   const uploaded: TaskAttachmentId[] = [];
   const refusal = pendingAttachmentRefusal(
-    input.pending.attachments,
+    pending.attachments,
     input.attachmentLimits ?? EMERGENCY_ATTACHMENT_POLICY,
   );
   if (refusal !== null) {
     input.onFailure(refusal);
-    input.restore(refusal);
-    return { ok: false, runId: null, attachmentIds: [], failure: refusal };
+    input.restore(refusal, pending);
+    return { ok: false, runId: null, attachmentIds: [], pending, failure: refusal };
   }
-  for (const attachment of input.pending.attachments) {
+  for (let index = 0; index < pending.attachments.length; index += 1) {
+    const attachment = pending.attachments[index];
+    const reusable =
+      attachment.uploaded !== undefined && attachment.uploaded.sessionId === input.sessionId
+        ? attachment.uploaded.attachment
+        : null;
+    if (reusable !== null) {
+      // Resolve the already-uploaded id FIRST: the retry carries the same
+      // durable identity and issues no second upload for these bytes.
+      uploaded.push(reusable);
+      continue;
+    }
     try {
       const id = await input.client.uploadAttachment(input.sessionId, {
         mime: attachment.mime,
@@ -876,17 +997,20 @@ export async function admitPendingSubmission(input: {
         data_base64: attachment.dataBase64,
       });
       uploaded.push(id);
+      const record: PendingUploadedAttachment = { sessionId: input.sessionId, attachment: id };
+      pending = withPendingUpload(pending, index, record);
+      input.onAttachmentUploaded?.(index, record);
     } catch (error) {
       const failure = uploadFailureOf(error, input.sessionId);
       input.onFailure(failure);
-      input.restore(failure);
-      return { ok: false, runId: null, attachmentIds: uploaded.map((id) => id.digest), failure };
+      input.restore(failure, pending);
+      return { ok: false, runId: null, attachmentIds: uploaded.map((id) => id.digest), pending, failure };
     }
   }
   const startRun = await startTaskRun({
     client: input.client,
     sessionId: input.sessionId,
-    goal: input.pending.text,
+    goal: pending.text,
     settings: { ...input.settings, attachments: uploaded },
     onStarted: input.onStarted,
     onFailure: (failure) => {
@@ -898,6 +1022,7 @@ export async function admitPendingSubmission(input: {
       ok: true,
       runId: startRun.runId,
       attachmentIds: uploaded.map((id) => id.digest),
+      pending,
       failure: null,
     };
   }
@@ -909,12 +1034,91 @@ export async function admitPendingSubmission(input: {
     code: startFailure.code,
     message: startFailure.message,
   };
-  input.restore(failure);
+  input.restore(failure, pending);
   return {
     ok: false,
     runId: null,
     attachmentIds: uploaded.map((id) => id.digest),
+    pending,
     failure,
   };
+}
+
+/**
+ * Bounded LOCAL pending state for submission retries. The host retains the
+ * enriched envelope per `(sessionId, messageId|draftId)` identity after a
+ * failed admission; a retry carrying the same identity merges the
+ * already-uploaded ids back in BEFORE admission, so only the absent
+ * attachments upload again (CAS dedupe foundation). A successful admission
+ * releases the entry; the map is bounded so a hostile client cannot grow
+ * host memory with submission identities.
+ */
+export class PendingSubmissionRetainer {
+  private readonly entries = new Map<string, PendingSubmission>();
+  private readonly maxEntries: number;
+
+  constructor(maxEntries = 8) {
+    this.maxEntries = maxEntries;
+  }
+
+  private keyOf(pending: PendingSubmission): string | null {
+    const identity = pending.messageId ?? pending.draftId;
+    if (identity === null || pending.sessionId === null) {
+      return null;
+    }
+    return `${pending.sessionId}\u0000${identity}`;
+  }
+
+  /** Retain the enriched envelope (no-op without an identity or uploads). */
+  retain(pending: PendingSubmission): void {
+    const key = this.keyOf(pending);
+    if (key === null || pending.attachments.length === 0) {
+      return;
+    }
+    this.entries.delete(key);
+    this.entries.set(key, pending);
+    while (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.entries.delete(oldest);
+    }
+  }
+
+  /**
+   * Merge the retained uploads into `pending` by attachment index. Only
+   * records bound to the SAME session are reused; a shape mismatch (a
+   * different attachment list arrived under the same identity) keeps the
+   * fresh envelope untouched.
+   */
+  restore(pending: PendingSubmission): PendingSubmission {
+    const key = this.keyOf(pending);
+    const retained = key === null ? undefined : this.entries.get(key);
+    if (retained === undefined || retained.attachments.length !== pending.attachments.length) {
+      return pending;
+    }
+    let merged = pending;
+    retained.attachments.forEach((attachment, index) => {
+      const uploaded = attachment.uploaded;
+      if (uploaded !== undefined && uploaded.sessionId === pending.sessionId) {
+        merged = withPendingUpload(merged, index, uploaded);
+      }
+    });
+    return merged;
+  }
+
+  /** Durable acceptance: the retained retry state is no longer needed. */
+  release(pending: PendingSubmission): void {
+    const key = this.keyOf(pending);
+    if (key !== null) {
+      this.entries.delete(key);
+    }
+  }
+
+  /** Bounded-state probe (tests). */
+  size(): number {
+    return this.entries.size;
+  }
 }
 

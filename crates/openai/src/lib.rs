@@ -1192,7 +1192,17 @@ pub fn chat_completions_body(
     req: &GenericAgentRequest,
     quirks: &OpenAiQuirks,
 ) -> serde_json::Value {
-    let messages = lower_chat_messages(&req.messages, quirks);
+    // Chat Completions carries the cacheable system prefix as the FIRST
+    // message (`role: "system"`), never as a top-level field and never
+    // after the conversation. OpenAI's model-gated `developer` role has no
+    // capability signal on this compatible-endpoint surface, so the
+    // universally implemented `system` role is the one this family emits
+    // (compatible servers commonly reject `developer`).
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(req.messages.len() + 1);
+    if !req.system.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": req.system }));
+    }
+    messages.extend(lower_chat_messages(&req.messages, quirks));
     let tools: Vec<serde_json::Value> = req
         .tools
         .iter()
@@ -1716,6 +1726,10 @@ pub fn messages_from(req: &GenericAgentRequest) -> Vec<RequestMessage> {
 }
 
 #[cfg(test)]
+#[path = "chat_lowering_tests.rs"]
+mod chat_lowering_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use faktor_core::cancellation::CancellationToken;
@@ -1753,50 +1767,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn wire_body_has_no_internal_leakage() {
-        let server = MockServer::new();
-        server.route(
-            "POST",
-            "/chat/completions",
-            MockAction::AssertThenRespond {
-                status: 200,
-                body: sse_body(&[
-                    serde_json::json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}),
-                ]),
-                assert: Arc::new(|body: &serde_json::Value| {
-                    // Frozen wire shape: exactly the OpenAI fields.
-                    assert_eq!(body["model"], "m1");
-                    assert!(body["messages"].is_array());
-                    assert_eq!(body["messages"][0]["role"], "user");
-                    assert!(body["stream"].as_bool().unwrap());
-                    assert_eq!(body["max_tokens"], 1000);
-                    assert_eq!(body["tools"][0]["type"], "function");
-                    assert_eq!(body["tool_choice"], "auto");
-                    // Internal fields must NEVER appear on the wire.
-                    for leaked in ["operation_id", "session_id", "attempt", "deadline_ms", "cancellation", "system", "op_id"] {
-                        assert!(!body.as_object().unwrap().contains_key(leaked), "{leaked} leaked!");
-                    }
-                    // The `system` prompt must not leak as a top-level field.
-                    assert!(!body.as_object().unwrap().contains_key("system"));
-                }),
-            },
-        );
-        let base = server.base_url().await;
-        let provider =
-            OpenAiProvider::permissive_for_tests(OpenAiConfig::chat(base, Some("sk-test".into())));
-        let mut stream = provider.stream(req("m1"));
-        let mut texts = String::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk.unwrap() {
-                ProviderChunk::Text { text } => texts.push_str(&text),
-                ProviderChunk::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(texts, "ok");
-    }
-
     /// Resolved image attachments lower BYTE-EXACTLY on both wire families:
     /// Chat gets `image_url` with a base64 data URL, Responses gets
     /// `input_image` with the same data URL. The base64 and media type are
@@ -1824,7 +1794,7 @@ mod tests {
                 ]),
                 assert: Arc::new(move |body: &serde_json::Value| {
                     assert_eq!(
-                        body["messages"][1]["content"],
+                        body["messages"][2]["content"],
                         serde_json::json!([
                             { "type": "text", "text": "look" },
                             {
@@ -1923,7 +1893,7 @@ mod tests {
                 ]),
                 assert: Arc::new(move |body: &serde_json::Value| {
                     assert_eq!(
-                        body["messages"][1]["content"],
+                        body["messages"][2]["content"],
                         serde_json::json!([
                             { "type": "text", "text": "read" },
                             {
@@ -3082,12 +3052,13 @@ mod tests {
                         );
                     }
                     let msgs = body["messages"].as_array().expect("messages array");
-                    assert_eq!(msgs.len(), 2, "assistant + tool message");
-                    assert_eq!(msgs[0]["role"], "assistant");
+                    assert_eq!(msgs.len(), 3, "system + assistant + tool message");
+                    assert_eq!(msgs[0]["role"], "system");
+                    assert_eq!(msgs[1]["role"], "assistant");
                     // content is text-only; the call rides tool_calls.
-                    assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 1);
-                    assert_eq!(msgs[0]["content"][0]["type"], "text");
-                    let tc = &msgs[0]["tool_calls"][0];
+                    assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 1);
+                    assert_eq!(msgs[1]["content"][0]["type"], "text");
+                    let tc = &msgs[1]["tool_calls"][0];
                     assert_eq!(tc["id"], "call_1");
                     assert_eq!(tc["type"], "function");
                     assert_eq!(tc["function"]["name"], "echo");
@@ -3095,11 +3066,11 @@ mod tests {
                         tc["function"]["arguments"], r#"{"x":1}"#,
                         "arguments must be the JSON STRING of the object"
                     );
-                    assert_eq!(msgs[1]["role"], "tool");
-                    assert_eq!(msgs[1]["tool_call_id"], "call_1");
-                    assert_eq!(msgs[1]["content"], "echo: {\"x\":1}");
+                    assert_eq!(msgs[2]["role"], "tool");
+                    assert_eq!(msgs[2]["tool_call_id"], "call_1");
+                    assert_eq!(msgs[2]["content"], "echo: {\"x\":1}");
                     assert!(
-                        msgs[1].get("tool_calls").is_none(),
+                        msgs[2].get("tool_calls").is_none(),
                         "tool messages never carry tool_calls"
                     );
                 }),
@@ -3150,8 +3121,9 @@ mod tests {
                         assert!(!raw.contains(banned), "no tool blocks allowed: {raw}");
                     }
                     let msgs = body["messages"].as_array().unwrap();
-                    assert_eq!(msgs.len(), 1);
-                    let calls = msgs[0]["tool_calls"].as_array().unwrap();
+                    assert_eq!(msgs.len(), 2, "system + assistant message");
+                    assert_eq!(msgs[0]["role"], "system");
+                    let calls = msgs[1]["tool_calls"].as_array().unwrap();
                     assert_eq!(calls.len(), 2);
                     let ids: Vec<&str> = calls.iter().map(|c| c["id"].as_str().unwrap()).collect();
                     assert_eq!(ids, vec!["call_a", "call_b"], "ids must stay distinct");
@@ -3162,7 +3134,7 @@ mod tests {
                         calls[1]["function"]["arguments"],
                         r#"{"path":"src","depth":2}"#
                     );
-                    let content = msgs[0]["content"].as_array().unwrap();
+                    let content = msgs[1]["content"].as_array().unwrap();
                     assert_eq!(content.len(), 1, "text-only content");
                     assert_eq!(content[0]["type"], "text");
                 }),

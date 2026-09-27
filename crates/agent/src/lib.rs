@@ -3337,7 +3337,21 @@ mod no_provider_switching {
         let mut sources = String::new();
         for file in [
             "lib.rs",
-            "runtime.rs",
+            "runtime/mod.rs",
+            "runtime/turn/mod.rs",
+            "runtime/turn/drive.rs",
+            "runtime/turn/queue.rs",
+            "runtime/turn/state.rs",
+            "runtime/request.rs",
+            "runtime/media.rs",
+            "runtime/retrieval.rs",
+            "runtime/routing.rs",
+            "runtime/provider_loop.rs",
+            "runtime/tool_loop.rs",
+            "runtime/retry.rs",
+            "runtime/settlement.rs",
+            "runtime/compaction.rs",
+            "runtime/verification_attribution.rs",
             "tool.rs",
             "tool_json.rs",
             "loop_detect.rs",
@@ -3792,6 +3806,21 @@ mod bounded_evidence_executor_tests {
         count
     }
 
+    /// Bounded settle for OS-thread growth assertions: other tests in this
+    /// binary run in parallel and their transient tokio worker/blocking
+    /// threads can overlap a measurement. Wait (bounded) for the
+    /// process-wide count to fit `before + slack`; a real per-poll leak is
+    /// ~200 threads and cannot settle.
+    async fn settled_thread_count(before: usize, slack: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut after = live_thread_count().unwrap_or(before);
+        while after > before + slack && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            after = live_thread_count().unwrap_or(after);
+        }
+        after
+    }
+
     /// Initialize the process-wide pool once, so later spawn-counter deltas
     /// measure only this test's executors. Also pins the DOCUMENTED fixed
     /// size of the production pool: the whole concurrency budget of the
@@ -3883,7 +3912,8 @@ mod bounded_evidence_executor_tests {
             live_before + 2,
             "200 polls must neither spawn nor leak an evidence worker"
         );
-        if let (Some(before), Some(after)) = (threads_before, live_thread_count()) {
+        if let Some(before) = threads_before {
+            let after = settled_thread_count(before, 64).await;
             assert!(
                 after <= before + 64,
                 "200 polls must not leak threads (generous ceiling): before={before} after={after}"
@@ -3943,7 +3973,8 @@ mod bounded_evidence_executor_tests {
         );
         assert!(stats.max_active <= 2, "active high-water: {stats:?}");
         assert!(stats.max_queue_depth <= 4, "queue high-water: {stats:?}");
-        if let (Some(before), Some(after)) = (threads_before, live_thread_count()) {
+        if let Some(before) = threads_before {
+            let after = settled_thread_count(before, 64).await;
             assert!(
                 after <= before + 64,
                 "the stuck provider must not leak threads: before={before} after={after}"
@@ -4417,7 +4448,8 @@ mod bounded_evidence_executor_tests {
             live_now <= live_before + 2 + 4,
             "live evidence threads must stay within workers + cap: before={live_before} now={live_now}"
         );
-        if let (Some(before), Some(after)) = (threads_before, live_thread_count()) {
+        if let Some(before) = threads_before {
+            let after = settled_thread_count(before, 2 + 4 + 64).await;
             assert!(
                 after <= before + 2 + 4 + 64,
                 "OS thread growth must stay bounded (workers + cap + generous slack for parallel tests): before={before} after={after}"
@@ -5188,7 +5220,21 @@ mod off_turn_wrapper_is_deleted {
         let mut sources = String::new();
         for file in [
             "lib.rs",
-            "runtime.rs",
+            "runtime/mod.rs",
+            "runtime/turn/mod.rs",
+            "runtime/turn/drive.rs",
+            "runtime/turn/queue.rs",
+            "runtime/turn/state.rs",
+            "runtime/request.rs",
+            "runtime/media.rs",
+            "runtime/retrieval.rs",
+            "runtime/routing.rs",
+            "runtime/provider_loop.rs",
+            "runtime/tool_loop.rs",
+            "runtime/retry.rs",
+            "runtime/settlement.rs",
+            "runtime/compaction.rs",
+            "runtime/verification_attribution.rs",
             "tool.rs",
             "tool_json.rs",
             "loop_detect.rs",

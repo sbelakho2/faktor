@@ -46,18 +46,14 @@ LLM used only where reasoning is actually needed
   absent from recent context automatically receives the matching exact +
   symbol + lexical (+ semantic, when an embedder is configured) evidence
   package bounded by the wire plan's context budget, and a prompt matching
-  nothing yields no evidence section. Behavioral certification today is at
-  the agent runtime
-  (`ordinary_turn_receives_repository_evidence_without_a_search_tool_call`
-  for the automatic package, the `configured_embedder_*` tests for the
-  semantic leg, `no_embedder_degrades_honestly_and_never_invents_semantic_evidence`
-  for honest absence). A daemon-core behavioral test of the same two
-  behaviors is NOT yet in `tests/production-wiring`: a fake/custom provider
-  endpoint cannot route an agent turn under the production policy (the
-  Implement/Review quality floor is a hard 60 while every non-official
-  endpoint carries the conservative prior 50), so the missing seam is a
-  routable fake-provider/quality-authority seam in `build_daemon_core`;
-  nothing here claims it.
+  nothing yields no evidence section. Certified at the agent runtime
+  (`ordinary_turn_receives_repository_evidence_without_a_search_tool_call`,
+  the `configured_embedder_*` tests,
+  `no_embedder_degrades_honestly_and_never_invents_semantic_evidence`) and
+  daemon-core in `tests/production-wiring/tests/retrieval.rs`: an ordinary
+  turn receives the evidence section from the daemon's own index/evidence
+  ladder, a no-match prompt never fabricates one, and semantic fusion
+  reaches the request through a configured loopback embedder.
 - **Explicit concurrency** — resource-class budgets, dependency DAG scheduling,
   state-aware retries with jitter, circuit breakers.
 - **Process supervision** — no orphans. Process groups on Unix; Windows
@@ -210,7 +206,10 @@ authoritative surface and is scan-enforced.
   `build_daemon_core` graph with fake external seams, so the daemon — not a
   hand-built subsystem — supplies identity/config/authority. Certified:
   `source_market` runs the production planner's mechanism/cache decisions
-  and survives variant/packaging across tool → service → bridge → adapter;
+  (the planner is seam-injectable through
+  `build_daemon_with_acquisition_planner`; the spy planner observes the
+  daemon's own `build_daemon_core` invoking it) and survives
+  variant/packaging across tool → service → bridge → adapter;
   a configured marketplace account scope keys the authenticated cache row
   (and an anonymous context cannot address it, while authenticated prices
   are never public-addressable); the real Alibaba AOP signing path passes an
@@ -219,18 +218,33 @@ authoritative surface and is scan-enforced.
   a contracted task's completion PR traverses the daemon `TaskExecutor` into
   `GitHubCompletionScm`/`GitHubApp` against a fake GitHub (installation
   token, exact ref, exact head/base/marker); durable jobs are requester-
-  scoped (`NotFound` across sessions); image turns are refused typed before
-  dispatch for non-vision models, and ordered byte-exact image parts reach a
-  loopback provider through the daemon's provider registry/transport.
-  Residuals (reported, not hidden): (a) `AcquisitionPlanner::plan` itself is
-  not seam-injectable through `build_daemon_core` — the commerce service is
-  built with the default planner inside `open_commerce_service_with`, so the
-  planner is certified through its executed mechanism and cache decisions;
-  (b) a full agent turn against a non-official provider endpoint cannot
-  route yet (hard quality floor 60 vs conservative prior 50), so the
-  positive image-dispatch half is certified at the daemon provider boundary
-  and the daemon-core retrieval behaviors above remain pending that routing
-  seam.
+  scoped (`NotFound` across sessions); image turns route end to end through
+  the daemon's provider registry/transport — a non-vision model refuses
+  typed before dispatch and the loopback provider receives ordered
+  byte-exact media; ordinary turns receive automatically retrieved
+  repository evidence and no-match turns never fabricate an evidence section
+  (`tests/production-wiring/tests/retrieval.rs`).
+  Residuals (reported, not hidden): external services are represented by
+  in-process fakes/loopback servers — the certification executes the daemon
+  path, never a live vendor; live-provider/network behavior is covered by
+  the adapters' own contract suites and the `[soak]`/`[fault]` lanes.
+
+<!-- capability-axes:start -->
+| Capability | wired | adapter_certified | daemon_e2e_certified | platforms_certified | external_dependency |
+| --- | --- | --- | --- | --- | --- |
+| `acquisition_planner` | true | true | true | darwin,linux,windows | faked |
+| `identity_cache` | true | true | true | darwin,linux,windows | faked |
+| `vision` | true | true | true | darwin,linux,windows | faked |
+| `retrieval` | true | true | true | darwin,linux,windows | faked |
+| `scm` | true | true | true | darwin,linux,windows | faked |
+| `jobs` | true | false | true | darwin,linux,windows | faked |
+<!-- capability-axes:end -->
+
+The five fields above are DERIVED, not written: `scripts/capabilities-manifest.mjs`
+probes the production constructors and the `tests/production-wiring` suite and
+writes `target/certification/capabilities.json`. `bash scripts/check-docs-sync.sh`
+compares this table field-by-field against that manifest and rejects any
+hand-written binary capability claim outside the marked block.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |

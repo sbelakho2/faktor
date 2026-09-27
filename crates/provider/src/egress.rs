@@ -3494,6 +3494,19 @@ mod tests {
                     if rel.starts_with("tests/") || rel.contains("/tests/") {
                         continue; // test-only layout
                     }
+                    // Out-of-line test-only modules (module decomposition):
+                    // `tests.rs` / `*_tests.rs` files are test code by
+                    // convention, still counted toward `hits` so the walk
+                    // proves it covers the test helpers.
+                    let base = rel.rsplit('/').next().unwrap_or("");
+                    if base == "tests.rs" || base.ends_with("_tests.rs") {
+                        if let Ok(source) = std::fs::read_to_string(&path) {
+                            hits += mask_noncode(&source)
+                                .matches(PERMISSIVE_CTOR_MARKER)
+                                .count();
+                        }
+                        continue;
+                    }
                     let Ok(source) = std::fs::read_to_string(&path) else {
                         continue;
                     };

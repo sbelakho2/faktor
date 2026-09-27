@@ -17,7 +17,13 @@
 // `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`
 // and are written ONLY when `-Dfaktor.parity.writeBaselines=true` is passed
 // (the smoke script's `--write-baselines` flag): a normal run compares
-// against the pinned file and reports drift as a failure.
+// against the pinned record for THIS PLATFORM and reports drift as a failure.
+// Audit 28: the schema is `faktor-parity-visual-baselines/v3` with distinct
+// `platforms.{linux,macos,windows}` records. A platform with no record is
+// reported "not certified on platform <p>" and is NEVER compared against
+// another platform's (or a canonical) digest; release claims require all
+// three records (scripts/check-visual-platforms.mjs --release via
+// certify.sh).
 package dev.faktor.frontend
 
 import dev.faktor.shared.JsonCodec
@@ -58,10 +64,32 @@ internal data class ParityFailure(val surface: String, val check: String, val me
 
 internal data class ParityVisualResult(
     val panel: String,
-    val passed: Boolean,
+    /** `passed` | `drifted` | `not_certified` (audit 28). */
+    val status: String,
     val digest: String,
     val baseline: String?,
+    /** The platform the render ran on (`linux` | `macos` | `windows` | `unknown`). */
+    val platform: String,
     val detail: String
+) {
+    val passed: Boolean get() = status == "passed"
+    val drifted: Boolean get() = status == "drifted"
+    val notCertified: Boolean get() = status == "not_certified"
+}
+
+/** One platform's pinned visual baseline record. */
+internal data class VisualPlatformRecord(
+    val environment: String,
+    val digests: Map<String, String>
+)
+
+/** The pinned visual baseline file: per-platform records only. There is no
+ * canonical/shared digest pool: a platform without a record is NOT
+ * CERTIFIED, never compared against another platform's digests. */
+internal data class VisualBaseline(
+    val schema: String,
+    val requiredPlatforms: List<String>,
+    val platforms: Map<String, VisualPlatformRecord>
 )
 
 private val PARITY_PATH = "target/certification/jetbrains-parity.json"
@@ -79,6 +107,7 @@ internal object ParityMatrix {
     private val cannedFailures = ArrayList<ParityFailure>()
     private val daemonFailures = ArrayList<ParityFailure>()
     private var visualResults: List<ParityVisualResult> = emptyList()
+    private var visualCoverage: Map<String, String> = emptyMap()
 
     private fun register(row: ParityRow) {
         rows.add(row)
@@ -208,6 +237,164 @@ internal object ParityMatrix {
 
     /** The visual results of the run (empty before [`run`]). */
     fun visuals(): List<ParityVisualResult> = visualResults
+
+    /** Per-required-platform certification derived from the baseline file:
+     * `certified` only when a distinct record with non-empty digests exists. */
+    fun visualPlatformCoverage(): Map<String, String> = visualCoverage
+
+    /** The platform this render runs on, mapped onto the release vocabulary. */
+    private fun visualPlatform(): String {
+        val os = asciiLowerCase(System.getProperty("os.name", "unknown"))
+            .replace(Regex("[^a-z0-9]+"), "-")
+        return when {
+            os.contains("mac") -> "macos"
+            os.contains("win") -> "windows"
+            os.contains("linux") -> "linux"
+            else -> "unknown"
+        }
+    }
+
+    /**
+     * Audit 28 policy core (pure, testable): a platform without a record in
+     * the baseline file is `not_certified` and is never compared against any
+     * other platform's digests; a missing panel inside a present record and
+     * a digest mismatch are both `drifted`; a match is `passed`.
+     */
+    internal fun visualResultsFor(
+        platform: String,
+        baseline: VisualBaseline?,
+        digests: Map<String, String>
+    ): List<ParityVisualResult> {
+        val record = baseline?.platforms?.get(platform)
+        return digests.map { (panel, digest) ->
+            when {
+                record == null -> ParityVisualResult(
+                    panel, "not_certified", digest, null, platform,
+                    "not certified on platform $platform " +
+                        "(no baseline record for this platform; the canonical pin is never inherited)"
+                )
+                !record.digests.containsKey(panel) -> ParityVisualResult(
+                    panel, "drifted", digest, null, platform,
+                    "panel $panel missing from the certified $platform baseline record"
+                )
+                record.digests.getValue(panel) != digest -> ParityVisualResult(
+                    panel, "drifted", digest, record.digests.getValue(panel), platform,
+                    "component-tree/state digest drifted from the certified $platform baseline"
+                )
+                else -> ParityVisualResult(
+                    panel, "passed", digest, record.digests.getValue(panel), platform,
+                    "digest matches the certified $platform baseline (${record.environment})"
+                )
+            }
+        }
+    }
+
+    /** Release-claim coverage: the required platforms are certified only by
+     * their OWN non-empty records in the baseline file. */
+    internal fun visualCoverageOf(baseline: VisualBaseline?): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (platform in REQUIRED_VISUAL_PLATFORMS) {
+            val record = baseline?.platforms?.get(platform)
+            val certified = record != null &&
+                record.digests.isNotEmpty() &&
+                record.digests.values.all { it.isNotEmpty() }
+            out[platform] = if (certified) "certified" else "not_certified"
+        }
+        return out
+    }
+
+    /**
+     * Adversarial self-test of the environment-specific policy (audit 28),
+     * run by `JetBrainsParitySmoke`: a missing platform record is never
+     * inherited, a mismatch drifts, a v2 file is unreadable, and unknown
+     * platforms stay not certified.
+     */
+    internal fun visualCertificationPolicySelfTest() {
+        val panels = listOf("task-tree", "settings")
+        val linuxDigests = mapOf("task-tree" to "aa", "settings" to "bb")
+        val macosDigests = mapOf("task-tree" to "cc", "settings" to "dd")
+        fun baselineText(windows: Boolean): String {
+            val out = StringBuilder()
+            out.append("{\"schema\": \"$VISUAL_BASELINE_SCHEMA\",")
+            out.append("\"requiredPlatforms\": [\"linux\",\"macos\",\"windows\"],")
+            out.append("\"platforms\": {")
+            out.append("\"linux\": {\"environment\": \"linux-amd64-jvm17\", \"digests\": {")
+            out.append("\"task-tree\": \"aa\", \"settings\": \"bb\"}},")
+            out.append("\"macos\": {\"environment\": \"mac-os-x-aarch64-jvm17\", \"digests\": {")
+            out.append("\"task-tree\": \"cc\", \"settings\": \"dd\"}}")
+            if (windows) {
+                out.append(",\"windows\": {\"environment\": \"windows-amd64-jvm17\", \"digests\": {")
+                out.append("\"task-tree\": \"ee\", \"settings\": \"ff\"}}")
+            }
+            out.append("}}")
+            return out.toString()
+        }
+        val complete = parseVisualBaseline(JsonCodec.parse(baselineText(windows = true)))
+            ?: fail("self-test: complete v3 baseline must parse")
+        val missingWindows = parseVisualBaseline(JsonCodec.parse(baselineText(windows = false)))
+            ?: fail("self-test: v3 baseline without windows must parse")
+        assertEquals(
+            mapOf(
+                "linux" to "certified",
+                "macos" to "certified",
+                "windows" to "certified"
+            ),
+            visualCoverageOf(complete),
+            "self-test: complete coverage"
+        )
+        assertEquals(
+            mapOf(
+                "linux" to "certified",
+                "macos" to "certified",
+                "windows" to "not_certified"
+            ),
+            visualCoverageOf(missingWindows),
+            "self-test: missing platform is not certified"
+        )
+        // A missing platform record must NOT inherit the linux digests.
+        val windowsResults = visualResultsFor("windows", missingWindows, linuxDigests)
+        assertTrue(
+            windowsResults.all { it.notCertified && it.status != "passed" },
+            "self-test: missing windows record must be not_certified"
+        )
+        // Drift against this platform's own record is a failure.
+        val drifted = visualResultsFor(
+            "linux",
+            complete,
+            mapOf("task-tree" to "aa", "settings" to "zz")
+        )
+        assertTrue(
+            drifted.single { it.panel == "settings" }.drifted,
+            "self-test: a digest mismatch must drift"
+        )
+        assertTrue(
+            drifted.single { it.panel == "task-tree" }.passed,
+            "self-test: a matching digest must pass"
+        )
+        // A v2 file is unreadable: no canonical inheritance.
+        val v2 = JsonCodec.parse(
+            "{\"schema\": \"faktor-parity-visual-baselines/v2\", \"panelDigests\": {\"task-tree\": \"aa\", \"settings\": \"bb\"}}"
+        )
+        assertTrue(
+            parseVisualBaseline(v2) == null,
+            "self-test: v2 canonical digests must not be readable as platform records"
+        )
+        val v2Results = visualResultsFor("linux", parseVisualBaseline(v2), linuxDigests)
+        assertTrue(
+            v2Results.all { it.notCertified },
+            "self-test: a v2 baseline certifies no platform"
+        )
+        // Unknown platforms stay not certified even with full records.
+        val unknown = visualResultsFor("solaris", complete, panels.associateWith { "aa" })
+        assertTrue(
+            unknown.all { it.notCertified },
+            "self-test: unknown platforms are not certified"
+        )
+        assertTrue(
+            visualCoverageOf(complete).values.all { it == "certified" },
+            "self-test: complete coverage must be certified"
+        )
+    }
 
     // ------------------------------------------------------------- rows
 
@@ -544,9 +731,12 @@ internal object ParityMatrix {
 
     /**
      * Renders every panel into an offscreen `BufferedImage`, computes a
-     * canonical component-tree/state digest and compares it against the pinned
-     * baseline. A missing baseline is reported as unproven (never a pass);
-     * `-Dfaktor.parity.writeBaselines=true` writes/refreshes the pin.
+     * canonical component-tree/state digest and compares it against the
+     * pinned baseline record FOR THIS PLATFORM (audit 28). A platform with
+     * no record is reported `not_certified` and is NEVER compared against
+     * another platform's digests; a mismatch against this platform's own
+     * record is drift. `-Dfaktor.parity.writeBaselines=true` records this
+     * platform's render.
      */
     private fun runVisual(): List<ParityVisualResult> {
         val panels = listOf(
@@ -568,66 +758,60 @@ internal object ParityMatrix {
             assertEquals(true, renderOk, "$name rendered a degenerate frame: $render")
             digests[name] = ParityAwt.digest(panel, name)
         }
+        val platform = visualPlatform()
         val baselineFile = File(ParityPath.repoRoot(), PARITY_BASELINE_PATH)
         if (System.getProperty("faktor.parity.writeBaselines") == "true") {
-            writeVisualBaselines(baselineFile, digests)
+            assertTrue(
+                platform != "unknown",
+                "cannot pin a visual baseline on an unknown platform"
+            )
+            writeVisualBaselines(baselineFile, platform, digests)
+            visualCoverage = visualCoverageOf(readVisualBaseline(baselineFile))
             return digests.map { (name, digest) ->
                 ParityVisualResult(
-                    name, true, digest, digest, "baseline pinned from this render"
+                    name, "passed", digest, digest, platform,
+                    "baseline pinned from this render on $platform"
                 )
             }
         }
-        val pinned = readVisualBaselines(baselineFile)
-        return digests.map { (name, digest) ->
-            val expected = pinned?.get(name)
-            when {
-                pinned == null -> ParityVisualResult(
-                    name, false, digest, null,
-                    "no pinned visual baseline at $PARITY_BASELINE_PATH"
-                )
-                expected == null -> ParityVisualResult(
-                    name, false, digest, null, "panel $name missing from the pinned baseline"
-                )
-                expected != digest -> ParityVisualResult(
-                    name, false, digest, expected,
-                    "component-tree/state digest drifted from the pinned baseline"
-                )
-                else -> ParityVisualResult(
-                    name, true, digest, expected, "digest matches the pinned baseline"
-                )
-            }
-        }
+        val baseline = readVisualBaseline(baselineFile)
+        visualCoverage = visualCoverageOf(baseline)
+        return visualResultsFor(platform, baseline, digests)
     }
 
     /**
-     * The pinned digests for THIS rendering environment when the baseline
-     * file records them, else the canonical `panelDigests` pin (the hermetic
-     * CI render). The component digest includes laid-out bounds, which follow
-     * the host's font metrics, so one pin can only be valid for the
-     * environment that produced it; `-Dfaktor.parity.writeBaselines=true`
-     * records the current environment alongside (never over) the canonical
-     * pin. An environment with no entry still compares against the canonical
-     * pin: drift is never silently accepted anywhere.
+     * Parses a v3 baseline: per-platform records only. A v2 file (canonical
+     * `panelDigests` + `environmentDigests`) is NOT readable here — the
+     * canonical pin must never be inherited as a platform record. Malformed
+     * content returns null (which surfaces as `not_certified`, never a pass).
      */
-    private fun readVisualBaselines(file: File): Map<String, String>? {
-        if (!file.isFile) return null
-        val json = try {
-            JsonCodec.parse(file.readText(Charsets.UTF_8))
-        } catch (e: Exception) {
-            return null
-        }
+    private fun parseVisualBaseline(json: JsonValue): VisualBaseline? {
         val root = json.view("baseline")
-        val environment = root.optionalField("environmentDigests")
-            ?.objectValue()
-            ?.optionalField(visualEnvironment())
-            ?.value as? JsonValue.Obj
-        val field = environment ?: (root.field("panelDigests").value as? JsonValue.Obj)
-            ?: return null
-        val out = LinkedHashMap<String, String>()
-        for ((key, value) in field.fields) {
-            out[key] = (value as? JsonValue.Str)?.value ?: return null
+        val schema = root.field("schema").string()
+        if (schema != VISUAL_BASELINE_SCHEMA) return null
+        val required = root.field("requiredPlatforms").array().map { it.string() }
+        val platformObj = root.field("platforms").value as? JsonValue.Obj ?: return null
+        val platforms = LinkedHashMap<String, VisualPlatformRecord>()
+        for ((platform, value) in platformObj.fields) {
+            val record = value.view("platforms.$platform").objectValue()
+            val environment = record.field("environment").string()
+            val digestObj = record.field("digests").value as? JsonValue.Obj ?: return null
+            val digests = LinkedHashMap<String, String>()
+            for ((panel, digest) in digestObj.fields) {
+                digests[panel] = digest.view("platforms.$platform.digests.$panel").string()
+            }
+            platforms[platform] = VisualPlatformRecord(environment, digests)
         }
-        return out
+        return VisualBaseline(schema, required, platforms)
+    }
+
+    private fun readVisualBaseline(file: File): VisualBaseline? {
+        if (!file.isFile) return null
+        return try {
+            parseVisualBaseline(JsonCodec.parse(file.readText(Charsets.UTF_8)))
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** The stable fingerprint of the rendering host (OS + arch + JVM major). */
@@ -645,80 +829,79 @@ internal object ParityMatrix {
         return "$os-$arch-jvm$jvm"
     }
 
-    private fun writeVisualBaselines(file: File, digests: Map<String, String>) {
+    /**
+     * Records THIS platform's render as its own baseline record (audit 28),
+     * preserving every other platform record verbatim. A v2 file is refused:
+     * its canonical `panelDigests` must be migrated explicitly to the
+     * platform that actually produced them (never inherited silently).
+     */
+    private fun writeVisualBaselines(file: File, platform: String, digests: Map<String, String>) {
         val expected = File(ParityPath.repoRoot(), PARITY_BASELINE_PATH)
         assertEquals(
             expected.canonicalPath, file.canonicalPath,
             "visual baselines must be written to the pinned in-tree path"
         )
-        file.parentFile.mkdirs()
-        val existing = try {
-            if (file.isFile) JsonCodec.parse(file.readText(Charsets.UTF_8)) else null
-        } catch (e: Exception) {
+        assertTrue(
+            REQUIRED_VISUAL_PLATFORMS.contains(platform),
+            "platform $platform is not in the release vocabulary"
+        )
+        val existing = if (file.isFile) {
+            try {
+                JsonCodec.parse(file.readText(Charsets.UTF_8))
+            } catch (e: Exception) {
+                null
+            }
+        } else {
             null
         }
-        val canonical = LinkedHashMap<String, String>()
-        val environments = LinkedHashMap<String, LinkedHashMap<String, String>>()
         if (existing != null) {
-            val root = existing.view("baseline")
-            val pinned = root.field("panelDigests").value as? JsonValue.Obj
-            if (pinned != null) {
-                for ((key, value) in pinned.fields) {
-                    val text = (value as? JsonValue.Str)?.value ?: continue
-                    canonical[key] = text
-                }
-            }
-            val recorded = root.optionalField("environmentDigests")?.value as? JsonValue.Obj
-            if (recorded != null) {
-                for ((environment, value) in recorded.fields) {
-                    val map = value as? JsonValue.Obj ?: continue
-                    val entries = LinkedHashMap<String, String>()
-                    for ((panel, digest) in map.fields) {
-                        val text = (digest as? JsonValue.Str)?.value ?: continue
-                        entries[panel] = text
-                    }
-                    environments[environment] = entries
-                }
-            }
+            assertTrue(
+                parseVisualBaseline(existing) != null,
+                "existing visual baseline is not $VISUAL_BASELINE_SCHEMA; migrate the v2 " +
+                    "canonical digest to a platform record first (never inherit it)"
+            )
         }
-        if (canonical.isEmpty()) {
-            // First-ever pin: this render is the canonical baseline.
-            canonical.putAll(digests)
-        }
-        environments[visualEnvironment()] = LinkedHashMap(digests)
+        file.parentFile.mkdirs()
+        val platforms = LinkedHashMap<String, VisualPlatformRecord>()
+        readVisualBaseline(file)?.let { platforms.putAll(it.platforms) }
+        platforms[platform] = VisualPlatformRecord(visualEnvironment(), LinkedHashMap(digests))
         val out = StringBuilder()
         out.append("{\n")
-        out.append("  \"schema\": \"faktor-parity-visual-baselines/v2\",\n")
+        out.append("  \"schema\": \"$VISUAL_BASELINE_SCHEMA\",\n")
         out.append("  \"method\": ")
         JsonCodec.writeString(out, VISUAL_METHOD)
         out.append(",\n")
-        out.append("  \"panelDigests\": {\n")
-        appendDigestEntries(out, canonical)
-        out.append("  },\n")
-        out.append("  \"environmentDigests\": {\n")
-        val keys = environments.keys.sorted()
-        for ((index, environment) in keys.withIndex()) {
+        out.append("  \"requiredPlatforms\": [")
+        for ((index, required) in REQUIRED_VISUAL_PLATFORMS.withIndex()) {
+            JsonCodec.writeString(out, required)
+            out.append(if (index == REQUIRED_VISUAL_PLATFORMS.size - 1) "],\n" else ", ")
+        }
+        out.append("  \"platforms\": {\n")
+        val keys = platforms.keys.sorted()
+        for ((index, key) in keys.withIndex()) {
             out.append("    ")
-            JsonCodec.writeString(out, environment)
+            JsonCodec.writeString(out, key)
             out.append(": {\n")
-            appendDigestEntries(out, environments.getValue(environment))
+            out.append("      \"environment\": ")
+            JsonCodec.writeString(out, platforms.getValue(key).environment)
+            out.append(",\n")
+            out.append("      \"digests\": {\n")
+            val entries = platforms.getValue(key).digests
+            val entryKeys = entries.keys.toList()
+            for ((e, panel) in entryKeys.withIndex()) {
+                out.append("        ")
+                JsonCodec.writeString(out, panel)
+                out.append(": ")
+                JsonCodec.writeString(out, entries.getValue(panel))
+                out.append(if (e == entryKeys.size - 1) "\n" else ",\n")
+            }
+            out.append("      }\n")
             out.append("    }")
             out.append(if (index == keys.size - 1) "\n" else ",\n")
         }
         out.append("  }\n")
         out.append("}\n")
         file.writeText(out.toString(), Charsets.UTF_8)
-    }
-
-    private fun appendDigestEntries(out: StringBuilder, entries: Map<String, String>) {
-        val keys = entries.keys.toList()
-        for ((index, key) in keys.withIndex()) {
-            out.append("    ")
-            JsonCodec.writeString(out, key)
-            out.append(": ")
-            JsonCodec.writeString(out, entries.getValue(key))
-            out.append(if (index == keys.size - 1) "\n" else ",\n")
-        }
     }
 
     // ----------------------------------------------------------- artifact
@@ -746,7 +929,19 @@ internal object ParityMatrix {
             )
         }
         val visualPassed = visual.count { it.passed }
-        val visualComplete = visual.isNotEmpty() && visualPassed == visual.size
+        val visualStatus = when {
+            visual.isEmpty() -> "unavailable"
+            visual.any { it.drifted } -> "failed"
+            visual.any { it.notCertified } -> "not_certified"
+            else -> "passed"
+        }
+        val visualComplete = visualStatus == "passed"
+        val visualPlatform = if (visual.isEmpty()) "unknown" else visual.first().platform
+        val coverage = if (visualCoverage.isEmpty()) {
+            visualCoverageOf(null)
+        } else {
+            visualCoverage
+        }
         val artifact = obj(
             "schema" to JsonValue.Str("faktor-jetbrains-parity/v1"),
             "commit" to JsonValue.Str(commit),
@@ -762,22 +957,23 @@ internal object ParityMatrix {
                 "total" to JsonValue.Int64(rows.size.toLong())
             ),
             "visual" to obj(
-                "status" to JsonValue.Str(
-                    when {
-                        visual.isEmpty() -> "unavailable"
-                        visualComplete -> "passed"
-                        else -> "failed"
-                    }
-                ),
+                "status" to JsonValue.Str(visualStatus),
                 "passed" to JsonValue.Int64(visualPassed.toLong()),
                 "total" to JsonValue.Int64(visual.size.toLong()),
                 "method" to JsonValue.Str(VISUAL_METHOD),
                 "baseline" to JsonValue.Str(PARITY_BASELINE_PATH),
+                "platform" to JsonValue.Str(visualPlatform),
+                "platforms" to obj(
+                    *REQUIRED_VISUAL_PLATFORMS.map { platform ->
+                        platform to JsonValue.Str(coverage[platform] ?: "not_certified")
+                    }.toTypedArray()
+                ),
                 "panels" to JsonValue.Arr(
                     visual.map { result ->
                         obj(
                             "panel" to JsonValue.Str(result.panel),
-                            "status" to JsonValue.Str(if (result.passed) "passed" else "failed"),
+                            "status" to JsonValue.Str(result.status),
+                            "platform" to JsonValue.Str(result.platform),
                             "digest" to JsonValue.Str(result.digest),
                             "baseline" to (result.baseline?.let { JsonValue.Str(it) } ?: JsonValue.Null),
                             "detail" to JsonValue.Str(result.detail)
@@ -791,7 +987,12 @@ internal object ParityMatrix {
         file.writeText(JsonCodec.write(artifact) + "\n", Charsets.UTF_8)
         println(
             "JETBRAINS PARITY MATRIX: ${rows.size} behavioral rows ($passed passed), " +
-                "visual $visualPassed/${visual.size} panels, artifact $PARITY_PATH @ $commit"
+                "visual $visualPassed/${visual.size} panels ($visualStatus on $visualPlatform), " +
+                "platforms " +
+                REQUIRED_VISUAL_PLATFORMS.joinToString(",") {
+                    "$it=" + (coverage[it] ?: "not_certified")
+                } +
+                ", artifact $PARITY_PATH @ $commit"
         )
     }
 }
@@ -1033,6 +1234,12 @@ internal data class RenderStats(
 internal const val VISUAL_METHOD =
     "offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline"
 
+/** Baseline schema v3: distinct per-platform records, no inherited pin. */
+internal const val VISUAL_BASELINE_SCHEMA = "faktor-parity-visual-baselines/v3"
+
+/** Release claims require a distinct certified record for every platform. */
+internal val REQUIRED_VISUAL_PLATFORMS = listOf("linux", "macos", "windows")
+
 /** All seven typed criterion-binding kinds, with their exact references. */
 internal val PARITY_BINDING_KINDS: List<Triple<String, String, String?>> = listOf(
     Triple("check criterion", "required_check", "check:rust_check:digest-check"),
@@ -1219,11 +1426,25 @@ internal const val PARITY_SESSIONS_JSON = "{\"sessions\":[" +
     "{\"id\":\"8\",\"title\":\"older\",\"provider\":\"beta\",\"model\":\"n\"," +
     "\"state\":\"ended\"}]}"
 
+/**
+ * The advertised attachment contract of the parity fake daemon: tight enough
+ * that the oversize-refusal row exercises a real bound (a 5 KiB PDF is
+ * refused against the 4 KiB per-document bound) while the accept rows stay
+ * small and fast. Every value is daemon-ADVERTISED; the client never mirrors.
+ */
+internal const val PARITY_ATTACHMENT_LIMITS_JSON = "{" +
+    "\"maxUploadBytes\":65536,\"maxRequestBytes\":131072,\"maxAttachmentBytes\":262144," +
+    "\"image\":{\"mimes\":[{\"mime\":\"image/png\",\"maxBytes\":65536}," +
+    "{\"mime\":\"image/jpeg\",\"maxBytes\":65536}],\"maxRequestBytes\":131072}," +
+    "\"document\":{\"capable\":true,\"mimes\":[{\"mime\":\"application/pdf\",\"maxBytes\":4096}," +
+    "{\"mime\":\"text/plain\",\"maxBytes\":4096}],\"maxRequestBytes\":8192}}"
+
 internal const val PARITY_MODELS_JSON = "[" +
     "{\"provider\":\"alpha\",\"model\":\"m\",\"context\":1000,\"maxOutput\":100," +
     "\"tools\":true,\"parallelTools\":false,\"reasoning\":true,\"thinking\":false," +
-    "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
-    "\"streaming\":true,\"source\":\"conservativeDefault\"}," +
+    "\"vision\":true,\"structuredOutput\":false,\"embeddings\":false," +
+    "\"streaming\":true,\"source\":\"conservativeDefault\"," +
+    "\"documentCapable\":true,\"attachmentLimits\":" + PARITY_ATTACHMENT_LIMITS_JSON + "}," +
     "{\"provider\":\"beta\",\"model\":\"n\",\"context\":2000,\"maxOutput\":200," +
     "\"tools\":false,\"parallelTools\":false,\"reasoning\":false,\"thinking\":true," +
     "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +

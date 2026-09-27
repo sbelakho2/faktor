@@ -1916,6 +1916,19 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    /// Wall deadline for watcher registration in tests. The production
+    /// default (10s) is a *pathological-root* guard: under full-suite
+    /// contention (8 concurrent fs test binaries) FSEvents registration
+    /// legitimately exceeded it, `open` degraded to watcher-less, and both
+    /// watcher tests failed on a loaded host. Tests that assert
+    /// attachment/delivery therefore give registration a generous deadline —
+    /// the assertion keeps its teeth (a root that truly cannot register still
+    /// fails loudly, and the event wait below has its own bound), while the
+    /// host scheduler can no longer turn a successful registration into a
+    /// false negative.
+    const TEST_WATCH_REGISTRATION_DEADLINE: std::time::Duration =
+        std::time::Duration::from_secs(240);
+
     fn fixture() -> (
         tempfile::TempDir,
         Arc<WorkspaceFileService>,
@@ -1924,7 +1937,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
         fs::create_dir_all(&root).unwrap();
-        let service = WorkspaceFileService::new();
+        let service = WorkspaceFileService::with_watch_registration_deadline(
+            TEST_WATCH_REGISTRATION_DEADLINE,
+        );
         let handle = service.open(WorkspaceId::new(1), root.clone()).unwrap();
         (dir, service, handle)
     }
@@ -2185,6 +2200,10 @@ mod tests {
     #[tokio::test]
     async fn watcher_delivers_events_with_workspace_id() {
         let (_d, _s, h) = fixture();
+        assert!(
+            h.watcher_attached(),
+            "registration must have succeeded before delivery is asserted"
+        );
         fs::write(h.root().join("w.txt"), "x").unwrap();
         let mut saw = false;
         // FSEvents delivery on a loaded host can lag well past any fixed

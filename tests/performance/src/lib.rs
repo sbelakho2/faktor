@@ -212,7 +212,7 @@ async fn idle_memory_under_80mb() {
     println!("IDLE_RSS_KB={rss_kb}");
 }
 
-fn rss_kb() -> u64 {
+pub fn rss_kb() -> u64 {
     let pid = std::process::id();
     let out = std::process::Command::new("/bin/ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
@@ -284,32 +284,32 @@ const WALL_CAP: Duration = Duration::from_secs(10);
 
 /// Repeated-measure sample set, stored as u64 nanoseconds.
 #[derive(Debug, Default)]
-struct Dist {
+pub struct Dist {
     samples: Vec<u64>,
 }
 
 impl Dist {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             samples: Vec::new(),
         }
     }
 
-    fn push(&mut self, ns: u64) {
+    pub fn push(&mut self, ns: u64) {
         self.samples.push(ns);
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.samples.len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
 
     /// The `p`-th percentile in ns, by linear interpolation between sorted
     /// order statistics (deterministic and monotone in `p` for a fixed set).
-    fn pct(&self, p: f64) -> f64 {
+    pub fn pct(&self, p: f64) -> f64 {
         assert!(!self.samples.is_empty(), "pct on an empty Dist");
         assert!((0.0..=100.0).contains(&p), "pct {p} out of [0, 100]");
         let mut sorted = self.samples.clone();
@@ -322,21 +322,21 @@ impl Dist {
     }
 
     /// Arithmetic mean of the samples in ns.
-    fn mean(&self) -> f64 {
+    pub fn mean(&self) -> f64 {
         assert!(!self.samples.is_empty(), "mean of an empty Dist");
         self.samples.iter().map(|&s| s as f64).sum::<f64>() / self.samples.len() as f64
     }
 
     /// Largest sample in ns (the raw worst case behind the percentile
     /// report; tail-latency gates assert on it directly).
-    fn max(&self) -> u64 {
+    pub fn max(&self) -> u64 {
         assert!(!self.samples.is_empty(), "max of an empty Dist");
         *self.samples.iter().max().expect("non-empty checked above")
     }
 }
 
 /// Human-readable ns quantity, e.g. `format_pct(1_500.0) == "1.50 µs"`.
-fn format_pct(ns: f64) -> String {
+pub fn format_pct(ns: f64) -> String {
     if ns >= 1e9 {
         format!("{:.2} s", ns / 1e9)
     } else if ns >= 1e6 {
@@ -374,7 +374,7 @@ fn bench_n_with_cap<F: FnMut()>(mut f: F, n: usize, cap: Duration) -> Dist {
 /// Runner/build metadata for perf reports: package version, build profile
 /// (Cargo does not expose `PROFILE` at compile time; `debug_assertions` is
 /// the reliable proxy) and the git commit under test.
-fn build_meta() -> String {
+pub fn build_meta() -> String {
     let head = match std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

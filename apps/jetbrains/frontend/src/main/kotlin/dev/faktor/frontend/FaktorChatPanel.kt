@@ -21,7 +21,6 @@ import dev.faktor.shared.JsonValue
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
-import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
@@ -129,6 +128,11 @@ class FaktorChatPanel(
 
     private val attachments = AttachmentsPanel()
 
+    // Audit 29: bounded local pending-upload state. A failed start keeps the
+    // already-uploaded ids; the retry resolves them first and uploads only
+    // the absent attachments (parity with the VS Code pending envelope).
+    private val pendingAttachmentRetry = PendingAttachmentRetry()
+
     // Task-mode completion contract controls: shown ONLY in the Task tab
     // (the chat composer never carries a contract). The submitted contract is
     // tracked so the tree can report durable step provenance.
@@ -201,6 +205,9 @@ class FaktorChatPanel(
 
     init {
         service.setListener(this)
+        // Clipboard/paste staging notices (refusals included) surface in the
+        // transcript exactly once, on the EDT.
+        attachments.onNotice = { message -> onEdt { appendSystem(message) } }
         buildLayout()
         wireActions()
         setControlsEnabled(false)
@@ -456,51 +463,45 @@ class FaktorChatPanel(
         val files = attachments.files()
         val contract = completionContractFromControls()
         runAsync("start task") {
-            // Image parity (same representation as the VS Code client): an
-            // image the ADVERTISED model contract allows is read (bounded by
-            // the advertised per-image ceiling) and uploaded as a durable
-            // binary attachment; the run carries its typed id. Non-image
-            // paths keep the workspace-relative `files` vocabulary (workspace
-            // source files are never blindly uploaded). An undeliverable
-            // image refuses loudly here, before any start.
+            // Binary + document parity (same representation as the VS Code
+            // client): the ADVERTISED model contract governs every entry.
+            // Deliverable documents (application/pdf, text/plain) upload as
+            // durable binary attachments when the chosen model advertises
+            // document input; allowlisted images — including in-memory
+            // clipboard PNGs staged separately from paths — upload the same
+            // way; ordinary workspace source files keep the repository
+            // context (`files`) and are never blindly uploaded. An
+            // undeliverable or oversize entry is a typed refusal BEFORE any
+            // upload, so nothing partial reaches the durable store.
             val policy = resolveAttachmentPolicy()
-            val binary = ArrayList<NativeAttachmentId>()
-            val pathFiles = ArrayList<String>()
-            for (path in files) {
-                val mime = AttachmentImages.mimeOf(path)
-                if (mime == null) {
-                    pathFiles.add(path)
-                    continue
-                }
-                val file = java.io.File(path)
-                if (!policy.imageMimes.contains(mime)) {
-                    throw IllegalStateException(
-                        "image attachment " + file.name + " has mime " + mime +
-                            " which the selected model does not advertise as deliverable (deliverable types: " +
-                            policy.imageMimes.joinToString(", ") + ")"
-                    )
-                }
-                val bytes = AttachmentImages.readBounded(file, policy.maxImageBytes)
-                    ?: throw IllegalStateException(
-                        "image attachment " + file.name + " is not a regular file or exceeds the " +
-                            "advertised " + policy.maxImageBytes + " byte per-image bound"
-                    )
-                binary.add(
-                    service.uploadAttachment(
-                        mime,
-                        file.name,
-                        java.util.Base64.getEncoder().encodeToString(bytes)
-                    )
-                )
+            val plan = planAttachments(files, attachments.binaryAttachments(), policy)
+            // Upload plan in ENTRY order: binaries first, then image and
+            // document paths. The retry key binds path + size + mtime + mime
+            // (binaries: the exact SHA-256), so a changed file uploads again
+            // (different bytes = different identity) while an unchanged
+            // retry resolves the retained id first and uploads only absent
+            // attachments (audit 29, CAS dedupe foundation).
+            val sessionId = try {
+                service.projection().sessionId
+            } catch (e: Exception) {
+                ""
+            }
+            val uploadKeys = plan.uploads.map { it.key }
+            val binary = pendingAttachmentRetry.resolve(sessionId, uploadKeys) { index ->
+                val upload = plan.uploads[index]
+                service.uploadAttachment(upload.mime, upload.filename, upload.base64)
             }
             val started = service.startTaskRun(
                 goal,
                 if (criteria.isEmpty()) null else criteria,
                 mutationMode = settingsPanel.mutationMode(),
-                files = if (pathFiles.isEmpty()) null else pathFiles,
+                files = if (plan.pathFiles.isEmpty()) null else plan.pathFiles,
                 attachments = if (binary.isEmpty()) null else binary,
                 completionContract = contract
             )
+            // Durable acceptance: this submission's retained ids are no longer
+            // pending; a later submission uploads from scratch.
+            pendingAttachmentRetry.release(sessionId, uploadKeys)
             submittedCompletion = contract
             onEdt {
                 val contractText = if (contract == null) {
@@ -508,9 +509,10 @@ class FaktorChatPanel(
                 } else {
                     " completion=" + contract.requestedSteps().joinToString(",")
                 }
+                val attached = plan.pathFiles.size + plan.uploads.size
                 appendSystem(
                     "task run ${started.runId} started (${started.state})" +
-                        if (files.isEmpty()) "" else " with ${files.size} attachment(s)" +
+                        if (attached == 0) "" else " with $attached attachment(s)" +
                         contractText
                 )
                 resetCompletionControls()
@@ -1756,6 +1758,9 @@ class FaktorChatPanel(
     }
 
     internal fun attachmentsView(): AttachmentsPanel = attachments
+
+    /** The rendered transcript (smoke assertions on typed refusals). */
+    internal fun transcriptTextForTest(): String = transcript.text
 
     internal fun newSessionForTest() {
         newSessionFromControls()

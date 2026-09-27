@@ -36,7 +36,7 @@ use faktor_scm::{GitHubApp, ManualClock, StaticTokenSource};
 use faktor_session::{Task, TaskBudget};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use faktor_tests_production_wiring::wiring::{self, Config};
+use faktor_tests_production_wiring::harness::{self, Config};
 
 const TENANT: &str = "tenant-a";
 const NOW_MS: i64 = 1_700_000_000_000;
@@ -268,7 +268,7 @@ fn repository_row(owner: &str, name: &str, installation_id: i64) -> RepositoryRo
 /// at the current revision, and the durable PASSED verification record that
 /// authorizes the step.
 fn seed_contract_task(
-    graph: &wiring::DaemonGraph,
+    graph: &harness::DaemonGraph,
     parent: faktor_core::SessionId,
 ) -> VerificationRecordId {
     let handle = graph.session.get_session(parent).unwrap().unwrap();
@@ -325,7 +325,7 @@ fn seed_contract_task(
 
 /// One fresh session over `repo` with the session-owned worktree row the
 /// completion step resolves its root from.
-fn session_for(graph: &wiring::DaemonGraph, repo: &Path, label: &str) -> faktor_core::SessionId {
+fn session_for(graph: &harness::DaemonGraph, repo: &Path, label: &str) -> faktor_core::SessionId {
     let workspace = graph
         .session
         .create_workspace(repo.to_str().unwrap())
@@ -339,7 +339,7 @@ fn session_for(graph: &wiring::DaemonGraph, repo: &Path, label: &str) -> faktor_
     parent
 }
 
-async fn run_and_expect_blocker(graph: &wiring::DaemonGraph, parent: faktor_core::SessionId) {
+async fn run_and_expect_blocker(graph: &harness::DaemonGraph, parent: faktor_core::SessionId) {
     let proof = seed_contract_task(graph, parent);
     let report = graph
         .tasks
@@ -447,7 +447,7 @@ async fn manual_completion_scm_adapter_contract_and_embedded_host_injection() {
     // wires no completion SCM provider and opens no SCM store.
     let data = dir.path().join("data");
     let graph =
-        wiring::build_production_graph(&data, Config::default()).expect("production daemon graph");
+        harness::build_production_graph(&data, Config::default()).expect("production daemon graph");
     assert!(
         graph.scm.is_none(),
         "cloud-disabled parity: no SCM store is opened"

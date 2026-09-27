@@ -20,6 +20,7 @@ package dev.faktor.frontend
 
 import dev.faktor.backend.BackendConnection
 import dev.faktor.backend.StdoutSink
+import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeRequests
@@ -109,6 +110,9 @@ object JetBrainsParitySmoke {
         // frames AND the fake daemon, the visual matrix renders each panel
         // against the pinned baselines, and the artifact is written to
         // target/certification/jetbrains-parity.json bound to this HEAD.
+        step("visual certification policy: platform records are never inherited") {
+            ParityMatrix.visualCertificationPolicySelfTest()
+        }
         step("parity matrix: behavioral rows + visual render vs pinned baselines + artifact") {
             assertTrue(
                 matrixHit,
@@ -119,11 +123,27 @@ object JetBrainsParitySmoke {
                 "parity matrix behavioral rows failed (see the artifact row evidence)"
             )
             for (result in ParityMatrix.visuals()) {
+                // Audit 28: drift against THIS platform's own record is a
+                // hard failure; a platform with no baseline record is
+                // surfaced as not certified (never compared against another
+                // platform's or a canonical digest).
                 assertTrue(
-                    result.passed,
+                    !result.drifted,
                     "visual row ${result.panel}: ${result.detail}"
                 )
+                if (result.notCertified) {
+                    println(
+                        "VISUAL NOT CERTIFIED ON PLATFORM ${result.platform}: " +
+                            "${result.panel}: ${result.detail}"
+                    )
+                }
             }
+            println(
+                "VISUAL PLATFORM COVERAGE: " +
+                    ParityMatrix.visualPlatformCoverage().entries.joinToString(", ") {
+                        "${it.key}=${it.value}"
+                    }
+            )
         }
 
         println(if (failures == 0) "JETBRAINS PARITY SMOKE PASS" else "JETBRAINS PARITY SMOKE FAIL ($failures)")
@@ -732,8 +752,12 @@ object JetBrainsParitySmoke {
                 // carries acceptance criteria.
                 chat.settingsView().selectMutationMode("shadow")
                 chat.completionCommit.isSelected = true
-                val attachment = Files.createTempFile("faktor-parity-attach-", ".txt")
-                chat.attachmentsView().addFiles(listOf(attachment.toString()))
+                // Audit 13: an ordinary workspace SOURCE file stays on the
+                // repository-context `files` vocabulary and is never
+                // uploaded (no blind uploads).
+                val source = Files.createTempFile("faktor-parity-source-", ".rs")
+                Files.write(source, "fn main() {}".toByteArray())
+                chat.attachmentsView().addFiles(listOf(source.toString()))
                 chat.setTaskFieldsForTest("parity goal", "criterion A, criterion B")
                 chat.submitTaskForTest()
                 await("task run routed") {
@@ -746,10 +770,113 @@ object JetBrainsParitySmoke {
                 )
                 assertTrue(taskBody.contains("\"mutation_mode\":\"shadow\""), taskBody)
                 assertTrue(taskBody.contains("\"completion_contract\":{\"include_commit\":true"), taskBody)
-                assertTrue(taskBody.contains(attachment.toString()), taskBody)
+                assertTrue(
+                    taskBody.contains("\"files\":[\"" + source.toString() + "\"]"),
+                    "the source file must ride the repository-context `files` array: $taskBody"
+                )
+                assertEquals(
+                    0,
+                    daemon.requestCount("POST", "/native/session/7/attachments"),
+                    "a workspace source file is never uploaded"
+                )
+                chat.attachmentsView().clear()
                 await("task refresh after start") {
                     chat.taskTreeView().model()?.steps?.isNotEmpty() ?: false
                 }
+
+                // Audit 13: the advertised document contract accepts
+                // application/pdf + text/plain as durable attachments; the
+                // run carries their typed ids, never the filesystem paths.
+                val pdf = Files.createTempFile("faktor-parity-doc-", ".pdf")
+                Files.write(pdf, "%PDF-1.4 parity".toByteArray())
+                val txt = Files.createTempFile("faktor-parity-doc-", ".txt")
+                Files.write(txt, "plain parity".toByteArray())
+                chat.attachmentsView().addFiles(listOf(pdf.toString(), txt.toString()))
+                val runsBeforeDocs = daemon.requestCount("POST", "/native/session/7/task-runs")
+                chat.submitTaskForTest()
+                await("document uploads routed") {
+                    daemon.requestCount("POST", "/native/session/7/attachments") >= 2 &&
+                        daemon.requestCount("POST", "/native/session/7/task-runs") > runsBeforeDocs
+                }
+                val documentBodies = attachmentBodies(daemon)
+                assertTrue(
+                    documentBodies.any { it.contains("\"mime\":\"application/pdf\"") },
+                    "the PDF must upload as an application/pdf attachment: $documentBodies"
+                )
+                assertTrue(
+                    documentBodies.any { it.contains("\"mime\":\"text/plain\"") },
+                    "the text document must upload as a text/plain attachment: $documentBodies"
+                )
+                val documentRun = daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
+                val documentMimes = attachmentMimes(documentRun)
+                assertEquals(
+                    listOf("application/pdf", "text/plain"), documentMimes,
+                    "the run carries the durable document ids in entry order: $documentRun"
+                )
+                assertTrue(
+                    !documentRun.contains(pdf.toString()) && !documentRun.contains(txt.toString()),
+                    "delivered documents must not also ride workspace paths: $documentRun"
+                )
+                chat.attachmentsView().clear()
+
+                // Audit 12: a clipboard BufferedImage converts to bounded PNG
+                // bytes IN MEMORY (no file, no path) and reaches a durable
+                // NativeAttachmentId through the SAME upload path.
+                val clipboardImage = java.awt.image.BufferedImage(
+                    2, 2, java.awt.image.BufferedImage.TYPE_INT_ARGB
+                )
+                clipboardImage.setRGB(0, 0, 0xFF00FF00.toInt())
+                clipboardImage.setRGB(1, 1, 0xFF0000FF.toInt())
+                assertTrue(
+                    chat.attachmentsView().addClipboardImage(clipboardImage, "clipboard.png"),
+                    "the in-memory clipboard image must stage as a pending binary"
+                )
+                assertEquals(1, chat.attachmentsView().binaryCount())
+                val runsBeforeClipboard = daemon.requestCount("POST", "/native/session/7/task-runs")
+                chat.submitTaskForTest()
+                await("clipboard PNG upload routed") {
+                    attachmentBodies(daemon).any { it.contains("\"mime\":\"image/png\"") } &&
+                        daemon.requestCount("POST", "/native/session/7/task-runs") > runsBeforeClipboard
+                }
+                val pngBody = attachmentBodies(daemon).last { it.contains("\"mime\":\"image/png\"") }
+                assertTrue(
+                    pngBody.contains("\"filename\":\"clipboard.png\""),
+                    "the clipboard attachment is named, not a filesystem path: $pngBody"
+                )
+                val pngBytes = java.util.Base64.getDecoder().decode(
+                    JsonCodec.parse(pngBody).view("clipboard upload").field("data_base64").string()
+                )
+                assertEquals(0x89.toByte(), pngBytes[0], "the uploaded bytes are a PNG")
+                assertEquals('N'.code.toByte(), pngBytes[2], "the uploaded bytes are a PNG")
+                val clipboardRun = daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
+                assertEquals(
+                    listOf("image/png"), attachmentMimes(clipboardRun),
+                    "the run carries the clipboard image's durable id: $clipboardRun"
+                )
+                chat.attachmentsView().clear()
+
+                // Typed refusal: an over-bound document is refused BEFORE any
+                // upload and surfaces its exact advertised bound.
+                val oversize = Files.createTempFile("faktor-parity-big-", ".pdf")
+                Files.write(oversize, ByteArray(5000) { 1 })
+                chat.attachmentsView().addFiles(listOf(oversize.toString()))
+                val uploadsBeforeRefusal = attachmentBodies(daemon).size
+                val runsBeforeRefusal = daemon.requestCount("POST", "/native/session/7/task-runs")
+                chat.submitTaskForTest()
+                await("typed oversized document refusal surfaces") {
+                    chat.transcriptTextForTest().contains("per-document bound")
+                }
+                assertEquals(
+                    uploadsBeforeRefusal,
+                    attachmentBodies(daemon).size,
+                    "a refused document uploads nothing"
+                )
+                assertEquals(
+                    runsBeforeRefusal,
+                    daemon.requestCount("POST", "/native/session/7/task-runs"),
+                    "a refused document never starts a run"
+                )
+                chat.attachmentsView().clear()
             }
             registry.observables["criterion_proofs"] = {
                 // The verification route's records render every binding kind
@@ -963,6 +1090,27 @@ object JetBrainsParitySmoke {
         daemon.on("POST", "/native/session/7/task-runs") { _, response ->
             response.json(200, TASK_RUN_STARTED_JSON)
         }
+        // Durable attachment uploads (audit 12/13): the fake echoes the
+        // strict request back as a typed attachment id so the ACCEPT rows
+        // prove the client consumed the advertised contract, uploaded the
+        // exact bytes (document / in-memory PNG), and carried only the
+        // durable ids into the task start.
+        val attachmentUploads = java.util.concurrent.atomic.AtomicInteger()
+        daemon.on("POST", "/native/session/7/attachments") { request, response ->
+            val ordinal = attachmentUploads.incrementAndGet()
+            val body = JsonCodec.parse(request.body).view("upload attachment")
+            val mime = body.field("mime").string()
+            val filename = body.optionalField("filename")?.string()
+            val size = java.util.Base64.getDecoder()
+                .decode(body.field("data_base64").string()).size
+            val filenameJson =
+                if (filename == null) "null" else "\"" + filename.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+            response.json(
+                200,
+                "{\"digest\":\"" + ordinal.toString().padStart(64, '0') + "\",\"mime\":\"" +
+                    mime + "\",\"filename\":" + filenameJson + ",\"size\":" + size + "}"
+            )
+        }
         daemon.on("GET", "/native/session/7/tasks/3/verification") { _, response ->
             response.json(200, PARITY_CRITERION_PROOF_JSON)
         }
@@ -1032,6 +1180,21 @@ object JetBrainsParitySmoke {
             Thread.sleep(25L)
         }
         fail("timed out waiting for: $what")
+    }
+
+    /** Every captured attachment-upload body for session 7, in request order. */
+    private fun attachmentBodies(daemon: ParityFakeDaemon): List<String> =
+        synchronized(daemon.requests) {
+            daemon.requests
+                .filter { it.method == "POST" && it.path == "/native/session/7/attachments" }
+                .map { it.body }
+        }
+
+    /** The `attachments[].mime` list of one task-run body (empty when absent). */
+    private fun attachmentMimes(body: String): List<String> {
+        val attachments = JsonCodec.parse(body).view("task-run").optionalField("attachments")
+            ?: return emptyList()
+        return attachments.array().map { it.field("mime").string() }
     }
 
     private fun step(name: String, body: () -> Unit) {
