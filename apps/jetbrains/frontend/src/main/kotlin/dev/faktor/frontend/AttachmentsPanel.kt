@@ -239,7 +239,12 @@ class PendingBinaryAttachment(
         (filename ?: "clipboard") + " (" + mime + ", " + bytes.size + " bytes, in memory)"
 }
 
-/** One validated, base64-ready upload of a task start (keyed for retry reuse). */
+/**
+ * One validated, base64-ready upload of a task start. `key` is the retry
+ * identity ([pathUploadKey]): kind + mime + filename + byte digest, so a
+ * rename/re-select of identical bytes never reuses a stale durable id while
+ * an unchanged reference does.
+ */
 class PlannedAttachmentUpload(
     val key: String,
     val mime: String,
@@ -324,7 +329,7 @@ fun planAttachments(
         }
         uploads.add(
             PlannedAttachmentUpload(
-                key = "binary:" + binary.mime + ":" + sha256Hex(binary.bytes),
+                key = pathUploadKey("binary", binary.mime, binary.filename, binary.bytes),
                 mime = binary.mime,
                 filename = binary.filename,
                 base64 = binary.base64()
@@ -362,7 +367,7 @@ fun planAttachments(
             }
             uploads.add(
                 PlannedAttachmentUpload(
-                    key = pathUploadKey("image", imageMime, bytes),
+                    key = pathUploadKey("image", imageMime, name, bytes),
                     mime = imageMime,
                     filename = name,
                     base64 = Base64.getEncoder().encodeToString(bytes)
@@ -408,7 +413,7 @@ fun planAttachments(
             }
             uploads.add(
                 PlannedAttachmentUpload(
-                    key = pathUploadKey("document", documentMime, bytes),
+                    key = pathUploadKey("document", documentMime, name, bytes),
                     mime = documentMime,
                     filename = name,
                     base64 = Base64.getEncoder().encodeToString(bytes)
@@ -423,9 +428,25 @@ fun planAttachments(
     return AttachmentPlan(pathFiles, uploads)
 }
 
-/** The retry key of one path upload: kind + mime + SHA-256 of the EXACT bytes. */
-internal fun pathUploadKey(kind: String, mime: String, bytes: ByteArray): String =
-    kind + ":" + mime + ":" + sha256Hex(bytes)
+/**
+ * The LOCAL retry-reuse key of one upload: kind + mime + FILENAME + declared
+ * size + SHA-256 of the EXACT bytes. This is a client-local reuse key, NOT
+ * the daemon's CAS/attachment identity (the daemon hashes the bytes with
+ * BLAKE3 and stores `digest + mime + filename + size`); it only needs to
+ * change whenever the reference changes, and it carries the SAME field set
+ * the VS Code client hashes so the two clients cannot drift. A rename/
+ * re-select of identical bytes is a DIFFERENT reference and uploads fresh,
+ * while the same reference at a different position/list order reuses its
+ * retained id.
+ */
+internal fun pathUploadKey(
+    kind: String,
+    mime: String,
+    filename: String?,
+    bytes: ByteArray
+): String =
+    kind + ":" + mime + ":name=" + (filename ?: "") + ":size=" + bytes.size +
+        ":sha=" + sha256Hex(bytes)
 
 /** Lowercase SHA-256 of the exact bytes (the retry identity of a binary). */
 private fun sha256Hex(bytes: ByteArray): String {
@@ -455,12 +476,14 @@ private fun menuShortcutV(): KeyStroke =
 /**
  * Bounded LOCAL pending-upload state for the Task composer (audit 29,
  * parity with the VS Code pending-submission envelope): after a successful
- * upload the durable id is retained here, bound to the session it was
- * uploaded under; a start failure keeps the state, and the retry resolves
- * the id first and uploads only the absent attachments (CAS dedupe
- * foundation). An entry retained for one session is never reused by
- * another session, and the map is bounded so a hostile client can never
- * grow host memory with submission identities.
+ * upload the durable id is retained here, bound to the session AND the exact
+ * reference key ([pathUploadKey]: kind + mime + filename + byte digest) it
+ * was uploaded under; a start failure keeps the state, and the retry
+ * resolves the id first and uploads only the absent references (CAS dedupe
+ * foundation). A renamed/re-selected file computes a new key and uploads
+ * fresh. An entry retained for one session is never reused by another
+ * session, and the map is bounded so a hostile client can never grow host
+ * memory with submission identities.
  */
 class PendingAttachmentRetry(private val maxEntries: Int = MAX_PENDING_UPLOADS) {
 

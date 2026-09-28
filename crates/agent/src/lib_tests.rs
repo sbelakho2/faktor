@@ -3470,3 +3470,289 @@ mod compact_adaptive_quality_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod maximum_quality_authority_tests {
+    //! P1 (one quality authority): MaximumQuality tier formation must read
+    //! the SAME authority-aware effective quality the router's priced
+    //! qualification applies. Durable measured outcomes supersede the
+    //! descriptor, and a `ConservativeUnknown` placeholder authorizes
+    //! nothing above floor 0.
+    use crate::*;
+    use faktor_core::model::{
+        MicroUsdPerMillionTokens, ModelDescriptor, ModelEconomics, ModelSource, PriceQuote,
+        PricingSnapshot, PricingState, QualityAuthority, QualityMetric, QualityStatement,
+    };
+    use faktor_router::{
+        MemoryOutcomeStore, OutcomeKey, OutcomeSample, OutcomeStore, RouteCandidate, RouteRequest,
+        RouterService,
+    };
+    use std::sync::Arc;
+
+    fn descriptor(provider: &str, model: &str, coding: u8, context: u8) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: provider.into(),
+            model: model.into(),
+            context: 128_000,
+            max_output: 16_000,
+            tools: true,
+            parallel_tools: true,
+            reasoning: false,
+            thinking: false,
+            vision: false,
+            structured_output: false,
+            embeddings: false,
+            streaming: true,
+            economics: ModelEconomics {
+                tool_reliability: coding,
+                reasoning_reliability: coding,
+                coding_reliability: coding,
+                context_reliability: context,
+                estimated_latency_ms: 300,
+                ..Default::default()
+            },
+            source: ModelSource::UserOverride,
+        }
+    }
+
+    fn pricing(price: u64) -> PricingState {
+        PricingState::Known(PricingSnapshot::exact(
+            PriceQuote {
+                input: MicroUsdPerMillionTokens(price),
+                output: MicroUsdPerMillionTokens(price),
+                cache_read: MicroUsdPerMillionTokens(0),
+                cache_write: MicroUsdPerMillionTokens(0),
+            },
+            1,
+            "authority-test".into(),
+        ))
+    }
+
+    /// A descriptor-derived candidate: its declared quality is the
+    /// descriptor's built-in prior (never measured).
+    fn builtin_candidate(provider: &str, model: &str, quality: u8, price: u64) -> RouteCandidate {
+        RouteCandidate::new(
+            descriptor(provider, model, quality, quality),
+            pricing(price),
+        )
+    }
+
+    fn user_metric(value: u8) -> QualityMetric {
+        QualityMetric::new(
+            value,
+            QualityAuthority::UserConfigured {
+                source: "providers.declared.quality".into(),
+                version: "faktor-user-quality-v1".into(),
+            },
+        )
+    }
+
+    fn all_user(value: u8) -> QualityStatement {
+        QualityStatement {
+            tool: user_metric(value),
+            reasoning: user_metric(value),
+            coding: user_metric(value),
+            context: user_metric(value),
+        }
+    }
+
+    fn declared_candidate(
+        provider: &str,
+        model: &str,
+        descriptor_quality: u8,
+        declared: QualityStatement,
+        price: u64,
+    ) -> RouteCandidate {
+        RouteCandidate::with_quality(
+            descriptor(provider, model, descriptor_quality, descriptor_quality),
+            pricing(price),
+            declared,
+        )
+    }
+
+    fn conservative_candidate(
+        provider: &str,
+        model: &str,
+        descriptor_quality: u8,
+        price: u64,
+    ) -> RouteCandidate {
+        let d = descriptor(provider, model, descriptor_quality, descriptor_quality);
+        let quality = QualityStatement::conservative_unknown(&d.performance());
+        RouteCandidate::with_quality(d, pricing(price), quality)
+    }
+
+    fn implement_req(floor: u8) -> RouteRequest {
+        RouteRequest {
+            phase: RouterPhase::Implement,
+            required_capabilities: vec![],
+            context_tokens: 1_000,
+            estimated_output_tokens: 100,
+            quality_floor: floor,
+            quality_target: None,
+            task_budget_remaining_micro: 0,
+            latency_preference_ms: None,
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Low,
+        }
+    }
+
+    /// Seed verified Implement/Medium/Low outcomes for one (provider, model).
+    fn seed(
+        store: &MemoryOutcomeStore,
+        provider: &str,
+        model: &str,
+        successes: u64,
+        failures: u64,
+    ) {
+        let key = OutcomeKey {
+            provider: provider.into(),
+            model: model.into(),
+            phase: RouterPhase::Implement,
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Low,
+        };
+        for _ in 0..successes {
+            store.append_sample(
+                &key,
+                OutcomeSample {
+                    verified_success: true,
+                    rework_cost_micro: 0,
+                    rework_turns: 0,
+                },
+            );
+        }
+        for _ in 0..failures {
+            store.append_sample(
+                &key,
+                OutcomeSample {
+                    verified_success: false,
+                    rework_cost_micro: 0,
+                    rework_turns: 0,
+                },
+            );
+        }
+    }
+
+    fn service(rows: Vec<RouteCandidate>, store: Arc<MemoryOutcomeStore>) -> Arc<RouterService> {
+        Arc::new(RouterService::with_route_candidates(rows, store))
+    }
+
+    fn maxq(svc: &Arc<RouterService>) -> Arc<dyn RoutingPolicy> {
+        EconomicRoutingPolicy::new(svc.clone(), RoutingMode::MaximumQuality)
+    }
+
+    #[test]
+    fn maximum_quality_prefers_higher_measured_quality_over_equal_descriptor_priors() {
+        // Both rows carry the SAME descriptor prior (80); durable outcomes
+        // measure them differently. A descriptor-only tier would put both in
+        // one tier and let the cheaper row win; the authority-aware tier puts
+        // the higher-measured row alone at the top.
+        let store = Arc::new(MemoryOutcomeStore::new());
+        seed(&store, "measured-high", "m", 200, 0);
+        seed(&store, "measured-low", "m", 100, 0);
+        let high = builtin_candidate("measured-high", "m", 80, 5_000_000);
+        let low = builtin_candidate("measured-low", "m", 80, 1);
+        let svc = service(vec![high, low], store);
+        let chosen = maxq(&svc).route(&implement_req(0)).unwrap();
+        assert_eq!(
+            chosen.provider, "measured-high",
+            "MaximumQuality must choose the higher MEASURED quality: {}",
+            chosen.reasoning
+        );
+    }
+
+    #[test]
+    fn maximum_quality_reverses_descriptor_order_by_measured_outcomes() {
+        // Descriptor-high (95) measured-low (~60) is the CHEAPER row; a
+        // descriptor tier would probe both at the low row's tier and let the
+        // cheap descriptor-high row win. Authority-aware tiers put the
+        // descriptor-low/high-measured row alone at the top.
+        let store = Arc::new(MemoryOutcomeStore::new());
+        seed(&store, "descriptor-high", "m", 70, 30);
+        seed(&store, "descriptor-low", "m", 90, 15);
+        let descriptor_high = builtin_candidate("descriptor-high", "m", 95, 1);
+        let descriptor_low = builtin_candidate("descriptor-low", "m", 50, 5_000_000);
+        let svc = service(vec![descriptor_high, descriptor_low], store);
+        let chosen = maxq(&svc).route(&implement_req(0)).unwrap();
+        assert_eq!(
+            chosen.provider, "descriptor-low",
+            "measured outcomes must reverse the descriptor ordering: {}",
+            chosen.reasoning
+        );
+    }
+
+    #[test]
+    fn maximum_quality_upgrades_conservative_unknown_with_measured_outcomes() {
+        let store = Arc::new(MemoryOutcomeStore::new());
+        seed(&store, "unknown", "m", 200, 0);
+        let req = implement_req(50);
+        let upgraded = service(
+            vec![conservative_candidate("unknown", "m", 50, 1_000_000)],
+            store,
+        );
+        let chosen = maxq(&upgraded).route(&req).unwrap();
+        assert_eq!(
+            chosen.provider, "unknown",
+            "strong measured outcomes must authorize a ConservativeUnknown row: {}",
+            chosen.reasoning
+        );
+        // Without evidence the placeholder authorizes nothing above floor 0,
+        // so the identical single-candidate set is refused — proving the
+        // selection above rode the measured upgrade, not the placeholder.
+        let empty = service(
+            vec![conservative_candidate("unknown", "m", 50, 1_000_000)],
+            Arc::new(MemoryOutcomeStore::new()),
+        );
+        assert_eq!(maxq(&empty).route(&req), Err(RouteFailure::NoCapableModel));
+    }
+
+    #[test]
+    fn maximum_quality_ignores_declared_high_downgraded_by_measured_failures() {
+        // The loud row DECLARES 95 but durable verified failures measure it
+        // at 0; the quiet row declares 70 but measures ~64. A declared tier
+        // (95, then 70) would deny both and wrongly surface NoCapableModel;
+        // authority-aware tiers serve the quiet row's measured tier directly.
+        let store = Arc::new(MemoryOutcomeStore::new());
+        seed(&store, "loud", "m", 0, 100);
+        seed(&store, "quiet", "m", 60, 20);
+        let loud = declared_candidate("loud", "m", 95, all_user(95), 1);
+        let quiet = declared_candidate("quiet", "m", 70, all_user(70), 5_000_000);
+        let svc = service(vec![loud, quiet], store);
+        let chosen = maxq(&svc).route(&implement_req(0)).unwrap();
+        assert_eq!(
+            chosen.provider, "quiet",
+            "a declared-high but measured-failed row must not force a pointless high tier: {}",
+            chosen.reasoning
+        );
+    }
+
+    #[test]
+    fn maximum_quality_exact_quality_ties_resolve_economically() {
+        let store = Arc::new(MemoryOutcomeStore::new());
+        seed(&store, "cheap", "m", 200, 0);
+        seed(&store, "pricey", "m", 200, 0);
+        let cheap = builtin_candidate("cheap", "m", 80, 1_000);
+        let pricey = builtin_candidate("pricey", "m", 80, 50_000_000);
+        let svc = service(vec![cheap.clone(), pricey.clone()], store);
+        let req = implement_req(0);
+        let now = faktor_core::model::unix_now_ms();
+        let q_cheap = faktor_router::phase_quality_value(
+            &svc.effective_quality_for(&cheap, &req, now),
+            req.phase,
+        );
+        let q_pricey = faktor_router::phase_quality_value(
+            &svc.effective_quality_for(&pricey, &req, now),
+            req.phase,
+        );
+        assert_eq!(
+            q_cheap, q_pricey,
+            "the authority-aware phase qualities must tie exactly"
+        );
+        let chosen = maxq(&svc).route(&req).unwrap();
+        assert_eq!(
+            chosen.provider, "cheap",
+            "exact authoritative-quality ties must be resolved economically: {}",
+            chosen.reasoning
+        );
+    }
+}

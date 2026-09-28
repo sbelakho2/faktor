@@ -156,6 +156,22 @@ pub enum StoreError {
         "writer shutdown timed out: {rejected} queued mutations rejected; owner thread detached"
     )]
     WriterShutdownTimeout { rejected: usize },
+    /// Typed bounded-shutdown expiry for the maintenance authority (audit item
+    /// 6/7): every maintenance task was cancelled but `active` tasks had still
+    /// not deregistered when the bound expired, so a store-owned authority is
+    /// still alive and touching its own connection (and possibly the backup
+    /// destination). `writer_outcome` carries what the writer authority did,
+    /// so the caller sees BOTH authorities. A successful shutdown requires
+    /// every store-owned authority — writer AND maintenance registry — to be
+    /// quiescent.
+    #[error(
+        "maintenance shutdown timed out: {active} active task(s) did not drain; \
+         writer outcome {writer_outcome:?}"
+    )]
+    MaintenanceShutdownTimeout {
+        active: usize,
+        writer_outcome: WriterShutdownOutcome,
+    },
     /// Typed maintenance failure (audit item 6): the online-backup
     /// maintenance thread could not be spawned, died without a result, or was
     /// cancelled because the store is shutting down. Online backups never run

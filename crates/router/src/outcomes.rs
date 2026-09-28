@@ -359,6 +359,88 @@ impl OutcomeStore for EmptyOutcomeStore {
     }
 }
 
+/// The full lookup key a [`MemoOutcomeStore`] memoizes.
+type OutcomeLookupKey = (String, String, RouterPhase, TaskClass, RiskBucket);
+
+/// A route-scoped MEMO over another outcome registry: the first
+/// [`OutcomeStore::lookup_stats`] for a key reads the durable store and every
+/// repeat is served from memory. A routing policy builds ONE per route and
+/// passes it through `RouterService::route_*_with`, so MaximumQuality's
+/// descending quality-floor probes recompute each candidate's effective
+/// quality from the SAME lookups instead of re-reading the store per probe.
+///
+/// It holds no invalidation state: durable outcomes do not change inside one
+/// synchronous route, so it MUST NOT outlive the route that created it.
+pub struct MemoOutcomeStore<'a> {
+    inner: &'a dyn OutcomeStore,
+    cache: Mutex<HashMap<OutcomeLookupKey, Option<VerifiedOutcomeStats>>>,
+}
+
+impl<'a> MemoOutcomeStore<'a> {
+    pub fn new(inner: &'a dyn OutcomeStore) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl OutcomeStore for MemoOutcomeStore<'_> {
+    fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample) {
+        // Routing never appends; delegate so the wrapper stays a faithful
+        // `OutcomeStore` for any caller.
+        self.inner.append_sample(key, sample);
+    }
+
+    fn stats(&self, key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
+        self.inner.stats(key)
+    }
+
+    fn phase_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+    ) -> Option<VerifiedOutcomeStats> {
+        self.inner.phase_stats(provider, model, phase)
+    }
+
+    fn task_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+    ) -> Option<VerifiedOutcomeStats> {
+        self.inner.task_stats(provider, model, phase, task_class)
+    }
+
+    fn lookup_stats(
+        &self,
+        provider: &str,
+        model: &str,
+        phase: RouterPhase,
+        task_class: TaskClass,
+        risk_bucket: RiskBucket,
+    ) -> Option<VerifiedOutcomeStats> {
+        let key = (
+            provider.to_string(),
+            model.to_string(),
+            phase,
+            task_class,
+            risk_bucket,
+        );
+        if let Some(hit) = recover_lock(&self.cache).get(&key).copied() {
+            return hit;
+        }
+        let out = self
+            .inner
+            .lookup_stats(provider, model, phase, task_class, risk_bucket);
+        recover_lock(&self.cache).insert(key, out);
+        out
+    }
+}
+
 /// In-process outcome registry (Mutex-protected). The corpus gates and
 /// router tests feed and consult verified history through this; the
 /// production daemon swaps in a store-backed implementation over the same

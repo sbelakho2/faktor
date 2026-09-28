@@ -1560,3 +1560,158 @@ async fn accepted_llm_summary_records_compression_provenance_and_never_replaces_
         );
     }
 }
+
+// ============================================================================
+// P0 (oversized compaction summary): the summary size cap is a REFUSAL,
+// never a completion. Text is accepted ONLY on a clean end AND not
+// oversized AND non-empty; every refusal leaves the provenance slot `None`
+// so an incomplete compression can never claim acceptance.
+// ============================================================================
+
+const SUMMARY_MAX_CHARS: usize = 60_000;
+
+fn streaming_summarizer(
+    provider: Arc<dyn faktor_provider::Provider>,
+    summary_timeout: Duration,
+) -> StreamingSummarizer {
+    StreamingSummarizer {
+        provider,
+        model: "summary-model".into(),
+        op_id: OpId::new(1),
+        session_id: SessionId::new(1),
+        cancellation: CancellationToken::new(),
+        summary_timeout,
+        budget_marker: None,
+        output_slot: Arc::new(std::sync::Mutex::new(None)),
+    }
+}
+
+fn summary_history() -> Vec<RecentTurn> {
+    vec![RecentTurn {
+        role: "user".into(),
+        text: "summarize this".into(),
+    }]
+}
+
+fn assert_slot_empty(summarizer: &StreamingSummarizer) {
+    assert!(
+        summarizer.output_slot.lock().unwrap().is_none(),
+        "a refused summary must never fill the provenance slot"
+    );
+}
+
+#[tokio::test]
+async fn compaction_summary_exactly_at_the_cap_is_accepted() {
+    // Boundary (1): exactly SUMMARY_MAX_CHARS followed by a clean Done is a
+    // complete summary and fills the typed provenance slot.
+    let provider = Arc::new(scripted_provider(vec![
+        ScriptedResponse::Text("a".repeat(SUMMARY_MAX_CHARS)),
+        ScriptedResponse::End,
+    ]));
+    let summarizer = streaming_summarizer(provider, Duration::from_secs(30));
+    let text = summarizer
+        .run(&summary_history())
+        .await
+        .expect("a clean end at exactly the cap must be accepted");
+    assert_eq!(text.len(), SUMMARY_MAX_CHARS);
+    let slot = summarizer.output_slot.lock().unwrap();
+    let accepted = slot
+        .as_ref()
+        .expect("the accepted summary must be captured as typed provenance");
+    assert_eq!(accepted.trust, OutputTrust::ContextCompression);
+    assert_eq!(accepted.value.len(), SUMMARY_MAX_CHARS);
+}
+
+#[tokio::test]
+async fn compaction_summary_one_over_the_cap_is_refused() {
+    // Boundary (2): one char over the cap is refused even with a clean Done:
+    // the cap is checked before appending and never completes the run.
+    let provider = Arc::new(scripted_provider(vec![
+        ScriptedResponse::Text("a".repeat(SUMMARY_MAX_CHARS + 1)),
+        ScriptedResponse::End,
+    ]));
+    let summarizer = streaming_summarizer(provider, Duration::from_secs(30));
+    assert!(
+        summarizer.run(&summary_history()).await.is_none(),
+        "one char over the cap must be refused even with a clean Done"
+    );
+    assert_slot_empty(&summarizer);
+}
+
+#[tokio::test]
+async fn compaction_summary_over_the_cap_without_done_is_refused() {
+    // Boundary (3): an oversized stream that never sends Done (a stall) is
+    // refused; the oversized buffer is never built and the slot stays empty.
+    let gated = Arc::new(GatedStreamProvider::new());
+    let summarizer = Arc::new(streaming_summarizer(gated.clone(), Duration::from_secs(30)));
+    let run = summarizer.clone();
+    let task = tokio::spawn(async move { run.run(&summary_history()).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if gated.recorded().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the summary stream must open");
+    assert!(
+        gated.push(Ok(ProviderChunk::Text {
+            text: "a".repeat(SUMMARY_MAX_CHARS + 1)
+        })),
+        "the test must push while the summarizer still waits"
+    );
+    let out = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the oversized run must terminate rather than wait out the deadline")
+        .expect("the run task must not panic");
+    assert!(
+        out.is_none(),
+        "an oversized stream without a Done must be refused"
+    );
+    assert_slot_empty(&summarizer);
+    assert!(
+        !gated.push(Ok(ProviderChunk::Done)),
+        "the oversized run must have terminated (dropped) the stream"
+    );
+}
+
+#[tokio::test]
+async fn compaction_summary_prefix_over_the_cap_never_accepts_a_prefix() {
+    // Boundary (4): an over-cap prefix followed by a crucial tail then Done
+    // is refused; the truncated prefix is NEVER returned (no prefix
+    // acceptance) and no provenance is captured.
+    let prefix = "p".repeat(SUMMARY_MAX_CHARS + 1);
+    let provider = Arc::new(scripted_provider(vec![
+        ScriptedResponse::Text(prefix.clone()),
+        ScriptedResponse::Text("CRUCIAL TAIL".into()),
+        ScriptedResponse::End,
+    ]));
+    let summarizer = streaming_summarizer(provider, Duration::from_secs(30));
+    assert!(
+        summarizer.run(&summary_history()).await.is_none(),
+        "an over-cap prefix must never be accepted, even if a tail then Done follows"
+    );
+    assert_slot_empty(&summarizer);
+}
+
+#[tokio::test]
+async fn compaction_summary_cap_met_then_provider_error_is_refused() {
+    // Boundary (5): text exactly at the cap followed by a provider error is
+    // NOT a summary: the stream did not end cleanly, so it is refused and
+    // the slot stays empty.
+    let provider = Arc::new(scripted_provider(vec![
+        ScriptedResponse::Text("a".repeat(SUMMARY_MAX_CHARS)),
+        ScriptedResponse::Die(ProviderError::new(
+            ProviderErrorKind::Network,
+            "connection vanished mid-summary",
+        )),
+    ]));
+    let summarizer = streaming_summarizer(provider, Duration::from_secs(30));
+    assert!(
+        summarizer.run(&summary_history()).await.is_none(),
+        "a provider error after reaching the cap must be refused"
+    );
+    assert_slot_empty(&summarizer);
+}

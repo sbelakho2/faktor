@@ -29,19 +29,19 @@ export type TaskAttachmentId = NativeAttachmentId;
 
 /**
  * One already-uploaded attachment retained in LOCAL pending state, bound to
- * the session it was uploaded under AND to the exact content that produced
+ * the session it was uploaded under AND to the exact reference that produced
  * it: a retry may reuse the durable id ONLY while it addresses the same
- * session and the pending bytes+mime still hash to `contentDigest` (a
- * cross-session or changed-content retry must upload again; the daemon
- * would refuse the foreign id and reusing an id for different bytes would
- * silently deliver the wrong artifact).
+ * session and the pending bytes+mime+filename+size still hash to `contentDigest`
+ * (a cross-session, changed-content or renamed retry must upload again; the
+ * daemon would refuse the foreign id, and reusing an id whose reference
+ * metadata changed would silently deliver the wrong artifact).
  */
 export interface PendingUploadedAttachment {
   readonly sessionId: string;
   /**
-   * [`pendingAttachmentContentDigest`] of the bytes this id was uploaded
-   * from: the content identity that decides retry reuse, never the
-   * attachment's array index.
+   * [`pendingAttachmentContentDigest`] of the reference (bytes + mime +
+   * filename + size) this id was uploaded from: the content identity that decides
+   * retry reuse, never the attachment's array index.
    */
   readonly contentDigest: string;
   readonly attachment: TaskAttachmentId;
@@ -55,33 +55,50 @@ export interface PendingBinaryAttachment {
   readonly dataBase64: string;
   readonly isImage: boolean;
   /**
-   * The durable id of a PRIOR successful upload of these exact bytes under
-   * `uploaded.sessionId` (CAS dedupe foundation): a retry resolves it first
-   * and uploads only the attachments that are still absent. Set by
-   * [`withPendingUpload`] after a successful upload; never trusted from the
-   * webview without the strict shape validation in
-   * [`parsePendingSubmission`].
+   * The durable id of a PRIOR successful upload of this exact reference
+   * (bytes + mime + filename) under `uploaded.sessionId` (CAS dedupe
+   * foundation): a retry resolves it first and uploads only the attachments
+   * that are still absent. Set by [`withPendingUpload`] after a successful
+   * upload; never trusted from the webview without the strict shape
+   * validation in [`parsePendingSubmission`].
    */
   readonly uploaded?: PendingUploadedAttachment;
 }
 
 /**
- * The LOCAL content identity of one pending attachment: SHA-256 over a
- * 4-byte big-endian length frame + the MIME bytes, followed by the DECODED
- * payload bytes, as lowercase hex. Retry reuse is decided on this digest
- * (plus the session) and NEVER on the attachment's array index: a draft
- * that changed bytes for the same slot uploads fresh, while identical
- * bytes that moved position still reuse their durable id.
+ * The LOCAL retry-reuse key of one pending attachment: SHA-256 over a
+ * domain-separated, length-framed encoding of the MIME, the FILENAME (a
+ * `null` filename is the empty string), the declared SIZE and the DECODED
+ * payload bytes, as lowercase hex. This is a client-local reuse key, NOT the
+ * daemon's CAS/attachment identity (the daemon hashes the bytes with BLAKE3
+ * and stores `digest + mime + filename + size`); it only needs to change
+ * whenever the reference changes. Retry reuse is decided on this key (plus
+ * the session) and NEVER on the attachment's array index: a draft that
+ * changed bytes, renamed/re-selected its file, or changed its declared size
+ * uploads fresh (and gets the new reference's metadata back), while an
+ * unchanged reference that moved position still reuses its durable id.
  */
 export function pendingAttachmentContentDigest(
-  attachment: Pick<PendingBinaryAttachment, 'mime' | 'dataBase64'>,
+  attachment: Pick<PendingBinaryAttachment, 'mime' | 'filename' | 'bytes' | 'dataBase64'>,
 ): string {
   const mime = Buffer.from(attachment.mime, 'utf8');
+  const filename = Buffer.from(attachment.filename ?? '', 'utf8');
   const frame = Buffer.allocUnsafe(4);
-  frame.writeUInt32BE(mime.length, 0);
+  const size = Buffer.allocUnsafe(8);
   const hash = createHash('sha256');
+  // Distinct domain tags keep the fields unambiguously separated.
+  hash.update(Buffer.from([0x01]));
+  frame.writeUInt32BE(mime.length, 0);
   hash.update(frame);
   hash.update(mime);
+  hash.update(Buffer.from([0x02]));
+  frame.writeUInt32BE(filename.length, 0);
+  hash.update(frame);
+  hash.update(filename);
+  hash.update(Buffer.from([0x04]));
+  size.writeBigUInt64BE(BigInt(attachment.bytes), 0);
+  hash.update(size);
+  hash.update(Buffer.from([0x03]));
   hash.update(Buffer.from(attachment.dataBase64, 'base64'));
   return hash.digest('hex');
 }
@@ -969,9 +986,10 @@ export function pendingAttachmentRefusal(
  * against the ADVERTISED upload/image/document contract FIRST (an
  * undeliverable part refuses the whole submission before any upload, so it
  * leaves no partial bytes in the durable store), then resolve every
- * attachment that was ALREADY uploaded from the SAME bytes+mime under this
- * session (the envelope's `uploaded` record whose `contentDigest` matches
- * the pending bytes; a changed draft slot never reuses a stale id) and
+ * attachment that was ALREADY uploaded from the SAME exact reference
+ * (bytes + mime + filename + size) under this session (the envelope's `uploaded`
+ * record whose `contentDigest` matches the pending reference; a changed or
+ * renamed draft slot never reuses a stale id) and
  * upload only the absent ones — a retry never uploads the same bytes twice
  * (CAS dedupe foundation). After each successful upload the durable id is
  * retained into the returned envelope ([`withPendingUpload`], plus the
@@ -1025,10 +1043,12 @@ export async function admitPendingSubmission(input: {
         : null;
     if (reusable !== null) {
       // Resolve the already-uploaded id FIRST only when the retained record
-      // was uploaded from the very same bytes+mime: the retry then carries
-      // the same durable identity and issues no second upload. A record
-      // whose content digest differs (the draft slot changed bytes) is
-      // stale and the attachment uploads fresh.
+      // was uploaded from the very same reference (bytes + mime +
+      // filename + size):
+      // the retry then carries the same durable identity and issues no
+      // second upload. A record whose content digest differs (the draft slot
+      // changed bytes or was renamed) is stale and the attachment uploads
+      // fresh.
       uploaded.push(reusable);
       continue;
     }
@@ -1095,12 +1115,13 @@ export async function admitPendingSubmission(input: {
  * enriched envelope per `(sessionId, messageId|draftId)` identity after a
  * failed admission; a retry carrying the same identity merges the
  * already-uploaded ids back in BEFORE admission by CONTENT DIGEST (SHA-256
- * of decoded bytes + MIME), one retained record per incoming attachment, so
- * only the absent attachments upload again (CAS dedupe foundation). A draft
- * that changed the bytes of a slot — even with the same identity, the same
- * attachment count and the same position — matches nothing and uploads
- * fresh. A successful admission releases the entry; the map is bounded so a
- * hostile client cannot grow host memory with submission identities.
+ * of decoded bytes + MIME + filename + size), one retained record per incoming
+ * attachment, so only the absent attachments upload again (CAS dedupe
+ * foundation). A draft that changed the bytes of a slot — or renamed/
+ * re-selected its file — even with the same identity, the same attachment
+ * count and the same position, matches nothing and uploads fresh. A
+ * successful admission releases the entry; the map is bounded so a hostile
+ * client cannot grow host memory with submission identities.
  */
 export class PendingSubmissionRetainer {
   private readonly entries = new Map<string, PendingSubmission>();
@@ -1138,11 +1159,12 @@ export class PendingSubmissionRetainer {
   /**
    * Merge the retained uploads into `pending` by CONTENT DIGEST. Every
    * incoming attachment is matched against the retained records whose
-   * `contentDigest` equals the digest computed over its own bytes+mime
-   * (records are consumed one-to-one, so duplicate attachments keep
-   * distinct durable ids), and only records bound to the SAME session are
-   * reused. A draft whose bytes changed under the same identity matches
-   * nothing and is returned untouched — the retry uploads fresh.
+   * `contentDigest` equals the digest computed over its own bytes+mime+
+   * filename+size (records are consumed one-to-one, so duplicate attachments
+   * keep distinct durable ids), and only records bound to the SAME session
+   * are reused. A draft whose bytes changed — or whose file was renamed —
+   * under the same identity matches nothing and is returned untouched — the
+   * retry uploads fresh.
    */
   restore(pending: PendingSubmission): PendingSubmission {
     const key = this.keyOf(pending);

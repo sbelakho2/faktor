@@ -50,3 +50,6 @@ mod provider;
 pub use provider::*;
 mod commerce;
 pub use commerce::*;
+
+#[cfg(test)]
+mod tests;

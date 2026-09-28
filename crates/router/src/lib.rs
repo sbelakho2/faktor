@@ -622,6 +622,24 @@ pub fn effective_quality_statement(
     candidate.quality.clone()
 }
 
+/// The authority-aware 0..=100 phase quality of one statement: the numeric
+/// value the qualification floor compares, on the SAME authority the floor
+/// decision uses. A [`QualityAuthority::Measured`] statement carries its
+/// scaled confidence; a [`QualityAuthority::UserConfigured`] or
+/// [`QualityAuthority::BuiltInPrior`] declaration carries its declared
+/// value; a [`QualityAuthority::ConservativeUnknown`] placeholder is `0` —
+/// its numeric placeholder 50 is NOT a measured 50 and authorizes nothing
+/// above floor 0.
+pub fn phase_quality_value(statement: &QualityStatement, phase: RouterPhase) -> u8 {
+    let metric = statement.phase_metric(phase);
+    match metric.authority {
+        QualityAuthority::Measured(_)
+        | QualityAuthority::UserConfigured { .. }
+        | QualityAuthority::BuiltInPrior => metric.value,
+        QualityAuthority::ConservativeUnknown => 0,
+    }
+}
+
 /// Cache-aware base cost of one call, shared by the qualification budget
 /// axis and the scored candidates (computed exactly once per candidate).
 fn base_call_cost(d: &ModelDescriptor, req: &RouteRequest, cache: &[CacheState]) -> u64 {
@@ -1841,6 +1859,21 @@ impl RouterService {
         cache: &[CacheState],
         now_ms: u64,
     ) -> Result<QualifiedCandidate<'_>, QualificationFailure> {
+        self.qualify_specific_at_with(provider, model, req, cache, now_ms, self.outcomes.as_ref())
+    }
+
+    /// [`RouterService::qualify_specific_at`] consulting an explicit outcome
+    /// registry (a route-scoped memo for the pinned path of
+    /// [`RouterService::route_at_with`]).
+    fn qualify_specific_at_with(
+        &self,
+        provider: &str,
+        model: &str,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
+    ) -> Result<QualifiedCandidate<'_>, QualificationFailure> {
         let health = self.telemetry.snapshot();
         qualify_specific_authoritative_at(
             &self.priced,
@@ -1850,7 +1883,7 @@ impl RouterService {
             cache,
             &health,
             now_ms,
-            self.outcomes.as_ref(),
+            outcomes,
         )
     }
 
@@ -1880,6 +1913,48 @@ impl RouterService {
                     self.outcomes.as_ref(),
                 )
             })
+    }
+
+    /// The AUTHORITY-AWARE effective quality statement of one candidate for
+    /// this service's request axes at an explicit wall clock: exactly the
+    /// statement the priced qualification pass ([`qualify_priced_refs`])
+    /// applies, so a caller (MaximumQuality tier formation) can build
+    /// quality tiers on the SAME authority the router qualifies with.
+    /// Durable measured outcomes supersede the candidate's declared
+    /// statement; absent evidence the declared statement is returned
+    /// verbatim. Pair it with [`phase_quality_value`].
+    pub fn effective_quality_for(
+        &self,
+        candidate: &RouteCandidate,
+        req: &RouteRequest,
+        now_ms: u64,
+    ) -> QualityStatement {
+        self.effective_quality_for_with(candidate, req, now_ms, self.outcomes.as_ref())
+    }
+
+    /// [`RouterService::effective_quality_for`] consulting an explicit
+    /// outcome registry (the route-scoped memo shared with the probe).
+    pub fn effective_quality_for_with(
+        &self,
+        candidate: &RouteCandidate,
+        req: &RouteRequest,
+        now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
+    ) -> QualityStatement {
+        effective_quality_statement(
+            candidate,
+            req.phase,
+            req.task_class,
+            req.risk_bucket,
+            now_ms,
+            outcomes,
+        )
+    }
+
+    /// The service's outcome registry (the durable verified-outcome store a
+    /// route-scoped [`outcomes::MemoOutcomeStore`] wraps).
+    pub fn outcome_store(&self) -> &dyn outcomes::OutcomeStore {
+        self.outcomes.as_ref()
     }
 
     /// Expected cost = base + P(retry)*base + (1-P(success))*escalation,
@@ -1914,13 +1989,30 @@ impl RouterService {
         cache: &[CacheState],
         now_ms: u64,
     ) -> Result<RouteDecision, String> {
+        self.route_at_with(req, cache, now_ms, self.outcomes.as_ref())
+    }
+
+    /// [`RouterService::route_at`] consulting an EXPLICIT outcome registry for
+    /// the quality axis. A routing policy wraps the service registry in a
+    /// route-scoped memo and passes it here so repeated probes
+    /// (MaximumQuality's descending quality floors) reuse the candidate
+    /// lookups already paid for, instead of re-reading the durable store per
+    /// probe. Passing the service's own registry is byte-identical to
+    /// [`RouterService::route_at`].
+    pub fn route_at_with(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
+    ) -> Result<RouteDecision, String> {
         if let Some((provider, model)) = &self.pinned {
-            return self.route_pinned(provider, model, req, cache, now_ms);
+            return self.route_pinned(provider, model, req, cache, now_ms, outcomes);
         }
         if !self.priced.is_empty() {
-            return self.route_priced(req, cache, now_ms);
+            return self.route_priced(req, cache, now_ms, outcomes);
         }
-        self.route_legacy(req, cache)
+        self.route_legacy(req, cache, outcomes)
     }
 
     /// The priced production route (pricing-path audit): qualification over
@@ -1933,6 +2025,7 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
         now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
     ) -> Result<RouteDecision, String> {
         let health = self.telemetry.snapshot();
         let qualified = qualified_priced_candidates_authoritative_at(
@@ -1941,10 +2034,10 @@ impl RouterService {
             cache,
             &health,
             now_ms,
-            self.outcomes.as_ref(),
+            outcomes,
         )
         .map_err(|f| f.route_error())?;
-        let scored = score_priced_candidates(&qualified, &self.priced, req, self.outcomes.as_ref());
+        let scored = score_priced_candidates(&qualified, &self.priced, req, outcomes);
         let winner = scored.iter().min_by(|a, b| a.compare(b)).ok_or_else(|| {
             "no candidate clears capability/fit filtering (missing: )".to_string()
         })?;
@@ -2023,9 +2116,23 @@ impl RouterService {
         planner: &dyn CandidatePlanner,
         now_ms: u64,
     ) -> Result<SizedRouteDecision, String> {
+        self.route_with_candidate_plans_at_with(req, cache, planner, now_ms, self.outcomes.as_ref())
+    }
+
+    /// [`RouterService::route_with_candidate_plans_at`] consulting an explicit
+    /// outcome registry (the route-scoped memo a MaximumQuality probe
+    /// reuses across its descending quality floors).
+    pub fn route_with_candidate_plans_at_with(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        planner: &dyn CandidatePlanner,
+        now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
+    ) -> Result<SizedRouteDecision, String> {
         if self.pinned.is_some() || self.priced.is_empty() {
             return self
-                .route_at(req, cache, now_ms)
+                .route_at_with(req, cache, now_ms, outcomes)
                 .map(SizedRouteDecision::without_plan);
         }
         let health = self.telemetry.snapshot();
@@ -2036,19 +2143,10 @@ impl RouterService {
         //    candidate eliminated by its REAL footprint still relaxes into
         //    `[minimum, target)`.
         let refs: Vec<&RouteCandidate> = self.priced.iter().collect();
-        let qualified = qualify_priced_refs(
-            &refs,
-            req,
-            cache,
-            &health,
-            now_ms,
-            self.outcomes.as_ref(),
-            false,
-        )
-        .map_err(|f| f.route_error())?;
+        let qualified = qualify_priced_refs(&refs, req, cache, &health, now_ms, outcomes, false)
+            .map_err(|f| f.route_error())?;
         // 2. Pre-rank by the cheap (unmeasured) expected-cost ladder.
-        let mut pre =
-            score_priced_candidates(&qualified, &self.priced, req, self.outcomes.as_ref());
+        let mut pre = score_priced_candidates(&qualified, &self.priced, req, outcomes);
         pre.sort_by(|a, b| a.compare(b));
         let ranked: Vec<QualifiedCandidate<'_>> = pre
             .iter()
@@ -2132,13 +2230,13 @@ impl RouterService {
                         req.task_class,
                         req.risk_bucket,
                         now_ms,
-                        self.outcomes.as_ref(),
+                        outcomes,
                     )
                     .clears_floor(req.phase, target)
                 })
         });
         // 7. Final route over the measured survivors.
-        let scored = score_priced_candidates(&sized, &self.priced, req, self.outcomes.as_ref());
+        let scored = score_priced_candidates(&sized, &self.priced, req, outcomes);
         let winner = scored.iter().min_by(|a, b| a.compare(b)).ok_or_else(|| {
             "no candidate clears capability/fit filtering (missing: )".to_string()
         })?;
@@ -2210,16 +2308,40 @@ impl RouterService {
         prefix_history: Option<&[stability::TurnPrefix]>,
         planner: &dyn CandidatePlanner,
     ) -> Result<SizedRouteDecision, String> {
+        self.route_with_prefix_stability_and_candidate_plans_at_with(
+            req,
+            cache,
+            floor,
+            prefix_history,
+            planner,
+            unix_now_ms(),
+            self.outcomes.as_ref(),
+        )
+    }
+
+    /// [`RouterService::route_with_prefix_stability_and_candidate_plans`]
+    /// consulting an explicit outcome registry (the route-scoped memo).
+    #[allow(clippy::too_many_arguments)] // explicit axes mirror the non-with entry point
+    pub fn route_with_prefix_stability_and_candidate_plans_at_with(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        floor: f64,
+        prefix_history: Option<&[stability::TurnPrefix]>,
+        planner: &dyn CandidatePlanner,
+        now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
+    ) -> Result<SizedRouteDecision, String> {
         let Some(history) = prefix_history else {
-            return self.route_with_candidate_plans(req, cache, planner);
+            return self.route_with_candidate_plans_at_with(req, cache, planner, now_ms, outcomes);
         };
         let last = stability::turn_stabilities(history).pop();
         let Some(last_stability) = last else {
-            return self.route_with_candidate_plans(req, cache, planner);
+            return self.route_with_candidate_plans_at_with(req, cache, planner, now_ms, outcomes);
         };
         let penalty = stability::churn_penalty(last_stability, floor);
         if penalty == 0.0 {
-            return self.route_with_candidate_plans(req, cache, planner);
+            return self.route_with_candidate_plans_at_with(req, cache, planner, now_ms, outcomes);
         }
         let cache_without_reads: Vec<CacheState> = cache
             .iter()
@@ -2230,7 +2352,13 @@ impl RouterService {
                 will_write_tokens: c.will_write_tokens,
             })
             .collect();
-        let mut sized = self.route_with_candidate_plans(req, &cache_without_reads, planner)?;
+        let mut sized = self.route_with_candidate_plans_at_with(
+            req,
+            &cache_without_reads,
+            planner,
+            now_ms,
+            outcomes,
+        )?;
         sized.decision.estimated_cost_micro = stability::apply_churn_penalty(
             sized.decision.estimated_cost_micro,
             last_stability,
@@ -2302,7 +2430,7 @@ impl RouterService {
                 pricing_snapshot: None,
             });
         }
-        self.route_pinned(provider, model, req, cache, now_ms)
+        self.route_pinned(provider, model, req, cache, now_ms, self.outcomes.as_ref())
     }
 
     fn route_pinned(
@@ -2312,9 +2440,10 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
         now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
     ) -> Result<RouteDecision, String> {
         let q = self
-            .qualify_specific_at(provider, model, req, cache, now_ms)
+            .qualify_specific_at_with(provider, model, req, cache, now_ms, outcomes)
             .map_err(|f| f.route_error())?;
         let cost = q.cost;
         let base = cost.numeric().unwrap_or(0);
@@ -2356,11 +2485,12 @@ impl RouterService {
         &self,
         req: &RouteRequest,
         cache: &[CacheState],
+        outcomes: &dyn outcomes::OutcomeStore,
     ) -> Result<RouteDecision, String> {
         let health = self.telemetry.snapshot();
         let qualified = qualified_candidates(&self.router.candidates, req, cache, &health)
             .map_err(|f| f.route_error())?;
-        let scored = score_candidates(&qualified, req.phase, self.outcomes.as_ref());
+        let scored = score_candidates(&qualified, req.phase, outcomes);
         let winner = scored
             .iter()
             .min_by(|a, b| a.compare(b))
@@ -2497,16 +2627,37 @@ impl RouterService {
         floor: f64,
         prefix_history: Option<&[stability::TurnPrefix]>,
     ) -> Result<RouteDecision, String> {
+        self.route_with_prefix_stability_at_with(
+            req,
+            cache,
+            floor,
+            prefix_history,
+            unix_now_ms(),
+            self.outcomes.as_ref(),
+        )
+    }
+
+    /// [`RouterService::route_with_prefix_stability`] consulting an explicit
+    /// outcome registry (the route-scoped memo).
+    pub fn route_with_prefix_stability_at_with(
+        &self,
+        req: &RouteRequest,
+        cache: &[CacheState],
+        floor: f64,
+        prefix_history: Option<&[stability::TurnPrefix]>,
+        now_ms: u64,
+        outcomes: &dyn outcomes::OutcomeStore,
+    ) -> Result<RouteDecision, String> {
         let Some(history) = prefix_history else {
-            return self.route(req, cache);
+            return self.route_at_with(req, cache, now_ms, outcomes);
         };
         let last = stability::turn_stabilities(history).pop();
         let Some(last_stability) = last else {
-            return self.route(req, cache);
+            return self.route_at_with(req, cache, now_ms, outcomes);
         };
         let penalty = stability::churn_penalty(last_stability, floor);
         if penalty == 0.0 {
-            return self.route(req, cache);
+            return self.route_at_with(req, cache, now_ms, outcomes);
         }
         // Churn invalidates provider-side caches: price the route with
         // every cache-read discount zeroed (the cache write this call
@@ -2520,7 +2671,7 @@ impl RouterService {
                 will_write_tokens: c.will_write_tokens,
             })
             .collect();
-        let mut decision = self.route(req, &cache_without_reads)?;
+        let mut decision = self.route_at_with(req, &cache_without_reads, now_ms, outcomes)?;
         decision.estimated_cost_micro =
             stability::apply_churn_penalty(decision.estimated_cost_micro, last_stability, floor);
         decision.reasoning = format!(

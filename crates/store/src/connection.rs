@@ -330,6 +330,11 @@ pub(crate) struct MaintenanceRegistry {
     active: Mutex<Vec<ActiveMaintenance>>,
     next_id: AtomicU64,
     idle: Condvar,
+    /// Closed once a shutdown/drop has begun: a maintenance task that tries to
+    /// register after cancellation would otherwise escape the cancel+wait and
+    /// let `Store::shutdown` report success with a live store-owned thread
+    /// (the exact authority leak the success condition forbids).
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for MaintenanceRegistry {
@@ -349,17 +354,37 @@ impl MaintenanceRegistry {
     }
 
     /// Register one task; the returned id deregisters it when the task ends.
-    fn register(&self, cancel: Arc<AtomicBool>, interrupt: rusqlite::InterruptHandle) -> u64 {
+    /// `None` once the registry is closed for shutdown: a late registrant must
+    /// never escape cancellation, so the caller refuses typed instead.
+    ///
+    /// The closed check and the push happen under the `active` lock, and
+    /// `close()` takes the same lock, so a registration racing a shutdown
+    /// either lands before `close()` (and is therefore visible to
+    /// `cancel_all`) or observes the closed flag and is refused.
+    fn register(
+        &self,
+        cancel: Arc<AtomicBool>,
+        interrupt: rusqlite::InterruptHandle,
+    ) -> Option<u64> {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.active
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(ActiveMaintenance {
-                id,
-                cancel,
-                interrupt,
-            });
-        id
+        active.push(ActiveMaintenance {
+            id,
+            cancel,
+            interrupt,
+        });
+        Some(id)
+    }
+
+    /// Close the registry to new registrations (shutdown/drop). Idempotent;
+    /// must be called BEFORE [`Self::cancel_all`] so a registration cannot slip
+    /// in after the cancel sweep.
+    pub(crate) fn close(&self) {
+        let _active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        self.closed.store(true, Ordering::Release);
     }
 
     fn unregister(&self, id: u64) {
@@ -440,6 +465,7 @@ impl Drop for Store {
         // each backup observes the token between page batches and fails its
         // caller typed. The writer's own `Drop` is the bounded stop (drain →
         // interrupt → reject → detach); it never joins unboundedly.
+        self.maintenance.close();
         let cancelled = self.maintenance.cancel_all();
         if cancelled > 0 {
             tracing::info!(
@@ -1481,6 +1507,140 @@ mod writer_service_tests {
         assert!(!backup_path.exists(), "partial backup file must be removed");
         assert_eq!(store.maintenance_active_count(), 0);
     }
+
+    /// Finding 3: a maintenance task that ignores cancellation keeps a
+    /// store-owned authority alive, so `shutdown` must NOT report success even
+    /// when the writer drained cleanly. The typed error names the surviving
+    /// authority and carries the writer outcome, the call stays bounded, and
+    /// the fake task is still registered afterwards.
+    #[test]
+    fn shutdown_reports_typed_error_when_maintenance_does_not_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path(), true).unwrap());
+        let alive = Arc::new(AtomicBool::new(false));
+        let fake = store.spawn_nonresponsive_maintenance(Arc::clone(&alive));
+        assert!(alive.load(Ordering::SeqCst), "fake maintenance is alive");
+        assert_eq!(store.maintenance_active_count(), 1);
+
+        let bounded = Duration::from_millis(200);
+        let at = Instant::now();
+        let err = store.shutdown(bounded).unwrap_err();
+        let elapsed = at.elapsed();
+        assert!(
+            elapsed < bounded + WRITER_SHUTDOWN_INTERRUPT_GRACE + Duration::from_secs(2),
+            "shutdown with a live maintenance authority must stay bounded: {elapsed:?}"
+        );
+        match err {
+            StoreError::MaintenanceShutdownTimeout {
+                active,
+                writer_outcome,
+            } => {
+                assert_eq!(active, 1, "the surviving authority is named");
+                assert_eq!(
+                    writer_outcome,
+                    WriterShutdownOutcome::Drained,
+                    "the writer outcome is carried even though maintenance leaked"
+                );
+            }
+            other => panic!(
+                "a surviving maintenance authority must be a typed non-success, got {other:?}"
+            ),
+        }
+        // The fake task is STILL alive and registered after shutdown returned.
+        assert!(fake.is_alive(), "fake maintenance must survive the bound");
+        assert_eq!(store.maintenance_active_count(), 1);
+        // Dropping the test task releases the registration (it "exits" after
+        // the observation) so teardown never waits on it.
+        drop(fake);
+        wait_until(
+            || store.maintenance_active_count() == 0,
+            "fake maintenance exit",
+        );
+    }
+
+    /// Finding: shutdown is a TOCTOU unless the registry is CLOSED before the
+    /// cancel sweep. A backup that registers during the writer-drain window
+    /// would otherwise escape cancellation while `shutdown` still reported
+    /// success. This certifies the closed gate: once shutdown began, a new
+    /// registration is refused.
+    #[test]
+    fn register_after_shutdown_begins_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        store.shutdown(Duration::from_millis(200)).unwrap();
+        assert_eq!(store.maintenance_active_count(), 0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupt = rusqlite::Connection::open_in_memory()
+            .unwrap()
+            .get_interrupt_handle();
+        assert!(
+            store.maintenance.register(cancel, interrupt).is_none(),
+            "a maintenance registration after the shutdown close gate must be refused"
+        );
+    }
+
+    /// A deliberately nonresponsive maintenance registration: it ignores the
+    /// cancel flag and never deregisters on its own, so the registry cannot
+    /// drain inside a shutdown bound. Dropping it releases the registration
+    /// and lets its worker exit, so the test process never waits on it at
+    /// teardown.
+    struct NonresponsiveMaintenance {
+        id: u64,
+        registry: Arc<MaintenanceRegistry>,
+        alive: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl NonresponsiveMaintenance {
+        fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for NonresponsiveMaintenance {
+        fn drop(&mut self) {
+            self.alive.store(false, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            self.registry.unregister(self.id);
+        }
+    }
+
+    impl Store {
+        /// Register a maintenance task that never observes cancellation, so a
+        /// test can certify that a store-owned maintenance authority surviving
+        /// the bound makes `Store::shutdown` return a typed non-success.
+        fn spawn_nonresponsive_maintenance(
+            &self,
+            alive: Arc<AtomicBool>,
+        ) -> NonresponsiveMaintenance {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let interrupt = rusqlite::Connection::open_in_memory()
+                .expect("in-memory connection for a fake maintenance interrupt handle")
+                .get_interrupt_handle();
+            let id = self
+                .maintenance
+                .register(Arc::clone(&cancel), interrupt)
+                .expect("the registry is open before shutdown begins");
+            alive.store(true, Ordering::SeqCst);
+            let task_alive = Arc::clone(&alive);
+            let worker = thread::Builder::new()
+                .name("faktor-store-fake-maintenance".into())
+                .spawn(move || {
+                    while task_alive.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                })
+                .expect("spawn fake maintenance thread");
+            NonresponsiveMaintenance {
+                id,
+                registry: Arc::clone(&self.maintenance),
+                alive,
+                worker: Some(worker),
+            }
+        }
+    }
 }
 
 impl Store {
@@ -1754,6 +1914,15 @@ impl Store {
     ///    [`StoreError::WriterShutdownTimeout`] (it exits on its own — never
     ///    an unbounded join).
     ///
+    /// SUCCESS CONDITION: `Ok` means EVERY store-owned authority is quiescent
+    /// — the maintenance registry drained to empty AND the writer owner
+    /// stopped within the bound. If maintenance did not drain in time this
+    /// returns [`StoreError::MaintenanceShutdownTimeout`] carrying the writer
+    /// outcome (even when the writer drained), so a surviving maintenance
+    /// thread is never reported as a successful shutdown. Only when
+    /// maintenance drained does a detached writer surface as
+    /// [`StoreError::WriterShutdownTimeout`].
+    ///
     /// Always returns within `timeout + WRITER_SHUTDOWN_INTERRUPT_GRACE`.
     #[doc(hidden)]
     pub fn shutdown(&self, timeout: Duration) -> StoreResult<WriterShutdownOutcome> {
@@ -1761,6 +1930,10 @@ impl Store {
         // Stop admissions FIRST: while maintenance winds down, no new
         // mutation may be admitted.
         self.writer.begin_shutdown();
+        // Close the maintenance registry BEFORE cancelling: a task that tries
+        // to register in the writer-drain window cannot slip past the cancel
+        // sweep and let this report success with a live store-owned thread.
+        self.maintenance.close();
         let cancelled = self.maintenance.cancel_all();
         if cancelled > 0 {
             tracing::info!(
@@ -1773,12 +1946,18 @@ impl Store {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let outcome = self.writer.shutdown(remaining);
         if !maintenance_drained {
+            let active = self.maintenance.active_count();
             tracing::warn!(
                 target: "faktor_store::maintenance",
-                active = self.maintenance.active_count(),
+                active,
+                ?outcome,
                 "maintenance did not drain inside the shutdown bound; its caller \
-                 still receives the typed cancellation"
+                 still receives the typed cancellation and shutdown is NOT a success"
             );
+            return Err(StoreError::MaintenanceShutdownTimeout {
+                active,
+                writer_outcome: outcome,
+            });
         }
         match outcome {
             WriterShutdownOutcome::Detached { rejected } => {
@@ -2180,7 +2359,11 @@ impl Store {
         let interrupt = src.get_interrupt_handle();
         let registry = Arc::clone(&self.maintenance);
         let task_registry = Arc::clone(&registry);
-        let id = registry.register(Arc::clone(&cancel), interrupt);
+        let Some(id) = registry.register(Arc::clone(&cancel), interrupt) else {
+            return Err(StoreError::Maintenance(
+                "store is shutting down; backup refused before any page was copied".into(),
+            ));
+        };
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("faktor-store-backup".into())

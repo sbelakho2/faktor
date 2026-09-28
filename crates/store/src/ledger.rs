@@ -451,7 +451,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 25, "v24 is the migration head");
+            assert_eq!(version, 26, "v25 is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",
@@ -1413,7 +1413,11 @@ impl Store {
             .iter()
             .map(|state| state.to_string())
             .collect();
-        let target_state = target_state.to_owned();
+        // Preparation BEFORE enqueueing: the target state is serialized here,
+        // not on the writer owner. The message data is wrapped by SQLite's
+        // `json_object` inside the SQL-only closure (byte-identical to the
+        // former `json!` wrapper), so the owner thread never runs serde.
+        let state_json = serde_json::to_string(target_state).unwrap();
         self.writer.execute("admit_queue_head", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let head: Option<QueueHeadRow> = tx
@@ -1474,21 +1478,12 @@ impl Store {
             let event_seq = prev_event + 1;
             tx.execute(
                 "INSERT INTO message(session_id, seq, role, data, created_ms)
-             VALUES (?1, ?2, 'user', ?3, ?4)",
-                params![
-                    session.raw() as i64,
-                    event_seq,
-                    serde_json::json!({ "text": prompt }).to_string(),
-                    now_ms()
-                ],
+             VALUES (?1, ?2, 'user', json_object('text', ?3), ?4)",
+                params![session.raw() as i64, event_seq, prompt, now_ms()],
             )?;
             tx.execute(
                 "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![
-                    session.raw() as i64,
-                    serde_json::to_string(&target_state).unwrap(),
-                    now_ms()
-                ],
+                params![session.raw() as i64, state_json, now_ms()],
             )?;
             tx.commit()?;
             Ok(Some((

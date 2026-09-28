@@ -911,15 +911,23 @@ impl std::fmt::Debug for EconomicRoutingPolicy {
     }
 }
 
-/// The phase-quality metric the router applies per phase (mirror of the
-/// router crate's documented rule; duplicated here because the router's
-/// helper is private): heavy phases (Implement/Review/Debug) judge the
-/// coding-reliability mean, every other phase judges context reliability.
-fn phase_quality(econ: &faktor_core::model::ModelEconomics, phase: RouterPhase) -> u8 {
-    match phase {
-        RouterPhase::Implement | RouterPhase::Review | RouterPhase::Debug => econ.coding_quality(),
-        _ => econ.context_reliability,
-    }
+/// The DESCRIPTOR-ONLY phase quality of one candidate, read through the
+/// SAME authority the router's descriptor-only compatibility qualification
+/// applies ([`faktor_router::qualified_candidates`] via
+/// `clears_quality_floor` -> `QualityStatement::from_legacy_performance`).
+/// It deliberately delegates to the router-owned metric instead of mirroring
+/// `ModelEconomics::coding_quality()` (the mean of three dimensions), which
+/// is NOT what the descriptor floor compares: heavy phases judge
+/// `coding_reliability` alone. Tier and qualification therefore never
+/// disagree.
+fn descriptor_phase_quality(d: &faktor_core::model::ModelDescriptor, phase: RouterPhase) -> u8 {
+    faktor_router::phase_quality_value(
+        &faktor_core::model::QualityStatement::from_legacy_performance(
+            &d.performance(),
+            faktor_core::model::QualityAuthority::BuiltInPrior,
+        ),
+        phase,
+    )
 }
 
 impl EconomicRoutingPolicy {
@@ -966,6 +974,7 @@ impl EconomicRoutingPolicy {
     /// `planner` present the router's candidate-sized entry runs and the
     /// winning plan crosses back; without one the plain consult runs
     /// byte-identically.
+    #[allow(clippy::too_many_arguments)] // one explicit axis per parameter, mirroring the router
     fn consult_at_with_plans(
         &self,
         req: &faktor_router::RouteRequest,
@@ -973,6 +982,8 @@ impl EconomicRoutingPolicy {
         target: Option<u8>,
         prefix_history: Option<&[TurnPrefix]>,
         planner: Option<&dyn faktor_router::CandidatePlanner>,
+        outcomes: Option<&dyn faktor_router::outcomes::OutcomeStore>,
+        now_ms: u64,
     ) -> Result<faktor_router::SizedRouteDecision, String> {
         let mut routed = req.clone();
         routed.quality_floor = floor;
@@ -982,31 +993,61 @@ impl EconomicRoutingPolicy {
         // below it), MaximumQuality probes each tier as a hard floor, and a
         // pin validates the minimum only.
         routed.quality_target = target;
-        match (planner, prefix_history) {
-            (Some(planner), None) => self
+        // A route-scoped outcome override (MaximumQuality's memo) makes every
+        // probe reuse the same candidate lookups; absent one, the service's
+        // own registry is consulted exactly as before.
+        let stable_floor = faktor_router::stability::DEFAULT_STABILITY_FLOOR;
+        match (planner, prefix_history, outcomes) {
+            (Some(planner), None, Some(o)) => {
+                self.service
+                    .route_with_candidate_plans_at_with(&routed, &[], planner, now_ms, o)
+            }
+            (Some(planner), None, None) => {
+                self.service
+                    .route_with_candidate_plans(&routed, &[], planner)
+            }
+            (Some(planner), Some(history), Some(o)) => self
                 .service
-                .route_with_candidate_plans(&routed, &[], planner),
-            (Some(planner), Some(history)) => self
+                .route_with_prefix_stability_and_candidate_plans_at_with(
+                    &routed,
+                    &[],
+                    stable_floor,
+                    Some(history),
+                    planner,
+                    now_ms,
+                    o,
+                ),
+            (Some(planner), Some(history), None) => self
                 .service
                 .route_with_prefix_stability_and_candidate_plans(
                     &routed,
                     &[],
-                    faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                    stable_floor,
                     Some(history),
                     planner,
                 ),
-            (None, None) => self
+            (None, None, Some(o)) => self
+                .service
+                .route_at_with(&routed, &[], now_ms, o)
+                .map(faktor_router::SizedRouteDecision::without_plan),
+            (None, None, None) => self
                 .service
                 .route(&routed, &[])
                 .map(faktor_router::SizedRouteDecision::without_plan),
-            (None, Some(history)) => self
+            (None, Some(history), Some(o)) => self
                 .service
-                .route_with_prefix_stability(
+                .route_with_prefix_stability_at_with(
                     &routed,
                     &[],
-                    faktor_router::stability::DEFAULT_STABILITY_FLOOR,
+                    stable_floor,
                     Some(history),
+                    now_ms,
+                    o,
                 )
+                .map(faktor_router::SizedRouteDecision::without_plan),
+            (None, Some(history), None) => self
+                .service
+                .route_with_prefix_stability(&routed, &[], stable_floor, Some(history))
                 .map(faktor_router::SizedRouteDecision::without_plan),
         }
     }
@@ -1023,8 +1064,16 @@ impl EconomicRoutingPolicy {
         // the router's permission to prefer the target tier and relax into
         // `[minimum, target)` only without a target survivor.
         let (floor, target) = faktor_router::quality_band(req.quality_floor, req.quality_target);
-        self.consult_at_with_plans(req, floor, target, prefix_history, planner)
-            .map_err(|e| self.map_denial(&e, req))
+        self.consult_at_with_plans(
+            req,
+            floor,
+            target,
+            prefix_history,
+            planner,
+            None,
+            faktor_core::model::unix_now_ms(),
+        )
+        .map_err(|e| self.map_denial(&e, req))
     }
 
     fn route_economy(
@@ -1047,6 +1096,17 @@ impl EconomicRoutingPolicy {
     /// The number of router consults is bounded by the distinct phase
     /// qualities in the candidate set (small; the candidate catalog itself
     /// is bounded).
+    ///
+    /// Tier formation and qualification read ONE quality authority: a
+    /// service carrying priced candidates qualifies through the
+    /// authority-aware effective quality (durable measured outcomes
+    /// supersede the descriptor and `ConservativeUnknown` authorizes nothing
+    /// above floor 0), so the tiers are built from that same statement; a
+    /// descriptor-only service qualifies through the descriptor's declared
+    /// built-in prior, so its tiers are the descriptor values. Probing a
+    /// descriptor tier against a measured qualification (or the reverse)
+    /// could pick a lower-current-quality model or waste probes on a
+    /// descriptor-high candidate the router would refuse.
     fn route_maximum_quality_sized(
         &self,
         req: &faktor_router::RouteRequest,
@@ -1056,14 +1116,35 @@ impl EconomicRoutingPolicy {
         // The requested floor is the hard lower bound of the tier probe:
         // tiers below it never serve, and when no tier above it clears the
         // caps the refusal names the empty above-floor set.
-        let mut tiers: Vec<u8> = self
-            .service
-            .router
-            .candidates
-            .iter()
-            .map(|c| phase_quality(&c.economics, req.phase))
-            .filter(|&q| q >= req.quality_floor.min(100))
-            .collect();
+        let floor_bound = req.quality_floor.min(100);
+        // ONE route-scoped memo: tier formation and every descending probe
+        // share one durable-outcome lookup per candidate instead of
+        // re-reading the store once per tier.
+        let now_ms = faktor_core::model::unix_now_ms();
+        let outcomes = faktor_router::outcomes::MemoOutcomeStore::new(self.service.outcome_store());
+        let mut tiers: Vec<u8> = if self.service.priced.is_empty() {
+            self.service
+                .router
+                .candidates
+                .iter()
+                .map(|c| descriptor_phase_quality(c, req.phase))
+                .filter(|&q| q >= floor_bound)
+                .collect()
+        } else {
+            self.service
+                .priced
+                .iter()
+                .map(|c| {
+                    faktor_router::phase_quality_value(
+                        &self
+                            .service
+                            .effective_quality_for_with(c, req, now_ms, &outcomes),
+                        req.phase,
+                    )
+                })
+                .filter(|&q| q >= floor_bound)
+                .collect()
+        };
         tiers.sort_unstable();
         tiers.dedup();
         tiers.reverse();
@@ -1072,7 +1153,15 @@ impl EconomicRoutingPolicy {
             // Each probed tier is a HARD floor: the mode already takes the
             // highest servable tier, so no target preference can apply
             // inside a probe (the tier itself is the preference).
-            match self.consult_at_with_plans(req, floor, None, prefix_history, planner) {
+            match self.consult_at_with_plans(
+                req,
+                floor,
+                None,
+                prefix_history,
+                planner,
+                Some(&outcomes),
+                now_ms,
+            ) {
                 Ok(d) => return Ok(d),
                 Err(e) => last_denial = Some(self.map_denial(&e, req)),
             }
@@ -1101,8 +1190,16 @@ impl EconomicRoutingPolicy {
         let (minimum, target) = faktor_router::quality_band(req.quality_floor, req.quality_target);
         let floor = minimum.clamp(Self::BALANCED_QUALITY_FLOOR, 100);
         let target = target.map(|t| t.clamp(floor, 100)).filter(|t| *t > floor);
-        self.consult_at_with_plans(req, floor, target, prefix_history, planner)
-            .map_err(|e| self.map_denial(&e, req))
+        self.consult_at_with_plans(
+            req,
+            floor,
+            target,
+            prefix_history,
+            planner,
+            None,
+            faktor_core::model::unix_now_ms(),
+        )
+        .map_err(|e| self.map_denial(&e, req))
     }
 
     fn route_balanced(

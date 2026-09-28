@@ -5945,63 +5945,15 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         "sleep(",
     ];
 
-    /// Grandfathered writer-job closures that still prepare nothing: every
-    /// entry is an EXACT (file, trimmed line) pair, kept load-bearing and
-    /// non-stale by the tests below. The audit-item-8 target is a typed
-    /// prepared-write API; until those call sites migrate, a NEW forbidden
-    /// call anywhere (including inside an allowlisted file) is a red scan.
-    /// `crates/store/src/connection.rs` and `writer.rs` (the owned writer
-    /// core) are deliberately absent — their jobs must stay prepared.
-    const WRITER_JOB_ALLOWLIST: &[(&str, &str)] = &[
-        // crates/store/src/ledger.rs — the queue-admission closure serializes
-        // the materialized prompt message and the target state instead of
-        // capturing both before enqueue. Follow-up: prepare `message_json`
-        // and `state_json` on the caller's thread.
-        (
-            "crates/store/src/ledger.rs",
-            "serde_json::json!({ \"text\": prompt }).to_string(),",
-        ),
-        (
-            "crates/store/src/ledger.rs",
-            "serde_json::to_string(&target_state).unwrap(),",
-        ),
-        // crates/store/src/sessions.rs — create_session / lifecycle-state
-        // setters / transition_session / insert_checkpoint_and_event
-        // serialize in-process enums inside the job. Follow-up: serialize the
-        // four fixed strings on the caller's thread and pass them prepared.
-        (
-            "crates/store/src/sessions.rs",
-            "serde_json::to_string(&AgentState::Idle).unwrap(),",
-        ),
-        (
-            "crates/store/src/sessions.rs",
-            "serde_json::to_string(&lifecycle).unwrap(),",
-        ),
-        (
-            "crates/store/src/sessions.rs",
-            "serde_json::to_string(&state).unwrap(),",
-        ),
-        (
-            "crates/store/src/sessions.rs",
-            "serde_json::to_string(&expected).unwrap(),",
-        ),
-        (
-            "crates/store/src/sessions.rs",
-            "serde_json::to_string(&new).unwrap(),",
-        ),
-        (
-            "crates/store/src/sessions.rs",
-            "let state_json = serde_json::to_string(&t.new_state).unwrap();",
-        ),
-        ("crates/store/src/sessions.rs", "serde_json::json!({"),
-        // crates/store/src/tasks.rs — task_complete_verified serializes the
-        // terminal state inside the job. Follow-up: capture the constant JSON
-        // before enqueue.
-        (
-            "crates/store/src/tasks.rs",
-            "serde_json::to_string(&TaskState::VerifiedComplete).unwrap(),",
-        ),
-    ];
+    /// Writer-job closures that still prepare nothing. The ratchet is
+    /// COMPLETE: every audited call site now prepares its serialization,
+    /// construction, filesystem work and hashing on the caller's thread, so
+    /// this list is EMPTY and must stay empty. `writer_job_allowlist_is_empty`
+    /// fails loudly the moment an entry is re-added — re-adding one is a
+    /// regression; fix the call site instead. The scan's forbidden-marker
+    /// coverage is unchanged: `crates/store/src/connection.rs` and
+    /// `writer.rs` (the owned writer core) stay prepared.
+    const WRITER_JOB_ALLOWLIST: &[(&str, &str)] = &[];
 
     /// True for bytes that continue a Rust identifier (used to keep marker
     /// matches from firing inside longer paths/identifiers).
@@ -6192,30 +6144,36 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 writer_job_offenders(&f)
             );
         }
+        // The ratchet is empty: even a newly planted unprepared job in a
+        // former allowlisted file has no escape hatch left and must fire.
+        let planted = synthetic_file(
+            "crates/store/src/ledger.rs",
+            "fn f() { self.writer.execute(\"x\", move |conn| { let _ = serde_json::json!({}); Ok(()) }) }\n",
+        );
+        assert!(
+            !writer_job_offenders(&planted).is_empty(),
+            "a newly planted unprepared job in a former allowlisted file must be caught"
+        );
     }
 
-    /// Every grandfathered writer-job allowlist entry must still name a real
-    /// line (a dead entry means the residual moved and must be re-audited),
-    /// and the owned writer core may never be allowlisted.
+    /// The writer-job ratchet is COMPLETE: the allowlist is empty, so a new
+    /// unprepared job in ANY production file is a red scan. Non-emptiness is
+    /// itself a failure — re-adding an entry is a regression, not a fix.
     #[test]
-    fn writer_job_allowlist_entries_stay_load_bearing_and_non_stale() {
-        for (rel, text) in WRITER_JOB_ALLOWLIST {
-            let src = std::fs::read_to_string(repo_root().join(rel))
-                .unwrap_or_else(|_| panic!("allowlisted writer file missing: {rel}"));
-            assert!(
-                src.lines().any(|l| l.trim() == *text),
-                "stale writer-job allowlist entry {rel}: {text:?} — the residual moved \
-                 or was fixed; update the allowlist"
-            );
-            assert_ne!(
-                *rel, "crates/store/src/connection.rs",
-                "the owned writer core must stay prepared: {text:?}"
-            );
-            assert_ne!(
-                *rel, "crates/store/src/writer.rs",
-                "the writer service itself must stay prepared: {text:?}"
-            );
-        }
+    fn writer_job_allowlist_is_empty() {
+        assert!(
+            WRITER_JOB_ALLOWLIST.is_empty(),
+            "the writer-job allowlist ratchet is complete and must stay empty; \
+             fix the call site instead of re-adding an entry: {WRITER_JOB_ALLOWLIST:?}"
+        );
+        // The owned writer core can never be grandfathered, empty or not.
+        assert!(
+            !WRITER_JOB_ALLOWLIST
+                .iter()
+                .any(|(rel, _)| *rel == "crates/store/src/connection.rs"
+                    || *rel == "crates/store/src/writer.rs"),
+            "the owned writer core must stay prepared"
+        );
     }
 
     // ------------------------------------------------------------------
