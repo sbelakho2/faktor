@@ -42,6 +42,7 @@ import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
 import dev.faktor.shared.view
+import java.awt.GraphicsEnvironment
 import java.awt.Toolkit
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
@@ -1980,15 +1981,18 @@ object FrontendSmoke {
 
         // Audit 11: the paste binding is the platform menu shortcut (the
         // toolkit's own mask: Command+V on macOS, Ctrl+V elsewhere), never a
-        // hardcoded Ctrl stroke.
+        // hardcoded Ctrl stroke. Headless there is no toolkit display: the
+        // binding must still exist on the documented Ctrl/X11 fallback mask,
+        // and the toolkit mask itself is only asserted when a toolkit exists.
         step("paste shortcut binds the platform menu-shortcut mask") {
+            val headless = GraphicsEnvironment.isHeadless()
             val panel = AttachmentsPanel()
-            val mask = Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
+            val mask = menuShortcutMask()
             val bound = panel.pasteKeyStroke() ?: fail("the panel must install a paste binding")
             assertEquals(
                 KeyStroke.getKeyStroke(KeyEvent.VK_V, mask),
                 bound,
-                "the binding is VK_V with the toolkit's menu-shortcut mask"
+                "the binding is VK_V with the platform menu-shortcut mask"
             )
             assertEquals(KeyEvent.VK_V, bound.keyCode)
             assertEquals(false, bound.isOnKeyRelease)
@@ -1996,13 +2000,29 @@ object FrontendSmoke {
                 (bound.modifiers and mask) == mask,
                 "the bound stroke carries the platform menu-shortcut mask"
             )
-            // Where the menu shortcut is NOT Ctrl (macOS: Command), the old
-            // hardcoded `ctrl V` stroke must not be what is installed.
-            if (mask != InputEvent.CTRL_DOWN_MASK) {
-                assertTrue(
-                    bound != KeyStroke.getKeyStroke(KeyEvent.VK_V, InputEvent.CTRL_DOWN_MASK),
-                    "a non-Ctrl platform must not bind plain Ctrl+V"
+            if (headless) {
+                // The headless platform contract is the documented Ctrl mask
+                // (Linux/X11): the same helper the binding used, so a silent
+                // headless toolkit call regression fails here.
+                assertEquals(
+                    InputEvent.CTRL_DOWN_MASK,
+                    mask,
+                    "headless must bind the documented Ctrl fallback mask"
                 )
+            } else {
+                assertEquals(
+                    Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx,
+                    mask,
+                    "headful must bind the toolkit's own menu-shortcut mask"
+                )
+                // Where the menu shortcut is NOT Ctrl (macOS: Command), the
+                // old hardcoded `ctrl V` stroke must not be what is installed.
+                if (mask != InputEvent.CTRL_DOWN_MASK) {
+                    assertTrue(
+                        bound != KeyStroke.getKeyStroke(KeyEvent.VK_V, InputEvent.CTRL_DOWN_MASK),
+                        "a non-Ctrl platform must not bind plain Ctrl+V"
+                    )
+                }
             }
             assertTrue(
                 panel.actionMap.get("faktor-paste-image") != null,
@@ -2020,9 +2040,9 @@ object FrontendSmoke {
             val bytes = AttachmentImages.pngBytes(image) ?: fail("the PNG conversion refused")
             assertTrue(bytes.size > 8, "PNG bytes must carry the signature + payload")
             assertEquals(0x89.toByte(), bytes[0], "PNG signature byte 0")
-            assertEquals('P'.code.toByte(), bytes[1], "PNG signature byte 1")
-            assertEquals('N'.code.toByte(), bytes[2], "PNG signature byte 2")
-            assertEquals('G'.code.toByte(), bytes[3], "PNG signature byte 3")
+            assertEquals('P'.toInt().toByte(), bytes[1], "PNG signature byte 1")
+            assertEquals('N'.toInt().toByte(), bytes[2], "PNG signature byte 2")
+            assertEquals('G'.toInt().toByte(), bytes[3], "PNG signature byte 3")
             val decoded = ImageIO.read(ByteArrayInputStream(bytes))
                 ?: fail("the in-memory PNG must decode")
             assertEquals(3, decoded.width)
@@ -2044,6 +2064,17 @@ object FrontendSmoke {
             // The panel stages the bytes separately from paths and never
             // creates a file for them.
             val panel = AttachmentsPanel()
+            if (GraphicsEnvironment.isHeadless()) {
+                // No OS clipboard exists headless: the paste path must answer
+                // the explicit unavailable refusal (never throw, never stage),
+                // while the in-memory PNG conversion below stays exercised.
+                val refusal = panel.pasteImageFromClipboard()
+                assertTrue(
+                    refusal != null && refusal.contains("unavailable"),
+                    "a headless clipboard paste must return the explicit refusal"
+                )
+                assertEquals(0, panel.binaryCount(), "a refused paste stages nothing")
+            }
             assertTrue(panel.addClipboardImage(image, "clip-shot.png"))
             assertEquals(1, panel.binaryCount())
             assertEquals(1, panel.count())
@@ -2238,7 +2269,7 @@ object FrontendSmoke {
                     assertEquals(limits.image.mimes.map { it.mime }, policy.imageMimes)
                     assertTrue(
                         AttachmentImages.emergencyPolicy().maxImageBytes <=
-                            limits.image.mimes.maxOf { it.maxBytes },
+                            (limits.image.mimes.map { it.maxBytes }.max() ?: 0),
                         "the emergency ceiling must stay conservative"
                     )
                     assertEquals(

@@ -20,11 +20,13 @@ import dev.faktor.shared.asciiLowerCase
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
+import java.awt.GraphicsEnvironment
 import java.awt.Image
 import java.awt.Toolkit
 import java.awt.datatransfer.Clipboard
 import java.awt.datatransfer.DataFlavor
 import java.awt.event.ActionEvent
+import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
@@ -110,11 +112,11 @@ object AttachmentImages {
         maxUploadBytes = limits.maxUploadBytes,
         maxAttachmentBytes = limits.maxAttachmentBytes,
         imageMimes = limits.image.mimes.map { it.mime },
-        maxImageBytes = limits.image.mimes.map { it.maxBytes }.minOrNull() ?: MAX_IMAGE_BYTES,
+        maxImageBytes = limits.image.mimes.map { it.maxBytes }.min() ?: MAX_IMAGE_BYTES,
         maxRequestImageBytes = limits.image.maxRequestBytes,
         documentCapable = limits.document.capable,
         documentMimes = limits.document.mimes.map { it.mime },
-        maxDocumentBytes = limits.document.mimes.map { it.maxBytes }.minOrNull() ?: MAX_DOCUMENT_BYTES,
+        maxDocumentBytes = limits.document.mimes.map { it.maxBytes }.min() ?: MAX_DOCUMENT_BYTES,
         maxRequestDocumentBytes = limits.document.maxRequestBytes
     )
 
@@ -468,13 +470,26 @@ private const val HEX = "0123456789abcdef"
 private const val PASTE_ACTION = "faktor-paste-image"
 
 /**
+ * The platform menu-shortcut mask: Command on macOS, Ctrl on Windows/Linux,
+ * decided by the toolkit and never hardcoded. A headless JVM has no
+ * toolkit display, so the mask falls back to the documented Ctrl/X11
+ * contract instead of throwing HeadlessException; the paste binding always
+ * exists, headless included.
+ */
+internal fun menuShortcutMask(): Int =
+    if (GraphicsEnvironment.isHeadless()) {
+        InputEvent.CTRL_DOWN_MASK
+    } else {
+        Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
+    }
+
+/**
  * The ONE platform menu-shortcut paste stroke: `KeyStroke.getKeyStroke(
- * KeyEvent.VK_V, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx)` —
- * Command+V on macOS, Ctrl+V on Windows/Linux, decided by the toolkit and
- * never by a hardcoded Ctrl binding.
+ * KeyEvent.VK_V, menuShortcutMask())` — Command+V on macOS, Ctrl+V on
+ * Windows/Linux (and the headless fallback), never a hardcoded Ctrl stroke.
  */
 private fun menuShortcutV(): KeyStroke =
-    KeyStroke.getKeyStroke(KeyEvent.VK_V, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx)
+    KeyStroke.getKeyStroke(KeyEvent.VK_V, menuShortcutMask())
 
 /**
  * Bounded LOCAL pending-upload state for the Task composer (audit 29,
@@ -665,9 +680,14 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
     /**
      * Paste the system clipboard image (if any) as an in-memory pending
      * attachment. Returns null on success, else the typed refusal text the
-     * composer surfaces; a headless/absent clipboard is never an exception.
+     * composer surfaces; a headless/absent clipboard is never an exception
+     * and never a silent no-op: headless returns the explicit unavailable
+     * refusal before any toolkit access.
      */
     fun pasteImageFromClipboard(): String? {
+        if (GraphicsEnvironment.isHeadless()) {
+            return "the system clipboard is unavailable in this environment"
+        }
         val clipboard: Clipboard = try {
             Toolkit.getDefaultToolkit().systemClipboard
         } catch (e: Exception) {

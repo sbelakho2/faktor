@@ -172,7 +172,7 @@ fun parseProtocolMessage(v: JsonView): ProtocolMessage {
         sessionId = v.field("session_id").string(),
         seq = v.field("seq").long(),
         createdMs = v.field("created_ms").long(),
-        parts = v.field("parts").array().map { parseProtocolPart(it) },
+        parts = v.field("parts").array().map { parseProtocolPart(it) }
     )
 }
 
@@ -187,7 +187,7 @@ fun parseProtocolPart(v: JsonView): ProtocolPart {
         }
     }
             ProtocolPart.Text(
-                text = v.field("text").string(),
+                text = v.field("text").string()
             )
         }
         "reasoning" -> {
@@ -198,7 +198,7 @@ fun parseProtocolPart(v: JsonView): ProtocolPart {
         }
     }
             ProtocolPart.Reasoning(
-                text = v.field("text").string(),
+                text = v.field("text").string()
             )
         }
         "tool_call" -> {
@@ -212,7 +212,7 @@ fun parseProtocolPart(v: JsonView): ProtocolPart {
                 toolCallId = v.field("tool_call_id").string(),
                 name = v.field("name").string(),
                 input = v.field("input").value,
-                state = v.field("state").string(),
+                state = v.field("state").string()
             )
         }
         "tool_result" -> {
@@ -224,7 +224,7 @@ fun parseProtocolPart(v: JsonView): ProtocolPart {
     }
             ProtocolPart.ToolResult(
                 toolCallId = v.field("tool_call_id").string(),
-                result = parseProtocolToolResultBody(v.field("result")),
+                result = parseProtocolToolResultBody(v.field("result"))
             )
         }
         "summary" -> {
@@ -235,7 +235,7 @@ fun parseProtocolPart(v: JsonView): ProtocolPart {
         }
     }
             ProtocolPart.Summary(
-                text = v.field("text").string(),
+                text = v.field("text").string()
             )
         }
         else -> throw NativeProtocolException(v.path, "unknown Part type " + tag)
@@ -253,7 +253,7 @@ fun parseProtocolToolResultBody(v: JsonView): ProtocolToolResultBody {
         excerpt = v.field("excerpt").string(),
         exitCode = v.optionalField("exit_code")?.int(),
         artifact = v.optionalField("artifact")?.string(),
-        sliceHint = v.optionalField("slice_hint")?.string(),
+        sliceHint = v.optionalField("slice_hint")?.string()
     )
 }
 
@@ -262,7 +262,7 @@ fun parseProtocolPageMeta(v: JsonView): ProtocolPageMeta {
         size = v.field("size").long(),
         cursor = v.optionalField("cursor")?.long(),
         hasMore = v.field("has_more").bool(),
-        totalEstimate = v.optionalField("total_estimate")?.long(),
+        totalEstimate = v.optionalField("total_estimate")?.long()
     )
 }
 
@@ -272,7 +272,7 @@ fun parseProtocolMessagesPage(v: JsonView): ProtocolMessagesPage {
         messages = v.field("messages").array().map { parseProtocolMessage(it) },
         hasMore = v.field("has_more").bool(),
         nextBefore = v.optionalField("next_before")?.long(),
-        page = v.optionalField("page")?.let { parseProtocolPageMeta(it) } ?: ProtocolPageMeta(0L, null, false, null),
+        page = v.optionalField("page")?.let { parseProtocolPageMeta(it) } ?: ProtocolPageMeta(0L, null, false, null)
     )
 }
 
@@ -283,7 +283,7 @@ fun parseProtocolSessionState(v: JsonView): ProtocolSessionState {
         title = v.field("title").string(),
         lastEventSeq = v.field("last_event_seq").long(),
         agentState = parseProtocolAgentStateView(v.field("agent_state")),
-        taskLedger = v.optionalField("task_ledger")?.value,
+        taskLedger = v.optionalField("task_ledger")?.value
     )
 }
 
@@ -292,7 +292,7 @@ fun parseProtocolAgentStateView(v: JsonView): ProtocolAgentStateView {
         state = v.field("state").string(),
         label = v.field("label").string(),
         active = v.field("active").bool(),
-        terminal = v.field("terminal").bool(),
+        terminal = v.field("terminal").bool()
     )
 }
 
@@ -301,7 +301,7 @@ fun parseProtocolAttachmentId(v: JsonView): ProtocolAttachmentId {
         digest = v.field("digest").string(),
         mime = v.field("mime").string(),
         filename = v.optionalField("filename")?.string(),
-        size = v.field("size").long(),
+        size = v.field("size").long()
     )
 }
 
@@ -311,7 +311,7 @@ fun parseProtocolAttachmentRef(v: JsonView): ProtocolAttachmentRef {
         digest = v.field("digest").string(),
         mime = v.field("mime").string(),
         filename = v.optionalField("filename")?.string(),
-        size = v.field("size").long(),
+        size = v.field("size").long()
     )
 }
 
@@ -325,7 +325,7 @@ fun parseProtocolAttachmentUpload(v: JsonView): ProtocolAttachmentUpload {
     return ProtocolAttachmentUpload(
         mime = v.field("mime").string(),
         filename = v.optionalField("filename")?.string(),
-        dataBase64 = v.field("data_base64").string(),
+        dataBase64 = v.field("data_base64").string()
     )
 }
 
@@ -337,7 +337,7 @@ fun parseProtocolTaskRun(v: JsonView): ProtocolTaskRun {
         state = v.field("state").string(),
         goal = v.optionalField("goal")?.string(),
         itemIds = v.field("item_ids").array().map { it.string() },
-        model = v.optionalField("model")?.string(),
+        model = v.optionalField("model")?.string()
     )
 }
 
@@ -345,14 +345,14 @@ fun parseProtocolTaskRunStarted(v: JsonView): ProtocolTaskRunStarted {
     return ProtocolTaskRunStarted(
         taskId = v.field("task_id").long(),
         runId = v.field("run_id").string(),
-        state = v.field("state").string(),
+        state = v.field("state").string()
     )
 }
 
 fun parseProtocolTaskRunCancelled(v: JsonView): ProtocolTaskRunCancelled {
     return ProtocolTaskRunCancelled(
         runId = v.field("run_id").string(),
-        cancelled = v.field("cancelled").bool(),
+        cancelled = v.field("cancelled").bool()
     )
 }
 
@@ -370,7 +370,7 @@ fun parseProtocolTaskRunWorkItem(v: JsonView): ProtocolTaskRunWorkItem {
         dependsOn = v.optionalField("depends_on")?.array()?.map { it.string() },
         acceptanceChecks = v.optionalField("acceptance_checks")?.array()?.map { it.string() },
         ownership = v.optionalField("ownership")?.value,
-        requiredCapabilities = v.optionalField("required_capabilities")?.value,
+        requiredCapabilities = v.optionalField("required_capabilities")?.value
     )
 }
 
@@ -393,7 +393,7 @@ fun parseProtocolTaskRunStartRequest(v: JsonView): ProtocolTaskRunStartRequest {
         routingMode = v.optionalField("routing_mode")?.string(),
         files = v.optionalField("files")?.array()?.map { it.string() },
         attachments = v.optionalField("attachments")?.array()?.map { parseProtocolAttachmentId(it) },
-        completionContract = v.optionalField("completion_contract")?.value,
+        completionContract = v.optionalField("completion_contract")?.value
     )
 }
 
@@ -421,7 +421,7 @@ object ProtocolErrorCodes {
         "oversized",
         "rate_limited",
         "deadlock",
-        "internal_error",
+        "internal_error"
     )
 
     val HTTP_STATUS: Map<String, Int> = mapOf(
@@ -438,7 +438,7 @@ object ProtocolErrorCodes {
         "oversized" to 413,
         "rate_limited" to 429,
         "deadlock" to 409,
-        "internal_error" to 500,
+        "internal_error" to 500
     )
 
     val RETRYABLE: Map<String, Boolean> = mapOf(
@@ -455,7 +455,7 @@ object ProtocolErrorCodes {
         "oversized" to false,
         "rate_limited" to true,
         "deadlock" to true,
-        "internal_error" to false,
+        "internal_error" to false
     )
 }
 
