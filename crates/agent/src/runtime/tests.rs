@@ -20,8 +20,6 @@ pub(crate) use faktor_memory::MemoryWriter as _;
 
 pub(crate) use faktor_provider::{ContentKind, FakeProvider, ReportedCurrency, ScriptedResponse};
 
-pub(crate) use faktor_router::OutcomeStore as _;
-
 pub(crate) use faktor_session::budget::BudgetCapEvidence;
 
 pub(crate) use faktor_session::BudgetAuthority;

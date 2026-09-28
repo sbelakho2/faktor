@@ -918,6 +918,8 @@ impl From<faktor_store::VerificationRecordRow> for VerificationRecord {
 pub enum TaskError {
     #[error("task {0} not found")]
     NotFound(TaskId),
+    #[error("attachment blob not found: {0}")]
+    AttachmentBlobNotFound(String),
     #[error("task {task_id} already exists: a task row is created once and mutated through update_task/transition_task/complete_verified_task, never recreated")]
     AlreadyExists { task_id: TaskId },
     #[error("create_task refused: state {state:?} cannot seed a task; only Pending, Planning or Running may (VerifiedComplete requires a passing verification record via complete_verified_task)")]
@@ -939,6 +941,12 @@ pub enum TaskError {
         task_id: TaskId,
         expected: TaskRevision,
         actual: TaskRevision,
+    },
+    #[error("task {task_id} attachments changed concurrently: expected {expected:?}, actual {actual:?} (re-read the row and retry the seed)")]
+    AttachmentsChanged {
+        task_id: TaskId,
+        expected: Vec<AttachmentId>,
+        actual: Vec<AttachmentId>,
     },
     #[error("task is not Verifying (actual state {actual:?}); VerifiedComplete requires Verifying plus a passing record via complete_verified_task")]
     NotVerifying { actual: TaskState },
@@ -1123,6 +1131,7 @@ impl From<TaskError> for SessionError {
     fn from(e: TaskError) -> Self {
         match e {
             TaskError::NotFound(m) => SessionError::NotFound(format!("task {m}")),
+            TaskError::AttachmentBlobNotFound(m) => SessionError::NotFound(m),
             TaskError::Store(m) => SessionError::Store(faktor_store::StoreError::Conflict(m)),
             TaskError::Oversized(m) => SessionError::Oversized(m),
             TaskError::Malformed(m) => SessionError::Malformed(m),
@@ -1160,6 +1169,41 @@ fn task_error_from_core(e: faktor_core::Error) -> TaskError {
         faktor_core::ErrorKind::Oversized => TaskError::Oversized(e.message),
         faktor_core::ErrorKind::Conflict => TaskError::Conflict(e.message),
         _ => TaskError::Store(e.message),
+    }
+}
+
+/// Map one atomic-seed refusal onto the typed task error space. Every cause
+/// keeps its own variant; nothing here weakens the state-machine or CAS
+/// semantics into a prose-only error.
+fn seed_refusal_to_task_error(
+    task_id: TaskId,
+    refusal: faktor_store::SeedTaskAttachmentRefusal,
+) -> TaskError {
+    match refusal {
+        faktor_store::SeedTaskAttachmentRefusal::TaskMissing { .. } => TaskError::NotFound(task_id),
+        faktor_store::SeedTaskAttachmentRefusal::TaskExists { task_id } => {
+            TaskError::AlreadyExists { task_id }
+        }
+        faktor_store::SeedTaskAttachmentRefusal::RevisionMismatch { expected, actual } => {
+            TaskError::RevisionMismatch {
+                task_id,
+                expected,
+                actual,
+            }
+        }
+        faktor_store::SeedTaskAttachmentRefusal::Terminal { state } => {
+            TaskError::TerminalTask { task_id, state }
+        }
+        faktor_store::SeedTaskAttachmentRefusal::AttachmentsMismatch { expected, actual } => {
+            TaskError::AttachmentsChanged {
+                task_id,
+                expected,
+                actual,
+            }
+        }
+        faktor_store::SeedTaskAttachmentRefusal::IllegalCreateState { state } => {
+            TaskError::IllegalCreateState { state }
+        }
     }
 }
 
@@ -1706,6 +1750,133 @@ impl SessionHandle {
         out.updated_ms = self.manager.now_ms();
         store.upsert_task(&out)?;
         Ok(Task::from(out))
+    }
+
+    /// Atomically seed ONE task's durable attachment set (audit finding 2):
+    /// every id is structurally validated and every CAS blob is verified by a
+    /// streamed re-hash (`Cas::verify_now`, no bytes materialize) BEFORE
+    /// anything is written; the reference rows AND the task-row write then
+    /// land in ONE store `BEGIN IMMEDIATE` transaction, so the seed either
+    /// fully succeeds or leaves the durable state unchanged — reference rows
+    /// included.
+    ///
+    /// `create` is the CREATE template, used only when the caller expects no
+    /// task row yet (the orchestrated child): `Some(task)` inserts that row
+    /// with revision 1 when none exists and refuses typed when one does
+    /// ([`TaskError::AlreadyExists`]). `None` patches the EXISTING row under
+    /// the preflight revision, non-terminal state and current attachment set,
+    /// all of which the transaction re-verifies (a concurrent change is a
+    /// typed refusal with zero writes).
+    ///
+    /// A terminal task row is frozen: `Ok(None)` with zero writes (no
+    /// reference rows, no task patch).
+    pub fn seed_task_attachments(
+        &self,
+        attachments: &[AttachmentId],
+        create: Option<Task>,
+    ) -> Result<Option<Task>, TaskError> {
+        if attachments.is_empty() {
+            return Ok(None);
+        }
+        if attachments.len() > MAX_ATTACHMENTS_PER_TASK {
+            return Err(TaskError::Oversized(format!(
+                "{} seeded attachments exceed MAX_ATTACHMENTS_PER_TASK ({MAX_ATTACHMENTS_PER_TASK})",
+                attachments.len()
+            )));
+        }
+        for id in attachments {
+            id.validate().map_err(task_error_from_core)?;
+        }
+        for id in attachments {
+            self.manager
+                .cas()
+                .verify_now(&id.digest.to_hex())
+                .map_err(|e| match e {
+                    faktor_cas::CasError::NotFound(hash) => {
+                        TaskError::AttachmentBlobNotFound(hash.to_string())
+                    }
+                    other => TaskError::Store(other.to_string()),
+                })?;
+        }
+        let _guard = self.command_guard();
+        let task_id = self.task_id().map_err(|e| TaskError::Store(e.message))?;
+        if let Some(template) = &create {
+            if template.task_id != task_id || template.session_id != self.id {
+                return Err(TaskError::Malformed(
+                    "the seed create template must carry this session's own task identity".into(),
+                ));
+            }
+            if !template.state.is_creatable() {
+                return Err(TaskError::IllegalCreateState {
+                    state: template.state,
+                });
+            }
+        }
+        let store = self.manager.store();
+        let existing = store.get_task(self.id, task_id)?;
+        if existing.as_ref().is_some_and(|row| row.state.is_terminal()) {
+            return Ok(None);
+        }
+        let mut prepared_refs = Vec::with_capacity(attachments.len());
+        for id in attachments {
+            prepared_refs
+                .push(faktor_store::PreparedAttachmentRef::prepare(id).map_err(TaskError::from)?);
+        }
+        let now = self.manager.now_ms();
+        let (target, expected_revision, expected_attachments, expected_nonterminal, write) =
+            match create {
+                Some(mut template) => {
+                    template.attachments = attachments.to_vec();
+                    if template.created_ms == 0 {
+                        template.created_ms = now;
+                    }
+                    template.updated_ms = now;
+                    validate_task_fields(&template)?;
+                    let write = faktor_store::PreparedTaskWrite::prepare(task_row(
+                        template,
+                        TaskRevision::new(1),
+                    ))
+                    .map_err(TaskError::from)?;
+                    (None, None, None, false, write)
+                }
+                None => {
+                    let Some(row) = existing else {
+                        return Err(TaskError::NotFound(task_id));
+                    };
+                    let mut next = Task::from(row.clone());
+                    next.attachments = attachments.to_vec();
+                    next.updated_ms = now;
+                    validate_task_fields(&next)?;
+                    let revision = row
+                        .revision
+                        .checked_next()
+                        .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
+                    let write = faktor_store::PreparedTaskWrite::prepare(task_row(next, revision))
+                        .map_err(TaskError::from)?;
+                    (
+                        Some(task_id),
+                        Some(row.revision),
+                        Some(row.attachments),
+                        true,
+                        write,
+                    )
+                }
+            };
+        let outcome = store
+            .seed_task_attachments_txn(
+                self.id,
+                target,
+                expected_revision,
+                expected_attachments,
+                expected_nonterminal,
+                &prepared_refs,
+                write,
+            )
+            .map_err(TaskError::from)?;
+        match outcome {
+            Ok(row) => Ok(Some(Task::from(row))),
+            Err(refusal) => Err(seed_refusal_to_task_error(task_id, refusal)),
+        }
     }
 
     /// Drive ONE legal machine edge (audit P0-7) — the single chokepoint

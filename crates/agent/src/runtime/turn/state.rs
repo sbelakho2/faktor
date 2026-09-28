@@ -2088,30 +2088,25 @@ impl AgentRuntime {
 
     // ------------------------------------------------------------ entry points
 
-    /// Inherit the run's durable BINARY attachment set into one child
-    /// session BEFORE its drive begins (the orchestrated-child path; the
-    /// parent's rows are session-scoped, so each id is re-admitted here):
+    /// Seed the run's durable BINARY attachment set into one child session
+    /// BEFORE its drive begins (the orchestrated-child path; the parent's
+    /// rows are session-scoped, so each id is re-admitted here):
     ///
     /// - the terminal preflight runs FIRST: a child whose task row is already
     ///   terminal is frozen and returns `Ok` with NO attachment write at all
     ///   (the row cannot gain new durable references);
     /// - every id is structurally validated and every CAS blob is verified
-    ///   by a streamed re-hash BEFORE anything is written
-    ///   ([`faktor_session::SessionHandle::inherit_attachments`]) — no bytes
+    ///   by a streamed re-hash BEFORE anything is written — no bytes
     ///   materialize and a missing/tampered blob leaves zero new rows;
-    /// - all reference rows land in ONE writer transaction (all-or-nothing),
-    ///   then the session's durable Task row carries the set, so request
-    ///   construction resolves the byte-identical bytes on every hop and
-    ///   after a crash re-attach (never expanded in durable JSON).
-    ///
-    /// Residual gap (documented precisely — NOT claimed atomic): the
-    /// reference batch and the task row write are two writer transactions,
-    /// because the task row owns its state-machine validation in the session
-    /// layer. A failure between them can leave the COMPLETE reference set
-    /// unreferenced by the task row — never a partial set, and never a task
-    /// row pointing at references that do not exist; a concurrent terminal
-    /// transition after the preflight can likewise leave the complete set
-    /// unpatched. Re-running the seed converges idempotently.
+    /// - the reference rows AND the task row write (create or patch) land in
+    ///   ONE store `BEGIN IMMEDIATE` transaction
+    ///   ([`faktor_session::SessionHandle::seed_task_attachments`]): every
+    ///   failed condition rolls the whole seed back, so a failure leaves ZERO
+    ///   durable writes. There is no two-transaction window in which the
+    ///   complete reference set can be orphaned by a failed task patch, and a
+    ///   task transitioned to terminal between the preflight and the write is
+    ///   re-verified inside the transaction (typed refusal, zero writes) —
+    ///   never a frozen row that gained references.
     ///
     /// An empty set is a no-op (byte-parity for attachment-free children).
     pub fn seed_task_attachments(
@@ -2135,31 +2130,27 @@ impl AgentRuntime {
         {
             return Ok(());
         }
-        handle.inherit_attachments(attachments)?;
-        if existing.is_some() {
-            handle.update_task(
+        // The create template is used ONLY when the preflight saw no task row;
+        // an existing row is patched under the transaction's revision CAS.
+        let create = if existing.is_none() {
+            let now = handle.now_ms();
+            let goal = truncate(&handle.title()?, 200);
+            Some(Task {
                 task_id,
-                faktor_session::TaskPatch {
-                    attachments: Some(attachments.to_vec()),
-                    ..Default::default()
-                },
-            )?;
-            return Ok(());
-        }
-        let now = handle.now_ms();
-        let goal = truncate(&handle.title()?, 200);
-        handle.create_task(Task {
-            task_id,
-            session_id: session,
-            goal,
-            acceptance_criteria: Vec::new(),
-            plan: Vec::new(),
-            attachments: attachments.to_vec(),
-            budget: faktor_session::TaskBudget::default(),
-            state: TaskState::Pending,
-            created_ms: now,
-            updated_ms: now,
-        })?;
+                session_id: session,
+                goal,
+                acceptance_criteria: Vec::new(),
+                plan: Vec::new(),
+                attachments: Vec::new(),
+                budget: faktor_session::TaskBudget::default(),
+                state: TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+        } else {
+            None
+        };
+        handle.seed_task_attachments(attachments, create)?;
         Ok(())
     }
 
@@ -2432,12 +2423,14 @@ mod tests {
         );
     }
 
-    /// A task patch that fails AFTER validation must never leave a PARTIAL
-    /// reference set. The hostile revision-overflow row forces exactly that
-    /// failure: the batch is all-or-nothing, so only the complete requested
-    /// set can remain, and the task row is provably unpatched.
+    /// A seed whose task patch fails leaves ZERO durable writes: the hostile
+    /// revision-overflow row forces a typed Malformed before enqueue, and
+    /// because the reference batch and the task write are ONE transaction
+    /// there is no "complete reference set inserted, task row unpatched"
+    /// intermediate. The task row is unchanged and the child holds no
+    /// reference rows.
     #[test]
-    fn seed_task_attachments_task_patch_failure_leaves_no_partial_reference_set() {
+    fn seed_task_attachments_task_patch_failure_leaves_zero_writes() {
         let (runtime, parent, child, _dir) = parent_child();
         let a = parent
             .put_attachment("image/png", Some("a.png"), b"\x89PNG-a")
@@ -2446,8 +2439,7 @@ mod tests {
             .put_attachment("application/pdf", Some("b.pdf"), b"%PDF-b")
             .unwrap();
         // Hostile durable row: non-terminal but with an exhausted revision,
-        // so the task patch must fail with a typed Malformed AFTER the
-        // attachment batch validated.
+        // so the seed must fail with a typed Malformed.
         seed_task_row(
             &child,
             &runtime.deps().session.store(),
@@ -2458,17 +2450,16 @@ mod tests {
         let task_id = child.task_id().unwrap();
         let err = runtime
             .seed_task_attachments(child.id(), &[a.clone(), b.clone()])
-            .expect_err("an exhausted revision must fail the task patch");
+            .expect_err("an exhausted revision must fail the seed");
         assert_eq!(err.kind, ErrorKind::Malformed);
-        let stored = child.list_attachments(16).unwrap();
         assert!(
-            stored.is_empty() || (stored.contains(&a) && stored.contains(&b)),
-            "a failed task patch must never leave a partial reference set: {stored:?}"
+            child.list_attachments(16).unwrap().is_empty(),
+            "a failed seed must leave ZERO reference rows, never the complete set"
         );
         assert_eq!(
             child.get_task(task_id).unwrap().unwrap().attachments,
             Vec::new(),
-            "the failed patch must not have changed the task row"
+            "the failed seed must not have changed the task row"
         );
     }
 }

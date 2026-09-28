@@ -34,11 +34,13 @@ import {
 import {
   parseProtocolErrorEnvelope,
   validateProtocolAttachmentId,
+  validateProtocolAttachmentRef,
   validateProtocolTaskRun,
   validateProtocolTaskRunCancelled,
   validateProtocolTaskRunStarted,
   ProtocolDtoError,
   type ProtocolAttachmentId,
+  type ProtocolAttachmentRef,
   type ProtocolJson,
   type ProtocolTaskRun,
   type ProtocolTaskRunCancelled,
@@ -673,6 +675,28 @@ export type NativeTaskRunCancelled = ProtocolTaskRunCancelled;
  * from the canonical schema (`ProtocolAttachmentId`).
  */
 export type NativeAttachmentId = ProtocolAttachmentId;
+
+/**
+ * One durable attachment REFERENCE: the surrogate `ref_id` the retrieval
+ * routes address plus the exact CAS digest and presentation metadata.
+ * Generated from the canonical schema (`ProtocolAttachmentRef`); the upload
+ * response is this shape, so the reference identity is never discarded.
+ */
+export type NativeAttachmentRef = ProtocolAttachmentRef;
+
+/** The exact task-admission projection of one reference: the durable
+ *  `AttachmentId` a task start's `attachments` member carries (the reference
+ *  identity is retained locally, never widened onto the wire). */
+export function attachmentIdOf(ref: NativeAttachmentRef): NativeAttachmentId {
+  return { digest: ref.digest, mime: ref.mime, filename: ref.filename, size: ref.size };
+}
+
+/** One served attachment byte payload: the exact bytes plus the server's
+ *  MIME for the addressed reference (`null` when the daemon sent none). */
+export interface NativeAttachmentBytes {
+  readonly mime: string | null;
+  readonly bytes: Uint8Array;
+}
 
 export interface NativeAgentEntry {
   readonly agent_id: string;
@@ -2048,6 +2072,24 @@ export function validateAttachmentId(json: Json): NativeAttachmentId {
     fail(path, `expected a non-negative size, got ${id.size}`);
   }
   return id;
+}
+
+/** Strict decode of one durable attachment REFERENCE (the upload response
+ *  and the ref/blob metadata routes). The generated decoder owns the shape;
+ *  the canonical `ref_id` and digest/size invariants the native surface
+ *  additionally promises are checked here. */
+export function validateAttachmentRef(json: Json, path: string): NativeAttachmentRef {
+  const ref = asNativeProtocol(() => validateProtocolAttachmentRef(json, path));
+  if (!Number.isInteger(ref.ref_id) || ref.ref_id < 1) {
+    fail(path, `expected a positive integer ref_id, got ${JSON.stringify(ref.ref_id)}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(ref.digest)) {
+    fail(path, `expected a 64-char lowercase hex digest, got ${JSON.stringify(ref.digest)}`);
+  }
+  if (ref.size < 0) {
+    fail(path, `expected a non-negative size, got ${ref.size}`);
+  }
+  return ref;
 }
 
 function presentationTag(object: JsonObject, key: string, path: string): 'foreground' | 'background' {
@@ -3680,6 +3722,52 @@ export class NativeClient {
     return options.validate(parsed, label);
   }
 
+  /**
+   * One bounded raw-byte GET. Non-2xx bodies are mapped to the daemon's
+   * typed error envelope exactly like every JSON request; a 2xx body is
+   * returned byte-exact with the server's own `content-type` (never a
+   * fabricated MIME, `null` when the daemon sends none). The body is read
+   * under an explicit byte cap.
+   */
+  private async requestBytes(
+    method: string,
+    path: string,
+    maxBytes: number,
+  ): Promise<NativeAttachmentBytes> {
+    const url = new URL(this.baseUrl + path);
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.bearerToken}`,
+      Accept: '*/*',
+    };
+    if (this.controlToken !== null) {
+      headers['x-faktor-control-token'] = this.controlToken;
+    }
+    const controller = new AbortController();
+    const timeout = this.timeoutMs;
+    const timer = setTimeout(() => controller.abort(), timeout);
+    let response: ResponseLike;
+    try {
+      response = await this.fetchImpl(url.toString(), { method, headers, signal: controller.signal });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new NativeProtocolError(`${method} ${path}`, `request timed out after ${timeout}ms`);
+      }
+      throw new NativeProtocolError(
+        `${method} ${path}`,
+        `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    const label = `${method} ${path}`;
+    if (!response.ok) {
+      const text = await readBounded(response, ERROR_BODY_BYTES, label);
+      throw apiError(response.status, text, label);
+    }
+    const mime = response.headers?.get?.('content-type') ?? null;
+    return { mime, bytes: await readBoundedBytes(response, maxBytes, label) };
+  }
+
   health(): Promise<NativeHealth> {
     return this.request('GET', '/native/health', { validate: validateHealth });
   }
@@ -3780,15 +3868,16 @@ export class NativeClient {
   /**
    * Upload ONE bounded binary attachment (standard base64) into the
    * session's durable CAS-backed store. The response is the typed
-   * `AttachmentId` a task start's `attachments` member accepts; task
-   * admission later validates an image id against the chosen model's
-   * vision capability (a typed refusal, never a dropped image). Callers
-   * must restore the draft on any refusal.
+   * `AttachmentRef` (surrogate `ref_id` plus digest/mime/filename/size) a
+   * task start's `attachments` member projects from via
+   * [`attachmentIdOf`]; task admission later validates an image id against
+   * the chosen model's vision capability (a typed refusal, never a dropped
+   * image). Callers must restore the draft on any refusal.
    */
   uploadAttachment(
     sessionId: string,
     request: { mime: string; filename?: string | null; data_base64: string },
-  ): Promise<NativeAttachmentId> {
+  ): Promise<NativeAttachmentRef> {
     return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/attachments`, {
       body: {
         mime: request.mime,
@@ -3797,8 +3886,54 @@ export class NativeClient {
           : {}),
         data_base64: request.data_base64,
       },
-      validate: validateAttachmentId,
+      validate: (json, path) => validateAttachmentRef(json, path),
     });
+  }
+
+  /** Resolve ONE durable attachment reference's own metadata. */
+  attachmentReference(sessionId: string, refId: number): Promise<NativeAttachmentRef> {
+    if (!Number.isInteger(refId) || refId < 1) {
+      throw new NativeProtocolError(
+        'GET /native/session/{id}/attachments/ref/{ref_id}',
+        `refId must be a positive integer, got ${JSON.stringify(refId)}`,
+      );
+    }
+    return this.request(
+      'GET',
+      `/native/session/${encodeURIComponent(sessionId)}/attachments/ref/${encodeURIComponent(String(refId))}`,
+      { validate: (json, path) => validateAttachmentRef(json, path) },
+    );
+  }
+
+  /** The verified bytes of ONE reference, with THAT reference's MIME. */
+  attachmentReferenceBytes(sessionId: string, refId: number): Promise<NativeAttachmentBytes> {
+    if (!Number.isInteger(refId) || refId < 1) {
+      throw new NativeProtocolError(
+        'GET /native/session/{id}/attachments/ref/{ref_id}/bytes',
+        `refId must be a positive integer, got ${JSON.stringify(refId)}`,
+      );
+    }
+    return this.requestBytes(
+      'GET',
+      `/native/session/${encodeURIComponent(sessionId)}/attachments/ref/${encodeURIComponent(String(refId))}/bytes`,
+      this.maxBodyBytes,
+    );
+  }
+
+  /** The raw CAS bytes of one blob, byte-exact and MIME-less (the digest
+   *  addresses no single reference, so no reference MIME is invented). */
+  attachmentBlobBytes(sessionId: string, digest: string): Promise<Uint8Array> {
+    if (!/^[0-9a-f]{64}$/.test(digest)) {
+      throw new NativeProtocolError(
+        'GET /native/session/{id}/attachments/blob/{digest}/bytes',
+        `digest must be 64 lowercase hex chars, got ${JSON.stringify(digest)}`,
+      );
+    }
+    return this.requestBytes(
+      'GET',
+      `/native/session/${encodeURIComponent(sessionId)}/attachments/blob/${encodeURIComponent(digest)}/bytes`,
+      this.maxBodyBytes,
+    ).then((payload) => payload.bytes);
   }
 
   cancelTaskRun(sessionId: string, runId: string): Promise<NativeTaskRunCancelled> {
@@ -4282,6 +4417,53 @@ async function readBounded(
     throw new NativeProtocolError(label, `body ${buffer.byteLength} bytes exceeds bound ${maxBytes}`);
   }
   return decodeUtf8([new Uint8Array(buffer)], buffer.byteLength);
+}
+
+async function readBoundedBytes(
+  response: ResponseLike,
+  maxBytes: number,
+  label: string,
+): Promise<Uint8Array> {
+  const declared = Number(response.headers?.get?.('content-length') ?? Number.NaN);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new NativeProtocolError(label, `declared body ${declared} bytes exceeds bound ${maxBytes}`);
+  }
+  const reader = response.body?.getReader();
+  if (reader) {
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value) {
+        continue;
+      }
+      size += value.byteLength;
+      if (size > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Cancellation is best-effort; the rejection below is the point.
+        }
+        throw new NativeProtocolError(label, `streamed body exceeded bound ${maxBytes} bytes`);
+      }
+      chunks.push(value);
+    }
+    const joined = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return joined;
+  }
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength > maxBytes) {
+    throw new NativeProtocolError(label, `body ${buffer.byteLength} bytes exceeds bound ${maxBytes}`);
+  }
+  return new Uint8Array(buffer);
 }
 
 function decodeUtf8(chunks: readonly Uint8Array[], size: number): string {

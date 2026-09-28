@@ -602,27 +602,33 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
         // Native binary attachments (additive, strict): upload ONE bounded
         // payload into the session's durable CAS-backed store, resolve ONE
         // reference by its stable `ref_id` (metadata and THAT reference's
-        // MIME-tagged bytes), fetch one referenceless BLOB by digest as raw
-        // octet-stream bytes, and the deprecated digest metadata lookup
-        // (single-reference only; several references are a typed 409 that
-        // lists the candidate ref ids). IMAGES are stored here and validated
-        // against the CHOSEN model's capabilities (vision, deliverable mime,
-        // per-provider byte bound) at task admission, where a refusal keeps
-        // the draft and bytes intact.
+        // MIME-tagged bytes), resolve one blob's metadata by digest (exactly
+        // one reference; several references are a typed 409 that lists the
+        // candidate ref ids), and fetch one blob's raw octet-stream bytes.
+        // The route grammar is strictly separated: `ref/{ref_id}` is
+        // canonical-decimal id-addressed, `blob/{digest}` is 64-hex
+        // digest-addressed, so a digest can never collide with a ref id.
+        // IMAGES are stored here and validated against the CHOSEN model's
+        // capabilities (vision, deliverable mime, per-provider byte bound) at
+        // task admission, where a refusal keeps the draft and bytes intact.
         .route(
             "/native/session/{id}/attachments",
             post(native_attachment_upload),
+        )
+        .route(
+            "/native/session/{id}/attachments/blob/{digest}",
+            get(native_attachment_blob_get),
         )
         .route(
             "/native/session/{id}/attachments/blob/{digest}/bytes",
             get(native_attachment_blob_bytes),
         )
         .route(
-            "/native/session/{id}/attachments/{ref_id}",
+            "/native/session/{id}/attachments/ref/{ref_id}",
             get(native_attachment_get),
         )
         .route(
-            "/native/session/{id}/attachments/{ref_id}/bytes",
+            "/native/session/{id}/attachments/ref/{ref_id}/bytes",
             get(native_attachment_bytes),
         )
         // Multi-candidate implementation tournaments (additive): start an

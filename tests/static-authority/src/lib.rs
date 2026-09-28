@@ -128,10 +128,11 @@
 //!     production writer job closure (`.writer.execute` / `execute_raw` /
 //!     `Store::writer_debug_job`) must not contain filesystem I/O,
 //!     serialization (`serde_json`, `to_vec`/`from_str`/`.json`), hashing,
-//!     sleeps or wall-clock acquisition (`now_ms(`/`SystemTime::now`/
-//!     `Utc::now`): those run on the single writer owner and stall every
-//!     domain's mutations (and the bounded shutdown). Preparation — including
-//!     the timestamp — happens on the caller's thread BEFORE enqueueing.
+//!     digest/string materialization (`.to_hex(`/`.to_string()`), sleeps or
+//!     wall-clock acquisition (`now_ms(`/`SystemTime`/`Utc::now`): those run
+//!     on the single writer owner and stall every domain's mutations (and the
+//!     bounded shutdown). Preparation — including the timestamp — happens on
+//!     the caller's thread BEFORE enqueueing.
 //!     `Instant::now()` stays legal inside a job: it is the writer service's
 //!     own monotonic queue/transaction-latency telemetry, not a row clock.
 //!     Grandfathered call sites are exact-line allowlisted, asserted
@@ -5901,13 +5902,16 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     ];
 
     /// Work a writer job closure must never perform — it belongs on the
-    /// caller's thread BEFORE enqueueing. Four families:
+    /// caller's thread BEFORE enqueueing. Five families:
     ///
     /// * filesystem I/O (`std::fs`, `OpenOptions`, `File::open/create`,
     ///   temp files, read/write/remove helpers),
     /// * serialization (`serde_json`, `to_vec`, `from_str`, `.json(`),
     /// * hashing (`Sha256`/`sha2`/`blake3`/`Digest`/`Hasher`) and sleeps,
-    /// * wall-clock acquisition (`now_ms(`, `SystemTime::now`, `Utc::now`):
+    /// * digest/string materialization (`.to_hex(`, `.to_string()`): the
+    ///   prepared representation is built on the caller's thread and the job
+    ///   binds it as-is (`&str`/`&String` parameters stay borrows),
+    /// * wall-clock acquisition (`now_ms(`, `SystemTime`, `Utc::now`):
     ///   the timestamp is part of the caller's preparation. `Instant::now()`
     ///   is deliberately NOT forbidden — it is a monotonic elapsed-time
     ///   probe, and the writer service itself measures queue/transaction
@@ -5949,12 +5953,18 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         "Digest",
         "Hasher",
         ".digest(",
+        // digest text materialization (`FileHash::to_hex` allocates a String;
+        // prepare it on the caller's thread)
+        ".to_hex(",
+        // string formatting on the writer owner (prepared values bind as-is;
+        // an owned copy of an already-prepared String is `.clone()`)
+        ".to_string()",
         // sleeps
         "thread::sleep",
         "sleep(",
         // wall clocks (Instant::now is owner-side latency telemetry, allowed)
         "now_ms(",
-        "SystemTime::now",
+        "SystemTime",
         "Utc::now",
     ];
 
@@ -6099,8 +6109,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert_no_offenders(
             "writer-job scan: a production writer job closure (.writer.execute / \
              .writer.execute_raw / .writer_debug_job) contains filesystem I/O, \
-             serialization, hashing, a sleep or wall-clock acquisition; prepare inputs \
-             and the timestamp on the caller's thread and keep the closure SQL-only",
+             serialization, hashing, digest/string materialization, a sleep or \
+             wall-clock acquisition; prepare inputs and the timestamp on the \
+             caller's thread and keep the closure SQL-only",
             &offenders,
             scanned,
             50,
@@ -6108,10 +6119,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     }
 
     /// Planted-fixture proof: every forbidden family fires inside a writer
-    /// job (including wall-clock acquisition), the call-shape variants are all
-    /// covered, and the prepared shapes (work AND the timestamp before the
-    /// call, SQL inside), `Instant::now()` latency telemetry plus
-    /// `#[cfg(test)]` code pass. The machinery is not vacuously green.
+    /// job (including wall-clock acquisition and digest/string
+    /// materialization), the call-shape variants are all covered, and the
+    /// prepared shapes (work AND the timestamp before the call, SQL inside),
+    /// `Instant::now()` latency telemetry plus `#[cfg(test)]` code pass. The
+    /// machinery is not vacuously green.
     #[test]
     fn writer_job_scan_fires_on_planted_unprepared_work() {
         for (family, src) in [
@@ -6144,6 +6156,14 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 "fn f(b: Vec<u8>) { self.writer.execute(\"x\", move |conn| { let d = Sha256::digest(&b); Ok(d) }) }\n",
             ),
             (
+                "to_hex",
+                "fn f(h: FileHash) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![h.to_hex()])?; Ok(()) }) }\n",
+            ),
+            (
+                "string materialization",
+                "fn f(s: String) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![s.to_string()])?; Ok(()) }) }\n",
+            ),
+            (
                 "sleep",
                 "fn f() { self.writer.execute(\"x\", move |conn| { std::thread::sleep(Duration::from_millis(5)); Ok(()) }) }\n",
             ),
@@ -6154,6 +6174,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             (
                 "system clock",
                 "fn f() { self.writer.execute(\"x\", move |conn| { let now = SystemTime::now(); Ok(()) }) }\n",
+            ),
+            (
+                "system clock epoch",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let _ = SystemTime::UNIX_EPOCH; Ok(()) }) }\n",
             ),
             (
                 "utc clock",
@@ -6179,6 +6203,16 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "fn f(v: Value) { let json = v.to_string(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![json])?; Ok(()) }) }\n",
             // Hashing before the call, digest bytes only inside.
             "fn f(b: Vec<u8>) { let d = Sha256::digest(&b); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![d])?; Ok(()) }) }\n",
+            // Digest text materialized before the call: only the prepared
+            // String crosses into the closure.
+            "fn f(h: FileHash) { let hex = h.to_hex(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![hex])?; Ok(()) }) }\n",
+            // String materialization before the call: the prepared String
+            // crosses, and a prepared borrowed `&str` binds as-is.
+            "fn f(n: u64) { let text = n.to_string(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![text])?; Ok(()) }) }\n",
+            "fn f(s: String) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![s.as_str()])?; Ok(()) }) }\n",
+            // Clock-derived values captured before the call (no clock type
+            // crosses into the closure).
+            "fn f(now: i64) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![now])?; Ok(()) }) }\n",
             // Filesystem work before the call, SQL-only inside.
             "fn f() -> std::io::Result<()> { std::fs::create_dir_all(\"/tmp\")?; self.writer.execute(\"x\", move |conn| { conn.execute(\"DELETE FROM t\", [])?; Ok(()) }) }\n",
             // cfg(test) code can never certify production: invisible.

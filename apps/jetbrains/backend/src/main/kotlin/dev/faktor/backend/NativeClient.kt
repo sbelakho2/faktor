@@ -65,10 +65,10 @@ import dev.faktor.shared.NativeTournamentStarted
 import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
+import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.parseNativeAbortAck
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
-import dev.faktor.shared.parseNativeAttachmentId
 import dev.faktor.shared.parseNativeBillingUsage
 import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeBoardPost
@@ -110,7 +110,9 @@ import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeUsage
 import dev.faktor.shared.parseNativeVerificationView
+import dev.faktor.shared.parseProtocolAttachmentRef
 import dev.faktor.shared.parseProtocolErrorEnvelope
+import dev.faktor.shared.view
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -123,6 +125,13 @@ import java.net.http.HttpResponse
 import java.time.Duration
 
 private const val REQUEST_ERROR_SNIPPET = 400
+
+/**
+ * One bounded raw-byte attachment response: the exact served bytes plus the
+ * server's own MIME for the addressed reference (`null` when absent). A
+ * digest-addressed blob never gets an invented MIME.
+ */
+class AttachmentBytes(val mime: String?, val bytes: ByteArray)
 
 /**
  * Typed client of the daemon's native surface. One instance per daemon
@@ -292,21 +301,67 @@ class NativeClient(
 
     /**
      * Upload ONE bounded binary attachment (standard base64) into the
-     * session's durable store; the response is the typed id a task start's
-     * `attachments` member accepts. Images use the same representation and
-     * are validated against the chosen model at task admission.
+     * session's durable store; the response is the full typed REFERENCE
+     * (`ref_id` included) this client retains, while a task start carries the
+     * exact `AttachmentId` projection of it. Images use the same
+     * representation and are validated against the chosen model at task
+     * admission.
      */
     fun uploadAttachment(
         sessionId: String,
         mime: String,
         filename: String? = null,
         dataBase64: String
-    ): NativeAttachmentId = parseNativeAttachmentId(
+    ): ProtocolAttachmentRef = parseAttachmentRef(
         request(
             "POST", "/native/session/" + encode(sessionId) + "/attachments", null,
             NativeRequests.uploadAttachment(mime, filename, dataBase64)
-        )
+        ),
+        "POST /native/session/{id}/attachments"
     )
+
+    /**
+     * Resolve ONE durable attachment REFERENCE by its canonical decimal
+     * surrogate id: the metadata is exactly THAT reference's (`ref_id`
+     * included), never another reference's.
+     */
+    fun attachmentReference(sessionId: String, refId: Long): ProtocolAttachmentRef {
+        val path = "GET /native/session/{id}/attachments/ref/{ref_id}"
+        if (refId < 1L) throw NativeProtocolException(path, "refId must be positive, got $refId")
+        return parseAttachmentRef(
+            request("GET", "/native/session/" + encode(sessionId) + "/attachments/ref/" + refId),
+            path
+        )
+    }
+
+    /**
+     * The verified bytes of exactly ONE durable attachment REFERENCE, served
+     * with THAT reference's MIME: two references sharing one CAS blob keep
+     * their own metadata through this route.
+     */
+    fun attachmentReferenceBytes(sessionId: String, refId: Long): AttachmentBytes {
+        val path = "GET /native/session/{id}/attachments/ref/{ref_id}/bytes"
+        if (refId < 1L) throw NativeProtocolException(path, "refId must be positive, got $refId")
+        return requestBytes(
+            "GET",
+            "/native/session/" + encode(sessionId) + "/attachments/ref/" + refId + "/bytes"
+        )
+    }
+
+    /**
+     * The raw CAS bytes of one blob, byte-exact and MIME-less: the digest
+     * addresses no single reference, so no reference MIME is invented.
+     */
+    fun attachmentBlobBytes(sessionId: String, digest: String): ByteArray {
+        val path = "GET /native/session/{id}/attachments/blob/{digest}/bytes"
+        if (!Regex("^[0-9a-f]{64}$").matches(digest)) {
+            throw NativeProtocolException(path, "digest must be 64 lowercase hex chars")
+        }
+        return requestBytes(
+            "GET",
+            "/native/session/" + encode(sessionId) + "/attachments/blob/" + encode(digest) + "/bytes"
+        ).bytes
+    }
 
     fun cancelTaskRun(sessionId: String, runId: String): NativeTaskRunCancelled =
         parseNativeTaskRunCancelled(
@@ -772,6 +827,58 @@ class NativeClient(
         return text
     }
 
+    /** Strict parse of one durable attachment REFERENCE: the generated
+     *  decoder owns the shape; the ref_id/digest/size invariants the native
+     *  surface additionally promises are checked here. */
+    private fun parseAttachmentRef(json: String, path: String): ProtocolAttachmentRef {
+        val ref = parseProtocolAttachmentRef(JsonCodec.parse(json).view(path))
+        if (ref.refId < 1L) {
+            throw NativeProtocolException(path, "expected a positive ref_id")
+        }
+        if (!Regex("^[0-9a-f]{64}$").matches(ref.digest)) {
+            throw NativeProtocolException(path, "expected a 64-char lowercase hex digest")
+        }
+        if (ref.size < 0L) {
+            throw NativeProtocolException(path, "expected a non-negative size")
+        }
+        return ref
+    }
+
+    /**
+     * One bounded raw-byte GET. Non-2xx bodies are mapped to the daemon's
+     * typed error envelope exactly like every JSON request; a 2xx body is
+     * returned byte-exact with the server's own `content-type` (never a
+     * fabricated MIME, null when the daemon sends none).
+     */
+    private fun requestBytes(method: String, path: String, maxBytes: Long = maxBodyBytes): AttachmentBytes {
+        val builder = HttpRequest.newBuilder(URI.create(baseUrl.trimEnd('/') + path))
+            .timeout(Duration.ofMillis(timeoutMs))
+            .header("Authorization", "Bearer $bearerToken")
+            .header("Accept", "*/*")
+        if (controlToken != null && controlToken.isNotEmpty()) {
+            builder.header("x-faktor-control-token", controlToken)
+        }
+        builder.method(method, HttpRequest.BodyPublishers.noBody())
+        val response = try {
+            http.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        } catch (e: IOException) {
+            throw NativeApiException(
+                0, "transport",
+                "$method $path failed (daemon down?): ${e.message}", true
+            )
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw NativeApiException(0, "transport", "$method $path interrupted", true)
+        }
+        val status = response.statusCode()
+        val bytes = response.body().use { readBoundedBytes(it, maxBytes, "$method $path") }
+        if (status !in 200..299) {
+            throw apiError(status, String(bytes, Charsets.UTF_8), "$method $path")
+        }
+        val mime = response.headers().firstValue("content-type").orElse(null)
+        return AttachmentBytes(mime, bytes)
+    }
+
     /** Reads at most [maxBytes]; an oversized body is closed and rejected. */
     private fun readBounded(stream: InputStream, maxBytes: Long, path: String): String {
         val out = ByteArrayOutputStream()
@@ -787,6 +894,24 @@ class NativeClient(
             out.write(buffer, 0, read)
         }
         return String(out.toByteArray(), Charsets.UTF_8)
+    }
+
+    /** Reads at most [maxBytes] byte-exact; an oversized body is closed and
+     *  rejected (never truncated, never decoded). */
+    private fun readBoundedBytes(stream: InputStream, maxBytes: Long, path: String): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        var total = 0L
+        while (true) {
+            val read = stream.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) {
+                throw NativeProtocolException(path, "response body exceeded bound $maxBytes bytes")
+            }
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
     }
 
     /** Maps a non-2xx body onto the daemon's typed error envelope. The

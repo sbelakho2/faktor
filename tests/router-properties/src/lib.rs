@@ -31,7 +31,7 @@ use faktor_core::model::{
 };
 use faktor_router::outcomes::{
     rework_probability_ppm, verified_success_confidence_ppm, work_cost_estimate,
-    MemoryOutcomeStore, OutcomeKey, OutcomeSample, OutcomeStore, VerifiedOutcomeStats,
+    MemoryOutcomeStore, OutcomeKey, OutcomeSample, OutcomeStore, OutcomeView, VerifiedOutcomeStats,
 };
 use faktor_router::{
     qualified_candidates, CacheState, LiveHealth, QualifiedCandidate, RouteRequest, Router,

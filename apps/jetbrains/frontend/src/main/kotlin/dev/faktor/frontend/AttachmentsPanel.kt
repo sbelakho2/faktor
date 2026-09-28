@@ -16,6 +16,7 @@ package dev.faktor.frontend
 import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeAttachmentLimits
 import dev.faktor.shared.NativeModelInfo
+import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.asciiLowerCase
 import java.awt.BorderLayout
 import java.awt.Dimension
@@ -494,32 +495,35 @@ private fun menuShortcutV(): KeyStroke =
 /**
  * Bounded LOCAL pending-upload state for the Task composer (audit 29,
  * parity with the VS Code pending-submission envelope): after a successful
- * upload the durable id is retained here, bound to the session AND the exact
- * reference key ([pathUploadKey]: kind + mime + filename + size + byte
- * digest) it was uploaded under; a start failure keeps the state, and the
- * retry resolves the id first and uploads only the absent references (CAS
- * dedupe foundation). A renamed/re-selected file computes a new key and
- * uploads fresh. An entry retained for one session is never reused by
- * another session, and the map is bounded so a hostile client can never grow
- * host memory with submission identities.
+ * upload the COMPLETE durable reference (`ref_id` included) is retained
+ * here, bound to the session AND the exact reference key ([pathUploadKey]:
+ * kind + mime + filename + size + byte digest) it was uploaded under; a
+ * start failure keeps the state, and the retry resolves the reference first
+ * and uploads only the absent ones (CAS dedupe foundation). A
+ * renamed/re-selected file computes a new key and uploads fresh. An entry
+ * retained for one session is never reused by another session, and the map
+ * is bounded so a hostile client can never grow host memory with submission
+ * identities.
  */
 class PendingAttachmentRetry(private val maxEntries: Int = MAX_PENDING_UPLOADS) {
 
-    /** One already-uploaded attachment retained in local pending state. */
+    /** One already-uploaded attachment retained in local pending state: the
+     *  complete typed reference, `ref_id` included. Task admission receives
+     *  its exact [attachmentId] projection. */
     data class RetainedAttachment(
         val sessionId: String,
         val key: String,
-        val attachment: NativeAttachmentId
+        val attachment: ProtocolAttachmentRef
     )
 
     private val retained = LinkedHashMap<String, RetainedAttachment>()
 
-    /** The durable id retained for this exact (session, key), or null. */
-    fun reusable(sessionId: String, key: String): NativeAttachmentId? =
+    /** The durable reference retained for this exact (session, key), or null. */
+    fun reusable(sessionId: String, key: String): ProtocolAttachmentRef? =
         retained[mapKey(sessionId, key)]?.attachment
 
     /** Retain one successful upload; the oldest entry is evicted past the bound. */
-    fun retain(sessionId: String, key: String, attachment: NativeAttachmentId) {
+    fun retain(sessionId: String, key: String, attachment: ProtocolAttachmentRef) {
         val mapKey = mapKey(sessionId, key)
         retained.remove(mapKey)
         retained[mapKey] = RetainedAttachment(sessionId, key, attachment)
@@ -530,27 +534,28 @@ class PendingAttachmentRetry(private val maxEntries: Int = MAX_PENDING_UPLOADS) 
     }
 
     /**
-     * Resolve the durable ids for one pending submission in ENTRY ORDER:
-     * already-uploaded entries resolve first and `upload(index)` runs ONLY
-     * for the absent ones. Every successful upload is retained immediately,
-     * so a later start failure keeps it and the retry uploads nothing twice.
+     * Resolve the task-admission `AttachmentId`s for one pending submission
+     * in ENTRY ORDER: already-uploaded entries resolve first (projected from
+     * the retained reference) and `upload(index)` runs ONLY for the absent
+     * ones. Every successful upload is retained immediately, so a later start
+     * failure keeps it and the retry uploads nothing twice.
      */
     fun resolve(
         sessionId: String,
         keys: List<String>,
-        upload: (Int) -> NativeAttachmentId
+        upload: (Int) -> ProtocolAttachmentRef
     ): List<NativeAttachmentId> {
         val ids = ArrayList<NativeAttachmentId>(keys.size)
         for (index in keys.indices) {
             val key = keys[index]
             val existing = reusable(sessionId, key)
             if (existing != null) {
-                ids.add(existing)
+                ids.add(existing.attachmentId())
                 continue
             }
             val uploaded = upload(index)
             retain(sessionId, key, uploaded)
-            ids.add(uploaded)
+            ids.add(uploaded.attachmentId())
         }
         return ids
     }
@@ -569,6 +574,14 @@ class PendingAttachmentRetry(private val maxEntries: Int = MAX_PENDING_UPLOADS) 
         const val MAX_PENDING_UPLOADS = 64
     }
 }
+
+/**
+ * The exact task-admission projection of one durable reference: the
+ * `AttachmentId` a task start carries, never widened with `ref_id` (the
+ * reference identity is retained locally).
+ */
+fun ProtocolAttachmentRef.attachmentId(): NativeAttachmentId =
+    NativeAttachmentId(digest, mime, filename, size)
 
 class AttachmentsPanel : JPanel(BorderLayout()) {
 

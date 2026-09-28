@@ -647,12 +647,31 @@ const indexCoverageJson = {
 };
 const indexCoverageUnhostedJson = { sessionId: '7', index_coverage: null };
 
+/** One durable attachment REFERENCE fixture (the upload / ref metadata
+ *  response shape): the surrogate ref id plus the exact metadata. */
+const attachmentDigest = 'a'.repeat(64);
+const attachmentRefJson = {
+  ref_id: 3,
+  digest: attachmentDigest,
+  mime: 'application/pdf',
+  filename: 'spec.pdf',
+  size: 8,
+};
+const attachmentBytes = Buffer.from('%PDF-1.4');
+
 // --------------------------------------------------------------- fake fetch
 
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
     headers: { 'content-type': 'application/json' },
+  });
+}
+
+function bytesResponse(value, contentType) {
+  return new Response(value, {
+    status: 200,
+    headers: { 'content-type': contentType },
   });
 }
 
@@ -751,6 +770,20 @@ async function validatorAccepts() {
         size: 8,
       }).size,
       8,
+    );
+    assertEqual(
+      nc.validateAttachmentRef(
+        {
+          ref_id: 3,
+          digest: 'a'.repeat(64),
+          mime: 'application/pdf',
+          filename: 'spec.pdf',
+          size: 8,
+        },
+        'test.ref',
+      ).ref_id,
+      3,
+      'the generated ref validator keeps the surrogate reference identity',
     );
     assertEqual(nc.validateTaskRunCancelled(clone(taskRunCancelledJson)).cancelled, true);
     assertEqual(nc.validateAgents(clone(agentsJson)).length, 2);
@@ -946,6 +979,22 @@ async function validatorRejects() {
       () => nc.validateAttachmentId({ digest: 'a'.repeat(64), mime: 'application/pdf', filename: null }),
       'missing required field size',
     );
+    assertProtocol(
+      () =>
+        nc.validateAttachmentRef(
+          { ref_id: 0, digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: 8 },
+          'test.ref',
+        ),
+      'positive integer ref_id',
+    );
+    assertProtocol(
+      () =>
+        nc.validateAttachmentRef(
+          { ref_id: 1, digest: 'a'.repeat(64), mime: 'application/pdf', filename: null },
+          'test.ref',
+        ),
+      'missing required field size',
+    );
     // Money is exact: the canonical string form is accepted (the legacy
     // number form stays accepted below the flag threshold, see moneyTests),
     // while a non-decimal string and an unsafe number both fail loudly.
@@ -1110,8 +1159,12 @@ async function clientAccepts() {
       'GET /native/session/7/task-runs': () => jsonResponse([taskRunJson]),
       'GET /native/session/7/task-runs/r1': () => jsonResponse(taskRunJson),
       'POST /native/session/7/task-runs': () => jsonResponse(taskRunStartedJson),
-      'POST /native/session/7/attachments': () =>
-        jsonResponse({ digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 8 }),
+      'POST /native/session/7/attachments': () => jsonResponse(attachmentRefJson),
+      'GET /native/session/7/attachments/ref/3': () => jsonResponse(attachmentRefJson),
+      'GET /native/session/7/attachments/ref/3/bytes': () =>
+        bytesResponse(attachmentBytes, 'application/pdf'),
+      [`GET /native/session/7/attachments/blob/${attachmentDigest}/bytes`]: () =>
+        bytesResponse(attachmentBytes, 'application/octet-stream'),
       'POST /native/session/7/task-runs/r1/cancel': () => jsonResponse(taskRunCancelledJson),
       'GET /native/agents': () => jsonResponse(agentsJson),
       'POST /native/agents/c1/pause': () => jsonResponse(controlAckJson),
@@ -1163,7 +1216,27 @@ async function clientAccepts() {
     assertEqual((await client.verification('7')).failedChecks.length, 1);
     assertEqual((await client.taskRuns('7'))[0].state, 'Running');
     assertEqual((await client.taskRunState('7', 'r1')).run_id, 'r1');    assertEqual((await client.startTaskRun('7', { goal: 'ship it' })).run_id, 'r1');
-    assertEqual((await client.uploadAttachment('7', { mime: 'application/pdf', filename: 'spec.pdf', data_base64: 'eA==' })).digest, 'a'.repeat(64));
+    const uploadedRef = await client.uploadAttachment('7', {
+      mime: 'application/pdf',
+      filename: 'spec.pdf',
+      data_base64: 'eA==',
+    });
+    assertEqual(uploadedRef.ref_id, 3, 'the upload response keeps the surrogate ref id');
+    assertDeepEqual(nc.attachmentIdOf(uploadedRef), {
+      digest: attachmentDigest,
+      mime: 'application/pdf',
+      filename: 'spec.pdf',
+      size: 8,
+    });
+    assertEqual((await client.attachmentReference('7', 3)).ref_id, 3);
+    const referenceBytes = await client.attachmentReferenceBytes('7', 3);
+    assertEqual(referenceBytes.mime, 'application/pdf', 'ref bytes carry THAT reference MIME');
+    assertDeepEqual([...referenceBytes.bytes], [...attachmentBytes]);
+    assertDeepEqual(
+      [...(await client.attachmentBlobBytes('7', attachmentDigest))],
+      [...attachmentBytes],
+      'blob bytes are the raw CAS bytes (no reference MIME invented)',
+    );
     assertEqual((await client.cancelTaskRun('7', 'r1')).cancelled, true);
     assertEqual((await client.agents('7')).length, 2);
     assertEqual((await client.pauseAgent('c1')).queuedSeq, 3);
@@ -1245,6 +1318,9 @@ async function clientAccepts() {
       filename: 'spec.pdf',
       data_base64: 'eA==',
     });
+    findCall(calls, 'GET', '/native/session/7/attachments/ref/3');
+    findCall(calls, 'GET', '/native/session/7/attachments/ref/3/bytes');
+    findCall(calls, 'GET', `/native/session/7/attachments/blob/${attachmentDigest}/bytes`);
     assertDeepEqual(findCall(calls, 'GET', '/native/messages').query, {
       session: '7',
       before: '9',
@@ -2619,7 +2695,7 @@ async function pendingSubmissionTests() {
     const client = {
       uploadAttachment: async (sessionId, request) => {
         calls.push({ kind: 'upload', sessionId, request });
-        return { digest: 'b'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 3 };
+        return { ref_id: 2, digest: 'b'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 3 };
       },
       startTaskRun: async (sessionId, request) => {
         calls.push({ kind: 'start', sessionId, request });
@@ -2664,7 +2740,7 @@ async function pendingSubmissionTests() {
       const client = {
         uploadAttachment: async () => {
           calls.push('upload');
-          return { digest: 'c'.repeat(64), mime: 'application/pdf', filename: null, size: 3 };
+          return { ref_id: 3, digest: 'c'.repeat(64), mime: 'application/pdf', filename: null, size: 3 };
         },
         startTaskRun: async (sessionId, request) => {
           calls.push('start');
@@ -2742,6 +2818,7 @@ async function pendingSubmissionTests() {
       uploadAttachment: async (sessionId, request) => {
         calls.push({ kind: 'upload', sessionId, request });
         return {
+          ref_id: 4,
           digest: 'e'.repeat(64),
           mime: request.mime,
           filename: request.filename ?? null,
@@ -3016,7 +3093,7 @@ async function pendingSubmissionTests() {
       client: {
         uploadAttachment: async (sessionId, request) => {
           calls2.push({ kind: 'upload', request });
-          return { digest: 'd'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 8 };
+          return { ref_id: 5, digest: 'd'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 8 };
         },
         startTaskRun: async (sessionId, request) => {
           calls2.push({ kind: 'start' });
@@ -3051,7 +3128,7 @@ async function pendingSubmissionTests() {
     const client = {
       uploadAttachment: async (sessionId, request) => {
         uploads.push(request.filename);
-        return { digest: 'f'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 3 };
+        return { ref_id: 6, digest: 'f'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 3 };
       },
       startTaskRun: async (sessionId, request) => {
         starts.push(request.attachments);
@@ -3107,6 +3184,7 @@ async function pendingSubmissionTests() {
       uploadAttachment: async (sessionId, request) => {
         uploads.push({ sessionId, filename: request.filename });
         return {
+          ref_id: sessionId === '7' ? 7 : 8,
           digest: (sessionId === '7' ? 'a' : 'b').repeat(64),
           mime: request.mime,
           filename: request.filename ?? null,
@@ -3162,6 +3240,7 @@ async function pendingSubmissionTests() {
         }
         uploadedNames.push(request.filename);
         return {
+          ref_id: calls,
           digest: String(calls).padStart(64, '0'),
           mime: request.mime,
           filename: request.filename ?? null,
@@ -3211,7 +3290,7 @@ async function pendingSubmissionTests() {
     const validUpload = {
       sessionId: '7',
       contentDigest: ts.pendingAttachmentContentDigest(binaryAttachment()),
-      attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+      attachment: { ref_id: 23, digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
     };
     const parsed = ts.parsePendingSubmission({
       ...pendingEnvelope(),
@@ -3230,6 +3309,19 @@ async function pendingSubmissionTests() {
       { sessionId: '', attachment: validUpload.attachment },
       { sessionId: '7', attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: -1 } },
       { sessionId: '7', attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 9, size: 3 } },
+      { sessionId: '7', attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: 3 } },
+      {
+        sessionId: '7',
+        attachment: { ref_id: 0, digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: 3 },
+      },
+      {
+        sessionId: '7',
+        attachment: { ref_id: 1.5, digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: 3 },
+      },
+      {
+        sessionId: '7',
+        attachment: { ref_id: '1', digest: 'a'.repeat(64), mime: 'application/pdf', filename: null, size: 3 },
+      },
     ]) {
       assertEqual(
         ts.parsePendingSubmission({
@@ -3240,6 +3332,60 @@ async function pendingSubmissionTests() {
         JSON.stringify(uploaded).slice(0, 160),
       );
     }
+  });
+
+  await test('an upload keeps its ref_id through admission and the ref routes retrieve per-reference metadata', async () => {
+    const digest = 'b'.repeat(64);
+    const refA = { ref_id: 11, digest, mime: 'application/pdf', filename: 'spec.pdf', size: 8 };
+    const refB = { ref_id: 12, digest, mime: 'text/plain', filename: 'notes.txt', size: 8 };
+    const bytes = Buffer.from('%PDF-1.4');
+    const { client, calls } = makeClient({
+      'POST /native/session/7/attachments': () => jsonResponse(refA),
+      'GET /native/session/7/attachments/ref/11': () => jsonResponse(refA),
+      'GET /native/session/7/attachments/ref/12': () => jsonResponse(refB),
+      'GET /native/session/7/attachments/ref/11/bytes': () => bytesResponse(bytes, 'application/pdf'),
+      'GET /native/session/7/attachments/ref/12/bytes': () => bytesResponse(bytes, 'text/plain'),
+      [`GET /native/session/7/attachments/blob/${digest}/bytes`]: () =>
+        bytesResponse(bytes, 'application/octet-stream'),
+      'POST /native/session/7/task-runs': () => jsonResponse(taskRunStartedJson),
+    });
+    const uploaded = await client.uploadAttachment('7', {
+      mime: 'application/pdf',
+      filename: 'spec.pdf',
+      data_base64: 'JVBERi0xLjQ=',
+    });
+    assertEqual(uploaded.ref_id, 11, 'the upload retains the reference identity');
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({
+        attachments: [binaryAttachment({ bytes: 8, dataBase64: 'JVBERi0xLjQ=' })],
+      }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {
+        throw new Error('the admission must succeed');
+      },
+    });
+    assertEqual(outcome.ok, true);
+    // The retained identity keeps ref_id; task admission projects the SAME
+    // digest/mime/filename/size (the wire projection carries no ref_id).
+    assertEqual(outcome.pending.attachments[0].uploaded.attachment.ref_id, 11);
+    assertDeepEqual(outcome.pending.attachments[0].uploaded.attachment, refA);
+    const start = calls.find(
+      (call) => call.method === 'POST' && call.path === '/native/session/7/task-runs',
+    );
+    assertDeepEqual(start.body.attachments, [
+      { digest, mime: 'application/pdf', filename: 'spec.pdf', size: 8 },
+    ]);
+    // Two references share the digest: every ref-addressed retrieval keeps
+    // its OWN metadata/MIME, while blob bytes are the raw CAS bytes.
+    assertDeepEqual(await client.attachmentReference('7', 11), refA);
+    assertDeepEqual(await client.attachmentReference('7', 12), refB);
+    assertEqual((await client.attachmentReferenceBytes('7', 11)).mime, 'application/pdf');
+    assertEqual((await client.attachmentReferenceBytes('7', 12)).mime, 'text/plain');
+    assertDeepEqual([...(await client.attachmentBlobBytes('7', digest))], [...bytes]);
   });
 
   await test('the retainer bounds retry state and merges uploads only by content identity', () => {
@@ -3257,7 +3403,7 @@ async function pendingSubmissionTests() {
       ts.withPendingUpload(pending, 0, {
         sessionId: '7',
         contentDigest: ts.pendingAttachmentContentDigest(pending.attachments[0]),
-        attachment: { digest, mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+        attachment: { ref_id: 24, digest, mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
       });
     const first = withUpload(envelope('m1'), 'a'.repeat(64));
     retainer.retain(first);
@@ -3300,7 +3446,7 @@ async function pendingSubmissionTests() {
       ts.withPendingUpload(before, 0, {
         sessionId: '7',
         contentDigest: ts.pendingAttachmentContentDigest(before.attachments[0]),
-        attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
+        attachment: { ref_id: 21, digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
       }),
     );
     assertEqual(
@@ -3321,6 +3467,7 @@ async function pendingSubmissionTests() {
       uploadAttachment: async (sessionId, request) => {
         uploads.push(request.data_base64);
         return {
+          ref_id: 9,
           digest: 'f'.repeat(64),
           mime: request.mime,
           filename: request.filename ?? null,
@@ -3345,7 +3492,7 @@ async function pendingSubmissionTests() {
           uploaded: {
             sessionId: '7',
             contentDigest: ts.pendingAttachmentContentDigest(unchanged.attachments[0]),
-            attachment: { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
+            attachment: { ref_id: 21, digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
           },
         },
       ],
@@ -3370,7 +3517,7 @@ async function pendingSubmissionTests() {
           uploaded: {
             sessionId: '7',
             contentDigest: ts.pendingAttachmentContentDigest(changedParsed.attachments[0]),
-            attachment: { digest: 'b'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
+            attachment: { ref_id: 22, digest: 'b'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 },
           },
         },
       ],
@@ -3429,6 +3576,7 @@ async function pendingSubmissionTests() {
         sessionId: '7',
         contentDigest: ts.pendingAttachmentContentDigest(before.attachments[0]),
         attachment: {
+          ref_id: 25,
           digest: 'a'.repeat(64),
           mime: named.mime,
           filename: named.filename,
@@ -3463,6 +3611,7 @@ async function pendingSubmissionTests() {
       sessionId: '7',
       contentDigest: ts.pendingAttachmentContentDigest(firstRef),
       attachment: {
+        ref_id: 26,
         digest: '1'.repeat(64),
         mime: firstRef.mime,
         filename: firstRef.filename,
@@ -3473,6 +3622,7 @@ async function pendingSubmissionTests() {
       sessionId: '7',
       contentDigest: ts.pendingAttachmentContentDigest(secondRef),
       attachment: {
+        ref_id: 27,
         digest: '2'.repeat(64),
         mime: secondRef.mime,
         filename: secondRef.filename,
@@ -3499,6 +3649,7 @@ async function pendingSubmissionTests() {
       uploadAttachment: async (sessionId, request) => {
         calls.push({ kind: 'upload', mime: request.mime, filename: request.filename });
         return {
+          ref_id: request.mime === 'application/pdf' ? 31 : 32,
           digest: (request.mime === 'application/pdf' ? 'a' : 'b').repeat(64),
           mime: request.mime,
           filename: request.filename ?? null,

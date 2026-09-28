@@ -262,19 +262,15 @@ pub fn work_cost_estimate(
     }
 }
 
-/// The additive outcome-registry handle a
-/// [`RouterService`](crate::RouterService) is built with
-/// ([`with_outcomes`](crate::RouterService::with_outcomes), defaulting to
-/// an empty registry — scoring is byte-identical while no stats exist).
+/// The READ-ONLY outcome view a routing policy consumes. Every quality
+/// consult goes through this interface, and a route-scoped memo is ONLY a
+/// view — there is deliberately no mutation method, so a memo can never
+/// promise (or silently break) interleaved-write fidelity it cannot provide.
 ///
 /// The durable implementation is a wiring-crate concern over the store
-/// crate's v18 `model_outcome_stats` table (append/read fns); the trait
-/// keeps the router independent of the store crate.
-pub trait OutcomeStore: Send + Sync {
-    /// Append ONE verified sample (event fact) for a key. The caller holds
-    /// the explicit verified-success signal; see [`OutcomeSample`].
-    fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample);
-
+/// crate's `model_outcome_stats` table (append/read fns); the trait keeps
+/// the router independent of the store crate.
+pub trait OutcomeView: Send + Sync {
     /// Per-key stats.
     fn stats(&self, key: &OutcomeKey) -> Option<VerifiedOutcomeStats>;
 
@@ -337,14 +333,20 @@ pub trait OutcomeStore: Send + Sync {
     }
 }
 
+/// The mutable outcome registry: appends verified samples and exposes them
+/// through the read-only [`OutcomeView`].
+pub trait OutcomeStore: OutcomeView {
+    /// Append ONE verified sample (event fact) for a key. The caller holds
+    /// the explicit verified-success signal; see [`OutcomeSample`].
+    fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample);
+}
+
 /// Default empty registry: every consult misses, every append is a no-op.
 /// Scoring over this registry is byte-identical to the pre-outcome router.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmptyOutcomeStore;
 
-impl OutcomeStore for EmptyOutcomeStore {
-    fn append_sample(&self, _key: &OutcomeKey, _sample: OutcomeSample) {}
-
+impl OutcomeView for EmptyOutcomeStore {
     fn stats(&self, _key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
         None
     }
@@ -359,27 +361,31 @@ impl OutcomeStore for EmptyOutcomeStore {
     }
 }
 
+impl OutcomeStore for EmptyOutcomeStore {
+    fn append_sample(&self, _key: &OutcomeKey, _sample: OutcomeSample) {}
+}
+
 /// The full lookup key a [`MemoOutcomeStore`] memoizes.
 type OutcomeLookupKey = (String, String, RouterPhase, TaskClass, RiskBucket);
 
-/// A route-scoped MEMO over another outcome registry: the first
-/// [`OutcomeStore::lookup_stats`] for a key reads the durable store and every
+/// A route-scoped MEMO over another outcome VIEW: the first
+/// [`OutcomeView::lookup_stats`] for a key reads the durable store and every
 /// repeat is served from memory. A routing policy builds ONE per route and
 /// passes it through `RouterService::route_*_with`, so MaximumQuality's
 /// descending quality-floor probes recompute each candidate's effective
 /// quality from the SAME lookups instead of re-reading the store per probe.
 ///
-/// It is a read-only participant in the route (routing never appends), but it
-/// stays a faithful [`OutcomeStore`]: [`OutcomeStore::append_sample`] clears
-/// the route-sized cache before delegating, so an interleaved write can never
-/// leave a stale cached read behind.
+/// It implements ONLY [`OutcomeView`], so it can never be handed to a
+/// mutation API and cannot promise interleaved-write fidelity it does not
+/// have: routing is read-only by construction, and a durable registry is
+/// never mutated through a route-scoped cache.
 pub struct MemoOutcomeStore<'a> {
-    inner: &'a dyn OutcomeStore,
+    inner: &'a dyn OutcomeView,
     cache: Mutex<HashMap<OutcomeLookupKey, Option<VerifiedOutcomeStats>>>,
 }
 
 impl<'a> MemoOutcomeStore<'a> {
-    pub fn new(inner: &'a dyn OutcomeStore) -> Self {
+    pub fn new(inner: &'a dyn OutcomeView) -> Self {
         Self {
             inner,
             cache: Mutex::new(HashMap::new()),
@@ -387,16 +393,7 @@ impl<'a> MemoOutcomeStore<'a> {
     }
 }
 
-impl OutcomeStore for MemoOutcomeStore<'_> {
-    fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample) {
-        // A write makes every cached read stale: invalidate the route-sized
-        // cache before delegating so a subsequent lookup re-reads the durable
-        // store. This keeps the wrapper a faithful `OutcomeStore` even if a
-        // caller interleaves reads and writes.
-        recover_lock(&self.cache).clear();
-        self.inner.append_sample(key, sample);
-    }
-
+impl OutcomeView for MemoOutcomeStore<'_> {
     fn stats(&self, key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
         self.inner.stats(key)
     }
@@ -470,13 +467,7 @@ impl MemoryOutcomeStore {
     }
 }
 
-impl OutcomeStore for MemoryOutcomeStore {
-    fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample) {
-        let mut inner = recover_lock(&self.inner);
-        let entry = inner.entry(key.clone()).or_default();
-        entry.absorb(sample);
-    }
-
+impl OutcomeView for MemoryOutcomeStore {
     fn stats(&self, key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
         recover_lock(&self.inner).get(key).copied()
     }
@@ -525,6 +516,14 @@ impl OutcomeStore for MemoryOutcomeStore {
     }
 }
 
+impl OutcomeStore for MemoryOutcomeStore {
+    fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample) {
+        let mut inner = recover_lock(&self.inner);
+        let entry = inner.entry(key.clone()).or_default();
+        entry.absorb(sample);
+    }
+}
+
 impl VerifiedOutcomeStats {
     /// Saturating column-wise sum of two per-key accumulator rows (the
     /// registry's phase consult folds every class/risk bucket of one
@@ -564,13 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn memo_outcome_store_invalidates_cached_reads_on_append() {
-        // Finding: a memo that serves a stale read after an append is not a
-        // faithful `OutcomeStore`. The first lookup caches the empty result;
-        // the append must invalidate it so the next lookup observes the write
-        // (an interleaved write can never leave a stale cached read behind).
+    fn memo_outcome_store_is_a_read_only_view_scoped_to_one_route() {
+        // Finding: a memo that can be mutated (or that claims fidelity across
+        // interleaved writes) is not honest. The memo implements ONLY
+        // `OutcomeView` — there is no append method to race with — and it
+        // serves one consistent snapshot for the life of one route; the next
+        // route builds a fresh memo.
         let inner = MemoryOutcomeStore::new();
-        let memo = MemoOutcomeStore::new(&inner);
         let key = OutcomeKey {
             provider: "p".into(),
             model: "m".into(),
@@ -578,24 +577,15 @@ mod tests {
             task_class: TaskClass::Medium,
             risk_bucket: RiskBucket::Medium,
         };
-        assert_eq!(
-            memo.lookup_stats(
-                "p",
-                "m",
-                RouterPhase::Implement,
-                TaskClass::Medium,
-                RiskBucket::Medium
-            ),
-            None
-        );
-        memo.append_sample(
+        inner.append_sample(
             &key,
             OutcomeSample {
                 verified_success: true,
                 ..Default::default()
             },
         );
-        let after = memo
+        let memo = MemoOutcomeStore::new(&inner);
+        let first = memo
             .lookup_stats(
                 "p",
                 "m",
@@ -603,9 +593,39 @@ mod tests {
                 TaskClass::Medium,
                 RiskBucket::Medium,
             )
-            .expect("the append must invalidate the cached miss");
-        assert_eq!(after.sample_count, 1);
-        assert_eq!(after.successes_first_pass, 1);
+            .expect("the first lookup reads through");
+        assert_eq!(first.sample_count, 1);
+        // A durable write landing after the route started is invisible to the
+        // route-scoped view (the view is a snapshot, not a live handle) ...
+        inner.append_sample(
+            &key,
+            OutcomeSample {
+                verified_success: true,
+                ..Default::default()
+            },
+        );
+        let cached = memo
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Medium,
+            )
+            .expect("the repeat is served from the route-scoped cache");
+        assert_eq!(cached.sample_count, 1);
+        // ... and the next route observes it through a fresh memo.
+        let fresh = MemoOutcomeStore::new(&inner);
+        let next = fresh
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Medium,
+            )
+            .expect("a fresh memo reads the durable store");
+        assert_eq!(next.sample_count, 2);
     }
 
     #[test]
