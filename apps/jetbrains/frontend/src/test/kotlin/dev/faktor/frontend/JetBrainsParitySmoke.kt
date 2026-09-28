@@ -847,7 +847,7 @@ object JetBrainsParitySmoke {
                     JsonCodec.parse(pngBody).view("clipboard upload").field("data_base64").string()
                 )
                 assertEquals(0x89.toByte(), pngBytes[0], "the uploaded bytes are a PNG")
-                assertEquals('N'.code.toByte(), pngBytes[2], "the uploaded bytes are a PNG")
+                assertEquals('N'.toInt().toByte(), pngBytes[2], "the uploaded bytes are a PNG")
                 val clipboardRun = daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
                 assertEquals(
                     listOf("image/png"), attachmentMimes(clipboardRun),

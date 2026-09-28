@@ -1891,6 +1891,17 @@ object FaktorFrontendApp {
             ).toString()
         }
         java.nio.file.Files.createDirectories(java.nio.file.Paths.get(dataDir))
+        // Headless is honest: a top-level window cannot exist, so refuse
+        // loudly instead of constructing a JFrame (HeadlessException). The
+        // panel itself is headless-safe; only the standalone window needs a
+        // display.
+        if (java.awt.GraphicsEnvironment.isHeadless()) {
+            System.err.println(
+                "[faktor] the standalone launcher needs a display; run the panel inside " +
+                    "the IDE tool window when headless"
+            )
+            kotlin.system.exitProcess(2)
+        }
         val service = FaktorFrontendService(
             java.nio.file.Paths.get(binary),
             java.nio.file.Paths.get(dataDir)

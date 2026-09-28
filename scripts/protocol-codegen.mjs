@@ -865,9 +865,10 @@ function genKotlin(schema) {
       );
       out.push(...lines);
       out.push(`    return Protocol${def.name}(`);
-      for (const f of def.shape.fields) {
-        out.push(`        ${ktCamel(f.name)} = ${ktExpr(f, 'v', types)},`);
-      }
+      def.shape.fields.forEach((f, index) => {
+        const comma = index === def.shape.fields.length - 1 ? '' : ',';
+        out.push(`        ${ktCamel(f.name)} = ${ktExpr(f, 'v', types)}${comma}`);
+      });
       out.push('    )');
     } else {
       out.push(`    val tag = v.field(${JSON.stringify(def.shape.tag)}).string()`);
@@ -881,9 +882,10 @@ function genKotlin(schema) {
         );
         out.push(...lines);
         out.push(`            Protocol${def.name}.${variant.name}(`);
-        for (const f of variant.fields) {
-          out.push(`                ${ktCamel(f.name)} = ${ktExpr(f, 'v', types)},`);
-        }
+        variant.fields.forEach((f, index) => {
+          const comma = index === variant.fields.length - 1 ? '' : ',';
+          out.push(`                ${ktCamel(f.name)} = ${ktExpr(f, 'v', types)}${comma}`);
+        });
         out.push('            )');
         out.push('        }');
       }
@@ -909,16 +911,24 @@ function genKotlin(schema) {
   out.push('object ProtocolErrorCodes {');
   const codes = schema.constants.error_codes;
   out.push('    val CODES: List<String> = listOf(');
-  for (const row of codes) out.push(`        ${JSON.stringify(row.code)},`);
+  codes.forEach((row, index) => {
+    const comma = index === codes.length - 1 ? '' : ',';
+    out.push(`        ${JSON.stringify(row.code)}${comma}`);
+  });
   out.push('    )');
   out.push('');
   out.push('    val HTTP_STATUS: Map<String, Int> = mapOf(');
-  for (const row of codes) out.push(`        ${JSON.stringify(row.code)} to ${row.http_status},`);
+  codes.forEach((row, index) => {
+    const comma = index === codes.length - 1 ? '' : ',';
+    out.push(`        ${JSON.stringify(row.code)} to ${row.http_status}${comma}`);
+  });
   out.push('    )');
   out.push('');
   out.push('    val RETRYABLE: Map<String, Boolean> = mapOf(');
-  for (const row of codes)
-    out.push(`        ${JSON.stringify(row.code)} to ${row.retryable},`);
+  codes.forEach((row, index) => {
+    const comma = index === codes.length - 1 ? '' : ',';
+    out.push(`        ${JSON.stringify(row.code)} to ${row.retryable}${comma}`);
+  });
   out.push('    )');
   out.push('}');
   out.push('');
@@ -934,7 +944,17 @@ function genKotlin(schema) {
   out.push('    return ProtocolErrorEnvelope(code, message, retryable)');
   out.push('}');
   out.push('');
-  return out.join('\n');
+  const text = out.join('\n');
+  // The pinned CI image compiles this file with apt-kotlinc 1.3.31, which has
+  // no trailing-comma support (a Kotlin 1.4 feature). Refuse to emit a file
+  // the CI lane cannot compile instead of discovering it in the lane.
+  const trailing = text.match(/,\s*\)/g);
+  if (trailing !== null) {
+    throw new Error(
+      `genKotlin: refusing to emit ${trailing.length} trailing comma(s) before ')': kotlinc 1.3.31 in the pinned CI image rejects them`,
+    );
+  }
+  return text;
 }
 
 // ------------------------------------------------------- native inventory
