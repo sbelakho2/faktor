@@ -37,16 +37,41 @@ const REPO_ROOT = resolve(APP_ROOT, '..', '..');
 const APP_MANIFEST = join(APP_ROOT, 'package.json');
 
 /**
- * The Faktor-owned panel surface is derived from the source tree itself:
- * every `src/*.ts` compiles to one `out/*.js`, and `media/` ships verbatim.
- * The packaged extension may carry NOTHING else under those two prefixes,
- * so any extra artifact (a vendored closure, a bridge output, a stray
- * bundle) fails without the check having to name it.
+ * Every TypeScript source under `src` compiles to the mirrored `.js` under
+ * `out`, and `media/` ships verbatim. The walk is RECURSIVE so a generated
+ * subdirectory (the protocol DTO under `src/generated`) is part of the
+ * expected surface exactly as tsconfig's recursive include compiles it; a
+ * flat walk would silently mis-derive the surface. The packaged extension
+ * may carry NOTHING else under those two prefixes, so any extra artifact
+ * (a vendored closure, a bridge output, a stray bundle) fails without the
+ * check having to name it.
  */
+function walkTs(dir, prefix, out = []) {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) {
+      walkTs(full, `${prefix}${name}/`, out);
+    } else if (name.endsWith('.ts')) {
+      out.push(`${prefix}${name.replace(/\.ts$/, '.js')}`);
+    }
+  }
+  return out;
+}
+
+function walkFiles(dir, prefix, out = []) {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) {
+      walkFiles(full, `${prefix}${name}/`, out);
+    } else {
+      out.push(`${prefix}${name}`);
+    }
+  }
+  return out;
+}
+
 function expectedPanelFiles() {
-  const sources = readdirSync(join(APP_ROOT, 'src'))
-    .filter((name) => name.endsWith('.ts'))
-    .map((name) => `out/${name.replace(/\.ts$/, '.js')}`);
+  const sources = walkTs(join(APP_ROOT, 'src'), 'out/');
   const media = readdirSync(join(APP_ROOT, 'media'))
     .filter((name) => statSync(join(APP_ROOT, 'media', name)).isFile())
     .map((name) => `media/${name}`);
@@ -141,9 +166,7 @@ function extractedChecks(extensionDir) {
     const expected = PANEL_FILES.filter((relative) => relative.startsWith(`${prefix}/`))
       .map((relative) => relative.slice(prefix.length + 1))
       .sort();
-    const actual = readdirSync(directory)
-      .filter((name) => statSync(join(directory, name)).isFile())
-      .sort();
+    const actual = walkFiles(directory, '').sort();
     check(
       JSON.stringify(actual) === JSON.stringify(expected),
       `packaged ${prefix}/ ships exactly the Faktor-owned panel files (found: ${actual.join(', ')})`,
