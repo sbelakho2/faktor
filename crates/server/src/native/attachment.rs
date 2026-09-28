@@ -1,8 +1,15 @@
 //! Native binary-attachment surface (additive, strict): upload ONE
 //! `data_base64` payload into the session's durable CAS-backed attachment
 //! store, resolve one REFERENCE by its surrogate `ref_id` (metadata and its
-//! own MIME-tagged bytes), resolve one BLOB by digest (raw octet-stream
-//! bytes), and the ONE wire admission rule every task-start DTO uses.
+//! own MIME-tagged bytes), resolve one BLOB by digest (metadata when
+//! unambiguous, else a typed 409; raw octet-stream bytes), and the ONE wire
+//! admission rule every task-start DTO uses.
+//!
+//! The route grammar is strictly SEPARATED: `.../attachments/ref/{ref_id}`
+//! is reference-id-addressed (canonical decimal only) and
+//! `.../attachments/blob/{digest}` is digest-addressed (64-char hex). A
+//! decimal-looking digest can therefore never collide with a ref id on any
+//! path.
 //!
 //! - Bytes are validated (mime/filename/size bounds), written to the CAS,
 //!   and persisted as a typed `AttachmentId { digest, mime, filename, size }`
@@ -435,15 +442,19 @@ pub(crate) async fn native_attachment_upload(
     }
 }
 
-/// Parse one attachment REFERENCE path segment strictly: a decimal row id
-/// (`u64`). Reference routes are id-addressed because one CAS blob may back
-/// several references with distinct metadata.
+/// Parse one attachment REFERENCE path segment strictly: the CANONICAL
+/// decimal form of a `u64` (no sign, no whitespace, no leading zeros beyond
+/// `"0"`). A 64-digit decimal string is never accepted here — it is a
+/// possible hex digest and must be addressed on the `/blob/{digest}` routes.
 fn parse_ref_id(raw: &str) -> Result<u64, ApiError> {
-    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+    let canonical = !raw.is_empty()
+        && raw.bytes().all(|b| b.is_ascii_digit())
+        && (raw == "0" || !raw.starts_with('0'));
+    if !canonical {
         return Err(ApiError {
             code: "malformed",
             message: format!(
-                "{raw:?} is not a decimal attachment ref id; address a blob's bytes with /attachments/blob/{{digest}}/bytes"
+                "{raw:?} is not a canonical decimal attachment ref id; address a blob's metadata or bytes with /attachments/blob/{{digest}}"
             ),
             http_status: 400,
             retryable: false,
@@ -451,24 +462,24 @@ fn parse_ref_id(raw: &str) -> Result<u64, ApiError> {
     }
     raw.parse::<u64>().map_err(|_| ApiError {
         code: "malformed",
-        message: format!("{raw:?} is not a decimal attachment ref id"),
+        message: format!(
+            "{raw:?} is not a decimal attachment ref id; address a blob's metadata or bytes with /attachments/blob/{{digest}}"
+        ),
         http_status: 400,
         retryable: false,
     })
 }
 
-/// `GET /native/session/{id}/attachments/{ref_id}` — resolve exactly ONE
-/// durable attachment REFERENCE by its surrogate id: the returned metadata
-/// is THAT reference's own (`ref_id` is the stable wire identity), never
-/// another reference's. A hex digest segment keeps the deprecated digest
-/// lookup ONLY when it is unambiguous: exactly one reference exists for the
-/// digest, otherwise a typed 409 lists the candidate ref ids to choose from.
-/// Unknown/foreign ref ids, unknown digests and zero/mixed segments are
-/// typed 400/404s.
+/// `GET /native/session/{id}/attachments/ref/{ref_id}` — resolve exactly ONE
+/// durable attachment REFERENCE by its canonical decimal surrogate id: the
+/// returned metadata is THAT reference's own (`ref_id` is the stable wire
+/// identity), never another reference's. A non-canonical or non-decimal
+/// segment is a typed 400 that names the blob route (digests never share
+/// this segment grammar); an unknown/foreign ref id is a typed 404.
 pub(crate) async fn native_attachment_get(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, ref_or_digest)): Path<(String, String)>,
+    Path((id, ref_id)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
@@ -477,34 +488,51 @@ pub(crate) async fn native_attachment_get(
         Ok(h) => h,
         Err(r) => return *r,
     };
-    if !ref_or_digest.is_empty() && ref_or_digest.bytes().all(|b| b.is_ascii_digit()) {
-        // A 64-digit all-decimal segment overflows u64 and is a digest, not
-        // a ref id; it falls through to the digest branch below.
-        if let Ok(ref_id) = ref_or_digest.parse::<u64>() {
-            return match handle.attachment_ref(ref_id) {
-                Ok(Some(reference)) => Json(reference).into_response(),
-                Ok(None) => wire_status(not_found(&format!(
-                    "attachment ref {ref_id} in session {}",
-                    handle.id()
-                ))),
-                Err(e) => api_err(&e),
-            };
-        }
+    let ref_id = match parse_ref_id(&ref_id) {
+        Ok(ref_id) => ref_id,
+        Err(e) => return wire_status(e),
+    };
+    match handle.attachment_ref(ref_id) {
+        Ok(Some(reference)) => Json(reference).into_response(),
+        Ok(None) => wire_status(not_found(&format!(
+            "attachment ref {ref_id} in session {}",
+            handle.id()
+        ))),
+        Err(e) => api_err(&e),
     }
-    let hash = match parse_digest(&ref_or_digest) {
+}
+
+/// `GET /native/session/{id}/attachments/blob/{digest}` — resolve exactly one
+/// CAS blob's metadata by its 64-char hex digest: exactly ONE reference of
+/// this session => that reference; zero => a typed 404; several => a typed
+/// 409 whose message lists the candidate `ref_id`s to choose from (the
+/// reference-addressed route then returns each one's own metadata/MIME).
+pub(crate) async fn native_attachment_blob_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, digest)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let hash = match parse_digest(&digest) {
         Ok(h) => h,
         Err(e) => return wire_status(e),
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
     };
     match handle.attachment_refs_for_digest(hash) {
         Ok(mut refs) if refs.len() == 1 => Json(refs.remove(0)).into_response(),
         Ok(refs) if refs.is_empty() => wire_status(not_found(&format!(
-            "attachment {ref_or_digest} in session {}",
+            "attachment blob {digest} in session {}",
             handle.id()
         ))),
         Ok(refs) => wire_status(ApiError {
             code: "conflict",
             message: format!(
-                "attachment digest {ref_or_digest} in session {} has {} references; resolve one by ref_id: {:?}",
+                "attachment digest {digest} in session {} has {} references; resolve one by ref_id: {:?}",
                 handle.id(),
                 refs.len(),
                 refs.iter().map(|r| r.id).collect::<Vec<_>>()
@@ -516,11 +544,11 @@ pub(crate) async fn native_attachment_get(
     }
 }
 
-/// `GET /native/session/{id}/attachments/{ref_id}/bytes` — the verified
+/// `GET /native/session/{id}/attachments/ref/{ref_id}/bytes` — the verified
 /// bytes of exactly ONE durable attachment reference, served with THAT
-/// reference's MIME. A non-decimal segment is a typed 400 (blob bytes are
-/// `/attachments/blob/{digest}/bytes`); an unknown/foreign ref id is a
-/// typed 404.
+/// reference's MIME. A non-canonical decimal segment is a typed 400 (blob
+/// bytes are `/attachments/blob/{digest}/bytes`); an unknown/foreign ref id
+/// is a typed 404.
 pub(crate) async fn native_attachment_bytes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -562,9 +590,7 @@ pub(crate) async fn native_attachment_bytes(
 /// bytes of one blob referenced by THIS session, served as
 /// `application/octet-stream` (a digest-only blob has no single reference
 /// MIME). The blob must be referenced at least once by this session; an
-/// unknown/unreferenced digest is a typed 404. The digest probe uses the
-/// deterministic lowest-id reference (bounded single-row lookup, never the
-/// full reference set).
+/// unknown/unreferenced digest is a typed 404.
 pub(crate) async fn native_attachment_blob_bytes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -734,11 +760,11 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    /// The digest metadata route is UNAMBIGUOUS-OR-CONFLICT: exactly one
+    /// The blob metadata route is UNAMBIGUOUS-OR-CONFLICT: exactly one
     /// reference resolves; several references are a typed 409 listing the
     /// candidates; and ref ids never leak across sessions.
     #[tokio::test]
-    async fn digest_metadata_route_is_unambiguous_or_conflict_and_refs_are_scoped() {
+    async fn blob_metadata_route_is_unambiguous_or_conflict_and_refs_are_scoped() {
         let dir = tempfile::tempdir().unwrap();
         let (state, handle) = test_state(dir.path());
         let sid = handle.id().to_string();
@@ -752,7 +778,7 @@ mod tests {
             b"solo-bytes",
         )
         .await;
-        let meta = native_attachment_get(
+        let meta = native_attachment_blob_get(
             State(state.clone()),
             headers.clone(),
             Path((sid.clone(), solo.digest.to_hex())),
@@ -769,7 +795,7 @@ mod tests {
         let image = upload_ref(&state, &sid, "image/png", Some("solo.png"), b"solo-bytes").await;
         assert_eq!(image.digest, solo.digest);
         assert_ne!(image.id, solo.id);
-        let ambiguous = native_attachment_get(
+        let ambiguous = native_attachment_blob_get(
             State(state.clone()),
             headers.clone(),
             Path((sid.clone(), solo.digest.to_hex())),
@@ -843,7 +869,7 @@ mod tests {
         )
         .await;
         assert_eq!(foreign_bytes.status(), StatusCode::NOT_FOUND);
-        let foreign_digest = native_attachment_get(
+        let foreign_digest = native_attachment_blob_get(
             State(state.clone()),
             headers,
             Path((sid, other_ref.digest.to_hex())),
@@ -966,10 +992,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"%PDF-1.4");
-        // The deprecated digest metadata route is unambiguous-or-409: this
-        // digest has TWO references, so it is a typed conflict listing the
-        // candidate ref ids — never another reference's metadata.
-        let ambiguous = native_attachment_get(
+        // The blob metadata route is unambiguous-or-409: this digest has TWO
+        // references, so it is a typed conflict listing the candidate ref
+        // ids — never another reference's metadata.
+        let ambiguous = native_attachment_blob_get(
             State(state.clone()),
             headers.clone(),
             Path((sid.clone(), reference.digest.to_hex())),
@@ -999,7 +1025,7 @@ mod tests {
         )
         .await;
         assert_eq!(missing_bytes.status(), StatusCode::NOT_FOUND);
-        let missing_digest = native_attachment_get(
+        let missing_digest = native_attachment_blob_get(
             State(state.clone()),
             headers.clone(),
             Path((sid.clone(), "0".repeat(64))),
@@ -1029,6 +1055,235 @@ mod tests {
         )
         .await;
         assert_eq!(malformed_bytes.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// REGRESSION (audit finding 1): the ref and blob route grammars are
+    /// fully separated. A 64-decimal-digit digest with leading zeros
+    /// (`000...0001`) resolves as a DIGEST on the blob route and is never
+    /// treated as ref 1; an overflowing 64-decimal string is a typed 400 on
+    /// the ref route; a real hex digest with a-f resolves; an ordinary
+    /// numeric ref id resolves its own metadata/MIME; and a digest shared by
+    /// two references is a typed 409 listing the candidates while each ref
+    /// route serves its OWN metadata/MIME and blob bytes stay octet-stream.
+    #[tokio::test]
+    async fn ref_and_blob_route_grammars_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, handle) = test_state(dir.path());
+        let sid = handle.id().to_string();
+        let headers = auth_headers(&state);
+        // An ordinary upload becomes ref id 1 in this session.
+        let first = upload_ref(
+            &state,
+            &sid,
+            "application/pdf",
+            Some("spec.pdf"),
+            b"%PDF-1.4",
+        )
+        .await;
+        assert_eq!(first.id, 1, "the first reference is ref id 1");
+        // Seed a durable reference whose digest IS the 64-decimal-digit
+        // string `000...0001` (the former grammar collision): the blob route
+        // must resolve THAT digest's row, never ref 1's metadata.
+        let one_hex = format!("{:064x}", 1);
+        assert_eq!(one_hex.len(), 64);
+        let one = FileHash::from_hex(&one_hex).unwrap();
+        let leading = AttachmentId::new(one, "text/plain", Some("leading.txt"), 1).unwrap();
+        let leading_ref = state
+            .deps
+            .session
+            .store()
+            .put_attachment_ref(handle.id(), &leading)
+            .unwrap();
+        assert_ne!(leading_ref.id, first.id);
+        let resolved = native_attachment_blob_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), one_hex.clone())),
+        )
+        .await;
+        assert_eq!(resolved.status(), StatusCode::OK, "{one_hex}");
+        let body = axum::body::to_bytes(resolved.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let digest_ref: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            digest_ref, leading_ref,
+            "the blob route resolves the digest's own row"
+        );
+        assert_ne!(digest_ref, first, "the 64-digit digest is never ref 1");
+        // The same 64-digit string on the ref route is a typed 400 (leading
+        // zeros are not canonical decimal), never ref 1's metadata.
+        let as_ref = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), one_hex.clone())),
+        )
+        .await;
+        assert_eq!(as_ref.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(as_ref.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("/attachments/blob/"),
+            "{err:?}"
+        );
+        // A 64-decimal string that overflows u64 is a typed 400 on the ref
+        // route; on the blob route it is a valid (unknown) hex digest: 404.
+        let overflow = "9".repeat(64);
+        let as_ref = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), overflow.clone())),
+        )
+        .await;
+        assert_eq!(as_ref.status(), StatusCode::BAD_REQUEST);
+        let blob = native_attachment_blob_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), overflow)),
+        )
+        .await;
+        assert_eq!(blob.status(), StatusCode::NOT_FOUND);
+        // 64-char hex WITH a-f: a real blob resolves its own metadata on the
+        // ref route AND on the blob route.
+        let mut hex_ref = None;
+        for seed in 0u8..=255 {
+            let candidate =
+                upload_ref(&state, &sid, "application/octet-stream", None, &[seed]).await;
+            if candidate
+                .digest
+                .to_hex()
+                .bytes()
+                .any(|b| b.is_ascii_alphabetic())
+            {
+                hex_ref = Some(candidate);
+                break;
+            }
+        }
+        let hex_ref = hex_ref.expect("a BLAKE3 digest with a-f exists");
+        for (route, blob_route) in [
+            (hex_ref.id.to_string(), false),
+            (hex_ref.digest.to_hex(), true),
+        ] {
+            let response = if blob_route {
+                native_attachment_blob_get(
+                    State(state.clone()),
+                    headers.clone(),
+                    Path((sid.clone(), route)),
+                )
+                .await
+            } else {
+                native_attachment_get(
+                    State(state.clone()),
+                    headers.clone(),
+                    Path((sid.clone(), route)),
+                )
+                .await
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let reference: AttachmentRef = serde_json::from_slice(&body).unwrap();
+            assert_eq!(reference, hex_ref);
+        }
+        // An ordinary numeric ref id resolves its own metadata and MIME.
+        let by_id = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), first.id.to_string())),
+        )
+        .await;
+        assert_eq!(by_id.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(by_id.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let reference: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reference, first);
+        let bytes = native_attachment_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), first.id.to_string())),
+        )
+        .await;
+        assert_eq!(bytes.status(), StatusCode::OK);
+        assert_eq!(
+            bytes
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/pdf"
+        );
+        // A digest shared by two references: the blob metadata route is a
+        // typed 409 listing BOTH ids; every ref route serves its OWN
+        // metadata/MIME; the blob bytes route stays octet-stream.
+        let second = upload_ref(&state, &sid, "text/plain", Some("spec.txt"), b"%PDF-1.4").await;
+        assert_eq!(second.digest, first.digest);
+        assert_ne!(second.id, first.id);
+        let shared = native_attachment_blob_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), first.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(shared.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(shared.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["error"]["code"], "conflict");
+        let message = err["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&first.id.to_string()), "{err:?}");
+        assert!(message.contains(&second.id.to_string()), "{err:?}");
+        for (expected, mime) in [(&first, "application/pdf"), (&second, "text/plain")] {
+            let meta = native_attachment_get(
+                State(state.clone()),
+                headers.clone(),
+                Path((sid.clone(), expected.id.to_string())),
+            )
+            .await;
+            assert_eq!(meta.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(meta.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let reference: AttachmentRef = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                &reference, expected,
+                "each ref route keeps its own metadata"
+            );
+            let bytes = native_attachment_bytes(
+                State(state.clone()),
+                headers.clone(),
+                Path((sid.clone(), expected.id.to_string())),
+            )
+            .await;
+            assert_eq!(bytes.status(), StatusCode::OK);
+            assert_eq!(
+                bytes
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                mime
+            );
+        }
+        let blob_bytes = native_attachment_blob_bytes(
+            State(state.clone()),
+            headers,
+            Path((sid, first.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(blob_bytes.status(), StatusCode::OK);
+        assert_eq!(
+            blob_bytes
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
     }
 
     #[tokio::test]

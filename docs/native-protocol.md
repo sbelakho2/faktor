@@ -117,7 +117,8 @@ shrink-only handwritten budget live in
 --check` fails when a route is added without classification, when a
 `generated` DTO leaves the canonical schema, or when the audited
 handwritten set grows. The migrated attachment and task-run DTOs are
-generated into both IDE clients (`ProtocolAttachmentId`, `ProtocolTaskRun*`).
+generated into both IDE clients (`ProtocolAttachmentId`,
+`ProtocolAttachmentRef`, `ProtocolTaskRun*`).
 
 - `GET /session/{id}/projection` — one JSON snapshot of the session's
   state for UI badges/polling:
@@ -194,17 +195,21 @@ generated into both IDE clients (`ProtocolAttachmentId`, `ProtocolTaskRun*`).
   MIME/byte contract; a refusal keeps the durable bytes. Ordinary
   workspace source files ride the repository-context `files` path of a
   prompt/task start and are never uploaded blindly.
-- `GET /native/session/{id}/attachments/{ref_id}` and
-  `.../{ref_id}/bytes` — resolve ONE durable attachment REFERENCE by its
-  decimal surrogate id: the metadata is exactly THAT reference's
-  (`ref_id` included), and the bytes are served with THAT reference's
-  MIME. A blob may back several references with distinct metadata, so
-  digest-addressed retrieval is never used for a specific reference. For
-  backwards compatibility a 64-char hex digest segment still resolves the
-  deprecated metadata lookup ONLY when the digest is unambiguous: exactly
-  one reference exists for it; several references are a typed 409 whose
-  message lists the candidate `ref_id`s; unknown/foreign ref ids, unknown
-  digests and non-id/non-digest segments are typed 404/400s.
+- `GET /native/session/{id}/attachments/ref/{ref_id}` and
+  `.../ref/{ref_id}/bytes` — resolve ONE durable attachment REFERENCE by its
+  CANONICAL decimal surrogate id (no leading zeros): the metadata is exactly
+  THAT reference's (`ref_id` included), and the bytes are served with THAT
+  reference's MIME. A blob may back several references with distinct
+  metadata, so digest-addressed retrieval is never used for a specific
+  reference. A non-canonical/non-decimal segment is a typed 400 that names
+  the blob route; an unknown/foreign ref id is a typed 404.
+- `GET /native/session/{id}/attachments/blob/{digest}` — resolve ONE blob's
+  metadata by its 64-char hex digest: exactly one reference of this session
+  => that reference; zero => a typed 404; several references => a typed 409
+  whose message lists the candidate `ref_id`s (each `ref/{ref_id}` route then
+  serves its own metadata and MIME). The ref and blob route grammars never
+  share a segment: a 64-decimal-digit digest with leading zeros is a DIGEST
+  on this route, never a ref id.
 - `GET /native/session/{id}/attachments/blob/{digest}/bytes` — the raw CAS
   bytes of one blob referenced by this session, served as
   `application/octet-stream` (a digest-only blob has no single reference

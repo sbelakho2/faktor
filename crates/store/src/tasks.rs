@@ -1111,6 +1111,8 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ended_ms = now_ms();
+        // Preparation BEFORE enqueueing: the conflict diagnostic text.
+        let not_running = format!("tool run {op_id} is not running");
         self.writer
             .execute("finish_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
@@ -1126,9 +1128,7 @@ impl Store {
                     ],
                 )?;
                 if changed != 1 {
-                    return Err(StoreError::Conflict(format!(
-                        "tool run {op_id} is not running"
-                    )));
+                    return Err(StoreError::Conflict(not_running));
                 }
                 txn.side_row_applied();
                 let seq = Self::insert_event_locked(
@@ -1184,8 +1184,10 @@ impl Store {
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let state_json = serde_json::to_string(&state).unwrap();
         // Preparation BEFORE enqueueing: one timestamp for the row and the
-        // event, captured on the caller's thread (audit item 8).
+        // event, captured on the caller's thread (audit item 8), plus the
+        // conflict diagnostic text.
         let now = now_ms();
+        let not_running = format!("recovered tool run {op_id} is not running");
         self.writer
             .execute("finish_recovered_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, state)?;
@@ -1201,9 +1203,7 @@ impl Store {
                     ],
                 )?;
                 if changed != 1 {
-                    return Err(StoreError::Conflict(format!(
-                        "recovered tool run {op_id} is not running"
-                    )));
+                    return Err(StoreError::Conflict(not_running));
                 }
                 txn.side_row_applied();
                 let seq = Self::insert_event_locked(
@@ -1238,45 +1238,45 @@ impl Store {
             .expect("in-process TaskState serialization cannot fail");
         let attachments_json =
             serde_json::to_string(&t.attachments).unwrap_or_else(|_| "[]".into());
+        // Preparation BEFORE enqueueing: decode/refusal diagnostics.
+        let state_label = format!("task {}/{} state", t.session_id, t.task_id);
+        let completion_backstop = format!(
+            "task {}/{}: completion-relevant state {:?} may only be reached through the task machine (transition_task/complete_verified_task), never a raw row write",
+            t.session_id, t.task_id, t.state
+        );
         self.writer.execute("upsert_task", move |conn| {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_state_raw: Option<String> = tx
-            .query_row(
-                "SELECT state FROM task WHERE session_id = ?1 AND task_id = ?2",
-                params![t.session_id.raw() as i64, t.task_id.raw() as i64],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let current_state: Option<TaskState> = match current_state_raw {
-            Some(raw) => Some(parse_json(
-                &format!("task {}/{} state", t.session_id, t.task_id),
-                &raw,
-            )?),
-            None => None,
-        };
-        // P0-7 chokepoint backstop: completion-relevant states
-        // (NeedsVerification/Verifying/VerifiedComplete) may be written
-        // through this generic row path only when the row already holds
-        // that exact state (idempotent heal) or when the machine allows the
-        // edge into it (Running -> NeedsVerification,
-        // NeedsVerification -> Verifying). VerifiedComplete has NO machine
-        // edge and is produced exclusively by
-        // [`Store::task_complete_verified`] against a passing record — a raw
-        // row write can never mint a completion proof.
-        if t.state.is_completion_relevant() {
-            let legal = match current_state {
-                Some(cur) => cur == t.state || cur.allowed_transitions().contains(&t.state),
-                None => false,
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_state_raw: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM task WHERE session_id = ?1 AND task_id = ?2",
+                    params![t.session_id.raw() as i64, t.task_id.raw() as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let current_state: Option<TaskState> = match current_state_raw {
+                Some(raw) => Some(parse_json(&state_label, &raw)?),
+                None => None,
             };
-            if !legal {
-                return Err(StoreError::Malformed(format!(
-                    "task {}/{}: completion-relevant state {:?} may only be reached through the task machine (transition_task/complete_verified_task), never a raw row write",
-                    t.session_id, t.task_id, t.state
-                )));
+            // P0-7 chokepoint backstop: completion-relevant states
+            // (NeedsVerification/Verifying/VerifiedComplete) may be written
+            // through this generic row path only when the row already holds
+            // that exact state (idempotent heal) or when the machine allows the
+            // edge into it (Running -> NeedsVerification,
+            // NeedsVerification -> Verifying). VerifiedComplete has NO machine
+            // edge and is produced exclusively by
+            // [`Store::task_complete_verified`] against a passing record — a raw
+            // row write can never mint a completion proof.
+            if t.state.is_completion_relevant() {
+                let legal = match current_state {
+                    Some(cur) => cur == t.state || cur.allowed_transitions().contains(&t.state),
+                    None => false,
+                };
+                if !legal {
+                    return Err(StoreError::Malformed(completion_backstop));
+                }
             }
-        }
-        tx.execute(
-            "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
+            tx.execute(
+                "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
                               max_tokens, max_turns, spent_tokens, spent_turns,
                               state, created_ms, updated_ms, revision, attachments)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
@@ -1293,26 +1293,26 @@ impl Store {
                 updated_ms = excluded.updated_ms,
                 revision = excluded.revision,
                 attachments = excluded.attachments",
-            params![
-                t.task_id.raw() as i64,
-                t.session_id.raw() as i64,
-                t.goal,
-                criteria_json,
-                plan_json,
-                t.max_tokens.map(|m| m as i64),
-                t.max_turns.map(|m| m as i64),
-                t.spent_tokens.min(i64::MAX as u64) as i64,
-                t.spent_turns.min(i64::MAX as u32) as i64,
-                // In-process constructed enum (see create_session).
-                state_json,
-                t.created_ms,
-                t.updated_ms,
-                t.revision.raw() as i64,
-                attachments_json,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
+                params![
+                    t.task_id.raw() as i64,
+                    t.session_id.raw() as i64,
+                    t.goal,
+                    criteria_json,
+                    plan_json,
+                    t.max_tokens.map(|m| m as i64),
+                    t.max_turns.map(|m| m as i64),
+                    t.spent_tokens.min(i64::MAX as u64) as i64,
+                    t.spent_turns.min(i64::MAX as u32) as i64,
+                    // In-process constructed enum (see create_session).
+                    state_json,
+                    t.created_ms,
+                    t.updated_ms,
+                    t.revision.raw() as i64,
+                    attachments_json,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -1370,6 +1370,12 @@ impl Store {
     ) -> StoreResult<std::result::Result<TaskRow, TaskCompletionRefusal>> {
         // In-process constructed enum prepared BEFORE enqueueing.
         let verified_complete_json = serde_json::to_string(&TaskState::VerifiedComplete).unwrap();
+        // Preparation BEFORE enqueueing: decode labels and refusal texts (the
+        // closure formats nothing).
+        let workspace_label = format!("session {session_id} workspace_id");
+        let worktree_label = format!("session {session_id} worktree_id");
+        let overflow = format!("task {session_id}/{task_id} revision overflow at completion");
+        let vanished = format!("task {session_id}/{task_id} vanished between validation and write");
         self.writer.execute("task_complete_verified", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // The task's current base worktree: the session row (v8 identity).
@@ -1465,10 +1471,8 @@ impl Store {
                     missing,
                 }));
             }
-            let task_ws_id =
-                id_field::<WorkspaceId>(&format!("session {session_id} workspace_id"), task_ws)?;
-            let task_wt_id =
-                id_field::<WorktreeId>(&format!("session {session_id} worktree_id"), task_wt)?;
+            let task_ws_id = id_field::<WorkspaceId>(&workspace_label, task_ws)?;
+            let task_wt_id = id_field::<WorktreeId>(&worktree_label, task_wt)?;
             if record.workspace_id != task_ws_id || record.worktree_id != task_wt_id {
                 return Ok(Err(TaskCompletionRefusal::WorktreeMismatch {
                     record_id,
@@ -1522,11 +1526,9 @@ impl Store {
                     uncertain_micro,
                 }));
             }
-            let new_revision = expected_revision.checked_next().ok_or_else(|| {
-                StoreError::Malformed(format!(
-                    "task {session_id}/{task_id} revision overflow at completion"
-                ))
-            })?;
+            let new_revision = expected_revision
+                .checked_next()
+                .ok_or_else(|| StoreError::Malformed(overflow))?;
             let updated = tx.execute(
                 "UPDATE task SET state = ?3, revision = ?4, updated_ms = ?5
              WHERE session_id = ?1 AND task_id = ?2 AND revision = ?6",
@@ -1540,9 +1542,7 @@ impl Store {
                 ],
             )?;
             if updated != 1 {
-                return Err(StoreError::Conflict(format!(
-                    "task {session_id}/{task_id} vanished between validation and write"
-                )));
+                return Err(StoreError::Conflict(vanished));
             }
             tx.commit()?;
             let mut completed = task;
@@ -1745,9 +1745,10 @@ impl Store {
             )));
         }
         // Prepared ENTIRELY before enqueue: both status strings serialize on
-        // the caller's thread.
+        // the caller's thread, as does the corrupt-row decode label.
         let new_status_json = serde_json::to_string(&new_status).unwrap();
         let running_status_json = serde_json::to_string(&VerificationStatus::Running).unwrap();
+        let status_label = format!("verification_record {record_id} status");
         self.writer
             .execute("verification_record_finalize", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1776,10 +1777,7 @@ impl Store {
                     )
                     .optional()?;
                 let current: Option<VerificationStatus> = match current_raw {
-                    Some(raw) => Some(parse_json(
-                        &format!("verification_record {record_id} status"),
-                        &raw,
-                    )?),
+                    Some(raw) => Some(parse_json(&status_label, &raw)?),
                     None => None,
                 };
                 match current {
@@ -2086,13 +2084,11 @@ impl Store {
             }
             let row = verification_job_get(&tx, session_id, task_id, attempt_op_id, &check_id)?;
             let Some(mut job) = row else {
-                return Ok(Err(VerificationJobRefusal::Missing {
-                    check_id: check_id.to_string(),
-                }));
+                return Ok(Err(VerificationJobRefusal::Missing { check_id }));
             };
             if job.inline_status.is_some() || job.state != "queued" {
                 return Ok(Err(VerificationJobRefusal::NotOpen {
-                    check_id: check_id.to_string(),
+                    check_id,
                     state: job.state,
                 }));
             }
@@ -2173,13 +2169,11 @@ impl Store {
                 let Some(mut job) =
                     verification_job_get(&tx, session_id, task_id, attempt_op_id, &check_id)?
                 else {
-                    return Ok(Err(VerificationJobRefusal::Missing {
-                        check_id: check_id.to_string(),
-                    }));
+                    return Ok(Err(VerificationJobRefusal::Missing { check_id }));
                 };
                 if job.inline_status.is_some() || job.state != "running" {
                     return Ok(Err(VerificationJobRefusal::NotOpen {
-                        check_id: check_id.to_string(),
+                        check_id,
                         state: job.state,
                     }));
                 }
@@ -2199,9 +2193,7 @@ impl Store {
                         )
                         .optional()?;
                     if already.is_some() {
-                        return Ok(Err(VerificationJobRefusal::ResultExists {
-                            check_id: check_id.to_string(),
-                        }));
+                        return Ok(Err(VerificationJobRefusal::ResultExists { check_id }));
                     }
                     tx.execute(
                         "INSERT INTO verification_job_result(
@@ -2211,15 +2203,14 @@ impl Store {
                             session_id.raw() as i64,
                             task_id.raw() as i64,
                             attempt_op_id as i64,
-                            check_id,
-                            result,
+                            check_id.as_str(),
+                            result.as_str(),
                             now
                         ],
                     )?;
-                    job.result_json = Some(result.to_string());
+                    job.result_json = Some(result);
                 }
-                job.state = state.to_string();
-                job.note = note.clone();
+                job.note = note;
                 job.updated_ms = now;
                 job.finished_ms = Some(now);
                 tx.execute(
@@ -2231,12 +2222,13 @@ impl Store {
                         session_id.raw() as i64,
                         task_id.raw() as i64,
                         attempt_op_id as i64,
-                        check_id,
-                        state,
-                        note,
+                        check_id.as_str(),
+                        state.as_str(),
+                        job.note.as_deref(),
                         now
                     ],
                 )?;
+                job.state = state;
                 tx.commit()?;
                 Ok(Ok(job))
             })

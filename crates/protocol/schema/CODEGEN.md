@@ -106,9 +106,10 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET /native/session/{id}/agents` | handwritten-grandfathered |  |
 | `POST /native/session/{id}/agents/{child}/presentation` | handwritten-grandfathered |  |
 | `POST /native/session/{id}/attachments` | generated | `AttachmentUpload`, `AttachmentRef` |
+| `GET /native/session/{id}/attachments/blob/{digest}` | generated | `AttachmentRef` |
 | `GET /native/session/{id}/attachments/blob/{digest}/bytes` | streaming-special-case |  |
-| `GET /native/session/{id}/attachments/{ref_id}` | generated | `AttachmentRef` |
-| `GET /native/session/{id}/attachments/{ref_id}/bytes` | streaming-special-case |  |
+| `GET /native/session/{id}/attachments/ref/{ref_id}` | generated | `AttachmentRef` |
+| `GET /native/session/{id}/attachments/ref/{ref_id}/bytes` | streaming-special-case |  |
 | `GET,POST /native/session/{id}/board` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/checkpoints` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/events` | streaming-special-case |  |
@@ -181,7 +182,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | 1 | Error envelope `{error:{code,message,retryable}}` | `apps/vscode/src/nativeClient.ts` `apiError()` and `apps/jetbrains/backend/.../NativeClient.kt` `apiError()` now call the generated `parseProtocolErrorEnvelope`; the duplicated field checks were deleted. Wire behavior unchanged (missing/ill-typed `code`/`message` still falls back to `http_error`; a non-boolean `retryable` still reads as false). |
 | 2 (open) | Page metadata (`page`, `hasMore`, `nextCursor`/`nextBefore`) | The clients' page DTOs are projections of the native wire routes (camelCase `sessionId`, `nextCursor`), not of `faktor_protocol::native`; migrate only when the server route DTOs are moved into `faktor-protocol`. |
 | 3 (open) | Conversation messages/parts | The native wire message rows differ from `faktor_protocol::native::Message` (wire: `createdMs`/`data`/`kind` parts; protocol: snake_case typed parts used by ACP). Do not generate the wire projections from the protocol shapes until the two converge. |
-| 4 | Attachments + task-run DTOs (audit 15) | `AttachmentId`, `AttachmentUpload`, `TaskRun`, `TaskRunStarted`, `TaskRunCancelled`, `TaskRunWorkItem`, `TaskRunStartRequest` are canonical schema types now; both IDEs' parsed surfaces delegate to the generated `ProtocolAttachmentId`/`ProtocolTaskRun*` parsers (the VS Code `NativeTaskRun`/`NativeAttachmentId` names and the JetBrains `NativeTaskRun*`/`NativeAttachmentId` names are aliases), and the five routes are classified `generated` in the inventory. The server stays the strict authority: `NativeAttachmentUpload`/`StartTaskRunRequest` keep their `deny_unknown_fields` serde DTOs, mirrored field-for-field by the schema. |
+| 4 | Attachments + task-run DTOs (audit 15) | `AttachmentId`, `AttachmentRef`, `AttachmentUpload`, `TaskRun`, `TaskRunStarted`, `TaskRunCancelled`, `TaskRunWorkItem`, `TaskRunStartRequest` are canonical schema types now; both IDEs' parsed surfaces delegate to the generated `ProtocolAttachmentId`/`ProtocolAttachmentRef`/`ProtocolTaskRun*` parsers (the VS Code `NativeTaskRun`/`NativeAttachmentId` names and the JetBrains `NativeTaskRun*`/`NativeAttachmentId` names are aliases), and the six routes are classified `generated` in the inventory (the attachment routes split the ref-id and digest grammars: `ref/{ref_id}` metadata/bytes vs `blob/{digest}` metadata/bytes). The server stays the strict authority: `NativeAttachmentUpload`/`StartTaskRunRequest` keep their `deny_unknown_fields` serde DTOs, mirrored field-for-field by the schema. |
 
 The migration is deliberately conservative: a generated client may only
 replace a handwritten DTO when the wire shape is provably identical.

@@ -14,9 +14,11 @@
 import { createHash } from 'node:crypto';
 
 import { NativeApiError } from './nativeClient.ts';
+import { attachmentIdOf } from './nativeClient.ts';
 import type {
   NativeAttachmentId,
   NativeAttachmentLimits,
+  NativeAttachmentRef,
   NativeCompletionContract,
   NativeModelInfo,
   NativeTaskRunStarted,
@@ -30,21 +32,24 @@ export type TaskAttachmentId = NativeAttachmentId;
 /**
  * One already-uploaded attachment retained in LOCAL pending state, bound to
  * the session it was uploaded under AND to the exact reference that produced
- * it: a retry may reuse the durable id ONLY while it addresses the same
- * session and the pending bytes+mime+filename+size still hash to `contentDigest`
- * (a cross-session, changed-content or renamed retry must upload again; the
+ * it (the COMPLETE `AttachmentRef`, `ref_id` included): a retry may reuse
+ * the durable reference ONLY while it addresses the same session and the
+ * pending bytes+mime+filename+size still hash to `contentDigest` (a
+ * cross-session, changed-content or renamed retry must upload again; the
  * daemon would refuse the foreign id, and reusing an id whose reference
- * metadata changed would silently deliver the wrong artifact).
+ * metadata changed would silently deliver the wrong artifact). Task
+ * admission still sends the exact `AttachmentId` projection (see
+ * [`attachmentIdOf`]) — only the retained identity gains `ref_id`.
  */
 export interface PendingUploadedAttachment {
   readonly sessionId: string;
   /**
    * [`pendingAttachmentContentDigest`] of the reference (bytes + mime +
-   * filename + size) this id was uploaded from: the content identity that decides
-   * retry reuse, never the attachment's array index.
+   * filename + size) this reference was uploaded from: the content identity
+   * that decides retry reuse, never the attachment's array index.
    */
   readonly contentDigest: string;
-  readonly attachment: TaskAttachmentId;
+  readonly attachment: NativeAttachmentRef;
 }
 
 /** One binary attachment of a pending submission: exact bytes as base64. */
@@ -261,12 +266,19 @@ function pendingString(value: unknown, max = MAX_PENDING_ID_CHARS): string | nul
   return trimmed;
 }
 
-/** Strict decode of one durable attachment id (the upload response shape). */
-function parsePendingAttachmentId(raw: unknown): TaskAttachmentId | null {
+/** Strict decode of one durable attachment reference retained in local
+ *  pending state (the upload response shape): the complete identity,
+ *  `ref_id` included, so a retry reuses the exact reference rather than a
+ *  digest-only projection. */
+function parsePendingAttachmentRef(raw: unknown): NativeAttachmentRef | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return null;
   }
   const record = raw as Record<string, unknown>;
+  const refId =
+    typeof record.ref_id === 'number' && Number.isInteger(record.ref_id) && record.ref_id >= 1
+      ? record.ref_id
+      : null;
   const digest =
     typeof record.digest === 'string' && /^[0-9a-f]{64}$/.test(record.digest)
       ? record.digest
@@ -280,13 +292,13 @@ function parsePendingAttachmentId(raw: unknown): TaskAttachmentId | null {
     typeof record.size === 'number' && Number.isInteger(record.size) && record.size >= 0
       ? record.size
       : null;
-  if (digest === null || mime === null || size === null) {
+  if (refId === null || digest === null || mime === null || size === null) {
     return null;
   }
   if (filename === null && record.filename !== undefined && record.filename !== null) {
     return null;
   }
-  return { digest, mime, filename, size };
+  return { ref_id: refId, digest, mime, filename, size };
 }
 
 /** `null` = absent (optional by design); `'invalid'` = a hostile shape that
@@ -306,7 +318,7 @@ function parsePendingUploadedAttachment(
     typeof record.contentDigest === 'string' && /^[0-9a-f]{64}$/.test(record.contentDigest)
       ? record.contentDigest
       : null;
-  const attachment = parsePendingAttachmentId(record.attachment);
+  const attachment = parsePendingAttachmentRef(record.attachment);
   if (sessionId === null || contentDigest === null || attachment === null) {
     return 'invalid';
   }
@@ -768,7 +780,7 @@ export interface AttachmentUploadClient {
   uploadAttachment(
     sessionId: string,
     request: { mime: string; filename?: string | null; data_base64: string },
-  ): Promise<TaskAttachmentId>;
+  ): Promise<NativeAttachmentRef>;
 }
 
 export type AdmitFailureStage = 'upload' | 'start';
@@ -1047,27 +1059,27 @@ export async function admitPendingSubmission(input: {
         ? attachment.uploaded.attachment
         : null;
     if (reusable !== null) {
-      // Resolve the already-uploaded id FIRST only when the retained record
-      // was uploaded from the very same reference (bytes + mime +
-      // filename + size):
-      // the retry then carries the same durable identity and issues no
+      // Resolve the already-uploaded reference FIRST only when the retained
+      // record was uploaded from the very same reference (bytes + mime +
+      // filename + size): the retry then carries the same durable identity
+      // (projected to the exact task-admission AttachmentId) and issues no
       // second upload. A record whose content digest differs (the draft slot
       // changed bytes or was renamed) is stale and the attachment uploads
       // fresh.
-      uploaded.push(reusable);
+      uploaded.push(attachmentIdOf(reusable));
       continue;
     }
     try {
-      const id = await input.client.uploadAttachment(input.sessionId, {
+      const ref = await input.client.uploadAttachment(input.sessionId, {
         mime: attachment.mime,
         filename: attachment.filename,
         data_base64: attachment.dataBase64,
       });
-      uploaded.push(id);
+      uploaded.push(attachmentIdOf(ref));
       const record: PendingUploadedAttachment = {
         sessionId: input.sessionId,
         contentDigest,
-        attachment: id,
+        attachment: ref,
       };
       pending = withPendingUpload(pending, index, record);
       input.onAttachmentUploaded?.(index, record);

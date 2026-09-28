@@ -1107,7 +1107,8 @@ object JetBrainsParitySmoke {
                 if (filename == null) "null" else "\"" + filename.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
             response.json(
                 200,
-                "{\"digest\":\"" + ordinal.toString().padStart(64, '0') + "\",\"mime\":\"" +
+                "{\"ref_id\":" + ordinal + ",\"digest\":\"" +
+                    ordinal.toString().padStart(64, '0') + "\",\"mime\":\"" +
                     mime + "\",\"filename\":" + filenameJson + ",\"size\":" + size + "}"
             )
         }

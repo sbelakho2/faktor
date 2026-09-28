@@ -18,6 +18,7 @@ import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
+import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeAttachmentId
 import dev.faktor.shared.parseNativeBillingUsage
@@ -41,6 +42,7 @@ import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
+import dev.faktor.shared.parseProtocolAttachmentRef
 import dev.faktor.shared.view
 import java.awt.GraphicsEnvironment
 import java.awt.Toolkit
@@ -724,6 +726,22 @@ object FrontendSmoke {
             )
             assertEquals("image/png", parsedId.mime)
             assertEquals(4L, parsedId.size)
+            // The upload response is the FULL reference (additive `ref_id`):
+            // the generated ProtocolAttachmentRef parser keeps it and the
+            // task-admission projection drops only `ref_id`.
+            val parsedRef = parseProtocolAttachmentRef(
+                JsonCodec.parse(
+                    "{\"ref_id\":3,\"digest\":\"" + "b".repeat(64) +
+                        "\",\"mime\":\"image/png\",\"filename\":null,\"size\":4}"
+                ).view("attachment ref")
+            )
+            assertEquals(3L, parsedRef.refId)
+            assertEquals("b".repeat(64), parsedRef.digest)
+            assertEquals(
+                NativeAttachmentId("b".repeat(64), "image/png", null, 4),
+                parsedRef.attachmentId(),
+                "the task-admission projection keeps digest/mime/filename/size only"
+            )
             assertEquals(
                 "{\"goal\":\"g\",\"criteria\":[\"c\"],\"n\":3,\"files\":[\"/tmp/a.rs\"]}",
                 NativeRequests.startTournament("g", listOf("c"), 3, files = listOf("/tmp/a.rs"))
@@ -1864,13 +1882,15 @@ object FrontendSmoke {
             panel.shutdown()
         }
 
-        // Audit 29: the JetBrains pending-upload state reuses durable ids on a
-        // retry, uploads only absent attachments, and never reuses an entry
-        // across sessions.
-        step("pending attachment retry reuses uploads per session and only uploads absent entries") {
+        // Audit 29 + audit finding 4: the JetBrains pending-upload state
+        // retains the COMPLETE durable reference (ref_id included), reuses it
+        // on a retry, uploads only absent attachments, and never reuses an
+        // entry across sessions.
+        step("pending attachment retry retains the full reference and only uploads absent entries") {
             val retry = PendingAttachmentRetry(maxEntries = 2)
-            val id = { seed: String ->
-                NativeAttachmentId(
+            val ref = { seed: String, refId: Long ->
+                ProtocolAttachmentRef(
+                    refId = refId,
                     digest = seed.repeat(64),
                     mime = "image/png",
                     filename = "shot.png",
@@ -1881,28 +1901,39 @@ object FrontendSmoke {
             val keys = listOf("image:/w/a.png:4:1:image/png", "image:/w/b.png:4:1:image/png")
             val first = retry.resolve("7", keys) { index ->
                 uploads++
-                id(if (index == 0) "a" else "b")
+                ref(if (index == 0) "a" else "b", if (index == 0) 11L else 12L)
             }
             assertEquals(2, first.size)
             assertEquals(2, uploads, "the first attempt uploads every absent entry")
             assertEquals("a".repeat(64), first[0].digest)
+            assertEquals(
+                11L,
+                retry.reusable("7", keys[0])?.refId,
+                "the pending state keeps the uploaded reference identity"
+            )
             val retryIds = retry.resolve("7", keys) {
                 uploads++
-                id("z")
+                ref("z", 99L)
             }
-            assertEquals(2, uploads, "the retry resolves retained ids and uploads nothing")
+            assertEquals(2, uploads, "the retry resolves retained references and uploads nothing")
             assertEquals("b".repeat(64), retryIds[1].digest)
+            assertEquals(
+                12L,
+                retry.reusable("7", keys[1])?.refId,
+                "a reused reference keeps its own ref id"
+            )
             retry.resolve("8", keys) {
                 uploads++
-                id("c")
+                ref("c", 13L)
             }
             assertEquals(4, uploads, "an entry retained for session 7 is never reused by session 8")
             assertEquals("c".repeat(64), retry.reusable("8", keys[0])?.digest)
+            assertEquals(13L, retry.reusable("8", keys[0])?.refId)
             retry.release("8", keys)
             assertEquals(0, retry.size(), "durable acceptance releases the pending ids")
-            retry.retain("9", "k1", id("d"))
-            retry.retain("9", "k2", id("e"))
-            retry.retain("9", "k3", id("f"))
+            retry.retain("9", "k1", ref("d", 14L))
+            retry.retain("9", "k2", ref("e", 15L))
+            retry.retain("9", "k3", ref("f", 16L))
             assertEquals(2, retry.size(), "pending retry state is bounded")
             assertEquals(null, retry.reusable("9", "k1"), "the oldest pending upload was evicted")
         }
@@ -2292,6 +2323,32 @@ object FrontendSmoke {
                         )
                         if (started.runId.isEmpty()) fail("no run id")
                         println("  run=${started.runId} state=${started.state}")
+                    }
+                    step("binary attachment upload keeps ref_id and serves ref-addressed metadata/bytes") {
+                        val payload = "smoke bytes".toByteArray()
+                        val uploaded = client.uploadAttachment(
+                            sid,
+                            "text/plain",
+                            "smoke.txt",
+                            java.util.Base64.getEncoder().encodeToString(payload)
+                        )
+                        if (uploaded.refId < 1L) fail("the upload must carry a ref_id")
+                        assertEquals("text/plain", uploaded.mime)
+                        assertEquals(payload.size.toLong(), uploaded.size)
+                        assertEquals(
+                            uploaded,
+                            client.attachmentReference(sid, uploaded.refId),
+                            "the ref route resolves exactly THIS reference"
+                        )
+                        val refBytes = client.attachmentReferenceBytes(sid, uploaded.refId)
+                        assertEquals("text/plain", refBytes.mime, "ref bytes carry THAT reference MIME")
+                        assertTrue(payload.contentEquals(refBytes.bytes), "ref bytes are byte-exact")
+                        val blobBytes = client.attachmentBlobBytes(sid, uploaded.digest)
+                        assertTrue(
+                            payload.contentEquals(blobBytes),
+                            "blob bytes are the raw CAS bytes (no reference MIME invented)"
+                        )
+                        println("  ref=${uploaded.refId} digest=${uploaded.digest.take(12)}...")
                     }
                     step("permission list is served (reply route reachable)") {
                         val permissions = client.permissions(sid)

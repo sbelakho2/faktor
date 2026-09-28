@@ -59,6 +59,7 @@ import dev.faktor.shared.NativeTournamentStarted
 import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
+import dev.faktor.shared.ProtocolAttachmentRef
 import java.math.BigInteger
 import java.nio.file.Path
 
@@ -398,15 +399,16 @@ class FaktorFrontendService(
 
     /**
      * Upload ONE bounded binary attachment (standard base64) into the
-     * session's durable store; the returned typed id is what a later task
-     * start's `attachments` argument carries. Images use the same contract:
-     * the daemon admission validates them against the chosen model.
+     * session's durable store; the returned typed REFERENCE (`ref_id`
+     * included) is retained by the pending state and projected to the
+     * `AttachmentId` a later task start carries. Images use the same
+     * contract: the daemon admission validates them against the chosen model.
      */
     fun uploadAttachment(
         mime: String,
         filename: String? = null,
         dataBase64: String
-    ): NativeAttachmentId = clientOrThrow().uploadAttachment(
+    ): ProtocolAttachmentRef = clientOrThrow().uploadAttachment(
         requireSession(), mime, filename, dataBase64
     )
 

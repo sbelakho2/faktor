@@ -5,6 +5,7 @@ use super::*;
 use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
 use crate::*;
+use faktor_router::OutcomeView;
 
 #[tokio::test]
 async fn queue_survives_runner_gate_and_drains_sequentially() {

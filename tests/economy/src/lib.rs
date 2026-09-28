@@ -2155,7 +2155,7 @@ fn daemon_balanced_and_maximum_quality_mode_semantics_under_caps() {
 #[allow(unused_imports)]
 use faktor_core::model::{RiskBucket, TaskClass};
 #[allow(unused_imports)]
-use faktor_router::OutcomeStore;
+use faktor_router::{OutcomeStore, OutcomeView};
 
 // The scenario helpers are exercised by the #[cfg(test)] gates below; the
 // lib target itself only hosts them (like the kit/cert/daemon_gate mods).

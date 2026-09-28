@@ -90,7 +90,7 @@ pub mod outcomes;
 
 pub use outcomes::{
     rework_probability_ppm, verified_success_confidence_ppm, work_cost_estimate, EmptyOutcomeStore,
-    MemoryOutcomeStore, OutcomeKey, OutcomeSample, OutcomeStore, VerifiedOutcomeStats,
+    MemoryOutcomeStore, OutcomeKey, OutcomeSample, OutcomeStore, OutcomeView, VerifiedOutcomeStats,
     WorkCostEstimate,
 };
 
@@ -600,7 +600,7 @@ pub fn effective_quality_statement(
     task_class: TaskClass,
     risk_bucket: RiskBucket,
     now_ms: u64,
-    outcomes: &dyn outcomes::OutcomeStore,
+    outcomes: &dyn outcomes::OutcomeView,
 ) -> QualityStatement {
     let d = &candidate.descriptor;
     if let Some(stats) =
@@ -806,7 +806,7 @@ pub fn qualified_priced_candidates_authoritative_at<'a>(
     cache: &[CacheState],
     health: &LiveHealth,
     now_ms: u64,
-    outcomes: &dyn outcomes::OutcomeStore,
+    outcomes: &dyn outcomes::OutcomeView,
 ) -> Result<Vec<QualifiedCandidate<'a>>, QualificationFailure> {
     let refs: Vec<&'a RouteCandidate> = candidates.iter().collect();
     qualify_priced_refs(&refs, req, cache, health, now_ms, outcomes, true)
@@ -819,7 +819,7 @@ fn qualify_priced_refs<'a>(
     cache: &[CacheState],
     health: &LiveHealth,
     now_ms: u64,
-    outcomes: &dyn outcomes::OutcomeStore,
+    outcomes: &dyn outcomes::OutcomeView,
     // The adaptive target preference is applied at the END of this pass
     // (`true`), after every hard axis filtered the set. The candidate-sized
     // route calls with `false` and re-applies the preference after its
@@ -1000,7 +1000,7 @@ pub fn qualify_specific_authoritative_at<'a>(
     cache: &[CacheState],
     health: &LiveHealth,
     now_ms: u64,
-    outcomes: &dyn outcomes::OutcomeStore,
+    outcomes: &dyn outcomes::OutcomeView,
 ) -> Result<QualifiedCandidate<'a>, QualificationFailure> {
     let refs: Vec<&'a RouteCandidate> = candidates
         .iter()
@@ -1295,7 +1295,7 @@ fn two_cheapest_distinct<'a>(qualified: &[QualifiedCandidate<'a>]) -> CheapestTw
 fn score_candidates<'a>(
     qualified: &[QualifiedCandidate<'a>],
     phase: RouterPhase,
-    outcomes: &dyn outcomes::OutcomeStore,
+    outcomes: &dyn outcomes::OutcomeView,
 ) -> Vec<ScoredCandidate<'a>> {
     let two = two_cheapest_distinct(qualified);
     qualified
@@ -1403,7 +1403,7 @@ pub fn score_priced_candidates<'a>(
     qualified: &[QualifiedCandidate<'a>],
     candidates: &'a [RouteCandidate],
     req: &RouteRequest,
-    outcomes: &dyn outcomes::OutcomeStore,
+    outcomes: &dyn outcomes::OutcomeView,
 ) -> Vec<PricedScoredCandidate<'a>> {
     // Numeric base costs of every qualified candidate, cheapest first —
     // the escalation pool (unknown costs never enter it).
@@ -1872,7 +1872,7 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<QualifiedCandidate<'_>, QualificationFailure> {
         let health = self.telemetry.snapshot();
         qualify_specific_authoritative_at(
@@ -1939,7 +1939,7 @@ impl RouterService {
         candidate: &RouteCandidate,
         req: &RouteRequest,
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> QualityStatement {
         effective_quality_statement(
             candidate,
@@ -1953,7 +1953,7 @@ impl RouterService {
 
     /// The service's outcome registry (the durable verified-outcome store a
     /// route-scoped [`outcomes::MemoOutcomeStore`] wraps).
-    pub fn outcome_store(&self) -> &dyn outcomes::OutcomeStore {
+    pub fn outcome_store(&self) -> &dyn outcomes::OutcomeView {
         self.outcomes.as_ref()
     }
 
@@ -2004,7 +2004,7 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<RouteDecision, String> {
         if let Some((provider, model)) = &self.pinned {
             return self.route_pinned(provider, model, req, cache, now_ms, outcomes);
@@ -2025,7 +2025,7 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<RouteDecision, String> {
         let health = self.telemetry.snapshot();
         let qualified = qualified_priced_candidates_authoritative_at(
@@ -2128,7 +2128,7 @@ impl RouterService {
         cache: &[CacheState],
         planner: &dyn CandidatePlanner,
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<SizedRouteDecision, String> {
         if self.pinned.is_some() || self.priced.is_empty() {
             return self
@@ -2330,7 +2330,7 @@ impl RouterService {
         prefix_history: Option<&[stability::TurnPrefix]>,
         planner: &dyn CandidatePlanner,
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<SizedRouteDecision, String> {
         let Some(history) = prefix_history else {
             return self.route_with_candidate_plans_at_with(req, cache, planner, now_ms, outcomes);
@@ -2440,7 +2440,7 @@ impl RouterService {
         req: &RouteRequest,
         cache: &[CacheState],
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<RouteDecision, String> {
         let q = self
             .qualify_specific_at_with(provider, model, req, cache, now_ms, outcomes)
@@ -2485,7 +2485,7 @@ impl RouterService {
         &self,
         req: &RouteRequest,
         cache: &[CacheState],
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<RouteDecision, String> {
         let health = self.telemetry.snapshot();
         let qualified = qualified_candidates(&self.router.candidates, req, cache, &health)
@@ -2646,7 +2646,7 @@ impl RouterService {
         floor: f64,
         prefix_history: Option<&[stability::TurnPrefix]>,
         now_ms: u64,
-        outcomes: &dyn outcomes::OutcomeStore,
+        outcomes: &dyn outcomes::OutcomeView,
     ) -> Result<RouteDecision, String> {
         let Some(history) = prefix_history else {
             return self.route_at_with(req, cache, now_ms, outcomes);

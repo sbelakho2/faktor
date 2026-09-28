@@ -982,7 +982,7 @@ impl EconomicRoutingPolicy {
         target: Option<u8>,
         prefix_history: Option<&[TurnPrefix]>,
         planner: Option<&dyn faktor_router::CandidatePlanner>,
-        outcomes: Option<&dyn faktor_router::outcomes::OutcomeStore>,
+        outcomes: Option<&dyn faktor_router::outcomes::OutcomeView>,
         now_ms: u64,
     ) -> Result<faktor_router::SizedRouteDecision, String> {
         let mut routed = req.clone();
@@ -1461,28 +1461,7 @@ impl StoreOutcomeStore {
     }
 }
 
-impl faktor_router::OutcomeStore for StoreOutcomeStore {
-    fn append_sample(&self, key: &faktor_router::OutcomeKey, sample: faktor_router::OutcomeSample) {
-        if let Err(e) = self.store.model_outcome_stats_append(
-            &key.provider,
-            &key.model,
-            key.phase,
-            key.task_class,
-            key.risk_bucket,
-            faktor_store::ModelOutcomeSample {
-                verified_success: sample.verified_success,
-                rework_cost_micro: sample.rework_cost_micro,
-                rework_turns: sample.rework_turns,
-            },
-        ) {
-            tracing::warn!(
-                provider = %key.provider,
-                model = %key.model,
-                "verified-outcome sample append failed: {e}"
-            );
-        }
-    }
-
+impl faktor_router::OutcomeView for StoreOutcomeStore {
     fn stats(
         &self,
         key: &faktor_router::OutcomeKey,
@@ -1508,6 +1487,29 @@ impl faktor_router::OutcomeStore for StoreOutcomeStore {
         match self.store.model_outcome_stats_phase(provider, model, phase) {
             Ok(Some(row)) => Some(outcome_stats_from_store(&row)),
             _ => None,
+        }
+    }
+}
+
+impl faktor_router::OutcomeStore for StoreOutcomeStore {
+    fn append_sample(&self, key: &faktor_router::OutcomeKey, sample: faktor_router::OutcomeSample) {
+        if let Err(e) = self.store.model_outcome_stats_append(
+            &key.provider,
+            &key.model,
+            key.phase,
+            key.task_class,
+            key.risk_bucket,
+            faktor_store::ModelOutcomeSample {
+                verified_success: sample.verified_success,
+                rework_cost_micro: sample.rework_cost_micro,
+                rework_turns: sample.rework_turns,
+            },
+        ) {
+            tracing::warn!(
+                provider = %key.provider,
+                model = %key.model,
+                "verified-outcome sample append failed: {e}"
+            );
         }
     }
 }

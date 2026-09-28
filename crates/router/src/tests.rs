@@ -1544,8 +1544,7 @@ fn failed_verification_is_never_learned_as_a_success_and_hostile_stats_saturate(
     // registry that reports near-maximum rework spend keeps the
     // candidate's estimate at the saturation ceiling.
     struct Hostile;
-    impl OutcomeStore for Hostile {
-        fn append_sample(&self, _key: &OutcomeKey, _s: OutcomeSample) {}
+    impl OutcomeView for Hostile {
         fn stats(&self, _key: &OutcomeKey) -> Option<VerifiedOutcomeStats> {
             Some(VerifiedOutcomeStats {
                 failures_first_pass: 1,
@@ -1567,6 +1566,9 @@ fn failed_verification_is_never_learned_as_a_success_and_hostile_stats_saturate(
                 ..Default::default()
             })
         }
+    }
+    impl OutcomeStore for Hostile {
+        fn append_sample(&self, _key: &OutcomeKey, _s: OutcomeSample) {}
     }
     let svc = RouterService::with_outcomes(vec![cheap, strong], Arc::new(Hostile));
     let d = svc.route(&implement_req(40_000, 6_000, 80), &[]).unwrap();
