@@ -491,6 +491,33 @@ mod evidence_store_tests {
     }
 }
 
+/// Raw (undecoded) result of one queue-admission writer job (audit finding
+/// 5): row text and integer values only. The typed [`AdmittedPrompt`] is
+/// decoded by [`Store::admit_queue_head`] on the caller's thread after the
+/// job returns; the writer owner never parses JSON.
+struct RawAdmittedPrompt {
+    queue_seq: i64,
+    op_id: OpId,
+    prompt: String,
+    files_json: String,
+    model: Option<String>,
+    variant: Option<String>,
+    agent: Option<String>,
+    message_seq: i64,
+}
+
+/// Raw outcome of one queue-admission writer job. `Ineligible` carries the
+/// raw state/files text so the caller can preserve the former decode
+/// contract (a corrupt column surfaces typed; nothing was claimed).
+enum RawAdmitOutcome {
+    MissingSession,
+    Ineligible {
+        state_json: String,
+        files_json: String,
+    },
+    Claimed(RawAdmittedPrompt),
+}
+
 impl Store {
     /// Append an event with the next per-session sequence number, atomically.
     /// Duplicate/gap sequences are impossible under the transaction; the
@@ -1407,6 +1434,10 @@ impl Store {
     ///
     /// Returns Ok(None) when the head is absent or the session state is not
     /// in `eligible_states` (nothing is touched in either case).
+    ///
+    /// The writer closure is SQL-ONLY (audit finding 5): `files` and the
+    /// session state are validated against caller-prepared canonical texts
+    /// and decoded on the caller's thread, never on the single writer owner.
     pub fn admit_queue_head(
         &self,
         session: SessionId,
@@ -1422,19 +1453,32 @@ impl Store {
             Option<String>,
             Option<String>,
         );
-        let eligible_states: Vec<String> = eligible_states
+        // Preparation BEFORE enqueueing: every eligible state as the exact
+        // JSON text a session row stores, so the closure only compares raw
+        // text.
+        let eligible_states_json: Vec<String> = eligible_states
             .iter()
-            .map(|state| state.to_string())
+            .map(|state| {
+                serde_json::to_string(state)
+                    .expect("in-process session-state label serialization cannot fail")
+            })
             .collect();
         // Preparation BEFORE enqueueing: the target state is serialized here,
         // not on the writer owner. The message data is wrapped by SQLite's
         // `json_object` inside the SQL-only closure (byte-identical to the
         // former `json!` wrapper), so the owner thread never runs serde.
         let state_json = serde_json::to_string(target_state).unwrap();
+        // Preparation BEFORE enqueueing: decode labels (the closure formats
+        // nothing).
+        let op_id_label = format!("prompt_queue {session} op_id");
+        let session_state_label = format!("session {session} state");
+        let files_label = format!("prompt_queue {session} files");
+        let corrupt_files = format!("prompt_queue {session} files: not a string array");
+        let session_missing = format!("session {session} has no row for queue admission");
         // The timestamp is captured once on the caller's thread (audit item
         // 8): every row this one transaction stamps shares it.
         let now = now_ms();
-        self.writer.execute("admit_queue_head", move |conn| {
+        let outcome = self.writer.execute("admit_queue_head", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let head: Option<QueueHeadRow> = tx
                 .query_row(
@@ -1458,28 +1502,41 @@ impl Store {
             else {
                 return Ok(None);
             };
-            // Decode every persisted column BEFORE the first mutation: a corrupt
-            // row surfaces as a typed `Corrupt` naming the field and the
-            // transaction rolls back without claiming the prompt or materializing
-            // the message.
-            let op_id = id_field(
-                &format!("prompt_queue {session} seq {queue_seq} op_id"),
-                op_id_raw,
-            )?;
-            let files: Vec<String> = parse_json(
-                &format!("prompt_queue {session} seq {queue_seq} files"),
-                &files_json,
-            )?;
-            let state: String = tx
+            // Validate every persisted column BEFORE the first mutation: a
+            // corrupt row surfaces as a typed `Corrupt` naming the field and
+            // the transaction rolls back without claiming the prompt or
+            // materializing the message. `files` must be a JSON array of
+            // strings; SQL-side validation is exact, so the caller's parse
+            // after commit cannot fail on a row this transaction mutated.
+            let op_id = id_field(&op_id_label, op_id_raw)?;
+            let files_ok: i64 = tx
+                .query_row(
+                    "SELECT json_type(?1) = 'array'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM json_each(?1) WHERE json_type(value) <> 'text'
+                        )",
+                    params![files_json.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(|_| StoreError::Corrupt(vec![corrupt_files.clone()]))?;
+            if files_ok != 1 {
+                return Err(StoreError::Corrupt(vec![corrupt_files.clone()]));
+            }
+            let state_raw: Option<String> = tx
                 .query_row(
                     "SELECT state FROM session WHERE id = ?1",
                     params![session.raw() as i64],
                     |r| r.get(0),
                 )
-                .map_err(|e| StoreError::Migration(format!("session missing: {e}")))?;
-            let state_label: String = parse_json(&format!("session {session} state"), &state)?;
-            if !eligible_states.iter().any(|s| s == &state_label) {
-                return Ok(None);
+                .optional()?;
+            let Some(state_raw) = state_raw else {
+                return Ok(Some(RawAdmitOutcome::MissingSession));
+            };
+            if !eligible_states_json.iter().any(|text| text == &state_raw) {
+                return Ok(Some(RawAdmitOutcome::Ineligible {
+                    state_json: state_raw,
+                    files_json,
+                }));
             }
             tx.execute(
                 "UPDATE prompt_queue SET status = 'claimed', claimed_at = ?2
@@ -1502,20 +1559,48 @@ impl Store {
                 params![session.raw() as i64, state_json, now],
             )?;
             tx.commit()?;
-            Ok(Some((
-                AdmittedPrompt {
-                    queue_seq,
-                    op_id,
-                    prompt,
-                    files,
-                    model,
-                    variant,
-                    agent,
-                    message_seq: event_seq,
-                },
-                event_seq,
-            )))
-        })
+            Ok(Some(RawAdmitOutcome::Claimed(RawAdmittedPrompt {
+                queue_seq,
+                op_id,
+                prompt,
+                files_json,
+                model,
+                variant,
+                agent,
+                message_seq: event_seq,
+            })))
+        })?;
+        // The typed outcome is recovered HERE, on the caller's thread.
+        match outcome {
+            None => Ok(None),
+            Some(RawAdmitOutcome::MissingSession) => Err(StoreError::Migration(session_missing)),
+            Some(RawAdmitOutcome::Ineligible {
+                state_json,
+                files_json,
+            }) => {
+                // Preserve the former decode contract: a corrupt state or
+                // files column surfaces typed; nothing was admitted.
+                let _: String = parse_json(&session_state_label, &state_json)?;
+                let _: Vec<String> = parse_json(&files_label, &files_json)?;
+                Ok(None)
+            }
+            Some(RawAdmitOutcome::Claimed(raw)) => {
+                let files: Vec<String> = parse_json(&files_label, &raw.files_json)?;
+                Ok(Some((
+                    AdmittedPrompt {
+                        queue_seq: raw.queue_seq,
+                        op_id: raw.op_id,
+                        prompt: raw.prompt,
+                        files,
+                        model: raw.model,
+                        variant: raw.variant,
+                        agent: raw.agent,
+                        message_seq: raw.message_seq,
+                    },
+                    raw.message_seq,
+                )))
+            }
+        }
     }
 
     pub fn mark_queue_status(

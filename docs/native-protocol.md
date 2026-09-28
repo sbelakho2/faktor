@@ -197,7 +197,8 @@ generated into both IDE clients (`ProtocolAttachmentId`,
   prompt/task start and are never uploaded blindly.
 - `GET /native/session/{id}/attachments/ref/{ref_id}` and
   `.../ref/{ref_id}/bytes` — resolve ONE durable attachment REFERENCE by its
-  CANONICAL decimal surrogate id (no leading zeros): the metadata is exactly
+  CANONICAL decimal surrogate id (no leading zeros; ref ids start at 1, so
+  `"0"` is a typed 400): the metadata is exactly
   THAT reference's (`ref_id` included), and the bytes are served with THAT
   reference's MIME. A blob may back several references with distinct
   metadata, so digest-addressed retrieval is never used for a specific
@@ -209,12 +210,26 @@ generated into both IDE clients (`ProtocolAttachmentId`,
   whose message lists the candidate `ref_id`s (each `ref/{ref_id}` route then
   serves its own metadata and MIME). The ref and blob route grammars never
   share a segment: a 64-decimal-digit digest with leading zeros is a DIGEST
-  on this route, never a ref id.
+  on this route, never a ref id. First-party clients expose this read as
+  `attachmentBlobReference` (VS Code `NativeClient`, JetBrains
+  `NativeClient`), surfacing the 409 as a typed API error rather than
+  guessing a reference.
 - `GET /native/session/{id}/attachments/blob/{digest}/bytes` — the raw CAS
   bytes of one blob referenced by this session, served as
   `application/octet-stream` (a digest-only blob has no single reference
   MIME). The blob must be referenced at least once by the session; an
   unknown/unreferenced digest is a typed 404.
+- Attachment byte retrieval is bounded by the HTTP attachment contract: both
+  `.../bytes` routes serve at most `MAX_ATTACHMENT_UPLOAD_BYTES` (7 MiB
+  decoded, `crates/server/src/native/attachment.rs`) BY DESIGN — the
+  retrieval ceiling is the upload contract, not a suggestion, so HTTP
+  retrieval is never tighter than HTTP admission. The core CAS/attachment
+  ceiling (`MAX_ATTACHMENT_BYTES`, 32 MiB) stays for programmatic callers:
+  an attachment larger than 7 MiB can be stored programmatically but is NOT
+  retrievable over HTTP. Clients bound these responses by the same contract
+  (VS Code `ATTACHMENT_RESPONSE_MAX_BYTES`, JetBrains
+  `NativeClient.ATTACHMENT_RESPONSE_MAX_BYTES`) instead of their generic body
+  caps, and refuse an over-bound response typedly.
 - `GET /native/session/{id}/events?after=<seq>` — the durable journal SSE
   stream, cursor-resumable: frames are `id: <seq>`, `event: <kind>`,
   `data: <native_event_row>` (the exact shape of the `/native/events`

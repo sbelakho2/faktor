@@ -1,5 +1,6 @@
 //! `tasks`: cohesive slice of the mechanically decomposed parent module.
 
+use super::task_completion_guard::{read_and_validate_completion_record, record_unchanged};
 use super::*;
 
 // ------------------------------------------- verification job bounds (v22)
@@ -308,6 +309,15 @@ pub enum TaskCompletionRefusal {
         uncertain: usize,
         uncertain_micro: u64,
     },
+}
+
+/// Raw completion-job payloads whose recovery would run JSON decoding on the
+/// writer owner (audit finding 5): [`Store::task_complete_verified`] decodes
+/// them on the caller's thread after the job returns.
+enum RawCompletionRefusal {
+    NotVerifying(String),
+    RecordNotPassed(String),
+    CriteriaNotCovered(String),
 }
 
 /// Typed refusal of a record-finalize CAS. A record finalizes exactly once
@@ -1244,6 +1254,10 @@ impl Store {
             "task {}/{}: completion-relevant state {:?} may only be reached through the task machine (transition_task/complete_verified_task), never a raw row write",
             t.session_id, t.task_id, t.state
         );
+        // Preparation BEFORE enqueueing: the raw state vocabulary (audit
+        // finding 5 — no `TaskState` decode on the writer owner).
+        let state_vocabulary = task_state_vocabulary();
+        let corrupt_state = format!("{state_label}: no known task state");
         self.writer.execute("upsert_task", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current_state_raw: Option<String> = tx
@@ -1253,8 +1267,16 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let current_state: Option<TaskState> = match current_state_raw {
-                Some(raw) => Some(parse_json(&state_label, &raw)?),
+            // The vocabulary lookup preserves the eager decode contract: an
+            // unknown state text is corruption, exactly like a failed parse.
+            let current_state: Option<TaskState> = match current_state_raw.as_deref() {
+                Some(raw) => Some(
+                    state_vocabulary
+                        .iter()
+                        .find(|(text, _)| text == raw)
+                        .map(|(_, state)| *state)
+                        .ok_or_else(|| StoreError::Corrupt(vec![corrupt_state.clone()]))?,
+                ),
                 None => None,
             };
             // P0-7 chokepoint backstop: completion-relevant states
@@ -1368,15 +1390,32 @@ impl Store {
         record_id: VerificationRecordId,
         now: i64,
     ) -> StoreResult<std::result::Result<TaskRow, TaskCompletionRefusal>> {
-        // In-process constructed enum prepared BEFORE enqueueing.
+        // Preparation BEFORE enqueueing: the canonical state text the
+        // SQL-only closure compares the raw `task.state` column against, plus
+        // decode labels and refusal texts (the closure formats nothing).
         let verified_complete_json = serde_json::to_string(&TaskState::VerifiedComplete).unwrap();
-        // Preparation BEFORE enqueueing: decode labels and refusal texts (the
-        // closure formats nothing).
+        let verifying_json = serde_json::to_string(&TaskState::Verifying).unwrap();
+        let passed_json = serde_json::to_string(&VerificationStatus::Passed).unwrap();
         let workspace_label = format!("session {session_id} workspace_id");
         let worktree_label = format!("session {session_id} worktree_id");
+        let task_revision_label = format!("task {session_id}/{task_id} revision");
+        let record_task_label = format!("verification_record {record_id} task_id");
+        let record_revision_label = format!("verification_record {record_id} revision");
+        let record_workspace_label = format!("verification_record {record_id} workspace_id");
+        let record_worktree_label = format!("verification_record {record_id} worktree_id");
+        let status_label = format!("verification_record {record_id} status");
+        let corrupt_criteria = format!("task {session_id}/{task_id} criteria json is corrupt");
+        let record_changed = format!("verification_record {record_id} changed before write");
         let overflow = format!("task {session_id}/{task_id} revision overflow at completion");
         let vanished = format!("task {session_id}/{task_id} vanished between validation and write");
-        self.writer.execute("task_complete_verified", move |conn| {
+        let vanished_after =
+            format!("task {session_id}/{task_id} vanished after completion commit");
+        // Caller-side typed validation BEFORE enqueueing; the job surfaces its
+        // verdict (including wrong-shape Corrupt) after the task refusals.
+        let prepared = read_and_validate_completion_record(&*self.read()?, record_id.raw() as i64);
+        // The job returns raw payloads this thread decodes (no JSON on the owner).
+        type RawCompletion = Result<Option<TaskCompletionRefusal>, RawCompletionRefusal>;
+        let raw: RawCompletion = self.writer.execute("task_complete_verified", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // The task's current base worktree: the session row (v8 identity).
             let base: Option<(i64, i64)> = tx
@@ -1387,100 +1426,97 @@ impl Store {
                 )
                 .optional()?;
             let Some((task_ws, task_wt)) = base else {
-                return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
+                return Ok(Ok(Some(TaskCompletionRefusal::TaskMissing { task_id })));
             };
-            let task = {
-                let mut stmt = tx.prepare(
-                    "SELECT task_id, session_id, goal, acceptance_criteria, plan,
-                        max_tokens, max_turns, spent_tokens, spent_turns,
-                        state, created_ms, updated_ms, revision, attachments
-                 FROM task WHERE session_id = ?1 AND task_id = ?2",
-                )?;
-                let mut rows =
-                    stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
-                match rows.next()? {
-                    Some(row) => Some(task_row_map(row, session_id)?),
-                    None => None,
-                }
+            // SELECT ONLY the raw task columns the CAS/coverage need (no `TaskRow` decode).
+            let task: Option<(i64, String, String)> = tx
+                .query_row(
+                    "SELECT revision, state, acceptance_criteria
+                     FROM task WHERE session_id = ?1 AND task_id = ?2",
+                    params![session_id.raw() as i64, task_id.raw() as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((task_revision_raw, task_state, task_criteria_json)) = task else {
+                return Ok(Ok(Some(TaskCompletionRefusal::TaskMissing { task_id })));
             };
-            let Some(task) = task else {
-                return Ok(Err(TaskCompletionRefusal::TaskMissing { task_id }));
-            };
-            if task.revision != expected_revision {
-                return Ok(Err(TaskCompletionRefusal::RevisionMismatch {
+            // (d) the task must still be at the caller's expected revision.
+            if task_revision_raw != expected_revision.raw() as i64 {
+                let actual = id_field::<TaskRevision>(&task_revision_label, task_revision_raw)?;
+                return Ok(Ok(Some(TaskCompletionRefusal::RevisionMismatch {
                     expected: expected_revision,
-                    actual: task.revision,
-                }));
+                    actual,
+                })));
             }
-            if task.state != TaskState::Verifying {
-                return Ok(Err(TaskCompletionRefusal::NotVerifying {
-                    actual: task.state,
-                }));
+            // (a) only a `Verifying` task may be completed: raw text compare;
+            // the typed state is recovered on the caller's thread.
+            if task_state != verifying_json {
+                return Ok(Err(RawCompletionRefusal::NotVerifying(task_state)));
             }
-            let record = {
-                let mut stmt = tx.prepare(
-                    "SELECT id, task_id, revision, workspace_id, worktree_id, tree_hash,
-                        criteria_json, checks_json, changed_files_json,
-                        unrelated_changes_json, reviewer_json, status,
-                        started_ms, completed_ms
-                 FROM verification_record WHERE id = ?1",
-                )?;
-                let mut rows = stmt.query(params![record_id.raw() as i64])?;
-                match rows.next()? {
-                    Some(row) => Some(verification_record_map(row)?),
-                    None => None,
-                }
-            };
+            // Raw record columns, same discipline; the typed JSON shapes were
+            // already validated caller-side, before this job was enqueued.
+            type RawRecord = (i64, i64, i64, i64, String, String);
+            let record: Option<RawRecord> = tx
+                .query_row(
+                    "SELECT task_id, revision, workspace_id, worktree_id, criteria_json, status FROM verification_record WHERE id = ?1",
+                    params![record_id.raw() as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()?;
             let Some(record) = record else {
-                return Ok(Err(TaskCompletionRefusal::RecordMissing { record_id }));
+                return Ok(Ok(Some(TaskCompletionRefusal::RecordMissing { record_id })));
             };
-            if record.task_id != task_id {
-                return Ok(Err(TaskCompletionRefusal::RecordWrongTask {
+            // The prepared verdict surfaces HERE; the CAS requires byte-identity.
+            let prepared = prepared?;
+            if !record_unchanged(&tx, record_id.raw() as i64, prepared.as_ref())? {
+                return Err(StoreError::Conflict(record_changed));
+            }
+            let record_task = id_field::<TaskId>(&record_task_label, record.0)?;
+            if record_task != task_id {
+                return Ok(Ok(Some(TaskCompletionRefusal::RecordWrongTask {
                     record_id,
-                    record_task: record.task_id,
+                    record_task,
                     requested: task_id,
-                }));
+                })));
             }
-            if record.revision != expected_revision {
-                return Ok(Err(TaskCompletionRefusal::RecordWrongRevision {
+            let record_revision = id_field::<TaskRevision>(&record_revision_label, record.1)?;
+            if record_revision != expected_revision {
+                return Ok(Ok(Some(TaskCompletionRefusal::RecordWrongRevision {
                     record_id,
-                    record_revision: record.revision,
+                    record_revision,
                     expected: expected_revision,
-                }));
+                })));
             }
-            if record.status != VerificationStatus::Passed {
-                return Ok(Err(TaskCompletionRefusal::RecordNotPassed {
-                    record_id,
-                    status: record.status,
-                }));
+            if record.5 != passed_json {
+                return Ok(Err(RawCompletionRefusal::RecordNotPassed(record.5)));
             }
-            let missing: Vec<String> = task
-                .acceptance_criteria
-                .iter()
-                .filter(|c| {
-                    !record
-                        .criteria
-                        .iter()
-                        .any(|cv| cv.passed && &cv.criterion_key == *c)
-                })
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                return Ok(Err(TaskCompletionRefusal::CriteriaNotCovered {
-                    record_id,
-                    missing,
-                }));
+            // (f) coverage + criteria shape validation in ONE SQL pass:
+            // `None` = corrupt criteria, `"[]"` = fully covered, else missing JSON.
+            let missing_json: Option<String> = tx
+                .query_row(
+                    "SELECT CASE WHEN json_type(?1) = 'array' AND NOT EXISTS (SELECT 1 FROM json_each(?1) WHERE type <> 'text') AND json_type(?2) = 'array' AND NOT EXISTS (SELECT 1 FROM json_each(?2) WHERE type <> 'object' OR COALESCE(json_type(value, '$.criterion_key'), 'missing') <> 'text' OR COALESCE(json_type(value, '$.passed'), 'missing') NOT IN ('true', 'false')) THEN COALESCE((SELECT json_group_array(value) FROM json_each(?1) AS c WHERE NOT EXISTS (SELECT 1 FROM json_each(?2) AS r WHERE json_extract(r.value, '$.passed') = 1 AND json_extract(r.value, '$.criterion_key') = c.value)), '[]') ELSE NULL END",
+                    params![task_criteria_json.as_str(), record.4.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(|_| StoreError::Corrupt(vec![corrupt_criteria.clone()]))?;
+            let missing_json =
+                missing_json.ok_or_else(|| StoreError::Corrupt(vec![corrupt_criteria.clone()]))?;
+            if missing_json != "[]" {
+                return Ok(Err(RawCompletionRefusal::CriteriaNotCovered(missing_json)));
             }
+            // (g) the record's base worktree must equal the task's current one.
             let task_ws_id = id_field::<WorkspaceId>(&workspace_label, task_ws)?;
             let task_wt_id = id_field::<WorktreeId>(&worktree_label, task_wt)?;
-            if record.workspace_id != task_ws_id || record.worktree_id != task_wt_id {
-                return Ok(Err(TaskCompletionRefusal::WorktreeMismatch {
+            let record_ws_id = id_field::<WorkspaceId>(&record_workspace_label, record.2)?;
+            let record_wt_id = id_field::<WorktreeId>(&record_worktree_label, record.3)?;
+            if record_ws_id != task_ws_id || record_wt_id != task_wt_id {
+                return Ok(Ok(Some(TaskCompletionRefusal::WorktreeMismatch {
                     record_id,
-                    record_workspace: record.workspace_id,
-                    record_worktree: record.worktree_id,
+                    record_workspace: record_ws_id,
+                    record_worktree: record_wt_id,
                     task_workspace: task_ws_id,
                     task_worktree: task_wt_id,
-                }));
+                })));
             }
             // (h) THE ACCOUNTING GATE (completion-vs-reserve invariant): no
             // reservation of this task may still hold budget — `reserved`
@@ -1518,13 +1554,13 @@ impl Store {
                 != 0
             {
                 tx.rollback()?;
-                return Ok(Err(TaskCompletionRefusal::ReservationsHeld {
+                return Ok(Ok(Some(TaskCompletionRefusal::ReservationsHeld {
                     reserved,
                     dispatched,
                     reserved_micro,
                     uncertain,
                     uncertain_micro,
-                }));
+                })));
             }
             let new_revision = expected_revision
                 .checked_next()
@@ -1535,7 +1571,7 @@ impl Store {
                 params![
                     session_id.raw() as i64,
                     task_id.raw() as i64,
-                    verified_complete_json,
+                    verified_complete_json.as_str(),
                     new_revision.raw() as i64,
                     now,
                     expected_revision.raw() as i64
@@ -1545,12 +1581,36 @@ impl Store {
                 return Err(StoreError::Conflict(vanished));
             }
             tx.commit()?;
-            let mut completed = task;
-            completed.state = TaskState::VerifiedComplete;
-            completed.revision = new_revision;
-            completed.updated_ms = now;
-            Ok(Ok(completed))
-        })
+            Ok(Ok(None))
+        })?;
+        // Raw refusal payloads are decoded HERE; success re-reads the
+        // committed row on this thread (the task is terminal after the
+        // transaction, so the read is exactly the row the job wrote).
+        match raw {
+            Ok(Some(refusal)) => Ok(Err(refusal)),
+            Ok(None) => Ok(Ok(self
+                .get_task(session_id, task_id)?
+                .ok_or_else(|| StoreError::Corrupt(vec![vanished_after]))?)),
+            Err(RawCompletionRefusal::NotVerifying(raw_state)) => {
+                let actual: TaskState = parse_json(&format!("task {task_id} state"), &raw_state)?;
+                Ok(Err(TaskCompletionRefusal::NotVerifying { actual }))
+            }
+            Err(RawCompletionRefusal::RecordNotPassed(raw_status)) => {
+                let status: VerificationStatus = parse_json(&status_label, &raw_status)?;
+                Ok(Err(TaskCompletionRefusal::RecordNotPassed {
+                    record_id,
+                    status,
+                }))
+            }
+            Err(RawCompletionRefusal::CriteriaNotCovered(raw_missing)) => {
+                let label = format!("record {record_id} criteria");
+                let missing: Vec<String> = parse_json(&label, &raw_missing)?;
+                Ok(Err(TaskCompletionRefusal::CriteriaNotCovered {
+                    record_id,
+                    missing,
+                }))
+            }
+        }
     }
 
     // ------------------------------------------------------- verification records
@@ -1745,11 +1805,13 @@ impl Store {
             )));
         }
         // Prepared ENTIRELY before enqueue: both status strings serialize on
-        // the caller's thread, as does the corrupt-row decode label.
+        // the caller's thread, and the closure returns the raw current-status
+        // text on a CAS miss (audit finding 5: no `parse_json` on the owner).
         let new_status_json = serde_json::to_string(&new_status).unwrap();
         let running_status_json = serde_json::to_string(&VerificationStatus::Running).unwrap();
         let status_label = format!("verification_record {record_id} status");
-        self.writer
+        let outcome = self
+            .writer
             .execute("verification_record_finalize", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let updated = tx.execute(
@@ -1767,8 +1829,9 @@ impl Store {
                     tx.commit()?;
                     return Ok(Ok(()));
                 }
-                // The CAS missed: surface the current status so callers can tell an
-                // already-final record from a not-yet-started one.
+                // The CAS missed: surface the RAW current status so callers
+                // can tell an already-final record from a not-yet-started
+                // one; the typed decode runs on the caller's thread.
                 let current_raw: Option<String> = tx
                     .query_row(
                         "SELECT status FROM verification_record WHERE id = ?1",
@@ -1776,18 +1839,19 @@ impl Store {
                         |r| r.get(0),
                     )
                     .optional()?;
-                let current: Option<VerificationStatus> = match current_raw {
-                    Some(raw) => Some(parse_json(&status_label, &raw)?),
-                    None => None,
-                };
-                match current {
-                    Some(current) => Ok(Err(RecordFinalizeRefusal::NotRunning {
-                        record_id,
-                        current,
-                    })),
-                    None => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
-                }
-            })
+                Ok(Err(current_raw))
+            })?;
+        match outcome {
+            Ok(()) => Ok(Ok(())),
+            Err(None) => Ok(Err(RecordFinalizeRefusal::Missing { record_id })),
+            Err(Some(raw)) => {
+                let current: VerificationStatus = parse_json(&status_label, &raw)?;
+                Ok(Err(RecordFinalizeRefusal::NotRunning {
+                    record_id,
+                    current,
+                }))
+            }
+        }
     }
 
     // ------------------------------------------------ verification jobs (v22)

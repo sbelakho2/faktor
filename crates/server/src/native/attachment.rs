@@ -20,8 +20,15 @@
 //!   rename/re-select is repairable, never silently inherited).
 //! - The upload body is bounded by [`MAX_ATTACHMENT_UPLOAD_BYTES`] so its
 //!   base64 form plus the JSON envelope stays under the daemon's 10 MiB
-//!   request cap (`crate::api::MAX_BODY_BYTES`). The session/CAS ceiling
-//!   remains `MAX_ATTACHMENT_BYTES` for programmatic callers.
+//!   request cap (`crate::api::MAX_BODY_BYTES`). That SAME constant is the
+//!   HTTP RETRIEVAL ceiling: the `ref/{ref_id}/bytes` and
+//!   `blob/{digest}/bytes` routes serve at most this many bytes by design,
+//!   so HTTP retrieval is never tighter than HTTP admission. The
+//!   session/CAS ceiling (`MAX_ATTACHMENT_BYTES`, 32 MiB) is unchanged for
+//!   programmatic callers: an attachment stored programmatically above the
+//!   HTTP ceiling is NOT retrievable over HTTP, and the retrieval cap is
+//!   the contract, never a suggestion — both byte routes pass exactly this
+//!   bound to the session layer's `attachment_ref_bytes`/`attachment_bytes`.
 //! - IMAGE ADMISSION IS MODEL-AWARE: images are admitted (stored) and then
 //!   validated at task admission against the CHOSEN model — `vision` must
 //!   be advertised, the mime must be a deliverable image type, and the size
@@ -55,11 +62,14 @@ use faktor_protocol::error::ApiError;
 use super::*;
 use crate::api::AppState;
 
-/// Decoded-byte ceiling of one HTTP upload. Base64 inflates by 4/3, so
-/// 7 MiB decodes to ~9.33 MiB encoded — with the JSON envelope this stays
-/// under the daemon's 10 MiB `MAX_BODY_BYTES` cap. Larger payloads are a
-/// typed 413 before any decode; the session/CAS ceiling
-/// (`MAX_ATTACHMENT_BYTES`) is unchanged for programmatic callers.
+/// Decoded-byte ceiling of one HTTP attachment upload AND of every HTTP
+/// attachment byte retrieval: the `.../bytes` routes serve at most this
+/// many bytes, so retrieval can never be tighter than admission. Base64
+/// inflates by 4/3, so 7 MiB decodes to ~9.33 MiB encoded — with the JSON
+/// envelope this stays under the daemon's 10 MiB `MAX_BODY_BYTES` cap.
+/// Larger payloads are a typed 413 before any decode; the session/CAS
+/// ceiling (`MAX_ATTACHMENT_BYTES`, 32 MiB) is unchanged for programmatic
+/// callers, whose larger attachments are not retrievable over HTTP.
 pub const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 7 * 1024 * 1024;
 
 /// Strict request DTO of one native attachment upload. `data_base64` is the
@@ -443,13 +453,24 @@ pub(crate) async fn native_attachment_upload(
 }
 
 /// Parse one attachment REFERENCE path segment strictly: the CANONICAL
-/// decimal form of a `u64` (no sign, no whitespace, no leading zeros beyond
-/// `"0"`). A 64-digit decimal string is never accepted here — it is a
-/// possible hex digest and must be addressed on the `/blob/{digest}` routes.
+/// decimal form of a POSITIVE `u64` (no sign, no whitespace, no leading
+/// zeros). `"0"` itself is refused: ref ids start at 1, matching
+/// `AttachmentRef::validate()` and both first-party clients. A 64-digit
+/// decimal string is never accepted here — it is a possible hex digest and
+/// must be addressed on the `/blob/{digest}` routes.
 fn parse_ref_id(raw: &str) -> Result<u64, ApiError> {
-    let canonical = !raw.is_empty()
-        && raw.bytes().all(|b| b.is_ascii_digit())
-        && (raw == "0" || !raw.starts_with('0'));
+    if raw == "0" {
+        return Err(ApiError {
+            code: "malformed",
+            message: format!(
+                "{raw:?} is not a canonical decimal attachment ref id; ref ids start at 1"
+            ),
+            http_status: 400,
+            retryable: false,
+        });
+    }
+    let canonical =
+        !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) && !raw.starts_with('0');
     if !canonical {
         return Err(ApiError {
             code: "malformed",
@@ -1284,6 +1305,98 @@ mod tests {
                 .unwrap(),
             "application/octet-stream"
         );
+    }
+
+    /// REGRESSION (audit finding 3): ref id 0 is NOT a canonical reference
+    /// id. `"0"`, `"00"`, `"01"`, `"0001"` and the 64-zero-digit string are
+    /// typed 400 malformed on BOTH ref routes — never a lookup of ref 1 —
+    /// while `"1"` keeps its existing lookup semantics; the blob routes stay
+    /// unaffected (the 64-digit form there is a digest, not a ref id).
+    #[tokio::test]
+    async fn ref_id_zero_and_leading_zero_forms_are_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, handle) = test_state(dir.path());
+        let sid = handle.id().to_string();
+        let headers = auth_headers(&state);
+        let first = upload_ref(
+            &state,
+            &sid,
+            "application/pdf",
+            Some("spec.pdf"),
+            b"%PDF-1.4",
+        )
+        .await;
+        assert_eq!(first.id, 1, "the first reference is ref id 1");
+        let sixty_four_zeros = "0".repeat(64);
+        for hostile in ["0", "00", "01", "0001", sixty_four_zeros.as_str()] {
+            for bytes_route in [false, true] {
+                let response = if bytes_route {
+                    native_attachment_bytes(
+                        State(state.clone()),
+                        headers.clone(),
+                        Path((sid.clone(), hostile.to_string())),
+                    )
+                    .await
+                } else {
+                    native_attachment_get(
+                        State(state.clone()),
+                        headers.clone(),
+                        Path((sid.clone(), hostile.to_string())),
+                    )
+                    .await
+                };
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{hostile}");
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(err["error"]["code"], "malformed", "{hostile}");
+            }
+        }
+        // The valid canonical form still resolves ITS OWN reference metadata
+        // and bytes (existing lookup semantics, unchanged).
+        let meta = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), "1".to_string())),
+        )
+        .await;
+        assert_eq!(meta.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(meta.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let reference: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reference, first);
+        let bytes = native_attachment_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), "1".to_string())),
+        )
+        .await;
+        assert_eq!(bytes.status(), StatusCode::OK);
+        assert_eq!(
+            bytes
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/pdf"
+        );
+        // The blob routes are unaffected: the 64-zero-digit segment is a
+        // valid unknown DIGEST there (typed 404), never ref 0/1.
+        let blob = native_attachment_blob_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), "0".repeat(64))),
+        )
+        .await;
+        assert_eq!(blob.status(), StatusCode::NOT_FOUND);
+        let blob_bytes = native_attachment_blob_bytes(
+            State(state.clone()),
+            headers,
+            Path((sid, "0".repeat(64))),
+        )
+        .await;
+        assert_eq!(blob_bytes.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

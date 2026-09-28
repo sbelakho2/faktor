@@ -195,6 +195,7 @@ pub use messages::*;
 mod tasks;
 pub use tasks::*;
 mod ledger;
+mod task_completion_guard;
 pub use ledger::*;
 mod attachments;
 pub use attachments::*;

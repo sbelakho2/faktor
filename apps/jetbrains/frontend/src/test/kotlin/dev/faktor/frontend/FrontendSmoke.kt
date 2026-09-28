@@ -758,6 +758,144 @@ object FrontendSmoke {
             )
         }
 
+        // Audit findings 2/4: the attachment byte RESPONSE bound mirrors the
+        // daemon's HTTP upload/retrieval contract (7 MiB), never the generic
+        // 4 MiB body cap; and the blob metadata route is surfaced with its
+        // 404/1/409 semantics instead of staying server-only.
+        step("attachment retrieval: 7 MiB HTTP contract bound; blob metadata 404/1/409") {
+            val server = com.sun.net.httpserver.HttpServer.create(
+                java.net.InetSocketAddress("127.0.0.1", 0), 0
+            )
+            val mib = 1024 * 1024
+            // Generated bounded payloads (no embedded literals): 4 MiB + 1
+            // and exactly 7 MiB fit the retrieval contract; 7 MiB + 1 does not.
+            val justOverFour = ByteArray(4 * mib + 1)
+            val seven = ByteArray(7 * mib)
+            val overSeven = ByteArray(7 * mib + 1)
+            for (buffer in listOf(justOverFour, seven, overSeven)) {
+                buffer[0] = 0x5a
+                buffer[buffer.size - 1] = 0xa5.toByte()
+            }
+            val digestBlobFour = "a".repeat(64)
+            val digestRefSeven = "b".repeat(64)
+            val digestOver = "c".repeat(64)
+            val digestSolo = "d".repeat(64)
+            val digestMissing = "e".repeat(64)
+            val digestShared = "f".repeat(64)
+            server.createContext("/native/session/7/attachments/ref/1/bytes") { exchange ->
+                respondAttachmentBytes(exchange, 200, "application/pdf", justOverFour)
+            }
+            server.createContext("/native/session/7/attachments/ref/2/bytes") { exchange ->
+                respondAttachmentBytes(exchange, 200, "application/pdf", seven)
+            }
+            server.createContext("/native/session/7/attachments/ref/3/bytes") { exchange ->
+                respondAttachmentBytes(exchange, 200, "application/pdf", overSeven)
+            }
+            server.createContext("/native/session/7/attachments/blob/$digestBlobFour/bytes") { exchange ->
+                respondAttachmentBytes(exchange, 200, "application/octet-stream", justOverFour)
+            }
+            server.createContext("/native/session/7/attachments/blob/$digestRefSeven/bytes") { exchange ->
+                respondAttachmentBytes(exchange, 200, "application/octet-stream", seven)
+            }
+            server.createContext("/native/session/7/attachments/blob/$digestOver/bytes") { exchange ->
+                respondAttachmentBytes(exchange, 200, "application/octet-stream", overSeven)
+            }
+            // Blob metadata: exactly one reference resolves, zero is a typed
+            // 404, several are the typed 409 conflict listing both ref ids.
+            server.createContext("/native/session/7/attachments/blob/$digestSolo") { exchange ->
+                respondAttachmentJson(
+                    exchange, 200,
+                    "{\"ref_id\":11,\"digest\":\"$digestSolo\",\"mime\":\"application/pdf\"," +
+                        "\"filename\":\"spec.pdf\",\"size\":8}"
+                )
+            }
+            server.createContext("/native/session/7/attachments/blob/$digestMissing") { exchange ->
+                respondAttachmentJson(
+                    exchange, 404,
+                    "{\"error\":{\"code\":\"not_found\",\"message\":\"attachment blob " +
+                        "$digestMissing in session 7\",\"retryable\":false}}"
+                )
+            }
+            server.createContext("/native/session/7/attachments/blob/$digestShared") { exchange ->
+                respondAttachmentJson(
+                    exchange, 409,
+                    "{\"error\":{\"code\":\"conflict\",\"message\":\"attachment digest " +
+                        "$digestShared in session 7 has 2 references; resolve one by ref_id: " +
+                        "[11, 12]\",\"retryable\":false}}"
+                )
+            }
+            server.start()
+            val client = NativeClient(
+                "http://127.0.0.1:" + server.address.port, "smoke-password"
+            )
+            try {
+                assertEquals(
+                    4L * 1024 * 1024, NativeClient.DEFAULT_MAX_BODY_BYTES,
+                    "the generic body cap stays 4 MiB"
+                )
+                assertEquals(
+                    7L * 1024 * 1024, NativeClient.ATTACHMENT_RESPONSE_MAX_BYTES,
+                    "the attachment response bound mirrors the daemon HTTP contract"
+                )
+                val refFour = client.attachmentReferenceBytes("7", 1L)
+                assertEquals(
+                    4 * mib + 1, refFour.bytes.size,
+                    "a 4 MiB + 1 ref payload exceeds the old 4 MiB cap and still retrieves"
+                )
+                assertEquals(0x5a.toByte(), refFour.bytes[0], "first byte byte-exact")
+                assertEquals(
+                    0xa5.toByte(), refFour.bytes[refFour.bytes.size - 1], "last byte byte-exact"
+                )
+                assertEquals(
+                    7 * mib, client.attachmentReferenceBytes("7", 2L).bytes.size,
+                    "exactly 7 MiB ref bytes retrieve byte-exact"
+                )
+                assertEquals(
+                    4 * mib + 1, client.attachmentBlobBytes("7", digestBlobFour).size,
+                    "a 4 MiB + 1 blob payload exceeds the old 4 MiB cap and still retrieves"
+                )
+                assertEquals(
+                    7 * mib, client.attachmentBlobBytes("7", digestRefSeven).size,
+                    "exactly 7 MiB blob bytes retrieve byte-exact"
+                )
+                val refOver: () -> Unit = { client.attachmentReferenceBytes("7", 3L) }
+                val blobOver: () -> Unit = { client.attachmentBlobBytes("7", digestOver) }
+                for ((label, call) in listOf("ref" to refOver, "blob" to blobOver)) {
+                    try {
+                        call()
+                        fail("$label 7 MiB + 1 must be refused typed")
+                    } catch (e: NativeProtocolException) {
+                        assertTrue(
+                            (e.message ?: "").contains("exceeded bound"),
+                            "$label: ${e.message}"
+                        )
+                    }
+                }
+                val solo = client.attachmentBlobReference("7", digestSolo)
+                assertEquals(11L, solo.refId, "one reference resolves its own metadata")
+                assertEquals(digestSolo, solo.digest)
+                try {
+                    client.attachmentBlobReference("7", digestMissing)
+                    fail("zero references must not answer 200")
+                } catch (e: NativeApiException) {
+                    assertEquals(404, e.status, "zero references: ${e.message}")
+                }
+                try {
+                    client.attachmentBlobReference("7", digestShared)
+                    fail("several references must not answer 200")
+                } catch (e: NativeApiException) {
+                    assertEquals(409, e.status, "several references: ${e.message}")
+                    assertEquals("conflict", e.code, e.message)
+                    assertTrue(
+                        (e.message ?: "").contains("11") && (e.message ?: "").contains("12"),
+                        "the 409 must list both candidate ref ids: ${e.message}"
+                    )
+                }
+            } finally {
+                server.stop(0)
+            }
+        }
+
         step("completion contract: strict request, strict parse, durable provenance") {
             // The default path stays byte-identical (no contract, no item).
             assertEquals("{\"goal\":\"g\"}", NativeRequests.startTaskRun("g"))
@@ -2490,6 +2628,37 @@ private fun refusalOf(body: () -> Unit): AttachmentRefusal {
         return e
     }
     throw AssertionError("expected an AttachmentRefusal, nothing was thrown")
+}
+
+/** One bounded JSON response of the attachment-contract fake daemon. */
+private fun respondAttachmentJson(
+    exchange: com.sun.net.httpserver.HttpExchange,
+    status: Int,
+    body: String
+) {
+    val bytes = body.toByteArray(Charsets.UTF_8)
+    exchange.responseHeaders.add("Content-Type", "application/json")
+    exchange.sendResponseHeaders(status, bytes.size.toLong())
+    exchange.responseBody.use { it.write(bytes) }
+    exchange.close()
+}
+
+/** One bounded raw-byte response of the attachment-contract fake daemon. */
+private fun respondAttachmentBytes(
+    exchange: com.sun.net.httpserver.HttpExchange,
+    status: Int,
+    contentType: String,
+    body: ByteArray
+) {
+    exchange.responseHeaders.add("Content-Type", contentType)
+    exchange.sendResponseHeaders(status, body.size.toLong())
+    try {
+        exchange.responseBody.use { it.write(body) }
+    } catch (e: java.io.IOException) {
+        // The client aborts the read once the byte bound is exceeded.
+    } finally {
+        exchange.close()
+    }
 }
 
 // Audits 5/6/16: a PARTIAL generation with a capped fingerprint round and a

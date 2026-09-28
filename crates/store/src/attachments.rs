@@ -235,6 +235,40 @@ impl PreparedTaskWrite {
     }
 }
 
+/// The caller-read task row prepared for one seed PATCH: the raw CAS columns
+/// (`revision`, canonical `state` JSON, canonical `attachments` JSON) exactly
+/// as the caller read them, plus the typed row itself for the idempotent
+/// return. Serialization happens HERE, on the caller's thread — the writer
+/// closure compares raw text and never decodes an `AgentState` or a
+/// `Vec<AttachmentId>` on the single writer owner (audit finding 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedTaskExpectation {
+    row: TaskRow,
+    revision_i64: i64,
+    state_json: String,
+    attachments_json: String,
+}
+
+impl PreparedTaskExpectation {
+    /// Prepare the raw CAS columns of the row the caller read. The revision
+    /// uses the schema's lossless two's-complement cast; the state and the
+    /// attachment set are serialized once, caller-side.
+    pub fn prepare(row: TaskRow) -> StoreResult<Self> {
+        let task_id = row.task_id;
+        // In-process constructed enum (see `upsert_task`).
+        let state_json = serde_json::to_string(&row.state)
+            .expect("in-process TaskState serialization cannot fail");
+        let attachments_json = serde_json::to_string(&row.attachments)
+            .map_err(|e| StoreError::Malformed(format!("task {task_id} attachments json: {e}")))?;
+        Ok(Self {
+            revision_i64: row.revision.raw() as i64,
+            row,
+            state_json,
+            attachments_json,
+        })
+    }
+}
+
 /// Typed refusal of [`Store::seed_task_attachments_txn`]: the transaction
 /// re-read the task row and one of the caller's expectations did not hold.
 /// Every refusal leaves ZERO durable writes — reference rows included — so
@@ -253,12 +287,12 @@ pub enum SeedTaskAttachmentRefusal {
     },
     /// The row is terminal: a frozen row can never gain references.
     Terminal { state: TaskState },
-    /// The durable attachment set differs from the caller's expectation: a
-    /// concurrent mutation replaced it.
-    AttachmentsMismatch {
-        expected: Vec<AttachmentId>,
-        actual: Vec<AttachmentId>,
-    },
+    /// The durable state text or attachment text differs from the caller's
+    /// prepared expectation: a concurrent mutation replaced the row. The
+    /// refusal is payload-free because recovering the typed cause would
+    /// require decoding the raw row INSIDE the writer job; callers with the
+    /// typed expectation re-read the row on their own thread instead.
+    StateOrSetChanged,
     /// The CREATE path's prepared state cannot seed a task.
     IllegalCreateState { state: TaskState },
 }
@@ -268,9 +302,7 @@ pub enum SeedTaskAttachmentRefusal {
 enum SeedMode {
     Patch {
         task_id: TaskId,
-        expected_revision: TaskRevision,
-        expected_attachments: Vec<AttachmentId>,
-        expected_nonterminal: bool,
+        expectation: Box<PreparedTaskExpectation>,
     },
     Create,
 }
@@ -425,14 +457,14 @@ impl Store {
     /// (session layer) keep validation/policy; this command enforces the
     /// already-decided conditional write:
     ///
-    /// * `task_id == Some(id)` — PATCH: the row must exist; its durable
-    ///   revision must equal `expected_revision`, its current attachment set
-    ///   must equal `expected_attachments`, and its state must be
-    ///   non-terminal when `expected_nonterminal`. Then every reference is
-    ///   inserted-or-ignored and (unless the desired set is already durable)
-    ///   the row's `attachments`/`revision`/`updated_ms` are taken from
+    /// * `patch == Some(expectation)` — PATCH: the row must exist; its raw
+    ///   `revision`, `state` and `attachments` columns must equal the
+    ///   caller-prepared expectation (the row the caller read), whose state
+    ///   must be non-terminal. Then every reference is inserted-or-ignored
+    ///   and (unless the desired set is already durable) the row's
+    ///   `attachments`/`revision`/`updated_ms` are taken from
     ///   `prepared_task`.
-    /// * `task_id == None` — CREATE: no row may exist for the prepared row's
+    /// * `patch == None` — CREATE: no row may exist for the prepared row's
     ///   identity; every reference is inserted-or-ignored, then the prepared
     ///   row (revision 1) is inserted.
     ///
@@ -441,14 +473,15 @@ impl Store {
     /// rolls back whole. `prepared_task.row.attachments` must equal the
     /// prepared reference set (validated caller-side), so a returned row can
     /// never point at references that were not inserted.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The writer closure is SQL-ONLY (audit finding 1): the CAS compares the
+    /// raw `revision`/`state`/`attachments` text against the caller-prepared
+    /// expectation and never decodes a `TaskRow`, `AgentState` or
+    /// `Vec<AttachmentId>` on the single writer owner.
     pub fn seed_task_attachments_txn(
         &self,
         session_id: SessionId,
-        task_id: Option<TaskId>,
-        expected_revision: Option<TaskRevision>,
-        expected_attachments: Option<Vec<AttachmentId>>,
-        expected_nonterminal: bool,
+        patch: Option<PreparedTaskExpectation>,
         attachments: &[PreparedAttachmentRef],
         prepared_task: PreparedTaskWrite,
     ) -> StoreResult<std::result::Result<TaskRow, SeedTaskAttachmentRefusal>> {
@@ -480,21 +513,23 @@ impl Store {
             ));
         }
         let task_identity = prepared_task.row.task_id;
-        let mode = match task_id {
-            Some(patch_id) => {
-                if prepared_task.row.task_id != patch_id {
+        let mode = match patch {
+            Some(expectation) => {
+                if expectation.row.session_id != session_id {
                     return Err(StoreError::Malformed(format!(
-                        "seed task write names task {task_identity}, not {patch_id}"
+                        "seed patch names session {}, not {session_id}",
+                        expectation.row.session_id
                     )));
                 }
-                let (Some(expected_revision), Some(expected_attachments)) =
-                    (expected_revision, expected_attachments)
-                else {
-                    return Err(StoreError::Malformed(
-                        "a seed patch requires expected_revision and expected_attachments".into(),
-                    ));
-                };
-                let new_revision = expected_revision
+                if expectation.row.task_id != task_identity {
+                    return Err(StoreError::Malformed(format!(
+                        "seed patch names task {}, not {task_identity}",
+                        expectation.row.task_id
+                    )));
+                }
+                let new_revision = expectation
+                    .row
+                    .revision
                     .checked_next()
                     .ok_or_else(|| StoreError::Malformed("task revision overflow".into()))?;
                 if prepared_task.row.revision != new_revision {
@@ -502,22 +537,21 @@ impl Store {
                         "a seed patch must write exactly the next revision".into(),
                     ));
                 }
+                // Caller-prepared terminal protection: the expectation IS the
+                // row the caller read, so its typed state is available on this
+                // thread. A durable transition to terminal after the read
+                // changes the raw state text and refuses below.
+                if expectation.row.state.is_terminal() {
+                    return Ok(Err(SeedTaskAttachmentRefusal::Terminal {
+                        state: expectation.row.state,
+                    }));
+                }
                 SeedMode::Patch {
-                    task_id: patch_id,
-                    expected_revision,
-                    expected_attachments,
-                    expected_nonterminal,
+                    task_id: task_identity,
+                    expectation: Box::new(expectation),
                 }
             }
             None => {
-                if expected_revision.is_some()
-                    || expected_attachments.is_some()
-                    || expected_nonterminal
-                {
-                    return Err(StoreError::Malformed(
-                        "a seed create takes no patch conditions".into(),
-                    ));
-                }
                 if prepared_task.row.revision != TaskRevision::new(1) {
                     return Err(StoreError::Malformed(
                         "a seeded task row starts at revision 1".into(),
@@ -527,77 +561,84 @@ impl Store {
             }
         };
         // Preparation BEFORE enqueueing: one caller-side corrupt diagnostic per
-        // reference and the vanished-row conflict text (the closure formats
-        // nothing).
+        // reference, the vanished-row conflict text and the corrupt-revision
+        // diagnostic (the closure formats nothing).
         let mut not_found: Vec<String> = attachments
             .iter()
             .map(|attachment| attachment.not_found_message(session_id))
             .collect();
         let vanished =
             format!("task {session_id}/{task_identity} vanished between validation and write");
+        let corrupt_revision =
+            format!("task {session_id}/{task_identity} revision: not a positive revision");
         self.writer
             .execute("seed_task_attachments_txn", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let current = {
-                    let mut stmt = tx.prepare(
-                        "SELECT task_id, session_id, goal, acceptance_criteria, plan,
-                                max_tokens, max_turns, spent_tokens, spent_turns,
-                                state, created_ms, updated_ms, revision, attachments
-                         FROM task WHERE session_id = ?1 AND task_id = ?2",
-                    )?;
-                    let mut rows =
-                        stmt.query(params![session_id.raw() as i64, task_identity.raw() as i64])?;
-                    match rows.next()? {
-                        Some(row) => Some(task_row_map(row, session_id)?),
-                        None => None,
-                    }
-                };
                 let prepared = prepared_task;
                 match mode {
                     SeedMode::Patch {
                         task_id,
-                        expected_revision,
-                        expected_attachments,
-                        expected_nonterminal,
+                        expectation,
                     } => {
-                        let Some(current) = current else {
+                        // SELECT ONLY the raw CAS columns: no row decode runs on
+                        // the writer owner (audit finding 1).
+                        let raw = tx
+                            .query_row(
+                                "SELECT revision, state, attachments FROM task
+                                 WHERE session_id = ?1 AND task_id = ?2",
+                                params![session_id.raw() as i64, task_id.raw() as i64],
+                                |r| {
+                                    Ok((
+                                        r.get::<_, i64>(0)?,
+                                        r.get::<_, String>(1)?,
+                                        r.get::<_, String>(2)?,
+                                    ))
+                                },
+                            )
+                            .optional()?;
+                        let Some((raw_revision, raw_state, raw_attachments)) = raw else {
                             return Ok(Err(SeedTaskAttachmentRefusal::TaskMissing { task_id }));
                         };
-                        if expected_nonterminal && current.state.is_terminal() {
-                            return Ok(Err(SeedTaskAttachmentRefusal::Terminal {
-                                state: current.state,
-                            }));
+                        // The durable state moved (a terminal transition lands
+                        // here): the refusal is raw and payload-free, because
+                        // recovering the typed state would decode inside the
+                        // writer job.
+                        if raw_state != expectation.state_json {
+                            return Ok(Err(SeedTaskAttachmentRefusal::StateOrSetChanged));
                         }
-                        if current.revision != expected_revision {
+                        if raw_revision != expectation.revision_i64 {
+                            let actual = TaskRevision::try_from(raw_revision as u64)
+                                .map_err(|_| StoreError::Corrupt(vec![corrupt_revision.clone()]))?;
                             return Ok(Err(SeedTaskAttachmentRefusal::RevisionMismatch {
-                                expected: expected_revision,
-                                actual: current.revision,
+                                expected: expectation.row.revision,
+                                actual,
                             }));
                         }
-                        if current.attachments != expected_attachments {
-                            return Ok(Err(SeedTaskAttachmentRefusal::AttachmentsMismatch {
-                                expected: expected_attachments,
-                                actual: current.attachments,
-                            }));
+                        if raw_attachments != expectation.attachments_json {
+                            return Ok(Err(SeedTaskAttachmentRefusal::StateOrSetChanged));
                         }
                         let _ =
                             insert_prepared_refs(&tx, session_id, &attachments, &mut not_found)?;
-                        if current.attachments == prepared.row.attachments {
+                        if raw_attachments == prepared.attachments_json {
                             // Idempotent re-seed: the reference rows converge,
                             // the task row (and its revision) is not touched.
+                            // The caller-provided typed row is returned as-is.
                             tx.commit()?;
-                            return Ok(Ok(current));
+                            return Ok(Ok(expectation.row));
                         }
                         let updated = tx.execute(
                             "UPDATE task SET attachments = ?3, revision = ?4, updated_ms = ?5
-                             WHERE session_id = ?1 AND task_id = ?2 AND revision = ?6",
+                             WHERE session_id = ?1 AND task_id = ?2 AND revision = ?6
+                               AND state = ?7 AND attachments = ?8",
                             params![
                                 session_id.raw() as i64,
                                 task_id.raw() as i64,
                                 prepared.attachments_json.as_str(),
                                 prepared.row.revision.raw() as i64,
                                 prepared.row.updated_ms,
-                                expected_revision.raw() as i64,
+                                expectation.revision_i64,
+                                expectation.state_json.as_str(),
+                                expectation.attachments_json.as_str(),
                             ],
                         )?;
                         if updated != 1 {
@@ -607,7 +648,14 @@ impl Store {
                         Ok(Ok(prepared.row))
                     }
                     SeedMode::Create => {
-                        if current.is_some() {
+                        let exists: Option<i64> = tx
+                            .query_row(
+                                "SELECT 1 FROM task WHERE session_id = ?1 AND task_id = ?2 LIMIT 1",
+                                params![session_id.raw() as i64, task_identity.raw() as i64],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        if exists.is_some() {
                             return Ok(Err(SeedTaskAttachmentRefusal::TaskExists {
                                 task_id: task_identity,
                             }));
@@ -1249,7 +1297,7 @@ mod tests {
         );
         let write = PreparedTaskWrite::prepare(row.clone()).unwrap();
         let outcome = store
-            .seed_task_attachments_txn(s.id, None, None, None, false, &refs, write)
+            .seed_task_attachments_txn(s.id, None, &refs, write)
             .unwrap()
             .expect("the create path must land");
         assert_eq!(outcome, row);
@@ -1265,7 +1313,7 @@ mod tests {
         // nothing at all.
         let write = PreparedTaskWrite::prepare(row.clone()).unwrap();
         let refusal = store
-            .seed_task_attachments_txn(s.id, None, None, None, false, &refs, write)
+            .seed_task_attachments_txn(s.id, None, &refs, write)
             .unwrap()
             .expect_err("an existing row must refuse the create");
         assert_eq!(refusal, SeedTaskAttachmentRefusal::TaskExists { task_id });
@@ -1299,7 +1347,16 @@ mod tests {
         store
             .upsert_task(&task_seed_row(s.id, task_id, TaskState::Running, 5, vec![]))
             .unwrap();
-        // Stale revision: the transaction refuses before the first insert.
+        // Stale revision: the caller read revision 4, the row is at 5; the
+        // transaction refuses before the first insert.
+        let stale = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            4,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1309,15 +1366,7 @@ mod tests {
         ))
         .unwrap();
         let refusal = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(4)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(stale), &refs, write)
             .unwrap()
             .expect_err("a stale revision must refuse");
         assert_eq!(
@@ -1328,7 +1377,17 @@ mod tests {
             }
         );
         assert!(listed_sorted(&store, s.id).is_empty());
-        // Stale attachment set: same zero-write refusal.
+        // Stale attachment set at the SAME revision: the raw attachment text
+        // no longer matches the caller's expectation, so the seed refuses
+        // payload-free and writes nothing.
+        let stale = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            5,
+            vec![a.clone()],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1338,26 +1397,14 @@ mod tests {
         ))
         .unwrap();
         let refusal = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(5)),
-                Some(vec![a.clone()]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(stale), &refs, write)
             .unwrap()
             .expect_err("a stale attachment set must refuse");
-        assert_eq!(
-            refusal,
-            SeedTaskAttachmentRefusal::AttachmentsMismatch {
-                expected: vec![a.clone()],
-                actual: vec![],
-            }
-        );
+        assert_eq!(refusal, SeedTaskAttachmentRefusal::StateOrSetChanged);
         assert!(listed_sorted(&store, s.id).is_empty());
-        // Terminal row: the freeze is re-verified INSIDE the transaction.
+        // A concurrent transition to terminal changes the raw state text and
+        // refuses payload-free (the caller recovers the typed state with its
+        // own re-read), with zero reference rows.
         store
             .upsert_task(&task_seed_row(
                 s.id,
@@ -1367,6 +1414,14 @@ mod tests {
                 vec![],
             ))
             .unwrap();
+        let stale = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            5,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1376,17 +1431,34 @@ mod tests {
         ))
         .unwrap();
         let refusal = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(5)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(stale), &refs, write)
             .unwrap()
-            .expect_err("a terminal row must refuse the seed");
+            .expect_err("a concurrent terminal transition must refuse the seed");
+        assert_eq!(refusal, SeedTaskAttachmentRefusal::StateOrSetChanged);
+        assert!(listed_sorted(&store, s.id).is_empty());
+        // A caller-prepared expectation that IS terminal is refused BEFORE
+        // enqueueing (caller-side terminal protection, never a decode on the
+        // writer owner).
+        let terminal = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Cancelled,
+            5,
+            vec![],
+        ))
+        .unwrap();
+        let write = PreparedTaskWrite::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            6,
+            desired.clone(),
+        ))
+        .unwrap();
+        let refusal = store
+            .seed_task_attachments_txn(s.id, Some(terminal), &refs, write)
+            .unwrap()
+            .expect_err("a terminal expectation must refuse the seed");
         assert_eq!(
             refusal,
             SeedTaskAttachmentRefusal::Terminal {
@@ -1398,8 +1470,52 @@ mod tests {
             store.get_task(s.id, task_id).unwrap().unwrap().attachments,
             Vec::new()
         );
-        // Patch on a missing row.
+        // A corrupt raw revision (zero) on a non-terminal row is a typed
+        // Corrupt, never a panic.
+        store
+            .upsert_task(&task_seed_row(s.id, task_id, TaskState::Running, 7, vec![]))
+            .unwrap();
+        store
+            .writer
+            .execute("plant_zero_revision", move |conn| {
+                conn.execute(
+                    "UPDATE task SET revision = 0 WHERE session_id = ?1 AND task_id = ?2",
+                    params![s.id.raw() as i64, task_id.raw() as i64],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let stale = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            1,
+            vec![],
+        ))
+        .unwrap();
+        let write = PreparedTaskWrite::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            2,
+            desired.clone(),
+        ))
+        .unwrap();
+        let err = store
+            .seed_task_attachments_txn(s.id, Some(stale), &refs, write)
+            .expect_err("a zero raw revision is corruption");
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        assert!(listed_sorted(&store, s.id).is_empty());
         let missing = TaskId::new(9);
+        // Patch on a missing row.
+        let stale = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            missing,
+            TaskState::Running,
+            1,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             missing,
@@ -1409,15 +1525,7 @@ mod tests {
         ))
         .unwrap();
         let refusal = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(missing),
-                Some(TaskRevision::new(1)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(stale), &refs, write)
             .unwrap()
             .expect_err("a missing patch target must refuse");
         assert_eq!(
@@ -1426,6 +1534,14 @@ mod tests {
         );
         assert!(listed_sorted(&store, s.id).is_empty());
         // The reference batch must equal the prepared row's list.
+        let expectation = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            5,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1435,19 +1551,19 @@ mod tests {
         ))
         .unwrap();
         let err = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(5)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(expectation), &refs, write)
             .expect_err("a mismatched desired set is caller misconfiguration");
         assert!(matches!(err, StoreError::Malformed(_)), "{err:?}");
         assert!(listed_sorted(&store, s.id).is_empty());
         // The bound is enforced before any write.
+        let expectation = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            5,
+            vec![],
+        ))
+        .unwrap();
         let many = vec![refs[0].clone(); faktor_core::attachment::MAX_ATTACHMENTS_PER_TASK + 1];
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
@@ -1458,15 +1574,7 @@ mod tests {
         ))
         .unwrap();
         let err = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(5)),
-                Some(vec![]),
-                true,
-                &many,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(expectation), &many, write)
             .expect_err("an over-bound seed batch must refuse");
         assert!(matches!(err, StoreError::Oversized(_)), "{err:?}");
         assert!(listed_sorted(&store, s.id).is_empty());
@@ -1496,7 +1604,16 @@ mod tests {
             .upsert_task(&task_seed_row(s.id, task_id, TaskState::Running, 3, vec![]))
             .unwrap();
         let refs = prepared_refs(&[a.clone(), b.clone()]);
-        // First patch: revision 3 -> 4, both references land.
+        // First patch: revision 3 -> 4, both references land. The expectation
+        // is the row the caller read.
+        let expectation = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            3,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1506,15 +1623,7 @@ mod tests {
         ))
         .unwrap();
         let outcome = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(3)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(expectation), &refs, write)
             .unwrap()
             .expect("the patch path must land");
         assert_eq!(outcome.revision, TaskRevision::new(4));
@@ -1524,6 +1633,14 @@ mod tests {
         assert_eq!(stored.attachments, vec![a.clone(), b.clone()]);
         // Idempotent re-seed: the same desired set converges; the reference
         // rows are re-proven and the revision does NOT bump.
+        let expectation = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            4,
+            vec![a.clone(), b.clone()],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1533,15 +1650,7 @@ mod tests {
         ))
         .unwrap();
         let outcome = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(4)),
-                Some(vec![a.clone(), b.clone()]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(expectation), &refs, write)
             .unwrap()
             .expect("the idempotent re-seed must succeed");
         assert_eq!(
@@ -1584,6 +1693,14 @@ mod tests {
             })
             .unwrap();
         let refs = prepared_refs(std::slice::from_ref(&a));
+        let expectation = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            1,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1593,15 +1710,7 @@ mod tests {
         ))
         .unwrap();
         let err = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(1)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(expectation), &refs, write)
             .expect_err("the hostile task patch must abort the whole transaction");
         assert!(matches!(err, StoreError::Sqlite(_)), "{err:?}");
         assert!(
@@ -1619,6 +1728,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let expectation = PreparedTaskExpectation::prepare(task_seed_row(
+            s.id,
+            task_id,
+            TaskState::Running,
+            1,
+            vec![],
+        ))
+        .unwrap();
         let write = PreparedTaskWrite::prepare(task_seed_row(
             s.id,
             task_id,
@@ -1628,15 +1745,7 @@ mod tests {
         ))
         .unwrap();
         let outcome = store
-            .seed_task_attachments_txn(
-                s.id,
-                Some(task_id),
-                Some(TaskRevision::new(1)),
-                Some(vec![]),
-                true,
-                &refs,
-                write,
-            )
+            .seed_task_attachments_txn(s.id, Some(expectation), &refs, write)
             .unwrap()
             .expect("the retried seed must land");
         assert_eq!(outcome.revision, TaskRevision::new(2));
@@ -1685,7 +1794,7 @@ mod tests {
         ))
         .unwrap();
         let err = store
-            .seed_task_attachments_txn(s.id, None, None, None, false, &refs, write)
+            .seed_task_attachments_txn(s.id, None, &refs, write)
             .expect_err("the hostile reference insert must abort the create");
         assert!(matches!(err, StoreError::Sqlite(_)), "{err:?}");
         assert!(
