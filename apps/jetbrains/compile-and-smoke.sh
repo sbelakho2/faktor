@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# JetBrains split-mode smoke (no Gradle, no network):
+# JetBrains split-mode smoke:
 #   1. build faktor-cli if missing
 #   2. compile shared + backend + test + frontend (Swing panel) with kotlinc
 #   3. run BackendSmoke (daemon lifecycle), NativeBridgeSmoke (native protocol
@@ -8,6 +8,11 @@
 #      parity families + the executable behavioral/visual parity matrix
 #      artifact + real daemon restart/reconnect) against the real daemon;
 #      exit 0/1
+#
+# When kotlinc is absent (dev hosts), the same smokes run on the
+# Gradle-managed Kotlin/IntelliJ classpath instead:
+#   ./gradlew :backend:smoke :frontend:smoke -PfaktorCliBin=<bin>
+# CI images that ship kotlinc keep the self-contained, network-free path.
 #
 # Flags:
 #   --write-baselines  re-pin the visual matrix baselines from this render
@@ -94,14 +99,20 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-# ---- 2. kotlinc ------------------------------------------------------------
+# ---- 2. kotlinc, or the Gradle smoke tasks when it is absent ---------------
 KOTLINC="${KOTLINC:-}"
 if [ -z "$KOTLINC" ]; then
   KOTLINC="$(command -v kotlinc 2>/dev/null || true)"
 fi
+
 if [ -z "$KOTLINC" ]; then
-  echo "FAIL: kotlinc not found (set KOTLINC or install kotlin)" >&2
-  exit 1
+  echo "[compile-and-smoke] kotlinc not found; running the Gradle smoke tasks"
+  GRADLE_SMOKE_ARGS=(--console=plain --no-daemon "-PfaktorCliBin=$BIN")
+  if [ -n "$EXTRA_JVM_ARGS" ]; then
+    GRADLE_SMOKE_ARGS+=(-PwriteBaselines=true)
+  fi
+  (cd "$JETBRAINS" && ./gradlew "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke)
+  exit $?
 fi
 
 # ---- 3. kotlin-stdlib.jar (bundled with the compiler distribution) ---------

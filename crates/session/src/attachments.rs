@@ -1,19 +1,23 @@
 //! Durable binary/image attachments: bytes in the CAS, typed metadata rows
-//! in the store (`AttachmentId { digest, mime, filename, size }`, schema
-//! v24).
+//! in the store (schema v25: one `AttachmentId { digest, mime, filename,
+//! size }` per REFERENCE, addressed by a stable surrogate `ref_id`).
 //!
-//! - `put_attachment` validates the mime/filename/size bounds BEFORE hashing
-//!   or writing anything, streams the bytes into the CAS (content-addressed,
-//!   dedupe + corruption detection come from the CAS), then persists one
-//!   typed REFERENCE row keyed by the FULL metadata
+//! - `put_attachment`/`put_attachment_ref` validate the mime/filename/size
+//!   bounds BEFORE hashing or writing anything, stream the bytes into the
+//!   CAS (content-addressed, dedupe + corruption detection come from the
+//!   CAS), then persist one typed REFERENCE row keyed by the FULL metadata
 //!   `(session_id, digest, mime, filename, size)`.
 //! - Dedupe is by reference, never by digest alone: the same blob may back
 //!   several references with distinct metadata, and only an EXACT-metadata
 //!   re-upload is idempotent.
-//! - `attachment`/`attachment_row`/`attachments_by_digest`/
+//! - `attachment_ref`/`attachment_refs_for_digest`/
+//!   `attachment`/`attachment_row`/`attachments_by_digest`/
 //!   `list_attachments` resolve the durable rows after a restart (never a
-//!   process-local map); `attachment_bytes` re-verifies the
-//!   CAS blob and refuses a metadata/blob size mismatch.
+//!   process-local map); `attachment_bytes`/`attachment_ref_bytes`
+//!   re-verify the CAS blob and refuse a metadata/blob size mismatch.
+//! - `inherit_attachments` is the orchestrated-child batch: it validates
+//!   every id, verifies every CAS blob, then lands ALL reference rows in one
+//!   store transaction (all-or-nothing).
 //!
 //! The attachment is deliberately SEPARATE from the workspace-relative
 //! `files` vocabulary: an attachment is bytes addressed by digest, never a
@@ -28,7 +32,8 @@
 //! exists.
 
 use faktor_core::attachment::{
-    validate_filename, validate_mime, AttachmentId, MAX_ATTACHMENTS_PER_TASK, MAX_ATTACHMENT_BYTES,
+    validate_filename, validate_mime, AttachmentId, AttachmentRef, MAX_ATTACHMENTS_PER_TASK,
+    MAX_ATTACHMENT_BYTES,
 };
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
@@ -60,6 +65,20 @@ impl SessionHandle {
         filename: Option<&str>,
         bytes: &[u8],
     ) -> faktor_core::Result<AttachmentId> {
+        self.put_attachment_ref(mime, filename, bytes)
+            .map(|reference| reference.attachment())
+    }
+
+    /// [`Self::put_attachment`] returning the first-class REFERENCE identity
+    /// (surrogate `ref_id` plus the exact metadata), so the caller can
+    /// address this exact reference later even when the CAS blob backs
+    /// several references with distinct metadata.
+    pub fn put_attachment_ref(
+        &self,
+        mime: &str,
+        filename: Option<&str>,
+        bytes: &[u8],
+    ) -> faktor_core::Result<AttachmentRef> {
         let canonical_mime = mime.trim().to_ascii_lowercase();
         validate_mime(&canonical_mime)?;
         if let Some(name) = filename {
@@ -82,7 +101,7 @@ impl SessionHandle {
         let stored = self
             .manager
             .store()
-            .put_attachment(self.id, &computed)
+            .put_attachment_ref(self.id, &computed)
             .map_err(crate::map_store_err)?;
         if stored.size != computed.size {
             return Err(SessionError::Malformed(format!(
@@ -95,6 +114,34 @@ impl SessionHandle {
         Ok(stored)
     }
 
+    /// Resolve ONE durable attachment REFERENCE by its surrogate row id
+    /// (restart-safe). `None` covers an unknown, out-of-range or foreign
+    /// session's id — never a cross-session read.
+    pub fn attachment_ref(&self, ref_id: u64) -> faktor_core::Result<Option<AttachmentRef>> {
+        self.manager
+            .store()
+            .attachment_ref(self.id, ref_id)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Every reference of THIS session backed by one CAS blob `digest`, in
+    /// deterministic insert order, bounded by the store's
+    /// `MAX_ATTACHMENT_REFS_PER_BLOB` (a typed `Oversized` beyond it).
+    pub fn attachment_refs_for_digest(
+        &self,
+        digest: FileHash,
+    ) -> faktor_core::Result<Vec<AttachmentRef>> {
+        self.manager
+            .store()
+            .attachment_refs_for_digest(self.id, digest)
+            .map_err(|e| match e {
+                faktor_store::StoreError::Oversized(message) => {
+                    SessionError::Oversized(message).into()
+                }
+                other => crate::map_store_err(other).into(),
+            })
+    }
+
     /// Copy one already-admitted attachment into THIS session (the
     /// orchestrated-child inheritance path): the id is structurally
     /// validated, the CAS blob at its digest is verified to EXIST and hash
@@ -103,6 +150,12 @@ impl SessionHandle {
     /// child's request construction then re-verifies the blob like any
     /// other attachment. A missing/tampered blob is a typed refusal, never
     /// an inherited phantom row.
+    ///
+    /// Authority note: the CAS proves the bytes hash to the digest, not that
+    /// an authorized source session owned this reference. The caller is the
+    /// authority — today only the runtime's orchestrated-child path (which
+    /// already holds the run's admitted set) may hand ids over, so this
+    /// method must never be exposed to arbitrary callers.
     pub fn inherit_attachment(&self, id: &AttachmentId) -> faktor_core::Result<AttachmentId> {
         id.validate()?;
         self.manager
@@ -176,6 +229,76 @@ impl SessionHandle {
             .into());
         }
         Ok(bytes)
+    }
+
+    /// Read one REFERENCE's bytes back, verifying the CAS blob against the
+    /// reference metadata: the reference is structurally validated, the
+    /// tracked size is checked before any I/O and the decoded byte count
+    /// must equal `reference.size` (a mismatch is loud, never served).
+    pub fn attachment_ref_bytes(
+        &self,
+        reference: &AttachmentRef,
+        max_bytes: usize,
+    ) -> faktor_core::Result<Vec<u8>> {
+        reference.validate()?;
+        self.attachment_bytes(&reference.attachment(), max_bytes)
+    }
+
+    /// Copy an attachment SET into THIS session in ONE store transaction
+    /// (the orchestrated-child inheritance path): EVERY id is structurally
+    /// validated, EVERY CAS blob is verified by a streamed re-hash
+    /// (`Cas::verify_now`, no bytes materialize) BEFORE anything is written,
+    /// and only then are all reference rows inserted in one writer
+    /// transaction. A structurally hostile id, a missing/tampered blob or a
+    /// store failure therefore leaves ZERO new rows. Each returned reference
+    /// matches its input id exactly; an existing row is reused idempotently.
+    pub fn inherit_attachments(
+        &self,
+        ids: &[AttachmentId],
+    ) -> faktor_core::Result<Vec<AttachmentRef>> {
+        if ids.len() > MAX_ATTACHMENTS_PER_TASK {
+            return Err(Error::new(
+                ErrorKind::Oversized,
+                format!(
+                    "{} inherited attachments exceed MAX_ATTACHMENTS_PER_TASK ({MAX_ATTACHMENTS_PER_TASK})",
+                    ids.len()
+                ),
+            ));
+        }
+        for id in ids {
+            id.validate()?;
+        }
+        for id in ids {
+            self.manager
+                .cas()
+                .verify_now(&id.digest.to_hex())
+                .map_err(SessionError::from)?;
+        }
+        let refs = self
+            .manager
+            .store()
+            .inherit_attachment_refs(self.id, ids)
+            .map_err(crate::map_store_err)?;
+        if refs.len() != ids.len() {
+            return Err(SessionError::Internal(format!(
+                "inherited {} references for {} requested attachments",
+                refs.len(),
+                ids.len()
+            ))
+            .into());
+        }
+        for (reference, id) in refs.iter().zip(ids) {
+            if reference.attachment() != *id {
+                return Err(Error::new(
+                    ErrorKind::Malformed,
+                    format!(
+                        "inherited attachment {} conflicts with an existing row of session {}",
+                        id.digest, self.id
+                    ),
+                ));
+            }
+        }
+        Ok(refs)
     }
 
     /// Resolve and validate one attachment SET at admission time: the count
@@ -563,6 +686,104 @@ mod tests {
         // Idempotent re-inheritance (crash re-attach path).
         assert_eq!(child.inherit_attachment(&id).unwrap(), id);
         assert_eq!(child.list_attachments(16).unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn attachment_refs_are_id_addressed_and_resolve_their_own_metadata() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let png = s
+            .put_attachment_ref("image/png", Some("shot.png"), b"\x89PNG-ref")
+            .unwrap();
+        let pdf = s
+            .put_attachment_ref("application/pdf", Some("spec.pdf"), b"\x89PNG-ref")
+            .unwrap();
+        assert_ne!(png.id, pdf.id, "distinct references keep distinct ids");
+        assert_eq!(png.digest, pdf.digest, "the one CAS blob is shared");
+        assert_eq!(png.attachment(), s.attachment(png.digest).unwrap().unwrap());
+        // The id-addressed reads return THAT reference's own metadata.
+        assert_eq!(s.attachment_ref(png.id).unwrap(), Some(png.clone()));
+        assert_eq!(s.attachment_ref(pdf.id).unwrap(), Some(pdf.clone()));
+        assert_eq!(
+            s.attachment_refs_for_digest(png.digest).unwrap(),
+            vec![png.clone(), pdf.clone()]
+        );
+        // Bytes are served against the ADDRESSED reference's metadata.
+        assert_eq!(
+            s.attachment_ref_bytes(&png, 1 << 20).unwrap(),
+            b"\x89PNG-ref"
+        );
+        assert_eq!(
+            s.attachment_ref_bytes(&pdf, 1 << 20).unwrap(),
+            b"\x89PNG-ref"
+        );
+        // Unknown ids are honest absences; a hostile ref shape is typed.
+        assert_eq!(s.attachment_ref(pdf.id + 1).unwrap(), None);
+        let hostile = AttachmentRef {
+            filename: Some("../secrets".into()),
+            ..png.clone()
+        };
+        assert_eq!(
+            s.attachment_ref_bytes(&hostile, 1 << 20).unwrap_err().kind,
+            faktor_core::ErrorKind::Malformed
+        );
+        // A zero-byte bound refuses before any blob read.
+        let err = s.attachment_ref_bytes(&png, 2).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
+    }
+
+    #[test]
+    fn inherit_attachments_preflights_every_blob_and_writes_atomically() {
+        let (_d, m) = test_manager();
+        let parent = session(&m);
+        let child = session(&m);
+        let a = parent
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG-a")
+            .unwrap();
+        let b = parent
+            .put_attachment("application/pdf", Some("b.pdf"), b"%PDF-b")
+            .unwrap();
+        // A batch with ONE phantom blob inserts NOTHING.
+        let phantom = AttachmentId {
+            digest: FileHash::from([43; 32]),
+            ..a.clone()
+        };
+        let err = child
+            .inherit_attachments(&[a.clone(), phantom])
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::NotFound);
+        assert!(
+            child.list_attachments(16).unwrap().is_empty(),
+            "a single unverifiable id must leave zero new rows"
+        );
+        // A structurally hostile id is refused before any verification.
+        let hostile = AttachmentId {
+            filename: Some("..\\secrets".into()),
+            ..a.clone()
+        };
+        let err = child.inherit_attachments(&[hostile]).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed);
+        assert!(child.list_attachments(16).unwrap().is_empty());
+        // The success path lands both references with their own ids and
+        // stays idempotent.
+        let refs = child.inherit_attachments(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(
+            refs.iter().map(|r| r.attachment()).collect::<Vec<_>>(),
+            vec![a.clone(), b.clone()]
+        );
+        assert_eq!(
+            child.inherit_attachments(&[a.clone(), b.clone()]).unwrap(),
+            refs
+        );
+        let mut stored = child.list_attachments(16).unwrap();
+        stored.sort_by_key(|id| id.digest.to_hex());
+        let mut expected = vec![a, b];
+        expected.sort_by_key(|id| id.digest.to_hex());
+        assert_eq!(stored, expected);
+        // The bound is typed and inclusive.
+        let many = vec![refs[0].attachment(); MAX_ATTACHMENTS_PER_TASK + 1];
+        let err = child.inherit_attachments(&many).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
     }
 
     #[test]

@@ -462,6 +462,56 @@
       }
     },
     {
+      "name": "AttachmentRef",
+      "doc": "One durable attachment REFERENCE (native additive-response contract): the surrogate reference id the retrieval routes address, plus the CAS digest and the exact presentation metadata (mime, optional filename, decompressed size). Decoders ignore unknown fields.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "ref_id",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "digest",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "mime",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "filename",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "size",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
       "name": "AttachmentUpload",
       "doc": "Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime.",
       "unknown_fields": "reject",

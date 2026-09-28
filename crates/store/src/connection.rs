@@ -516,16 +516,16 @@ pub enum HotWrite {
     },
 }
 
-/// [`HotWrite`] with every JSON body PRE-SERIALIZED before enqueueing (audit
-/// item 7). [`Store::batch_hot_writes`] builds these on the caller's thread;
-/// the writer owner then executes statements only — it never touches
-/// `serde_json` on the hot path.
+/// [`HotWrite`] with every JSON body PRE-SERIALIZED and every row timestamp
+/// PRE-CAPTURED before enqueueing (audit items 7/8). [`Store::batch_hot_writes`]
+/// builds these on the caller's thread; the writer owner then executes
+/// statements only — it never touches `serde_json` or a clock on the hot path.
 pub(crate) enum PreparedHotWrite {
     AppendEvent {
         session_id: SessionId,
         op_id: Option<OpId>,
         kind: EventKind,
-        state: AgentState,
+        state_json: String,
         ts_ms: i64,
         payload_json: Option<String>,
         payload_ver: i64,
@@ -535,11 +535,13 @@ pub(crate) enum PreparedHotWrite {
         seq: i64,
         role: String,
         data_json: String,
+        created_ms: i64,
     },
     PutPart {
         message_id: i64,
         kind: String,
         data_json: String,
+        created_ms: i64,
     },
     RecordProviderCall {
         session_id: SessionId,
@@ -550,12 +552,14 @@ pub(crate) enum PreparedHotWrite {
         tokens_in: Option<u64>,
         tokens_out: Option<u64>,
         error: Option<String>,
+        ts_ms: i64,
     },
 }
 
 impl PreparedHotWrite {
-    /// Serialize one caller command's JSON bodies. Runs on the caller's
-    /// thread, before the command is enqueued.
+    /// Serialize one caller command's JSON bodies and capture its row
+    /// timestamp. Runs on the caller's thread, before the command is
+    /// enqueued.
     pub(crate) fn prepare(w: &HotWrite) -> Self {
         match w {
             HotWrite::AppendEvent {
@@ -570,7 +574,7 @@ impl PreparedHotWrite {
                 session_id: *session_id,
                 op_id: *op_id,
                 kind: *kind,
-                state: *state,
+                state_json: serde_json::to_string(state).unwrap(),
                 ts_ms: *ts_ms,
                 payload_json: payload.as_ref().map(|p| p.to_string()),
                 payload_ver: *payload_ver,
@@ -585,6 +589,7 @@ impl PreparedHotWrite {
                 seq: *seq,
                 role: role.clone(),
                 data_json: data.to_string(),
+                created_ms: now_ms(),
             },
             HotWrite::PutPart {
                 message_id,
@@ -594,6 +599,7 @@ impl PreparedHotWrite {
                 message_id: *message_id,
                 kind: kind.clone(),
                 data_json: data.to_string(),
+                created_ms: now_ms(),
             },
             HotWrite::RecordProviderCall {
                 session_id,
@@ -613,6 +619,7 @@ impl PreparedHotWrite {
                 tokens_in: *tokens_in,
                 tokens_out: *tokens_out,
                 error: error.clone(),
+                ts_ms: now_ms(),
             },
         }
     }
@@ -740,6 +747,10 @@ pub(crate) fn check_quick(conn: &Connection) -> StoreResult<Vec<String>> {
     Ok(issues)
 }
 
+/// Wall-clock milliseconds since the Unix epoch (`0` if the clock reads
+/// before it). Callers capture the value on THEIR thread before enqueueing a
+/// writer job (audit items 4/8): the job body must prepare nothing, so it
+/// never reads a clock itself — the captured value travels into the closure.
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2221,7 +2232,7 @@ impl Store {
                 session_id,
                 op_id,
                 kind,
-                state,
+                state_json,
                 ts_ms,
                 payload_json,
                 payload_ver,
@@ -2230,7 +2241,7 @@ impl Store {
                 *session_id,
                 *op_id,
                 *kind,
-                *state,
+                state_json,
                 *ts_ms,
                 payload_json.clone(),
                 *payload_ver,
@@ -2241,15 +2252,16 @@ impl Store {
                 seq,
                 role,
                 data_json,
-            } => Self::insert_message_on(conn, *session_id, *seq, role, data_json)
+                created_ms,
+            } => Self::insert_message_on(conn, *session_id, *seq, role, data_json, *created_ms)
                 .map(HotWriteOutcome::RowId),
             PreparedHotWrite::PutPart {
                 message_id,
                 kind,
                 data_json,
-            } => {
-                Self::insert_part_on(conn, *message_id, kind, data_json).map(HotWriteOutcome::RowId)
-            }
+                created_ms,
+            } => Self::insert_part_on(conn, *message_id, kind, data_json, *created_ms)
+                .map(HotWriteOutcome::RowId),
             PreparedHotWrite::RecordProviderCall {
                 session_id,
                 op_id,
@@ -2259,6 +2271,7 @@ impl Store {
                 tokens_in,
                 tokens_out,
                 error,
+                ts_ms,
             } => Self::insert_provider_call_on(
                 conn,
                 *session_id,
@@ -2282,6 +2295,7 @@ impl Store {
                 None,
                 None,
                 None,
+                *ts_ms,
             )
             .map(HotWriteOutcome::RowId),
         }

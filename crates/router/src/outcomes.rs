@@ -369,8 +369,10 @@ type OutcomeLookupKey = (String, String, RouterPhase, TaskClass, RiskBucket);
 /// descending quality-floor probes recompute each candidate's effective
 /// quality from the SAME lookups instead of re-reading the store per probe.
 ///
-/// It holds no invalidation state: durable outcomes do not change inside one
-/// synchronous route, so it MUST NOT outlive the route that created it.
+/// It is a read-only participant in the route (routing never appends), but it
+/// stays a faithful [`OutcomeStore`]: [`OutcomeStore::append_sample`] clears
+/// the route-sized cache before delegating, so an interleaved write can never
+/// leave a stale cached read behind.
 pub struct MemoOutcomeStore<'a> {
     inner: &'a dyn OutcomeStore,
     cache: Mutex<HashMap<OutcomeLookupKey, Option<VerifiedOutcomeStats>>>,
@@ -387,8 +389,11 @@ impl<'a> MemoOutcomeStore<'a> {
 
 impl OutcomeStore for MemoOutcomeStore<'_> {
     fn append_sample(&self, key: &OutcomeKey, sample: OutcomeSample) {
-        // Routing never appends; delegate so the wrapper stays a faithful
-        // `OutcomeStore` for any caller.
+        // A write makes every cached read stale: invalidate the route-sized
+        // cache before delegating so a subsequent lookup re-reads the durable
+        // store. This keeps the wrapper a faithful `OutcomeStore` even if a
+        // caller interleaves reads and writes.
+        recover_lock(&self.cache).clear();
         self.inner.append_sample(key, sample);
     }
 
@@ -556,6 +561,51 @@ mod tests {
             rework_turns_sum: rework_turns,
             sample_count: successes + failures,
         }
+    }
+
+    #[test]
+    fn memo_outcome_store_invalidates_cached_reads_on_append() {
+        // Finding: a memo that serves a stale read after an append is not a
+        // faithful `OutcomeStore`. The first lookup caches the empty result;
+        // the append must invalidate it so the next lookup observes the write
+        // (an interleaved write can never leave a stale cached read behind).
+        let inner = MemoryOutcomeStore::new();
+        let memo = MemoOutcomeStore::new(&inner);
+        let key = OutcomeKey {
+            provider: "p".into(),
+            model: "m".into(),
+            phase: RouterPhase::Implement,
+            task_class: TaskClass::Medium,
+            risk_bucket: RiskBucket::Medium,
+        };
+        assert_eq!(
+            memo.lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Medium
+            ),
+            None
+        );
+        memo.append_sample(
+            &key,
+            OutcomeSample {
+                verified_success: true,
+                ..Default::default()
+            },
+        );
+        let after = memo
+            .lookup_stats(
+                "p",
+                "m",
+                RouterPhase::Implement,
+                TaskClass::Medium,
+                RiskBucket::Medium,
+            )
+            .expect("the append must invalidate the cached miss");
+        assert_eq!(after.sample_count, 1);
+        assert_eq!(after.successes_first_pass, 1);
     }
 
     #[test]

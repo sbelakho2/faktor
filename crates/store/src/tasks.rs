@@ -1045,6 +1045,11 @@ impl Store {
         let recovery_json = recovery.to_string();
         let replay_json = replay_descriptor.map(|d| d.to_string());
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let started_ms = now_ms();
         self.writer.execute("start_tool_run_and_event", move |conn| {
         let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let changed = txn.tx.execute(
@@ -1055,7 +1060,7 @@ impl Store {
                 op_id.raw() as i64,
                 tool,
                 args_json,
-                now_ms(),
+                started_ms,
                 recovery_json,
                 expected_hash,
                 replay_json,
@@ -1073,7 +1078,7 @@ impl Store {
             session_id,
             event.op_id,
             event.kind,
-            event.state,
+            &event_state_json,
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
@@ -1101,6 +1106,11 @@ impl Store {
         let status = status.to_owned();
         let effect_status = effect_status.to_owned();
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let ended_ms = now_ms();
         self.writer
             .execute("finish_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
@@ -1112,7 +1122,7 @@ impl Store {
                         op_id.raw() as i64,
                         status,
                         effect_status,
-                        now_ms()
+                        ended_ms
                     ],
                 )?;
                 if changed != 1 {
@@ -1126,7 +1136,7 @@ impl Store {
                     session_id,
                     event.op_id,
                     event.kind,
-                    event.state,
+                    &event_state_json,
                     event.ts_ms,
                     event_payload_json,
                     event.payload_ver,
@@ -1171,6 +1181,11 @@ impl Store {
         let status = status.to_owned();
         let effect_status = effect_status.to_owned();
         let payload_json = payload.map(|p| p.to_string());
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let state_json = serde_json::to_string(&state).unwrap();
+        // Preparation BEFORE enqueueing: one timestamp for the row and the
+        // event, captured on the caller's thread (audit item 8).
+        let now = now_ms();
         self.writer
             .execute("finish_recovered_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, state)?;
@@ -1182,7 +1197,7 @@ impl Store {
                         op_id.raw() as i64,
                         status,
                         effect_status,
-                        now_ms()
+                        now
                     ],
                 )?;
                 if changed != 1 {
@@ -1196,8 +1211,8 @@ impl Store {
                     session_id,
                     Some(op_id),
                     event_kind,
-                    state,
-                    now_ms(),
+                    &state_json,
+                    now,
                     payload_json,
                     1,
                 )?;
@@ -1729,6 +1744,10 @@ impl Store {
                 "record {record_id}: finalize status must be Passed or Failed, got {new_status:?}"
             )));
         }
+        // Prepared ENTIRELY before enqueue: both status strings serialize on
+        // the caller's thread.
+        let new_status_json = serde_json::to_string(&new_status).unwrap();
+        let running_status_json = serde_json::to_string(&VerificationStatus::Running).unwrap();
         self.writer
             .execute("verification_record_finalize", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1738,9 +1757,9 @@ impl Store {
              WHERE id = ?1 AND status = ?4",
                     params![
                         record_id.raw() as i64,
-                        serde_json::to_string(&new_status).unwrap(),
+                        new_status_json,
                         completed_ms,
-                        serde_json::to_string(&VerificationStatus::Running).unwrap()
+                        running_status_json
                     ],
                 )?;
                 if updated == 1 {
@@ -2325,6 +2344,9 @@ impl Store {
         let args_json = args.to_string();
         let recovery_json = recovery.to_string();
         let replay_json = replay_descriptor.map(|d| d.to_string());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let started_ms = now_ms();
         self.writer.execute("start_tool_run", move |conn| {
         conn.execute(
             "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash, replay_descriptor)
@@ -2334,7 +2356,7 @@ impl Store {
                 op_id.raw() as i64,
                 tool,
                 args_json,
-                now_ms(),
+                started_ms,
                 recovery_json,
                 expected_hash,
                 replay_json,
@@ -2413,6 +2435,9 @@ impl Store {
     ) -> StoreResult<()> {
         let status = status.to_owned();
         let effect_status = effect_status.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let ended_ms = now_ms();
         self.writer.execute("finish_tool_run", move |conn| {
             let n = conn.execute(
                 "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
@@ -2422,7 +2447,7 @@ impl Store {
                     op_id.raw() as i64,
                     status,
                     effect_status,
-                    now_ms()
+                    ended_ms
                 ],
             )?;
             if n == 0 {
@@ -2490,6 +2515,9 @@ impl Store {
         let provider = provider.to_owned();
         let model = model.to_owned();
         let variant = variant.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("start_turn_record", move |conn| {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -2499,10 +2527,9 @@ impl Store {
                 session_id.raw() as i64,
                 turn_op_id.raw() as i64,
                 TURN_RECORD_FAILED,
-                now_ms()
+                now
             ],
         )?;
-        let now = now_ms();
         tx.execute(
             "INSERT INTO turn_record(session_id, turn_op_id, queue_seq, prompt_message_id, effective_provider, effective_model, variant, started_at, status, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?8)
@@ -2548,6 +2575,9 @@ impl Store {
         let model = model.to_owned();
         let variant = variant.map(|v| v.to_owned());
         let tool_mode = tool_mode.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("set_turn_record_envelope", move |conn| {
         let n = conn.execute(
             "UPDATE turn_record SET effective_provider = ?3, effective_model = ?4, variant = ?5, tool_mode = ?6, updated_ms = ?7
@@ -2559,7 +2589,7 @@ impl Store {
                 model,
                 variant,
                 tool_mode,
-                now_ms()
+                now
             ],
         )?;
         Ok(n > 0)
@@ -2583,6 +2613,9 @@ impl Store {
             )));
         }
         let status = status.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("finish_turn_record", move |conn| {
             let n = conn.execute(
                 "UPDATE turn_record SET status = ?3, updated_ms = ?4
@@ -2591,7 +2624,7 @@ impl Store {
                     session_id.raw() as i64,
                     turn_op_id.raw() as i64,
                     status,
-                    now_ms()
+                    now
                 ],
             )?;
             Ok(n > 0)

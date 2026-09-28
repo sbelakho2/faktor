@@ -713,6 +713,9 @@ impl Store {
         let status = status.to_owned();
         let error = error.map(|v| v.to_owned());
         let prefix_segments_json = prefix_segments_json.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let ts_ms = now_ms();
         self.writer
             .execute("record_provider_call_with_prefix_segments", move |conn| {
                 Self::insert_provider_call_on(
@@ -733,6 +736,7 @@ impl Store {
                     None,
                     None,
                     None,
+                    ts_ms,
                 )
             })
     }
@@ -767,6 +771,9 @@ impl Store {
         let model = model.to_owned();
         let status = status.to_owned();
         let error = error.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let ts_ms = now_ms();
         self.writer
             .execute("record_provider_call_attempt", move |conn| {
                 conn.execute(
@@ -783,7 +790,7 @@ impl Store {
                         reservation_id,
                         provider,
                         model,
-                        now_ms(),
+                        ts_ms,
                         status,
                         tokens_in.map(|t| t as i64),
                         tokens_out.map(|t| t as i64),
@@ -795,8 +802,9 @@ impl Store {
     }
 
     /// Shared single-row provider-call insert; see [`Self::insert_message_on`].
-    /// The usage-settlement row of the hot append surface. The four attempt
-    /// parameters are the additive v18 surface and
+    /// The usage-settlement row of the hot append surface. The caller supplies
+    /// `ts_ms` (captured before enqueueing) and it stamps both `started_ms` and
+    /// `ended_ms`. The four attempt parameters are the additive v18 surface and
     /// `prefix_segments_json` the additive v19 one: `None` everywhere
     /// records a legacy row (no attempt identity, no reservation link, no
     /// segment observation).
@@ -819,6 +827,7 @@ impl Store {
         attempt_ordinal: Option<u32>,
         parent_model_call_op_id: Option<OpId>,
         reservation_id: Option<i64>,
+        ts_ms: i64,
     ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO provider_call(session_id, op_id, provider, model, started_ms, ended_ms, status, tokens_in, tokens_out, error, prompt_prefix_hash, prompt_tokens, prefix_stability, prefix_segments_json, attempt_op_id, attempt_ordinal, parent_model_call_op_id, reservation_id)
@@ -828,8 +837,8 @@ impl Store {
                 op_id.raw() as i64,
                 provider,
                 model,
-                now_ms(),
-                now_ms(),
+                ts_ms,
+                ts_ms,
                 status,
                 tokens_in.map(|t| t as i64),
                 tokens_out.map(|t| t as i64),
@@ -2236,6 +2245,13 @@ impl Store {
     ) -> StoreResult<()> {
         let provider = provider.to_owned();
         let model = model.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp and the JSON-encoded
+        // enum dimensions are captured on the caller's thread (audit item 8)
+        // — the writer job executes SQL only.
+        let updated_ms = now_ms();
+        let phase_json = outcome_db_phase(phase);
+        let class_json = outcome_db_class(task_class);
+        let bucket_json = outcome_db_bucket(risk_bucket);
         self.writer
             .execute("model_outcome_stats_append", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2246,13 +2262,7 @@ impl Store {
                  FROM model_outcome_stats
                  WHERE provider = ?1 AND model = ?2 AND phase = ?3 AND task_class = ?4
                    AND risk_bucket = ?5",
-                        params![
-                            provider,
-                            model,
-                            outcome_db_phase(phase),
-                            outcome_db_class(task_class),
-                            outcome_db_bucket(risk_bucket)
-                        ],
+                        params![provider, model, phase_json, class_json, bucket_json],
                         |r| {
                             Ok((
                                 r.get::<_, i64>(0)?,
@@ -2300,15 +2310,15 @@ impl Store {
                     params![
                         provider,
                         model,
-                        outcome_db_phase(phase),
-                        outcome_db_class(task_class),
-                        outcome_db_bucket(risk_bucket),
+                        phase_json,
+                        class_json,
+                        bucket_json,
                         outcome_clamp_i64(successes),
                         outcome_clamp_i64(failures),
                         outcome_clamp_i64(cost_sum),
                         outcome_clamp_i64(turns_sum),
                         outcome_clamp_i64(count),
-                        now_ms()
+                        updated_ms
                     ],
                 )?;
                 tx.commit()?;

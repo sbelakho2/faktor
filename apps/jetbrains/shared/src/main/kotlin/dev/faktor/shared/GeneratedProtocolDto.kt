@@ -96,6 +96,15 @@ data class ProtocolAttachmentId(
     val size: Long
 )
 
+/** One durable attachment REFERENCE (native additive-response contract): the surrogate reference id the retrieval routes address, plus the CAS digest and the exact presentation metadata (mime, optional filename, decompressed size). Decoders ignore unknown fields. (unknown_fields: ignore) */
+data class ProtocolAttachmentRef(
+    val refId: Long,
+    val digest: String,
+    val mime: String,
+    val filename: String?,
+    val size: Long
+)
+
 /** Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime. (unknown_fields: reject) */
 data class ProtocolAttachmentUpload(
     val mime: String,
@@ -289,6 +298,16 @@ fun parseProtocolAgentStateView(v: JsonView): ProtocolAgentStateView {
 
 fun parseProtocolAttachmentId(v: JsonView): ProtocolAttachmentId {
     return ProtocolAttachmentId(
+        digest = v.field("digest").string(),
+        mime = v.field("mime").string(),
+        filename = v.optionalField("filename")?.string(),
+        size = v.field("size").long(),
+    )
+}
+
+fun parseProtocolAttachmentRef(v: JsonView): ProtocolAttachmentRef {
+    return ProtocolAttachmentRef(
+        refId = v.field("ref_id").long(),
         digest = v.field("digest").string(),
         mime = v.field("mime").string(),
         filename = v.optionalField("filename")?.string(),

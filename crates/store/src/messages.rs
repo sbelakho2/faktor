@@ -148,26 +148,30 @@ impl Store {
         data: serde_json::Value,
     ) -> StoreResult<i64> {
         let role = role.to_owned();
-        // Preparation BEFORE enqueueing: the message JSON body.
+        // Preparation BEFORE enqueueing: the message JSON body and its
+        // timestamp (audit item 8) — the writer job executes SQL only.
         let data_json = data.to_string();
+        let created_ms = now_ms();
         self.writer.execute("put_message", move |conn| {
-            Self::insert_message_on(conn, session_id, seq, &role, &data_json)
+            Self::insert_message_on(conn, session_id, seq, &role, &data_json, created_ms)
         })
     }
 
     /// Shared single-row message insert (fixed-arity contract). Runs on the
     /// caller's connection: the actor batch executes it inside one grouped
-    /// transaction, the direct path outside any explicit transaction.
+    /// transaction, the direct path outside any explicit transaction. The
+    /// caller supplies the row timestamp (captured before enqueueing).
     pub(crate) fn insert_message_on(
         conn: &Connection,
         session_id: SessionId,
         seq: i64,
         role: &str,
         data_json: &str,
+        created_ms: i64,
     ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO message(session_id, seq, role, data, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id.raw() as i64, seq, role, data_json, now_ms()],
+            params![session_id.raw() as i64, seq, role, data_json, created_ms],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -179,23 +183,27 @@ impl Store {
         data: serde_json::Value,
     ) -> StoreResult<i64> {
         let kind = kind.to_owned();
-        // Preparation BEFORE enqueueing: the part JSON body.
+        // Preparation BEFORE enqueueing: the part JSON body and its timestamp
+        // (audit item 8) — the writer job executes SQL only.
         let data_json = data.to_string();
+        let created_ms = now_ms();
         self.writer.execute("put_part", move |conn| {
-            Self::insert_part_on(conn, message_id, &kind, &data_json)
+            Self::insert_part_on(conn, message_id, &kind, &data_json, created_ms)
         })
     }
 
-    /// Shared single-row part insert; see [`Self::insert_message_on`].
+    /// Shared single-row part insert; see [`Self::insert_message_on`]. The
+    /// caller supplies the row timestamp (captured before enqueueing).
     pub(crate) fn insert_part_on(
         conn: &Connection,
         message_id: i64,
         kind: &str,
         data_json: &str,
+        created_ms: i64,
     ) -> StoreResult<i64> {
         conn.execute(
             "INSERT INTO part(message_id, kind, data, created_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![message_id, kind, data_json, now_ms()],
+            params![message_id, kind, data_json, created_ms],
         )?;
         Ok(conn.last_insert_rowid())
     }

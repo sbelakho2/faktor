@@ -88,8 +88,10 @@ impl Store {
     ) -> StoreResult<()> {
         let state_json = state_json.to_owned();
         let kind = kind.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("index_state_put", move |conn| {
-            let now = now_ms();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO index_state(workspace_id, state_json, generation, updated_ms)
@@ -129,8 +131,10 @@ impl Store {
         let expected_state_json = expected_state_json.to_owned();
         let new_state_json = new_state_json.to_owned();
         let kind = kind.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("index_state_cas", move |conn| {
-            let now = now_ms();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current: Option<(String, i64)> = tx
                 .query_row(

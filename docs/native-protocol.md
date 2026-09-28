@@ -177,22 +177,39 @@ generated into both IDE clients (`ProtocolAttachmentId`, `ProtocolTaskRun*`).
   prompts are a typed 400; unknown sessions 404.
 - `POST /native/session/{id}/attachments` — upload ONE durable typed
   attachment: `{mime, filename?, data_base64}` (strict DTO) →
-  `{digest, mime, filename, size}`. `data_base64` is the CANONICAL
-  standard-alphabet base64 of the raw bytes: whitespace and every
+  `{ref_id, digest, mime, filename, size}` (`ref_id` is the stable
+  surrogate row id of THAT reference; the response is additive over the
+  original `{digest, mime, filename, size}` shape). `data_base64` is the
+  CANONICAL standard-alphabet base64 of the raw bytes: whitespace and every
   non-canonical form (bad length/padding, non-zero trailing bits, foreign
   alphabet) are typed 400s, and the decoder reads the wire bytes directly
   into one pre-sized bounded destination. The decoded bytes are bounded by
-  the advertised `attachmentLimits.maxUploadBytes`; identical bytes dedupe
-  to the first durable row. IMAGE and DOCUMENT delivery is validated
+  the advertised `attachmentLimits.maxUploadBytes`; an EXACT-metadata
+  re-upload dedupes to the same reference (same `ref_id`), while identical
+  bytes under a different mime/filename are a DISTINCT reference with its
+  own `ref_id` and metadata. IMAGE and DOCUMENT delivery is validated
   model-aware at task admission, never at upload: images against
   `vision` + the image MIME/byte contract, `application/pdf` /
   `text/plain` against the chosen model's `documentCapable` and document
   MIME/byte contract; a refusal keeps the durable bytes. Ordinary
   workspace source files ride the repository-context `files` path of a
   prompt/task start and are never uploaded blindly.
-- `GET /native/session/{id}/attachments/{digest}` and
-  `.../{digest}/bytes` — resolve one durable attachment's metadata or its
-  verified bytes by BLAKE3 digest; unknown digests are typed 404s.
+- `GET /native/session/{id}/attachments/{ref_id}` and
+  `.../{ref_id}/bytes` — resolve ONE durable attachment REFERENCE by its
+  decimal surrogate id: the metadata is exactly THAT reference's
+  (`ref_id` included), and the bytes are served with THAT reference's
+  MIME. A blob may back several references with distinct metadata, so
+  digest-addressed retrieval is never used for a specific reference. For
+  backwards compatibility a 64-char hex digest segment still resolves the
+  deprecated metadata lookup ONLY when the digest is unambiguous: exactly
+  one reference exists for it; several references are a typed 409 whose
+  message lists the candidate `ref_id`s; unknown/foreign ref ids, unknown
+  digests and non-id/non-digest segments are typed 404/400s.
+- `GET /native/session/{id}/attachments/blob/{digest}/bytes` — the raw CAS
+  bytes of one blob referenced by this session, served as
+  `application/octet-stream` (a digest-only blob has no single reference
+  MIME). The blob must be referenced at least once by the session; an
+  unknown/unreferenced digest is a typed 404.
 - `GET /native/session/{id}/events?after=<seq>` — the durable journal SSE
   stream, cursor-resumable: frames are `id: <seq>`, `event: <kind>`,
   `data: <native_event_row>` (the exact shape of the `/native/events`

@@ -312,8 +312,10 @@ impl Store {
         // In-process constructed enum: serialization of a unit variant can
         // never fail, and it is prepared here rather than on the writer owner.
         let idle_state_json = serde_json::to_string(&AgentState::Idle).unwrap();
-        self.writer.execute("create_session", move |conn| {
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
+        self.writer.execute("create_session", move |conn| {
         conn.execute(
             "INSERT INTO session(workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6)",
@@ -335,7 +337,7 @@ impl Store {
             SessionId::new(id as u64),
             None,
             EventKind::SessionCreated,
-            AgentState::Idle,
+            &idle_state_json,
             now,
             Some(created_payload_json),
             1,
@@ -414,6 +416,9 @@ impl Store {
                 "worktree/task ids must be non-zero".into(),
             ));
         }
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("adopt_session_identity", move |conn| {
             let n = conn.execute(
                 "UPDATE session SET worktree_id = ?2, task_id = ?3, updated_ms = ?4 WHERE id = ?1",
@@ -421,7 +426,7 @@ impl Store {
                     id.raw() as i64,
                     worktree_id.raw() as i64,
                     task_id.raw() as i64,
-                    now_ms()
+                    now
                 ],
             )?;
             if n == 0 {
@@ -440,10 +445,13 @@ impl Store {
     ) -> StoreResult<()> {
         // In-process constructed enum prepared BEFORE enqueueing.
         let lifecycle_json = serde_json::to_string(&lifecycle).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("set_session_lifecycle", move |conn| {
             conn.execute(
                 "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![id.raw() as i64, lifecycle_json, now_ms()],
+                params![id.raw() as i64, lifecycle_json, now],
             )?;
             Ok(())
         })
@@ -452,10 +460,13 @@ impl Store {
     pub fn set_session_state(&self, id: SessionId, state: AgentState) -> StoreResult<()> {
         // In-process constructed enum prepared BEFORE enqueueing.
         let state_json = serde_json::to_string(&state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("set_session_state", move |conn| {
             conn.execute(
                 "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![id.raw() as i64, state_json, now_ms()],
+                params![id.raw() as i64, state_json, now],
             )?;
             Ok(())
         })
@@ -474,11 +485,14 @@ impl Store {
         // In-process constructed enums prepared BEFORE enqueueing.
         let expected_json = serde_json::to_string(&expected).unwrap();
         let new_json = serde_json::to_string(&new).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("set_lifecycle_if", move |conn| {
             let n = conn.execute(
                 "UPDATE session SET lifecycle = ?3, updated_ms = ?4
              WHERE id = ?1 AND lifecycle = ?2",
-                params![id.raw() as i64, expected_json, new_json, now_ms()],
+                params![id.raw() as i64, expected_json, new_json, now],
             )?;
             Ok(n > 0)
         })
@@ -491,10 +505,13 @@ impl Store {
     /// session metadata, not a state-machine transition.
     pub fn update_session_title(&self, id: SessionId, title: &str) -> StoreResult<bool> {
         let title = title.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("update_session_title", move |conn| {
             let n = conn.execute(
                 "UPDATE session SET title = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![id.raw() as i64, title, now_ms()],
+                params![id.raw() as i64, title, now],
             )?;
             Ok(n > 0)
         })
@@ -522,6 +539,9 @@ impl Store {
             .new_lifecycle
             .as_ref()
             .map(|l| serde_json::to_string(l).unwrap());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("transition_session", move |conn| {
             let tx = conn.unchecked_transaction()?;
             // (a) read the session row inside the transaction.
@@ -548,7 +568,6 @@ impl Store {
                 }
             }
             // (c) update lifecycle+state+updated_ms.
-            let now = now_ms();
             // In-process constructed enums prepared on the caller's thread.
             match new_lifecycle_json {
                 Some(lifecycle_json) => {
@@ -570,7 +589,7 @@ impl Store {
                 session_id,
                 op_id,
                 t.event_kind,
-                t.new_state,
+                &state_json,
                 now,
                 transition_payload_json,
                 t.event_payload_ver,
@@ -593,14 +612,23 @@ impl Store {
         op_id: OpId,
         capability: &str,
         expected_state: AgentState,
-        mut event: CommandEvent,
+        event: CommandEvent,
     ) -> StoreResult<(i64, i64, EventSeq)> {
         let seam = Arc::clone(&self.seam);
         let capability = capability.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
+        // The event payload is serialized caller-side; the one field this
+        // transaction alone can know (the allocated permission id) is patched
+        // by SQL after the INSERT, never by serializing on the owner thread.
+        let payload_base = event.payload.as_ref().map(std::string::ToString::to_string);
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
         self.writer
             .execute("insert_permission_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
-                let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
+                let expires_ms = now + Self::PERMISSION_WINDOW_MS;
                 let changed = txn.tx.execute(
                     "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
              VALUES (?1, ?2, ?3, 'pending', ?4)",
@@ -617,24 +645,28 @@ impl Store {
                     ));
                 }
                 let id = txn.tx.last_insert_rowid();
-                // The journal names the id this transaction actually allocated; the
-                // caller cannot know it before the insert.
-                if let Some(serde_json::Value::Object(obj)) = &mut event.payload {
-                    obj.insert("permission_id".into(), serde_json::json!(id));
-                }
+                // The journal names the id this transaction actually allocated;
+                // the caller cannot know it before the insert, so the
+                // caller-prepared payload is patched by SQL (non-object
+                // payloads are returned unchanged by `json_set`, exactly like
+                // the former in-closure object patch).
+                let payload_json = match payload_base {
+                    Some(base) => Some(txn.conn().query_row(
+                        "SELECT json_set(?1, '$.permission_id', ?2)",
+                        params![base, id],
+                        |r| r.get::<_, String>(0),
+                    )?),
+                    None => None,
+                };
                 txn.side_row_applied();
                 let seq = Self::insert_event_locked(
                     txn.conn(),
                     session_id,
                     event.op_id,
                     event.kind,
-                    event.state,
+                    &event_state_json,
                     event.ts_ms,
-                    // The journal names the id this transaction allocated, so this
-                    // one payload can only be serialized after the INSERT
-                    // (documented preparation exception; the value is small and
-                    // bounded).
-                    event.payload.map(|p| p.to_string()),
+                    payload_json,
                     event.payload_ver,
                 )?;
                 txn.precommit();
@@ -662,10 +694,14 @@ impl Store {
         let seam = Arc::clone(&self.seam);
         let decision = decision.to_owned();
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer
             .execute("resolve_permission_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
-                let now = now_ms();
                 txn.tx.execute(
                     "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
@@ -696,7 +732,7 @@ impl Store {
                     session_id,
                     Some(op_id),
                     event.kind,
-                    event.state,
+                    &event_state_json,
                     event.ts_ms,
                     event_payload_json,
                     event.payload_ver,
@@ -739,6 +775,13 @@ impl Store {
             )));
         }
         let seam = Arc::clone(&self.seam);
+        // The event payload is serialized caller-side; the ids this sweep
+        // terminalizes are known only inside the transaction, so they are
+        // patched into the prepared payload by SQL (never by serializing on
+        // the owner thread).
+        let payload_base = event.payload.as_ref().map(std::string::ToString::to_string);
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
         self.writer
             .execute("expire_pending_permissions_for_session", move |conn| {
                 let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
@@ -775,22 +818,50 @@ impl Store {
             )));
                 }
                 // The journal names the rows this transaction actually terminalized;
-                // the caller cannot know them before the SELECT under the same lock.
-                let ids: Vec<i64> = expired.iter().map(|(id, _)| *id).collect();
-                let ops: Vec<i64> = expired.iter().map(|(_, op)| op.raw() as i64).collect();
-                match &mut event.payload {
-                    Some(serde_json::Value::Object(obj)) => {
-                        obj.insert("permission_ids".into(), serde_json::json!(ids));
-                        obj.insert("op_ids".into(), serde_json::json!(ops));
-                    }
-                    Some(_) => {}
-                    None => {
-                        event.payload = Some(serde_json::json!({
-                            "permission_ids": ids,
-                            "op_ids": ops,
-                        }));
-                    }
+                // the caller cannot know them before the SELECT under the same lock,
+                // so the caller-prepared payload is patched by SQL (an existing
+                // object gets both arrays replaced; a missing payload becomes the
+                // object; a non-object payload is left unchanged, exactly like the
+                // former in-closure patch).
+                let mut ids_json = String::from("[]");
+                for (pid, _) in &expired {
+                    ids_json = txn.conn().query_row(
+                        "SELECT json_set(?1, '$[#]', ?2)",
+                        params![ids_json, *pid],
+                        |r| r.get::<_, String>(0),
+                    )?;
                 }
+                let mut ops_json = String::from("[]");
+                for (_, pop) in &expired {
+                    ops_json = txn.conn().query_row(
+                        "SELECT json_set(?1, '$[#]', ?2)",
+                        params![ops_json, pop.raw() as i64],
+                        |r| r.get::<_, String>(0),
+                    )?;
+                }
+                let payload_json = match payload_base {
+                    Some(base) => {
+                        let is_object = txn.conn().query_row(
+                            "SELECT json_type(?1) = 'object'",
+                            params![base],
+                            |r| r.get::<_, i64>(0),
+                        )? == 1;
+                        if is_object {
+                            Some(txn.conn().query_row(
+                                "SELECT json_set(?1, '$.permission_ids', json(?2), '$.op_ids', json(?3))",
+                                params![base, ids_json, ops_json],
+                                |r| r.get::<_, String>(0),
+                            )?)
+                        } else {
+                            Some(base)
+                        }
+                    }
+                    None => Some(txn.conn().query_row(
+                        "SELECT json_object('permission_ids', json(?1), 'op_ids', json(?2))",
+                        params![ids_json, ops_json],
+                        |r| r.get::<_, String>(0),
+                    )?),
+                };
                 if event.op_id.is_none() && expired.len() == 1 {
                     event.op_id = Some(expired[0].1);
                 }
@@ -800,11 +871,9 @@ impl Store {
                     session_id,
                     event.op_id,
                     event.kind,
-                    event.state,
+                    &event_state_json,
                     event.ts_ms,
-                    // The ids this sweep terminalized are only known inside the
-                    // transaction (documented preparation exception).
-                    event.payload.map(|p| p.to_string()),
+                    payload_json,
                     event.payload_ver,
                 )?;
                 txn.precommit();
@@ -837,6 +906,11 @@ impl Store {
         let after_hash = after_hash.to_owned();
         let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("put_checkpoint_and_event", move |conn| {
         let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let duplicate: Option<i64> = txn
@@ -864,7 +938,7 @@ impl Store {
                 after_cas_hash,
                 1i64,
                 1i64,
-                now_ms()
+                now
             ],
         )?;
         if changed != 1 {
@@ -879,7 +953,7 @@ impl Store {
             session_id,
             event.op_id,
             event.kind,
-            event.state,
+            &event_state_json,
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
@@ -935,6 +1009,12 @@ impl Store {
             "after_exists": after_exists,
         })
         .to_string();
+        // Preparation BEFORE enqueueing: the event's landing state JSON
+        // (`expected_state` is both the pre-state and the event's state).
+        let event_state_json = serde_json::to_string(&expected_state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let ts = now_ms();
         self.writer.execute("insert_checkpoint_and_event", move |conn| {
         let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let prev: i64 = txn.tx.query_row(
@@ -943,7 +1023,6 @@ impl Store {
             |r| r.get(0),
         )?;
         let sequence = prev + 1;
-        let ts = now_ms();
         let changed = txn.tx.execute(
             "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, before_exists, after_exists, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -971,7 +1050,7 @@ impl Store {
             session_id,
             None,
             EventKind::CheckpointCreated,
-            expected_state,
+            &event_state_json,
             ts,
             // `sequence` is allocated by the transaction; patch the
             // caller-prepared template with it using SQLite (SQL-only).
@@ -1034,6 +1113,9 @@ impl Store {
         let before_hash = before_hash.to_owned();
         let after_hash = after_hash.to_owned();
         let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("insert_checkpoint", move |conn| {
         let tx = conn.unchecked_transaction()?;
         let prev: i64 = tx.query_row(
@@ -1054,7 +1136,7 @@ impl Store {
                 after_cas_hash,
                 before_exists as i64,
                 after_exists as i64,
-                now_ms()
+                now
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1082,6 +1164,9 @@ impl Store {
         let before_hash = before_hash.to_owned();
         let after_hash = after_hash.to_owned();
         let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("put_checkpoint", move |conn| {
         conn.execute(
             "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, created_ms)
@@ -1093,7 +1178,7 @@ impl Store {
                 before_hash,
                 after_hash,
                 after_cas_hash,
-                now_ms()
+                now
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1142,11 +1227,14 @@ impl Store {
     }
 
     pub fn mark_checkpoint_restored(&self, id: i64) -> StoreResult<()> {
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer
             .execute("mark_checkpoint_restored", move |conn| {
                 conn.execute(
                     "UPDATE checkpoint SET restored_ms = ?2 WHERE id = ?1",
-                    params![id, now_ms()],
+                    params![id, now],
                 )?;
                 Ok(())
             })
@@ -1224,8 +1312,11 @@ impl Store {
         capability: &str,
     ) -> StoreResult<(i64, i64)> {
         let capability = capability.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("insert_permission", move |conn| {
-            let expires_ms = now_ms() + Self::PERMISSION_WINDOW_MS;
+            let expires_ms = now + Self::PERMISSION_WINDOW_MS;
             conn.execute(
                 "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
              VALUES (?1, ?2, ?3, 'pending', ?4)",
@@ -1257,9 +1348,11 @@ impl Store {
         decision: &str,
     ) -> StoreResult<()> {
         let decision = decision.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("resolve_permission", move |conn| {
             let tx = conn.unchecked_transaction()?;
-            let now = now_ms();
             tx.execute(
                 "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",

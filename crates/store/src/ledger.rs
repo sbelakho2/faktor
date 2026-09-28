@@ -525,9 +525,10 @@ impl Store {
         payload_ver: i64,
     ) -> StoreResult<EventSeq> {
         let seam = Arc::clone(&self.seam);
-        // Preparation BEFORE enqueueing: the event payload is serialized on
-        // the caller's thread.
+        // Preparation BEFORE enqueueing: the event payload and its landing
+        // state JSON are serialized on the caller's thread.
         let payload_json = payload.map(|p| p.to_string());
+        let state_json = serde_json::to_string(&state).unwrap();
         self.writer.execute("append_event_v", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let seq = Self::insert_event_locked(
@@ -535,7 +536,7 @@ impl Store {
                 session_id,
                 op_id,
                 kind,
-                state,
+                &state_json,
                 ts_ms,
                 payload_json,
                 payload_ver,
@@ -557,13 +558,15 @@ impl Store {
     /// transaction here would silently demote to a savepoint). The argument
     /// is a bare `&Connection`: a live `rusqlite::Transaction` derefs to one,
     /// and the actor batch passes its outer transaction connection directly.
+    /// `state_json` is the caller-prepared serialization of the event's
+    /// landing state — the writer owner never runs serde.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_event_locked(
         conn: &Connection,
         session_id: SessionId,
         op_id: Option<OpId>,
         kind: EventKind,
-        state: AgentState,
+        state_json: &str,
         ts_ms: i64,
         payload_json: Option<String>,
         payload_ver: i64,
@@ -600,8 +603,7 @@ impl Store {
                 session_id.raw() as i64,
                 op_id.map(|o| o.raw() as i64),
                 kind_name(kind),
-                // In-process constructed enum (see create_session).
-                serde_json::to_string(&state).unwrap(),
+                state_json,
                 ts,
                 payload_json,
                 payload_ver,
@@ -609,12 +611,7 @@ impl Store {
         )?;
         conn.execute(
             "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-            params![
-                session_id.raw() as i64,
-                // In-process constructed enum (see create_session).
-                serde_json::to_string(&state).unwrap(),
-                ts
-            ],
+            params![session_id.raw() as i64, state_json, ts],
         )?;
         Ok(seq)
     }
@@ -636,6 +633,11 @@ impl Store {
         let seam = Arc::clone(&self.seam);
         let strategy = strategy.to_owned();
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
+        // Preparation BEFORE enqueueing: the event's landing state JSON.
+        let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("record_compaction_and_event", move |conn| {
         let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let changed = txn.tx.execute(
@@ -648,7 +650,7 @@ impl Store {
                 target_tokens,
                 accepted as i64,
                 strategy,
-                now_ms()
+                now
             ],
         )?;
         if changed != 1 {
@@ -662,7 +664,7 @@ impl Store {
             session_id,
             event.op_id,
             event.kind,
-            event.state,
+            &event_state_json,
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
@@ -778,8 +780,10 @@ impl Store {
         session_id: SessionId,
         ledger: serde_json::Value,
     ) -> StoreResult<()> {
-        // Preparation BEFORE enqueueing: the ledger JSON blob.
+        // Preparation BEFORE enqueueing: the ledger JSON blob and its
+        // timestamp (audit item 8).
         let ledger_json = ledger.to_string();
+        let now = now_ms();
         self.writer.execute("put_task_ledger", move |conn| {
             // v10: the ledger blob moved to `task_ledger` when the typed
             // durable `task` rows took over the `task` table name.
@@ -789,7 +793,7 @@ impl Store {
             )?;
             conn.execute(
                 "INSERT INTO task_ledger(session_id, ledger, updated_ms) VALUES (?1, ?2, ?3)",
-                params![session_id.raw() as i64, ledger_json, now_ms()],
+                params![session_id.raw() as i64, ledger_json, now],
             )?;
             Ok(())
         })
@@ -818,8 +822,10 @@ impl Store {
         }
         let seam = Arc::clone(&self.seam);
         let entry_type = entry_type.to_owned();
-        // Preparation BEFORE enqueueing: the entry payload JSON.
+        // Preparation BEFORE enqueueing: the entry payload JSON and its
+        // timestamp (audit item 8).
         let payload_json = payload.to_string();
+        let now = now_ms();
         self.writer.execute("append_ledger_entry", move |conn| {
             // One transaction: seq allocation and the insert are atomic. The
             // next seq NEVER rewinds below the head checkpoint (GREATEST of the
@@ -850,7 +856,7 @@ impl Store {
                 entry_type,
                 schema_ver,
                 payload_json,
-                now_ms()
+                now
             ],
         )?;
             // Durability boundary of one typed-ledger append: crash before the
@@ -966,8 +972,10 @@ impl Store {
         schema_ver: i64,
     ) -> StoreResult<()> {
         let seam = Arc::clone(&self.seam);
-        // Preparation BEFORE enqueueing: the head JSON.
+        // Preparation BEFORE enqueueing: the head JSON and its timestamp
+        // (audit item 8).
         let head_json = head_json.to_string();
+        let now = now_ms();
         self.writer.execute("put_ledger_head", move |conn| {
             // Durability boundary of the standalone head refresh: crash before
             // the autocommit statement or right after it.
@@ -985,7 +993,7 @@ impl Store {
                 head_json,
                 checkpoint_seq,
                 schema_ver,
-                now_ms()
+                now
             ],
         )?;
             seam.trip("head_written");
@@ -1012,8 +1020,10 @@ impl Store {
     ) -> StoreResult<usize> {
         let seam = Arc::clone(&self.seam);
         let protect = protect.to_owned();
-        // Preparation BEFORE enqueueing: the folded head JSON.
+        // Preparation BEFORE enqueueing: the folded head JSON and its
+        // timestamp (audit item 8).
         let head_json = head_json.to_string();
+        let now = now_ms();
         self.writer.execute("compact_ledger", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let sid = session_id.raw() as i64;
@@ -1049,7 +1059,7 @@ impl Store {
                 head_json,
                 checkpoint_seq,
                 schema_ver,
-                now_ms()
+                now
             ],
         )?;
             // Durability boundary of the compaction fold: crash before the
@@ -1233,6 +1243,9 @@ impl Store {
         strategy: &str,
     ) -> StoreResult<()> {
         let strategy = strategy.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("record_compaction", move |conn| {
         conn.execute(
             "INSERT INTO compaction(session_id, before_tokens, after_tokens, target_tokens, accepted, strategy, created_ms)
@@ -1244,7 +1257,7 @@ impl Store {
                 target_tokens,
                 accepted as i64,
                 strategy,
-                now_ms()
+                now
             ],
         )?;
         Ok(())
@@ -1418,6 +1431,9 @@ impl Store {
         // `json_object` inside the SQL-only closure (byte-identical to the
         // former `json!` wrapper), so the owner thread never runs serde.
         let state_json = serde_json::to_string(target_state).unwrap();
+        // The timestamp is captured once on the caller's thread (audit item
+        // 8): every row this one transaction stamps shares it.
+        let now = now_ms();
         self.writer.execute("admit_queue_head", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let head: Option<QueueHeadRow> = tx
@@ -1468,7 +1484,7 @@ impl Store {
             tx.execute(
                 "UPDATE prompt_queue SET status = 'claimed', claimed_at = ?2
              WHERE session_id = ?1 AND seq = ?3",
-                params![session.raw() as i64, now_ms(), queue_seq],
+                params![session.raw() as i64, now, queue_seq],
             )?;
             let prev_event: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM event WHERE session_id = ?1",
@@ -1479,11 +1495,11 @@ impl Store {
             tx.execute(
                 "INSERT INTO message(session_id, seq, role, data, created_ms)
              VALUES (?1, ?2, 'user', json_object('text', ?3), ?4)",
-                params![session.raw() as i64, event_seq, prompt, now_ms()],
+                params![session.raw() as i64, event_seq, prompt, now],
             )?;
             tx.execute(
                 "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![session.raw() as i64, state_json, now_ms()],
+                params![session.raw() as i64, state_json, now],
             )?;
             tx.commit()?;
             Ok(Some((
@@ -1509,11 +1525,14 @@ impl Store {
         status: &str,
     ) -> StoreResult<()> {
         let status = status.to_owned();
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer.execute("mark_queue_status", move |conn| {
             conn.execute(
                 "UPDATE prompt_queue SET status = ?3, completed_at = ?4
              WHERE session_id = ?1 AND seq = ?2",
-                params![session.raw() as i64, queue_seq, status, now_ms()],
+                params![session.raw() as i64, queue_seq, status, now],
             )?;
             Ok(())
         })
@@ -1551,13 +1570,16 @@ impl Store {
     /// many rows were cancelled.
     pub fn cancel_queued_ops(&self, session: SessionId, ops: &[OpId]) -> StoreResult<i64> {
         let ops = ops.to_owned();
+        // Preparation BEFORE enqueueing: one timestamp for the whole cancel
+        // batch, captured on the caller's thread (audit item 8).
+        let now = now_ms();
         self.writer.execute("cancel_queued_ops", move |conn| {
         let mut n = 0i64;
         for op in ops {
             n += conn.execute(
                 "UPDATE prompt_queue SET status = 'cancelled', completed_at = ?3
                  WHERE session_id = ?1 AND op_id = ?2 AND status IN ('pending','claimed','running')",
-                params![session.raw() as i64, op.raw() as i64, now_ms()],
+                params![session.raw() as i64, op.raw() as i64, now],
             )? as i64;
         }
         Ok(n)
@@ -1584,6 +1606,9 @@ impl Store {
     /// so the row can never spin forever and is never delivered twice.
     /// Returns the number of claimed rows returned to pending.
     pub fn recover_claimed_queue_rows(&self, session: SessionId) -> StoreResult<i64> {
+        // Preparation BEFORE enqueueing: the timestamp is captured on the
+        // caller's thread (audit item 8) — the writer job executes SQL only.
+        let now = now_ms();
         self.writer
             .execute("recover_claimed_queue_rows", move |conn| {
                 let tx = conn.unchecked_transaction()?;
@@ -1599,7 +1624,7 @@ impl Store {
                   WHERE tr.session_id = prompt_queue.session_id
                     AND tr.turn_op_id = prompt_queue.op_id
                     AND tr.status = 'active')",
-                    params![session.raw() as i64, now_ms()],
+                    params![session.raw() as i64, now],
                 )? as i64;
                 tx.commit()?;
                 if retired > 0 {

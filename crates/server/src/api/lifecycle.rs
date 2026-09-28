@@ -600,21 +600,29 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
             post(native_task_run_cancel),
         )
         // Native binary attachments (additive, strict): upload ONE bounded
-        // payload into the session's durable CAS-backed store, resolve its
-        // typed metadata by digest, and fetch the verified bytes. IMAGES are
-        // stored here and validated against the CHOSEN model's capabilities
-        // (vision, deliverable mime, per-provider byte bound) at task
-        // admission, where a refusal keeps the draft and bytes intact.
+        // payload into the session's durable CAS-backed store, resolve ONE
+        // reference by its stable `ref_id` (metadata and THAT reference's
+        // MIME-tagged bytes), fetch one referenceless BLOB by digest as raw
+        // octet-stream bytes, and the deprecated digest metadata lookup
+        // (single-reference only; several references are a typed 409 that
+        // lists the candidate ref ids). IMAGES are stored here and validated
+        // against the CHOSEN model's capabilities (vision, deliverable mime,
+        // per-provider byte bound) at task admission, where a refusal keeps
+        // the draft and bytes intact.
         .route(
             "/native/session/{id}/attachments",
             post(native_attachment_upload),
         )
         .route(
-            "/native/session/{id}/attachments/{digest}",
+            "/native/session/{id}/attachments/blob/{digest}/bytes",
+            get(native_attachment_blob_bytes),
+        )
+        .route(
+            "/native/session/{id}/attachments/{ref_id}",
             get(native_attachment_get),
         )
         .route(
-            "/native/session/{id}/attachments/{digest}/bytes",
+            "/native/session/{id}/attachments/{ref_id}/bytes",
             get(native_attachment_bytes),
         )
         // Multi-candidate implementation tournaments (additive): start an

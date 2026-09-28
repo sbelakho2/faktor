@@ -77,6 +77,11 @@ export interface PendingBinaryAttachment {
  * changed bytes, renamed/re-selected its file, or changed its declared size
  * uploads fresh (and gets the new reference's metadata back), while an
  * unchanged reference that moved position still reuses its durable id.
+ * The JetBrains client's local key is a deliberate, documented difference:
+ * it also tags the LOCAL SOURCE KIND (image / document / in-memory binary)
+ * so a reference that moves between local source categories re-uploads.
+ * This client has only binary attachments, hence no kind tag; the two keys
+ * are intentionally not the same field set.
  */
 export function pendingAttachmentContentDigest(
   attachment: Pick<PendingBinaryAttachment, 'mime' | 'filename' | 'bytes' | 'dataBase64'>,

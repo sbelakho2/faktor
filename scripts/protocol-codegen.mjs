@@ -1046,7 +1046,7 @@ const HANDWRITTEN_FROZEN = new Set([
 /** The audit-15 migrated routes: they must STAY `generated`. */
 const MIGRATED_ROUTES = [
   '/native/session/{id}/attachments',
-  '/native/session/{id}/attachments/{digest}',
+  '/native/session/{id}/attachments/{ref_id}',
   '/native/session/{id}/task-runs',
   '/native/session/{id}/task-runs/{run_id}',
   '/native/session/{id}/task-runs/{run_id}/cancel',

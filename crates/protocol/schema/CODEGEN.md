@@ -105,9 +105,10 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `POST /native/session/{id}/abort` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/agents` | handwritten-grandfathered |  |
 | `POST /native/session/{id}/agents/{child}/presentation` | handwritten-grandfathered |  |
-| `POST /native/session/{id}/attachments` | generated | `AttachmentUpload`, `AttachmentId` |
-| `GET /native/session/{id}/attachments/{digest}` | generated | `AttachmentId` |
-| `GET /native/session/{id}/attachments/{digest}/bytes` | streaming-special-case |  |
+| `POST /native/session/{id}/attachments` | generated | `AttachmentUpload`, `AttachmentRef` |
+| `GET /native/session/{id}/attachments/blob/{digest}/bytes` | streaming-special-case |  |
+| `GET /native/session/{id}/attachments/{ref_id}` | generated | `AttachmentRef` |
+| `GET /native/session/{id}/attachments/{ref_id}/bytes` | streaming-special-case |  |
 | `GET,POST /native/session/{id}/board` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/checkpoints` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/events` | streaming-special-case |  |
