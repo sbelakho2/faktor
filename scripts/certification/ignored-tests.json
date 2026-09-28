@@ -191,7 +191,7 @@
       "reason": "release-only 10 GiB real-bytes manual soak"
     },
     {
-      "file": "crates/terminal/src/lib.rs",
+      "file": "crates/terminal/src/tests.rs",
       "fn": "timeline_ring_stays_bounded_under_300_spawns",
       "tag": "perf",
       "reason": "timing/ring bound run explicitly; not part of the trusted perf lane package set"
