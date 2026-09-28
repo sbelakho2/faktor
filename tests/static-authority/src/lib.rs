@@ -5951,6 +5951,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // out here)
         "task_row_map(",
         "parse_json(",
+        // indirect writer-side state verification: the old
+        // `SessionCommandTxn::begin` parsed the durable session state and
+        // formatted both refusal messages ON the writer owner. The prepared
+        // replacement (`begin_prepared`) compares caller-prepared raw text.
+        "SessionCommandTxn::begin(",
         // hashing
         "Sha256",
         "Sha512",
@@ -6205,6 +6210,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 "indirect json parse",
                 "fn f(raw: String) { self.writer.execute(\"x\", move |conn| { let s: T = parse_json(&label, &raw)?; Ok(s) }) }\n",
             ),
+            (
+                "indirect session command begin",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let txn = SessionCommandTxn::begin(conn, &seam, sid, expected)?; Ok(txn) }) }\n",
+            ),
         ] {
             let f = synthetic_file("crates/store/src/evil.rs", src);
             assert!(
@@ -6243,6 +6252,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             // into the closure — the same helper names are not flagged.
             "fn f(row: &Row) { let t = task_row_map(row, sid)?; self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![t.state])?; Ok(()) }) }\n",
             "fn f(raw: String) { let s: T = parse_json(&label, &raw)?; self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![s])?; Ok(()) }) }\n",
+            // Caller-side session state preparation: the expectation and both
+            // refusal messages are built BEFORE the call; the closure only
+            // binds the prepared value through `begin_prepared` (never the
+            // old owner-side-decoding `SessionCommandTxn::begin`).
+            "fn f() { let expected = PreparedSessionStateExpectation::prepare(sid, AgentState::Idle); self.writer.execute(\"x\", move |conn| { let txn = SessionCommandTxn::begin_prepared(conn, &seam, sid, expected)?; Ok(txn) }) }\n",
         ] {
             let f = synthetic_file("crates/store/src/good.rs", src);
             assert!(
@@ -6310,6 +6324,50 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                         "seed_task_attachments_txn closure line {} contains `{marker}`: {} \
                          — a writer job must execute SQL only; prepare the value on the \
                          caller's thread before enqueueing",
+                        line_of(f.src, at),
+                        trim_line(f.src, at)
+                    );
+                }
+                pos = at + mb.len();
+            }
+        }
+    }
+
+    /// Regression pin for the prepared session-command boundary (audit
+    /// finding 2): `SessionCommandTxn::begin_prepared` runs on the single
+    /// writer owner, so its body stays SQL-only — no JSON decode
+    /// (`parse_json(`/`serde_json`), no message formatting (`format!`,
+    /// `.to_string()`) and no digest materialization (`.to_hex(`). The
+    /// caller prepares a `PreparedSessionStateExpectation` instead; the
+    /// scan-15 marker `SessionCommandTxn::begin(` refuses the old
+    /// owner-side-decoding entry point.
+    #[test]
+    fn begin_prepared_writer_helper_is_sql_only() {
+        let f = load("crates/store/src/sessions.rs").expect("sessions.rs readable");
+        let fn_at = f
+            .src
+            .find("fn begin_prepared(")
+            .expect("begin_prepared present");
+        let next_fn = f.src[fn_at + 1..]
+            .find("\n    pub fn ")
+            .map(|offset| fn_at + 1 + offset)
+            .unwrap_or(f.src.len());
+        for marker in [
+            "parse_json(",
+            "serde_json",
+            "format!",
+            ".to_string()",
+            ".to_hex(",
+        ] {
+            let mb = marker.as_bytes();
+            let mut pos = fn_at;
+            while let Some(rel) = f.src[pos..next_fn].find(marker) {
+                let at = pos + rel;
+                if f.code[at..at + mb.len()].iter().all(|c| *c) {
+                    panic!(
+                        "begin_prepared line {} contains `{marker}`: {} — the helper runs \
+                         on the single writer owner; prepare the state text and the refusal \
+                         messages on the caller's thread",
                         line_of(f.src, at),
                         trim_line(f.src, at)
                     );

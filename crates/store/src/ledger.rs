@@ -662,11 +662,14 @@ impl Store {
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the session state expectation and
+        // both refusal messages (the closure formats nothing).
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer.execute("record_compaction_and_event", move |conn| {
-        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+        let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
         let changed = txn.tx.execute(
             "INSERT INTO compaction(session_id, before_tokens, after_tokens, target_tokens, accepted, strategy, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1511,10 +1514,12 @@ impl Store {
             let op_id = id_field(&op_id_label, op_id_raw)?;
             let files_ok: i64 = tx
                 .query_row(
-                    "SELECT json_type(?1) = 'array'
-                        AND NOT EXISTS (
-                            SELECT 1 FROM json_each(?1) WHERE json_type(value) <> 'text'
-                        )",
+                    "SELECT CASE
+                        WHEN json_valid(?1) = 0 THEN 0
+                        WHEN json_type(?1) <> 'array' THEN 0
+                        WHEN EXISTS (SELECT 1 FROM json_each(?1) WHERE type <> 'text') THEN 0
+                        ELSE 1
+                    END",
                     params![files_json.as_str()],
                     |r| r.get(0),
                 )
@@ -1580,7 +1585,7 @@ impl Store {
             }) => {
                 // Preserve the former decode contract: a corrupt state or
                 // files column surfaces typed; nothing was admitted.
-                let _: String = parse_json(&session_state_label, &state_json)?;
+                let _: AgentState = parse_json(&session_state_label, &state_json)?;
                 let _: Vec<String> = parse_json(&files_label, &files_json)?;
                 Ok(None)
             }

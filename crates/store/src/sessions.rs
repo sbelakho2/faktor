@@ -146,6 +146,37 @@ impl ExpiredPermissionResolution {
     }
 }
 
+/// One session state expectation PREPARED on the caller's thread for
+/// [`SessionCommandTxn::begin_prepared`]: the canonical `state` JSON text a
+/// durable session row must carry, plus both refusal messages. Serialization
+/// happens HERE, so the writer closure compares raw text and never decodes a
+/// state or materializes a message on the single writer owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedSessionStateExpectation {
+    pub state: AgentState,
+    pub state_json: String,
+    pub missing_message: String,
+    pub mismatch_message: String,
+}
+
+impl PreparedSessionStateExpectation {
+    /// Serialize the expected state once and prepare both refusal messages
+    /// caller-side (in-process `AgentState` serialization cannot fail).
+    pub fn prepare(session: SessionId, expected: AgentState) -> Self {
+        let state_json = serde_json::to_string(&expected)
+            .expect("in-process AgentState serialization cannot fail");
+        Self {
+            state: expected,
+            state_json,
+            missing_message: format!("session {session} does not exist; session command refused"),
+            mismatch_message: format!(
+                "session {session} state is not the expected {expected:?}; \
+                 session command refused before any write"
+            ),
+        }
+    }
+}
+
 /// One logical session command inside ONE SQLite transaction
 /// (`BEGIN IMMEDIATE`). The session must exist and be exactly in the
 /// caller's `expected_state` or the command refuses with `Conflict`
@@ -178,13 +209,14 @@ pub struct SessionCommandTxn<'a> {
 
 impl<'a> SessionCommandTxn<'a> {
     /// BEGIN IMMEDIATE, read the session row inside the transaction and
-    /// verify it is exactly in `expected_state`. Missing session or a
-    /// mismatch refuses typed before any write.
-    pub(crate) fn begin(
+    /// verify its raw `state` text is exactly the caller-prepared canonical
+    /// JSON. Missing session or a mismatch refuses typed before any write;
+    /// the helper formats nothing, so the writer job stays SQL-only.
+    pub(crate) fn begin_prepared(
         conn: &'a mut Connection,
         seam: &'a CrashSeam,
         session: SessionId,
-        expected_state: AgentState,
+        expected: PreparedSessionStateExpectation,
     ) -> StoreResult<Self> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let raw: Option<String> = tx
@@ -194,22 +226,20 @@ impl<'a> SessionCommandTxn<'a> {
                 |r| r.get(0),
             )
             .optional()?;
-        let raw = raw.ok_or_else(|| {
-            StoreError::Conflict(format!(
-                "session {session} does not exist; session command refused"
-            ))
-        })?;
-        let current: AgentState = parse_json(&format!("session {session} state"), &raw)?;
-        if current != expected_state {
-            return Err(StoreError::Conflict(format!(
-                "session {session} state is {current:?}, expected {expected_state:?}; \
-                     session command refused before any write"
-            )));
+        let PreparedSessionStateExpectation {
+            state,
+            state_json,
+            missing_message,
+            mismatch_message,
+        } = expected;
+        let raw = raw.ok_or(StoreError::Conflict(missing_message))?;
+        if raw != state_json {
+            return Err(StoreError::Conflict(mismatch_message));
         }
         Ok(Self {
             tx,
             session,
-            expected_state,
+            expected_state: state,
             seam,
         })
     }
@@ -625,9 +655,12 @@ impl Store {
         let payload_base = event.payload.as_ref().map(std::string::ToString::to_string);
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the session state expectation and
+        // both refusal messages (the closure formats nothing).
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         self.writer
             .execute("insert_permission_and_event", move |conn| {
-                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
                 let expires_ms = now + Self::PERMISSION_WINDOW_MS;
                 let changed = txn.tx.execute(
                     "INSERT INTO permission(session_id, op_id, capability, decision, expires_ms)
@@ -696,12 +729,15 @@ impl Store {
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the session state expectation and
+        // both refusal messages (the closure formats nothing).
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer
             .execute("resolve_permission_and_event", move |conn| {
-                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
                 txn.tx.execute(
                     "UPDATE permission SET decision = 'expired', resolved_ms = ?2
              WHERE id = ?1 AND decision = 'pending' AND expires_ms <= ?2",
@@ -782,9 +818,13 @@ impl Store {
         let payload_base = event.payload.as_ref().map(std::string::ToString::to_string);
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the session state expectation and
+        // both refusal messages (the closure formats nothing).
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         self.writer
             .execute("expire_pending_permissions_for_session", move |conn| {
-                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let txn =
+                    SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
                 let expired: Vec<(i64, OpId)> = {
                     let mut stmt = txn.tx.prepare(
                         "SELECT id, op_id FROM permission
@@ -908,11 +948,14 @@ impl Store {
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
+        // Preparation BEFORE enqueueing: the session state expectation and
+        // both refusal messages (the closure formats nothing).
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
         self.writer.execute("put_checkpoint_and_event", move |conn| {
-        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+        let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
         let duplicate: Option<i64> = txn
             .tx
             .query_row(
@@ -1012,11 +1055,14 @@ impl Store {
         // Preparation BEFORE enqueueing: the event's landing state JSON
         // (`expected_state` is both the pre-state and the event's state).
         let event_state_json = serde_json::to_string(&expected_state).unwrap();
+        // Preparation BEFORE enqueueing: the session state expectation and
+        // both refusal messages (the closure formats nothing).
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ts = now_ms();
         self.writer.execute("insert_checkpoint_and_event", move |conn| {
-        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+        let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
         let prev: i64 = txn.tx.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM checkpoint WHERE session_id = ?1",
             params![session_id.raw() as i64],
@@ -3356,6 +3402,312 @@ mod typed_ledger_tests {
         assert_eq!(
             status, "pending",
             "a refused admission must not claim the row"
+        );
+    }
+
+    fn pending_queue_row_with_files(store: &Store, files_json: &str) -> SessionId {
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .enqueue_prompt(s.id, OpId::new(1), "hi", &[], None, None, None, 1)
+            .unwrap();
+        store
+            .raw_conn()
+            .execute(
+                "UPDATE prompt_queue SET files = ?2 WHERE session_id = ?1 AND seq = 1",
+                params![s.id.raw() as i64, files_json],
+            )
+            .unwrap();
+        s.id
+    }
+
+    /// The `files` column is a string array or it is corrupt: JSON1's
+    /// `json_each.value` dequotes text elements, so `json_type(value)` parses
+    /// `src/lib.rs` as JSON and the old predicate raised "malformed JSON" for
+    /// EVERY non-empty list (and silently passed `[null]`). The admission
+    /// validation must classify on `json_each.type`, accept exactly the empty
+    /// array and string arrays, and refuse everything else typed with zero
+    /// mutation.
+    #[test]
+    fn queue_admission_files_column_accepts_only_json_string_arrays() {
+        for (files_json, accepted) in [
+            ("[]", Some(Vec::<String>::new())),
+            (r#"["src/lib.rs"]"#, Some(vec!["src/lib.rs".to_string()])),
+            (r#"["a","b"]"#, Some(vec!["a".to_string(), "b".to_string()])),
+            ("[1]", None),
+            ("[null]", None),
+            (r#"{"x":"a"}"#, None),
+            ("not-json", None),
+        ] {
+            let (_d, store) = tmp_store();
+            let s = pending_queue_row_with_files(&store, files_json);
+            match (store.admit_queue_head(s, &["idle"], "preparing"), accepted) {
+                (Ok(Some((admitted, _))), Some(expected)) => {
+                    assert_eq!(
+                        admitted.files, expected,
+                        "files {files_json} must round-trip"
+                    );
+                    let status: String = store
+                        .read()
+                        .unwrap()
+                        .query_row(
+                            "SELECT status FROM prompt_queue WHERE session_id = ?1",
+                            params![s.raw() as i64],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(status, "claimed");
+                    assert_eq!(
+                        store.messages_before(s, None, 10).unwrap().len(),
+                        1,
+                        "exactly one user message per admitted prompt"
+                    );
+                    assert!(
+                        store
+                            .admit_queue_head(s, &["idle"], "preparing")
+                            .unwrap()
+                            .is_none(),
+                        "a re-admit must be a no-op: the head was claimed"
+                    );
+                    assert_eq!(store.messages_before(s, None, 10).unwrap().len(), 1);
+                }
+                (Err(StoreError::Corrupt(msgs)), None) => {
+                    assert!(
+                        msgs.iter().any(|m| m.contains("files")),
+                        "{files_json}: the refusal must name the files column: {msgs:?}"
+                    );
+                    assert_admission_untouched(&store, s);
+                    assert_eq!(
+                        store.get_session(s).unwrap().unwrap().state,
+                        AgentState::Idle,
+                        "a refused admission must not move the session"
+                    );
+                    assert!(
+                        store.admit_queue_head(s, &["idle"], "preparing").is_err(),
+                        "the refusal is deterministic: the corrupt row is still refused"
+                    );
+                }
+                (other, _) => panic!("files {files_json} classified {other:?}"),
+            }
+        }
+    }
+
+    /// Assert a refused admission left the durable world exactly as it was:
+    /// the head is still pending and no message was materialized.
+    fn assert_admission_untouched(store: &Store, s: SessionId) {
+        let status: String = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM prompt_queue WHERE session_id = ?1 ORDER BY seq LIMIT 1",
+                params![s.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending", "a refused admission must not claim");
+        assert!(
+            store.messages_before(s, None, 10).unwrap().is_empty(),
+            "a refused admission must not materialize a message"
+        );
+    }
+
+    /// The ineligible branch decodes the durable session text as a TYPED
+    /// `AgentState`: `"zombie"` is well-formed JSON but not a state, so it
+    /// must surface `Corrupt` (never a silent `Ok(None)` "not eligible"),
+    /// with zero queue/message/session mutation. A valid but genuinely
+    /// ineligible state is still the intended `Ok(None)`.
+    #[test]
+    fn admit_queue_head_decodes_durable_session_state_typed() {
+        for (corrupt_state, needle) in [("\"zombie\"", "state"), ("not-json", "state")] {
+            let (_d, store) = tmp_store();
+            let s = pending_queue_row_with_files(&store, "[]");
+            store
+                .raw_conn()
+                .execute(
+                    "UPDATE session SET state = ?2 WHERE id = ?1",
+                    params![s.raw() as i64, corrupt_state],
+                )
+                .unwrap();
+            match store.admit_queue_head(s, &["idle"], "preparing") {
+                Err(StoreError::Corrupt(msgs)) => assert!(
+                    msgs.iter().any(|m| m.contains(needle)),
+                    "{corrupt_state}: the refusal must name the state column: {msgs:?}"
+                ),
+                other => panic!("state {corrupt_state} must refuse typed, got {other:?}"),
+            }
+            let status: String = store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM prompt_queue WHERE session_id = ?1",
+                    params![s.raw() as i64],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "pending");
+            assert!(store.messages_before(s, None, 10).unwrap().is_empty());
+            let durable: String = store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM session WHERE id = ?1",
+                    params![s.raw() as i64],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(durable, corrupt_state, "the corrupt row is never rewritten");
+        }
+        let (_d, store) = tmp_store();
+        let s = pending_queue_row_with_files(&store, "[]");
+        store
+            .raw_conn()
+            .execute(
+                "UPDATE session SET state = '\"completed\"' WHERE id = ?1",
+                params![s.raw() as i64],
+            )
+            .unwrap();
+        assert!(
+            store
+                .admit_queue_head(s, &["idle"], "preparing")
+                .unwrap()
+                .is_none(),
+            "a valid ineligible state is a clean no-op"
+        );
+        assert_admission_untouched(&store, s);
+        assert_eq!(
+            store.get_session(s).unwrap().unwrap().state,
+            AgentState::Completed,
+            "a valid ineligible state is never rewritten"
+        );
+    }
+
+    /// End-to-end queued-files case (the regression that was missing): while
+    /// a turn is active, a prompt with a real file list queues; the store's
+    /// public admission path (exactly the call `SessionHandle::
+    /// admit_next_queued` makes) then returns the SAME files, claims the row
+    /// and materializes the user message exactly once, and a re-admit is a
+    /// no-op.
+    #[test]
+    fn queued_prompt_with_files_admits_exactly_once_after_turn() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        for (from, to, kind) in [
+            (
+                AgentState::Idle,
+                AgentState::Preparing,
+                EventKind::PhaseChanged,
+            ),
+            (
+                AgentState::Preparing,
+                AgentState::BuildingContext,
+                EventKind::PhaseChanged,
+            ),
+            (
+                AgentState::BuildingContext,
+                AgentState::WaitingForModel,
+                EventKind::PhaseChanged,
+            ),
+            (
+                AgentState::WaitingForModel,
+                AgentState::Streaming,
+                EventKind::PhaseChanged,
+            ),
+        ] {
+            store
+                .transition_session(
+                    s.id,
+                    Some(OpId::new(9)),
+                    SessionTransition {
+                        expected_lifecycle: None,
+                        new_lifecycle: None,
+                        expected_state: Some(from),
+                        new_state: to,
+                        event_kind: kind,
+                        event_payload: None,
+                        event_payload_ver: 1,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .enqueue_prompt(
+                s.id,
+                OpId::new(10),
+                "queued with files",
+                &["src/lib.rs".to_string()],
+                None,
+                None,
+                None,
+                7,
+            )
+            .unwrap();
+        let handle_eligible = [
+            "idle",
+            "ready_for_next_turn",
+            "cancelled",
+            "failed_recoverable",
+        ];
+        assert!(
+            store
+                .admit_queue_head(s.id, &handle_eligible, "preparing")
+                .unwrap()
+                .is_none(),
+            "a prompt queued during a streaming turn must not admit mid-turn"
+        );
+        assert_eq!(
+            store.queue_status_counts(s.id).unwrap()["pending"].as_i64(),
+            Some(1)
+        );
+        assert!(store.messages_before(s.id, None, 10).unwrap().is_empty());
+        store
+            .transition_session(
+                s.id,
+                Some(OpId::new(9)),
+                SessionTransition {
+                    expected_lifecycle: None,
+                    new_lifecycle: None,
+                    expected_state: Some(AgentState::Streaming),
+                    new_state: AgentState::ReadyForNextTurn,
+                    event_kind: EventKind::TurnCompleted,
+                    event_payload: None,
+                    event_payload_ver: 1,
+                },
+            )
+            .unwrap();
+        let (admitted, message_seq) = store
+            .admit_queue_head(s.id, &handle_eligible, "preparing")
+            .unwrap()
+            .expect("the queued prompt must admit once the turn ended");
+        assert_eq!(admitted.op_id, OpId::new(10));
+        assert_eq!(admitted.queue_seq, 1);
+        assert_eq!(admitted.prompt, "queued with files");
+        assert_eq!(admitted.files, vec!["src/lib.rs".to_string()]);
+        assert_eq!(message_seq, admitted.message_seq);
+        assert_eq!(
+            store.get_session(s.id).unwrap().unwrap().state,
+            AgentState::Preparing
+        );
+        assert_eq!(
+            store.queue_status_counts(s.id).unwrap()["claimed"].as_i64(),
+            Some(1)
+        );
+        let messages = store.messages_before(s.id, None, 10).unwrap();
+        assert_eq!(messages.len(), 1, "materialized exactly once");
+        assert_eq!(messages[0].seq, admitted.message_seq);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].data["text"], "queued with files");
+        assert!(
+            store
+                .admit_queue_head(s.id, &handle_eligible, "preparing")
+                .unwrap()
+                .is_none(),
+            "re-admit must be a no-op: no pending head remains"
+        );
+        assert_eq!(store.messages_before(s.id, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            store.queue_status_counts(s.id).unwrap()["claimed"].as_i64(),
+            Some(1)
         );
     }
 
