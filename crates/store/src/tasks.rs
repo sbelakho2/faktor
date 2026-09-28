@@ -1032,9 +1032,8 @@ pub(crate) fn turn_record_map(r: &rusqlite::Row<'_>) -> StoreResult<TurnRecordRo
 mod verification_job_store_tests;
 
 impl Store {
-    /// `start_tool_run` as ONE transaction: insert the running tool_run row
-    /// and append `ToolStarted` (state `ExecutingTool`) together. Returns
-    /// `(tool_run_row_id, event_seq)`.
+    /// `start_tool_run` as ONE transaction: insert the running tool_run row and
+    /// append `ToolStarted` (state `ExecutingTool`); returns `(row_id, seq)`.
     #[allow(clippy::too_many_arguments)]
     pub fn start_tool_run_and_event(
         &self,
@@ -1057,11 +1056,13 @@ impl Store {
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
-        // Preparation BEFORE enqueueing: the timestamp is captured on the
-        // caller's thread (audit item 8) — the writer job executes SQL only.
+        // Preparation BEFORE enqueueing: the timestamp and the session state
+        // expectation are captured on the caller's thread (audit item 8) —
+        // the writer job executes SQL only.
         let started_ms = now_ms();
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         self.writer.execute("start_tool_run_and_event", move |conn| {
-        let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+        let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
         let changed = txn.tx.execute(
             "INSERT INTO tool_run(session_id, op_id, tool, args, status, started_ms, effect_status, recovery, expected_hash, replay_descriptor)
              VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'unknown', ?6, ?7, ?8)",
@@ -1100,9 +1101,8 @@ impl Store {
     }
 
     /// `finish_tool_run` as ONE transaction: move exactly ONE still-running
-    /// tool_run row to its terminal status and append the completion event
-    /// together. Zero changed rows (unknown or already finished) is the typed
-    /// `Conflict`; the event is never written without the row.
+    /// tool_run row to terminal status and append its completion event together;
+    /// zero changed rows is the typed `Conflict` — no row, no event.
     pub fn finish_tool_run_and_event(
         &self,
         session_id: SessionId,
@@ -1121,11 +1121,13 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ended_ms = now_ms();
-        // Preparation BEFORE enqueueing: the conflict diagnostic text.
+        // Preparation BEFORE enqueueing: the conflict diagnostic text and the
+        // session state expectation (the closure formats nothing).
         let not_running = format!("tool run {op_id} is not running");
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         self.writer
             .execute("finish_tool_run_and_event", move |conn| {
-                let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
+                let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
                 let changed = txn.tx.execute(
                     "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
              WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
@@ -1158,24 +1160,21 @@ impl Store {
     }
 
     /// Crash/abort terminalization as ONE transaction: move exactly ONE
-    /// still-running tool_run row to its terminal status/effect and append the
-    /// terminal event (`RecoveryApplied` / `ToolCancelled` by `event_kind`)
-    /// together, with the session re-verified in `state` before any write.
+    /// still-running tool_run row to its terminal status/effect, append the
+    /// terminal event (`RecoveryApplied` / `ToolCancelled` by `event_kind`) and
+    /// commit together, re-verifying the session in `state` before any write.
     ///
     /// `state` is both the expected pre-state and the event's landing state:
     /// the caller has already committed the state move (recovery commits
     /// `CrashDetected` onto the crash target; abort's first per-op command
     /// lands `Cancelled`), and each per-row command re-affirms it — a
-    /// self-transition is lawful and idempotent. Zero changed rows (unknown
-    /// or already finished) is the typed `Conflict`; the event is never
-    /// written without the row. This is the recovery sibling of
-    /// [`Store::finish_tool_run_and_event`]: recovery's pre-fix split of a
-    /// raw `finish_tool_run` plus a much later `transition_locked` could
-    /// leave a terminal tool row with no journal event that the scanner
-    /// never revisits.
-    ///
-    /// The event is stamped with the store clock and payload schema v1
-    /// (the schema every writer in this workspace currently stamps).
+    /// self-transition is lawful and idempotent. Zero changed rows (unknown or
+    /// already finished) is the typed `Conflict` and no event is written. This
+    /// is the recovery sibling of [`Store::finish_tool_run_and_event`]: the
+    /// former split of a raw `finish_tool_run` plus a much later
+    /// `transition_locked` could leave a terminal tool row with no journal
+    /// event that the scanner never revisits. The event is stamped with the
+    /// store clock and payload schema v1.
     #[allow(clippy::too_many_arguments)]
     pub fn finish_recovered_tool_run_and_event(
         &self,
@@ -1194,13 +1193,14 @@ impl Store {
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let state_json = serde_json::to_string(&state).unwrap();
         // Preparation BEFORE enqueueing: one timestamp for the row and the
-        // event, captured on the caller's thread (audit item 8), plus the
-        // conflict diagnostic text.
+        // event plus the conflict diagnostic text and the session state
+        // expectation, prepared on the caller's thread (audit item 8).
         let now = now_ms();
         let not_running = format!("recovered tool run {op_id} is not running");
+        let expectation = PreparedSessionStateExpectation::prepare(session_id, state);
         self.writer
             .execute("finish_recovered_tool_run_and_event", move |conn| {
-                let txn = SessionCommandTxn::begin(conn, &seam, session_id, state)?;
+                let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
                 let changed = txn.tx.execute(
                     "UPDATE tool_run SET status = ?3, effect_status = ?4, ended_ms = ?5
              WHERE session_id = ?1 AND op_id = ?2 AND status = 'running'",
