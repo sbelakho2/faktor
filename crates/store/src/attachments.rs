@@ -16,6 +16,42 @@ pub struct CasHashRef {
     pub hash: String,
 }
 
+/// Decode one `attachment` row (`digest, mime, filename, size` column order)
+/// into its typed identity. A bad digest or a negative size is a typed
+/// conversion failure, never a panic.
+fn row_to_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentId> {
+    let digest_raw: String = r.get(0)?;
+    let mime: String = r.get(1)?;
+    let filename: Option<String> = r.get(2)?;
+    let size: i64 = r.get(3)?;
+    let digest = faktor_core::hash::FileHash::from_hex(&digest_raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("attachment digest {digest_raw:?} is not 32-byte hex"),
+            )),
+        )
+    })?;
+    if size < 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("attachment size {size} is negative"),
+            )),
+        ));
+    }
+    Ok(AttachmentId {
+        digest,
+        mime,
+        filename,
+        size: size as u64,
+    })
+}
+
 impl Store {
     /// Artifact rows reference CAS hashes; the blob itself lives in the CAS.
     pub fn put_artifact(
@@ -60,12 +96,15 @@ impl Store {
 
     // -------------------------------------------------------------- attachments
 
-    /// Persist one binary/image attachment's typed metadata (schema v24).
-    /// Dedupe IS the primary key `(session_id, digest)`: an identical digest
-    /// is a no-op and the FIRST-written row is read back and returned, so
-    /// repeated uploads of the same bytes resolve to one byte-identical
-    /// `AttachmentId`. The caller (session layer) validates the id before
-    /// this write; the store only persists/reads the typed row.
+    /// Persist one binary/image attachment REFERENCE and return the durable
+    /// row matching its FULL metadata (`digest` + `mime` + `filename` +
+    /// `size`), never another reference's metadata. The CAS blob is keyed by
+    /// `digest` alone and may back many references; the surrogate row id is
+    /// internal (the metadata index is `(session_id, digest, mime,
+    /// COALESCE(filename,''), size)`). An exact-metadata re-upload is
+    /// idempotent and returns the SAME row. The caller (session layer)
+    /// validates the id before this write; the store only persists/reads the
+    /// typed row.
     pub fn put_attachment(
         &self,
         session_id: SessionId,
@@ -75,7 +114,7 @@ impl Store {
         self.writer.execute("put_attachment", move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     session_id.raw() as i64,
                     attachment.digest.to_hex(),
@@ -84,50 +123,88 @@ impl Store {
                     attachment.size as i64,
                 ],
             )?;
-            let stored = conn.query_row(
+            conn.query_row(
                 "SELECT digest, mime, filename, size FROM attachment
-             WHERE session_id = ?1 AND digest = ?2",
-                params![session_id.raw() as i64, attachment.digest.to_hex()],
-                |r| {
-                    let digest: String = r.get(0)?;
-                    let mime: String = r.get(1)?;
-                    let filename: Option<String> = r.get(2)?;
-                    let size: i64 = r.get(3)?;
-                    let digest =
-                        faktor_core::hash::FileHash::from_hex(&digest).ok_or_else(|| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("attachment digest {digest:?} is not 32-byte hex"),
-                                )),
-                            )
-                        })?;
-                    if size < 0 {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Integer,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("attachment size {size} is negative"),
-                            )),
-                        ));
-                    }
-                    Ok(AttachmentId {
-                        digest,
-                        mime,
-                        filename,
-                        size: size as u64,
-                    })
-                },
-            )?;
-            Ok(stored)
+                 WHERE session_id = ?1 AND digest = ?2 AND mime = ?3
+                   AND filename IS ?4 AND size = ?5
+                 ORDER BY id ASC LIMIT 1",
+                params![
+                    session_id.raw() as i64,
+                    attachment.digest.to_hex(),
+                    attachment.mime.as_str(),
+                    attachment.filename.as_deref(),
+                    attachment.size as i64,
+                ],
+                row_to_attachment,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::Corrupt(vec![format!(
+                    "attachment reference (session {session_id}, digest {}, mime {:?}, filename {:?}, size {}) not found after insert",
+                    attachment.digest, attachment.mime, attachment.filename, attachment.size
+                )])
+            })
         })
     }
 
-    /// Resolve one durable attachment row by its digest (restart-safe: reads
-    /// the typed metadata, never a process-local map).
+    /// Resolve the EXACT attachment reference: `Some` only when a row of THIS
+    /// session matches all of `digest` + `mime` + `filename` + `size`.
+    /// `None` covers both "no such digest" and "digest exists with other
+    /// metadata"; callers that must distinguish the two use
+    /// [`Self::attachments_by_digest`].
+    pub fn attachment_row(
+        &self,
+        session_id: SessionId,
+        attachment: &AttachmentId,
+    ) -> StoreResult<Option<AttachmentId>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT digest, mime, filename, size FROM attachment
+                 WHERE session_id = ?1 AND digest = ?2 AND mime = ?3
+                   AND filename IS ?4 AND size = ?5
+                 ORDER BY id ASC LIMIT 1",
+                params![
+                    session_id.raw() as i64,
+                    attachment.digest.to_hex(),
+                    attachment.mime.as_str(),
+                    attachment.filename.as_deref(),
+                    attachment.size as i64,
+                ],
+                row_to_attachment,
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// EVERY attachment reference of THIS session that shares one CAS blob
+    /// `digest`, in deterministic insert (`id`) order. The caller owns the
+    /// bound: this materializes the durable rows for one digest, so a trust
+    /// boundary should prefer the exact [`Self::attachment_row`] lookup and
+    /// use this only for existence/diagnostics (or a caller-side limit).
+    pub fn attachments_by_digest(
+        &self,
+        session_id: SessionId,
+        digest: faktor_core::hash::FileHash,
+    ) -> StoreResult<Vec<AttachmentId>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT digest, mime, filename, size FROM attachment
+             WHERE session_id = ?1 AND digest = ?2 ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, digest.to_hex()])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(row_to_attachment(r)?);
+        }
+        Ok(out)
+    }
+
+    /// Resolve ONE durable attachment row by digest (restart-safe: reads the
+    /// typed metadata, never a process-local map). When several references
+    /// share a blob the returned row is DETERMINISTIC: the lowest surrogate
+    /// id (the first-inserted reference). Callers needing a specific
+    /// reference use [`Self::attachment_row`].
     pub fn attachment(
         &self,
         session_id: SessionId,
@@ -137,48 +214,17 @@ impl Store {
         let out = conn
             .query_row(
                 "SELECT digest, mime, filename, size FROM attachment
-                 WHERE session_id = ?1 AND digest = ?2",
+                 WHERE session_id = ?1 AND digest = ?2
+                 ORDER BY id ASC LIMIT 1",
                 params![session_id.raw() as i64, digest.to_hex()],
-                |r| {
-                    let digest_raw: String = r.get(0)?;
-                    let mime: String = r.get(1)?;
-                    let filename: Option<String> = r.get(2)?;
-                    let size: i64 = r.get(3)?;
-                    let digest =
-                        faktor_core::hash::FileHash::from_hex(&digest_raw).ok_or_else(|| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("attachment digest {digest_raw:?} is not 32-byte hex"),
-                                )),
-                            )
-                        })?;
-                    if size < 0 {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Integer,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("attachment size {size} is negative"),
-                            )),
-                        ));
-                    }
-                    Ok(AttachmentId {
-                        digest,
-                        mime,
-                        filename,
-                        size: size as u64,
-                    })
-                },
+                row_to_attachment,
             )
             .optional()?;
         Ok(out)
     }
 
-    /// The session's durable attachment metadata, newest digest order (a
-    /// bounded, deterministic page: at most `limit` rows).
+    /// The session's durable attachment metadata, deterministic digest order
+    /// (ties broken by insert id), a bounded page of at most `limit` rows.
     pub fn list_attachments(
         &self,
         session_id: SessionId,
@@ -187,29 +233,12 @@ impl Store {
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT digest, mime, filename, size FROM attachment
-             WHERE session_id = ?1 ORDER BY digest ASC LIMIT ?2",
+             WHERE session_id = ?1 ORDER BY digest ASC, id ASC LIMIT ?2",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64, limit as i64])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            let digest_raw: String = r.get(0)?;
-            let Some(digest) = faktor_core::hash::FileHash::from_hex(&digest_raw) else {
-                return Err(StoreError::Corrupt(vec![format!(
-                    "attachment digest {digest_raw:?} is not 32-byte hex"
-                )]));
-            };
-            let size: i64 = r.get(3)?;
-            if size < 0 {
-                return Err(StoreError::Corrupt(vec![format!(
-                    "attachment size {size} is negative"
-                )]));
-            }
-            out.push(AttachmentId {
-                digest,
-                mime: r.get(1)?,
-                filename: r.get(2)?,
-                size: size as u64,
-            });
+            out.push(row_to_attachment(r)?);
         }
         Ok(out)
     }
@@ -308,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_attachment_rows_dedupe_by_digest_and_survive_reopen() {
+    fn attachment_references_are_keyed_by_full_metadata_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), true).unwrap();
         let ws = store.create_workspace("/w").unwrap();
@@ -316,27 +345,77 @@ mod tests {
         let ws2 = store.create_workspace("/w2").unwrap();
         let s2 = store.create_session(ws2, "other", "p", "m").unwrap();
         let digest = faktor_core::hash::FileHash::from([7; 32]);
-        let id = AttachmentId::new(digest, "image/png", Some("shot.png"), 123).unwrap();
-        let first = store.put_attachment(s1.id, &id).unwrap();
-        assert_eq!(first, id);
-        // Dedupe by digest: a second write of the same digest is a no-op and
-        // the FIRST row's metadata is authoritative (never rewritten).
-        let conflicting = AttachmentId::new(digest, "application/pdf", Some("other"), 123).unwrap();
-        assert_eq!(store.put_attachment(s1.id, &conflicting).unwrap(), first);
+        let png = AttachmentId::new(digest, "image/png", Some("shot.png"), 123).unwrap();
+        let first = store.put_attachment(s1.id, &png).unwrap();
+        assert_eq!(first, png);
+        // Identical bytes under a different MIME is a DISTINCT reference: it
+        // must keep its own metadata, never inherit the first row's.
+        let pdf = AttachmentId::new(digest, "application/pdf", Some("shot.png"), 123).unwrap();
+        let second = store.put_attachment(s1.id, &pdf).unwrap();
+        assert_eq!(second, pdf);
+        assert_ne!(second, first);
+        assert_eq!(second.mime, "application/pdf");
+        // Identical bytes under a different filename is a DISTINCT reference:
+        // a rename/re-select is repairable.
+        let renamed = AttachmentId::new(digest, "image/png", Some("renamed.png"), 123).unwrap();
+        let third = store.put_attachment(s1.id, &renamed).unwrap();
+        assert_eq!(third, renamed);
+        assert_ne!(third, first);
+        // An EXACT-metadata re-upload is the only dedupe: idempotent, returns
+        // the same reference.
+        assert_eq!(store.put_attachment(s1.id, &pdf).unwrap(), second);
+        assert_eq!(store.put_attachment(s1.id, &png).unwrap(), first);
+        // Exact lookup resolves each reference's OWN metadata.
+        assert_eq!(
+            store.attachment_row(s1.id, &png).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.attachment_row(s1.id, &pdf).unwrap(),
+            Some(second.clone())
+        );
+        assert_eq!(
+            store.attachment_row(s1.id, &renamed).unwrap(),
+            Some(third.clone())
+        );
+        // A digest-only lookup is deterministic: the lowest id (first insert).
         assert_eq!(
             store.attachment(s1.id, digest).unwrap(),
             Some(first.clone())
         );
+        // Every reference to the one blob, in insert order.
+        assert_eq!(
+            store.attachments_by_digest(s1.id, digest).unwrap(),
+            vec![first.clone(), second.clone(), third.clone()]
+        );
         assert_eq!(
             store.list_attachments(s1.id, 10).unwrap(),
-            vec![first.clone()]
+            vec![first.clone(), second.clone(), third.clone()],
+            "listing is deterministic when several references share a digest"
         );
-        // Session scope: another session never sees the row.
+        // A reference whose metadata is absent is None even when the digest
+        // exists (the distinct-from-absent distinction lives in the session
+        // layer).
+        let other_digest = faktor_core::hash::FileHash::from([8; 32]);
+        let absent = AttachmentId::new(other_digest, "image/png", Some("shot.png"), 123).unwrap();
+        assert_eq!(store.attachment_row(s1.id, &absent).unwrap(), None);
+        // Session scope: another session never sees any of the references.
         assert!(store.attachment(s2.id, digest).unwrap().is_none());
-        // Reopen: the typed row resolves identically from disk.
+        assert!(store
+            .attachments_by_digest(s2.id, digest)
+            .unwrap()
+            .is_empty());
+        // Reopen: every reference resolves identically from disk.
         drop(store);
         let store = Store::open(dir.path(), true).unwrap();
-        assert_eq!(store.attachment(s1.id, digest).unwrap(), Some(first));
+        assert_eq!(
+            store.attachment_row(s1.id, &pdf).unwrap(),
+            Some(second.clone())
+        );
+        assert_eq!(
+            store.attachments_by_digest(s1.id, digest).unwrap(),
+            vec![first, second, third]
+        );
     }
 
     #[test]

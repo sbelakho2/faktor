@@ -1353,6 +1353,8 @@ impl Store {
         record_id: VerificationRecordId,
         now: i64,
     ) -> StoreResult<std::result::Result<TaskRow, TaskCompletionRefusal>> {
+        // In-process constructed enum prepared BEFORE enqueueing.
+        let verified_complete_json = serde_json::to_string(&TaskState::VerifiedComplete).unwrap();
         self.writer.execute("task_complete_verified", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // The task's current base worktree: the session row (v8 identity).
@@ -1516,8 +1518,7 @@ impl Store {
                 params![
                     session_id.raw() as i64,
                     task_id.raw() as i64,
-                    // In-process constructed enum (see create_session).
-                    serde_json::to_string(&TaskState::VerifiedComplete).unwrap(),
+                    verified_complete_json,
                     new_revision.raw() as i64,
                     now,
                     expected_revision.raw() as i64

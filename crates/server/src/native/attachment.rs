@@ -5,8 +5,10 @@
 //!
 //! - Bytes are validated (mime/filename/size bounds), written to the CAS,
 //!   and persisted as a typed `AttachmentId { digest, mime, filename, size }`
-//!   row BEFORE any task admission; a repeated upload of identical bytes is
-//!   a dedupe hit returning the FIRST durable row byte-identically.
+//!   REFERENCE row BEFORE any task admission; an EXACT-metadata re-upload is
+//!   a dedupe hit returning that reference, while identical bytes under a
+//!   different mime/filename return their OWN distinct reference (a
+//!   rename/re-select is repairable, never silently inherited).
 //! - The upload body is bounded by [`MAX_ATTACHMENT_UPLOAD_BYTES`] so its
 //!   base64 form plus the JSON envelope stays under the daemon's 10 MiB
 //!   request cap (`crate::api::MAX_BODY_BYTES`). The session/CAS ceiling
@@ -355,7 +357,9 @@ fn parse_digest(raw: &str) -> Result<FileHash, ApiError> {
 }
 
 /// `POST /native/session/{id}/attachments` — upload ONE bounded attachment.
-/// Returns the durable typed [`AttachmentId`] (same bytes → same id).
+/// Returns the durable typed [`AttachmentId`] for THIS exact reference (same
+/// digest + mime + filename + size → same id; same bytes with other metadata
+/// → that metadata's own reference).
 pub(crate) async fn native_attachment_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -440,6 +444,9 @@ fn attachment_meta(id: &AttachmentId) -> serde_json::Value {
 
 /// `GET /native/session/{id}/attachments/{digest}` — resolve ONE durable
 /// attachment row by digest (restart-safe). Unknown digests are typed 404s.
+/// When several references share a blob the first-inserted (lowest-id)
+/// reference is the deterministic answer (an upload of the exact reference
+/// returns that reference directly).
 pub(crate) async fn native_attachment_get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -616,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_resolve_and_dedupe_roundtrip_over_the_wire() {
+    async fn upload_resolve_and_reference_identity_roundtrip_over_the_wire() {
         let dir = tempfile::tempdir().unwrap();
         let (state, handle) = test_state(dir.path());
         let sid = handle.id().to_string();
@@ -639,8 +646,10 @@ mod tests {
         let id: AttachmentId = serde_json::from_slice(&body).unwrap();
         assert_eq!(id.mime, "application/pdf");
         assert_eq!(id.size, 8);
-        // Dedupe by digest: identical bytes return the byte-identical row.
-        let again = native_attachment_upload(
+        // Identical bytes under a DIFFERENT filename return a distinct
+        // reference with its own metadata (the CAS blob is shared) — a
+        // rename/re-select is repairable, never silently inherited.
+        let renamed = native_attachment_upload(
             State(state.clone()),
             headers.clone(),
             Path(sid.clone()),
@@ -651,12 +660,32 @@ mod tests {
             ))),
         )
         .await;
+        let body = axum::body::to_bytes(renamed.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let renamed_id: AttachmentId = serde_json::from_slice(&body).unwrap();
+        assert_ne!(renamed_id, id, "metadata-distinct references are distinct");
+        assert_eq!(renamed_id.digest, id.digest, "the one CAS blob is shared");
+        assert_eq!(renamed_id.filename.as_deref(), Some("other.pdf"));
+        // An EXACT-metadata re-upload is the only dedupe hit.
+        let again = native_attachment_upload(
+            State(state.clone()),
+            headers.clone(),
+            Path(sid.clone()),
+            Ok(Json(upload(
+                "application/pdf",
+                Some("spec.pdf"),
+                b"%PDF-1.4",
+            ))),
+        )
+        .await;
         let body = axum::body::to_bytes(again.into_body(), 1 << 20)
             .await
             .unwrap();
         let deduped: AttachmentId = serde_json::from_slice(&body).unwrap();
         assert_eq!(deduped, id);
-        // Resolve metadata and bytes by digest.
+        // Resolve metadata and bytes by digest (the lowest-id reference is
+        // deterministic: the first upload).
         let meta = native_attachment_get(
             State(state.clone()),
             headers.clone(),

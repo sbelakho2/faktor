@@ -309,6 +309,9 @@ impl Store {
         // here, not on the writer owner.
         let created_payload_json =
             serde_json::json!({ "title": title, "provider": provider, "model": model }).to_string();
+        // In-process constructed enum: serialization of a unit variant can
+        // never fail, and it is prepared here rather than on the writer owner.
+        let idle_state_json = serde_json::to_string(&AgentState::Idle).unwrap();
         self.writer.execute("create_session", move |conn| {
         let now = now_ms();
         conn.execute(
@@ -319,9 +322,7 @@ impl Store {
                 title,
                 provider,
                 model,
-                // In-process constructed enum: serialization of a unit
-                // variant can never fail.
-                serde_json::to_string(&AgentState::Idle).unwrap(),
+                idle_state_json,
                 now
             ],
         )?;
@@ -437,30 +438,24 @@ impl Store {
         id: SessionId,
         lifecycle: faktor_core::state::SessionLifecycle,
     ) -> StoreResult<()> {
+        // In-process constructed enum prepared BEFORE enqueueing.
+        let lifecycle_json = serde_json::to_string(&lifecycle).unwrap();
         self.writer.execute("set_session_lifecycle", move |conn| {
             conn.execute(
                 "UPDATE session SET lifecycle = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![
-                    id.raw() as i64,
-                    // In-process constructed enum (see create_session).
-                    serde_json::to_string(&lifecycle).unwrap(),
-                    now_ms()
-                ],
+                params![id.raw() as i64, lifecycle_json, now_ms()],
             )?;
             Ok(())
         })
     }
 
     pub fn set_session_state(&self, id: SessionId, state: AgentState) -> StoreResult<()> {
+        // In-process constructed enum prepared BEFORE enqueueing.
+        let state_json = serde_json::to_string(&state).unwrap();
         self.writer.execute("set_session_state", move |conn| {
             conn.execute(
                 "UPDATE session SET state = ?2, updated_ms = ?3 WHERE id = ?1",
-                params![
-                    id.raw() as i64,
-                    // In-process constructed enum (see create_session).
-                    serde_json::to_string(&state).unwrap(),
-                    now_ms()
-                ],
+                params![id.raw() as i64, state_json, now_ms()],
             )?;
             Ok(())
         })
@@ -476,17 +471,14 @@ impl Store {
         expected: SessionLifecycle,
         new: SessionLifecycle,
     ) -> StoreResult<bool> {
+        // In-process constructed enums prepared BEFORE enqueueing.
+        let expected_json = serde_json::to_string(&expected).unwrap();
+        let new_json = serde_json::to_string(&new).unwrap();
         self.writer.execute("set_lifecycle_if", move |conn| {
             let n = conn.execute(
                 "UPDATE session SET lifecycle = ?3, updated_ms = ?4
              WHERE id = ?1 AND lifecycle = ?2",
-                params![
-                    id.raw() as i64,
-                    // In-process constructed enums (see create_session).
-                    serde_json::to_string(&expected).unwrap(),
-                    serde_json::to_string(&new).unwrap(),
-                    now_ms()
-                ],
+                params![id.raw() as i64, expected_json, new_json, now_ms()],
             )?;
             Ok(n > 0)
         })
@@ -522,8 +514,14 @@ impl Store {
         op_id: Option<OpId>,
         t: SessionTransition,
     ) -> StoreResult<EventSeq> {
-        // Preparation BEFORE enqueueing: event payload JSON serialization.
+        // Preparation BEFORE enqueueing: event payload JSON serialization and
+        // the in-process enum strings the transaction writes.
         let transition_payload_json = t.event_payload.as_ref().map(|p| p.to_string());
+        let state_json = serde_json::to_string(&t.new_state).unwrap();
+        let new_lifecycle_json = t
+            .new_lifecycle
+            .as_ref()
+            .map(|l| serde_json::to_string(l).unwrap());
         self.writer.execute("transition_session", move |conn| {
             let tx = conn.unchecked_transaction()?;
             // (a) read the session row inside the transaction.
@@ -551,19 +549,12 @@ impl Store {
             }
             // (c) update lifecycle+state+updated_ms.
             let now = now_ms();
-            // In-process constructed enums (see create_session).
-            let state_json = serde_json::to_string(&t.new_state).unwrap();
-            match t.new_lifecycle {
-                Some(lifecycle) => {
+            // In-process constructed enums prepared on the caller's thread.
+            match new_lifecycle_json {
+                Some(lifecycle_json) => {
                     tx.execute(
                     "UPDATE session SET lifecycle = ?2, state = ?3, updated_ms = ?4 WHERE id = ?1",
-                    params![
-                        session_id.raw() as i64,
-                        // In-process constructed enum (see create_session).
-                        serde_json::to_string(&lifecycle).unwrap(),
-                        state_json,
-                        now
-                    ],
+                    params![session_id.raw() as i64, lifecycle_json, state_json, now],
                 )?;
                 }
                 None => {
@@ -931,6 +922,19 @@ impl Store {
         let before_hash = before_hash.to_owned();
         let after_hash = after_hash.to_owned();
         let after_cas_hash = after_cas_hash.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: every statically known field is
+        // serialized here. The transaction-allocated `sequence` is patched
+        // into this template by SQLite inside the SQL-only closure, so the
+        // owner thread never runs serde.
+        let checkpoint_payload_template = serde_json::json!({
+            "sequence": 0,
+            "path": path,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "before_exists": before_exists,
+            "after_exists": after_exists,
+        })
+        .to_string();
         self.writer.execute("insert_checkpoint_and_event", move |conn| {
         let txn = SessionCommandTxn::begin(conn, &seam, session_id, expected_state)?;
         let prev: i64 = txn.tx.query_row(
@@ -969,19 +973,13 @@ impl Store {
             EventKind::CheckpointCreated,
             expected_state,
             ts,
-            // `sequence` is allocated by the transaction, so this payload
-            // can only be serialized inside it (documented exception).
-            Some(
-                serde_json::json!({
-                    "sequence": sequence,
-                    "path": path,
-                    "before_hash": before_hash,
-                    "after_hash": after_hash,
-                    "before_exists": before_exists,
-                    "after_exists": after_exists,
-                })
-                .to_string(),
-            ),
+            // `sequence` is allocated by the transaction; patch the
+            // caller-prepared template with it using SQLite (SQL-only).
+            Some(txn.tx.query_row(
+                "SELECT json_set(?1, '$.sequence', ?2)",
+                params![checkpoint_payload_template, sequence],
+                |r| r.get(0),
+            )?),
             1,
         )?;
         txn.precommit();

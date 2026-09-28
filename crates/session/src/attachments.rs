@@ -5,12 +5,14 @@
 //! - `put_attachment` validates the mime/filename/size bounds BEFORE hashing
 //!   or writing anything, streams the bytes into the CAS (content-addressed,
 //!   dedupe + corruption detection come from the CAS), then persists one
-//!   typed metadata row keyed `(session_id, digest)`.
-//! - Dedupe by digest: an identical payload resolves to the FIRST-written
-//!   metadata row — repeated uploads are idempotent and return a
-//!   byte-identical [`AttachmentId`].
-//! - `attachment`/`list_attachments` resolve the durable rows after a
-//!   restart (never a process-local map); `attachment_bytes` re-verifies the
+//!   typed REFERENCE row keyed by the FULL metadata
+//!   `(session_id, digest, mime, filename, size)`.
+//! - Dedupe is by reference, never by digest alone: the same blob may back
+//!   several references with distinct metadata, and only an EXACT-metadata
+//!   re-upload is idempotent.
+//! - `attachment`/`attachment_row`/`attachments_by_digest`/
+//!   `list_attachments` resolve the durable rows after a restart (never a
+//!   process-local map); `attachment_bytes` re-verifies the
 //!   CAS blob and refuses a metadata/blob size mismatch.
 //!
 //! The attachment is deliberately SEPARATE from the workspace-relative
@@ -47,9 +49,11 @@ pub struct ResolvedAttachment {
 
 impl SessionHandle {
     /// Store a bounded attachment: validate bounds/shape, put the bytes into
-    /// the CAS, persist the typed metadata row. Returns the (possibly
-    /// pre-existing) canonical [`AttachmentId`]. Hostile mime/filename shapes
-    /// and oversized payloads are typed refusals before any write.
+    /// the CAS, persist the typed REFERENCE row. Returns the durable row for
+    /// THIS exact reference (a pre-existing row only when the full metadata
+    /// matches; identical bytes under different metadata return their own
+    /// distinct reference). Hostile mime/filename shapes and oversized
+    /// payloads are typed refusals before any write.
     pub fn put_attachment(
         &self,
         mime: &str,
@@ -123,6 +127,9 @@ impl SessionHandle {
     }
 
     /// Resolve one durable attachment row by its digest (restart-safe).
+    /// When several references share a blob the first-inserted (lowest-id)
+    /// reference is returned deterministically; use `resolve_attachments`
+    /// for an exact-reference check.
     pub fn attachment(&self, digest: FileHash) -> faktor_core::Result<Option<AttachmentId>> {
         self.manager
             .store()
@@ -174,9 +181,12 @@ impl SessionHandle {
     /// Resolve and validate one attachment SET at admission time: the count
     /// is bounded by [`MAX_ATTACHMENTS_PER_TASK`], every id is structurally
     /// validated (hostile mime/filename/size are typed refusals), and every
-    /// digest must resolve to a byte-identical durable row of THIS session.
-    /// Admission never fabricates an attachment: an unknown digest is a
-    /// typed `NotFound`, a mismatched durable row a typed `Malformed`.
+    /// id must resolve to the EXACT durable reference of THIS session
+    /// (`digest` + `mime` + `filename` + `size`). Admission never fabricates
+    /// an attachment: an absent digest is a typed `NotFound`, while a digest
+    /// that exists under DIFFERENT metadata is a typed `Malformed` (a request
+    /// can never borrow another reference's metadata merely because the
+    /// bytes match).
     ///
     /// Media policy lives ABOVE this layer: provider admission validates the
     /// image mime/size against the chosen model's capabilities, and request
@@ -191,29 +201,47 @@ impl SessionHandle {
                 ),
             ));
         }
+        let store = self.manager.store();
         for id in ids {
             id.validate()?;
-            match self.attachment(id.digest)? {
-                Some(stored) if stored == *id => {}
-                Some(stored) => {
-                    return Err(Error::new(
-                        ErrorKind::Malformed,
-                        format!(
-                            "attachment {} does not match the durable row (requested {} bytes / {} mime, stored {} bytes / {} mime)",
-                            id.digest, id.size, id.mime, stored.size, stored.mime
-                        ),
-                    ));
-                }
-                None => {
-                    return Err(Error::new(
-                        ErrorKind::NotFound,
-                        format!(
-                            "attachment {} is not stored in session {}",
-                            id.digest, self.id
-                        ),
-                    ));
-                }
+            if store
+                .attachment_row(self.id, id)
+                .map_err(crate::map_store_err)?
+                .is_some()
+            {
+                continue;
             }
+            // The exact reference missed: distinguish "no such blob in this
+            // session" from "blob exists under different metadata" with the
+            // deterministic SINGLE-row lookup. Never materialize the whole
+            // reference set just for a diagnostic (the same blob may back an
+            // unbounded number of references).
+            let Some(stored) = store
+                .attachment(self.id, id.digest)
+                .map_err(crate::map_store_err)?
+            else {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "attachment {} is not stored in session {}",
+                        id.digest, self.id
+                    ),
+                ));
+            };
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                format!(
+                    "attachment {} does not match any durable reference in session {} (requested {} bytes / {} mime / {:?} filename, stored {} bytes / {} mime / {:?} filename)",
+                    id.digest,
+                    self.id,
+                    id.size,
+                    id.mime,
+                    id.filename,
+                    stored.size,
+                    stored.mime,
+                    stored.filename
+                ),
+            ));
         }
         Ok(())
     }
@@ -309,7 +337,7 @@ mod tests {
     use crate::SessionManager;
 
     #[test]
-    fn upload_is_durable_typed_deduped_and_survives_reopen() {
+    fn upload_is_durable_metadata_keyed_and_survives_reopen() {
         let (dir, m) = test_manager();
         let s = session(&m);
         let bytes = b"durable attachment bytes".to_vec();
@@ -319,20 +347,44 @@ mod tests {
         assert_eq!(first.mime, "image/png", "mime is canonicalized");
         assert_eq!(first.size, bytes.len() as u64);
         assert!(first.is_image());
-        // Dedupe by digest: same bytes (even with different metadata) return
-        // the FIRST durable row byte-identically.
+        // Identical bytes under a DIFFERENT mime+filename are a distinct
+        // reference: they must never inherit the first row's metadata.
         let again = s
             .put_attachment("application/pdf", Some("other.pdf"), &bytes)
             .unwrap();
-        assert_eq!(again, first, "dedupe by digest returns the stored id");
-        assert_eq!(s.list_attachments(16).unwrap(), vec![first.clone()]);
-        // Bytes resolve from the CAS.
+        assert_ne!(again, first, "metadata-distinct references are distinct");
+        assert_eq!(again.digest, first.digest, "they share the one CAS blob");
+        assert_eq!(again.mime, "application/pdf");
+        assert_eq!(again.filename.as_deref(), Some("other.pdf"));
+        // An EXACT reference re-upload is the only dedupe (idempotent).
+        let exact = s
+            .put_attachment("image/png", Some("shot.png"), &bytes)
+            .unwrap();
+        assert_eq!(exact, first, "exact metadata dedupes to the same reference");
+        assert_eq!(
+            s.list_attachments(16).unwrap(),
+            vec![first.clone(), again.clone()]
+        );
+        // Exact resolution per reference; both resolve the shared CAS bytes.
+        s.resolve_attachments(&[first.clone(), again.clone()])
+            .unwrap();
         assert_eq!(s.attachment_bytes(&first, 1 << 20).unwrap(), bytes);
+        assert_eq!(s.attachment_bytes(&again, 1 << 20).unwrap(), bytes);
+        // A digest that exists under DIFFERENT metadata is Malformed, never
+        // silently accepted as some other stored reference.
+        let renamed = AttachmentId {
+            filename: Some("renamed.pdf".into()),
+            ..again.clone()
+        };
+        assert_eq!(
+            s.resolve_attachments(&[renamed]).unwrap_err().kind,
+            faktor_core::ErrorKind::Malformed
+        );
         // Bounded reads refuse before I/O.
         let err = s.attachment_bytes(&first, 4).unwrap_err();
         assert_eq!(err.kind, faktor_core::ErrorKind::Oversized);
 
-        // Reopen the REAL store/cas from disk: the typed row resolves
+        // Reopen the REAL store/cas from disk: every reference resolves
         // identically and the bytes still verify.
         drop(s);
         drop(m);
@@ -343,8 +395,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(h.attachment(first.digest).unwrap(), Some(first.clone()));
-        assert_eq!(h.list_attachments(16).unwrap(), vec![first.clone()]);
+        assert_eq!(
+            h.list_attachments(16).unwrap(),
+            vec![first.clone(), again.clone()]
+        );
         assert_eq!(h.attachment_bytes(&first, 1 << 20).unwrap(), bytes);
+        assert_eq!(h.attachment_bytes(&again, 1 << 20).unwrap(), bytes);
         // An unknown digest is an honest absence, never a phantom.
         assert_eq!(h.attachment(FileHash::from([9; 32])).unwrap(), None);
     }

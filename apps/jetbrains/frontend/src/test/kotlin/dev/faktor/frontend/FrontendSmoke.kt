@@ -1906,10 +1906,13 @@ object FrontendSmoke {
             assertEquals(null, retry.reusable("9", "k1"), "the oldest pending upload was evicted")
         }
 
-        // Audit 9/10: the path-attachment retry identity is the ACTUAL byte
-        // digest (kind + mime + SHA-256(bytes)); path/length/mtime are
-        // metadata only, so same-size same-mtime different bytes upload fresh.
-        step("path attachment identity is the byte digest, never path+size+mtime") {
+        // Audit 9/10 + attachment-reference identity: the retry identity is
+        // kind + mime + FILENAME + byte digest. Path/length/mtime are
+        // metadata only, so same-size same-mtime different bytes upload
+        // fresh; identical bytes under a different filename are a DIFFERENT
+        // reference and also upload fresh, while the same reference at
+        // another path keeps its id.
+        step("path attachment identity is kind+mime+filename+byte digest, never path or mtime") {
             val dir = Files.createTempDirectory("faktor-attach-identity-")
             val file = Paths.get(dir.toString(), "doc.txt")
             val bytesA = "AAAA".toByteArray()
@@ -1929,17 +1932,34 @@ object FrontendSmoke {
                 keyA != keyB,
                 "same-size same-mtime changed bytes must not reuse the old identity"
             )
-            // Identical bytes at a different path/time keep the SAME identity.
-            val twin = Paths.get(dir.toString(), "twin.txt")
+            // Identical bytes AND the same filename at another path/time keep
+            // the SAME reference identity.
+            val otherDir = Files.createDirectory(Paths.get(dir.toString(), "other"))
+            val twin = Paths.get(otherDir.toString(), "doc.txt")
             Files.write(twin, bytesB)
             twin.toFile().setLastModified(stamp + 1)
             val keyTwin = planAttachments(listOf(twin.toString()), emptyList(), policy)
                 .uploads.single().key
-            assertEquals(keyB, keyTwin, "identity is content, not path or mtime")
-            // The identity is exactly kind:mime:sha256(bytes); path never appears.
+            assertEquals(keyB, keyTwin, "identity is content+filename, not path or mtime")
+            // Identical bytes under a DIFFERENT filename is a distinct
+            // reference: a rename/re-select must upload fresh.
+            val renamed = Paths.get(otherDir.toString(), "renamed.txt")
+            Files.write(renamed, bytesB)
+            val keyRenamed = planAttachments(listOf(renamed.toString()), emptyList(), policy)
+                .uploads.single().key
+            assertTrue(
+                keyB != keyRenamed,
+                "identical bytes under a different filename must be a fresh reference"
+            )
+            // The identity is exactly kind:mime:name=<filename>:sha=<digest>;
+            // the PATH never appears.
             val digestHex = java.security.MessageDigest.getInstance("SHA-256")
                 .digest(bytesB).joinToString("") { "%02x".format(it.toInt() and 0xff) }
-            assertEquals("document:text/plain:$digestHex", keyB, "the retry key shape")
+            assertEquals(
+                "document:text/plain:name=doc.txt:sha=$digestHex",
+                keyB,
+                "the retry key shape"
+            )
             assertTrue(!keyB.contains(file.toString()), "the path stays metadata only")
         }
 

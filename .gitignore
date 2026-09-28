@@ -15,6 +15,11 @@ fuzz/Cargo.lock
 # OS core dumps (crash artifacts; never source)
 core
 core.*
+# Explicit source exception: the `config` module's core slice is real source
+# (`crates/cli/src/config.rs` declares `mod core;`). Without this negation the
+# `core.*` dump rule silently drops it and the CLI no longer compiles from a
+# clean checkout.
+!crates/cli/src/config/core.rs
 
 # Python bytecode from test mock servers (never source; the .py source is the
 # committed fixture). Enforced by the repository-hygiene scan in

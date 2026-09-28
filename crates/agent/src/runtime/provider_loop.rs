@@ -192,10 +192,17 @@ impl StreamingSummarizer {
     ///   - the bounded deadline marks the run FAILED;
     ///   - turn cancellation marks the run FAILED.
     ///
-    /// Any status other than Complete discards EVERY accumulated character
-    /// below and returns `None` — a truncated summary is small, so it would
-    /// slip under the compactor's hard cap and replace the real history
-    /// with a partial state transfer.
+    /// The size cap is a REFUSAL, never a completion: a chunk that would
+    /// push the accumulated text past `SUMMARY_MAX_CHARS` marks the run
+    /// oversized and it is refused exactly like a failed stream. The cap
+    /// is checked BEFORE appending, so an oversized buffer is never
+    /// constructed and a truncated prefix of a still-streaming summary is
+    /// never accepted.
+    ///
+    /// Any status other than Complete (and any oversized run) discards
+    /// EVERY accumulated character below and returns `None` — a truncated
+    /// summary is small, so it would slip under the compactor's hard cap
+    /// and replace the real history with a partial state transfer.
     pub(crate) async fn run(&self, history: &[faktor_context::RecentTurn]) -> Option<String> {
         use futures::StreamExt as _;
         const SUMMARY_MAX_CHARS: usize = 60_000;
@@ -254,6 +261,9 @@ impl StreamingSummarizer {
         let mut stream = self.provider.stream(request);
         let mut text = String::new();
         let mut complete = false;
+        // The size cap is NOT a completion: exceeding it refuses the whole
+        // run (see the completion protocol above).
+        let mut oversized = false;
         let deadline = tokio::time::timeout(self.summary_timeout, async {
             let mut cancel_ticks = tokio::time::interval(CANCEL_POLL_INTERVAL);
             loop {
@@ -268,13 +278,13 @@ impl StreamingSummarizer {
                         match chunk {
                             Some(Ok(ProviderChunk::Text { text: t }))
                             | Some(Ok(ProviderChunk::Reasoning { text: t })) => {
-                                text.push_str(&t);
-                                if text.len() > SUMMARY_MAX_CHARS {
-                                    // Bounded stop: the cap is the bound of
-                                    // what we would accept anyway.
-                                    complete = true;
+                                // Capacity is checked BEFORE appending so an
+                                // oversized accepted buffer is never built.
+                                if t.len() > SUMMARY_MAX_CHARS.saturating_sub(text.len()) {
+                                    oversized = true;
                                     return;
                                 }
+                                text.push_str(&t);
                             }
                             Some(Ok(ProviderChunk::Done)) => {
                                 // Clean end: the ONLY unconditional Complete.
@@ -298,10 +308,9 @@ impl StreamingSummarizer {
         // On timeout the inner future is dropped mid-stream with `complete`
         // still false: FAILED, every accumulated character discarded below.
         let _ = deadline.await;
-        if !complete || text.is_empty() {
+        if !complete || oversized || text.is_empty() {
             return None;
         }
-        text.truncate(SUMMARY_MAX_CHARS);
         // Audit item 3: capture the ACCEPTED summary as a typed
         // context-compression output (raw text + trust + durable call id)
         // so the compaction site can record its provenance. Nothing was

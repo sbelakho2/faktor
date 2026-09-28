@@ -3391,6 +3391,108 @@ async function pendingSubmissionTests() {
     assertEqual(matchingOutcome.attachmentIds[0], 'b'.repeat(64));
   });
 
+  await test('retry identity includes filename and size and ignores array position', async () => {
+    // Same bytes and mime, different filename or declared size: a
+    // rename/re-select is a different reference and must force a fresh
+    // upload; an unchanged reference is position-independent.
+    const named = binaryAttachment({ filename: 'spec.pdf' });
+    const renamed = binaryAttachment({ filename: 'renamed.pdf' });
+    const resized = binaryAttachment({ filename: 'spec.pdf', bytes: 4 });
+    const moved = binaryAttachment({ filename: 'spec.pdf' });
+    assert(
+      ts.pendingAttachmentContentDigest(named) !== ts.pendingAttachmentContentDigest(renamed),
+      'a changed filename must change the retry identity',
+    );
+    assert(
+      ts.pendingAttachmentContentDigest(named) !== ts.pendingAttachmentContentDigest(resized),
+      'a changed declared size must change the retry identity',
+    );
+    assertEqual(
+      ts.pendingAttachmentContentDigest(named),
+      ts.pendingAttachmentContentDigest(moved),
+      'the same exact reference is position-independent',
+    );
+
+    const retainer = new ts.PendingSubmissionRetainer();
+    const envelope = (messageId, attachments) =>
+      ts.parsePendingSubmission({
+        text: 'ship it',
+        sessionId: '7',
+        messageId,
+        draftId: null,
+        files: [],
+        attachments,
+      });
+    const before = envelope('rename-draft', [named]);
+    retainer.retain(
+      ts.withPendingUpload(before, 0, {
+        sessionId: '7',
+        contentDigest: ts.pendingAttachmentContentDigest(before.attachments[0]),
+        attachment: {
+          digest: 'a'.repeat(64),
+          mime: named.mime,
+          filename: named.filename,
+          size: 3,
+        },
+      }),
+    );
+    assertEqual(
+      retainer.restore(envelope('rename-draft', [renamed])).attachments[0].uploaded,
+      undefined,
+      'a renamed file under the same draft identity must not reuse the old id',
+    );
+    assertEqual(
+      retainer.restore(envelope('rename-draft', [moved])).attachments[0].uploaded.attachment.digest,
+      'a'.repeat(64),
+      'the unchanged reference reuses the retained id',
+    );
+
+    // Order-only changes keep every reference's id: two attachments that
+    // swap positions still match their retained records by the full digest.
+    const firstRef = binaryAttachment({
+      filename: 'one.pdf',
+      dataBase64: Buffer.from('ONE').toString('base64'),
+    });
+    const secondRef = binaryAttachment({
+      mime: 'text/plain',
+      filename: 'two.txt',
+      dataBase64: Buffer.from('TWO').toString('base64'),
+    });
+    const pair = envelope('order-draft', [firstRef, secondRef]);
+    let withUploads = ts.withPendingUpload(pair, 0, {
+      sessionId: '7',
+      contentDigest: ts.pendingAttachmentContentDigest(firstRef),
+      attachment: {
+        digest: '1'.repeat(64),
+        mime: firstRef.mime,
+        filename: firstRef.filename,
+        size: 3,
+      },
+    });
+    withUploads = ts.withPendingUpload(withUploads, 1, {
+      sessionId: '7',
+      contentDigest: ts.pendingAttachmentContentDigest(secondRef),
+      attachment: {
+        digest: '2'.repeat(64),
+        mime: secondRef.mime,
+        filename: secondRef.filename,
+        size: 3,
+      },
+    });
+    retainer.retain(withUploads);
+    const restored = retainer.restore(envelope('order-draft', [secondRef, firstRef]));
+    assertEqual(
+      restored.attachments[0].uploaded.attachment.digest,
+      '2'.repeat(64),
+      'the reordered second reference keeps its own id',
+    );
+    assertEqual(
+      restored.attachments[1].uploaded.attachment.digest,
+      '1'.repeat(64),
+      'the reordered first reference keeps its own id',
+    );
+  });
+
   await test('documents upload as durable attachments when the advertised model supports them', async () => {
     const calls = [];
     const client = {

@@ -711,11 +711,13 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // v24 — durable binary/image attachments (schema target 25; array index
     // 24). ONE row per `(session_id, digest)`: the CAS address of the bytes
     // plus the typed metadata `AttachmentId { digest, mime, filename, size }`.
-    // Dedupe IS the primary key: an identical digest resolves to the row's
-    // first-written metadata (the write path is `INSERT OR IGNORE` + read
-    // back). The `task.attachments` column carries the per-task typed list
-    // (bounded JSON; `'[]'` for every pre-v24 row), SEPARATE from the
-    // workspace-relative `files`/`plan` vocabulary.
+    // NOTE: the digest-only primary key was the attachment-identity bug the
+    // v25 rebuild below fixes (identical bytes under a different MIME/
+    // filename inherited the first row's metadata); this block stays as the
+    // historical shape a pre-v25 database carries. The `task.attachments`
+    // column carries the per-task typed list (bounded JSON; `'[]'` for every
+    // pre-v24 row), SEPARATE from the workspace-relative `files`/`plan`
+    // vocabulary.
     "CREATE TABLE IF NOT EXISTS attachment (
         session_id INTEGER NOT NULL REFERENCES session(id),
         digest TEXT NOT NULL,
@@ -725,6 +727,35 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (session_id, digest)
      );
      ALTER TABLE task ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';",
+    // v25 — attachment-reference identity (schema target 26; array index 25).
+    // The v24 table keyed `(session_id, digest)`, so identical bytes under a
+    // different MIME/filename silently inherited the FIRST row's metadata and
+    // a fresh upload could never repair it. CAS content-addressing stays: the
+    // blob is keyed by `digest` and one blob may back MANY attachment
+    // references with distinct legitimate metadata. The row is now a
+    // SURROGATE id plus a metadata-uniqueness index over
+    // `(session_id, digest, mime, COALESCE(filename,''), size)` — the
+    // COALESCE expression index is required because SQLite UNIQUE treats
+    // NULLs as distinct, so two no-filename rows with identical metadata
+    // would otherwise both live. Pre-v25 rows are preserved: the table is
+    // rebuilt (create new, INSERT ... SELECT, drop old, rename) so every
+    // existing reference survives with a new surrogate id.
+    "ALTER TABLE attachment RENAME TO attachment_v24;
+     CREATE TABLE attachment (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        digest TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        filename TEXT,
+        size INTEGER NOT NULL
+     );
+     INSERT INTO attachment (session_id, digest, mime, filename, size)
+        SELECT session_id, digest, mime, filename, size FROM attachment_v24;
+     DROP TABLE attachment_v24;
+     CREATE UNIQUE INDEX IF NOT EXISTS idx_attachment_reference
+        ON attachment(session_id, digest, mime, COALESCE(filename, ''), size);
+     CREATE INDEX IF NOT EXISTS idx_attachment_blob_order
+        ON attachment(session_id, digest, id);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

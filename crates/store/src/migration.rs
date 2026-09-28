@@ -2164,6 +2164,71 @@ mod tests {
     }
 
     #[test]
+    fn migration_v25_rebuilds_attachment_references_and_preserves_rows() {
+        // A pre-v25 database carries the digest-keyed attachment table. Seed
+        // one row in that exact shape, rewind the cursor, and reopen: the
+        // rebuild must preserve the row and let a metadata-distinct reference
+        // for the SAME blob coexist afterwards.
+        let dir = tempfile::tempdir().unwrap();
+        let digest = faktor_core::hash::FileHash::from([7; 32]);
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "att", "p", "m").unwrap();
+            {
+                let conn = store.raw_conn();
+                conn.execute("DROP TABLE attachment", []).unwrap();
+                conn.execute(
+                    "CREATE TABLE attachment (
+                        session_id INTEGER NOT NULL REFERENCES session(id),
+                        digest TEXT NOT NULL,
+                        mime TEXT NOT NULL,
+                        filename TEXT,
+                        size INTEGER NOT NULL,
+                        PRIMARY KEY (session_id, digest)
+                     )",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO attachment(session_id, digest, mime, filename, size)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        s.id.raw() as i64,
+                        digest.to_hex(),
+                        "image/png",
+                        "shot.png",
+                        123i64
+                    ],
+                )
+                .unwrap();
+                conn.execute("PRAGMA user_version = 25", []).unwrap();
+            }
+            s.id
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        let seeded = AttachmentId::new(digest, "image/png", Some("shot.png"), 123).unwrap();
+        // The pre-v25 row survived the rebuild with its exact metadata.
+        assert_eq!(
+            store.attachment_row(sid, &seeded).unwrap(),
+            Some(seeded.clone()),
+            "the pre-v25 reference must survive the rebuild"
+        );
+        assert_eq!(store.attachment(sid, digest).unwrap(), Some(seeded.clone()));
+        // A metadata-distinct reference to the SAME blob now coexists.
+        let other = AttachmentId::new(digest, "application/pdf", Some("other.pdf"), 123).unwrap();
+        assert_eq!(store.put_attachment(sid, &other).unwrap(), other);
+        assert_eq!(
+            store.attachments_by_digest(sid, digest).unwrap(),
+            vec![seeded, other]
+        );
+        // Reopen again: both references and the new index are durable.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.attachments_by_digest(sid, digest).unwrap().len(), 2);
+    }
+
+    #[test]
     fn fast_open_recovers_migrations_and_data_and_refuses_corruption() {
         // Audit 43: the fast production open must still run WAL recovery +
         // migrations and refuse a corrupt store — it just skips the full
