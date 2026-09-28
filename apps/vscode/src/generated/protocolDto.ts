@@ -260,6 +260,15 @@ export interface ProtocolAttachmentId {
   readonly size: number;
 }
 
+/** One durable attachment REFERENCE (native additive-response contract): the surrogate reference id the retrieval routes address, plus the CAS digest and the exact presentation metadata (mime, optional filename, decompressed size). Decoders ignore unknown fields. (unknown_fields: ignore) */
+export interface ProtocolAttachmentRef {
+  readonly ref_id: number;
+  readonly digest: string;
+  readonly mime: string;
+  readonly filename: string | null;
+  readonly size: number;
+}
+
 /** Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime. (unknown_fields: reject) */
 export interface ProtocolAttachmentUpload {
   readonly mime: string;
@@ -479,6 +488,21 @@ export function validateProtocolAttachmentId(value: ProtocolJson, path = "Protoc
     dtoRequired(object, key, path);
   }
   return {
+    digest: dtoString(object, "digest", path),
+    mime: dtoString(object, "mime", path),
+    filename: dtoNullableString(object, "filename", path),
+    size: dtoI64(object, "size", path),
+  };
+}
+
+export function validateProtocolAttachmentRef(value: ProtocolJson, path = "ProtocolAttachmentRef"): ProtocolAttachmentRef {
+  const object = dtoObject(value, path);
+  const required = ["ref_id","digest","mime","filename","size"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    ref_id: dtoI64(object, "ref_id", path),
     digest: dtoString(object, "digest", path),
     mime: dtoString(object, "mime", path),
     filename: dtoNullableString(object, "filename", path),

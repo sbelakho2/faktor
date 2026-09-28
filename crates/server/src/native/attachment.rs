@@ -1,11 +1,13 @@
 //! Native binary-attachment surface (additive, strict): upload ONE
 //! `data_base64` payload into the session's durable CAS-backed attachment
-//! store, resolve it by digest (metadata and bytes), and the ONE wire
-//! admission rule every task-start DTO uses.
+//! store, resolve one REFERENCE by its surrogate `ref_id` (metadata and its
+//! own MIME-tagged bytes), resolve one BLOB by digest (raw octet-stream
+//! bytes), and the ONE wire admission rule every task-start DTO uses.
 //!
 //! - Bytes are validated (mime/filename/size bounds), written to the CAS,
 //!   and persisted as a typed `AttachmentId { digest, mime, filename, size }`
-//!   REFERENCE row BEFORE any task admission; an EXACT-metadata re-upload is
+//!   REFERENCE row BEFORE any task admission; the response carries the
+//!   reference's stable `ref_id` (additive). An EXACT-metadata re-upload is
 //!   a dedupe hit returning that reference, while identical bytes under a
 //!   different mime/filename return their OWN distinct reference (a
 //!   rename/re-select is repairable, never silently inherited).
@@ -357,9 +359,10 @@ fn parse_digest(raw: &str) -> Result<FileHash, ApiError> {
 }
 
 /// `POST /native/session/{id}/attachments` — upload ONE bounded attachment.
-/// Returns the durable typed [`AttachmentId`] for THIS exact reference (same
-/// digest + mime + filename + size → same id; same bytes with other metadata
-/// → that metadata's own reference).
+/// Returns the durable typed reference (`ref_id` plus `digest`/`mime`/
+/// `filename`/`size`) for THIS exact reference (same digest + mime +
+/// filename + size → same ref id; same bytes with other metadata → that
+/// metadata's own reference with its own ref id).
 pub(crate) async fn native_attachment_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -424,7 +427,7 @@ pub(crate) async fn native_attachment_upload(
             retryable: false,
         });
     }
-    match handle.put_attachment(&mime, upload.filename.as_deref(), &bytes) {
+    match handle.put_attachment_ref(&mime, upload.filename.as_deref(), &bytes) {
         Ok(stored) => {
             Json(serde_json::to_value(&stored).unwrap_or(serde_json::Value::Null)).into_response()
         }
@@ -432,50 +435,137 @@ pub(crate) async fn native_attachment_upload(
     }
 }
 
-/// The metadata projection of one resolved attachment (no bytes).
-fn attachment_meta(id: &AttachmentId) -> serde_json::Value {
-    serde_json::json!({
-        "digest": id.digest.to_hex(),
-        "mime": id.mime,
-        "filename": id.filename,
-        "size": id.size,
+/// Parse one attachment REFERENCE path segment strictly: a decimal row id
+/// (`u64`). Reference routes are id-addressed because one CAS blob may back
+/// several references with distinct metadata.
+fn parse_ref_id(raw: &str) -> Result<u64, ApiError> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError {
+            code: "malformed",
+            message: format!(
+                "{raw:?} is not a decimal attachment ref id; address a blob's bytes with /attachments/blob/{{digest}}/bytes"
+            ),
+            http_status: 400,
+            retryable: false,
+        });
+    }
+    raw.parse::<u64>().map_err(|_| ApiError {
+        code: "malformed",
+        message: format!("{raw:?} is not a decimal attachment ref id"),
+        http_status: 400,
+        retryable: false,
     })
 }
 
-/// `GET /native/session/{id}/attachments/{digest}` — resolve ONE durable
-/// attachment row by digest (restart-safe). Unknown digests are typed 404s.
-/// When several references share a blob the first-inserted (lowest-id)
-/// reference is the deterministic answer (an upload of the exact reference
-/// returns that reference directly).
+/// `GET /native/session/{id}/attachments/{ref_id}` — resolve exactly ONE
+/// durable attachment REFERENCE by its surrogate id: the returned metadata
+/// is THAT reference's own (`ref_id` is the stable wire identity), never
+/// another reference's. A hex digest segment keeps the deprecated digest
+/// lookup ONLY when it is unambiguous: exactly one reference exists for the
+/// digest, otherwise a typed 409 lists the candidate ref ids to choose from.
+/// Unknown/foreign ref ids, unknown digests and zero/mixed segments are
+/// typed 400/404s.
 pub(crate) async fn native_attachment_get(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, digest)): Path<(String, String)>,
+    Path((id, ref_or_digest)): Path<(String, String)>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
-    let hash = match parse_digest(&digest) {
-        Ok(h) => h,
-        Err(e) => return wire_status(e),
-    };
     let handle = match native_resolve_session(&state, &id) {
         Ok(h) => h,
         Err(r) => return *r,
     };
-    match handle.attachment(hash) {
-        Ok(Some(stored)) => Json(attachment_meta(&stored)).into_response(),
-        Ok(None) => wire_status(not_found(&format!(
-            "attachment {digest} in session {}",
+    if !ref_or_digest.is_empty() && ref_or_digest.bytes().all(|b| b.is_ascii_digit()) {
+        // A 64-digit all-decimal segment overflows u64 and is a digest, not
+        // a ref id; it falls through to the digest branch below.
+        if let Ok(ref_id) = ref_or_digest.parse::<u64>() {
+            return match handle.attachment_ref(ref_id) {
+                Ok(Some(reference)) => Json(reference).into_response(),
+                Ok(None) => wire_status(not_found(&format!(
+                    "attachment ref {ref_id} in session {}",
+                    handle.id()
+                ))),
+                Err(e) => api_err(&e),
+            };
+        }
+    }
+    let hash = match parse_digest(&ref_or_digest) {
+        Ok(h) => h,
+        Err(e) => return wire_status(e),
+    };
+    match handle.attachment_refs_for_digest(hash) {
+        Ok(mut refs) if refs.len() == 1 => Json(refs.remove(0)).into_response(),
+        Ok(refs) if refs.is_empty() => wire_status(not_found(&format!(
+            "attachment {ref_or_digest} in session {}",
             handle.id()
         ))),
+        Ok(refs) => wire_status(ApiError {
+            code: "conflict",
+            message: format!(
+                "attachment digest {ref_or_digest} in session {} has {} references; resolve one by ref_id: {:?}",
+                handle.id(),
+                refs.len(),
+                refs.iter().map(|r| r.id).collect::<Vec<_>>()
+            ),
+            http_status: 409,
+            retryable: false,
+        }),
         Err(e) => api_err(&e),
     }
 }
 
-/// `GET /native/session/{id}/attachments/{digest}/bytes` — the verified
-/// bytes of ONE durable attachment (CAS re-hash; corruption is loud).
+/// `GET /native/session/{id}/attachments/{ref_id}/bytes` — the verified
+/// bytes of exactly ONE durable attachment reference, served with THAT
+/// reference's MIME. A non-decimal segment is a typed 400 (blob bytes are
+/// `/attachments/blob/{digest}/bytes`); an unknown/foreign ref id is a
+/// typed 404.
 pub(crate) async fn native_attachment_bytes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, ref_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let ref_id = match parse_ref_id(&ref_id) {
+        Ok(ref_id) => ref_id,
+        Err(e) => return wire_status(e),
+    };
+    let reference = match handle.attachment_ref(ref_id) {
+        Ok(Some(reference)) => reference,
+        Ok(None) => {
+            return wire_status(not_found(&format!(
+                "attachment ref {ref_id} in session {}",
+                handle.id()
+            )))
+        }
+        Err(e) => return api_err(&e),
+    };
+    match handle.attachment_ref_bytes(&reference, MAX_ATTACHMENT_UPLOAD_BYTES) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, reference.mime.as_str())],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => api_err(&e),
+    }
+}
+
+/// `GET /native/session/{id}/attachments/blob/{digest}/bytes` — the CAS
+/// bytes of one blob referenced by THIS session, served as
+/// `application/octet-stream` (a digest-only blob has no single reference
+/// MIME). The blob must be referenced at least once by this session; an
+/// unknown/unreferenced digest is a typed 404. The digest probe uses the
+/// deterministic lowest-id reference (bounded single-row lookup, never the
+/// full reference set).
+pub(crate) async fn native_attachment_blob_bytes(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, digest)): Path<(String, String)>,
@@ -495,7 +585,7 @@ pub(crate) async fn native_attachment_bytes(
         Ok(Some(stored)) => stored,
         Ok(None) => {
             return wire_status(not_found(&format!(
-                "attachment {digest} in session {}",
+                "attachment blob {digest} in session {}",
                 handle.id()
             )))
         }
@@ -504,7 +594,7 @@ pub(crate) async fn native_attachment_bytes(
     match handle.attachment_bytes(&stored, MAX_ATTACHMENT_UPLOAD_BYTES) {
         Ok(bytes) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, stored.mime.as_str())],
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
             bytes,
         )
             .into_response(),
@@ -517,6 +607,7 @@ mod tests {
     use super::*;
     use crate::api::ServerDeps;
     use faktor_agent::{AgentDeps, AgentRuntime, NoEvidence, ToolCallMode, ToolRegistry};
+    use faktor_core::attachment::AttachmentRef;
     use faktor_core::model::ModelCapabilities;
     use faktor_core::time::SystemClock;
     use faktor_provider::{FakeProvider, ProviderRegistry};
@@ -622,6 +713,145 @@ mod tests {
         }
     }
 
+    async fn upload_ref(
+        state: &AppState,
+        sid: &str,
+        mime: &str,
+        filename: Option<&str>,
+        bytes: &[u8],
+    ) -> AttachmentRef {
+        let response = native_attachment_upload(
+            State(state.clone()),
+            auth_headers(state),
+            Path(sid.to_string()),
+            Ok(Json(upload(mime, filename, bytes))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{mime}");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The digest metadata route is UNAMBIGUOUS-OR-CONFLICT: exactly one
+    /// reference resolves; several references are a typed 409 listing the
+    /// candidates; and ref ids never leak across sessions.
+    #[tokio::test]
+    async fn digest_metadata_route_is_unambiguous_or_conflict_and_refs_are_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, handle) = test_state(dir.path());
+        let sid = handle.id().to_string();
+        let headers = auth_headers(&state);
+        // Unique bytes: exactly one reference → the digest route returns it.
+        let solo = upload_ref(
+            &state,
+            &sid,
+            "application/octet-stream",
+            None,
+            b"solo-bytes",
+        )
+        .await;
+        let meta = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), solo.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(meta.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(meta.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let digest_ref: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(digest_ref, solo, "a single reference resolves itself");
+        // The same bytes as a SECOND reference (different MIME) make the
+        // digest route ambiguous: typed 409, never the first row's metadata.
+        let image = upload_ref(&state, &sid, "image/png", Some("solo.png"), b"solo-bytes").await;
+        assert_eq!(image.digest, solo.digest);
+        assert_ne!(image.id, solo.id);
+        let ambiguous = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), solo.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(ambiguous.status(), StatusCode::CONFLICT);
+        // Each ref route still resolves its OWN metadata.
+        for expected in [&solo, &image] {
+            let resolved = native_attachment_get(
+                State(state.clone()),
+                headers.clone(),
+                Path((sid.clone(), expected.id.to_string())),
+            )
+            .await;
+            assert_eq!(resolved.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resolved.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let reference: AttachmentRef = serde_json::from_slice(&body).unwrap();
+            assert_eq!(&reference, expected);
+        }
+        // The same blob's bytes carry each reference's OWN MIME on its ref
+        // bytes route.
+        for (expected, mime) in [(&solo, "application/octet-stream"), (&image, "image/png")] {
+            let bytes = native_attachment_bytes(
+                State(state.clone()),
+                headers.clone(),
+                Path((sid.clone(), expected.id.to_string())),
+            )
+            .await;
+            assert_eq!(bytes.status(), StatusCode::OK);
+            assert_eq!(
+                bytes
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                mime
+            );
+        }
+        // A second session's reference is invisible here: its ref id and its
+        // digest (scoped probe) are 404s/empty, never a cross-session read.
+        let manager = state.deps.session.clone();
+        let ws = manager
+            .create_workspace(dir.path().to_str().unwrap())
+            .unwrap();
+        let other = manager.create_session(ws, "other", "fake", "m").unwrap();
+        let other_handle = manager.get_session(other.id()).unwrap().unwrap();
+        let other_ref = upload_ref(
+            &state,
+            &other.id().to_string(),
+            "image/jpeg",
+            Some("foreign.jpg"),
+            b"foreign-bytes",
+        )
+        .await;
+        assert_eq!(
+            other_handle.attachment_ref(other_ref.id).unwrap(),
+            Some(other_ref.clone())
+        );
+        let foreign = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), other_ref.id.to_string())),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        let foreign_bytes = native_attachment_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), other_ref.id.to_string())),
+        )
+        .await;
+        assert_eq!(foreign_bytes.status(), StatusCode::NOT_FOUND);
+        let foreign_digest = native_attachment_get(
+            State(state.clone()),
+            headers,
+            Path((sid, other_ref.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(foreign_digest.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn upload_resolve_and_reference_identity_roundtrip_over_the_wire() {
         let dir = tempfile::tempdir().unwrap();
@@ -643,31 +873,33 @@ mod tests {
         let body = axum::body::to_bytes(first.into_body(), 1 << 20)
             .await
             .unwrap();
-        let id: AttachmentId = serde_json::from_slice(&body).unwrap();
-        assert_eq!(id.mime, "application/pdf");
-        assert_eq!(id.size, 8);
-        // Identical bytes under a DIFFERENT filename return a distinct
+        let reference: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert!(reference.id >= 1, "the upload response carries a ref_id");
+        assert_eq!(reference.mime, "application/pdf");
+        assert_eq!(reference.size, 8);
+        // Identical bytes under a DIFFERENT mime+filename return a distinct
         // reference with its own metadata (the CAS blob is shared) — a
         // rename/re-select is repairable, never silently inherited.
         let renamed = native_attachment_upload(
             State(state.clone()),
             headers.clone(),
             Path(sid.clone()),
-            Ok(Json(upload(
-                "application/pdf",
-                Some("other.pdf"),
-                b"%PDF-1.4",
-            ))),
+            Ok(Json(upload("text/plain", Some("other.txt"), b"%PDF-1.4"))),
         )
         .await;
         let body = axum::body::to_bytes(renamed.into_body(), 1 << 20)
             .await
             .unwrap();
-        let renamed_id: AttachmentId = serde_json::from_slice(&body).unwrap();
-        assert_ne!(renamed_id, id, "metadata-distinct references are distinct");
-        assert_eq!(renamed_id.digest, id.digest, "the one CAS blob is shared");
-        assert_eq!(renamed_id.filename.as_deref(), Some("other.pdf"));
-        // An EXACT-metadata re-upload is the only dedupe hit.
+        let renamed_ref: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_ne!(renamed_ref.id, reference.id, "each reference keeps its id");
+        assert_eq!(
+            renamed_ref.digest, reference.digest,
+            "the one CAS blob is shared"
+        );
+        assert_eq!(renamed_ref.mime, "text/plain");
+        assert_eq!(renamed_ref.filename.as_deref(), Some("other.txt"));
+        // An EXACT-metadata re-upload is the only dedupe hit: the SAME
+        // ref_id round-trips.
         let again = native_attachment_upload(
             State(state.clone()),
             headers.clone(),
@@ -682,36 +914,121 @@ mod tests {
         let body = axum::body::to_bytes(again.into_body(), 1 << 20)
             .await
             .unwrap();
-        let deduped: AttachmentId = serde_json::from_slice(&body).unwrap();
-        assert_eq!(deduped, id);
-        // Resolve metadata and bytes by digest (the lowest-id reference is
-        // deterministic: the first upload).
+        let deduped: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(deduped, reference);
+        // The ref route resolves exactly THAT reference's metadata.
         let meta = native_attachment_get(
             State(state.clone()),
             headers.clone(),
-            Path((sid.clone(), id.digest.to_hex())),
+            Path((sid.clone(), renamed_ref.id.to_string())),
         )
         .await;
         assert_eq!(meta.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(meta.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let meta_ref: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta_ref, renamed_ref, "the second ref resolves itself");
+        // Its bytes carry THAT reference's MIME.
         let bytes = native_attachment_bytes(
             State(state.clone()),
             headers.clone(),
-            Path((sid.clone(), id.digest.to_hex())),
+            Path((sid.clone(), renamed_ref.id.to_string())),
         )
         .await;
         assert_eq!(bytes.status(), StatusCode::OK);
+        assert_eq!(
+            bytes
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain"
+        );
         let body = axum::body::to_bytes(bytes.into_body(), 1 << 20)
             .await
             .unwrap();
         assert_eq!(&body[..], b"%PDF-1.4");
-        // Unknown digest: typed 404, never a phantom.
+        // The blob route serves the raw CAS bytes as octet-stream.
+        let blob = native_attachment_blob_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), reference.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(blob.status(), StatusCode::OK);
+        assert_eq!(
+            blob.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+        let body = axum::body::to_bytes(blob.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"%PDF-1.4");
+        // The deprecated digest metadata route is unambiguous-or-409: this
+        // digest has TWO references, so it is a typed conflict listing the
+        // candidate ref ids — never another reference's metadata.
+        let ambiguous = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), reference.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(ambiguous.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(ambiguous.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["error"]["code"], "conflict");
+        let message = err["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&reference.id.to_string()), "{err:?}");
+        assert!(message.contains(&renamed_ref.id.to_string()), "{err:?}");
+        // Unknown/foreign ref ids and unknown digests are typed 404s.
         let missing = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), (renamed_ref.id + 1).to_string())),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_bytes = native_attachment_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), (renamed_ref.id + 1).to_string())),
+        )
+        .await;
+        assert_eq!(missing_bytes.status(), StatusCode::NOT_FOUND);
+        let missing_digest = native_attachment_get(
             State(state.clone()),
             headers.clone(),
             Path((sid.clone(), "0".repeat(64))),
         )
         .await;
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing_digest.status(), StatusCode::NOT_FOUND);
+        let missing_blob = native_attachment_blob_bytes(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), "0".repeat(64))),
+        )
+        .await;
+        assert_eq!(missing_blob.status(), StatusCode::NOT_FOUND);
+        // A non-numeric, non-digest segment is a typed 400.
+        let malformed = native_attachment_get(
+            State(state.clone()),
+            headers.clone(),
+            Path((sid.clone(), "not-a-ref".to_string())),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        // A non-decimal bytes route is a typed 400 pointing at the blob route.
+        let malformed_bytes = native_attachment_bytes(
+            State(state.clone()),
+            headers,
+            Path((sid, reference.digest.to_hex())),
+        )
+        .await;
+        assert_eq!(malformed_bytes.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -739,17 +1056,24 @@ mod tests {
         let body = axum::body::to_bytes(image.into_body(), 1 << 20)
             .await
             .unwrap();
-        let image_id: AttachmentId = serde_json::from_slice(&body).unwrap();
-        assert_eq!(image_id.mime, "image/png");
-        assert!(image_id.is_image());
+        let image_ref: AttachmentRef = serde_json::from_slice(&body).unwrap();
+        assert_eq!(image_ref.mime, "image/png");
+        assert!(image_ref.attachment().is_image());
         // The stored image round-trips over the wire (bytes are reachable).
         let bytes = native_attachment_bytes(
             State(state.clone()),
             headers.clone(),
-            Path((sid.clone(), image_id.digest.to_hex())),
+            Path((sid.clone(), image_ref.id.to_string())),
         )
         .await;
         assert_eq!(bytes.status(), StatusCode::OK);
+        assert_eq!(
+            bytes
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "image/png"
+        );
         let body = axum::body::to_bytes(bytes.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -804,7 +1128,10 @@ mod tests {
         expect_status(response, StatusCode::PAYLOAD_TOO_LARGE).await;
         // The hostile attempts left exactly the (lawful) image row behind:
         // nothing durable was created by any malformed payload.
-        assert_eq!(handle.list_attachments(16).unwrap(), vec![image_id]);
+        assert_eq!(
+            handle.list_attachments(16).unwrap(),
+            vec![image_ref.attachment()]
+        );
     }
 
     #[test]
@@ -1023,10 +1350,10 @@ mod tests {
             let body = axum::body::to_bytes(response.into_body(), 1 << 20)
                 .await
                 .unwrap();
-            let id: AttachmentId = serde_json::from_slice(&body).unwrap();
+            let id: AttachmentRef = serde_json::from_slice(&body).unwrap();
             assert_eq!(id.mime, mime);
             assert_eq!(id.size, bytes.len() as u64);
-            assert!(!id.is_image());
+            assert!(!id.attachment().is_image());
         }
         // A whitespace-padded base64 body is a typed 400 BEFORE any decode
         // or CAS write (the strict protocol has no tolerant variant).

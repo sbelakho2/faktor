@@ -2,6 +2,15 @@
 
 use super::*;
 
+use faktor_core::attachment::AttachmentRef;
+
+/// Hard ceiling on the references of ONE CAS blob in ONE session that
+/// [`Store::attachment_refs_for_digest`] materializes. The digest route must
+/// never materialize an unbounded reference set; beyond this bound the probe
+/// is a typed [`StoreError::Oversized`] and callers must address one
+/// reference by its surrogate row id.
+pub const MAX_ATTACHMENT_REFS_PER_BLOB: usize = 64;
+
 /// One CAS blob hash the store schema references (artifact rows by content
 /// address, checkpoint rows by after-blob), with the referencing table and
 /// row id. Doctor's dangling-reference scan compares these against the CAS;
@@ -16,17 +25,17 @@ pub struct CasHashRef {
     pub hash: String,
 }
 
-/// Decode one `attachment` row (`digest, mime, filename, size` column order)
-/// into its typed identity. A bad digest or a negative size is a typed
-/// conversion failure, never a panic.
-fn row_to_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentId> {
-    let digest_raw: String = r.get(0)?;
-    let mime: String = r.get(1)?;
-    let filename: Option<String> = r.get(2)?;
-    let size: i64 = r.get(3)?;
+/// Decode one attachment metadata tuple (`digest, mime, filename, size`
+/// starting at `offset`) into its typed identity. A bad digest or a negative
+/// size is a typed conversion failure, never a panic.
+fn columns_to_attachment(r: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<AttachmentId> {
+    let digest_raw: String = r.get(offset)?;
+    let mime: String = r.get(offset + 1)?;
+    let filename: Option<String> = r.get(offset + 2)?;
+    let size: i64 = r.get(offset + 3)?;
     let digest = faktor_core::hash::FileHash::from_hex(&digest_raw).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            0,
+            offset,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -36,7 +45,7 @@ fn row_to_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentId> {
     })?;
     if size < 0 {
         return Err(rusqlite::Error::FromSqlConversionFailure(
-            3,
+            offset + 3,
             rusqlite::types::Type::Integer,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -49,6 +58,38 @@ fn row_to_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentId> {
         mime,
         filename,
         size: size as u64,
+    })
+}
+
+/// Decode one `attachment` row (`digest, mime, filename, size` column order)
+/// into its typed identity. A bad digest or a negative size is a typed
+/// conversion failure, never a panic.
+fn row_to_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentId> {
+    columns_to_attachment(r, 0)
+}
+
+/// Decode one `attachment` row (`id, digest, mime, filename, size` column
+/// order) into its typed REFERENCE identity. A non-positive surrogate id, a
+/// bad digest or a negative size is a typed conversion failure.
+fn row_to_attachment_ref(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRef> {
+    let id: i64 = r.get(0)?;
+    if id <= 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("attachment ref id {id} is not a positive row id"),
+            )),
+        ));
+    }
+    let attachment = columns_to_attachment(r, 1)?;
+    Ok(AttachmentRef {
+        id: id as u64,
+        digest: attachment.digest,
+        mime: attachment.mime,
+        filename: attachment.filename,
+        size: attachment.size,
     })
 }
 
@@ -65,6 +106,9 @@ impl Store {
         let kind = kind.to_owned();
         let cas_hash = cas_hash.to_owned();
         let summary = summary.to_owned();
+        // The timestamp is acquired on the CALLER's thread (never inside the
+        // writer job): writer closures stay SQL-only.
+        let created_ms = now_ms();
         self.writer.execute("put_artifact", move |conn| {
             conn.execute(
             "INSERT OR IGNORE INTO artifact(session_id, kind, cas_hash, summary, created_ms, size)
@@ -74,7 +118,7 @@ impl Store {
                 kind,
                 cas_hash,
                 summary,
-                now_ms(),
+                created_ms,
                 size
             ],
         )?;
@@ -110,8 +154,20 @@ impl Store {
         session_id: SessionId,
         attachment: &AttachmentId,
     ) -> StoreResult<AttachmentId> {
+        self.put_attachment_ref(session_id, attachment)
+            .map(|reference| reference.attachment())
+    }
+
+    /// [`Self::put_attachment`] returning the first-class REFERENCE identity
+    /// (surrogate `id` plus the exact metadata), so a caller can address this
+    /// exact reference later even when the CAS blob backs several.
+    pub fn put_attachment_ref(
+        &self,
+        session_id: SessionId,
+        attachment: &AttachmentId,
+    ) -> StoreResult<AttachmentRef> {
         let attachment = attachment.to_owned();
-        self.writer.execute("put_attachment", move |conn| {
+        self.writer.execute("put_attachment_ref", move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -124,7 +180,7 @@ impl Store {
                 ],
             )?;
             conn.query_row(
-                "SELECT digest, mime, filename, size FROM attachment
+                "SELECT id, digest, mime, filename, size FROM attachment
                  WHERE session_id = ?1 AND digest = ?2 AND mime = ?3
                    AND filename IS ?4 AND size = ?5
                  ORDER BY id ASC LIMIT 1",
@@ -135,7 +191,7 @@ impl Store {
                     attachment.filename.as_deref(),
                     attachment.size as i64,
                 ],
-                row_to_attachment,
+                row_to_attachment_ref,
             )
             .optional()?
             .ok_or_else(|| {
@@ -145,6 +201,123 @@ impl Store {
                 )])
             })
         })
+    }
+
+    /// Insert every requested reference in ONE writer job/transaction:
+    /// either all rows of `attachments` become durable or the transaction
+    /// rolls back and NONE do (duplicate ids inside the batch dedupe
+    /// idempotently). Returns each reference in input order. The caller
+    /// verifies every CAS blob and validates every id BEFORE calling; the
+    /// store only persists the typed rows.
+    pub fn inherit_attachment_refs(
+        &self,
+        session_id: SessionId,
+        attachments: &[AttachmentId],
+    ) -> StoreResult<Vec<AttachmentRef>> {
+        if attachments.len() > faktor_core::attachment::MAX_ATTACHMENTS_PER_TASK {
+            return Err(StoreError::Oversized(format!(
+                "{} inherited attachment references exceed MAX_ATTACHMENTS_PER_TASK ({})",
+                attachments.len(),
+                faktor_core::attachment::MAX_ATTACHMENTS_PER_TASK
+            )));
+        }
+        let attachments = attachments.to_vec();
+        self.writer.execute("inherit_attachment_refs", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut out = Vec::with_capacity(attachments.len());
+            for attachment in &attachments {
+                tx.execute(
+                    "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        session_id.raw() as i64,
+                        attachment.digest.to_hex(),
+                        attachment.mime.as_str(),
+                        attachment.filename.as_deref(),
+                        attachment.size as i64,
+                    ],
+                )?;
+                let reference = tx
+                    .query_row(
+                        "SELECT id, digest, mime, filename, size FROM attachment
+                         WHERE session_id = ?1 AND digest = ?2 AND mime = ?3
+                           AND filename IS ?4 AND size = ?5
+                         ORDER BY id ASC LIMIT 1",
+                        params![
+                            session_id.raw() as i64,
+                            attachment.digest.to_hex(),
+                            attachment.mime.as_str(),
+                            attachment.filename.as_deref(),
+                            attachment.size as i64,
+                        ],
+                        row_to_attachment_ref,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        StoreError::Corrupt(vec![format!(
+                            "attachment reference (session {session_id}, digest {}, mime {:?}, filename {:?}, size {}) not found after insert",
+                            attachment.digest, attachment.mime, attachment.filename, attachment.size
+                        )])
+                    })?;
+                out.push(reference);
+            }
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    /// Resolve ONE durable attachment reference by its surrogate row id,
+    /// scoped to the session (a foreign/unknown/out-of-range id is `None`,
+    /// never a cross-session read).
+    pub fn attachment_ref(
+        &self,
+        session_id: SessionId,
+        ref_id: u64,
+    ) -> StoreResult<Option<AttachmentRef>> {
+        let Ok(ref_id) = i64::try_from(ref_id) else {
+            return Ok(None);
+        };
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT id, digest, mime, filename, size FROM attachment
+                 WHERE session_id = ?1 AND id = ?2",
+                params![session_id.raw() as i64, ref_id],
+                row_to_attachment_ref,
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// EVERY attachment reference of THIS session that shares one CAS blob
+    /// `digest`, in deterministic insert (`id`) order — bounded by
+    /// [`MAX_ATTACHMENT_REFS_PER_BLOB`]: beyond the bound the probe is a
+    /// typed [`StoreError::Oversized`], never an unbounded materialization.
+    pub fn attachment_refs_for_digest(
+        &self,
+        session_id: SessionId,
+        digest: faktor_core::hash::FileHash,
+    ) -> StoreResult<Vec<AttachmentRef>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, digest, mime, filename, size FROM attachment
+             WHERE session_id = ?1 AND digest = ?2 ORDER BY id ASC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            digest.to_hex(),
+            (MAX_ATTACHMENT_REFS_PER_BLOB + 1) as i64
+        ])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            if out.len() == MAX_ATTACHMENT_REFS_PER_BLOB {
+                return Err(StoreError::Oversized(format!(
+                    "attachment digest {digest} in session {session_id} has more than MAX_ATTACHMENT_REFS_PER_BLOB ({MAX_ATTACHMENT_REFS_PER_BLOB}) references; resolve one by its surrogate ref id"
+                )));
+            }
+            out.push(row_to_attachment_ref(r)?);
+        }
+        Ok(out)
     }
 
     /// Resolve the EXACT attachment reference: `Some` only when a row of THIS
@@ -416,6 +589,150 @@ mod tests {
             store.attachments_by_digest(s1.id, digest).unwrap(),
             vec![first, second, third]
         );
+    }
+
+    #[test]
+    fn attachment_refs_are_id_addressed_and_session_scoped() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s1 = store.create_session(ws, "att", "p", "m").unwrap();
+        let ws2 = store.create_workspace("/w2").unwrap();
+        let s2 = store.create_session(ws2, "other", "p", "m").unwrap();
+        let digest = faktor_core::hash::FileHash::from([21; 32]);
+        let png = AttachmentId::new(digest, "image/png", Some("shot.png"), 123).unwrap();
+        let pdf = AttachmentId::new(digest, "application/pdf", None, 123).unwrap();
+        let first = store.put_attachment_ref(s1.id, &png).unwrap();
+        assert_eq!(first.attachment(), png);
+        assert!(first.id >= 1, "a durable row id is a positive surrogate");
+        let second = store.put_attachment_ref(s1.id, &pdf).unwrap();
+        assert_eq!(second.attachment(), pdf);
+        assert_ne!(second.id, first.id, "each reference keeps its own row id");
+        // An exact-metadata re-upload returns the SAME reference row.
+        assert_eq!(store.put_attachment_ref(s1.id, &png).unwrap(), first);
+        // Id-addressed resolution returns exactly that reference.
+        assert_eq!(
+            store.attachment_ref(s1.id, first.id).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.attachment_ref(s1.id, second.id).unwrap(),
+            Some(second.clone())
+        );
+        // Unknown, zero, out-of-range and foreign ids are honest absences.
+        assert_eq!(store.attachment_ref(s1.id, second.id + 1).unwrap(), None);
+        assert_eq!(store.attachment_ref(s1.id, 0).unwrap(), None);
+        assert_eq!(store.attachment_ref(s1.id, u64::MAX).unwrap(), None);
+        assert_eq!(store.attachment_ref(s2.id, first.id).unwrap(), None);
+        // The bounded digest probe sees both references in insert order.
+        assert_eq!(
+            store.attachment_refs_for_digest(s1.id, digest).unwrap(),
+            vec![first, second]
+        );
+        assert!(store
+            .attachment_refs_for_digest(s2.id, digest)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn attachment_refs_for_digest_is_bounded_and_typed_oversized() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "att", "p", "m").unwrap();
+        let digest = faktor_core::hash::FileHash::from([22; 32]);
+        for index in 0..MAX_ATTACHMENT_REFS_PER_BLOB {
+            let id =
+                AttachmentId::new(digest, "image/png", Some(&format!("f{index}.png")), 1).unwrap();
+            store.put_attachment_ref(s.id, &id).unwrap();
+        }
+        assert_eq!(
+            store
+                .attachment_refs_for_digest(s.id, digest)
+                .unwrap()
+                .len(),
+            MAX_ATTACHMENT_REFS_PER_BLOB,
+            "exactly the bound still materializes"
+        );
+        let extra = AttachmentId::new(digest, "image/png", Some("overflow.png"), 1).unwrap();
+        store.put_attachment_ref(s.id, &extra).unwrap();
+        let err = store
+            .attachment_refs_for_digest(s.id, digest)
+            .expect_err("one over the bound must be a typed Oversized");
+        assert!(matches!(err, StoreError::Oversized(_)), "{err:?}");
+        // The id-addressed probes stay exact and available beyond the bound.
+        assert_eq!(
+            store
+                .attachment_ref(s.id, 1)
+                .unwrap()
+                .unwrap()
+                .filename
+                .as_deref(),
+            Some("f0.png")
+        );
+    }
+
+    #[test]
+    fn inherit_attachment_refs_is_one_transaction_all_or_nothing() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "att", "p", "m").unwrap();
+        let digest_a = faktor_core::hash::FileHash::from([23; 32]);
+        let digest_b = faktor_core::hash::FileHash::from([24; 32]);
+        let a = AttachmentId::new(digest_a, "image/png", Some("a.png"), 3).unwrap();
+        let b = AttachmentId::new(digest_b, "application/pdf", Some("b.pdf"), 4).unwrap();
+        // The success path inserts both references in input order.
+        let refs = store
+            .inherit_attachment_refs(s.id, &[a.clone(), b.clone()])
+            .unwrap();
+        assert_eq!(
+            refs.iter().map(|r| r.attachment()).collect::<Vec<_>>(),
+            vec![a.clone(), b.clone()]
+        );
+        // A hostile trigger aborts the SECOND insert mid-batch: the whole
+        // transaction rolls back and no partial reference set survives.
+        store
+            .writer
+            .execute("plant_hostile_trigger", move |conn| {
+                conn.execute(
+                    "CREATE TRIGGER attachment_boom BEFORE INSERT ON attachment
+                     WHEN NEW.mime = 'text/plain'
+                     BEGIN SELECT RAISE(ABORT, 'hostile mid-batch failure'); END",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let c = AttachmentId::new(
+            faktor_core::hash::FileHash::from([25; 32]),
+            "image/png",
+            Some("c.png"),
+            5,
+        )
+        .unwrap();
+        let hostile = AttachmentId::new(
+            faktor_core::hash::FileHash::from([26; 32]),
+            "text/plain",
+            Some("d.txt"),
+            6,
+        )
+        .unwrap();
+        let before = store.list_attachments(s.id, 32).unwrap();
+        let err = store
+            .inherit_attachment_refs(s.id, &[c.clone(), hostile])
+            .expect_err("the hostile second insert must abort the transaction");
+        assert!(matches!(err, StoreError::Sqlite(_)), "{err:?}");
+        assert_eq!(
+            store.list_attachments(s.id, 32).unwrap(),
+            before,
+            "no partial reference set may survive a rolled-back batch"
+        );
+        assert_eq!(store.attachment_row(s.id, &c).unwrap(), None);
+        // The bound is enforced before any write.
+        let many = vec![c; faktor_core::attachment::MAX_ATTACHMENTS_PER_TASK + 1];
+        let err = store
+            .inherit_attachment_refs(s.id, &many)
+            .expect_err("over-bound batch");
+        assert!(matches!(err, StoreError::Oversized(_)), "{err:?}");
     }
 
     #[test]

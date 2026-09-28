@@ -241,9 +241,9 @@ class PendingBinaryAttachment(
 
 /**
  * One validated, base64-ready upload of a task start. `key` is the retry
- * identity ([pathUploadKey]): kind + mime + filename + byte digest, so a
- * rename/re-select of identical bytes never reuses a stale durable id while
- * an unchanged reference does.
+ * identity ([pathUploadKey]): kind + mime + filename + size + byte digest,
+ * so a rename/re-select of identical bytes never reuses a stale durable id
+ * while an unchanged reference does.
  */
 class PlannedAttachmentUpload(
     val key: String,
@@ -433,11 +433,14 @@ fun planAttachments(
  * size + SHA-256 of the EXACT bytes. This is a client-local reuse key, NOT
  * the daemon's CAS/attachment identity (the daemon hashes the bytes with
  * BLAKE3 and stores `digest + mime + filename + size`); it only needs to
- * change whenever the reference changes, and it carries the SAME field set
- * the VS Code client hashes so the two clients cannot drift. A rename/
- * re-select of identical bytes is a DIFFERENT reference and uploads fresh,
- * while the same reference at a different position/list order reuses its
- * retained id.
+ * change whenever the reference changes. The field set deliberately differs
+ * from the VS Code client's key (mime + filename + size + bytes): this client
+ * also tags the LOCAL SOURCE KIND (image / document / in-memory binary), so a
+ * reference that moves between local source categories re-uploads instead of
+ * reusing a stale durable id; the VS Code client has only binary attachments
+ * and therefore no kind tag. A rename/re-select of identical bytes is a
+ * DIFFERENT reference and uploads fresh, while the same reference at a
+ * different position/list order reuses its retained id.
  */
 internal fun pathUploadKey(
     kind: String,
@@ -477,13 +480,13 @@ private fun menuShortcutV(): KeyStroke =
  * Bounded LOCAL pending-upload state for the Task composer (audit 29,
  * parity with the VS Code pending-submission envelope): after a successful
  * upload the durable id is retained here, bound to the session AND the exact
- * reference key ([pathUploadKey]: kind + mime + filename + byte digest) it
- * was uploaded under; a start failure keeps the state, and the retry
- * resolves the id first and uploads only the absent references (CAS dedupe
- * foundation). A renamed/re-selected file computes a new key and uploads
- * fresh. An entry retained for one session is never reused by another
- * session, and the map is bounded so a hostile client can never grow host
- * memory with submission identities.
+ * reference key ([pathUploadKey]: kind + mime + filename + size + byte
+ * digest) it was uploaded under; a start failure keeps the state, and the
+ * retry resolves the id first and uploads only the absent references (CAS
+ * dedupe foundation). A renamed/re-selected file computes a new key and
+ * uploads fresh. An entry retained for one session is never reused by
+ * another session, and the map is bounded so a hostile client can never grow
+ * host memory with submission identities.
  */
 class PendingAttachmentRetry(private val maxEntries: Int = MAX_PENDING_UPLOADS) {
 

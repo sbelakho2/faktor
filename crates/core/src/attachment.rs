@@ -84,6 +84,49 @@ impl AttachmentId {
     }
 }
 
+/// One durable attachment REFERENCE: the surrogate row identity (`id`,
+/// stable across restarts, wire name `ref_id`) plus the full metadata of
+/// that reference. The CAS blob is keyed by `digest` alone and may back
+/// many references with distinct mime/filename/size, so every retrieval
+/// that must name ONE reference is addressed by `id`, never by digest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentRef {
+    #[serde(rename = "ref_id")]
+    pub id: u64,
+    pub digest: FileHash,
+    pub mime: String,
+    pub filename: Option<String>,
+    pub size: u64,
+}
+
+impl AttachmentRef {
+    /// The metadata identity of this reference (digest + mime + filename +
+    /// size), detached from the surrogate row id. Task JSON and request
+    /// construction keep using [`AttachmentId`].
+    pub fn attachment(&self) -> AttachmentId {
+        AttachmentId {
+            digest: self.digest,
+            mime: self.mime.clone(),
+            filename: self.filename.clone(),
+            size: self.size,
+        }
+    }
+
+    /// Structural validation: the metadata follows [`AttachmentId::validate`]
+    /// and the surrogate id must be a durable row id (non-zero — schema v25
+    /// AUTOINCREMENT ids start at 1).
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.id == 0 {
+            return Err(Error::new(
+                ErrorKind::Malformed,
+                "attachment ref id 0 is not a durable row id",
+            ));
+        }
+        self.attachment().validate()
+    }
+}
+
 /// Validate one canonical mime type: lowercase `type/subtype`, RFC-2045-ish
 /// token characters only, bounded length. Uppercase is refused (the write
 /// path canonicalizes; a stored/decoded uppercase value is corruption or a
@@ -273,5 +316,60 @@ mod tests {
             ..id.clone()
         };
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn attachment_ref_roundtrips_with_protocol_field_naming() {
+        let reference = AttachmentRef {
+            id: 7,
+            digest: hash(3),
+            mime: "image/png".into(),
+            filename: Some("shot.png".into()),
+            size: 42,
+        };
+        reference.validate().unwrap();
+        // The wire name of the surrogate row id is `ref_id`; `id` never
+        // appears, so a decoder can never mistake the row id for a field
+        // of `AttachmentId`.
+        let json = serde_json::to_value(&reference).unwrap();
+        assert_eq!(json["ref_id"], 7);
+        assert!(json.get("id").is_none());
+        let back: AttachmentRef = serde_json::from_value(json).unwrap();
+        assert_eq!(back, reference);
+        // The metadata identity is detached from the surrogate id.
+        assert_eq!(
+            back.attachment(),
+            AttachmentId::new(hash(3), "image/png", Some("shot.png"), 42).unwrap()
+        );
+        // Unknown members and a zero surrogate id are typed refusals.
+        assert!(serde_json::from_value::<AttachmentRef>(serde_json::json!({
+            "ref_id": 7,
+            "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+            "mime": "text/plain",
+            "filename": null,
+            "size": 1,
+            "evil": 1,
+        }))
+        .is_err());
+        assert_eq!(
+            AttachmentRef {
+                id: 0,
+                ..reference.clone()
+            }
+            .validate()
+            .unwrap_err()
+            .kind,
+            ErrorKind::Malformed
+        );
+        let hostile = AttachmentRef {
+            filename: Some("../secrets".into()),
+            ..reference.clone()
+        };
+        assert_eq!(hostile.validate().unwrap_err().kind, ErrorKind::Malformed);
+        let oversized = AttachmentRef {
+            size: MAX_ATTACHMENT_BYTES + 1,
+            ..reference
+        };
+        assert_eq!(oversized.validate().unwrap_err().kind, ErrorKind::Oversized);
     }
 }

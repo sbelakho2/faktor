@@ -124,15 +124,19 @@
 //!     explicitly named module is exempt: the manual adapter-contract
 //!     certification, whose setter use is asserted load-bearing and
 //!     non-stale.
-//! 15. **Prepared writer jobs execute SQL only** (audit item 8) — a
+//! 15. **Prepared writer jobs execute SQL only** (audit items 8, 4) — a
 //!     production writer job closure (`.writer.execute` / `execute_raw` /
 //!     `Store::writer_debug_job`) must not contain filesystem I/O,
-//!     serialization (`serde_json`, `to_vec`/`from_str`/`.json`), hashing or
-//!     sleeps: those run on the single writer owner and stall every domain's
-//!     mutations (and the bounded shutdown). Preparation happens on the
-//!     caller's thread BEFORE enqueueing. Grandfathered call sites are
-//!     exact-line allowlisted, asserted load-bearing and non-stale, and a
-//!     planted violation in every family fails the scan.
+//!     serialization (`serde_json`, `to_vec`/`from_str`/`.json`), hashing,
+//!     sleeps or wall-clock acquisition (`now_ms(`/`SystemTime::now`/
+//!     `Utc::now`): those run on the single writer owner and stall every
+//!     domain's mutations (and the bounded shutdown). Preparation — including
+//!     the timestamp — happens on the caller's thread BEFORE enqueueing.
+//!     `Instant::now()` stays legal inside a job: it is the writer service's
+//!     own monotonic queue/transaction-latency telemetry, not a row clock.
+//!     Grandfathered call sites are exact-line allowlisted, asserted
+//!     load-bearing and non-stale, and a planted violation in every family
+//!     fails the scan.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -5897,12 +5901,17 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     ];
 
     /// Work a writer job closure must never perform — it belongs on the
-    /// caller's thread BEFORE enqueueing. Three families:
+    /// caller's thread BEFORE enqueueing. Four families:
     ///
     /// * filesystem I/O (`std::fs`, `OpenOptions`, `File::open/create`,
     ///   temp files, read/write/remove helpers),
     /// * serialization (`serde_json`, `to_vec`, `from_str`, `.json(`),
-    /// * hashing (`Sha256`/`sha2`/`blake3`/`Digest`/`Hasher`) and sleeps.
+    /// * hashing (`Sha256`/`sha2`/`blake3`/`Digest`/`Hasher`) and sleeps,
+    /// * wall-clock acquisition (`now_ms(`, `SystemTime::now`, `Utc::now`):
+    ///   the timestamp is part of the caller's preparation. `Instant::now()`
+    ///   is deliberately NOT forbidden — it is a monotonic elapsed-time
+    ///   probe, and the writer service itself measures queue/transaction
+    ///   latency with it on the owner thread.
     ///
     /// Markers are matched on the code mask (strings/comments invisible) and
     /// must begin at a non-identifier boundary, so `faktor_fs::` and
@@ -5943,6 +5952,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // sleeps
         "thread::sleep",
         "sleep(",
+        // wall clocks (Instant::now is owner-side latency telemetry, allowed)
+        "now_ms(",
+        "SystemTime::now",
+        "Utc::now",
     ];
 
     /// Writer-job closures that still prepare nothing. The ratchet is
@@ -5961,35 +5974,58 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         b.is_ascii_alphanumeric() || b == b'_'
     }
 
-    /// The byte span of every writer-job call in one file: from the call
-    /// marker through the matching `)` of the call (parens balanced over the
-    /// code mask, so strings/comments cannot unbalance it).
+    /// The byte span of every writer-job call in one file: from the call's
+    /// `(` through its matching `)` (parens balanced over the code mask, so
+    /// strings/comments cannot unbalance it).
+    ///
+    /// Rustfmt may UNFOLD a long chain as `self.writer\n    .execute(`, so the
+    /// receiver search skips whitespace between `writer` and
+    /// `.execute(`/`.execute_raw(` — otherwise a reformatted call silently
+    /// drops out of the scan (the proof gap audit finding 4 closed).
     fn writer_job_spans(f: &File<'_>) -> Vec<(usize, usize)> {
         let bytes = f.src.as_bytes();
-        let mut spans = Vec::new();
+        let mut opens: Vec<usize> = Vec::new();
         for &marker in WRITER_JOB_CALL_MARKERS {
             for at in find_marker_offsets(f, marker) {
                 let open = at + marker.len() - 1;
                 debug_assert_eq!(bytes[open], b'(');
-                let mut depth = 0usize;
-                let mut i = open;
-                while i < bytes.len() {
-                    if f.code[i] {
-                        match bytes[i] {
-                            b'(' => depth += 1,
-                            b')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    i += 1;
-                }
-                spans.push((at, (i + 1).min(bytes.len())));
+                opens.push(open);
             }
+        }
+        for at in find_marker_offsets(f, "writer") {
+            let mut i = at + "writer".len();
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            for suffix in [".execute(", ".execute_raw(", "_debug_job("] {
+                if f.src[i..].starts_with(suffix) {
+                    opens.push(i + suffix.len() - 1);
+                    break;
+                }
+            }
+        }
+        opens.sort_unstable();
+        opens.dedup();
+        let mut spans = Vec::new();
+        for open in opens {
+            let mut depth = 0usize;
+            let mut i = open;
+            while i < bytes.len() {
+                if f.code[i] {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            spans.push((open, (i + 1).min(bytes.len())));
         }
         spans
     }
@@ -6041,13 +6077,13 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             .collect()
     }
 
-    /// Audit item 8: production writer job closures execute SQLite work only.
-    /// Serialization, filesystem I/O, hashing and sleeps all belong on the
-    /// caller's thread BEFORE the command is enqueued; inside the closure
-    /// they stall every other domain (and the bounded shutdown) behind the
-    /// single owner thread.
+    /// Audit items 8/4: production writer job closures execute SQLite work
+    /// only. Serialization, filesystem I/O, hashing, sleeps and wall-clock
+    /// acquisition all belong on the caller's thread BEFORE the command is
+    /// enqueued; inside the closure they stall every other domain (and the
+    /// bounded shutdown) behind the single owner thread.
     #[test]
-    fn prepared_writer_jobs_never_do_fs_serialization_hashing_or_sleeps() {
+    fn prepared_writer_jobs_never_do_fs_serialization_hashing_sleeps_or_clocks() {
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0usize;
         for rel in walk_crate_sources() {
@@ -6063,8 +6099,8 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         assert_no_offenders(
             "writer-job scan: a production writer job closure (.writer.execute / \
              .writer.execute_raw / .writer_debug_job) contains filesystem I/O, \
-             serialization, hashing or a sleep; prepare inputs on the caller's thread \
-             and keep the closure SQL-only",
+             serialization, hashing, a sleep or wall-clock acquisition; prepare inputs \
+             and the timestamp on the caller's thread and keep the closure SQL-only",
             &offenders,
             scanned,
             50,
@@ -6072,9 +6108,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     }
 
     /// Planted-fixture proof: every forbidden family fires inside a writer
-    /// job, the call-shape variants are all covered, and the prepared shapes
-    /// (work before the call, SQL inside) plus `#[cfg(test)]` code pass. The
-    /// machinery is not vacuously green.
+    /// job (including wall-clock acquisition), the call-shape variants are all
+    /// covered, and the prepared shapes (work AND the timestamp before the
+    /// call, SQL inside), `Instant::now()` latency telemetry plus
+    /// `#[cfg(test)]` code pass. The machinery is not vacuously green.
     #[test]
     fn writer_job_scan_fires_on_planted_unprepared_work() {
         for (family, src) in [
@@ -6111,6 +6148,18 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 "fn f() { self.writer.execute(\"x\", move |conn| { std::thread::sleep(Duration::from_millis(5)); Ok(()) }) }\n",
             ),
             (
+                "store clock",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let now = now_ms(); conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![now])?; Ok(()) }) }\n",
+            ),
+            (
+                "system clock",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let now = SystemTime::now(); Ok(()) }) }\n",
+            ),
+            (
+                "utc clock",
+                "fn f() { self.writer.execute(\"x\", move |conn| { let now = Utc::now(); Ok(()) }) }\n",
+            ),
+            (
                 "debug seam",
                 "fn f() { store.writer_debug_job(\"x\", move |conn| { std::fs::write(\"/tmp/z\", b\"y\"); }) }\n",
             ),
@@ -6136,6 +6185,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "#[cfg(test)]\nmod tests { fn t() { self.writer.execute(\"x\", move |conn| { std::fs::read_to_string(\"/tmp/z\") }); } }\n",
             // A writer call with no forbidden work anywhere.
             "fn f() { self.writer.execute(\"x\", move |conn| { conn.execute(\"DELETE FROM t\", [])?; Ok(()) }) }\n",
+            // Caller-side clock preparation: the timestamp is captured BEFORE
+            // the call and only the value crosses into the closure.
+            "fn f() { let now = now_ms(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![now])?; Ok(()) }) }\n",
+            // Owner-side monotonic latency telemetry (Instant) is deliberate.
+            "fn f() { self.writer.execute(\"x\", move |conn| { let started = Instant::now(); conn.execute(\"DELETE FROM t\", [])?; let _ = started.elapsed(); Ok(()) }) }\n",
         ] {
             let f = synthetic_file("crates/store/src/good.rs", src);
             assert!(

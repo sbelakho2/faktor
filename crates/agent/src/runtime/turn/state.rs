@@ -2092,16 +2092,28 @@ impl AgentRuntime {
     /// session BEFORE its drive begins (the orchestrated-child path; the
     /// parent's rows are session-scoped, so each id is re-admitted here):
     ///
-    /// - every id is structurally validated and its CAS blob is verified by
-    ///   a streamed re-hash ([`faktor_session::SessionHandle::inherit_attachment`])
-    ///   — no bytes materialize and a missing/tampered blob is typed;
-    /// - the session's durable Task row then carries the set, so request
+    /// - the terminal preflight runs FIRST: a child whose task row is already
+    ///   terminal is frozen and returns `Ok` with NO attachment write at all
+    ///   (the row cannot gain new durable references);
+    /// - every id is structurally validated and every CAS blob is verified
+    ///   by a streamed re-hash BEFORE anything is written
+    ///   ([`faktor_session::SessionHandle::inherit_attachments`]) — no bytes
+    ///   materialize and a missing/tampered blob leaves zero new rows;
+    /// - all reference rows land in ONE writer transaction (all-or-nothing),
+    ///   then the session's durable Task row carries the set, so request
     ///   construction resolves the byte-identical bytes on every hop and
     ///   after a crash re-attach (never expanded in durable JSON).
     ///
-    /// An empty set is a no-op (byte-parity for attachment-free children);
-    /// a terminal row is frozen (the set cannot be changed after the
-    /// child's task ended).
+    /// Residual gap (documented precisely — NOT claimed atomic): the
+    /// reference batch and the task row write are two writer transactions,
+    /// because the task row owns its state-machine validation in the session
+    /// layer. A failure between them can leave the COMPLETE reference set
+    /// unreferenced by the task row — never a partial set, and never a task
+    /// row pointing at references that do not exist; a concurrent terminal
+    /// transition after the preflight can likewise leave the complete set
+    /// unpatched. Re-running the seed converges idempotently.
+    ///
+    /// An empty set is a no-op (byte-parity for attachment-free children).
     pub fn seed_task_attachments(
         &self,
         session: SessionId,
@@ -2115,14 +2127,16 @@ impl AgentRuntime {
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
-        for id in attachments {
-            handle.inherit_attachment(id)?;
-        }
         let task_id = handle.task_id()?;
-        if let Some(task) = handle.get_task(task_id)? {
-            if task.state.is_terminal() {
-                return Ok(());
-            }
+        let existing = handle.get_task(task_id)?;
+        if existing
+            .as_ref()
+            .is_some_and(|task| task.state.is_terminal())
+        {
+            return Ok(());
+        }
+        handle.inherit_attachments(attachments)?;
+        if existing.is_some() {
             handle.update_task(
                 task_id,
                 faktor_session::TaskPatch {
@@ -2235,5 +2249,226 @@ impl AgentRuntime {
             .get()
             .and_then(|service| service.clone())?;
         Some(service.shutdown_worker().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::tests::{deps, new_session};
+    use faktor_core::model::ModelCapabilities;
+    use faktor_provider::FakeProvider;
+
+    /// A parent session (the upload owner) and a distinct, EMPTY child
+    /// session (the seed target) over one runtime, mirroring the real
+    /// orchestrated-child path.
+    fn parent_child() -> (
+        std::sync::Arc<AgentRuntime>,
+        faktor_session::SessionHandle,
+        faktor_session::SessionHandle,
+        tempfile::TempDir,
+    ) {
+        let (deps, dir) = deps(
+            FakeProvider::new("fake", ModelCapabilities::default()),
+            Vec::new(),
+        );
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let parent = new_session(runtime.deps());
+        let child = new_session(runtime.deps());
+        let parent_handle = runtime.deps.session.get_session(parent).unwrap().unwrap();
+        let child_handle = runtime.deps.session.get_session(child).unwrap().unwrap();
+        (runtime, parent_handle, child_handle, dir)
+    }
+
+    fn seed_task_row(
+        handle: &faktor_session::SessionHandle,
+        store: &faktor_store::Store,
+        session: SessionId,
+        state: TaskState,
+        revision: u64,
+    ) {
+        let now = handle.now_ms();
+        store
+            .upsert_task(&faktor_store::TaskRow {
+                task_id: handle.task_id().unwrap(),
+                session_id: session,
+                goal: "seed target".into(),
+                acceptance_criteria: Vec::new(),
+                plan: Vec::new(),
+                attachments: Vec::new(),
+                max_tokens: None,
+                max_turns: None,
+                spent_tokens: 0,
+                spent_turns: 0,
+                state,
+                revision: faktor_core::id::TaskRevision::new(revision),
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+    }
+
+    fn sorted(ids: &mut [faktor_core::attachment::AttachmentId]) {
+        ids.sort_by_key(|id| id.digest.to_hex());
+    }
+
+    /// A terminal task row is frozen: seeding new attachments returns `Ok`
+    /// and writes NOTHING (no reference rows, no task patch).
+    #[test]
+    fn seed_task_attachments_terminal_task_is_frozen_with_no_writes() {
+        let (runtime, parent, child, _dir) = parent_child();
+        let attachment = parent
+            .put_attachment("image/png", Some("late.png"), b"\x89PNG-late")
+            .unwrap();
+        let task_id = child.task_id().unwrap();
+        let now = child.now_ms();
+        child
+            .create_task(Task {
+                task_id,
+                session_id: child.id(),
+                goal: "frozen".into(),
+                acceptance_criteria: Vec::new(),
+                plan: Vec::new(),
+                attachments: Vec::new(),
+                budget: Default::default(),
+                state: TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        child
+            .transition_task(
+                task_id,
+                child.task_revision(task_id).unwrap(),
+                TaskTransition::Cancel,
+                None,
+            )
+            .unwrap();
+        assert!(
+            child.list_attachments(16).unwrap().is_empty(),
+            "the child starts without any attachment row"
+        );
+        runtime
+            .seed_task_attachments(child.id(), std::slice::from_ref(&attachment))
+            .expect("a terminal task is frozen, not an error");
+        assert!(
+            child.list_attachments(16).unwrap().is_empty(),
+            "a terminal task must gain zero new attachment reference rows"
+        );
+        let task = child.get_task(task_id).unwrap().unwrap();
+        assert!(task.state.is_terminal());
+        assert_eq!(task.attachments, Vec::new());
+        // The parent's own reference is untouched.
+        assert_eq!(parent.list_attachments(16).unwrap(), vec![attachment]);
+    }
+
+    /// `[A valid, B missing]` leaves NEITHER A nor B durable in the child:
+    /// every CAS blob is verified before the first reference row is written.
+    #[test]
+    fn seed_task_attachments_missing_second_blob_adds_neither() {
+        let (runtime, parent, child, _dir) = parent_child();
+        let valid = parent
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG-a")
+            .unwrap();
+        let missing = faktor_core::attachment::AttachmentId {
+            digest: faktor_core::hash::FileHash::from([99; 32]),
+            ..valid.clone()
+        };
+        let err = runtime
+            .seed_task_attachments(child.id(), &[valid.clone(), missing])
+            .expect_err("a missing blob must refuse the whole seed");
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert!(
+            child.list_attachments(16).unwrap().is_empty(),
+            "neither A nor B may be added when one blob is missing"
+        );
+        assert!(
+            child.get_task(child.task_id().unwrap()).unwrap().is_none(),
+            "no task row may be created for a refused seed"
+        );
+        // The refused A was never recorded in the child: an exact-resolution
+        // attempt is an honest absence, and a later lawful seed still works.
+        assert_eq!(child.attachment(valid.digest).unwrap(), None);
+        runtime
+            .seed_task_attachments(child.id(), std::slice::from_ref(&valid))
+            .unwrap();
+        assert_eq!(child.list_attachments(16).unwrap(), vec![valid.clone()]);
+        let task = child.get_task(child.task_id().unwrap()).unwrap().unwrap();
+        assert_eq!(task.attachments, vec![valid]);
+    }
+
+    /// The success path lands BOTH references and the task row's attachment
+    /// set, and re-seeding converges idempotently.
+    #[test]
+    fn seed_task_attachments_lands_both_references_and_the_task_set() {
+        let (runtime, parent, child, _dir) = parent_child();
+        let a = parent
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG-a")
+            .unwrap();
+        let b = parent
+            .put_attachment("application/pdf", Some("b.pdf"), b"%PDF-b")
+            .unwrap();
+        runtime
+            .seed_task_attachments(child.id(), &[a.clone(), b.clone()])
+            .unwrap();
+        let mut stored = child.list_attachments(16).unwrap();
+        sorted(&mut stored);
+        let mut expected = vec![a.clone(), b.clone()];
+        sorted(&mut expected);
+        assert_eq!(stored, expected, "both references are durable in the child");
+        let task_id = child.task_id().unwrap();
+        assert_eq!(
+            child.get_task(task_id).unwrap().unwrap().attachments,
+            vec![a.clone(), b.clone()],
+            "the task row carries the exact set"
+        );
+        // Idempotent re-seed (crash re-attach): same refs, same task set.
+        runtime
+            .seed_task_attachments(child.id(), &[a.clone(), b.clone()])
+            .unwrap();
+        assert_eq!(
+            child.get_task(task_id).unwrap().unwrap().attachments,
+            vec![a, b]
+        );
+    }
+
+    /// A task patch that fails AFTER validation must never leave a PARTIAL
+    /// reference set. The hostile revision-overflow row forces exactly that
+    /// failure: the batch is all-or-nothing, so only the complete requested
+    /// set can remain, and the task row is provably unpatched.
+    #[test]
+    fn seed_task_attachments_task_patch_failure_leaves_no_partial_reference_set() {
+        let (runtime, parent, child, _dir) = parent_child();
+        let a = parent
+            .put_attachment("image/png", Some("a.png"), b"\x89PNG-a")
+            .unwrap();
+        let b = parent
+            .put_attachment("application/pdf", Some("b.pdf"), b"%PDF-b")
+            .unwrap();
+        // Hostile durable row: non-terminal but with an exhausted revision,
+        // so the task patch must fail with a typed Malformed AFTER the
+        // attachment batch validated.
+        seed_task_row(
+            &child,
+            &runtime.deps().session.store(),
+            child.id(),
+            TaskState::Running,
+            u64::MAX,
+        );
+        let task_id = child.task_id().unwrap();
+        let err = runtime
+            .seed_task_attachments(child.id(), &[a.clone(), b.clone()])
+            .expect_err("an exhausted revision must fail the task patch");
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        let stored = child.list_attachments(16).unwrap();
+        assert!(
+            stored.is_empty() || (stored.contains(&a) && stored.contains(&b)),
+            "a failed task patch must never leave a partial reference set: {stored:?}"
+        );
+        assert_eq!(
+            child.get_task(task_id).unwrap().unwrap().attachments,
+            Vec::new(),
+            "the failed patch must not have changed the task row"
+        );
     }
 }

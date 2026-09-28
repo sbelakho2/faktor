@@ -304,6 +304,20 @@ fn type_defs() -> Vec<TypeDef> {
             },
         },
         TypeDef {
+            name: "AttachmentRef",
+            doc: "One durable attachment REFERENCE (native additive-response contract): the surrogate reference id the retrieval routes address, plus the CAS digest and the exact presentation metadata (mime, optional filename, decompressed size). Decoders ignore unknown fields.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("ref_id", Ty::I64),
+                    text_field("digest"),
+                    text_field("mime"),
+                    nullable("filename", Ty::String),
+                    req("size", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
             name: "AttachmentUpload",
             doc: "Strict request body of POST /native/session/{id}/attachments: canonical standard base64 bytes plus the declared mime.",
             unknown_fields: "reject",
@@ -617,6 +631,7 @@ mod tests {
         let names: Vec<&str> = type_defs().iter().map(|def| def.name).collect();
         for name in [
             "AttachmentId",
+            "AttachmentRef",
             "AttachmentUpload",
             "TaskRun",
             "TaskRunStarted",
@@ -687,6 +702,54 @@ mod tests {
         let mut with_extra = object.clone();
         with_extra.insert("extra".into(), serde_json::json!(1));
         assert!(serde_json::from_value::<AttachmentId>(with_extra.into()).is_err());
+        assert_eq!(def.unknown_fields, "ignore");
+    }
+
+    /// The `AttachmentRef` schema entry mirrors the REAL serde struct
+    /// (`faktor_core::attachment::AttachmentRef`) field-for-field: the upload
+    /// response and the ref-addressed retrieval routes both speak this shape,
+    /// so the surrogate reference id must be part of the canonical schema.
+    #[test]
+    fn attachment_ref_schema_mirrors_the_real_serde_shape() {
+        use faktor_core::attachment::{AttachmentId, AttachmentRef};
+        use faktor_core::hash::FileHash;
+
+        let value = AttachmentRef {
+            id: 7,
+            digest: FileHash::from([7u8; 32]),
+            mime: "image/png".into(),
+            filename: Some("shot.png".into()),
+            size: 4,
+        };
+        let json = serde_json::to_value(&value).unwrap();
+        let object = json
+            .as_object()
+            .expect("AttachmentRef serializes to an object");
+        let mut wire_keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        wire_keys.sort_unstable();
+        let def = type_defs()
+            .into_iter()
+            .find(|def| def.name == "AttachmentRef")
+            .expect("AttachmentRef is part of the canonical schema");
+        let Shape::Struct { fields } = def.shape else {
+            panic!("AttachmentRef must be a struct")
+        };
+        let mut schema_keys: Vec<&str> = fields.iter().map(|f| f.name).collect();
+        schema_keys.sort_unstable();
+        assert_eq!(
+            wire_keys, schema_keys,
+            "schema must mirror every serde field"
+        );
+        assert!(
+            object["ref_id"].is_i64(),
+            "the surrogate id is the ref_id wire field"
+        );
+        assert_eq!(object["digest"].as_str().unwrap().len(), 64);
+        // The reference projects to its full attachment identity, whose own
+        // schema entry is the AttachmentId.
+        let projected: AttachmentId = value.attachment();
+        assert_eq!(projected.digest, value.digest);
+        assert_eq!(projected.size, value.size);
         assert_eq!(def.unknown_fields, "ignore");
     }
 }

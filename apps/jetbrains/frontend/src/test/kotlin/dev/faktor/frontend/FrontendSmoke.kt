@@ -1907,12 +1907,12 @@ object FrontendSmoke {
         }
 
         // Audit 9/10 + attachment-reference identity: the retry identity is
-        // kind + mime + FILENAME + byte digest. Path/length/mtime are
+        // kind + mime + FILENAME + SIZE + byte digest. Path/length/mtime are
         // metadata only, so same-size same-mtime different bytes upload
         // fresh; identical bytes under a different filename are a DIFFERENT
         // reference and also upload fresh, while the same reference at
         // another path keeps its id.
-        step("path attachment identity is kind+mime+filename+byte digest, never path or mtime") {
+        step("path attachment identity is kind+mime+filename+size+byte digest, never path or mtime") {
             val dir = Files.createTempDirectory("faktor-attach-identity-")
             val file = Paths.get(dir.toString(), "doc.txt")
             val bytesA = "AAAA".toByteArray()
@@ -1951,14 +1951,29 @@ object FrontendSmoke {
                 keyB != keyRenamed,
                 "identical bytes under a different filename must be a fresh reference"
             )
-            // The identity is exactly kind:mime:name=<filename>:sha=<digest>;
-            // the PATH never appears.
+            // The identity is exactly
+            // kind:mime:name=<filename>:size=<n>:sha=<digest>; the PATH never
+            // appears.
             val digestHex = java.security.MessageDigest.getInstance("SHA-256")
                 .digest(bytesB).joinToString("") { "%02x".format(it.toInt() and 0xff) }
             assertEquals(
-                "document:text/plain:name=doc.txt:sha=$digestHex",
+                "document:text/plain:name=doc.txt:size=${bytesB.size}:sha=$digestHex",
                 keyB,
                 "the retry key shape"
+            )
+            // Adversarial: the size-less shape (the one this smoke used to
+            // assert) must never equal the real key — if pathUploadKey ever
+            // drops the size field, both assertions fail loudly.
+            assertTrue(
+                keyB != "document:text/plain:name=doc.txt:sha=$digestHex",
+                "the retry key must carry the size field, never the old size-less shape"
+            )
+            // The size field is part of the identity: same filename, same
+            // bytes-prefix, one byte more => a fresh reference.
+            assertTrue(
+                pathUploadKey("document", "text/plain", "doc.txt", bytesB + "!".toByteArray()) !=
+                    keyB,
+                "a changed size must change the retry key"
             )
             assertTrue(!keyB.contains(file.toString()), "the path stays metadata only")
         }
