@@ -203,6 +203,70 @@ pub struct CostReservationRow {
     pub settled_cost_micro: Option<u64>,
 }
 
+/// Every `TaskState` variant with its canonical row text, prepared on the
+/// caller's thread. Writer jobs that must decide a state-dependent rule from
+/// the RAW `task.state` column (audit finding 5) compare against these texts
+/// instead of decoding the row on the single writer owner; an unknown text is
+/// corruption, exactly like a failed `parse_json`. The exhaustive `match` is
+/// a compile-time drift guard: a new variant fails this build until the
+/// vocabulary is extended.
+pub(crate) fn task_state_vocabulary() -> Vec<(String, TaskState)> {
+    use TaskState::*;
+    let all = [
+        Pending,
+        Planning,
+        Running,
+        Waiting,
+        Blocked,
+        NeedsVerification,
+        Verifying,
+        VerifiedComplete,
+        Failed,
+        Cancelled,
+    ];
+    for state in all {
+        match state {
+            Pending | Planning | Running | Waiting | Blocked | NeedsVerification | Verifying
+            | VerifiedComplete | Failed | Cancelled => {}
+        }
+    }
+    all.into_iter()
+        .map(|state| {
+            (
+                serde_json::to_string(&state)
+                    .expect("in-process TaskState serialization cannot fail"),
+                state,
+            )
+        })
+        .collect()
+}
+
+/// Raw-text terms of the provider-operation reserve gate (audit finding 5):
+/// the canonical `task.state` texts that PERMIT a new reserve, the canonical
+/// texts that FORBID one together with their caller-prepared diagnostics,
+/// and the corrupt-state diagnostic. Built on the CALLER's thread, so the
+/// reserve writer closures compare raw columns and never decode `TaskState`
+/// on the single writer owner.
+fn provider_operation_gate_terms() -> (Vec<String>, Vec<(String, String)>, String) {
+    let mut permitted = Vec::new();
+    let mut forbidden = Vec::new();
+    for (text, state) in task_state_vocabulary() {
+        if Store::task_state_permits_provider_operation(state) {
+            permitted.push(text);
+        } else {
+            forbidden.push((
+                text,
+                format!(
+                    "cost reserve: task state {} forbids a new provider operation",
+                    state.label()
+                ),
+            ));
+        }
+    }
+    let corrupt = "cost reserve: task row state is not a known task state".to_string();
+    (permitted, forbidden, corrupt)
+}
+
 /// One reservation attempt's outcome (schema v15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CostReserveOutcome {
@@ -1168,6 +1232,11 @@ impl Store {
         pricing_snapshot_json: Option<&str>,
     ) -> StoreResult<CostReserveOutcome> {
         let pricing_snapshot_json = pricing_snapshot_json.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the raw state gate terms and the
+        // no-row conflict text (audit finding 5 — the closure formats
+        // nothing and never decodes `TaskState`).
+        let (permitted_states, forbidden_states, corrupt_state) = provider_operation_gate_terms();
+        let no_row = format!("cost reserve: task {task_id} of session {session_id} has no row");
         self.writer.execute("cost_reserve_inner", move |conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row_opt: Option<(Option<i64>, String)> = tx
@@ -1179,31 +1248,24 @@ impl Store {
             .optional()?;
         // Outer None = no task row; inner None = the row's cap is NULL =
         // unlimited (distinct states: an unlimited cap is a valid cap).
-        let (cap, state): (Option<i64>, TaskState) = match row_opt {
-            Some((cap, state_json)) => {
-                let state: TaskState = parse_json(
-                    &format!("cost reserve: task {task_id} of session {session_id} state"),
-                    &state_json,
-                )?;
-                (cap, state)
-            }
-            None => {
-                tx.rollback()?;
-                return Err(StoreError::Conflict(format!(
-                    "cost reserve: task {task_id} of session {session_id} has no row"
-                )));
-            }
+        let Some((cap, state_json)) = row_opt else {
+            tx.rollback()?;
+            return Err(StoreError::Conflict(no_row));
         };
         // The task-state gate: a reserve while the task is in a
         // completion/final state refuses typed and writes NOTHING (the same
         // predicate the completion transaction's zero-reservation gate
-        // closes from the other side).
-        if !Self::task_state_permits_provider_operation(state) {
+        // closes from the other side). The raw state text is matched against
+        // the caller-prepared vocabulary.
+        if !permitted_states.iter().any(|text| text == &state_json) {
             tx.rollback()?;
-            return Err(StoreError::Conflict(format!(
-                "cost reserve: task state {} forbids a new provider operation",
-                state.label()
-            )));
+            return match forbidden_states
+                .iter()
+                .find(|(text, _)| text == &state_json)
+            {
+                Some((_, message)) => Err(StoreError::Conflict(message.clone())),
+                None => Err(StoreError::Corrupt(vec![corrupt_state])),
+            };
         }
         let spent: i64 = tx.query_row(
             "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",
@@ -1279,6 +1341,11 @@ impl Store {
     ) -> StoreResult<CostReserveOutcome> {
         let attempt = attempt.to_owned();
         let pricing_snapshot_json = pricing_snapshot_json.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the raw state gate terms and the
+        // no-row conflict text (audit finding 5 — the closure formats
+        // nothing and never decodes `TaskState`).
+        let (permitted_states, forbidden_states, corrupt_state) = provider_operation_gate_terms();
+        let no_row = format!("cost reserve: task {task_id} of session {session_id} has no row");
         self.writer.execute("cost_reserve_attempt", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let row_opt: Option<(Option<i64>, String)> = tx
@@ -1288,27 +1355,21 @@ impl Store {
                     |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()?;
-            let (cap, state): (Option<i64>, TaskState) = match row_opt {
-                Some((cap, state_json)) => {
-                    let state: TaskState = parse_json(
-                        &format!("cost reserve: task {task_id} of session {session_id} state"),
-                        &state_json,
-                    )?;
-                    (cap, state)
-                }
-                None => {
-                    tx.rollback()?;
-                    return Err(StoreError::Conflict(format!(
-                        "cost reserve: task {task_id} of session {session_id} has no row"
-                    )));
-                }
-            };
-            if !Self::task_state_permits_provider_operation(state) {
+            let Some((cap, state_json)) = row_opt else {
                 tx.rollback()?;
-                return Err(StoreError::Conflict(format!(
-                    "cost reserve: task state {} forbids a new provider operation",
-                    state.label()
-                )));
+                return Err(StoreError::Conflict(no_row));
+            };
+            // The task-state gate: the raw state text is matched against the
+            // caller-prepared vocabulary (no decode on the writer owner).
+            if !permitted_states.iter().any(|text| text == &state_json) {
+                tx.rollback()?;
+                return match forbidden_states
+                    .iter()
+                    .find(|(text, _)| text == &state_json)
+                {
+                    Some((_, message)) => Err(StoreError::Conflict(message.clone())),
+                    None => Err(StoreError::Corrupt(vec![corrupt_state])),
+                };
             }
             let spent: i64 = tx.query_row(
                 "SELECT spent_cost_micro FROM task WHERE session_id = ?1 AND task_id = ?2",

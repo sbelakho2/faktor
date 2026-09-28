@@ -5945,6 +5945,12 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         "::from_str(",
         ".json(",
         "json!(",
+        // indirect decode helpers: a closure that merely NAMES one of these
+        // still parses/serializes on the writer owner (the call site is a
+        // marker-free identifier, so the lexical scanner needs them spelled
+        // out here)
+        "task_row_map(",
+        "parse_json(",
         // hashing
         "Sha256",
         "Sha512",
@@ -6191,6 +6197,14 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 "raw seam",
                 "fn f(s: String) { self.writer.execute_raw(\"x\", move |conn| { serde_json::from_str::<T>(&s).unwrap() }) }\n",
             ),
+            (
+                "indirect task row decode",
+                "fn f(row: &Row) { self.writer.execute(\"x\", move |conn| { let t = task_row_map(row, sid)?; Ok(t) }) }\n",
+            ),
+            (
+                "indirect json parse",
+                "fn f(raw: String) { self.writer.execute(\"x\", move |conn| { let s: T = parse_json(&label, &raw)?; Ok(s) }) }\n",
+            ),
         ] {
             let f = synthetic_file("crates/store/src/evil.rs", src);
             assert!(
@@ -6224,6 +6238,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             "fn f() { let now = now_ms(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![now])?; Ok(()) }) }\n",
             // Owner-side monotonic latency telemetry (Instant) is deliberate.
             "fn f() { self.writer.execute(\"x\", move |conn| { let started = Instant::now(); conn.execute(\"DELETE FROM t\", [])?; let _ = started.elapsed(); Ok(()) }) }\n",
+            // Caller-side decode helpers: the whole-row decode and the JSON
+            // parse happen BEFORE the enqueue and only prepared values cross
+            // into the closure — the same helper names are not flagged.
+            "fn f(row: &Row) { let t = task_row_map(row, sid)?; self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![t.state])?; Ok(()) }) }\n",
+            "fn f(raw: String) { let s: T = parse_json(&label, &raw)?; self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![s])?; Ok(()) }) }\n",
         ] {
             let f = synthetic_file("crates/store/src/good.rs", src);
             assert!(
@@ -6242,6 +6261,62 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             !writer_job_offenders(&planted).is_empty(),
             "a newly planted unprepared job in a former allowlisted file must be caught"
         );
+    }
+
+    /// Regression pin for the atomic seed path (audit findings 1/5): the
+    /// writer closure of `Store::seed_task_attachments_txn` must stay
+    /// SQL-only. The closure compares raw `revision`/`state`/`attachments`
+    /// text against a caller-prepared expectation and never runs a whole-row
+    /// decode (`task_row_map(`), a JSON parse (`parse_json(`/`serde_json`),
+    /// or timestamp/string materialization (`format!(`, `.to_string()`,
+    /// `.to_hex(`) on the single writer owner.
+    ///
+    /// HONEST LIMITATION: this is a lexical source assertion over the
+    /// closure's byte span, not whole-program analysis. An arbitrary helper
+    /// reached through an indirection the marker list does not spell out can
+    /// still escape; the defense is the marker list (which names the known
+    /// decode entry points for EVERY production writer job) plus this pin for
+    /// the seed path. A new indirect decode helper must be added to
+    /// [`WRITER_JOB_FORBIDDEN_MARKERS`] — never grandfathered.
+    #[test]
+    fn seed_task_attachments_writer_closure_is_sql_only() {
+        let f = load("crates/store/src/attachments.rs").expect("attachments.rs readable");
+        let fn_at = f
+            .src
+            .find("pub fn seed_task_attachments_txn")
+            .expect("seed_task_attachments_txn present");
+        let next_fn = f.src[fn_at + 1..]
+            .find("\n    pub fn ")
+            .map(|offset| fn_at + 1 + offset)
+            .unwrap_or(f.src.len());
+        let (open, close) = writer_job_spans(&f)
+            .into_iter()
+            .find(|(a, z)| *a >= fn_at && *z <= next_fn)
+            .expect("the seed writer job span");
+        for marker in [
+            "task_row_map(",
+            "parse_json(",
+            "serde_json",
+            "format!(",
+            ".to_string()",
+            ".to_hex(",
+        ] {
+            let mb = marker.as_bytes();
+            let mut pos = open;
+            while let Some(rel) = f.src[pos..close].find(marker) {
+                let at = pos + rel;
+                if f.code[at..at + mb.len()].iter().all(|c| *c) {
+                    panic!(
+                        "seed_task_attachments_txn closure line {} contains `{marker}`: {} \
+                         — a writer job must execute SQL only; prepare the value on the \
+                         caller's thread before enqueueing",
+                        line_of(f.src, at),
+                        trim_line(f.src, at)
+                    );
+                }
+                pos = at + mb.len();
+            }
+        }
     }
 
     /// The writer-job ratchet is COMPLETE: the allowlist is empty, so a new

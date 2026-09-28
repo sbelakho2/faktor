@@ -1161,6 +1161,8 @@ async function clientAccepts() {
       'POST /native/session/7/task-runs': () => jsonResponse(taskRunStartedJson),
       'POST /native/session/7/attachments': () => jsonResponse(attachmentRefJson),
       'GET /native/session/7/attachments/ref/3': () => jsonResponse(attachmentRefJson),
+      [`GET /native/session/7/attachments/blob/${attachmentDigest}`]: () =>
+        jsonResponse(attachmentRefJson),
       'GET /native/session/7/attachments/ref/3/bytes': () =>
         bytesResponse(attachmentBytes, 'application/pdf'),
       [`GET /native/session/7/attachments/blob/${attachmentDigest}/bytes`]: () =>
@@ -1229,6 +1231,11 @@ async function clientAccepts() {
       size: 8,
     });
     assertEqual((await client.attachmentReference('7', 3)).ref_id, 3);
+    assertEqual(
+      (await client.attachmentBlobReference('7', attachmentDigest)).ref_id,
+      3,
+      'the blob metadata route resolves the single reference',
+    );
     const referenceBytes = await client.attachmentReferenceBytes('7', 3);
     assertEqual(referenceBytes.mime, 'application/pdf', 'ref bytes carry THAT reference MIME');
     assertDeepEqual([...referenceBytes.bytes], [...attachmentBytes]);
@@ -1319,6 +1326,7 @@ async function clientAccepts() {
       data_base64: 'eA==',
     });
     findCall(calls, 'GET', '/native/session/7/attachments/ref/3');
+    findCall(calls, 'GET', `/native/session/7/attachments/blob/${attachmentDigest}`);
     findCall(calls, 'GET', '/native/session/7/attachments/ref/3/bytes');
     findCall(calls, 'GET', `/native/session/7/attachments/blob/${attachmentDigest}/bytes`);
     assertDeepEqual(findCall(calls, 'GET', '/native/messages').query, {
@@ -3784,6 +3792,161 @@ async function pendingSubmissionTests() {
     assertEqual(uploads.length, 0, 'no upload for workspace source files');
     assertDeepEqual(starts[0].files, ['src/a.ts', 'crates/b.rs'], 'paths stay repository-context');
     assertEqual(starts[0].attachments, undefined, 'source files never become binary attachments');
+  });
+}
+
+// -------- 7b-3. attachment HTTP retrieval contract (audit findings 2/4)
+
+async function attachmentHttpContractTests() {
+  await test('attachment byte routes use the 7 MiB HTTP contract, not the 4 MiB generic cap', async () => {
+    // The generic cap stays 4 MiB; the attachment bound mirrors the daemon's
+    // HTTP upload/retrieval contract. A 4-7 MiB admission must round-trip.
+    assertEqual(nc.DEFAULT_MAX_BODY_BYTES, 4 * 1024 * 1024, 'the generic body cap stays 4 MiB');
+    assertEqual(
+      nc.ATTACHMENT_RESPONSE_MAX_BYTES,
+      7 * 1024 * 1024,
+      'the attachment response bound mirrors the daemon HTTP contract',
+    );
+    assert(
+      nc.ATTACHMENT_RESPONSE_MAX_BYTES > nc.DEFAULT_MAX_BODY_BYTES,
+      'the old 4 MiB generic cap would refuse a 4-7 MiB retrieval',
+    );
+    const mib = 1024 * 1024;
+    // Generated bounded payloads (no embedded literals): 4 MiB + 1 and
+    // exactly 7 MiB fit the retrieval contract; 7 MiB + 1 is refused typed.
+    const justOverFour = new Uint8Array(4 * mib + 1);
+    const seven = new Uint8Array(7 * mib);
+    const overSeven = new Uint8Array(7 * mib + 1);
+    for (const buffer of [justOverFour, seven, overSeven]) {
+      buffer[0] = 0x5a;
+      buffer[buffer.length - 1] = 0xa5;
+    }
+    const digestFour = 'a'.repeat(64);
+    const digestSeven = 'b'.repeat(64);
+    const digestOver = 'c'.repeat(64);
+    const { client, calls } = makeClient({
+      'GET /native/session/7/attachments/ref/1/bytes': () =>
+        bytesResponse(justOverFour, 'application/pdf'),
+      'GET /native/session/7/attachments/ref/2/bytes': () =>
+        bytesResponse(seven, 'application/pdf'),
+      'GET /native/session/7/attachments/ref/3/bytes': () =>
+        bytesResponse(overSeven, 'application/pdf'),
+      [`GET /native/session/7/attachments/blob/${digestFour}/bytes`]: () =>
+        bytesResponse(justOverFour, 'application/octet-stream'),
+      [`GET /native/session/7/attachments/blob/${digestSeven}/bytes`]: () =>
+        bytesResponse(seven, 'application/octet-stream'),
+      [`GET /native/session/7/attachments/blob/${digestOver}/bytes`]: () =>
+        bytesResponse(overSeven, 'application/octet-stream'),
+    });
+    const refFour = await client.attachmentReferenceBytes('7', 1);
+    assertEqual(
+      refFour.bytes.byteLength,
+      4 * mib + 1,
+      'a 4 MiB + 1 ref payload exceeds the old cap and still retrieves',
+    );
+    assertEqual(refFour.bytes[0], 0x5a, 'the first byte survives byte-exact');
+    assertEqual(refFour.bytes[refFour.bytes.byteLength - 1], 0xa5, 'the last byte survives byte-exact');
+    const refSeven = await client.attachmentReferenceBytes('7', 2);
+    assertEqual(refSeven.bytes.byteLength, 7 * mib, 'exactly 7 MiB ref bytes retrieve byte-exact');
+    const blobFour = await client.attachmentBlobBytes('7', digestFour);
+    assertEqual(
+      blobFour.byteLength,
+      4 * mib + 1,
+      'a 4 MiB + 1 blob payload exceeds the old cap and still retrieves',
+    );
+    const blobSeven = await client.attachmentBlobBytes('7', digestSeven);
+    assertEqual(blobSeven.byteLength, 7 * mib, 'exactly 7 MiB blob bytes retrieve byte-exact');
+    findCall(calls, 'GET', '/native/session/7/attachments/ref/1/bytes');
+    findCall(calls, 'GET', '/native/session/7/attachments/ref/2/bytes');
+    findCall(calls, 'GET', `/native/session/7/attachments/blob/${digestFour}/bytes`);
+    findCall(calls, 'GET', `/native/session/7/attachments/blob/${digestSeven}/bytes`);
+    // One byte over the contract is refused typed on BOTH byte routes.
+    for (const [label, call] of [
+      ['ref', () => client.attachmentReferenceBytes('7', 3)],
+      ['blob', () => client.attachmentBlobBytes('7', digestOver)],
+    ]) {
+      await assertRejects(
+        call,
+        (error) =>
+          error instanceof nc.NativeProtocolError &&
+          error.message.includes(`exceeded bound ${7 * mib}`),
+        `${label} 7 MiB + 1`,
+      );
+    }
+    // The generic body cap is NOT raised for every request: an ordinary JSON
+    // response over the configured bound still fails, so the attachment
+    // bound is a contract, not a global loosening.
+    const tiny = makeClient(
+      { 'GET /native/session/7/tasks': () => jsonResponse([clone(taskViewJson)]) },
+      { maxBodyBytes: 8 },
+    );
+    await assertRejects(
+      () => tiny.client.tasks('7'),
+      (error) => error instanceof nc.NativeProtocolError,
+      'generic body bound still applies',
+    );
+  });
+
+  await test('blob metadata route: 1 resolves, 0 is a 404, several are the typed 409 conflict', async () => {
+    const digest = 'd'.repeat(64);
+    const emptyDigest = 'e'.repeat(64);
+    const conflictDigest = 'f'.repeat(64);
+    const { client, calls } = makeClient({
+      [`GET /native/session/7/attachments/blob/${digest}`]: () => jsonResponse(attachmentRefJson),
+      [`GET /native/session/7/attachments/blob/${emptyDigest}`]: () =>
+        jsonResponse(
+          {
+            error: {
+              code: 'not_found',
+              message: `attachment blob ${emptyDigest} in session 7`,
+              retryable: false,
+            },
+          },
+          404,
+        ),
+      // The two-refs-same-digest fixture: the daemon never picks a winner;
+      // the 409 lists both candidate ref ids and the client surfaces it.
+      [`GET /native/session/7/attachments/blob/${conflictDigest}`]: () =>
+        jsonResponse(
+          {
+            error: {
+              code: 'conflict',
+              message:
+                `attachment digest ${conflictDigest} in session 7 has 2 references; ` +
+                'resolve one by ref_id: [11, 12]',
+              retryable: false,
+            },
+          },
+          409,
+        ),
+    });
+    assertDeepEqual(
+      await client.attachmentBlobReference('7', digest),
+      attachmentRefJson,
+      'exactly one reference resolves its own metadata',
+    );
+    findCall(calls, 'GET', `/native/session/7/attachments/blob/${digest}`);
+    await assertRejects(
+      () => client.attachmentBlobReference('7', emptyDigest),
+      (error) =>
+        error instanceof nc.NativeApiError && error.status === 404 && error.code === 'not_found',
+      'zero references',
+    );
+    await assertRejects(
+      () => client.attachmentBlobReference('7', conflictDigest),
+      (error) =>
+        error instanceof nc.NativeApiError &&
+        error.status === 409 &&
+        error.code === 'conflict' &&
+        error.retryable === false &&
+        error.message.includes('11') &&
+        error.message.includes('12'),
+      'several references',
+    );
+    assertProtocol(
+      () => client.attachmentBlobReference('7', 'not-a-digest'),
+      'digest must be 64 lowercase hex chars',
+    );
   });
 }
 
@@ -6822,6 +6985,7 @@ async function main() {
   await shadowDefaultTests();
   await completionContractTests();
   await pendingSubmissionTests();
+  await attachmentHttpContractTests();
   await boardAndForwardingTests();
   await permissionReplyTests();
   await draftPreservationTests();

@@ -1174,7 +1174,10 @@ fn task_error_from_core(e: faktor_core::Error) -> TaskError {
 
 /// Map one atomic-seed refusal onto the typed task error space. Every cause
 /// keeps its own variant; nothing here weakens the state-machine or CAS
-/// semantics into a prose-only error.
+/// semantics into a prose-only error. [`SeedTaskAttachmentRefusal::StateOrSetChanged`]
+/// is resolved by the caller through a bounded re-read (the writer job is
+/// SQL-only and never decodes the raw row); this fallback covers a re-read
+/// that itself changed again.
 fn seed_refusal_to_task_error(
     task_id: TaskId,
     refusal: faktor_store::SeedTaskAttachmentRefusal,
@@ -1194,13 +1197,9 @@ fn seed_refusal_to_task_error(
         faktor_store::SeedTaskAttachmentRefusal::Terminal { state } => {
             TaskError::TerminalTask { task_id, state }
         }
-        faktor_store::SeedTaskAttachmentRefusal::AttachmentsMismatch { expected, actual } => {
-            TaskError::AttachmentsChanged {
-                task_id,
-                expected,
-                actual,
-            }
-        }
+        faktor_store::SeedTaskAttachmentRefusal::StateOrSetChanged => TaskError::Conflict(format!(
+            "task {task_id} state or attachment set changed concurrently; re-read the row and retry the seed"
+        )),
         faktor_store::SeedTaskAttachmentRefusal::IllegalCreateState { state } => {
             TaskError::IllegalCreateState { state }
         }
@@ -1823,58 +1822,90 @@ impl SessionHandle {
                 .push(faktor_store::PreparedAttachmentRef::prepare(id).map_err(TaskError::from)?);
         }
         let now = self.manager.now_ms();
-        let (target, expected_revision, expected_attachments, expected_nonterminal, write) =
-            match create {
-                Some(mut template) => {
-                    template.attachments = attachments.to_vec();
-                    if template.created_ms == 0 {
-                        template.created_ms = now;
-                    }
-                    template.updated_ms = now;
-                    validate_task_fields(&template)?;
-                    let write = faktor_store::PreparedTaskWrite::prepare(task_row(
-                        template,
-                        TaskRevision::new(1),
-                    ))
+        let mut expected_revision = None;
+        let mut expected_attachments = None;
+        let (patch, write) = match create {
+            Some(mut template) => {
+                template.attachments = attachments.to_vec();
+                if template.created_ms == 0 {
+                    template.created_ms = now;
+                }
+                template.updated_ms = now;
+                validate_task_fields(&template)?;
+                let write = faktor_store::PreparedTaskWrite::prepare(task_row(
+                    template,
+                    TaskRevision::new(1),
+                ))
+                .map_err(TaskError::from)?;
+                (None, write)
+            }
+            None => {
+                let Some(row) = existing else {
+                    return Err(TaskError::NotFound(task_id));
+                };
+                let mut next = Task::from(row.clone());
+                next.attachments = attachments.to_vec();
+                next.updated_ms = now;
+                validate_task_fields(&next)?;
+                let revision = row
+                    .revision
+                    .checked_next()
+                    .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
+                let write = faktor_store::PreparedTaskWrite::prepare(task_row(next, revision))
                     .map_err(TaskError::from)?;
-                    (None, None, None, false, write)
-                }
-                None => {
-                    let Some(row) = existing else {
-                        return Err(TaskError::NotFound(task_id));
-                    };
-                    let mut next = Task::from(row.clone());
-                    next.attachments = attachments.to_vec();
-                    next.updated_ms = now;
-                    validate_task_fields(&next)?;
-                    let revision = row
-                        .revision
-                        .checked_next()
-                        .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
-                    let write = faktor_store::PreparedTaskWrite::prepare(task_row(next, revision))
-                        .map_err(TaskError::from)?;
-                    (
-                        Some(task_id),
-                        Some(row.revision),
-                        Some(row.attachments),
-                        true,
-                        write,
-                    )
-                }
-            };
+                expected_revision = Some(row.revision);
+                expected_attachments = Some(row.attachments.clone());
+                // The raw CAS expectation of the row the caller just read
+                // (audit finding 1): prepared HERE, never decoded by the
+                // writer job.
+                let patch =
+                    faktor_store::PreparedTaskExpectation::prepare(row).map_err(TaskError::from)?;
+                (Some(patch), write)
+            }
+        };
         let outcome = store
-            .seed_task_attachments_txn(
-                self.id,
-                target,
-                expected_revision,
-                expected_attachments,
-                expected_nonterminal,
-                &prepared_refs,
-                write,
-            )
+            .seed_task_attachments_txn(self.id, patch, &prepared_refs, write)
             .map_err(TaskError::from)?;
         match outcome {
             Ok(row) => Ok(Some(Task::from(row))),
+            Err(faktor_store::SeedTaskAttachmentRefusal::StateOrSetChanged) => {
+                // The writer job only compares raw text; recover the typed
+                // cause with a bounded caller-side re-read (never a decode on
+                // the writer owner).
+                if let (Some(expected_revision), Some(expected_attachments)) =
+                    (expected_revision, expected_attachments)
+                {
+                    match store.get_task(self.id, task_id)? {
+                        None => Err(TaskError::NotFound(task_id)),
+                        Some(row) if row.state.is_terminal() => Err(TaskError::TerminalTask {
+                            task_id,
+                            state: row.state,
+                        }),
+                        Some(row) if row.revision != expected_revision => {
+                            Err(TaskError::RevisionMismatch {
+                                task_id,
+                                expected: expected_revision,
+                                actual: row.revision,
+                            })
+                        }
+                        Some(row) if row.attachments != expected_attachments => {
+                            Err(TaskError::AttachmentsChanged {
+                                task_id,
+                                expected: expected_attachments,
+                                actual: row.attachments,
+                            })
+                        }
+                        Some(_) => Err(TaskError::Conflict(format!(
+                            "task {task_id} state changed concurrently without a revision bump; re-read the row and retry the seed"
+                        ))),
+                    }
+                } else {
+                    Err(seed_refusal_to_task_error(
+                        task_id,
+                        faktor_store::SeedTaskAttachmentRefusal::StateOrSetChanged,
+                    ))
+                }
+            }
             Err(refusal) => Err(seed_refusal_to_task_error(task_id, refusal)),
         }
     }

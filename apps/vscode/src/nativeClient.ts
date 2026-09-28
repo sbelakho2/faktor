@@ -77,6 +77,20 @@ export const DEFAULT_TIMEOUT_MS = 15_000;
 export const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 export const ERROR_BODY_BYTES = 64 * 1024;
 export const EVIDENCE_MAX_BODY_BYTES = 32 * 1024 * 1024;
+/**
+ * Decoded-byte ceiling of an attachment byte RESPONSE. Mirrors the daemon's
+ * HTTP attachment contract (`MAX_ATTACHMENT_UPLOAD_BYTES` in
+ * `crates/server/src/native/attachment.rs`): the ref/blob `.../bytes` routes
+ * serve at most the same 7 MiB the upload route accepts, so retrieval is
+ * never tighter than admission. This is deliberately NOT the generic
+ * `maxBodyBytes` cap (4 MiB) and NOT derived from the catalog: the daemon
+ * builds the served `attachmentLimits.maxUploadBytes` from this same
+ * constant, so deriving would only add state without changing the bound.
+ * The core CAS ceiling (32 MiB) is for programmatic callers; larger
+ * attachments are not retrievable over HTTP. The response stays BOUNDED:
+ * an over-bound body is cancelled and refused typed.
+ */
+export const ATTACHMENT_RESPONSE_MAX_BYTES = 7 * 1024 * 1024;
 
 export interface NativeClientOptions {
   readonly baseUrl: string;
@@ -3905,7 +3919,30 @@ export class NativeClient {
     );
   }
 
-  /** The verified bytes of ONE reference, with THAT reference's MIME. */
+  /**
+   * Resolve ONE blob's metadata by digest: exactly one reference of this
+   * session resolves, zero is a typed 404, and several are the daemon's
+   * typed 409 conflict naming the candidate `ref_id`s. The conflict is
+   * surfaced as a `NativeApiError` (`status=409`, `code='conflict'`),
+   * never swallowed or resolved to an arbitrary reference.
+   */
+  attachmentBlobReference(sessionId: string, digest: string): Promise<NativeAttachmentRef> {
+    if (!/^[0-9a-f]{64}$/.test(digest)) {
+      throw new NativeProtocolError(
+        'GET /native/session/{id}/attachments/blob/{digest}',
+        `digest must be 64 lowercase hex chars, got ${JSON.stringify(digest)}`,
+      );
+    }
+    return this.request(
+      'GET',
+      `/native/session/${encodeURIComponent(sessionId)}/attachments/blob/${encodeURIComponent(digest)}`,
+      { validate: (json, path) => validateAttachmentRef(json, path) },
+    );
+  }
+
+  /** The verified bytes of ONE reference, with THAT reference's MIME. The
+   *  response bound is the HTTP attachment contract, never the generic
+   *  body cap (a 4-7 MiB admission must be retrievable). */
   attachmentReferenceBytes(sessionId: string, refId: number): Promise<NativeAttachmentBytes> {
     if (!Number.isInteger(refId) || refId < 1) {
       throw new NativeProtocolError(
@@ -3916,7 +3953,7 @@ export class NativeClient {
     return this.requestBytes(
       'GET',
       `/native/session/${encodeURIComponent(sessionId)}/attachments/ref/${encodeURIComponent(String(refId))}/bytes`,
-      this.maxBodyBytes,
+      ATTACHMENT_RESPONSE_MAX_BYTES,
     );
   }
 
@@ -3932,7 +3969,7 @@ export class NativeClient {
     return this.requestBytes(
       'GET',
       `/native/session/${encodeURIComponent(sessionId)}/attachments/blob/${encodeURIComponent(digest)}/bytes`,
-      this.maxBodyBytes,
+      ATTACHMENT_RESPONSE_MAX_BYTES,
     ).then((payload) => payload.bytes);
   }
 

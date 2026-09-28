@@ -156,6 +156,22 @@ class NativeClient(
         const val EVIDENCE_MAX_BODY_BYTES = 32L * 1024 * 1024
         const val READY_POLL_MS = 100L
 
+        /**
+         * Decoded-byte ceiling of an attachment byte RESPONSE. Mirrors the
+         * daemon's HTTP attachment contract (`MAX_ATTACHMENT_UPLOAD_BYTES`
+         * in `crates/server/src/native/attachment.rs`): the ref/blob
+         * `.../bytes` routes serve at most the same 7 MiB the upload route
+         * accepts, so retrieval is never tighter than admission. This is
+         * deliberately NOT the generic [DEFAULT_MAX_BODY_BYTES] cap (4 MiB)
+         * and NOT derived from the catalog: the daemon builds the served
+         * `attachmentLimits.maxUploadBytes` from this same constant, so
+         * deriving would only add state without changing the bound. The core
+         * CAS ceiling (32 MiB) is for programmatic callers; larger
+         * attachments are not retrievable over HTTP. Responses stay BOUNDED:
+         * an over-bound body is closed and refused typed.
+         */
+        const val ATTACHMENT_RESPONSE_MAX_BYTES = 7L * 1024 * 1024
+
         fun forConnection(
             connection: BackendConnection,
             controlToken: String? = null,
@@ -335,16 +351,40 @@ class NativeClient(
     }
 
     /**
+     * Resolve ONE blob's metadata by digest: exactly one reference of this
+     * session resolves, zero is a typed 404, and several are the daemon's
+     * typed 409 conflict naming the candidate `ref_id`s. The conflict
+     * surfaces as a [NativeApiException] (`status = 409`, `code =
+     * "conflict"`), never swallowed or resolved to an arbitrary reference.
+     */
+    fun attachmentBlobReference(sessionId: String, digest: String): ProtocolAttachmentRef {
+        val path = "GET /native/session/{id}/attachments/blob/{digest}"
+        if (!Regex("^[0-9a-f]{64}$").matches(digest)) {
+            throw NativeProtocolException(path, "digest must be 64 lowercase hex chars")
+        }
+        return parseAttachmentRef(
+            request(
+                "GET",
+                "/native/session/" + encode(sessionId) + "/attachments/blob/" + encode(digest)
+            ),
+            path
+        )
+    }
+
+    /**
      * The verified bytes of exactly ONE durable attachment REFERENCE, served
      * with THAT reference's MIME: two references sharing one CAS blob keep
-     * their own metadata through this route.
+     * their own metadata through this route. The response bound is the HTTP
+     * attachment contract, never the generic body cap (a 4-7 MiB admission
+     * must still be retrievable).
      */
     fun attachmentReferenceBytes(sessionId: String, refId: Long): AttachmentBytes {
         val path = "GET /native/session/{id}/attachments/ref/{ref_id}/bytes"
         if (refId < 1L) throw NativeProtocolException(path, "refId must be positive, got $refId")
         return requestBytes(
             "GET",
-            "/native/session/" + encode(sessionId) + "/attachments/ref/" + refId + "/bytes"
+            "/native/session/" + encode(sessionId) + "/attachments/ref/" + refId + "/bytes",
+            ATTACHMENT_RESPONSE_MAX_BYTES
         )
     }
 
@@ -359,7 +399,8 @@ class NativeClient(
         }
         return requestBytes(
             "GET",
-            "/native/session/" + encode(sessionId) + "/attachments/blob/" + encode(digest) + "/bytes"
+            "/native/session/" + encode(sessionId) + "/attachments/blob/" + encode(digest) + "/bytes",
+            ATTACHMENT_RESPONSE_MAX_BYTES
         ).bytes
     }
 
