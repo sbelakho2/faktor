@@ -21,7 +21,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         updated_ms INTEGER NOT NULL
      );
      CREATE TABLE IF NOT EXISTS event (
-        seq INTEGER NOT NULL,
+        seq INTEGER NOT NULL CHECK (seq > 0),
         session_id INTEGER NOT NULL REFERENCES session(id),
         op_id INTEGER,
         kind TEXT NOT NULL,
@@ -782,5 +782,25 @@ mod tests {
             s.last_event_seq(SessionId::new(1)).unwrap().unwrap().raw(),
             1
         );
+    }
+
+    #[test]
+    fn fresh_event_table_rejects_non_positive_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let session = store.create_session(ws, "t", "p", "m").unwrap();
+        let conn = store.raw_conn();
+        for hostile in [0i64, -1, i64::MIN] {
+            let r = conn.execute(
+                "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver)
+                 VALUES (?1, ?2, NULL, 'model_started', '\"streaming\"', 0, NULL, 1)",
+                params![hostile, session.id.raw() as i64],
+            );
+            assert!(
+                r.is_err(),
+                "fresh schema must reject event.seq = {hostile}: {r:?}"
+            );
+        }
     }
 }

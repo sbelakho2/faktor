@@ -98,13 +98,21 @@ pub struct JournalInvariants;
 impl JournalInvariants {
     /// Sequence numbers must be exactly `prev + 1`; gaps or duplicates are
     /// corruption (or replay) and are rejected by the store.
+    ///
+    /// # Panics
+    /// Panics at `u64::MAX` (`event seq overflow`); durable callers holding
+    /// hostile or persisted input must use [`Self::checked_next_seq`].
     pub fn next_seq(prev: Option<EventSeq>) -> EventSeq {
+        Self::checked_next_seq(prev).expect("event seq overflow")
+    }
+
+    /// [`Self::next_seq`] without the overflow panic: `None` only when the
+    /// next raw value would leave the `u64` domain (a durable row decoded at
+    /// `u64::MAX` is corruption to surface typed, never an abort).
+    pub fn checked_next_seq(prev: Option<EventSeq>) -> Option<EventSeq> {
         match prev {
-            None => EventSeq::new(1),
-            Some(p) => {
-                let raw = p.raw().checked_add(1).expect("event seq overflow");
-                EventSeq::new(raw)
-            }
+            None => Some(EventSeq::new(1)),
+            Some(p) => p.raw().checked_add(1).map(EventSeq::new),
         }
     }
 
@@ -132,6 +140,24 @@ mod tests {
         // u64::MAX + 1 would overflow; next_seq is contractually forbidden
         // from being called there (checked_add panics loudly).
         assert_eq!(EventSeq::new(u64::MAX).raw(), u64::MAX);
+    }
+
+    #[test]
+    fn checked_next_seq_reports_overflow_instead_of_panicking() {
+        assert_eq!(JournalInvariants::checked_next_seq(None).unwrap().raw(), 1);
+        // The last seq of the SQLite signed column still yields a raw next
+        // value; crossing the signed boundary is the durable caller's
+        // `i64::try_from` decision, never a panic here.
+        assert_eq!(
+            JournalInvariants::checked_next_seq(Some(EventSeq::new(i64::MAX as u64)))
+                .unwrap()
+                .raw(),
+            i64::MAX as u64 + 1
+        );
+        assert_eq!(
+            JournalInvariants::checked_next_seq(Some(EventSeq::new(u64::MAX))),
+            None
+        );
     }
 
     #[test]

@@ -529,7 +529,7 @@ pub(crate) enum PreparedHotWrite {
         ts_ms: i64,
         payload_json: Option<String>,
         payload_ver: i64,
-        seq_corrupt_message: String,
+        seq_messages: EventSeqMessages,
     },
     PutMessage {
         session_id: SessionId,
@@ -579,7 +579,7 @@ impl PreparedHotWrite {
                 ts_ms: *ts_ms,
                 payload_json: payload.as_ref().map(|p| p.to_string()),
                 payload_ver: *payload_ver,
-                seq_corrupt_message: format!("event journal of session {session_id} MAX(seq)"),
+                seq_messages: EventSeqMessages::for_session(*session_id),
             },
             HotWrite::PutMessage {
                 session_id,
@@ -2240,7 +2240,7 @@ impl Store {
                 ts_ms,
                 payload_json,
                 payload_ver,
-                seq_corrupt_message,
+                seq_messages,
             } => Self::insert_event_locked(
                 conn,
                 *session_id,
@@ -2250,7 +2250,7 @@ impl Store {
                 *ts_ms,
                 payload_json.clone(),
                 *payload_ver,
-                seq_corrupt_message,
+                seq_messages,
             )
             .map(HotWriteOutcome::EventSeq),
             PreparedHotWrite::PutMessage {
@@ -3078,14 +3078,17 @@ mod typed_ledger_tests {
         }
     }
 
-    /// Run one raw write with foreign keys OFF, then restore them: corrupting
-    /// a referenced id column behind the typed API's back is exactly the
-    /// hand-corrupted database the read-time decodes must survive.
+    /// Run one raw write with foreign keys and CHECK constraints OFF, then
+    /// restore them: corrupting a referenced id column (or a `CHECK`-guarded
+    /// seq) behind the typed API's back is exactly the hand-corrupted
+    /// database the read-time decodes must survive.
     pub(crate) fn corrupt_ignoring_fks(store: &Store, sql: &str, params: &[&dyn rusqlite::ToSql]) {
         let conn = store.raw_conn();
-        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON")
+            .unwrap();
         conn.execute(sql, params).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF")
+            .unwrap();
     }
 
     /// The persisted-id decode class across the id COLUMN types: a zero

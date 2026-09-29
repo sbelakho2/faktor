@@ -518,6 +518,39 @@ enum RawAdmitOutcome {
     Claimed(RawAdmittedPrompt),
 }
 
+/// The caller-prepared journal diagnostics of one session's event append:
+/// the `MAX(seq)` decode context and the seq-overflow context. Prepared on
+/// the caller's thread (audit item 8) so the insert helper stays
+/// `format!`-free and the writer owner never formats or allocates a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventSeqMessages {
+    /// Decode context for a hostile `MAX(seq)` raw (`id_field` names it).
+    pub(crate) seq_corrupt_message: String,
+    /// Returned verbatim when the next seq leaves the `u64` or `i64` domain.
+    pub(crate) seq_overflow_message: String,
+}
+
+impl EventSeqMessages {
+    pub(crate) fn for_session(session_id: SessionId) -> Self {
+        Self {
+            seq_corrupt_message: format!("event journal of session {session_id} MAX(seq)"),
+            seq_overflow_message: format!(
+                "event journal of session {session_id} event seq overflow"
+            ),
+        }
+    }
+
+    /// The seed append of a brand-new session: the id is SQLite-allocated
+    /// inside the transaction, so both diagnostics stay session-agnostic
+    /// static text.
+    pub(crate) fn for_new_session() -> Self {
+        Self {
+            seq_corrupt_message: "event journal of a new session MAX(seq)".to_owned(),
+            seq_overflow_message: "event journal of a new session event seq overflow".to_owned(),
+        }
+    }
+}
+
 impl Store {
     /// Append an event with the next per-session sequence number, atomically.
     /// Duplicate/gap sequences are impossible under the transaction; the
@@ -557,7 +590,7 @@ impl Store {
         let payload_json = payload.map(|p| p.to_string());
         let state_json = serde_json::to_string(&state).unwrap();
         // Preparation BEFORE enqueueing: the journal diagnostic context.
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer.execute("append_event_v", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let seq = Self::insert_event_locked(
@@ -569,7 +602,7 @@ impl Store {
                 ts_ms,
                 payload_json,
                 payload_ver,
-                &seq_corrupt_message,
+                &seq_messages,
             )?;
             // Durability boundary: crossing `ev_precommit` fires the crash
             // AFTER the insert executed but BEFORE the COMMIT (the append
@@ -589,8 +622,8 @@ impl Store {
     /// is a bare `&Connection`: a live `rusqlite::Transaction` derefs to one,
     /// and the actor batch passes its outer transaction connection directly.
     /// `state_json` is the caller-prepared serialization of the event's
-    /// landing state and `seq_corrupt_message` the caller-prepared
-    /// diagnostic context — the writer owner never runs serde or formatting.
+    /// landing state and `seq_messages` the caller-prepared diagnostic
+    /// contexts — the writer owner never runs serde or formatting.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_event_locked(
         conn: &Connection,
@@ -601,34 +634,45 @@ impl Store {
         ts_ms: i64,
         payload_json: Option<String>,
         payload_ver: i64,
-        seq_corrupt_message: &str,
+        seq_messages: &EventSeqMessages,
     ) -> StoreResult<EventSeq> {
         // Serialize appends per session so seq computation is race-free.
         // (The single-owner writer service already serializes every command;
-        // the per-session query is a second belt.)
-        let prev: Option<i64> = conn.query_row(
-            "SELECT MAX(seq) FROM event WHERE session_id = ?1",
-            params![session_id.raw() as i64],
-            |r| r.get(0),
-        )?;
-        let prev_seq = id_field_opt::<EventSeq>(seq_corrupt_message, prev)?;
-        let seq = JournalInvariants::next_seq(prev_seq);
-        let ts = JournalInvariants::monotonic_ts(
-            prev.map(|_| {
-                // Use the previous event's ts for monotonicity.
-                conn.query_row(
-                    "SELECT ts_ms FROM event WHERE session_id = ?1 AND seq = (SELECT MAX(seq) FROM event WHERE session_id = ?1)",
-                    params![session_id.raw() as i64],
-                    |r| r.get::<_, i64>(0),
-                ).unwrap_or(0)
-            }),
-            ts_ms,
-        );
+        // the per-session query is a second belt.) ONE fallible latest-event
+        // read serves BOTH the previous seq and the previous ts: any
+        // decode/DB failure is loud corruption, never a silent `prev_ts = 0`
+        // that would mask a break in the non-decreasing guarantee.
+        let latest: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT seq, ts_ms FROM event WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![session_id.raw() as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let (prev_seq, prev_ts) = match latest {
+            Some((raw_seq, prev_ts)) => (
+                Some(id_field::<EventSeq>(
+                    &seq_messages.seq_corrupt_message,
+                    raw_seq,
+                )?),
+                Some(prev_ts),
+            ),
+            None => (None, None),
+        };
+        // Durable input never panics and never wraps: `checked_next_seq`
+        // guards the u64 domain, `i64::try_from` the SQLite signed column.
+        // Either failure is the caller-prepared overflow corruption, refused
+        // before any row is written.
+        let seq = JournalInvariants::checked_next_seq(prev_seq)
+            .ok_or_else(|| StoreError::Corrupt(vec![seq_messages.seq_overflow_message.clone()]))?;
+        let seq_i64 = i64::try_from(seq.raw())
+            .map_err(|_| StoreError::Corrupt(vec![seq_messages.seq_overflow_message.clone()]))?;
+        let ts = JournalInvariants::monotonic_ts(prev_ts, ts_ms);
         conn.execute(
             "INSERT INTO event(seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                seq.raw() as i64,
+                seq_i64,
                 session_id.raw() as i64,
                 op_id.map(|o| o.raw() as i64),
                 kind_name(kind),
@@ -670,7 +714,7 @@ impl Store {
         // Preparation BEFORE enqueueing: the journal diagnostic context and
         // the timestamp are captured on the caller's thread (audit item 8) —
         // the writer job executes SQL only.
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         let now = now_ms();
         self.writer.execute("record_compaction_and_event", move |conn| {
         let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -702,7 +746,7 @@ impl Store {
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
-            &seq_corrupt_message,
+            &seq_messages,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -2306,6 +2350,211 @@ mod tests {
             params![s.id.raw() as i64],
         );
         assert!(r.is_err(), "duplicate (session,seq) must be rejected by PK");
+    }
+
+    fn event_row_count(store: &Store, sid: SessionId) -> i64 {
+        let conn = store.raw_conn();
+        conn.query_row(
+            "SELECT COUNT(*) FROM event WHERE session_id = ?1",
+            params![sid.raw() as i64],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Hostile raw write of the session's event seq: `CHECK (seq > 0)` is
+    /// bypassed the way an attacker with file access (or a database written
+    /// before the CHECK existed) bypasses it, so the append guard itself must
+    /// be what refuses.
+    fn seed_only_event_seq(store: &Store, sid: SessionId, seq: i64) {
+        let conn = store.raw_conn();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE event SET seq = ?2 WHERE session_id = ?1",
+                params![sid.raw() as i64, seq],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the hostile seed must rewrite the event row");
+    }
+
+    /// A refused append must leave the journal and the session row exactly as
+    /// they were: no event row appeared and neither `state` nor `updated_ms`
+    /// moved.
+    fn assert_append_refused_without_mutation(store: &Store, before: &SessionRow, rows: i64) {
+        assert_eq!(
+            event_row_count(store, before.id),
+            rows,
+            "a refused append must insert no event row"
+        );
+        let after = store.get_session(before.id).unwrap().unwrap();
+        assert_eq!(after.state, before.state, "session state must be untouched");
+        assert_eq!(
+            after.updated_ms, before.updated_ms,
+            "session updated_ms must be untouched"
+        );
+    }
+
+    fn hostile_append(store: &Store, sid: SessionId) -> StoreError {
+        store
+            .append_event(
+                sid,
+                None,
+                EventKind::PromptReceived,
+                AgentState::Preparing,
+                now_ms(),
+                None,
+            )
+            .unwrap_err()
+    }
+
+    #[test]
+    fn hostile_i64_max_prev_seq_append_refuses_typed_without_mutation() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        seed_only_event_seq(&store, s.id, i64::MAX);
+        match hostile_append(&store, s.id) {
+            StoreError::Corrupt(msgs) => assert!(
+                msgs.iter().any(|m| m.contains("overflow")),
+                "the signed-boundary refusal must name the overflow: {msgs:?}"
+            ),
+            other => panic!("i64::MAX previous seq must refuse typed Corrupt, got {other:?}"),
+        }
+        assert_eq!(
+            store.last_event_seq(s.id).unwrap().unwrap().raw(),
+            i64::MAX as u64,
+            "the hostile row itself is untouched, never wrapped"
+        );
+        assert_append_refused_without_mutation(&store, &s, 1);
+    }
+
+    #[test]
+    fn hostile_negative_prev_seq_append_refuses_typed_without_mutation() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        seed_only_event_seq(&store, s.id, -1);
+        match hostile_append(&store, s.id) {
+            StoreError::Corrupt(msgs) => assert!(
+                msgs.iter().any(|m| m.contains("overflow")),
+                "a -1 seq (the u64 upper half) must refuse as overflow: {msgs:?}"
+            ),
+            other => panic!("a negative previous seq must refuse typed Corrupt, got {other:?}"),
+        }
+        assert_eq!(
+            store.last_event_seq(s.id).unwrap().unwrap().raw(),
+            u64::MAX,
+            "-1 decodes as u64::MAX, the exact upper-half read is preserved"
+        );
+        assert_append_refused_without_mutation(&store, &s, 1);
+    }
+
+    #[test]
+    fn hostile_zero_prev_seq_append_refuses_typed_without_mutation() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        seed_only_event_seq(&store, s.id, 0);
+        match hostile_append(&store, s.id) {
+            StoreError::Corrupt(msgs) => assert!(
+                msgs.iter().any(|m| m.contains("MAX(seq)")),
+                "a zero seq must refuse through the decode context: {msgs:?}"
+            ),
+            other => panic!("a zero previous seq must refuse typed Corrupt, got {other:?}"),
+        }
+        assert_append_refused_without_mutation(&store, &s, 1);
+    }
+
+    #[test]
+    fn seq_at_i64_max_minus_one_appends_once_then_refuses_at_the_boundary() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        seed_only_event_seq(&store, s.id, i64::MAX - 1);
+        let seq = store
+            .append_event(
+                s.id,
+                None,
+                EventKind::PromptReceived,
+                AgentState::Preparing,
+                now_ms(),
+                None,
+            )
+            .expect("the last signed seq is still usable");
+        assert_eq!(seq.raw(), i64::MAX as u64);
+        let before = store.get_session(s.id).unwrap().unwrap();
+        match hostile_append(&store, s.id) {
+            StoreError::Corrupt(msgs) => assert!(
+                msgs.iter().any(|m| m.contains("overflow")),
+                "the next append must name the overflow: {msgs:?}"
+            ),
+            other => panic!("the i64::MAX boundary must refuse typed Corrupt, got {other:?}"),
+        }
+        assert_append_refused_without_mutation(&store, &before, 2);
+    }
+
+    #[test]
+    fn hostile_prev_ts_type_append_refuses_typed_without_mutation() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.raw_conn();
+            conn.execute(
+                "UPDATE event SET ts_ms = 'hostile-text' WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        let err = hostile_append(&store, s.id);
+        assert!(
+            matches!(err, StoreError::Corrupt(_) | StoreError::Sqlite(_)),
+            "a non-integer previous ts must refuse typed, never default to 0: {err:?}"
+        );
+        assert_append_refused_without_mutation(&store, &s, 1);
+    }
+
+    #[test]
+    fn append_ts_is_monotonic_and_seq_is_gapless() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let seed_ts = store.events_range(s.id, 1, None).unwrap()[0].ts_ms;
+        let seq2 = store
+            .append_event(
+                s.id,
+                None,
+                EventKind::PromptReceived,
+                AgentState::Preparing,
+                seed_ts - 60_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(seq2.raw(), 2);
+        let seq3 = store
+            .append_event(
+                s.id,
+                None,
+                EventKind::ModelStarted,
+                AgentState::Streaming,
+                seed_ts + 60_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(seq3.raw(), 3);
+        let events = store.events_range(s.id, 1, None).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].ts_ms, seed_ts);
+        assert_eq!(
+            events[1].ts_ms, seed_ts,
+            "a backward clock clamps to the previous ts"
+        );
+        assert_eq!(events[2].ts_ms, seed_ts + 60_000);
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e.seq.raw(), (i + 1) as u64, "gapless seq at {i}");
+        }
     }
 
     #[test]

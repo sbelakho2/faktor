@@ -918,3 +918,23 @@ fn concurrent_duplicate_resolution_has_exactly_one_winner() {
     let winner = if r1.is_ok() { "allow" } else { "deny" };
     assert_eq!(decision, winner, "the durable decision matches the winner");
 }
+
+#[test]
+fn every_agent_state_vocabulary_arm_round_trips_through_the_row_serializer() {
+    let vocabulary = all_agent_states();
+    let canonical = valid_state_json();
+    assert_eq!(
+        canonical.len(),
+        vocabulary.len(),
+        "the OnceLock vocabulary must cover every arm exactly once"
+    );
+    for state in vocabulary {
+        let text = serde_json::to_string(&state).expect("in-process state serialization");
+        let back: AgentState = serde_json::from_str(&text).expect("in-process state decode");
+        assert_eq!(back, state, "vocabulary arm {state:?} must round-trip");
+        assert!(
+            canonical.contains(&text),
+            "vocabulary text {text:?} must be the exact durable-row text"
+        );
+    }
+}
