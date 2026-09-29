@@ -1492,9 +1492,14 @@ impl SessionMemory {
         limit: i64,
     ) -> Result<FactsPage, faktor_store::StoreError> {
         let limit = limit.clamp(1, MAX_FACT_PAGE_SIZE);
+        let page_limit = u64::try_from(limit).map_err(|_| {
+            faktor_store::StoreError::Malformed(format!(
+                "memory fact page limit {limit} is negative"
+            ))
+        })?;
         let (rows, has_more) = self
             .store
-            .memory_facts_page(self.session, after, limit as u64)?;
+            .memory_facts_page(self.session, after, page_limit)?;
         let cursor = if has_more {
             rows.last()
                 .map(|r| (r.updated_ms, r.kind.clone(), r.key.clone()))
@@ -1694,6 +1699,22 @@ mod tests {
             assert!(p.facts.is_empty());
             assert!(!p.has_more);
         }
+    }
+
+    #[test]
+    fn hostile_max_page_limit_clamps_to_the_bound() {
+        let (_d, store, session) = fixture();
+        let mem = SessionMemory::new(store.clone(), session);
+        for i in 0..(MAX_FACT_PAGE_SIZE as usize + 3) {
+            mem.remember("decision", &format!("k{i:03}"), "v").unwrap();
+        }
+        let p = mem.facts_page(None, i64::MAX).unwrap();
+        assert_eq!(p.size, MAX_FACT_PAGE_SIZE, "hostile max clamps");
+        assert_eq!(p.facts.len(), MAX_FACT_PAGE_SIZE as usize);
+        assert!(p.has_more, "the probe row proves more facts exist");
+        let p = mem.facts_page(None, i64::MIN).unwrap();
+        assert_eq!(p.size, 1, "hostile min clamps to one");
+        assert_eq!(p.facts.len(), 1);
     }
 
     #[test]

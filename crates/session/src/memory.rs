@@ -73,10 +73,13 @@ impl SessionHandle {
         limit: i64,
     ) -> faktor_core::Result<MemoryFactsPage> {
         let limit = limit.clamp(1, MAX_FACT_PAGE_SIZE);
+        let page_limit = u64::try_from(limit).map_err(|_| {
+            SessionError::Malformed(format!("memory fact page limit {limit} is negative"))
+        })?;
         let (rows, has_more) = self
             .manager
             .store()
-            .memory_facts_page(self.id, after, limit as u64)
+            .memory_facts_page(self.id, after, page_limit)
             .map_err(crate::map_store_err)?;
         let cursor = if has_more {
             rows.last()
@@ -225,6 +228,16 @@ mod tests {
             assert!(!p.has_more);
             assert_eq!(p.cursor, None);
         }
+    }
+
+    #[test]
+    fn hostile_max_page_limit_clamps_to_the_bound() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let page = s.memory_facts_page(None, i64::MAX).unwrap();
+        assert_eq!(page.size, MAX_FACT_PAGE_SIZE, "hostile max clamps");
+        let page = s.memory_facts_page(None, i64::MIN).unwrap();
+        assert_eq!(page.size, 1, "hostile min clamps");
     }
 
     #[test]

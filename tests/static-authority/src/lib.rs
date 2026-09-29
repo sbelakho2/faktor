@@ -8368,8 +8368,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
     /// The mechanical gate for the recurring persistence-boundary cast class
     /// (waves 27-30): a page limit or monotonic sequence may only cross the
     /// SQLite boundary through a checked conversion or an explicitly
-    /// documented sentinel, never an unchecked `as i64`/`as u64`. The
-    /// allowlist is empty; the planted case proves the scan fires.
+    /// documented sentinel, never an unchecked `as i64`/`as u64`. The scan
+    /// covers EVERY walked crate source (production kept-ranges only), not a
+    /// prefix subset, so a new store crate inherits the gate. The allowlist
+    /// is empty; the planted case proves the scan fires.
     #[test]
     fn persistence_limits_and_sequences_are_never_cast_unchecked() {
         let planted = "fn f(limit: u64) { let _ = limit as i64; }";
@@ -8381,12 +8383,6 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         );
         let mut hits = Vec::new();
         for rel in walk_crate_sources() {
-            let in_scope = rel.starts_with("crates/store/src/")
-                || rel.starts_with("crates/server/src/native/")
-                || rel.starts_with("crates/evidence/src/");
-            if !in_scope {
-                continue;
-            }
             let Some(f) = load(&rel) else { continue };
             if f.kept.is_empty() {
                 continue;

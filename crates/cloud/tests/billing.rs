@@ -883,6 +883,42 @@ fn sqlite_billing_store_roundtrip_survives_a_restart() {
 }
 
 #[test]
+fn hostile_page_limit_is_refused_typed_without_wrapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("billing.db");
+    let store = SqliteControlPlaneStore::open(&path).unwrap();
+    // Only 64-bit `usize` can hold a limit above SQLite's signed domain
+    // (on 32-bit every `usize` fits `i64`, so no refusal is expressible).
+    if i64::try_from(usize::MAX).is_ok() {
+        return;
+    }
+    let organization = org("org_a");
+    assert!(store
+        .billing_accounts(&organization, None, 10)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .credit_entries(&organization, 0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(store.report_periods(&organization, 10).unwrap().is_empty());
+    for err in [
+        store
+            .billing_accounts(&organization, None, usize::MAX)
+            .unwrap_err(),
+        store
+            .credit_entries(&organization, 0, usize::MAX)
+            .unwrap_err(),
+        store.report_periods(&organization, usize::MAX).unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, BillingStoreError::Malformed(_)),
+            "the upper half of usize is refused typed, never wrapped: {err:?}"
+        );
+    }
+}
+
+#[test]
 fn credit_refusals_are_typed_and_write_nothing() {
     // The memory store and SQLite store must agree on the exact refusal
     // vocabulary (a divergence would be an accounting hole).

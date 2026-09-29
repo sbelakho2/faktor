@@ -409,8 +409,11 @@ impl SessionManager {
         self.reads
             .submit_tagged(DbReadKind::Memory, move |store| {
                 let limit = limit.clamp(1, crate::memory::MAX_FACT_PAGE_SIZE);
+                let page_limit = u64::try_from(limit).map_err(|_| {
+                    SessionError::Malformed(format!("memory fact page limit {limit} is negative"))
+                })?;
                 let (rows, has_more) = store
-                    .memory_facts_page(session, after.as_ref(), limit as u64)
+                    .memory_facts_page(session, after.as_ref(), page_limit)
                     .map_err(crate::map_store_err)?;
                 let cursor = if has_more {
                     rows.last()
