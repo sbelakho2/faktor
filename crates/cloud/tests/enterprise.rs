@@ -12,10 +12,10 @@ use faktor_cloud::enterprise::{
     BlobDeletion, BlobStoreError, RetentionBlobStore, RetentionReferenceOracle,
 };
 use faktor_cloud::{
-    ArtifactId, ArtifactKind, ArtifactReference, AuditAction, DeletionScope, DeletionState,
-    DeletionStep, EnterpriseService, EnterpriseStore, ManualClock, NewArtifact, NoReferences,
-    OrgSettings, OrganizationId, Principal, ReferenceKind, ReferenceScanError, RetentionClass,
-    Role, SqliteControlPlaneStore, SsoConfigRef, UserId,
+    ArtifactId, ArtifactKind, ArtifactReference, AuditAction, CloudStoreError, DeletionScope,
+    DeletionState, DeletionStep, EnterpriseService, EnterpriseStore, ManualClock, NewArtifact,
+    NoReferences, OrgSettings, OrganizationId, Principal, ReferenceKind, ReferenceScanError,
+    RetentionClass, Role, SqliteControlPlaneStore, SsoConfigRef, UserId,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -615,6 +615,38 @@ fn audit_rows_live_in_their_own_table_and_never_mix_with_proof_rows() {
         .query_row("SELECT COUNT(*) FROM ent_audit_event", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[test]
+fn hostile_page_limit_is_refused_typed_without_wrapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteControlPlaneStore::open(&dir.path().join("cp.db")).unwrap();
+    // Only 64-bit `usize` can hold a limit above SQLite's signed domain
+    // (on 32-bit every `usize` fits `i64`, so no refusal is expressible).
+    if i64::try_from(usize::MAX).is_ok() {
+        return;
+    }
+    let organization = org("org_1");
+    assert!(store.audit_events(&organization, 0, 10).unwrap().is_empty());
+    for err in [
+        store
+            .audit_events(&organization, 0, usize::MAX)
+            .unwrap_err(),
+        store
+            .artifacts(&organization, None, usize::MAX)
+            .unwrap_err(),
+        store
+            .deletion_jobs(&organization, None, usize::MAX)
+            .unwrap_err(),
+        store
+            .config_layers(&organization, None, usize::MAX)
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, CloudStoreError::Malformed(_)),
+            "the upper half of usize is refused typed, never wrapped: {err:?}"
+        );
+    }
 }
 
 #[test]

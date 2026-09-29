@@ -410,6 +410,15 @@ fn parse<T: for<'de> Deserialize<'de>>(payload: &str) -> Result<T, CloudStoreErr
     serde_json::from_str(payload).map_err(|e| CloudStoreError::Malformed(e.to_string()))
 }
 
+/// Page limits arrive as `usize` but bind into SQLite's signed range: a
+/// limit above `i64::MAX` is refused typed instead of wrapping negative
+/// (SQLite reads a negative LIMIT as unbounded).
+fn checked_page_limit(limit: usize) -> Result<i64, CloudStoreError> {
+    i64::try_from(limit).map_err(|_| {
+        CloudStoreError::Malformed(format!("page limit {limit} exceeds SQLite signed range"))
+    })
+}
+
 fn scoped_rows<T: for<'de> Deserialize<'de>>(
     conn: &Connection,
     sql: &str,
@@ -469,6 +478,7 @@ impl EnterpriseStore for SqliteControlPlaneStore {
         after_seq: i64,
         limit: usize,
     ) -> Result<Vec<AuditEvent>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
@@ -478,16 +488,13 @@ impl EnterpriseStore for SqliteControlPlaneStore {
             )
             .map_err(backend)?;
         let rows = stmt
-            .query_map(
-                params![organization.as_str(), after_seq, limit as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
+            .query_map(params![organization.as_str(), after_seq, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
@@ -556,17 +563,14 @@ impl EnterpriseStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ArtifactRecord>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_rows(
             &conn,
             "SELECT payload FROM ent_artifact
              WHERE organization_id = ?1 AND id > ?2
              ORDER BY id ASC LIMIT ?3",
-            &[
-                &organization.as_str(),
-                &after.unwrap_or(""),
-                &(limit as i64),
-            ],
+            &[&organization.as_str(), &after.unwrap_or(""), &limit],
         )
     }
 
@@ -613,17 +617,14 @@ impl EnterpriseStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<DeletionJob>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_rows(
             &conn,
             "SELECT payload FROM ent_deletion_job
              WHERE organization_id = ?1 AND id > ?2
              ORDER BY id ASC LIMIT ?3",
-            &[
-                &organization.as_str(),
-                &after.unwrap_or(""),
-                &(limit as i64),
-            ],
+            &[&organization.as_str(), &after.unwrap_or(""), &limit],
         )
     }
 
@@ -712,17 +713,14 @@ impl EnterpriseStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<StoredConfigLayer>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_rows(
             &conn,
             "SELECT payload FROM ent_config_layer
              WHERE organization_id = ?1 AND id > ?2
              ORDER BY id ASC LIMIT ?3",
-            &[
-                &organization.as_str(),
-                &after.unwrap_or(""),
-                &(limit as i64),
-            ],
+            &[&organization.as_str(), &after.unwrap_or(""), &limit],
         )
     }
 

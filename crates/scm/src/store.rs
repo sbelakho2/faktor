@@ -439,6 +439,15 @@ fn durability(e: faktor_cloud::CloudStoreError) -> ScmStoreError {
     ScmStoreError::Backend(e.to_string())
 }
 
+/// Page limits arrive as `usize` but bind into SQLite's signed range: a
+/// limit above `i64::MAX` is refused typed instead of wrapping negative
+/// (SQLite reads a negative LIMIT as unbounded).
+fn checked_page_limit(limit: usize) -> Result<i64, ScmStoreError> {
+    i64::try_from(limit).map_err(|_| {
+        ScmStoreError::Malformed(format!("page limit {limit} exceeds SQLite signed range"))
+    })
+}
+
 /// Apply the SCM schema ladder. The version read, the pre-migration restore
 /// point and every migration statement run inside ONE `BEGIN IMMEDIATE`
 /// transaction: a second concurrent opener blocks on the write lock, then
@@ -670,6 +679,7 @@ impl ScmStore for SqliteScmStore {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<RepositoryRow>, ScmStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
@@ -682,7 +692,7 @@ impl ScmStore for SqliteScmStore {
             .map_err(backend)?;
         let rows = stmt
             .query_map(
-                params![organization_id, after_id, limit as i64],
+                params![organization_id, after_id, limit],
                 repository_from_row,
             )
             .map_err(backend)?
@@ -742,14 +752,13 @@ impl ScmStore for SqliteScmStore {
         &self,
         limit: usize,
     ) -> Result<Vec<(String, String, i64)>, ScmStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare("SELECT delivery_id, event, received_ms FROM scm_webhook_delivery ORDER BY received_ms LIMIT ?1")
             .map_err(backend)?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+            .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
@@ -849,6 +858,32 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sync, 2, "synchronous = FULL on the writer connection");
+    }
+
+    #[test]
+    fn hostile_page_limit_is_refused_typed_without_wrapping() {
+        let store = SqliteScmStore::open_in_memory().unwrap();
+        // Only 64-bit `usize` can hold a limit above SQLite's signed domain
+        // (on 32-bit every `usize` fits `i64`, so no refusal is expressible).
+        if i64::try_from(usize::MAX).is_ok() {
+            return;
+        }
+        assert!(store
+            .repositories_for_organization("org_1", 0, 10)
+            .unwrap()
+            .is_empty());
+        assert!(store.webhook_deliveries(10).unwrap().is_empty());
+        for err in [
+            store
+                .repositories_for_organization("org_1", 0, usize::MAX)
+                .unwrap_err(),
+            store.webhook_deliveries(usize::MAX).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, ScmStoreError::Malformed(_)),
+                "the upper half of usize is refused typed, never wrapped: {err:?}"
+            );
+        }
     }
 
     /// A file-backed open records the writer policy marker `doctor` reads and

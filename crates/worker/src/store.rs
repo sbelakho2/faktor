@@ -905,6 +905,15 @@ fn durability(e: faktor_cloud::CloudStoreError) -> WorkerError {
     WorkerError::Backend(e.to_string())
 }
 
+/// Page limits arrive as `usize` but bind into SQLite's signed range: a
+/// limit above `i64::MAX` is refused typed instead of wrapping negative
+/// (SQLite reads a negative LIMIT as unbounded).
+fn checked_page_limit(limit: usize) -> Result<i64, WorkerError> {
+    i64::try_from(limit).map_err(|_| {
+        WorkerError::Malformed(format!("page limit {limit} exceeds SQLite signed range"))
+    })
+}
+
 /// Apply the worker-plane schema ladder. The version read, the pre-migration
 /// restore point and every migration statement run inside ONE `BEGIN
 /// IMMEDIATE` transaction: a second concurrent opener blocks on the write
@@ -1066,6 +1075,7 @@ impl WorkerStore for SqliteWorkerStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<WorkerRegistration>, WorkerError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
@@ -1075,7 +1085,7 @@ impl WorkerStore for SqliteWorkerStore {
             )
             .map_err(backend)?;
         let rows = stmt
-            .query_map(params![organization, after, limit as i64], |r| {
+            .query_map(params![organization, after, limit], |r| {
                 r.get::<_, String>(0)
             })
             .map_err(backend)?
@@ -2006,6 +2016,7 @@ impl WorkerStore for SqliteWorkerStore {
         after_seq: Option<i64>,
         limit: usize,
     ) -> Result<Vec<JournalEntry>, WorkerError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
@@ -2016,7 +2027,7 @@ impl WorkerStore for SqliteWorkerStore {
             )
             .map_err(backend)?;
         let rows = stmt
-            .query_map(params![organization, after_seq, limit as i64], |r| {
+            .query_map(params![organization, after_seq, limit], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -2074,6 +2085,27 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sync, 2, "synchronous = FULL on the writer connection");
+    }
+
+    #[test]
+    fn hostile_page_limit_is_refused_typed_without_wrapping() {
+        let store = SqliteWorkerStore::open_in_memory().unwrap();
+        // Only 64-bit `usize` can hold a limit above SQLite's signed domain
+        // (on 32-bit every `usize` fits `i64`, so no refusal is expressible).
+        if i64::try_from(usize::MAX).is_ok() {
+            return;
+        }
+        assert!(store.workers("org_1", None, 10).unwrap().is_empty());
+        assert!(store.journal("org_1", None, 10).unwrap().is_empty());
+        for err in [
+            store.workers("org_1", None, usize::MAX).unwrap_err(),
+            store.journal("org_1", None, usize::MAX).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, WorkerError::Malformed(_)),
+                "the upper half of usize is refused typed, never wrapped: {err:?}"
+            );
+        }
     }
 
     fn job(id: &str, org: &str) -> ExecutionJob {

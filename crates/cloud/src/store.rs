@@ -1616,6 +1616,15 @@ fn encode<T: Serialize>(value: &T) -> Result<String, CloudStoreError> {
         .map_err(|e| CloudStoreError::Malformed(format!("control-plane row encode: {e}")))
 }
 
+/// Page limits arrive as `usize` but bind into SQLite's signed range: a
+/// limit above `i64::MAX` is refused typed instead of wrapping negative
+/// (SQLite reads a negative LIMIT as unbounded).
+fn checked_page_limit(limit: usize) -> Result<i64, CloudStoreError> {
+    i64::try_from(limit).map_err(|_| {
+        CloudStoreError::Malformed(format!("page limit {limit} exceeds SQLite signed range"))
+    })
+}
+
 fn scoped_page<T: for<'de> Deserialize<'de>>(
     conn: &Connection,
     sql: &str,
@@ -1984,11 +1993,12 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 
     fn users(&self, after: Option<&str>, limit: usize) -> Result<Vec<User>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_page(
             &conn,
             "SELECT payload FROM cp_user WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT ?2",
-            &[&after, &(limit as i64)],
+            &[&after, &limit],
         )
     }
 
@@ -2005,11 +2015,12 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Organization>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_page(
             &conn,
             "SELECT payload FROM cp_organization WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT ?2",
-            &[&after, &(limit as i64)],
+            &[&after, &limit],
         )
     }
 
@@ -2055,13 +2066,14 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Membership>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_page(
             &conn,
             "SELECT payload FROM cp_membership
              WHERE organization_id = ?1 AND (?2 IS NULL OR id > ?2)
              ORDER BY id LIMIT ?3",
-            &[&organization.as_str(), &after, &(limit as i64)],
+            &[&organization.as_str(), &after, &limit],
         )
     }
 
@@ -2110,13 +2122,14 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Invitation>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_page(
             &conn,
             "SELECT payload FROM cp_invitation
              WHERE organization_id = ?1 AND (?2 IS NULL OR id > ?2)
              ORDER BY id LIMIT ?3",
-            &[&organization.as_str(), &after, &(limit as i64)],
+            &[&organization.as_str(), &after, &limit],
         )
     }
 
@@ -2195,13 +2208,14 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ServiceAccount>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_page(
             &conn,
             "SELECT payload FROM cp_service_account
              WHERE organization_id = ?1 AND (?2 IS NULL OR id > ?2)
              ORDER BY id LIMIT ?3",
-            &[&organization.as_str(), &after, &(limit as i64)],
+            &[&organization.as_str(), &after, &limit],
         )
     }
 
@@ -2220,6 +2234,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ApprovalRequest>, CloudStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock()?;
         scoped_page(
             &conn,
@@ -2232,7 +2247,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
                 &organization.as_str(),
                 &status.map(|s| s.as_str()),
                 &after,
-                &(limit as i64),
+                &limit,
             ],
         )
     }
@@ -3375,6 +3390,36 @@ mod tests {
             store.users(None, 1).unwrap_err(),
             CloudStoreError::Backend(_)
         ));
+    }
+
+    #[test]
+    fn hostile_page_limit_is_refused_typed_without_wrapping() {
+        let store = SqliteControlPlaneStore::open_in_memory().unwrap();
+        store.put_user(&user("usr_1", "a@b.c")).unwrap();
+        // Only 64-bit `usize` can hold a limit above SQLite's signed domain
+        // (on 32-bit every `usize` fits `i64`, so no refusal is expressible).
+        if i64::try_from(usize::MAX).is_ok() {
+            return;
+        }
+        let org = OrganizationId::try_new("org_a").unwrap();
+        assert_eq!(
+            store.users(None, 10).unwrap().len(),
+            1,
+            "valid limit unchanged"
+        );
+        for err in [
+            store.users(None, usize::MAX).unwrap_err(),
+            store.organizations(None, usize::MAX).unwrap_err(),
+            store.memberships(&org, None, usize::MAX).unwrap_err(),
+            store.invitations(&org, None, usize::MAX).unwrap_err(),
+            store.service_accounts(&org, None, usize::MAX).unwrap_err(),
+            store.approvals(&org, None, None, usize::MAX).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, CloudStoreError::Malformed(_)),
+                "the upper half of usize is refused typed, never wrapped: {err:?}"
+            );
+        }
     }
 
     #[test]

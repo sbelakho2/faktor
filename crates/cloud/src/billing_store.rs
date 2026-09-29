@@ -1165,6 +1165,15 @@ fn encode<T: Serialize>(value: &T) -> Result<String, BillingStoreError> {
         .map_err(|e| BillingStoreError::Malformed(format!("billing row encode: {e}")))
 }
 
+/// Page limits arrive as `usize` but bind into SQLite's signed range: a
+/// limit above `i64::MAX` is refused typed instead of wrapping negative
+/// (SQLite reads a negative LIMIT as unbounded).
+fn checked_page_limit(limit: usize) -> Result<i64, BillingStoreError> {
+    i64::try_from(limit).map_err(|_| {
+        BillingStoreError::Malformed(format!("page limit {limit} exceeds SQLite signed range"))
+    })
+}
+
 /// One matched `credit_entry` idempotency row: (id, kind, stored
 /// `amount_micro` column, reference, billing_account_id, usage_event_id,
 /// payload). The payload is carried so the identity comparison uses the
@@ -1493,6 +1502,7 @@ impl BillingStore for SqliteControlPlaneStore {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<BillingAccount>, BillingStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock_billing_conn()?;
         let mut stmt = conn
             .prepare(
@@ -1502,7 +1512,7 @@ impl BillingStore for SqliteControlPlaneStore {
             )
             .map_err(backend)?;
         let rows = stmt
-            .query_map(params![organization.as_str(), after, limit as i64], |r| {
+            .query_map(params![organization.as_str(), after, limit], |r| {
                 r.get::<_, String>(0)
             })
             .map_err(backend)?
@@ -1667,6 +1677,7 @@ impl BillingStore for SqliteControlPlaneStore {
         after_seq: i64,
         limit: usize,
     ) -> Result<Vec<StoredCreditEntry>, BillingStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock_billing_conn()?;
         let mut stmt = conn
             .prepare(
@@ -1676,17 +1687,14 @@ impl BillingStore for SqliteControlPlaneStore {
             )
             .map_err(backend)?;
         let rows = stmt
-            .query_map(
-                params![organization.as_str(), after_seq, limit as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                },
-            )
+            .query_map(params![organization.as_str(), after_seq, limit], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
@@ -1858,6 +1866,7 @@ impl BillingStore for SqliteControlPlaneStore {
         organization: &OrganizationId,
         limit: usize,
     ) -> Result<Vec<ReportPeriodRow>, BillingStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock_billing_conn()?;
         let mut stmt = conn
             .prepare(
@@ -1867,7 +1876,7 @@ impl BillingStore for SqliteControlPlaneStore {
             )
             .map_err(backend)?;
         let rows = stmt
-            .query_map(params![organization.as_str(), limit as i64], |r| {
+            .query_map(params![organization.as_str(), limit], |r| {
                 r.get::<_, String>(0)
             })
             .map_err(backend)?
@@ -1891,6 +1900,7 @@ impl SqliteControlPlaneStore {
         after_seq: i64,
         limit: usize,
     ) -> Result<Vec<StoredUsageEvent>, BillingStoreError> {
+        let limit = checked_page_limit(limit)?;
         let conn = self.lock_billing_conn()?;
         // The task filter compares the reversible text encoding
         // (`crate::billing::task_id_text`), NEVER a numeric projection: the
@@ -1915,7 +1925,7 @@ impl SqliteControlPlaneStore {
                             organization.as_str(),
                             crate::billing::task_id_text(task_id),
                             after_seq,
-                            limit as i64
+                            limit
                         ],
                         usage_row,
                     )
@@ -1933,10 +1943,7 @@ impl SqliteControlPlaneStore {
                     )
                     .map_err(backend)?;
                 let mapped = stmt
-                    .query_map(
-                        params![organization.as_str(), after_seq, limit as i64],
-                        usage_row,
-                    )
+                    .query_map(params![organization.as_str(), after_seq, limit], usage_row)
                     .map_err(backend)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(backend)?;

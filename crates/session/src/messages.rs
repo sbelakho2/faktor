@@ -417,9 +417,12 @@ impl SessionHandle {
         limit: i64,
     ) -> faktor_core::Result<Vec<MessageRow>> {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let page_limit = u64::try_from(limit).map_err(|_| {
+            SessionError::Malformed(format!("message page limit {limit} is negative"))
+        })?;
         self.manager
             .store()
-            .messages_before(self.id, before, limit as u64)
+            .messages_before(self.id, before, page_limit)
             .map_err(|e| crate::map_store_err(e).into())
     }
 
@@ -454,10 +457,16 @@ impl SessionHandle {
         limit: i64,
     ) -> faktor_core::Result<MessagesPage> {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let page_limit = u64::try_from(limit).map_err(|_| {
+            SessionError::Malformed(format!("message page limit {limit} is negative"))
+        })?;
+        let probe_limit = page_limit.checked_add(1).ok_or_else(|| {
+            SessionError::Malformed(format!("message page probe limit {page_limit} overflows"))
+        })?;
         let mut rows = self
             .manager
             .store()
-            .messages_before(self.id, before, limit as u64 + 1)
+            .messages_before(self.id, before, probe_limit)
             .map_err(crate::map_store_err)?;
         let has_more = rows.len() as i64 > limit;
         if has_more {
@@ -606,6 +615,31 @@ mod tests {
         assert!(latest.has_more);
         // before=0 yields nothing, not an error.
         assert!(s.messages_page(Some(0), 10).unwrap().messages.is_empty());
+    }
+
+    #[test]
+    fn hostile_max_limit_probes_exactly_one_past_the_clamp_ceiling() {
+        let (_d, s) = seeded_session();
+        for i in 0..(MAX_PAGE_SIZE as usize + 5) {
+            let seq = s.proposed_message_seq().unwrap();
+            s.put_message(seq, "assistant", serde_json::json!({"i": i}))
+                .unwrap();
+        }
+        // The hostile ceiling clamps to MAX_PAGE_SIZE, and the page probe is
+        // exactly one past it: `has_more` is proven by one extra row, never
+        // by loading a second page or by wrapping the probe.
+        let page = s.messages_page(None, i64::MAX).unwrap();
+        assert_eq!(page.messages.len(), MAX_PAGE_SIZE as usize);
+        assert_eq!(page.page.size, MAX_PAGE_SIZE);
+        assert!(page.has_more);
+        let oldest = page.messages.last().unwrap().seq;
+        assert_eq!(page.page.cursor, Some(oldest));
+        // The next request continues strictly below the cursor and is
+        // deterministic under replay.
+        let next = s.messages_page(page.page.cursor, i64::MAX).unwrap();
+        assert!(next.messages.iter().all(|m| m.seq < oldest));
+        let replay = s.messages_page(page.page.cursor, i64::MAX).unwrap();
+        assert_eq!(replay.messages, next.messages);
     }
 
     #[test]
