@@ -146,16 +146,19 @@ fn authorize_worker(principal: &faktor_cloud::Principal, action: Action) -> Resu
 }
 
 /// One bounded cursor page of workers (`limit` above the bound is a 400,
-/// never a silent clamp).
+/// never a silent clamp). The comparison is `u64`-to-`u64` BEFORE any
+/// conversion, so a hostile upper-half value cannot truncate past it.
 fn page_limit(limit: Option<u64>) -> Result<usize, ApiError> {
+    let max =
+        u64::try_from(faktor_worker::MAX_WORKER_PAGE).expect("the worker page bound fits u64");
     match limit {
         None => Ok(50),
         Some(0) => Err(malformed_body("limit must be >= 1")),
-        Some(l) if l as usize > faktor_worker::MAX_WORKER_PAGE => Err(malformed_body(&format!(
+        Some(l) if l > max => Err(malformed_body(&format!(
             "limit {l} exceeds the worker page bound {}",
             faktor_worker::MAX_WORKER_PAGE
         ))),
-        Some(l) => Ok(l as usize),
+        Some(l) => Ok(usize::try_from(l).expect("bounded above by the worker page bound")),
     }
 }
 
