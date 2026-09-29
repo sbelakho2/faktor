@@ -146,32 +146,80 @@ impl ExpiredPermissionResolution {
     }
 }
 
+/// Every `AgentState` variant, in enum declaration order.
+const ALL_AGENT_STATES: [AgentState; 17] = [
+    AgentState::Idle,
+    AgentState::Preparing,
+    AgentState::BuildingContext,
+    AgentState::WaitingForModel,
+    AgentState::Streaming,
+    AgentState::ToolRequested,
+    AgentState::WaitingForPermission,
+    AgentState::ExecutingTool,
+    AgentState::Validating,
+    AgentState::UpdatingMemory,
+    AgentState::ReadyForNextTurn,
+    AgentState::Completed,
+    AgentState::Cancelled,
+    AgentState::FailedRecoverable,
+    AgentState::FailedPermanent,
+    AgentState::NeedsUserInput,
+    AgentState::Suspended,
+];
+
+/// [`ALL_AGENT_STATES`] serialized exactly as the durable session rows
+/// serialize it, built once on the caller's thread. `begin_prepared` runs on
+/// the single writer owner, so it can only SCAN this caller-prepared
+/// vocabulary — never serialize a state itself.
+fn valid_state_json() -> &'static [String] {
+    static VALID: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    VALID.get_or_init(|| {
+        ALL_AGENT_STATES
+            .into_iter()
+            .map(|state| {
+                serde_json::to_string(&state)
+                    .expect("in-process AgentState serialization cannot fail")
+            })
+            .collect()
+    })
+}
+
 /// One session state expectation PREPARED on the caller's thread for
 /// [`SessionCommandTxn::begin_prepared`]: the canonical `state` JSON text a
-/// durable session row must carry, plus both refusal messages. Serialization
+/// durable session row must carry, the canonical vocabulary that separates a
+/// valid-but-unexpected durable state (`Conflict`) from text that is not an
+/// `AgentState` at all (`Corrupt`), plus every refusal message. Serialization
 /// happens HERE, so the writer closure compares raw text and never decodes a
 /// state or materializes a message on the single writer owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedSessionStateExpectation {
     pub state: AgentState,
     pub state_json: String,
+    pub valid_state_json: &'static [String],
     pub missing_message: String,
     pub mismatch_message: String,
+    pub corrupt_message: String,
 }
 
 impl PreparedSessionStateExpectation {
-    /// Serialize the expected state once and prepare both refusal messages
-    /// caller-side (in-process `AgentState` serialization cannot fail).
+    /// Serialize the expected state once and prepare all three refusal
+    /// messages caller-side (in-process `AgentState` serialization cannot
+    /// fail).
     pub fn prepare(session: SessionId, expected: AgentState) -> Self {
         let state_json = serde_json::to_string(&expected)
             .expect("in-process AgentState serialization cannot fail");
         Self {
             state: expected,
             state_json,
+            valid_state_json: valid_state_json(),
             missing_message: format!("session {session} does not exist; session command refused"),
             mismatch_message: format!(
                 "session {session} state is not the expected {expected:?}; \
                  session command refused before any write"
+            ),
+            corrupt_message: format!(
+                "session {session} durable state is not a valid AgentState; \
+                 session command refused before any write (storage is corrupt)"
             ),
         }
     }
@@ -210,8 +258,10 @@ pub struct SessionCommandTxn<'a> {
 impl<'a> SessionCommandTxn<'a> {
     /// BEGIN IMMEDIATE, read the session row inside the transaction and
     /// verify its raw `state` text is exactly the caller-prepared canonical
-    /// JSON. Missing session or a mismatch refuses typed before any write;
-    /// the helper formats nothing, so the writer job stays SQL-only.
+    /// JSON. Missing session or a valid-but-unexpected state refuses
+    /// `Conflict`; text that is not in the caller-prepared `AgentState`
+    /// vocabulary refuses `Corrupt` — both before any write. The helper
+    /// formats nothing, so the writer job stays SQL-only.
     pub(crate) fn begin_prepared(
         conn: &'a mut Connection,
         seam: &'a CrashSeam,
@@ -229,19 +279,24 @@ impl<'a> SessionCommandTxn<'a> {
         let PreparedSessionStateExpectation {
             state,
             state_json,
+            valid_state_json,
             missing_message,
             mismatch_message,
+            corrupt_message,
         } = expected;
         let raw = raw.ok_or(StoreError::Conflict(missing_message))?;
-        if raw != state_json {
-            return Err(StoreError::Conflict(mismatch_message));
+        if raw == state_json {
+            return Ok(Self {
+                tx,
+                session,
+                expected_state: state,
+                seam,
+            });
         }
-        Ok(Self {
-            tx,
-            session,
-            expected_state: state,
-            seam,
-        })
+        if !valid_state_json.contains(&raw) {
+            return Err(StoreError::Corrupt(vec![corrupt_message]));
+        }
+        Err(StoreError::Conflict(mismatch_message))
     }
 
     /// The session this command belongs to.
@@ -342,8 +397,11 @@ impl Store {
         // In-process constructed enum: serialization of a unit variant can
         // never fail, and it is prepared here rather than on the writer owner.
         let idle_state_json = serde_json::to_string(&AgentState::Idle).unwrap();
-        // Preparation BEFORE enqueueing: the timestamp is captured on the
-        // caller's thread (audit item 8) — the writer job executes SQL only.
+        // Preparation BEFORE enqueueing: the timestamp and the journal
+        // diagnostic context are captured on the caller's thread (audit item
+        // 8). The session id is SQLite-allocated inside the transaction, so
+        // the seed diagnostic is the caller-prepared static text.
+        let seq_corrupt_message = "event journal of a new session MAX(seq)";
         let now = now_ms();
         self.writer.execute("create_session", move |conn| {
         conn.execute(
@@ -371,6 +429,7 @@ impl Store {
             now,
             Some(created_payload_json),
             1,
+            seq_corrupt_message,
         )?;
         tx.commit()?;
         Ok(
@@ -446,8 +505,10 @@ impl Store {
                 "worktree/task ids must be non-zero".into(),
             ));
         }
-        // Preparation BEFORE enqueueing: the timestamp is captured on the
-        // caller's thread (audit item 8) — the writer job executes SQL only.
+        // Preparation BEFORE enqueueing: the refusal diagnostic and the
+        // timestamp are captured on the caller's thread (audit item 8) — the
+        // writer job executes SQL only.
+        let missing_session = format!("adopt_session_identity: session {id} does not exist");
         let now = now_ms();
         self.writer.execute("adopt_session_identity", move |conn| {
             let n = conn.execute(
@@ -460,9 +521,7 @@ impl Store {
                 ],
             )?;
             if n == 0 {
-                return Err(StoreError::Migration(format!(
-                    "adopt_session_identity: session {id} does not exist"
-                )));
+                return Err(StoreError::Migration(missing_session));
             }
             Ok(())
         })
@@ -569,32 +628,77 @@ impl Store {
             .new_lifecycle
             .as_ref()
             .map(|l| serde_json::to_string(l).unwrap());
-        // Preparation BEFORE enqueueing: the timestamp is captured on the
-        // caller's thread (audit item 8) — the writer job executes SQL only.
+        // Preparation BEFORE enqueueing: every refusal message. The durable
+        // mismatch values are read inside the transaction, but both enums are
+        // closed, so each possible diagnostic is prepared here (the closure
+        // formats nothing).
+        let missing_message = format!("session {session_id} does not exist; cannot transition");
+        let lifecycle_mismatch = t.expected_lifecycle.map(|expected| {
+            [
+                SessionLifecycle::Open,
+                SessionLifecycle::Suspended,
+                SessionLifecycle::Closing,
+                SessionLifecycle::Closed,
+                SessionLifecycle::FailedPermanent,
+            ]
+            .into_iter()
+            .map(|durable| {
+                (
+                    durable,
+                    format!("session {session_id} lifecycle is {durable:?}, expected {expected:?}"),
+                )
+            })
+            .collect::<Vec<_>>()
+        });
+        let state_mismatch = t.expected_state.map(|expected| {
+            ALL_AGENT_STATES
+                .into_iter()
+                .map(|durable| {
+                    (
+                        durable,
+                        format!("session {session_id} state is {durable:?}, expected {expected:?}"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        // Preparation BEFORE enqueueing: the journal diagnostic context and
+        // the timestamp are captured on the caller's thread (audit item 8) —
+        // the writer job executes SQL only.
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         let now = now_ms();
         self.writer.execute("transition_session", move |conn| {
             let tx = conn.unchecked_transaction()?;
             // (a) read the session row inside the transaction.
             let Some(row) = Self::get_session_locked(&tx, session_id)? else {
-                return Err(StoreError::Conflict(format!(
-                    "session {session_id} does not exist; cannot transition"
-                )));
+                return Err(StoreError::Conflict(missing_message));
             };
             // (b) verify the expected values; mismatch aborts with nothing written.
             if let Some(expected) = t.expected_lifecycle {
                 if row.lifecycle != expected {
-                    return Err(StoreError::Conflict(format!(
-                        "session {session_id} lifecycle is {:?}, expected {:?}",
-                        row.lifecycle, expected
-                    )));
+                    let message = lifecycle_mismatch
+                        .map(|candidates| {
+                            candidates
+                                .into_iter()
+                                .find(|(durable, _)| *durable == row.lifecycle)
+                                .map(|(_, message)| message)
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    return Err(StoreError::Conflict(message));
                 }
             }
             if let Some(expected) = t.expected_state {
                 if row.state != expected {
-                    return Err(StoreError::Conflict(format!(
-                        "session {session_id} state is {:?}, expected {:?}",
-                        row.state, expected
-                    )));
+                    let message = state_mismatch
+                        .map(|candidates| {
+                            candidates
+                                .into_iter()
+                                .find(|(durable, _)| *durable == row.state)
+                                .map(|(_, message)| message)
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    return Err(StoreError::Conflict(message));
                 }
             }
             // (c) update lifecycle+state+updated_ms.
@@ -623,6 +727,7 @@ impl Store {
                 now,
                 transition_payload_json,
                 t.event_payload_ver,
+                &seq_corrupt_message,
             )?;
             // (e) commit: lifecycle change and event are durable together.
             tx.commit()?;
@@ -655,9 +760,11 @@ impl Store {
         let payload_base = event.payload.as_ref().map(std::string::ToString::to_string);
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
-        // Preparation BEFORE enqueueing: the session state expectation and
-        // both refusal messages (the closure formats nothing).
+        // Preparation BEFORE enqueueing: the session state expectation, all
+        // refusal messages and the journal diagnostic context (the closure
+        // formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         self.writer
             .execute("insert_permission_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -701,6 +808,7 @@ impl Store {
                     event.ts_ms,
                     payload_json,
                     event.payload_ver,
+                    &seq_corrupt_message,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -729,9 +837,13 @@ impl Store {
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
-        // Preparation BEFORE enqueueing: the session state expectation and
-        // both refusal messages (the closure formats nothing).
+        // Preparation BEFORE enqueueing: the session state expectation, all
+        // refusal messages and the journal diagnostic context (the closure
+        // formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let not_pending = format!("permission {id} is not pending");
+        let op_id_context = format!("permission {id} op_id");
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
@@ -752,16 +864,14 @@ impl Store {
                     // Commit BEFORE refusing: an expired row's terminalization must
                     // survive even though the resolution itself is refused.
                     txn.commit()?;
-                    return Err(StoreError::Conflict(format!(
-                        "permission {id} is not pending"
-                    )));
+                    return Err(StoreError::Conflict(not_pending));
                 }
                 let op_raw: i64 = txn.tx.query_row(
                     "SELECT op_id FROM permission WHERE id = ?1",
                     params![id],
                     |r| r.get(0),
                 )?;
-                let op_id = id_field(&format!("permission {id} op_id"), op_raw)?;
+                let op_id = id_field(&op_id_context, op_raw)?;
                 txn.side_row_applied();
                 let seq = Self::insert_event_locked(
                     txn.conn(),
@@ -772,6 +882,7 @@ impl Store {
                     event.ts_ms,
                     event_payload_json,
                     event.payload_ver,
+                    &seq_corrupt_message,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -818,9 +929,16 @@ impl Store {
         let payload_base = event.payload.as_ref().map(std::string::ToString::to_string);
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
-        // Preparation BEFORE enqueueing: the session state expectation and
-        // both refusal messages (the closure formats nothing).
+        // Preparation BEFORE enqueueing: the session state expectation, the
+        // sweep's refusal diagnostics and the journal diagnostic context (the
+        // closure formats nothing). The terminalized rows are discovered
+        // inside the transaction, so their refusal is the static message.
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let expired_op_id_context = "expired pending permission op_id";
+        let terminalized_mismatch = "expire_pending_permissions: terminalized row count \
+                                     mismatch; refusing a partial sweep"
+            .to_owned();
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         self.writer
             .execute("expire_pending_permissions_for_session", move |conn| {
                 let txn =
@@ -838,7 +956,7 @@ impl Store {
                         .collect::<Result<Vec<_>, _>>()?;
                     rows.into_iter()
                         .map(|(id, op_raw)| {
-                            Ok((id, id_field(&format!("permission {id} op_id"), op_raw)?))
+                            Ok((id, id_field(expired_op_id_context, op_raw)?))
                         })
                         .collect::<StoreResult<Vec<_>>>()?
                 };
@@ -852,10 +970,7 @@ impl Store {
                     params![session_id.raw() as i64, now_ms],
                 )?;
                 if changed != expired.len() {
-                    return Err(StoreError::Migration(format!(
-                "expire_pending_permissions: expected {} terminalized rows, updated {changed}",
-                expired.len()
-            )));
+                    return Err(StoreError::Migration(terminalized_mismatch));
                 }
                 // The journal names the rows this transaction actually terminalized;
                 // the caller cannot know them before the SELECT under the same lock,
@@ -915,6 +1030,7 @@ impl Store {
                     event.ts_ms,
                     payload_json,
                     event.payload_ver,
+                    &seq_corrupt_message,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -948,9 +1064,12 @@ impl Store {
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
-        // Preparation BEFORE enqueueing: the session state expectation and
-        // both refusal messages (the closure formats nothing).
+        // Preparation BEFORE enqueueing: the session state expectation, all
+        // refusal messages and the journal diagnostic context (the closure
+        // formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let duplicate_sequence = format!("checkpoint sequence {sequence} already exists");
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
@@ -965,9 +1084,7 @@ impl Store {
             )
             .optional()?;
         if duplicate.is_some() {
-            return Err(StoreError::Conflict(format!(
-                "checkpoint sequence {sequence} already exists"
-            )));
+            return Err(StoreError::Conflict(duplicate_sequence));
         }
         let changed = txn.tx.execute(
             "INSERT INTO checkpoint(session_id, sequence, path, before_hash, after_hash, after_cas_hash, before_exists, after_exists, created_ms)
@@ -1000,6 +1117,7 @@ impl Store {
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
+            &seq_corrupt_message,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -1056,8 +1174,9 @@ impl Store {
         // (`expected_state` is both the pre-state and the event's state).
         let event_state_json = serde_json::to_string(&expected_state).unwrap();
         // Preparation BEFORE enqueueing: the session state expectation and
-        // both refusal messages (the closure formats nothing).
+        // the journal diagnostic context (the closure formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ts = now_ms();
@@ -1106,6 +1225,7 @@ impl Store {
                 |r| r.get(0),
             )?),
             1,
+            &seq_corrupt_message,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -1394,8 +1514,10 @@ impl Store {
         decision: &str,
     ) -> StoreResult<()> {
         let decision = decision.to_owned();
-        // Preparation BEFORE enqueueing: the timestamp is captured on the
-        // caller's thread (audit item 8) — the writer job executes SQL only.
+        // Preparation BEFORE enqueueing: the refusal diagnostic and the
+        // timestamp are captured on the caller's thread (audit item 8) — the
+        // writer job executes SQL only.
+        let not_pending = format!("permission {id} is not pending");
         let now = now_ms();
         self.writer.execute("resolve_permission", move |conn| {
             let tx = conn.unchecked_transaction()?;
@@ -1413,9 +1535,7 @@ impl Store {
             // survive even though the resolution itself is refused.
             tx.commit()?;
             if changed != 1 {
-                return Err(StoreError::Conflict(format!(
-                    "permission {id} is not pending"
-                )));
+                return Err(StoreError::Conflict(not_pending));
             }
             Ok(())
         })

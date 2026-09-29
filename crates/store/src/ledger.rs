@@ -556,6 +556,8 @@ impl Store {
         // state JSON are serialized on the caller's thread.
         let payload_json = payload.map(|p| p.to_string());
         let state_json = serde_json::to_string(&state).unwrap();
+        // Preparation BEFORE enqueueing: the journal diagnostic context.
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         self.writer.execute("append_event_v", move |conn| {
             let tx = conn.unchecked_transaction()?;
             let seq = Self::insert_event_locked(
@@ -567,6 +569,7 @@ impl Store {
                 ts_ms,
                 payload_json,
                 payload_ver,
+                &seq_corrupt_message,
             )?;
             // Durability boundary: crossing `ev_precommit` fires the crash
             // AFTER the insert executed but BEFORE the COMMIT (the append
@@ -586,7 +589,8 @@ impl Store {
     /// is a bare `&Connection`: a live `rusqlite::Transaction` derefs to one,
     /// and the actor batch passes its outer transaction connection directly.
     /// `state_json` is the caller-prepared serialization of the event's
-    /// landing state — the writer owner never runs serde.
+    /// landing state and `seq_corrupt_message` the caller-prepared
+    /// diagnostic context — the writer owner never runs serde or formatting.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_event_locked(
         conn: &Connection,
@@ -597,6 +601,7 @@ impl Store {
         ts_ms: i64,
         payload_json: Option<String>,
         payload_ver: i64,
+        seq_corrupt_message: &str,
     ) -> StoreResult<EventSeq> {
         // Serialize appends per session so seq computation is race-free.
         // (The single-owner writer service already serializes every command;
@@ -606,10 +611,7 @@ impl Store {
             params![session_id.raw() as i64],
             |r| r.get(0),
         )?;
-        let prev_seq = id_field_opt::<EventSeq>(
-            &format!("event journal of session {session_id} MAX(seq)"),
-            prev,
-        )?;
+        let prev_seq = id_field_opt::<EventSeq>(seq_corrupt_message, prev)?;
         let seq = JournalInvariants::next_seq(prev_seq);
         let ts = JournalInvariants::monotonic_ts(
             prev.map(|_| {
@@ -665,8 +667,10 @@ impl Store {
         // Preparation BEFORE enqueueing: the session state expectation and
         // both refusal messages (the closure formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
-        // Preparation BEFORE enqueueing: the timestamp is captured on the
-        // caller's thread (audit item 8) — the writer job executes SQL only.
+        // Preparation BEFORE enqueueing: the journal diagnostic context and
+        // the timestamp are captured on the caller's thread (audit item 8) —
+        // the writer job executes SQL only.
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         let now = now_ms();
         self.writer.execute("record_compaction_and_event", move |conn| {
         let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -698,6 +702,7 @@ impl Store {
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
+            &seq_corrupt_message,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -1050,23 +1055,24 @@ impl Store {
     ) -> StoreResult<usize> {
         let seam = Arc::clone(&self.seam);
         let protect = protect.to_owned();
-        // Preparation BEFORE enqueueing: the folded head JSON and its
-        // timestamp (audit item 8).
+        // Preparation BEFORE enqueueing: the folded head JSON, its timestamp
+        // (audit item 8) and the whole DELETE statement text — the closure
+        // must not format.
         let head_json = head_json.to_string();
+        let sid = session_id.raw() as i64;
+        let mut sql =
+            format!("DELETE FROM ledger_entry WHERE session_id = {sid} AND seq < {below_seq}");
+        if !protect.is_empty() {
+            sql.push_str(&format!(
+                " AND seq NOT IN ({})",
+                std::iter::repeat_n("?", protect.len())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         let now = now_ms();
         self.writer.execute("compact_ledger", move |conn| {
             let tx = conn.unchecked_transaction()?;
-            let sid = session_id.raw() as i64;
-            let mut sql =
-                format!("DELETE FROM ledger_entry WHERE session_id = {sid} AND seq < {below_seq}");
-            if !protect.is_empty() {
-                sql.push_str(&format!(
-                    " AND seq NOT IN ({})",
-                    std::iter::repeat_n("?", protect.len())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ));
-            }
             let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
             for p in &protect {
                 params.push(p);
@@ -1842,6 +1848,9 @@ impl Store {
                 "alloc_op_ids: count must be non-zero".into(),
             ));
         }
+        // Preparation BEFORE enqueueing: the corruption refusal diagnostic
+        // (the durable `next_value` is read inside the transaction).
+        let corrupted_next = "op_id_seq next_value corrupted: negative".to_owned();
         self.writer.execute("alloc_op_ids", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let next: i64 = tx
@@ -1857,9 +1866,7 @@ impl Store {
                     )
                 })?;
             if next < 0 {
-                return Err(StoreError::Migration(format!(
-                    "op_id_seq next_value corrupted: {next}"
-                )));
+                return Err(StoreError::Migration(corrupted_next));
             }
             let start = next as u64;
             // `next_value` lives in a signed INTEGER column: the sequence is
@@ -1999,6 +2006,12 @@ impl Store {
                 row.revision
             )));
         }
+        // Preparation BEFORE enqueueing: the collision refusal diagnostic
+        // (the explicit id is caller-known).
+        let existing_conflict = format!(
+            "evidence {} already exists; refusing to overwrite a durable envelope",
+            row.id
+        );
         let row = row.to_owned();
         self.writer.execute("evidence_insert", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2035,10 +2048,7 @@ impl Store {
                     )
                     .optional()?;
                 if existing.is_some() {
-                    return Err(StoreError::Conflict(format!(
-                        "evidence {} already exists; refusing to overwrite a durable envelope",
-                        row.id
-                    )));
+                    return Err(StoreError::Conflict(existing_conflict));
                 }
                 tx.execute(
                     "INSERT INTO evidence (
