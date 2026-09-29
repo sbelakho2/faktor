@@ -546,16 +546,29 @@ pub(crate) struct NativeMessagesQuery {
 }
 
 /// One native message page bound (bounded everything): oversized `limit`
-/// values are rejected with a 400, never silently clamped.
+/// values are rejected with a 400, never silently clamped. The comparison
+/// happens in the `u64` domain before any cast, so `u64::MAX` can never wrap
+/// into a negative `i64` and slip past the bound.
 pub(crate) fn page_limit(limit: Option<u64>, max: i64) -> Result<i64, ApiError> {
+    let max_u64 = u64::try_from(max).map_err(|_| malformed_body("invalid server page bound"))?;
     match limit {
         None => Ok(max),
         Some(0) => Err(malformed_body("limit must be >= 1")),
-        Some(l) if l as i64 > max => Err(malformed_body(&format!(
+        Some(l) if l > max_u64 => Err(malformed_body(&format!(
             "limit {l} exceeds the native page bound {max}"
         ))),
-        Some(l) => Ok(l as i64),
+        Some(l) => Ok(i64::try_from(l).expect("bounded above by max")),
     }
+}
+
+/// The store-side read bound of one validated native page: one extra row is
+/// read so `hasMore` is exact. Checked arithmetic keeps the bound inside
+/// `u64`/`i64`, so the store never receives a wrapped negative `LIMIT`.
+fn store_page_bound(limit: i64) -> Result<u64, ApiError> {
+    u64::try_from(limit)
+        .ok()
+        .and_then(|l| l.checked_add(1))
+        .ok_or_else(|| malformed_body("invalid server page bound"))
 }
 
 /// `GET /native/messages?session=<id>&before=<seq>&limit=<n>` — cursor
@@ -582,12 +595,16 @@ pub(crate) async fn native_messages(
         Ok(l) => l,
         Err(e) => return wire_status(e),
     };
+    let read_bound = match store_page_bound(limit) {
+        Ok(b) => b,
+        Err(e) => return wire_status(e),
+    };
     let handle = match native_resolve_session(&state, &q.session) {
         Ok(h) => h,
         Err(r) => return *r,
     };
     let store = state.deps.session.store();
-    let rows = match store.messages_before(handle.id(), q.before, limit as u64 + 1) {
+    let rows = match store.messages_before(handle.id(), q.before, read_bound) {
         Ok(r) => r,
         Err(e) => return api_err(&store_err_to_core(e)),
     };
@@ -661,12 +678,16 @@ pub(crate) async fn native_events(
         Ok(l) => l,
         Err(e) => return wire_status(e),
     };
+    let read_bound = match store_page_bound(limit) {
+        Ok(b) => b,
+        Err(e) => return wire_status(e),
+    };
     let handle = match native_resolve_session(&state, &q.session) {
         Ok(h) => h,
         Err(r) => return *r,
     };
     let after = q.after.unwrap_or(0);
-    let events = match handle.events_range(after.saturating_add(1), Some(limit as u64 + 1)) {
+    let events = match handle.events_range(after.saturating_add(1), Some(read_bound)) {
         Ok(e) => e,
         Err(e) => return api_err(&e),
     };
@@ -745,7 +766,10 @@ pub(crate) async fn native_session_events(
 /// The bounded, paged journal poll behind the native SSE stream: at most
 /// [`MAX_NATIVE_EVENT_PAGE`] frames per poll are materialized; when the
 /// page is exhausted the stream sleeps and emits a heartbeat. The journal
-/// is the source of truth and the frame `id:` is the resume cursor.
+/// is the source of truth and the frame `id:` is the resume cursor. A
+/// journal read failure is terminal: the stream emits one `error` frame
+/// naming `journal_read_failed` and then ends — it never heartbeats over a
+/// corrupt or unreadable authority.
 fn native_journal_stream(
     handle: faktor_session::SessionHandle,
     cursor: i64,
@@ -757,20 +781,39 @@ fn native_journal_stream(
             handle,
             cursor,
             std::collections::VecDeque::<axum::response::sse::Event>::new(),
+            false,
         ),
-        move |(handle, mut cursor, mut queue)| async move {
+        move |(handle, mut cursor, mut queue, terminated)| async move {
+            if terminated {
+                return None;
+            }
             if let Some(frame) = queue.pop_front() {
                 return Some((
                     Ok::<axum::response::sse::Event, std::convert::Infallible>(frame),
-                    (handle, cursor, queue),
+                    (handle, cursor, queue, terminated),
                 ));
             }
-            let events = handle
-                .events_range(
-                    cursor.saturating_add(1) as u64,
-                    Some(MAX_NATIVE_EVENT_PAGE as u64),
-                )
-                .unwrap_or_default();
+            let events = match handle.events_range(
+                cursor.saturating_add(1) as u64,
+                Some(MAX_NATIVE_EVENT_PAGE as u64),
+            ) {
+                Ok(events) => events,
+                Err(e) => {
+                    tracing::error!(
+                        session_id = %handle.id(),
+                        error = %e,
+                        "native journal read failed; terminating the SSE stream"
+                    );
+                    return Some((
+                        Ok::<axum::response::sse::Event, std::convert::Infallible>(
+                            axum::response::sse::Event::default()
+                                .event("error")
+                                .data(r#"{"code":"journal_read_failed"}"#),
+                        ),
+                        (handle, cursor, queue, true),
+                    ));
+                }
+            };
             let mut batch = std::collections::VecDeque::new();
             let mut advanced = false;
             for e in events {
@@ -794,7 +837,7 @@ fn native_journal_stream(
                 if let Some(frame) = batch.pop_front() {
                     return Some((
                         Ok::<axum::response::sse::Event, std::convert::Infallible>(frame),
-                        (handle, cursor, batch),
+                        (handle, cursor, batch, terminated),
                     ));
                 }
             }
@@ -805,7 +848,7 @@ fn native_journal_stream(
                         .event("heartbeat")
                         .data("{}"),
                 ),
-                (handle, cursor, queue),
+                (handle, cursor, queue, terminated),
             ))
         },
     )
@@ -1100,7 +1143,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn abort_state(root: &std::path::Path) -> (AppState, faktor_core::id::SessionId) {
+    fn test_state(root: &std::path::Path, title: &str) -> (AppState, faktor_core::id::SessionId) {
         let deps = crate::api::tests::test_deps(root);
         let session = deps.session.clone();
         let state = AppState {
@@ -1111,18 +1154,15 @@ mod tests {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let ws = session.create_workspace("/tmp").unwrap();
-        let sid = session
-            .create_session(ws, "abort", "fake", "m")
-            .unwrap()
-            .id();
+        let sid = session.create_session(ws, title, "fake", "m").unwrap().id();
         (state, sid)
     }
 
-    async fn abort_request(
-        state: &AppState,
-        sid: faktor_core::id::SessionId,
-        op_id: Option<&str>,
-    ) -> (StatusCode, serde_json::Value) {
+    fn abort_state(root: &std::path::Path) -> (AppState, faktor_core::id::SessionId) {
+        test_state(root, "abort")
+    }
+
+    fn authed_headers(state: &AppState) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1130,9 +1170,28 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
+        headers
+    }
+
+    async fn json_body(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn abort_request(
+        state: &AppState,
+        sid: faktor_core::id::SessionId,
+        op_id: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
         let response = native_session_abort(
             State(state.clone()),
-            headers,
+            authed_headers(state),
             Path(sid.to_string()),
             Ok(Json(NativeAbortRequest {
                 session_id: sid.to_string(),
@@ -1140,14 +1199,7 @@ mod tests {
             })),
         )
         .await;
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (
-            status,
-            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
-        )
+        json_body(response).await
     }
 
     /// A hostile `op_id` that parses as a `u64` but violates the id contract
@@ -1217,5 +1269,283 @@ mod tests {
         let (status, body) = abort_request(&state, sid, Some("8")).await;
         assert_eq!(status, StatusCode::OK, "authority stays usable: {body}");
         assert_eq!(body["aborted"], serde_json::json!(["8"]), "{body}");
+    }
+
+    async fn events_request(
+        state: &AppState,
+        sid: faktor_core::id::SessionId,
+        after: Option<u64>,
+        limit: Option<u64>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = native_events(
+            State(state.clone()),
+            authed_headers(state),
+            Query(NativeEventsQuery {
+                session: sid.to_string(),
+                after,
+                limit,
+            }),
+        )
+        .await;
+        json_body(response).await
+    }
+
+    async fn messages_request(
+        state: &AppState,
+        sid: faktor_core::id::SessionId,
+        before: Option<i64>,
+        limit: Option<u64>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = native_messages(
+            State(state.clone()),
+            authed_headers(state),
+            Query(NativeMessagesQuery {
+                session: sid.to_string(),
+                before,
+                limit,
+            }),
+        )
+        .await;
+        json_body(response).await
+    }
+
+    async fn read_sse(
+        response: Response,
+        max_chunks: usize,
+        timeout: std::time::Duration,
+    ) -> (String, bool) {
+        use futures_util::StreamExt as _;
+        let mut body = response.into_body().into_data_stream();
+        let mut out = String::new();
+        let mut ended = false;
+        for _ in 0..max_chunks {
+            match tokio::time::timeout(timeout, body.next()).await {
+                Ok(Some(Ok(chunk))) => out.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(Some(Err(e))) => panic!("SSE body read failed: {e}"),
+                Ok(None) => {
+                    ended = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        (out, ended)
+    }
+
+    /// Finding 3 (P1): the bound is compared in the `u64` domain before any
+    /// cast. `u64::MAX` used to wrap to -1 and slip past the comparison;
+    /// every oversized value is now a typed 400 and every accepted value
+    /// stays inside the cap.
+    #[test]
+    fn native_page_limit_matrix_never_bypasses_the_cap() {
+        for max in [MAX_NATIVE_CURSOR_PAGE, MAX_NATIVE_EVENT_PAGE] {
+            assert_eq!(page_limit(None, max).unwrap(), max);
+            assert_eq!(page_limit(Some(1), max).unwrap(), 1);
+            assert_eq!(page_limit(Some(max as u64), max).unwrap(), max);
+            for l in [
+                0u64,
+                max as u64 + 1,
+                i64::MAX as u64,
+                i64::MAX as u64 + 1,
+                u64::MAX,
+            ] {
+                let e = page_limit(Some(l), max)
+                    .expect_err(&format!("limit {l} against bound {max} must be refused"));
+                assert_eq!(e.http_status, 400, "limit {l}: {e:?}");
+                assert_eq!(e.code, "malformed", "limit {l}: {e:?}");
+            }
+        }
+    }
+
+    /// Finding 3 (P1) over the wire: `/native/events` never accepts a
+    /// wrapping limit. Every accepted value yields at most the 256-event cap
+    /// against a 301-event journal; `i64::MAX`, `i64::MAX + 1` and
+    /// `u64::MAX` are typed 400s, never an oversized or unbounded page.
+    #[tokio::test]
+    async fn native_events_limit_matrix_never_bypasses_the_page_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "events-limit");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        for _ in 0..300 {
+            handle
+                .force_append_event(
+                    faktor_core::event::EventKind::PhaseChanged,
+                    faktor_core::state::AgentState::WaitingForModel,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let cap = MAX_NATIVE_EVENT_PAGE;
+        for (limit, expected) in [(None, cap), (Some(1), 1), (Some(cap as u64), cap)] {
+            let (status, body) = events_request(&state, sid, None, limit).await;
+            assert_eq!(status, StatusCode::OK, "limit {limit:?}: {body}");
+            let events = body["events"].as_array().unwrap();
+            assert_eq!(events.len() as i64, expected, "limit {limit:?}: {body}");
+            assert_eq!(body["hasMore"], serde_json::json!(true), "{body}");
+            assert!(
+                events.len() as i64 <= cap,
+                "a bounded page can never exceed the cap: {body}"
+            );
+        }
+        for limit in [
+            Some(0u64),
+            Some(cap as u64 + 1),
+            Some(i64::MAX as u64),
+            Some(i64::MAX as u64 + 1),
+            Some(u64::MAX),
+        ] {
+            let (status, body) = events_request(&state, sid, None, limit).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "limit {limit:?} must be a typed 400: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "malformed",
+                "limit {limit:?}: {body}"
+            );
+            assert!(
+                body.get("events").is_none(),
+                "a refused limit must not carry a page: {body}"
+            );
+        }
+    }
+
+    /// Finding 3 (P1) over the wire: `/native/messages` is the same matrix
+    /// against the 200-message cursor cap. A validated limit also keeps the
+    /// `limit + 1` store read inside the integer domain.
+    #[tokio::test]
+    async fn native_messages_limit_matrix_never_bypasses_the_page_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "messages-limit");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        for seq in 1..=300i64 {
+            handle
+                .put_message(
+                    seq,
+                    "user",
+                    serde_json::json!({ "text": format!("m{seq}") }),
+                )
+                .unwrap();
+        }
+        let cap = MAX_NATIVE_CURSOR_PAGE;
+        for (limit, expected) in [(None, cap), (Some(1), 1), (Some(cap as u64), cap)] {
+            let (status, body) = messages_request(&state, sid, None, limit).await;
+            assert_eq!(status, StatusCode::OK, "limit {limit:?}: {body}");
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len() as i64, expected, "limit {limit:?}: {body}");
+            assert_eq!(body["hasMore"], serde_json::json!(true), "{body}");
+            assert!(
+                messages.len() as i64 <= cap,
+                "a bounded page can never exceed the cap: {body}"
+            );
+        }
+        for limit in [
+            Some(0u64),
+            Some(cap as u64 + 1),
+            Some(i64::MAX as u64),
+            Some(i64::MAX as u64 + 1),
+            Some(u64::MAX),
+        ] {
+            let (status, body) = messages_request(&state, sid, None, limit).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "limit {limit:?} must be a typed 400: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "malformed",
+                "limit {limit:?}: {body}"
+            );
+            assert!(
+                body.get("messages").is_none(),
+                "a refused limit must not carry a page: {body}"
+            );
+        }
+    }
+
+    /// Finding 4: the happy path is unchanged — durable frames stream in
+    /// journal order with their seq as the frame id, and an exhausted page
+    /// heartbeats instead of terminating.
+    #[tokio::test]
+    async fn native_journal_sse_streams_frames_and_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-happy");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        handle
+            .force_append_event(
+                faktor_core::event::EventKind::PhaseChanged,
+                faktor_core::state::AgentState::WaitingForModel,
+                None,
+                None,
+            )
+            .unwrap();
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Query(NativeSessionEventsQuery { after: Some(1) }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (frames, ended) = read_sse(response, 6, std::time::Duration::from_secs(5)).await;
+        assert!(!ended, "a healthy journal stream stays open: {frames}");
+        assert!(frames.contains("event: phase_changed"), "{frames}");
+        assert!(frames.contains("id: 2"), "{frames}");
+        assert!(frames.contains("event: heartbeat"), "{frames}");
+    }
+
+    /// Finding 4 (P1) hostile: a corrupt durable event must terminate the
+    /// SSE stream with the typed error frame, never a heartbeat loop over an
+    /// unreadable authority. The paged twin is loud on the same store.
+    #[tokio::test]
+    async fn native_journal_sse_terminates_with_an_error_frame_on_corrupt_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "sse-corrupt");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        handle
+            .force_append_event(
+                faktor_core::event::EventKind::PhaseChanged,
+                faktor_core::state::AgentState::WaitingForModel,
+                None,
+                None,
+            )
+            .unwrap();
+        state
+            .deps
+            .session
+            .store()
+            .sql_execute(&format!(
+                "UPDATE event SET state = '\"not_a_state\"' WHERE session_id = {} AND seq = 2",
+                sid.raw()
+            ))
+            .unwrap();
+        let (status, body) = events_request(&state, sid, None, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"]["code"], "store_error", "{body}");
+
+        let response = native_session_events(
+            State(state.clone()),
+            authed_headers(&state),
+            Path(sid.to_string()),
+            Query(NativeSessionEventsQuery { after: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (frames, ended) = read_sse(response, 16, std::time::Duration::from_secs(5)).await;
+        assert!(
+            ended,
+            "the stream must terminate on a journal read failure: {frames}"
+        );
+        assert!(frames.contains("event: error"), "{frames}");
+        assert!(
+            frames.contains(r#"{"code":"journal_read_failed"}"#),
+            "{frames}"
+        );
+        assert!(
+            !frames.contains("heartbeat"),
+            "no heartbeat may follow a failed authority read: {frames}"
+        );
     }
 }

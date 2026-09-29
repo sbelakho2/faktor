@@ -366,6 +366,47 @@ mod evidence_store_tests {
     }
 
     #[test]
+    fn evidence_hostile_negative_ids_and_sequence_refuse_typed() {
+        let (_d, store) = tmp();
+        let ws = store.create_workspace("/w").unwrap();
+        let sid = store.create_session(ws, "t", "p", "m").unwrap().id;
+        let id = store.evidence_insert(&row(sid, ws, "hostile")).unwrap();
+        let conn = store.raw_conn();
+        // `-1` is the two's-complement form of an id above i64::MAX: an
+        // out-of-domain id smuggled past the insert boundary.
+        let changed = conn
+            .execute(
+                "UPDATE evidence SET id = -1 WHERE id = ?1",
+                params![id as i64],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(matches!(
+            store.evidence_ids_by_backing(&"ab".repeat(32), 10),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            store.evidence_high_water(),
+            Err(StoreError::Corrupt(_))
+        ));
+        // A negative `sqlite_sequence` row is the same class of poison.
+        conn.execute(
+            "UPDATE evidence SET id = ?1 WHERE id = -1",
+            params![id as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = -1 WHERE name = 'evidence'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.evidence_high_water(),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn evidence_scope_listing_and_backing_digest_index_are_bounded_and_scoped() {
         let (_d, store) = tmp();
         let ws_a = store.create_workspace("/a").unwrap();
@@ -756,12 +797,17 @@ impl Store {
 
     // -------------------------------------------------- actor batch surface
 
-    /// Events strictly after `after_seq` (SSE resume cursor).
+    /// Events strictly after `after_seq` (SSE resume cursor). A cursor at or
+    /// above `i64::MAX` can never be followed by a durable seq, so the page
+    /// is empty — never a `u64` wrap into the whole journal.
     pub fn events_after(
         &self,
         session_id: SessionId,
         after_seq: EventSeq,
     ) -> StoreResult<Vec<Event>> {
+        if after_seq.raw() >= i64::MAX as u64 {
+            return Ok(Vec::new());
+        }
         self.events_range(session_id, after_seq.raw() + 1, None)
     }
 
@@ -771,18 +817,27 @@ impl Store {
         from_seq: u64,
         limit: Option<u64>,
     ) -> StoreResult<Vec<Event>> {
+        let from = match i64::try_from(from_seq) {
+            Ok(from) => from,
+            // No durable seq is above i64::MAX: the page is empty.
+            Err(_) => return Ok(Vec::new()),
+        };
+        // `None` is SQLite's unbounded sentinel (`LIMIT -1`); an explicit
+        // limit above the signed range is refused, never bound as a negative
+        // (unbounded) LIMIT.
+        let limit = match limit {
+            None => -1i64,
+            Some(limit) => i64::try_from(limit).map_err(|_| {
+                StoreError::Oversized("event page limit exceeds SQLite signed range".into())
+            })?,
+        };
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver
              FROM event
              WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq ASC LIMIT ?3",
         )?;
-        let limit = limit.unwrap_or(u64::MAX);
-        let mut rows = stmt.query(params![
-            session_id.raw() as i64,
-            from_seq as i64,
-            limit as i64
-        ])?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, from, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(event_map(row, session_id)?.0);
@@ -800,18 +855,25 @@ impl Store {
         from_seq: u64,
         limit: Option<u64>,
     ) -> StoreResult<Vec<(Event, i64)>> {
+        let from = match i64::try_from(from_seq) {
+            Ok(from) => from,
+            // No durable seq is above i64::MAX: the page is empty.
+            Err(_) => return Ok(Vec::new()),
+        };
+        // Same signed-range discipline as [`Store::events_range`].
+        let limit = match limit {
+            None => -1i64,
+            Some(limit) => i64::try_from(limit).map_err(|_| {
+                StoreError::Oversized("event page limit exceeds SQLite signed range".into())
+            })?,
+        };
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT seq, session_id, op_id, kind, state, ts_ms, payload, payload_ver
              FROM event
              WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq ASC LIMIT ?3",
         )?;
-        let limit = limit.unwrap_or(u64::MAX);
-        let mut rows = stmt.query(params![
-            session_id.raw() as i64,
-            from_seq as i64,
-            limit as i64
-        ])?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, from, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(event_map(row, session_id)?);
@@ -917,15 +979,29 @@ impl Store {
                 params![session_id.raw() as i64],
                 |r| r.get(0),
             )?;
+            if let Some(prev) = prev {
+                if prev < 1 {
+                    return Err(StoreError::Corrupt(vec![
+                        "typed ledger last sequence is below 1".into(),
+                    ]));
+                }
+            }
             let checkpoint: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(checkpoint_seq), 0) FROM ledger_head WHERE session_id = ?1",
                 params![session_id.raw() as i64],
                 |r| r.get(0),
             )?;
-            let seq = prev
-                .map(|p| p.max(checkpoint))
-                .unwrap_or(checkpoint)
-                .saturating_add(1);
+            if checkpoint < 0 {
+                return Err(StoreError::Corrupt(vec![
+                    "typed ledger head checkpoint is negative".into(),
+                ]));
+            }
+            let high_water = prev.unwrap_or(0).max(checkpoint);
+            let seq = high_water.checked_add(1).ok_or_else(|| {
+                StoreError::Corrupt(vec![
+                    "typed ledger sequence exhausted SQLite signed range".into()
+                ])
+            })?;
             tx.execute(
             "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -949,12 +1025,36 @@ impl Store {
 
     /// Read ledger entries of one session, ascending by seq. Bounded reads:
     /// the caller pages with `after_seq` and `limit` (paging is fundamental).
+    /// `u64::MAX` is the legacy whole-ledger sentinel preserved for the
+    /// existing fold callers and maps to the explicit unbounded page
+    /// ([`Store::ledger_entries_page`] with `None`); any OTHER limit above
+    /// the signed range refuses typed before SQL.
     pub fn ledger_entries(
         &self,
         session_id: SessionId,
         after_seq: Option<i64>,
         limit: u64,
     ) -> StoreResult<Vec<LedgerEntryRow>> {
+        let limit = if limit == u64::MAX { None } else { Some(limit) };
+        self.ledger_entries_page(session_id, after_seq, limit)
+    }
+
+    /// Explicit-page twin of [`Store::ledger_entries`]: `None` binds
+    /// SQLite's unbounded sentinel (`LIMIT -1`) for whole-ledger folds, and
+    /// an explicit limit above `i64::MAX` refuses typed — never bound as a
+    /// negative (unbounded) LIMIT.
+    pub fn ledger_entries_page(
+        &self,
+        session_id: SessionId,
+        after_seq: Option<i64>,
+        limit: Option<u64>,
+    ) -> StoreResult<Vec<LedgerEntryRow>> {
+        let limit = match limit {
+            None => -1i64,
+            Some(limit) => i64::try_from(limit).map_err(|_| {
+                StoreError::Oversized("ledger entry page limit exceeds SQLite signed range".into())
+            })?,
+        };
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT seq, entry_type, schema_ver, payload, created_ms FROM ledger_entry
@@ -963,7 +1063,7 @@ impl Store {
         let mut rows = stmt.query(params![
             session_id.raw() as i64,
             after_seq.unwrap_or(0),
-            limit as i64
+            limit
         ])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -978,13 +1078,32 @@ impl Store {
     /// newest-first by contract: the (session_id, seq) primary key serves
     /// the ORDER BY seq DESC scan, so one page reads O(limit) rows — never
     /// the whole stream. Same row shape and decode contract as
-    /// [`Store::ledger_entries`].
+    /// [`Store::ledger_entries`]; same `u64::MAX` legacy sentinel rule.
     pub fn ledger_entries_desc(
         &self,
         session_id: SessionId,
         before_seq: Option<i64>,
         limit: u64,
     ) -> StoreResult<Vec<LedgerEntryRow>> {
+        let limit = if limit == u64::MAX { None } else { Some(limit) };
+        self.ledger_entries_desc_page(session_id, before_seq, limit)
+    }
+
+    /// Explicit-page twin of [`Store::ledger_entries_desc`]: `None` binds
+    /// SQLite's unbounded sentinel; an explicit limit above `i64::MAX`
+    /// refuses typed.
+    pub fn ledger_entries_desc_page(
+        &self,
+        session_id: SessionId,
+        before_seq: Option<i64>,
+        limit: Option<u64>,
+    ) -> StoreResult<Vec<LedgerEntryRow>> {
+        let limit = match limit {
+            None => -1i64,
+            Some(limit) => i64::try_from(limit).map_err(|_| {
+                StoreError::Oversized("ledger entry page limit exceeds SQLite signed range".into())
+            })?,
+        };
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT seq, entry_type, schema_ver, payload, created_ms FROM ledger_entry
@@ -993,7 +1112,7 @@ impl Store {
         let mut rows = stmt.query(params![
             session_id.raw() as i64,
             before_seq.unwrap_or(i64::MAX),
-            limit as i64
+            limit
         ])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1378,7 +1497,16 @@ impl Store {
             params![session.raw() as i64],
             |r| r.get(0),
         )?;
-        let seq = prev + 1;
+        if prev < 0 {
+            return Err(StoreError::Corrupt(vec![
+                "prompt queue last sequence is negative".into(),
+            ]));
+        }
+        let seq = prev.checked_add(1).ok_or_else(|| {
+            StoreError::Corrupt(vec![
+                "prompt queue sequence exhausted SQLite signed range".into(),
+            ])
+        })?;
         tx.execute(
             "INSERT INTO prompt_queue(session_id, seq, op_id, prompt, files, model, variant, agent, status, requested_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
@@ -1950,16 +2078,21 @@ impl Store {
     }
 
     /// Journal projection consistency for EVERY session (`doctor --deep`).
-    /// A session's journal is the gapless sequence 1..=N: the (session_id,
-    /// seq) primary key structurally forbids duplicates, so a count/range
-    /// mismatch means a gap, a lost commit, or tampering. A session row with
-    /// NO journal rows at all is also flagged: creation seeds the journal in
-    /// the same transaction as the session row, so a row without events is
-    /// a torn write. Returns human-readable problems; empty = consistent.
+    /// A session's journal is the gapless sequence 1..=N whose FIRST event is
+    /// the `session_created` seed in the `idle` state and whose timestamps
+    /// are non-decreasing in seq order. The (session_id, seq) primary key
+    /// structurally forbids duplicates, so a count/range mismatch means a
+    /// gap, a lost commit, or tampering. A session row with NO journal rows
+    /// at all is also flagged: creation seeds the journal in the same
+    /// transaction as the session row, so a row without events is a torn
+    /// write. Returns human-readable problems; empty = consistent.
     pub fn journal_consistency_issues(&self) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
         let mut issues = Vec::new();
         {
+            // Gapless 1..=N per session: the (session_id, seq) primary key
+            // forbids duplicates, so a count/range mismatch is a gap, a lost
+            // commit or tampering.
             let mut stmt = conn.prepare(
                 "SELECT session_id, COUNT(*), MIN(seq), MAX(seq)
                  FROM event GROUP BY session_id",
@@ -1975,6 +2108,54 @@ impl Store {
                         "session {sid}: journal holds {count} event(s) spanning seq {min_seq}..={max_seq}; invariant is a gapless 1..={count}"
                     ));
                 }
+            }
+        }
+        {
+            // First-event contract: seq 1 is the session_created seed in the
+            // idle state. A journal whose seq-1 slot was overwritten by a
+            // LATER event stays numerically gapless and is only visible here.
+            let mut stmt =
+                conn.prepare("SELECT session_id, kind, state FROM event WHERE seq = 1")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let sid: i64 = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let state: String = row.get(2)?;
+                if kind != "session_created" {
+                    issues.push(format!(
+                        "session {sid}: first journal event kind is {kind:?}, not session_created"
+                    ));
+                }
+                match parse_json::<AgentState>(
+                    &format!("journal first event state for session {sid}"),
+                    &state,
+                ) {
+                    Ok(AgentState::Idle) => {}
+                    Ok(other) => issues.push(format!(
+                        "session {sid}: first journal event state is {other:?}, not idle"
+                    )),
+                    Err(_) => issues.push(format!(
+                        "session {sid}: first journal event state is not a valid AgentState"
+                    )),
+                }
+            }
+        }
+        {
+            // Timestamps never step backwards in seq order (the append path
+            // clamps a backward clock, so a regression is tampering).
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM (
+                     SELECT session_id, ts_ms,
+                            LAG(ts_ms) OVER (PARTITION BY session_id ORDER BY seq) AS prev_ts
+                     FROM event
+                 ) WHERE ts_ms < prev_ts",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let sid: i64 = row.get(0)?;
+                issues.push(format!(
+                    "session {sid}: journal timestamps are not non-decreasing in seq order"
+                ));
             }
         }
         {
@@ -2043,6 +2224,11 @@ impl Store {
     /// globally-unique id (`AUTOINCREMENT`); a non-zero id is inserted
     /// explicitly and a collision refuses with `Conflict` instead of ever
     /// overwriting an existing envelope. Returns the id actually stored.
+    ///
+    /// The durable evidence-id domain is `1..=i64::MAX` (the SQLite signed
+    /// `INTEGER PRIMARY KEY` range): an id above it is refused BEFORE any SQL,
+    /// so an id can never be stored in its two's-complement negative form and
+    /// read back as corruption.
     pub fn evidence_insert(&self, row: &EvidenceRow) -> StoreResult<u64> {
         if row.revision < 1 {
             return Err(StoreError::Malformed(format!(
@@ -2050,6 +2236,12 @@ impl Store {
                 row.revision
             )));
         }
+        let explicit_id = i64::try_from(row.id).map_err(|_| {
+            StoreError::Malformed(format!(
+                "evidence id {} exceeds the durable signed domain (1..=i64::MAX)",
+                row.id
+            ))
+        })?;
         // Preparation BEFORE enqueueing: the collision refusal diagnostic
         // (the explicit id is caller-known).
         let existing_conflict = format!(
@@ -2087,7 +2279,7 @@ impl Store {
                 let existing: Option<i64> = tx
                     .query_row(
                         "SELECT id FROM evidence WHERE id = ?1",
-                        params![row.id as i64],
+                        params![explicit_id],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -2101,7 +2293,7 @@ impl Store {
                     compact, backing_cas_hash, completeness, created_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
-                        row.id as i64,
+                        explicit_id,
                         row.session_id.raw() as i64,
                         row.workspace_id.raw() as i64,
                         row.task_id.map(|t| t as i64),
@@ -2126,8 +2318,15 @@ impl Store {
 
     /// Read one evidence row by id. Unscoped: callers acting for a session
     /// MUST compare the scope columns before serving the row (the evidence
-    /// crate's `DurableEvidenceStore::get_scoped` owns that rule).
+    /// crate's `DurableEvidenceStore::get_scoped` owns that rule). An id above
+    /// the durable `1..=i64::MAX` domain is refused typed before SQL: it can
+    /// name no stored row and must never be folded into a negative lookup.
     pub fn evidence_get(&self, id: u64) -> StoreResult<Option<EvidenceRow>> {
+        let id = i64::try_from(id).map_err(|_| {
+            StoreError::Malformed(format!(
+                "evidence id {id} exceeds the durable signed domain (1..=i64::MAX)"
+            ))
+        })?;
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT id, session_id, workspace_id, task_id, kind, revision,
@@ -2135,7 +2334,7 @@ impl Store {
                     compact, backing_cas_hash, completeness, created_ms
              FROM evidence WHERE id = ?1",
         )?;
-        let mut rows = stmt.query(params![id as i64])?;
+        let mut rows = stmt.query(params![id])?;
         match rows.next()? {
             Some(row) => Ok(Some(evidence_row_map(row)?)),
             None => Ok(None),
@@ -2189,7 +2388,11 @@ impl Store {
     ) -> StoreResult<Vec<EvidenceRow>> {
         let bound = i64::try_from(limit.min(10_000)).unwrap_or(10_000);
         let cursor = match before {
-            Some(before) => i64::try_from(before).unwrap_or(i64::MAX),
+            Some(before) => i64::try_from(before).map_err(|_| {
+                StoreError::Malformed(format!(
+                    "evidence cursor {before} exceeds the durable signed domain (1..=i64::MAX)"
+                ))
+            })?,
             None => i64::MAX,
         };
         let conn = self.read()?;
@@ -2217,7 +2420,8 @@ impl Store {
     /// Evidence ids whose backing bytes hash to `backing_cas_hash`, oldest
     /// first (bounded). The digest is an audit input only: the evidence
     /// layer still enforces scope before any read, so knowing a digest never
-    /// grants cross-session access.
+    /// grants cross-session access. A stored id outside the durable
+    /// `1..=i64::MAX` domain is typed corruption, never folded into a `u64`.
     pub fn evidence_ids_by_backing(
         &self,
         backing_cas_hash: &str,
@@ -2231,14 +2435,22 @@ impl Store {
         let mut rows = stmt.query(params![backing_cas_hash, bound])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(row.get::<_, i64>(0)? as u64);
+            let id_raw: i64 = row.get(0)?;
+            if id_raw < 1 {
+                return Err(StoreError::Corrupt(vec![format!(
+                    "evidence id {id_raw} is below 1"
+                )]));
+            }
+            out.push(id_raw as u64);
         }
         Ok(out)
     }
 
     /// The current evidence id high-water mark: the largest id ever issued
     /// (0 when none). Durable across reopen via `sqlite_sequence`, so a
-    /// restart can never reissue an id.
+    /// restart can never reissue an id. A negative stored id or sequence
+    /// (the two's-complement form of an id above `i64::MAX`) is typed
+    /// corruption, never clamped to 0.
     pub fn evidence_high_water(&self) -> StoreResult<u64> {
         let conn = self.read()?;
         let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM evidence", [], |r| {
@@ -2252,7 +2464,13 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0);
-        Ok(max_id.max(seq).max(0) as u64)
+        if max_id < 0 || seq < 0 {
+            return Err(StoreError::Corrupt(vec![format!(
+                "evidence high-water mark is negative (max id {max_id}, sequence {seq}); \
+                 the durable domain is 1..=i64::MAX"
+            )]));
+        }
+        Ok(max_id.max(seq) as u64)
     }
 }
 
@@ -2314,6 +2532,179 @@ mod tests {
         let tail = store.events_after(sid, EventSeq::new(400)).unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].seq.raw(), 401);
+    }
+
+    #[test]
+    fn event_page_cursors_and_limits_never_wrap_the_signed_domain() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        // Cursors at/above the top of the signed seq domain can never be
+        // followed by a durable seq: empty pages, never a wrapped replay.
+        let after_max = store.events_after(s.id, EventSeq::new(u64::MAX)).unwrap();
+        assert!(after_max.is_empty());
+        let after_edge = store
+            .events_after(s.id, EventSeq::new(i64::MAX as u64))
+            .unwrap();
+        assert!(after_edge.is_empty());
+        let range_above = store.events_range(s.id, i64::MAX as u64 + 1, None).unwrap();
+        assert!(range_above.is_empty());
+        let versioned_above = store
+            .events_versioned_range(s.id, i64::MAX as u64 + 1, None)
+            .unwrap();
+        assert!(versioned_above.is_empty());
+        // The largest signed seq is still a real cursor: it includes the
+        // event stored AT the boundary.
+        seed_only_event_seq(&store, s.id, i64::MAX);
+        let boundary = store.events_range(s.id, i64::MAX as u64, None).unwrap();
+        assert_eq!(boundary.len(), 1);
+        let tail = store
+            .events_after(s.id, EventSeq::new(i64::MAX as u64 - 1))
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        // An explicit limit above the signed range refuses typed; it must
+        // never bind a negative LIMIT (SQLite's unbounded sentinel).
+        for limit in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(
+                matches!(
+                    store.events_range(s.id, 1, Some(limit)),
+                    Err(StoreError::Oversized(_))
+                ),
+                "limit {limit} must refuse typed Oversized"
+            );
+            assert!(
+                matches!(
+                    store.events_versioned_range(s.id, 1, Some(limit)),
+                    Err(StoreError::Oversized(_))
+                ),
+                "versioned limit {limit} must refuse typed Oversized"
+            );
+        }
+        // i64::MAX itself is the largest legal explicit limit; `None` stays
+        // the honest unbounded page (the seeded boundary event).
+        assert_eq!(
+            store
+                .events_range(s.id, 1, Some(i64::MAX as u64))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.events_range(s.id, 1, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn journal_consistency_flags_later_event_masquerading_as_seq_one() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        store
+            .append_event(
+                s.id,
+                None,
+                EventKind::ModelChunkReceived,
+                AgentState::Streaming,
+                now_ms(),
+                None,
+            )
+            .unwrap();
+        assert!(store.journal_consistency_issues().unwrap().is_empty());
+        // Torn create: the original session_created seed is lost and the
+        // LATER event is renumbered into its seq-1 slot. The journal is
+        // numerically gapless (count == max == 1), so only the first-event
+        // kind/state contract can flag it.
+        let conn = store.raw_conn();
+        conn.execute(
+            "DELETE FROM event WHERE session_id = ?1 AND seq = 1",
+            params![s.id.raw() as i64],
+        )
+        .unwrap();
+        let renumbered = conn
+            .execute(
+                "UPDATE event SET seq = 1 WHERE session_id = ?1 AND seq = 2",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        assert_eq!(renumbered, 1, "the hostile renumber must land");
+        drop(conn);
+        let issues = store.journal_consistency_issues().unwrap();
+        assert_eq!(issues.len(), 2, "kind AND state must both flag: {issues:?}");
+        for needle in ["session_created", "not idle"] {
+            assert!(
+                issues.iter().any(|i| i.contains(needle)),
+                "{needle} must be flagged: {issues:?}"
+            );
+        }
+        for issue in &issues {
+            assert!(
+                issue.contains(&format!("session {}", s.id.raw())),
+                "each issue must name the session: {issue}"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_consistency_flags_backwards_timestamps() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        let seed_ts = store.events_range(s.id, 1, None).unwrap()[0].ts_ms;
+        store
+            .append_event(
+                s.id,
+                None,
+                EventKind::ModelStarted,
+                AgentState::Streaming,
+                seed_ts + 10,
+                None,
+            )
+            .unwrap();
+        assert!(store.journal_consistency_issues().unwrap().is_empty());
+        store
+            .raw_conn()
+            .execute(
+                "UPDATE event SET ts_ms = ?2 WHERE session_id = ?1 AND seq = 2",
+                params![s.id.raw() as i64, seed_ts - 1],
+            )
+            .unwrap();
+        let issues = store.journal_consistency_issues().unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].contains("non-decreasing"),
+            "the backward step must be flagged: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_queue_sequence_exhaustion_refuses_typed_without_a_row() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "t", "p", "m").unwrap();
+        {
+            let conn = store.raw_conn();
+            conn.execute(
+                "INSERT INTO prompt_queue(session_id, seq, op_id, prompt, files, status, requested_at)
+                 VALUES (?1, ?2, 1, 'hostile', '[]', 'pending', 0)",
+                params![s.id.raw() as i64, i64::MAX],
+            )
+            .unwrap();
+        }
+        let err = store
+            .enqueue_prompt(s.id, OpId::new(2), "next", &[], None, None, None, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(ref msgs)
+                if msgs.iter().any(|m| m.contains("exhausted"))),
+            "the i64::MAX queue seq must refuse as exhaustion: {err:?}"
+        );
+        let rows: i64 = store
+            .raw_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM prompt_queue WHERE session_id = ?1",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the refused enqueue must insert no row");
     }
 
     #[test]
@@ -3038,6 +3429,36 @@ mod typed_ledger_tests {
         store.create_session(ws, "t", "p", "m").unwrap().id
     }
 
+    /// One refused typed-ledger append (the hostile callers want the error).
+    fn refused_append(store: &Store, session: SessionId) -> StoreError {
+        store
+            .append_ledger_entry(session, "goal_set", 1, serde_json::json!({"goal": "next"}))
+            .unwrap_err()
+    }
+
+    fn assert_ledger_corrupt_contains(err: StoreError, needle: &str) {
+        match err {
+            StoreError::Corrupt(msgs) => assert!(
+                msgs.iter().any(|m| m.contains(needle)),
+                "the refusal must name {needle:?}: {msgs:?}"
+            ),
+            other => panic!("must refuse typed Corrupt naming {needle:?}, got {other:?}"),
+        }
+    }
+
+    /// Hostile raw ledger row: no API can mint a seq at/below the signed
+    /// floor, so a tampered database is the only way to seed one.
+    fn seed_ledger_entry(store: &Store, session: SessionId, seq: i64) {
+        store
+            .raw_conn()
+            .execute(
+                "INSERT INTO ledger_entry(session_id, seq, entry_type, schema_ver, payload, created_ms)
+                 VALUES (?1, ?2, 'goal_set', 1, '{\"goal\":\"hostile\"}', 1)",
+                params![session.raw() as i64, seq],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn ledger_entries_append_gapless_and_page_bounded() {
         let (_d, store) = tmp_store();
@@ -3061,6 +3482,94 @@ mod typed_ledger_tests {
         let s2 = sid(&store);
         assert!(store.ledger_entries(s2, None, 10).unwrap().is_empty());
         assert_eq!(store.ledger_max_seq(s2).unwrap(), 0);
+    }
+
+    #[test]
+    fn ledger_append_refuses_at_the_sqlite_signed_ceiling_without_mutation() {
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        // Empty entry table, head checkpoint at i64::MAX: the next typed seq
+        // would be i64::MAX + 1, outside SQLite's signed range. The append
+        // must refuse typed, insert no row and leave the head untouched.
+        store
+            .put_ledger_head(s, serde_json::json!({"goal": "g"}), i64::MAX, 1)
+            .unwrap();
+        assert_ledger_corrupt_contains(refused_append(&store, s), "exhausted");
+        assert!(
+            store.ledger_entries(s, None, 10).unwrap().is_empty(),
+            "a refused append must insert no entry"
+        );
+        let head = store.ledger_head(s).unwrap().unwrap();
+        assert_eq!(head.checkpoint_seq, i64::MAX);
+        assert_eq!(head.head_json["goal"], "g");
+    }
+
+    #[test]
+    fn ledger_append_refuses_at_prev_i64_max_and_corrupt_sequence_bounds() {
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        seed_ledger_entry(&store, s, i64::MAX);
+        assert_ledger_corrupt_contains(refused_append(&store, s), "exhausted");
+        assert_eq!(
+            store.ledger_max_seq(s).unwrap(),
+            i64::MAX,
+            "the hostile row is the only row; the refused append inserted none"
+        );
+
+        // prev below 1 is corruption, never a minted non-positive seq.
+        let s2 = sid(&store);
+        seed_ledger_entry(&store, s2, 0);
+        assert_ledger_corrupt_contains(refused_append(&store, s2), "below 1");
+        assert_eq!(store.ledger_max_seq(s2).unwrap(), 0, "no row inserted");
+
+        // A negative head checkpoint is corruption too.
+        let s3 = sid(&store);
+        store
+            .put_ledger_head(s3, serde_json::json!({"schema_ver": 1}), -1, 1)
+            .unwrap();
+        assert_ledger_corrupt_contains(refused_append(&store, s3), "negative");
+        assert!(store.ledger_entries(s3, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ledger_page_limits_refuse_above_the_signed_range() {
+        let (_d, store) = tmp_store();
+        let s = sid(&store);
+        store
+            .append_ledger_entry(s, "goal_set", 1, serde_json::json!({"goal": "g"}))
+            .unwrap();
+        // The largest signed limit is a real bounded page; `None` and the
+        // legacy `u64::MAX` sentinel stay the honest unbounded page.
+        let pages = [
+            store.ledger_entries(s, None, i64::MAX as u64).unwrap(),
+            store.ledger_entries_desc(s, None, i64::MAX as u64).unwrap(),
+            store.ledger_entries_page(s, None, None).unwrap(),
+            store.ledger_entries_desc_page(s, None, None).unwrap(),
+            store.ledger_entries(s, None, u64::MAX).unwrap(),
+            store.ledger_entries_desc(s, None, u64::MAX).unwrap(),
+        ];
+        assert!(pages.iter().all(|rows| rows.len() == 1), "{pages:?}");
+        // Any OTHER out-of-range limit refuses typed on both APIs.
+        let oversized =
+            |rows: StoreResult<Vec<LedgerEntryRow>>| matches!(rows, Err(StoreError::Oversized(_)));
+        for limit in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(oversized(store.ledger_entries_page(s, None, Some(limit))));
+            assert!(oversized(store.ledger_entries_desc_page(
+                s,
+                None,
+                Some(limit)
+            )));
+        }
+        assert!(oversized(store.ledger_entries(
+            s,
+            None,
+            i64::MAX as u64 + 1
+        )));
+        assert!(oversized(store.ledger_entries_desc(
+            s,
+            None,
+            i64::MAX as u64 + 1
+        )));
     }
 
     #[test]

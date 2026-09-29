@@ -24,6 +24,14 @@ use faktor_core::{SessionId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 /// Identifies one evidence envelope. Serialized/parsed as a plain `u64`.
+///
+/// The in-memory domain stays the full `u64` range, but the DURABLE domain
+/// is `1..=i64::MAX`: durable ids live in SQLite's signed `INTEGER PRIMARY
+/// KEY` column, and the store refuses an id above `i64::MAX` at every
+/// durable boundary (`evidence_insert`, `evidence_get`, the newest-first
+/// pagination cursor and `evidence_high_water`) instead of persisting its
+/// two's-complement negative form and reading it back as corruption. `0` is
+/// the insert-time "assign the next id" sentinel, never a stored id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EvidenceId(pub u64);
@@ -741,6 +749,28 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<EvidenceId>("18446744073709551615").unwrap(),
             EvidenceId(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn evidence_id_durable_domain_is_the_signed_positive_range() {
+        // The durable boundary is 1..=i64::MAX. The in-memory u64 tuple stays
+        // wide enough to NAME an out-of-domain id so the store can refuse it
+        // typed; it is never persisted (see this crate's
+        // `durable_domain_tests::evidence_ids_honor_the_durable_signed_domain`
+        // for the enforcement and the no-row proof).
+        let max_durable = i64::MAX as u64;
+        assert_eq!(EvidenceId(1).0, 1, "1 is the smallest durable id");
+        assert_eq!(EvidenceId(max_durable).0, max_durable);
+        assert!(
+            EvidenceId(max_durable + 1).0 > max_durable,
+            "the first id outside the durable domain stays nameable in memory"
+        );
+        assert_eq!(EvidenceId(0).0, 0, "0 is the insert sentinel, never stored");
+        assert_eq!(
+            EvidenceId(u64::MAX).0,
+            u64::MAX,
+            "the in-memory width stays u64"
         );
     }
 

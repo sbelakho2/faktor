@@ -419,8 +419,14 @@ impl Store {
         // the seed diagnostics are the caller-prepared static text.
         let seq_messages = EventSeqMessages::for_new_session();
         let now = now_ms();
+        let seam = Arc::clone(&self.seam);
         self.writer.execute("create_session", move |conn| {
-        conn.execute(
+        // ONE transaction: the session row and its seed event commit
+        // together or not at all (a crash between them used to leave a
+        // session row whose journal could later start at seq 1 with an
+        // event that is not SessionCreated).
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO session(workspace_id, title, provider, model, state, lifecycle, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6)",
             params![
@@ -432,13 +438,15 @@ impl Store {
                 now
             ],
         )?;
-        let id: i64 = conn.last_insert_rowid();
+        let id: i64 = tx.last_insert_rowid();
+        let sid = SessionId::new(id as u64);
+        // Durability boundary: the session row is written, the seed event is
+        // not yet (panic rolls the WHOLE creation back — no session row).
+        seam.trip("create_session_row");
         // Seed the journal with SessionCreated so every session starts at seq 1.
-        // The session row and its seed event are one transaction.
-        let tx = conn.unchecked_transaction()?;
         Self::insert_event_locked(
             &tx,
-            SessionId::new(id as u64),
+            sid,
             None,
             EventKind::SessionCreated,
             &idle_state_json,
@@ -447,17 +455,19 @@ impl Store {
             1,
             &seq_messages,
         )?;
+        // Durability boundary: the seed event is written, COMMIT is not yet
+        // (panic rolls the WHOLE creation back — no session, no event).
+        seam.trip("create_session_precommit");
+        let row = Self::get_session_locked(&tx, sid)?.ok_or_else(|| {
+            StoreError::Corrupt(vec![
+                "just-created session not readable inside creation transaction".into(),
+            ])
+        })?;
         tx.commit()?;
-        Ok(
-            match Self::get_session_locked(conn, SessionId::new(id as u64))? {
-                Some(row) => row,
-                None => {
-                    return Err(StoreError::Corrupt(vec![
-                        "just-created session not readable back".into(),
-                    ]))
-                }
-            },
-        )
+        // Durability boundary: COMMIT returned, the acknowledgement was lost
+        // (the session row and its seq-1 seed event are durable together).
+        seam.trip("create_session_committed");
+        Ok(row)
         })
     }
 

@@ -53,17 +53,39 @@ impl Store {
         before_seq: Option<i64>,
         limit: u64,
     ) -> StoreResult<Vec<MessageRow>> {
+        // `u64::MAX` is this legacy signature's documented whole-conversation
+        // sentinel; every other out-of-range limit is an explicit request the
+        // explicit page twin refuses typed (never a negative/unbounded LIMIT).
+        let limit = if limit == u64::MAX { None } else { Some(limit) };
+        self.messages_before_page(session_id, before_seq, limit)
+    }
+
+    /// Explicit-page twin of [`Store::messages_before`]: `None` binds
+    /// SQLite's unbounded sentinel (`LIMIT -1`) and an explicit limit above
+    /// `i64::MAX` refuses typed.
+    pub fn messages_before_page(
+        &self,
+        session_id: SessionId,
+        before_seq: Option<i64>,
+        limit: Option<u64>,
+    ) -> StoreResult<Vec<MessageRow>> {
+        let limit = match limit {
+            None => -1i64,
+            Some(limit) => i64::try_from(limit).map_err(|_| {
+                StoreError::Oversized("message page limit exceeds SQLite signed range".into())
+            })?,
+        };
         let conn = self.read()?;
         let (sql, params) = match before_seq {
             Some(b) => (
                 "SELECT id, session_id, seq, role, data, created_ms FROM message
                  WHERE session_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
-                vec![session_id.raw() as i64, b, limit as i64],
+                vec![session_id.raw() as i64, b, limit],
             ),
             None => (
                 "SELECT id, session_id, seq, role, data, created_ms FROM message
                  WHERE session_id = ?1 ORDER BY seq DESC LIMIT ?2",
-                vec![session_id.raw() as i64, limit as i64],
+                vec![session_id.raw() as i64, limit],
             ),
         };
         let mut stmt = conn.prepare(sql)?;
