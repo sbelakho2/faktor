@@ -827,3 +827,25 @@ fn newer_worker_store_schema_is_a_typed_409_on_the_worker_wire() {
     assert!(message.contains("v9"), "{message}");
     assert!(message.contains("v7"), "{message}");
 }
+
+/// The worker page bound compares in `u64` BEFORE any conversion: the
+/// upper half of `u64` must be a typed 400, never a truncated pass or a
+/// silent clamp.
+#[test]
+fn page_limit_never_wraps_the_unsigned_bound() {
+    use super::page_limit;
+    let max = u64::try_from(faktor_worker::MAX_WORKER_PAGE).unwrap();
+    assert_eq!(page_limit(None).unwrap(), 50);
+    assert!(page_limit(Some(0)).is_err());
+    assert_eq!(page_limit(Some(1)).unwrap(), 1);
+    assert_eq!(
+        page_limit(Some(max)).unwrap(),
+        faktor_worker::MAX_WORKER_PAGE
+    );
+    for l in [max + 1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        assert!(
+            page_limit(Some(l)).is_err(),
+            "limit {l} must be a typed 400"
+        );
+    }
+}

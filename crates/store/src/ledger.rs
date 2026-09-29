@@ -18,6 +18,16 @@ pub struct MemoryFactRow {
 /// window.
 pub type MemoryFactCursor = (i64, String, String);
 
+/// Verification depth of [`Store::journal_session_problems`]. `Open` keeps
+/// session open bounded (point reads plus ONE covering-index aggregate);
+/// `Deep` adds the adjacent-inversion timestamp aggregate the doctor sweep
+/// runs. Both NEVER materialize the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalDepth {
+    Open,
+    Deep,
+}
+
 /// One typed, versioned row of the durable session ledger (audits 27,
 /// 71-72; schema v11). The journal is the source of truth for *what
 /// happened*; `ledger_entry` is the rich append-only typed ledger and
@@ -2077,100 +2087,213 @@ impl Store {
         Ok(next as u64)
     }
 
-    /// Journal projection consistency for EVERY session (`doctor --deep`).
-    /// A session's journal is the gapless sequence 1..=N whose FIRST event is
-    /// the `session_created` seed in the `idle` state and whose timestamps
-    /// are non-decreasing in seq order. The (session_id, seq) primary key
-    /// structurally forbids duplicates, so a count/range mismatch means a
-    /// gap, a lost commit, or tampering. A session row with NO journal rows
-    /// at all is also flagged: creation seeds the journal in the same
-    /// transaction as the session row, so a row without events is a torn
-    /// write. Returns human-readable problems; empty = consistent.
-    pub fn journal_consistency_issues(&self) -> StoreResult<Vec<String>> {
+    /// Bounded, depth-aware journal verification for ONE session — the
+    /// per-session authority behind session open ([`JournalDepth::Open`])
+    /// and the doctor sweep ([`JournalDepth::Deep`]). It NEVER materializes
+    /// the journal: the `(session_id, seq)` primary key plus `CHECK (seq >
+    /// 0)` answers the gapless `1..=N` question from ONE covering-index
+    /// aggregate (`MIN(seq) = 1 AND MAX(seq) = COUNT(*)`), and every other
+    /// check is a point read (session row, first event, tail event). The
+    /// first event must be the `session_created` seed in the `idle` state;
+    /// the tail event's landing state must agree with the session row's
+    /// projected state (the ONE tolerated divergence is the queue-admission
+    /// reservation window — see below; an UNDECODABLE tail state cannot be
+    /// compared and is reported by the strict event readers at open and by
+    /// `Deep` here); a session row with no events is a torn write (creation
+    /// seeds both in one transaction). `Deep` additionally requires
+    /// non-decreasing timestamps in seq order via an adjacent-pair inversion
+    /// count. Returns human-readable problems naming the session;
+    /// empty = consistent.
+    pub fn journal_session_problems(
+        &self,
+        session_id: SessionId,
+        depth: JournalDepth,
+    ) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
-        let mut issues = Vec::new();
-        {
-            // Gapless 1..=N per session: the (session_id, seq) primary key
-            // forbids duplicates, so a count/range mismatch is a gap, a lost
-            // commit or tampering.
-            let mut stmt = conn.prepare(
-                "SELECT session_id, COUNT(*), MIN(seq), MAX(seq)
-                 FROM event GROUP BY session_id",
-            )?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let sid: i64 = row.get(0)?;
-                let count: i64 = row.get(1)?;
-                let min_seq: i64 = row.get(2)?;
-                let max_seq: i64 = row.get(3)?;
-                if min_seq != 1 || count != max_seq {
-                    issues.push(format!(
-                        "session {sid}: journal holds {count} event(s) spanning seq {min_seq}..={max_seq}; invariant is a gapless 1..={count}"
-                    ));
-                }
-            }
+        Self::journal_session_problems_on(&conn, session_id, depth)
+    }
+
+    fn journal_session_problems_on(
+        conn: &Connection,
+        session_id: SessionId,
+        depth: JournalDepth,
+    ) -> StoreResult<Vec<String>> {
+        let sid = session_id.raw() as i64;
+        let mut problems = Vec::new();
+        // Point read of the projected authority (the session row). The
+        // doctor iterates rows, so a missing row is only visible to direct
+        // callers — it is still a problem, never an excuse to skip.
+        let row_state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM session WHERE id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if row_state.is_none() {
+            problems.push(format!(
+                "session {session_id}: session row is missing for its journal"
+            ));
         }
-        {
-            // First-event contract: seq 1 is the session_created seed in the
-            // idle state. A journal whose seq-1 slot was overwritten by a
-            // LATER event stays numerically gapless and is only visible here.
-            let mut stmt =
-                conn.prepare("SELECT session_id, kind, state FROM event WHERE seq = 1")?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let sid: i64 = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let state: String = row.get(2)?;
+        // ONE covering-index aggregate over `(session_id, seq)`: COUNT/MIN/
+        // MAX never touch the table rows or the payload columns.
+        let (count, min_seq, max_seq): (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0)
+             FROM event WHERE session_id = ?1",
+            params![sid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if count == 0 {
+            if row_state.is_some() {
+                problems.push(format!(
+                    "session {session_id}: session row exists but its journal has no events (torn creation)"
+                ));
+            }
+            return Ok(problems);
+        }
+        if min_seq != 1 || count != max_seq {
+            problems.push(format!(
+                "session {session_id}: journal holds {count} event(s) spanning seq {min_seq}..={max_seq}; invariant is a gapless 1..={count}"
+            ));
+        }
+        // Point read of the first event: the seq-1 seed contract. A journal
+        // whose seq-1 slot was overwritten by a LATER event stays
+        // numerically gapless and is only visible here.
+        let first: Option<(i64, String, String)> = conn
+            .query_row(
+                "SELECT seq, kind, state FROM event WHERE session_id = ?1 ORDER BY seq ASC LIMIT 1",
+                params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((seq, kind, state)) = first {
+            if seq == 1 {
                 if kind != "session_created" {
-                    issues.push(format!(
-                        "session {sid}: first journal event kind is {kind:?}, not session_created"
+                    problems.push(format!(
+                        "session {session_id}: first journal event kind is {kind:?}, not session_created"
                     ));
                 }
                 match parse_json::<AgentState>(
-                    &format!("journal first event state for session {sid}"),
+                    &format!("journal first event state for session {session_id}"),
                     &state,
                 ) {
                     Ok(AgentState::Idle) => {}
-                    Ok(other) => issues.push(format!(
-                        "session {sid}: first journal event state is {other:?}, not idle"
+                    Ok(other) => problems.push(format!(
+                        "session {session_id}: first journal event state is {other:?}, not idle"
                     )),
-                    Err(_) => issues.push(format!(
-                        "session {sid}: first journal event state is not a valid AgentState"
+                    Err(_) => problems.push(format!(
+                        "session {session_id}: first journal event state is not a valid AgentState"
                     )),
                 }
             }
         }
-        {
+        // Point read of the tail event: every append writes the session
+        // row's projection and the event's landing state in ONE
+        // transaction, so the two must agree.
+        let tail: Option<String> = conn
+            .query_row(
+                "SELECT state FROM event WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let (Some(row_state), Some(tail_state)) = (row_state.as_deref(), tail.as_deref()) {
+            match (
+                parse_json::<AgentState>(&format!("session {session_id} state"), row_state),
+                parse_json::<AgentState>(
+                    &format!("session {session_id} tail journal event state"),
+                    tail_state,
+                ),
+            ) {
+                (Ok(projected), Ok(landed)) if projected == landed => {}
+                (Ok(projected), Ok(landed)) => {
+                    // The ONE legal projection-ahead window: queue admission
+                    // ([`Store::admit_queue_head`]) reserves the next journal
+                    // seq for the materialized admission message and moves
+                    // the row to `preparing` in ONE transaction, while the
+                    // matching `prompt_admitted` event at that reserved seq
+                    // lands immediately after (the agent queue runner). A
+                    // crash between the two leaves the projection exactly one
+                    // reserved event AHEAD of the journal — recoverable
+                    // residue, not corruption. Accepted ONLY while the
+                    // artifact proving the reservation exists: a message row
+                    // at `MAX(event.seq) + 1` and a `preparing` projection.
+                    let mut reserved_admission = false;
+                    if projected == AgentState::Preparing {
+                        if let Some(reserved_seq) = max_seq.checked_add(1) {
+                            reserved_admission = conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM message
+                                 WHERE session_id = ?1 AND seq = ?2)",
+                                params![sid, reserved_seq],
+                                |r| r.get(0),
+                            )?;
+                        }
+                    }
+                    if !reserved_admission {
+                        problems.push(format!(
+                            "session {session_id}: journal tail event state {landed:?} disagrees with the session row state {projected:?}"
+                        ));
+                    }
+                }
+                (Err(_), _) => problems.push(format!(
+                    "session {session_id}: session row state is not a valid AgentState"
+                )),
+                (_, Err(_)) => {
+                    // An undecodable event state cannot be compared: Open is
+                    // the bounded projection check, and the strict event
+                    // readers (journal replay, SSE, paged reads) already
+                    // refuse it typed. `Deep` still reports it so the
+                    // corruption is never silent.
+                    if depth == JournalDepth::Deep {
+                        problems.push(format!(
+                            "session {session_id}: tail journal event state is not a valid AgentState"
+                        ));
+                    }
+                }
+            }
+        }
+        if depth == JournalDepth::Deep {
             // Timestamps never step backwards in seq order (the append path
-            // clamps a backward clock, so a regression is tampering).
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT session_id FROM (
-                     SELECT session_id, ts_ms,
-                            LAG(ts_ms) OVER (PARTITION BY session_id ORDER BY seq) AS prev_ts
-                     FROM event
-                 ) WHERE ts_ms < prev_ts",
+            // clamps a backward clock, so a regression is tampering). ONE
+            // adjacent-pair inversion count; never a row-by-row compare.
+            let inversions: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM event e
+                 JOIN event p ON p.session_id = e.session_id AND p.seq = e.seq - 1
+                 WHERE e.session_id = ?1 AND e.ts_ms < p.ts_ms",
+                params![sid],
+                |r| r.get(0),
             )?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let sid: i64 = row.get(0)?;
-                issues.push(format!(
-                    "session {sid}: journal timestamps are not non-decreasing in seq order"
+            if inversions > 0 {
+                problems.push(format!(
+                    "session {session_id}: journal timestamps are not non-decreasing in seq order"
                 ));
             }
         }
-        {
-            // Sessions whose journal is missing entirely (torn creation).
-            let mut stmt = conn.prepare(
-                "SELECT s.id FROM session s
-                 WHERE NOT EXISTS (SELECT 1 FROM event e WHERE e.session_id = s.id)",
-            )?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let sid: i64 = row.get(0)?;
-                issues.push(format!(
-                    "session {sid}: session row exists but its journal has no events (torn creation)"
-                ));
-            }
+        Ok(problems)
+    }
+
+    /// Journal projection consistency for EVERY session (`doctor --deep`).
+    /// A session's journal is the gapless sequence 1..=N whose FIRST event is
+    /// the `session_created` seed in the `idle` state, whose timestamps are
+    /// non-decreasing in seq order, and whose tail event agrees with the
+    /// session row's projected state. This is the per-session authority
+    /// [`Store::journal_session_problems`] at [`JournalDepth::Deep`], swept
+    /// across the session rows (orphan event rows cannot exist: the event
+    /// table's `session_id` references `session(id)`). Returns
+    /// human-readable problems; empty = consistent.
+    pub fn journal_consistency_issues(&self) -> StoreResult<Vec<String>> {
+        let conn = self.read()?;
+        let mut issues = Vec::new();
+        let mut stmt = conn.prepare("SELECT id FROM session ORDER BY id ASC")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let sid_raw: i64 = row.get(0)?;
+            let sid = id_field::<SessionId>(&format!("session id {sid_raw}"), sid_raw)?;
+            issues.extend(Self::journal_session_problems_on(
+                &conn,
+                sid,
+                JournalDepth::Deep,
+            )?);
         }
         Ok(issues)
     }
@@ -2475,6 +2598,10 @@ impl Store {
 }
 
 #[cfg(test)]
+#[path = "journal_authority_tests.rs"]
+mod journal_authority_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2492,186 +2619,6 @@ mod tests {
             Err(StoreError::Sqlite(_)) | Err(StoreError::Corrupt(_)) => {}
             other => panic!("truncated db must fail cleanly, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn journal_sequences_are_gapless_under_concurrent_append() {
-        let (_d, store) = tmp_store();
-        let ws = store.create_workspace("/w").unwrap();
-        let session = store.create_session(ws, "c", "p", "m").unwrap();
-        let sid = session.id;
-        let store = std::sync::Arc::new(store);
-        let mut handles = vec![];
-        for t in 0..8 {
-            let store = store.clone();
-            handles.push(std::thread::spawn(move || {
-                for i in 0..50 {
-                    store
-                        .append_event(
-                            sid,
-                            Some(OpId::new(1 + t * 100 + i)),
-                            EventKind::ModelChunkReceived,
-                            AgentState::Streaming,
-                            now_ms(),
-                            Some(serde_json::json!({"i": i})),
-                        )
-                        .unwrap();
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let events = store.events_range(sid, 1, None).unwrap();
-        // SessionCreated(1) + 400 chunks = 401 events, seq 1..=401 gapless.
-        assert_eq!(events.len(), 401);
-        for (i, e) in events.iter().enumerate() {
-            assert_eq!(e.seq.raw(), (i + 1) as u64, "gap at {i}");
-        }
-        // Resume cursor semantics: events_after(seq 400) returns exactly 1.
-        let tail = store.events_after(sid, EventSeq::new(400)).unwrap();
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].seq.raw(), 401);
-    }
-
-    #[test]
-    fn event_page_cursors_and_limits_never_wrap_the_signed_domain() {
-        let (_d, store) = tmp_store();
-        let ws = store.create_workspace("/w").unwrap();
-        let s = store.create_session(ws, "t", "p", "m").unwrap();
-        // Cursors at/above the top of the signed seq domain can never be
-        // followed by a durable seq: empty pages, never a wrapped replay.
-        let after_max = store.events_after(s.id, EventSeq::new(u64::MAX)).unwrap();
-        assert!(after_max.is_empty());
-        let after_edge = store
-            .events_after(s.id, EventSeq::new(i64::MAX as u64))
-            .unwrap();
-        assert!(after_edge.is_empty());
-        let range_above = store.events_range(s.id, i64::MAX as u64 + 1, None).unwrap();
-        assert!(range_above.is_empty());
-        let versioned_above = store
-            .events_versioned_range(s.id, i64::MAX as u64 + 1, None)
-            .unwrap();
-        assert!(versioned_above.is_empty());
-        // The largest signed seq is still a real cursor: it includes the
-        // event stored AT the boundary.
-        seed_only_event_seq(&store, s.id, i64::MAX);
-        let boundary = store.events_range(s.id, i64::MAX as u64, None).unwrap();
-        assert_eq!(boundary.len(), 1);
-        let tail = store
-            .events_after(s.id, EventSeq::new(i64::MAX as u64 - 1))
-            .unwrap();
-        assert_eq!(tail.len(), 1);
-        // An explicit limit above the signed range refuses typed; it must
-        // never bind a negative LIMIT (SQLite's unbounded sentinel).
-        for limit in [i64::MAX as u64 + 1, u64::MAX] {
-            assert!(
-                matches!(
-                    store.events_range(s.id, 1, Some(limit)),
-                    Err(StoreError::Oversized(_))
-                ),
-                "limit {limit} must refuse typed Oversized"
-            );
-            assert!(
-                matches!(
-                    store.events_versioned_range(s.id, 1, Some(limit)),
-                    Err(StoreError::Oversized(_))
-                ),
-                "versioned limit {limit} must refuse typed Oversized"
-            );
-        }
-        // i64::MAX itself is the largest legal explicit limit; `None` stays
-        // the honest unbounded page (the seeded boundary event).
-        assert_eq!(
-            store
-                .events_range(s.id, 1, Some(i64::MAX as u64))
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(store.events_range(s.id, 1, None).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn journal_consistency_flags_later_event_masquerading_as_seq_one() {
-        let (_d, store) = tmp_store();
-        let ws = store.create_workspace("/w").unwrap();
-        let s = store.create_session(ws, "t", "p", "m").unwrap();
-        store
-            .append_event(
-                s.id,
-                None,
-                EventKind::ModelChunkReceived,
-                AgentState::Streaming,
-                now_ms(),
-                None,
-            )
-            .unwrap();
-        assert!(store.journal_consistency_issues().unwrap().is_empty());
-        // Torn create: the original session_created seed is lost and the
-        // LATER event is renumbered into its seq-1 slot. The journal is
-        // numerically gapless (count == max == 1), so only the first-event
-        // kind/state contract can flag it.
-        let conn = store.raw_conn();
-        conn.execute(
-            "DELETE FROM event WHERE session_id = ?1 AND seq = 1",
-            params![s.id.raw() as i64],
-        )
-        .unwrap();
-        let renumbered = conn
-            .execute(
-                "UPDATE event SET seq = 1 WHERE session_id = ?1 AND seq = 2",
-                params![s.id.raw() as i64],
-            )
-            .unwrap();
-        assert_eq!(renumbered, 1, "the hostile renumber must land");
-        drop(conn);
-        let issues = store.journal_consistency_issues().unwrap();
-        assert_eq!(issues.len(), 2, "kind AND state must both flag: {issues:?}");
-        for needle in ["session_created", "not idle"] {
-            assert!(
-                issues.iter().any(|i| i.contains(needle)),
-                "{needle} must be flagged: {issues:?}"
-            );
-        }
-        for issue in &issues {
-            assert!(
-                issue.contains(&format!("session {}", s.id.raw())),
-                "each issue must name the session: {issue}"
-            );
-        }
-    }
-
-    #[test]
-    fn journal_consistency_flags_backwards_timestamps() {
-        let (_d, store) = tmp_store();
-        let ws = store.create_workspace("/w").unwrap();
-        let s = store.create_session(ws, "t", "p", "m").unwrap();
-        let seed_ts = store.events_range(s.id, 1, None).unwrap()[0].ts_ms;
-        store
-            .append_event(
-                s.id,
-                None,
-                EventKind::ModelStarted,
-                AgentState::Streaming,
-                seed_ts + 10,
-                None,
-            )
-            .unwrap();
-        assert!(store.journal_consistency_issues().unwrap().is_empty());
-        store
-            .raw_conn()
-            .execute(
-                "UPDATE event SET ts_ms = ?2 WHERE session_id = ?1 AND seq = 2",
-                params![s.id.raw() as i64, seed_ts - 1],
-            )
-            .unwrap();
-        let issues = store.journal_consistency_issues().unwrap();
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(
-            issues[0].contains("non-decreasing"),
-            "the backward step must be flagged: {issues:?}"
-        );
     }
 
     #[test]
@@ -2757,7 +2704,7 @@ mod tests {
     /// bypassed the way an attacker with file access (or a database written
     /// before the CHECK existed) bypasses it, so the append guard itself must
     /// be what refuses.
-    fn seed_only_event_seq(store: &Store, sid: SessionId, seq: i64) {
+    pub(crate) fn seed_only_event_seq(store: &Store, sid: SessionId, seq: i64) {
         let conn = store.raw_conn();
         conn.execute_batch("PRAGMA ignore_check_constraints = ON")
             .unwrap();

@@ -888,6 +888,11 @@ impl SessionManager {
                 // that fails its schema decode fails the session open
                 // loudly — never a silent drop.
                 handle.ledger_verify_open()?;
+                // Open-time event-journal verification (audit consolidation):
+                // the bounded store authority checks the seed contract, the
+                // gapless 1..=N span and the tail-vs-projection state
+                // agreement; a torn/corrupt journal fails the open typed.
+                handle.journal_verify_open()?;
                 Ok(Some(handle))
             }
             None => Ok(None),
@@ -905,6 +910,14 @@ impl SessionManager {
             // Open-time typed-ledger verification (audit 27): a corrupt
             // typed entry fails the session open loudly.
             handle.ledger_verify_open()?;
+            // Open-time event-journal verification (audit consolidation):
+            // the same bounded authority as `get_session`, so a session
+            // listed here is one that may be opened. On a large-history
+            // store this adds one covering-index aggregate per session
+            // (O(events) index entries, no row materialization); a
+            // performance-lane regression can fall back to the O(1)
+            // seed/tail points without dropping validation.
+            handle.journal_verify_open()?;
             out.push(handle);
         }
         Ok(out)
@@ -1892,5 +1905,172 @@ mod tests {
             last = raw;
             assert!(seen.insert(raw), "op id {raw} reused");
         }
+    }
+
+    #[test]
+    fn corrupt_journals_refuse_open_list_and_recovery_typed() {
+        use faktor_core::event::EventKind;
+        use faktor_core::state::AgentState;
+
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/w").unwrap();
+
+        // Healthy: open, list and the recovery sweep all succeed.
+        let healthy = m.create_session(ws, "healthy", "p", "m").unwrap();
+        m.get_session(healthy.id())
+            .unwrap()
+            .unwrap()
+            .force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
+            .unwrap();
+        assert!(m.get_session(healthy.id()).unwrap().is_some());
+        assert!(m
+            .list_sessions(Some(ws))
+            .unwrap()
+            .iter()
+            .any(|h| h.id() == healthy.id()));
+        let reports = m.recover_all_sessions().unwrap();
+        assert!(reports.iter().any(|r| r.session_id == healthy.id()));
+
+        // A torn journal (session row with ZERO events) refuses typed.
+        let torn = m.create_session(ws, "torn", "p", "m").unwrap();
+        m.store()
+            .sql_execute(&format!(
+                "DELETE FROM event WHERE session_id = {}",
+                torn.id().raw()
+            ))
+            .unwrap();
+        let err = m.get_session(torn.id()).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        assert!(err.message.contains("no events"), "{err:?}");
+        assert!(err.message.contains(&torn.id().to_string()), "{err:?}");
+
+        // The seq-1 seed slot supplanted by a renumbered later event: fails
+        // typed naming both the kind and the first-state contract.
+        let supplanted = m.create_session(ws, "supplanted", "p", "m").unwrap();
+        m.get_session(supplanted.id())
+            .unwrap()
+            .unwrap()
+            .force_append_event(
+                EventKind::ModelChunkReceived,
+                AgentState::Streaming,
+                None,
+                None,
+            )
+            .unwrap();
+        m.store()
+            .sql_execute(&format!(
+                "DELETE FROM event WHERE session_id = {} AND seq = 1;
+                 UPDATE event SET seq = 1 WHERE session_id = {} AND seq = 2",
+                supplanted.id().raw(),
+                supplanted.id().raw()
+            ))
+            .unwrap();
+        let err = m.get_session(supplanted.id()).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        assert!(err.message.contains("session_created"), "{err:?}");
+        assert!(err.message.contains("not idle"), "{err:?}");
+
+        // A gap (1,3) refuses typed.
+        let gapped = m.create_session(ws, "gapped", "p", "m").unwrap();
+        for _ in 0..2 {
+            m.get_session(gapped.id())
+                .unwrap()
+                .unwrap()
+                .force_append_event(
+                    EventKind::ModelChunkReceived,
+                    AgentState::Streaming,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        m.store()
+            .sql_execute(&format!(
+                "DELETE FROM event WHERE session_id = {} AND seq = 2",
+                gapped.id().raw()
+            ))
+            .unwrap();
+        let err = m.get_session(gapped.id()).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        assert!(err.message.contains("1..=3"), "{err:?}");
+
+        // The tail event's landing state disagrees with the row projection.
+        let drifted = m.create_session(ws, "drifted", "p", "m").unwrap();
+        m.get_session(drifted.id())
+            .unwrap()
+            .unwrap()
+            .force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
+            .unwrap();
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE session SET state = '\"idle\"' WHERE id = {}",
+                drifted.id().raw()
+            ))
+            .unwrap();
+        let err = m.get_session(drifted.id()).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        assert!(err.message.contains("disagrees"), "{err:?}");
+
+        // Timestamp inversion is a Deep (doctor) finding: the bounded Open
+        // authority deliberately does not run the O(events) adjacent-pair
+        // scan, so the session still opens.
+        let inverted = m.create_session(ws, "inverted", "p", "m").unwrap();
+        m.get_session(inverted.id())
+            .unwrap()
+            .unwrap()
+            .force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
+            .unwrap();
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE event SET ts_ms = 0 WHERE session_id = {} AND seq = 2",
+                inverted.id().raw()
+            ))
+            .unwrap();
+        assert!(
+            m.get_session(inverted.id()).is_ok(),
+            "Open does not verify timestamp order (Deep does)"
+        );
+
+        // list_sessions refuses the corrupt store, and the recovery sweep
+        // stays LOUD (typed error) instead of skipping the session.
+        let err = m.list_sessions(None).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        let err = m.recover_all_sessions().unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+    }
+
+    #[test]
+    fn open_stays_bounded_on_a_large_journal() {
+        use faktor_core::event::EventKind;
+        use faktor_core::state::AgentState;
+
+        const EVENTS: u64 = 10_000;
+        let (_d, m) = tmp_manager();
+        let ws = m.create_workspace("/w").unwrap();
+        let s = m.create_session(ws, "large", "p", "m").unwrap();
+        for i in 0..EVENTS {
+            m.store()
+                .append_event(
+                    s.id(),
+                    Some(OpId::new(i + 1)),
+                    EventKind::ModelChunkReceived,
+                    AgentState::Streaming,
+                    m.now_ms(),
+                    Some(serde_json::json!({"i": i})),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            m.store().last_event_seq(s.id()).unwrap().unwrap().raw(),
+            EVENTS + 1,
+            "seed event + appends are one gapless span"
+        );
+        // Open and list run the bounded authority on the 10k journal.
+        assert!(m.get_session(s.id()).unwrap().is_some());
+        assert!(m
+            .list_sessions(Some(ws))
+            .unwrap()
+            .iter()
+            .any(|h| h.id() == s.id()));
     }
 }

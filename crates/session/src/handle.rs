@@ -337,6 +337,33 @@ impl SessionHandle {
         Ok(outcome)
     }
 
+    /// Session-open journal verification (audit consolidation): the durable
+    /// event journal is checked at [`faktor_store::JournalDepth::Open`] via
+    /// the store's bounded per-session authority — seed contract, gapless
+    /// `1..=N`, tail-vs-projection state agreement — WITHOUT materializing
+    /// the journal. Any problem FAILS THE OPEN as the crate's established
+    /// corruption surface (`Malformed`, mirroring
+    /// [`SessionHandle::ledger_verify_open`]), naming the session and every
+    /// bounded problem found. The deep timestamp sweep stays the doctor's
+    /// (`JournalDepth::Deep`); open does not pay an O(events) scan beyond
+    /// the one covering-index aggregate.
+    pub fn journal_verify_open(&self) -> faktor_core::Result<()> {
+        let problems = self
+            .manager
+            .store()
+            .journal_session_problems(self.id, faktor_store::JournalDepth::Open)
+            .map_err(crate::map_store_err)?;
+        if problems.is_empty() {
+            return Ok(());
+        }
+        Err(SessionError::Malformed(format!(
+            "session {}: event journal failed open verification: {}",
+            self.id,
+            problems.join("; ")
+        ))
+        .into())
+    }
+
     // ---------------------------------------------------------------- prompts
 
     /// Accept a user prompt: journals `PromptReceived`, stores the user
@@ -2177,5 +2204,28 @@ pub(crate) mod tests {
             .map(|m| m.seq)
             .collect();
         assert_eq!(seqs, vec![3]);
+    }
+
+    #[test]
+    fn journal_verify_open_maps_a_torn_journal_to_the_typed_corruption_surface() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        assert!(s.journal_verify_open().is_ok(), "a fresh journal verifies");
+        s.force_append_event(EventKind::ModelStarted, AgentState::Streaming, None, None)
+            .unwrap();
+        assert!(
+            s.journal_verify_open().is_ok(),
+            "a healthy journal verifies"
+        );
+        m.store()
+            .sql_execute(&format!(
+                "DELETE FROM event WHERE session_id = {}",
+                s.id().raw()
+            ))
+            .unwrap();
+        let err = s.journal_verify_open().unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Malformed, "{err:?}");
+        assert!(err.message.contains("no events"), "{err:?}");
+        assert!(err.message.contains(&s.id().to_string()), "{err:?}");
     }
 }
