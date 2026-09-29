@@ -1059,7 +1059,7 @@ impl Store {
         // the writer job executes SQL only.
         let started_ms = now_ms();
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer.execute("start_tool_run_and_event", move |conn| {
         let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
         let changed = txn.tx.execute(
@@ -1092,7 +1092,7 @@ impl Store {
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
-            &seq_corrupt_message,
+            &seq_messages,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -1124,7 +1124,7 @@ impl Store {
         // session state expectation (the closure formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         let not_running = format!("tool run {op_id} is not running");
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer
             .execute("finish_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -1152,7 +1152,7 @@ impl Store {
                     event.ts_ms,
                     event_payload_json,
                     event.payload_ver,
-                    &seq_corrupt_message,
+                    &seq_messages,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -1197,7 +1197,7 @@ impl Store {
         let now = now_ms();
         let expectation = PreparedSessionStateExpectation::prepare(session_id, state);
         let not_running = format!("recovered tool run {op_id} is not running");
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer
             .execute("finish_recovered_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -1225,7 +1225,7 @@ impl Store {
                     now,
                     payload_json,
                     1,
-                    &seq_corrupt_message,
+                    &seq_messages,
                 )?;
                 txn.precommit();
                 txn.commit()?;

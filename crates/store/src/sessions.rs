@@ -146,35 +146,51 @@ impl ExpiredPermissionResolution {
     }
 }
 
-/// Every `AgentState` variant, in enum declaration order.
-const ALL_AGENT_STATES: [AgentState; 17] = [
-    AgentState::Idle,
-    AgentState::Preparing,
-    AgentState::BuildingContext,
-    AgentState::WaitingForModel,
-    AgentState::Streaming,
-    AgentState::ToolRequested,
-    AgentState::WaitingForPermission,
-    AgentState::ExecutingTool,
-    AgentState::Validating,
-    AgentState::UpdatingMemory,
-    AgentState::ReadyForNextTurn,
-    AgentState::Completed,
-    AgentState::Cancelled,
-    AgentState::FailedRecoverable,
-    AgentState::FailedPermanent,
-    AgentState::NeedsUserInput,
-    AgentState::Suspended,
-];
+/// Every `AgentState` variant, in enum declaration order. The exhaustive
+/// `match` over every arm is a compile-time drift guard (the `TaskState`
+/// pattern): a new variant fails this build until the vocabulary is
+/// extended, so a legitimately persisted new state can never be classified
+/// `Corrupt`.
+fn all_agent_states() -> [AgentState; 17] {
+    use AgentState::*;
+    let all = [
+        Idle,
+        Preparing,
+        BuildingContext,
+        WaitingForModel,
+        Streaming,
+        ToolRequested,
+        WaitingForPermission,
+        ExecutingTool,
+        Validating,
+        UpdatingMemory,
+        ReadyForNextTurn,
+        Completed,
+        Cancelled,
+        FailedRecoverable,
+        FailedPermanent,
+        NeedsUserInput,
+        Suspended,
+    ];
+    for state in all {
+        match state {
+            Idle | Preparing | BuildingContext | WaitingForModel | Streaming | ToolRequested
+            | WaitingForPermission | ExecutingTool | Validating | UpdatingMemory
+            | ReadyForNextTurn | Completed | Cancelled | FailedRecoverable | FailedPermanent
+            | NeedsUserInput | Suspended => {}
+        }
+    }
+    all
+}
 
-/// [`ALL_AGENT_STATES`] serialized exactly as the durable session rows
+/// [`all_agent_states`] serialized exactly as the durable session rows
 /// serialize it, built once on the caller's thread. `begin_prepared` runs on
 /// the single writer owner, so it can only SCAN this caller-prepared
 /// vocabulary — never serialize a state itself.
 fn valid_state_json() -> &'static [String] {
     static VALID: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     VALID.get_or_init(|| {
-        ALL_AGENT_STATES
+        all_agent_states()
             .into_iter()
             .map(|state| {
                 serde_json::to_string(&state)
@@ -400,8 +416,8 @@ impl Store {
         // Preparation BEFORE enqueueing: the timestamp and the journal
         // diagnostic context are captured on the caller's thread (audit item
         // 8). The session id is SQLite-allocated inside the transaction, so
-        // the seed diagnostic is the caller-prepared static text.
-        let seq_corrupt_message = "event journal of a new session MAX(seq)";
+        // the seed diagnostics are the caller-prepared static text.
+        let seq_messages = EventSeqMessages::for_new_session();
         let now = now_ms();
         self.writer.execute("create_session", move |conn| {
         conn.execute(
@@ -429,7 +445,7 @@ impl Store {
             now,
             Some(created_payload_json),
             1,
-            seq_corrupt_message,
+            &seq_messages,
         )?;
         tx.commit()?;
         Ok(
@@ -651,7 +667,7 @@ impl Store {
             .collect::<Vec<_>>()
         });
         let state_mismatch = t.expected_state.map(|expected| {
-            ALL_AGENT_STATES
+            all_agent_states()
                 .into_iter()
                 .map(|durable| {
                     (
@@ -664,7 +680,7 @@ impl Store {
         // Preparation BEFORE enqueueing: the journal diagnostic context and
         // the timestamp are captured on the caller's thread (audit item 8) —
         // the writer job executes SQL only.
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         let now = now_ms();
         self.writer.execute("transition_session", move |conn| {
             let tx = conn.unchecked_transaction()?;
@@ -727,7 +743,7 @@ impl Store {
                 now,
                 transition_payload_json,
                 t.event_payload_ver,
-                &seq_corrupt_message,
+                &seq_messages,
             )?;
             // (e) commit: lifecycle change and event are durable together.
             tx.commit()?;
@@ -764,7 +780,7 @@ impl Store {
         // refusal messages and the journal diagnostic context (the closure
         // formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer
             .execute("insert_permission_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -808,7 +824,7 @@ impl Store {
                     event.ts_ms,
                     payload_json,
                     event.payload_ver,
-                    &seq_corrupt_message,
+                    &seq_messages,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -843,7 +859,7 @@ impl Store {
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         let not_pending = format!("permission {id} is not pending");
         let op_id_context = format!("permission {id} op_id");
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
@@ -882,7 +898,7 @@ impl Store {
                     event.ts_ms,
                     event_payload_json,
                     event.payload_ver,
-                    &seq_corrupt_message,
+                    &seq_messages,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -938,7 +954,7 @@ impl Store {
         let terminalized_mismatch = "expire_pending_permissions: terminalized row count \
                                      mismatch; refusing a partial sweep"
             .to_owned();
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         self.writer
             .execute("expire_pending_permissions_for_session", move |conn| {
                 let txn =
@@ -1030,7 +1046,7 @@ impl Store {
                     event.ts_ms,
                     payload_json,
                     event.payload_ver,
-                    &seq_corrupt_message,
+                    &seq_messages,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -1069,7 +1085,7 @@ impl Store {
         // formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
         let duplicate_sequence = format!("checkpoint sequence {sequence} already exists");
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let now = now_ms();
@@ -1117,7 +1133,7 @@ impl Store {
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
-            &seq_corrupt_message,
+            &seq_messages,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -1176,7 +1192,7 @@ impl Store {
         // Preparation BEFORE enqueueing: the session state expectation and
         // the journal diagnostic context (the closure formats nothing).
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
-        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
+        let seq_messages = EventSeqMessages::for_session(session_id);
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ts = now_ms();
@@ -1225,7 +1241,7 @@ impl Store {
                 |r| r.get(0),
             )?),
             1,
-            &seq_corrupt_message,
+            &seq_messages,
         )?;
         txn.precommit();
         txn.commit()?;
