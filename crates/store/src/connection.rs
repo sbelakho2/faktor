@@ -529,6 +529,7 @@ pub(crate) enum PreparedHotWrite {
         ts_ms: i64,
         payload_json: Option<String>,
         payload_ver: i64,
+        seq_corrupt_message: String,
     },
     PutMessage {
         session_id: SessionId,
@@ -578,6 +579,7 @@ impl PreparedHotWrite {
                 ts_ms: *ts_ms,
                 payload_json: payload.as_ref().map(|p| p.to_string()),
                 payload_ver: *payload_ver,
+                seq_corrupt_message: format!("event journal of session {session_id} MAX(seq)"),
             },
             HotWrite::PutMessage {
                 session_id,
@@ -2071,10 +2073,11 @@ impl Store {
 
     pub fn create_workspace(&self, root: &str) -> StoreResult<WorkspaceId> {
         let root = root.to_owned();
+        let root_label = root.clone();
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let created_ms = now_ms();
-        self.writer.execute("create_workspace", move |conn| {
+        let id = self.writer.execute("create_workspace", move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO workspace(root, created_ms) VALUES (?1, ?2)",
                 params![root, created_ms],
@@ -2084,8 +2087,9 @@ impl Store {
                 params![root],
                 |r| r.get(0),
             )?;
-            id_field(&format!("workspace id {id} (root {root:?})"), id)
-        })
+            Ok(id)
+        })?;
+        id_field(&format!("workspace id {id} (root {root_label:?})"), id)
     }
 
     /// The recorded root path of a workspace; `None` when the workspace id is
@@ -2236,6 +2240,7 @@ impl Store {
                 ts_ms,
                 payload_json,
                 payload_ver,
+                seq_corrupt_message,
             } => Self::insert_event_locked(
                 conn,
                 *session_id,
@@ -2245,6 +2250,7 @@ impl Store {
                 *ts_ms,
                 payload_json.clone(),
                 *payload_ver,
+                seq_corrupt_message,
             )
             .map(HotWriteOutcome::EventSeq),
             PreparedHotWrite::PutMessage {

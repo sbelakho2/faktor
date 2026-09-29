@@ -1149,6 +1149,11 @@ impl Store {
         task_id: TaskId,
         max_cost_micro: Option<u64>,
     ) -> StoreResult<()> {
+        // Preparation BEFORE enqueueing: the refusal diagnostic (the closure
+        // formats nothing).
+        let no_row = format!(
+            "task {task_id} of session {session_id} has no row; the task machine owns creation"
+        );
         self.writer.execute("cost_task_cap_set", move |conn| {
             let n = conn.execute(
                 "UPDATE task SET max_cost_micro = ?1 WHERE session_id = ?2 AND task_id = ?3",
@@ -1159,9 +1164,7 @@ impl Store {
                 ],
             )?;
             if n == 0 {
-                return Err(StoreError::Conflict(format!(
-                "task {task_id} of session {session_id} has no row; the task machine owns creation"
-            )));
+                return Err(StoreError::Conflict(no_row));
             }
             Ok(())
         })
@@ -1472,6 +1475,10 @@ impl Store {
         settled_ms: i64,
     ) -> StoreResult<CostReservationState> {
         let route_decision_json = route_decision_json.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: the refusal diagnostic (the task ids
+        // are read inside the transaction, so the message is static).
+        let task_missing =
+            "cost settle: task has no row; the task machine owns creation".to_owned();
         self.writer.execute("cost_settle", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let row: Option<(i64, i64, String)> = tx
@@ -1522,9 +1529,7 @@ impl Store {
             )?;
             if n == 0 {
                 tx.rollback()?;
-                return Err(StoreError::Conflict(format!(
-                    "cost settle: task {task_id} of session {session_id} has no row"
-                )));
+                return Err(StoreError::Conflict(task_missing));
             }
             tx.commit()?;
             Ok(CostReservationState::Applied)
@@ -1563,6 +1568,11 @@ impl Store {
         settled_ms: i64,
     ) -> StoreResult<CostSettleOutcome> {
         let route_decision_json = route_decision_json.map(|v| v.to_owned());
+        // Preparation BEFORE enqueueing: every refusal diagnostic (the task
+        // ids are read inside the transaction, so that message is static).
+        let snapshot_context = format!("reservation {reservation_id} pricing_snapshot_json");
+        let task_missing =
+            "cost settle: task has no row; the task machine owns creation".to_owned();
         self.writer.execute("cost_settle_usage", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let row: Option<(i64, i64, String, Option<String>)> = tx
@@ -1582,10 +1592,7 @@ impl Store {
                 return Ok(CostSettleOutcome::NotOpen { current: status });
             }
             let snapshot = match snapshot_json {
-                Some(json) => Some(parse_json::<PricingSnapshot>(
-                    &format!("reservation {reservation_id} pricing_snapshot_json"),
-                    &json,
-                )?),
+                Some(json) => Some(parse_json::<PricingSnapshot>(&snapshot_context, &json)?),
                 None => None,
             };
             // The locally calculated actual: categories x the frozen snapshot.
@@ -1682,9 +1689,7 @@ impl Store {
             )?;
             if n == 0 {
                 tx.rollback()?;
-                return Err(StoreError::Conflict(format!(
-                    "cost settle: task {task_id} of session {session_id} has no row"
-                )));
+                return Err(StoreError::Conflict(task_missing));
             }
             tx.commit()?;
             Ok(CostSettleOutcome::Applied {
@@ -1890,6 +1895,7 @@ impl Store {
         for reservation_id in candidates {
             // One prepared command per candidate: the transaction body runs
             // on the writer owner; the report folds OUTSIDE it.
+            let snapshot_context = format!("reservation {reservation_id} pricing_snapshot_json");
             let outcome = self.writer.execute("cost_reconcile_uncertain", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 // Only a row still UNCERTAIN settles (concurrent recovery or
@@ -1907,10 +1913,7 @@ impl Store {
                     return Ok(CostReconcileOutcome::Skipped);
                 };
                 let snapshot = match snapshot_json {
-                    Some(json) => Some(parse_json::<PricingSnapshot>(
-                        &format!("reservation {reservation_id} pricing_snapshot_json"),
-                        &json,
-                    )?),
+                    Some(json) => Some(parse_json::<PricingSnapshot>(&snapshot_context, &json)?),
                     None => None,
                 };
                 // The completed provider-call row of THIS SAME attempt (or, for

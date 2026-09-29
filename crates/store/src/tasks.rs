@@ -1047,11 +1047,9 @@ impl Store {
         expected_state: AgentState,
         event: CommandEvent,
     ) -> StoreResult<(i64, EventSeq)> {
-        let seam = Arc::clone(&self.seam);
-        let tool = tool.to_owned();
+        let (seam, tool) = (Arc::clone(&self.seam), tool.to_owned());
         // Preparation BEFORE enqueueing: argument/recovery/replay JSON.
-        let args_json = args.to_string();
-        let recovery_json = recovery.to_string();
+        let (args_json, recovery_json) = (args.to_string(), recovery.to_string());
         let replay_json = replay_descriptor.map(|d| d.to_string());
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
@@ -1061,6 +1059,7 @@ impl Store {
         // the writer job executes SQL only.
         let started_ms = now_ms();
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         self.writer.execute("start_tool_run_and_event", move |conn| {
         let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
         let changed = txn.tx.execute(
@@ -1093,6 +1092,7 @@ impl Store {
             event.ts_ms,
             event_payload_json,
             event.payload_ver,
+            &seq_corrupt_message,
         )?;
         txn.precommit();
         txn.commit()?;
@@ -1113,8 +1113,7 @@ impl Store {
         event: CommandEvent,
     ) -> StoreResult<EventSeq> {
         let seam = Arc::clone(&self.seam);
-        let status = status.to_owned();
-        let effect_status = effect_status.to_owned();
+        let (status, effect_status) = (status.to_owned(), effect_status.to_owned());
         let event_payload_json = event.payload.as_ref().map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let event_state_json = serde_json::to_string(&event.state).unwrap();
@@ -1123,8 +1122,9 @@ impl Store {
         let ended_ms = now_ms();
         // Preparation BEFORE enqueueing: the conflict diagnostic text and the
         // session state expectation (the closure formats nothing).
-        let not_running = format!("tool run {op_id} is not running");
         let expectation = PreparedSessionStateExpectation::prepare(session_id, expected_state);
+        let not_running = format!("tool run {op_id} is not running");
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         self.writer
             .execute("finish_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -1152,6 +1152,7 @@ impl Store {
                     event.ts_ms,
                     event_payload_json,
                     event.payload_ver,
+                    &seq_corrupt_message,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -1187,17 +1188,16 @@ impl Store {
         payload: Option<serde_json::Value>,
     ) -> StoreResult<EventSeq> {
         let seam = Arc::clone(&self.seam);
-        let status = status.to_owned();
-        let effect_status = effect_status.to_owned();
+        let (status, effect_status) = (status.to_owned(), effect_status.to_owned());
         let payload_json = payload.map(|p| p.to_string());
         // Preparation BEFORE enqueueing: the event's landing state JSON.
         let state_json = serde_json::to_string(&state).unwrap();
-        // Preparation BEFORE enqueueing: one timestamp for the row and the
-        // event plus the conflict diagnostic text and the session state
-        // expectation, prepared on the caller's thread (audit item 8).
+        // Preparation BEFORE enqueueing: one timestamp plus the conflict
+        // diagnostic and the session state expectation (audit item 8).
         let now = now_ms();
-        let not_running = format!("recovered tool run {op_id} is not running");
         let expectation = PreparedSessionStateExpectation::prepare(session_id, state);
+        let not_running = format!("recovered tool run {op_id} is not running");
+        let seq_corrupt_message = format!("event journal of session {session_id} MAX(seq)");
         self.writer
             .execute("finish_recovered_tool_run_and_event", move |conn| {
                 let txn = SessionCommandTxn::begin_prepared(conn, &seam, session_id, expectation)?;
@@ -1225,6 +1225,7 @@ impl Store {
                     now,
                     payload_json,
                     1,
+                    &seq_corrupt_message,
                 )?;
                 txn.precommit();
                 txn.commit()?;
@@ -1874,9 +1875,14 @@ impl Store {
         checks: &[VerificationJobRow],
     ) -> StoreResult<bool> {
         validate_verification_attempt(attempt, changed, checks)?;
-        let attempt = attempt.to_owned();
-        let changed = changed.to_owned();
-        let checks = checks.to_owned();
+        // Preparation BEFORE enqueueing: one open-job refusal diagnostic per
+        // check (the prior attempt id is read inside the transaction).
+        let mut open_job_conflicts: Vec<String> = checks
+            .iter()
+            .map(|check| format!("check '{}' has an open job; supersede that attempt before beginning attempt {}", check.check_id, attempt.attempt_op_id))
+            .collect();
+        let (attempt, changed, checks) =
+            (attempt.to_owned(), changed.to_owned(), checks.to_owned());
         self.writer
             .execute("verification_attempt_begin", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1895,7 +1901,7 @@ impl Store {
                 if exists.is_some() {
                     return Ok(false);
                 }
-                for check in &checks {
+                for (check_index, check) in checks.iter().enumerate() {
                     if check.inline_status.is_some() {
                         continue;
                     }
@@ -1914,12 +1920,12 @@ impl Store {
                             |r| r.get(0),
                         )
                         .optional()?;
-                    if let Some(prior) = open_elsewhere {
-                        return Err(StoreError::Conflict(format!(
-                    "check '{}' has an open job of attempt {prior}; supersede that attempt before \
-                     beginning attempt {}",
-                    check.check_id, attempt.attempt_op_id
-                )));
+                    if open_elsewhere.is_some() {
+                        let message = open_job_conflicts
+                            .get_mut(check_index)
+                            .map(std::mem::take)
+                            .unwrap_or_default();
+                        return Err(StoreError::Conflict(message));
                     }
                 }
                 tx.execute(
@@ -2215,8 +2221,7 @@ impl Store {
                 )));
             }
         }
-        let check_id = check_id.to_owned();
-        let state = state.to_owned();
+        let (check_id, state) = (check_id.to_owned(), state.to_owned());
         let note = note.map(|v| v.to_owned());
         let result_json = result_json.map(|v| v.to_owned());
         self.writer
@@ -2397,8 +2402,7 @@ impl Store {
     ) -> StoreResult<i64> {
         let tool = tool.to_owned();
         // Preparation BEFORE enqueueing: argument/recovery/replay JSON.
-        let args_json = args.to_string();
-        let recovery_json = recovery.to_string();
+        let (args_json, recovery_json) = (args.to_string(), recovery.to_string());
         let replay_json = replay_descriptor.map(|d| d.to_string());
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
@@ -2433,7 +2437,6 @@ impl Store {
         op_id: OpId,
         postcondition: &serde_json::Value,
     ) -> StoreResult<()> {
-        let postcondition = postcondition.to_owned();
         // Preparation BEFORE enqueueing: the postcondition JSON.
         let postcondition_json = postcondition.to_string();
         self.writer
@@ -2489,8 +2492,7 @@ impl Store {
         status: &str,
         effect_status: &str,
     ) -> StoreResult<()> {
-        let status = status.to_owned();
-        let effect_status = effect_status.to_owned();
+        let (status, effect_status) = (status.to_owned(), effect_status.to_owned());
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
         let ended_ms = now_ms();
@@ -2568,8 +2570,7 @@ impl Store {
         model: &str,
         variant: Option<&str>,
     ) -> StoreResult<i64> {
-        let provider = provider.to_owned();
-        let model = model.to_owned();
+        let (provider, model) = (provider.to_owned(), model.to_owned());
         let variant = variant.map(|v| v.to_owned());
         // Preparation BEFORE enqueueing: the timestamp is captured on the
         // caller's thread (audit item 8) — the writer job executes SQL only.
@@ -2627,8 +2628,7 @@ impl Store {
         variant: Option<&str>,
         tool_mode: Option<&str>,
     ) -> StoreResult<bool> {
-        let provider = provider.to_owned();
-        let model = model.to_owned();
+        let (provider, model) = (provider.to_owned(), model.to_owned());
         let variant = variant.map(|v| v.to_owned());
         let tool_mode = tool_mode.map(|v| v.to_owned());
         // Preparation BEFORE enqueueing: the timestamp is captured on the

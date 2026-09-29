@@ -5970,6 +5970,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // string formatting on the writer owner (prepared values bind as-is;
         // an owned copy of an already-prepared String is `.clone()`)
         ".to_string()",
+        "format!(",
         // sleeps
         "thread::sleep",
         "sleep(",
@@ -6175,6 +6176,15 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 "fn f(s: String) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![s.to_string()])?; Ok(()) }) }\n",
             ),
             (
+                "format allocation",
+                r#"fn f() {
+        self.writer.execute("x", move |conn| {
+            let s = format!("id={id}");
+            Ok(())
+        })
+    }"#,
+            ),
+            (
                 "sleep",
                 "fn f() { self.writer.execute(\"x\", move |conn| { std::thread::sleep(Duration::from_millis(5)); Ok(()) }) }\n",
             ),
@@ -6233,6 +6243,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             // crosses, and a prepared borrowed `&str` binds as-is.
             "fn f(n: u64) { let text = n.to_string(); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![text])?; Ok(()) }) }\n",
             "fn f(s: String) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![s.as_str()])?; Ok(()) }) }\n",
+            // Diagnostic formatting before the call: the prepared message
+            // crosses into the closure and binds as-is.
+            "fn f(id: u64) { let msg = format!(\"id={id}\"); self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![msg])?; Ok(()) }) }\n",
             // Clock-derived values captured before the call (no clock type
             // crosses into the closure).
             "fn f(now: i64) { self.writer.execute(\"x\", move |conn| { conn.execute(\"INSERT INTO t(x) VALUES (?1)\", params![now])?; Ok(()) }) }\n",
@@ -6368,6 +6381,55 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                         "begin_prepared line {} contains `{marker}`: {} — the helper runs \
                          on the single writer owner; prepare the state text and the refusal \
                          messages on the caller's thread",
+                        line_of(f.src, at),
+                        trim_line(f.src, at)
+                    );
+                }
+                pos = at + mb.len();
+            }
+        }
+    }
+
+    /// Regression pin for the shared event-append helper (audit finding 2):
+    /// `insert_event_locked` runs on the single writer owner inside every
+    /// caller's transaction, so its body stays SQL-only — no JSON decode
+    /// (`parse_json(`/`serde_json`), no message formatting (`format!`,
+    /// `.to_string()`) and no digest materialization (`.to_hex(`).
+    ///
+    /// HONEST LIMITATION: a lexical closure marker cannot be used for this
+    /// helper — its prepared call is legitimate inside `writer.execute`
+    /// closures, so `insert_event_locked(` stays out of
+    /// [`WRITER_JOB_FORBIDDEN_MARKERS`] (adding it would flag every call
+    /// site). The caller-prepared `seq_corrupt_message` parameter plus this
+    /// pin are the enforcement; arbitrary deeper indirection remains the
+    /// documented scanner limitation.
+    #[test]
+    fn insert_event_locked_writer_helper_is_sql_only() {
+        let f = load("crates/store/src/ledger.rs").expect("ledger.rs readable");
+        let fn_at = f
+            .src
+            .find("fn insert_event_locked(")
+            .expect("insert_event_locked present");
+        let next_fn = f.src[fn_at + 1..]
+            .find("\n    pub fn ")
+            .map(|offset| fn_at + 1 + offset)
+            .unwrap_or(f.src.len());
+        for marker in [
+            "parse_json(",
+            "serde_json",
+            "format!",
+            ".to_string()",
+            ".to_hex(",
+        ] {
+            let mb = marker.as_bytes();
+            let mut pos = fn_at;
+            while let Some(rel) = f.src[pos..next_fn].find(marker) {
+                let at = pos + rel;
+                if f.code[at..at + mb.len()].iter().all(|c| *c) {
+                    panic!(
+                        "insert_event_locked line {} contains `{marker}`: {} — the helper runs \
+                         on the single writer owner; prepare the landing state and the journal \
+                         diagnostic on the caller's thread",
                         line_of(f.src, at),
                         trim_line(f.src, at)
                     );

@@ -520,6 +520,142 @@ fn content_checkpoint_allocates_sequence_and_journals_atomically() {
     );
 }
 
+/// Run one pipeline command with an arbitrary `expected_state` (the durable
+/// world stays whatever the prefix produced) so refusal tests can drive the
+/// whole family matrix through one call shape.
+fn run_cmd(
+    store: &Store,
+    sid: SessionId,
+    cmd: Cmd,
+    pid: Option<i64>,
+    expected: AgentState,
+) -> StoreResult<()> {
+    match cmd {
+        Cmd::Permission => store
+            .insert_permission_and_event(
+                sid,
+                OpId::new(OP),
+                "cap",
+                expected,
+                ev(
+                    EventKind::ToolRequested,
+                    AgentState::WaitingForPermission,
+                    serde_json::json!({}),
+                ),
+            )
+            .map(|_| ()),
+        Cmd::Grant => store
+            .resolve_permission_and_event(
+                pid.expect("permission"),
+                sid,
+                "allow",
+                expected,
+                ev(
+                    EventKind::PermissionGranted,
+                    AgentState::ExecutingTool,
+                    serde_json::json!({}),
+                ),
+            )
+            .map(|_| ()),
+        Cmd::StartTool => store
+            .start_tool_run_and_event(
+                sid,
+                OpId::new(OP),
+                "read_file",
+                serde_json::json!({}),
+                serde_json::json!({}),
+                None,
+                None,
+                expected,
+                ev(
+                    EventKind::ToolStarted,
+                    AgentState::ExecutingTool,
+                    serde_json::json!({}),
+                ),
+            )
+            .map(|_| ()),
+        Cmd::FinishTool => store
+            .finish_tool_run_and_event(
+                sid,
+                OpId::new(OP),
+                "completed",
+                "verified",
+                expected,
+                ev(
+                    EventKind::ToolCompleted,
+                    AgentState::Validating,
+                    serde_json::json!({}),
+                ),
+            )
+            .map(|_| ()),
+        Cmd::Checkpoint => store
+            .put_checkpoint_and_event(
+                sid,
+                0,
+                "a.rs",
+                &"11".repeat(32),
+                &"22".repeat(32),
+                None,
+                expected,
+                ev(
+                    EventKind::CheckpointCreated,
+                    AgentState::Validating,
+                    serde_json::json!({}),
+                ),
+            )
+            .map(|_| ()),
+        Cmd::Compaction => store
+            .record_compaction_and_event(
+                sid,
+                100_000,
+                40_000,
+                50_000,
+                true,
+                "summarize",
+                expected,
+                ev(
+                    EventKind::ContextCompacted,
+                    AgentState::Validating,
+                    serde_json::json!({}),
+                ),
+            )
+            .map(|_| ()),
+    }
+}
+
+/// Row counts for one session id across every table a session command can
+/// touch, including the task row. Used when the session row itself is absent
+/// and the content-comparing [`world`] cannot run.
+fn row_counts(store: &Store, sid: SessionId) -> Vec<(String, i64)> {
+    let conn = store.raw_conn();
+    [
+        ("session", "id"),
+        ("event", "session_id"),
+        ("permission", "session_id"),
+        ("tool_run", "session_id"),
+        ("checkpoint", "session_id"),
+        ("compaction", "session_id"),
+        ("task", "session_id"),
+    ]
+    .into_iter()
+    .map(|(table, column)| {
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                params![sid.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (format!("{table}.{column}"), n)
+    })
+    .collect()
+}
+
+/// A durable state that is VALID but not the caller's expectation refuses
+/// `Conflict`; text that is not an `AgentState` (`"zombie"`, `not-json`,
+/// empty) refuses `Corrupt`; an absent session refuses `Conflict` — every
+/// case across every pipeline command family and with ZERO side-row, event,
+/// task or session mutation.
 #[test]
 fn expected_state_mismatch_refuses_before_any_write() {
     for (idx, cmd) in CMDS.iter().enumerate() {
@@ -528,103 +664,7 @@ fn expected_state_mismatch_refuses_before_any_write() {
         let pid = run_prefix(&store, sid, *cmd);
         // Suspended is never the pipeline's current state at any command.
         let wrong = AgentState::Suspended;
-        let err = match cmd {
-            Cmd::Permission => store
-                .insert_permission_and_event(
-                    sid,
-                    OpId::new(OP),
-                    "cap",
-                    wrong,
-                    ev(
-                        EventKind::ToolRequested,
-                        AgentState::WaitingForPermission,
-                        serde_json::json!({}),
-                    ),
-                )
-                .map(|_| ())
-                .unwrap_err(),
-            Cmd::Grant => store
-                .resolve_permission_and_event(
-                    pid.expect("permission"),
-                    sid,
-                    "allow",
-                    wrong,
-                    ev(
-                        EventKind::PermissionGranted,
-                        AgentState::ExecutingTool,
-                        serde_json::json!({}),
-                    ),
-                )
-                .map(|_| ())
-                .unwrap_err(),
-            Cmd::StartTool => store
-                .start_tool_run_and_event(
-                    sid,
-                    OpId::new(OP),
-                    "read_file",
-                    serde_json::json!({}),
-                    serde_json::json!({}),
-                    None,
-                    None,
-                    wrong,
-                    ev(
-                        EventKind::ToolStarted,
-                        AgentState::ExecutingTool,
-                        serde_json::json!({}),
-                    ),
-                )
-                .map(|_| ())
-                .unwrap_err(),
-            Cmd::FinishTool => store
-                .finish_tool_run_and_event(
-                    sid,
-                    OpId::new(OP),
-                    "completed",
-                    "verified",
-                    wrong,
-                    ev(
-                        EventKind::ToolCompleted,
-                        AgentState::Validating,
-                        serde_json::json!({}),
-                    ),
-                )
-                .map(|_| ())
-                .unwrap_err(),
-            Cmd::Checkpoint => store
-                .put_checkpoint_and_event(
-                    sid,
-                    0,
-                    "a.rs",
-                    &"11".repeat(32),
-                    &"22".repeat(32),
-                    None,
-                    wrong,
-                    ev(
-                        EventKind::CheckpointCreated,
-                        AgentState::Validating,
-                        serde_json::json!({}),
-                    ),
-                )
-                .map(|_| ())
-                .unwrap_err(),
-            Cmd::Compaction => store
-                .record_compaction_and_event(
-                    sid,
-                    100_000,
-                    40_000,
-                    50_000,
-                    true,
-                    "summarize",
-                    wrong,
-                    ev(
-                        EventKind::ContextCompacted,
-                        AgentState::Validating,
-                        serde_json::json!({}),
-                    ),
-                )
-                .map(|_| ())
-                .unwrap_err(),
-        };
+        let err = run_cmd(&store, sid, *cmd, pid, wrong).unwrap_err();
         assert!(
             matches!(err, StoreError::Conflict(_)),
             "{} with a wrong expected state must refuse with Conflict: {err:?}",
@@ -638,6 +678,176 @@ fn expected_state_mismatch_refuses_before_any_write() {
         );
         drop(store);
         drop(dir);
+    }
+    for cmd in CMDS {
+        for corrupt in ["\"zombie\"", "not-json", ""] {
+            let (dir, store, sid) = setup();
+            let pid = run_prefix(&store, sid, cmd);
+            store
+                .raw_conn()
+                .execute(
+                    "UPDATE session SET state = ?2 WHERE id = ?1",
+                    params![sid.raw() as i64, corrupt],
+                )
+                .unwrap();
+            let before = world(&store, sid);
+            let counts_before = row_counts(&store, sid);
+            let err = run_cmd(&store, sid, cmd, pid, AgentState::Suspended).unwrap_err();
+            match err {
+                StoreError::Corrupt(msgs) => assert!(
+                    msgs.iter().any(|m| m.contains("durable state")),
+                    "{} with state {corrupt:?}: Corrupt must name the state column: {msgs:?}",
+                    cmd.name()
+                ),
+                other => panic!(
+                    "{} with a valid-but-not-Expected state must refuse Corrupt for {corrupt:?}, got {other:?}",
+                    cmd.name()
+                ),
+            }
+            assert_eq!(
+                world(&store, sid),
+                before,
+                "{} with corrupt state {corrupt:?} refused before any write",
+                cmd.name()
+            );
+            assert_eq!(
+                row_counts(&store, sid),
+                counts_before,
+                "{} with corrupt state {corrupt:?} touched no side row, event or task",
+                cmd.name()
+            );
+            drop(store);
+            drop(dir);
+        }
+    }
+    // A session id with no row: `Conflict`, and nothing anywhere for it.
+    let (_dir, store, _sid) = setup();
+    let missing = SessionId::new(9_999_999);
+    for cmd in CMDS {
+        let err = run_cmd(&store, missing, cmd, Some(1), AgentState::Suspended).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "{} for a missing session must refuse with Conflict: {err:?}",
+            cmd.name()
+        );
+        assert!(
+            row_counts(&store, missing).iter().all(|(_, n)| *n == 0),
+            "{} for a missing session must write no row anywhere: {:?}",
+            cmd.name(),
+            row_counts(&store, missing)
+        );
+    }
+}
+
+type RunCase = fn(&Store, SessionId, AgentState) -> StoreResult<()>;
+
+/// The corrupt-vs-mismatch distinction also holds for the session-command
+/// families outside the six-step pipeline: the recovery permission sweep,
+/// the content-aware checkpoint and the recovered tool-run terminalization.
+#[test]
+fn session_command_families_outside_pipeline_distinguish_corrupt_state() {
+    let cases: [(&str, RunCase); 3] = [
+        ("expire_pending_permissions", |store, sid, expected| {
+            store
+                .expire_pending_permissions_for_session(
+                    sid,
+                    10_000,
+                    expected,
+                    ev(
+                        EventKind::PermissionExpired,
+                        AgentState::Idle,
+                        serde_json::json!({}),
+                    ),
+                )
+                .map(|_| ())
+        }),
+        ("insert_checkpoint", |store, sid, expected| {
+            store
+                .insert_checkpoint_and_event(
+                    sid,
+                    "a.rs",
+                    false,
+                    "",
+                    true,
+                    &"aa".repeat(32),
+                    None,
+                    expected,
+                )
+                .map(|_| ())
+        }),
+        ("finish_recovered_tool_run", |store, sid, expected| {
+            store
+                .finish_recovered_tool_run_and_event(
+                    sid,
+                    OpId::new(OP),
+                    "interrupted",
+                    "unknown",
+                    EventKind::RecoveryApplied,
+                    expected,
+                    None,
+                )
+                .map(|_| ())
+        }),
+    ];
+    for (name, run) in cases {
+        let (dir, store, sid) = setup();
+        let before = world(&store, sid);
+        let err = run(&store, sid, AgentState::Suspended).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "{name} with a wrong expected state must refuse with Conflict: {err:?}"
+        );
+        assert_eq!(
+            world(&store, sid),
+            before,
+            "{name} refused before any write"
+        );
+        drop(store);
+        drop(dir);
+        for corrupt in ["\"zombie\"", "not-json", ""] {
+            let (dir, store, sid) = setup();
+            store
+                .raw_conn()
+                .execute(
+                    "UPDATE session SET state = ?2 WHERE id = ?1",
+                    params![sid.raw() as i64, corrupt],
+                )
+                .unwrap();
+            let before = world(&store, sid);
+            let counts_before = row_counts(&store, sid);
+            match run(&store, sid, AgentState::Suspended) {
+                Err(StoreError::Corrupt(msgs)) => assert!(
+                    msgs.iter().any(|m| m.contains("durable state")),
+                    "{name} with state {corrupt:?}: Corrupt must name the state column: {msgs:?}"
+                ),
+                other => panic!(
+                    "{name} with a valid-but-not-Expected state must refuse Corrupt for {corrupt:?}, got {other:?}"
+                ),
+            }
+            assert_eq!(
+                world(&store, sid),
+                before,
+                "{name} with corrupt state {corrupt:?} refused before any write"
+            );
+            assert_eq!(
+                row_counts(&store, sid),
+                counts_before,
+                "{name} with corrupt state {corrupt:?} touched no side row, event or task"
+            );
+            drop(store);
+            drop(dir);
+        }
+        let (_dir, store, _sid) = setup();
+        let missing = SessionId::new(9_999_999);
+        let err = run(&store, missing, AgentState::Suspended).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "{name} for a missing session must refuse with Conflict: {err:?}"
+        );
+        assert!(
+            row_counts(&store, missing).iter().all(|(_, n)| *n == 0),
+            "{name} for a missing session must write no row anywhere"
+        );
     }
 }
 
