@@ -315,8 +315,10 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
-    /// Replay the journal from durable state, enforcing the same transition
-    /// rules as the live path. Corruption is a loud error. O(n) in journal
+    /// Replay the journal from durable state, enforcing the journal's
+    /// structural invariants (first seq 1, first state `Idle`, gapless
+    /// sequences, non-decreasing timestamps) and the same transition rules
+    /// as the live path. Corruption is a loud error. O(n) in journal
     /// length; diagnostic / startup-verification use only. (Audits 71-72)
     /// every payload is additionally decoded through its schema version —
     /// a row stamped with an unknown version fails the replay loudly,
@@ -1229,6 +1231,82 @@ pub(crate) mod tests {
         // Nothing was written: journal still has only SessionCreated, state Idle.
         assert_eq!(s.last_event_seq().unwrap().unwrap().raw(), 1);
         assert_eq!(s.state().unwrap(), AgentState::Idle);
+    }
+
+    #[test]
+    fn replay_journal_rejects_hostile_durable_journal() {
+        let (_d, m) = test_manager();
+        // The only row (SessionCreated, Idle) moved out of seq 1.
+        let s = session(&m);
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE event SET seq = 5 WHERE session_id = {} AND seq = 1",
+                s.id().raw()
+            ))
+            .unwrap();
+        let err = s.replay_journal().unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Internal);
+        assert!(
+            err.to_string().contains("first event seq is 5")
+                && err.to_string().contains("expected 1"),
+            "{err}"
+        );
+
+        // A deleted middle event: the journal is 1,3 — a gap.
+        let s2 = session(&m);
+        s2.submit_prompt("x", &[]).unwrap();
+        s2.append_event(
+            EventKind::ContextPrepared,
+            AgentState::BuildingContext,
+            None,
+            None,
+        )
+        .unwrap();
+        m.store()
+            .sql_execute(&format!(
+                "DELETE FROM event WHERE session_id = {} AND seq = 2",
+                s2.id().raw()
+            ))
+            .unwrap();
+        let err = s2.replay_journal().unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Internal);
+        assert!(err.to_string().contains("expected 2"), "{err}");
+
+        // A backwards timestamp with otherwise legal landings.
+        let s3 = session(&m);
+        s3.submit_prompt("x", &[]).unwrap();
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE event SET ts_ms = 1 WHERE session_id = {} AND seq = 2",
+                s3.id().raw()
+            ))
+            .unwrap();
+        let err = s3.replay_journal().unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Internal);
+        assert!(
+            err.to_string()
+                .contains("timestamp 1 is before previous timestamp"),
+            "{err}"
+        );
+
+        // A SessionCreated that claims a non-Idle first state.
+        let s4 = session(&m);
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE event SET state = '\"preparing\"' WHERE session_id = {} AND seq = 1",
+                s4.id().raw()
+            ))
+            .unwrap();
+        let err = s4.replay_journal().unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Internal);
+        assert!(err.to_string().contains("expected Idle"), "{err}");
+
+        // An untouched journal still replays.
+        let s5 = session(&m);
+        let out = s5.replay_journal().unwrap();
+        assert_eq!(out.state, AgentState::Idle);
+        assert_eq!(out.last_seq.raw(), 1);
+        assert_eq!(out.event_count, 1);
     }
 
     #[test]

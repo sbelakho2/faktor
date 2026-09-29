@@ -11,6 +11,14 @@ const SEAMS: [&str; 3] = [
     "session_command_committed",
 ];
 
+/// The three durability boundaries of `create_session`, whose session row
+/// and `SessionCreated` seed event are ONE transaction.
+const CREATE_SEAMS: [&str; 3] = [
+    "create_session_row",
+    "create_session_precommit",
+    "create_session_committed",
+];
+
 const CMDS: [Cmd; 6] = [
     Cmd::Permission,
     Cmd::Grant,
@@ -370,6 +378,87 @@ fn recovered_tool_finish_seams_commit_row_and_event_together() {
                 durable, old,
                 "crashed terminalization at {seam}: neither row nor event"
             ),
+        }
+    }
+}
+
+/// Whole-table row count, for crash worlds where the SQLite-allocated
+/// session id was never observed by the crashed caller.
+fn table_rows(store: &Store, table: &str) -> i64 {
+    store
+        .raw_conn()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Finding 1 (P1): `create_session` is ONE transaction — the session row and
+/// its `SessionCreated` seed event commit together or not at all. Aborting
+/// at either pre-commit boundary and reopening yields NO session row and NO
+/// event row (the old session-row-without-journal window is gone); aborting
+/// at the post-commit boundary yields the row AND its seq-1 Idle seed event
+/// together.
+#[test]
+fn create_session_seams_never_leave_a_row_without_its_seed_event() {
+    for seam in CREATE_SEAMS {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        store.crash_arm(CrashArm {
+            point: seam,
+            ordinal: 0,
+        });
+        // The seam's deliberate in-transaction panic is contained at the
+        // durable-authority boundary and surfaced as the typed unavailable
+        // state; the test thread never panics. Assert the armed boundary was
+        // the one observed BEFORE reopening, so a never-fired seam cannot
+        // pass as a clean old/new world.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.create_session(ws, "s", "p", "m")
+        }));
+        assert!(store.seam_crash_observed(&caught), "seam {seam} must fire");
+        match caught.expect("the seam panic is contained, never rethrown here") {
+            Err(StoreError::WriterUnavailable(reason)) => assert!(
+                reason.contains(seam),
+                "seam {seam}: the typed refusal must name the boundary: {reason}"
+            ),
+            other => panic!("seam {seam}: creation must fail typed, got {other:?}"),
+        }
+        assert!(
+            !store.writer_available(),
+            "seam {seam} must stop admissions"
+        );
+        drop(store);
+
+        let store = Store::open(dir.path().join("store"), true).unwrap();
+        // Durable rows, read raw from the reopened file.
+        let session_rows = table_rows(&store, "session");
+        let event_rows = table_rows(&store, "event");
+        // The reopened-store view.
+        let listed = store.list_sessions(None).unwrap();
+        match seam {
+            "create_session_committed" => {
+                assert_eq!(session_rows, 1, "seam {seam}: the session row is durable");
+                assert_eq!(event_rows, 1, "seam {seam}: the seed event is durable");
+                assert_eq!(listed.len(), 1, "seam {seam}");
+                let row = &listed[0];
+                assert_eq!(row.state, AgentState::Idle, "seam {seam}");
+                let durable = store.get_session(row.id).unwrap().expect("readable");
+                assert_eq!(durable.state, AgentState::Idle, "seam {seam}");
+                let events = store.events_range(row.id, 1, None).unwrap();
+                assert_eq!(events.len(), 1, "seam {seam}: exactly the seed event");
+                assert_eq!(events[0].seq.raw(), 1, "seam {seam}: seed seq is 1");
+                assert_eq!(events[0].kind, EventKind::SessionCreated, "seam {seam}");
+                assert_eq!(events[0].state, AgentState::Idle, "seam {seam}");
+            }
+            _ => {
+                assert_eq!(
+                    session_rows, 0,
+                    "seam {seam}: the session row must roll back"
+                );
+                assert_eq!(event_rows, 0, "seam {seam}: the seed event must roll back");
+                assert!(listed.is_empty(), "seam {seam}: no session is listed");
+                assert!(store.session_ids().unwrap().is_empty(), "seam {seam}");
+            }
         }
     }
 }

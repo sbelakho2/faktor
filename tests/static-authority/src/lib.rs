@@ -8312,6 +8312,98 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         );
     }
 
+    /// Scan one source for unchecked `as i64`/`as u64` casts of a page limit
+    /// or monotonic sequence. Those values can exceed the signed SQLite
+    /// domain and wrap (a negative LIMIT is unbounded; a wrapped seq corrupts
+    /// ordering). Deliberate ID bit-pattern encodings go through
+    /// `<id>.raw()` and are not matched.
+    fn unchecked_persistence_cast_offenders(
+        src: &str,
+        code: &[bool],
+        kept: &[(usize, usize)],
+    ) -> Vec<String> {
+        const GUARDED: &[&str] = &[
+            "limit",
+            "from_seq",
+            "after_seq",
+            "before_seq",
+            "cursor",
+            "offset",
+            "high_water",
+            "next_seq",
+            "next_raw",
+            "max_seq",
+            "checkpoint_seq",
+            "page_limit",
+            "page_size",
+        ];
+        let mut hits = Vec::new();
+        let mut offset = 0usize;
+        for (idx, line) in src.split_inclusive('\n').enumerate() {
+            let mut search = 0usize;
+            while let Some(pos) = line[search..].find(" as ") {
+                let at = search + pos;
+                let pos_abs = offset + at;
+                let in_kept = kept.iter().any(|&(s, e)| pos_abs >= s && pos_abs < e);
+                let is_code = code.get(pos_abs).copied().unwrap_or(false);
+                if in_kept && is_code {
+                    let ty = line[at + 4..].trim_start();
+                    if ty.starts_with("i64") || ty.starts_with("u64") {
+                        let ident = line[..at]
+                            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .next()
+                            .unwrap_or("");
+                        if GUARDED.contains(&ident) {
+                            hits.push(format!("line {}: {}", idx + 1, line.trim_end()));
+                        }
+                    }
+                }
+                search = at + 4;
+            }
+            offset += line.len();
+        }
+        hits
+    }
+
+    /// The mechanical gate for the recurring persistence-boundary cast class
+    /// (waves 27-30): a page limit or monotonic sequence may only cross the
+    /// SQLite boundary through a checked conversion or an explicitly
+    /// documented sentinel, never an unchecked `as i64`/`as u64`. The
+    /// allowlist is empty; the planted case proves the scan fires.
+    #[test]
+    fn persistence_limits_and_sequences_are_never_cast_unchecked() {
+        let planted = "fn f(limit: u64) { let _ = limit as i64; }";
+        let planted_code = code_mask(planted);
+        let planted_kept = kept_ranges(planted, &planted_code);
+        assert!(
+            !unchecked_persistence_cast_offenders(planted, &planted_code, &planted_kept).is_empty(),
+            "the cast gate must fire on a planted `limit as i64`"
+        );
+        let mut hits = Vec::new();
+        for rel in walk_crate_sources() {
+            let in_scope = rel.starts_with("crates/store/src/")
+                || rel.starts_with("crates/server/src/native/")
+                || rel.starts_with("crates/evidence/src/");
+            if !in_scope {
+                continue;
+            }
+            let Some(f) = load(&rel) else { continue };
+            if f.kept.is_empty() {
+                continue;
+            }
+            hits.extend(
+                unchecked_persistence_cast_offenders(f.src, &f.code, &f.kept)
+                    .into_iter()
+                    .map(|hit| format!("{rel} {hit}")),
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "unchecked persistence limit/sequence casts (use a checked conversion or a documented sentinel):\n{}",
+            hits.join("\n")
+        );
+    }
+
     #[test]
     fn migrated_native_dto_tripwire_fires_on_a_planted_regression() {
         let root = repo_root();

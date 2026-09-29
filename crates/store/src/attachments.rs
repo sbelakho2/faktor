@@ -833,12 +833,17 @@ impl Store {
         session_id: SessionId,
         limit: usize,
     ) -> StoreResult<Vec<AttachmentId>> {
+        // A limit above SQLite's signed range refuses typed; it is never bound
+        // as a negative LIMIT (which SQLite treats as unbounded).
+        let limit = i64::try_from(limit).map_err(|_| {
+            StoreError::Oversized("attachment page limit exceeds SQLite signed range".into())
+        })?;
         let conn = self.read()?;
         let mut stmt = conn.prepare(
             "SELECT digest, mime, filename, size FROM attachment
              WHERE session_id = ?1 ORDER BY digest ASC, id ASC LIMIT ?2",
         )?;
-        let mut rows = stmt.query(params![session_id.raw() as i64, limit as i64])?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, limit])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(row_to_attachment(r)?);
