@@ -366,7 +366,7 @@ pub(crate) async fn a_pending_row_blocks_a_duplicate_start_without_touching_anyt
     assert_eq!(receipt.mode, TaskRunMode::InSession);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 pub(crate) async fn concurrent_duplicate_starts_claim_one_key_and_run_one_prompt() {
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
@@ -380,9 +380,13 @@ pub(crate) async fn concurrent_duplicate_starts_claim_one_key_and_run_one_prompt
 
     let env2 = env.clone();
     let req2 = req.clone();
-    let other = std::thread::spawn(move || env2.executor.start_task(env2.parent, req2));
+    // The claim path spawns the detached drive onto the runtime, so the
+    // concurrent caller must run WITH a runtime context: a plain OS thread
+    // panics with "there is no reactor running". Two workers give real
+    // parallelism for the race.
+    let other = tokio::spawn(async move { env2.executor.start_task(env2.parent, req2) });
     let first = env.executor.start_task(env.parent, req.clone());
-    let second = other.join().expect("claim thread");
+    let second = other.await.expect("claim task");
 
     let mut receipts = Vec::new();
     for result in [first, second] {
