@@ -134,18 +134,47 @@ impl InstallPointer {
 pub fn file_digest(path: &Path) -> Result<String, UpdateError> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| UpdateError::Install(format!("open {}: {e}", path.display())))?;
+    file_digest_of(&mut file, path)
+}
+
+/// The sha256 hex of one OPEN file's full content, streamed (bounded memory).
+/// The descriptor is rewound to offset 0 first so the caller gets the digest
+/// of the whole file regardless of prior reads; the launcher uses this to hash
+/// exactly the descriptor it will exec (see `crate::release`), so verification
+/// and execution observe one file object and no pathname is reopened between
+/// them.
+pub(crate) fn file_digest_of(file: &mut fs::File, what: &Path) -> Result<String, UpdateError> {
+    use std::io::{Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| UpdateError::Install(format!("rewind {}: {e}", what.display())))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|e| UpdateError::Install(format!("read {}: {e}", path.display())))?;
+            .map_err(|e| UpdateError::Install(format!("read {}: {e}", what.display())))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Create one directory (and any missing parents) with the operator-private
+/// mode: on unix `0o700`, so the install tree whose ancestry the bootstrap
+/// launcher verifies is never writable by group or others. Directories that
+/// already exist are not modified — the launcher's ancestry check decides at
+/// launch time (and a refusal names the offending path).
+pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 /// The install root and its derived paths.
@@ -156,20 +185,22 @@ pub struct InstallLayout {
 
 impl InstallLayout {
     /// Open (creating) one install root. The layout directories are created
-    /// here so `stage`/`apply` never race directory creation.
+    /// here so `stage`/`apply` never race directory creation. New directories
+    /// are created group/other-inaccessible (`0o700` on unix), matching the
+    /// operator-owned install tree the bootstrap launcher requires.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, UpdateError> {
         let root = root.into();
         if root.as_os_str().is_empty() {
             return Err(UpdateError::Config("install root must not be empty".into()));
         }
         let layout = InstallLayout { root };
-        fs::create_dir_all(layout.artifacts_dir()).map_err(|e| {
+        create_private_dir_all(&layout.artifacts_dir()).map_err(|e| {
             UpdateError::Install(format!(
                 "create artifacts dir {}: {e}",
                 layout.artifacts_dir().display()
             ))
         })?;
-        fs::create_dir_all(layout.staging_dir()).map_err(|e| {
+        create_private_dir_all(&layout.staging_dir()).map_err(|e| {
             UpdateError::Install(format!(
                 "create staging dir {}: {e}",
                 layout.staging_dir().display()
@@ -282,7 +313,7 @@ impl InstallLayout {
         let parent = dest
             .parent()
             .ok_or_else(|| UpdateError::Install("artifact path has no parent".into()))?;
-        fs::create_dir_all(parent).map_err(|e| {
+        create_private_dir_all(parent).map_err(|e| {
             UpdateError::Install(format!("create artifact dir {}: {e}", parent.display()))
         })?;
         faktor_fs::atomic::atomic_adopt(staged, &dest)?;
@@ -470,6 +501,44 @@ mod tests {
         std::fs::write(layout.artifact_path("bundle.tar.gz", &digest), b"evil").unwrap();
         let err = DigestProbe.probe(&layout, &pointer).unwrap_err();
         assert_eq!(err.code(), "health_failed");
+    }
+
+    #[test]
+    fn an_open_file_digest_covers_the_whole_file_from_offset_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        std::fs::write(&path, b"artifact bytes").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut scratch = [0u8; 4];
+        file.read_exact(&mut scratch).unwrap();
+        assert_eq!(
+            file_digest_of(&mut file, &path).unwrap(),
+            crate::manifest::sha256_hex(b"artifact bytes"),
+            "a partially read descriptor still hashes the whole file"
+        );
+    }
+
+    /// The install tree the launcher authenticates is created private: no
+    /// group/other bits anywhere in the layout (`umask 002` must not leak
+    /// write permission into the exec path).
+    #[cfg(unix)]
+    #[test]
+    fn layout_directories_are_created_group_and_other_inaccessible() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, layout) = layout();
+        for path in [
+            layout.root().to_path_buf(),
+            layout.artifacts_dir(),
+            layout.staging_dir(),
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} has mode {mode:o}; the install tree must not be group/other accessible",
+                path.display()
+            );
+        }
     }
 
     #[test]

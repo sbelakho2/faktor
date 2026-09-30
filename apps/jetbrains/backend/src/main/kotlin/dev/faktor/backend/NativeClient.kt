@@ -304,13 +304,20 @@ class NativeClient(
         mutationMode: String? = null,
         files: List<String>? = null,
         attachments: List<NativeAttachmentId>? = null,
-        completionContract: NativeCompletionContract? = null
+        completionContract: NativeCompletionContract? = null,
+        /**
+         * Client idempotency identity of ONE logical start: the daemon records
+         * the first receipt under it and replays that receipt for a retry of
+         * the same immutable submission, so a lost response never creates a
+         * second run.
+         */
+        submissionId: String? = null
     ): NativeTaskRunStarted = parseNativeTaskRunStarted(
         request(
             "POST", "/native/session/" + encode(sessionId) + "/task-runs", null,
             NativeRequests.startTaskRun(
                 goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
-                attachments, completionContract
+                attachments, completionContract, submissionId
             )
         )
     )

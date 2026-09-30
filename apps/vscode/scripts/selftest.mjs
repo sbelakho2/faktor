@@ -2614,6 +2614,9 @@ async function completionContractTests() {
     dom.document.getElementById('goal').value = 'plain goal';
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
     assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal' });
+    // The explicit result releases the single-flight lock before the next
+    // logical submission (the lock itself is covered separately).
+    deliver({ type: 'startResult', goal: 'plain goal', ok: true });
     // Checked boxes: the exact strict contract rides this task start only.
     dom.document.getElementById('goal').value = 'contracted goal';
     dom.document.getElementById('contract-commit').checked = true;
@@ -5255,12 +5258,29 @@ function makeFakeDom() {
       className: '',
       textContent: '',
       scrollTop: 0,
-      scrollHeight: 0,
       hidden: false,
       value: '',
       type: '',
+      disabled: false,
+      checked: false,
+      offsetTop: 0,
+      // Entries occupy layout in the real panel; the fake gives every
+      // article a fixed height so anchor preservation is measurable.
+      offsetHeight: tagName === 'article' ? 40 : 0,
+      clientHeight: 0,
     };
+    Object.defineProperty(node, 'scrollHeight', {
+      get: () =>
+        Math.max(
+          node.clientHeight,
+          node.children.reduce((sum, child) => sum + (child.offsetHeight || 0), 0),
+        ),
+    });
     node.appendChild = (child) => {
+      child.offsetTop = node.children.reduce(
+        (sum, entry) => sum + (entry.offsetHeight || 0),
+        0,
+      );
       node.children.push(child);
       child.parentNode = node;
       return child;
@@ -5307,7 +5327,21 @@ function makeFakeDom() {
     },
     createElement: makeNode,
     createElementNS: (namespace, tagName) => makeNode(tagName),
-    querySelectorAll: () => [],
+    querySelectorAll(selector) {
+      const match = /^\[data-evidence="([^"]+)"\]$/.exec(String(selector));
+      if (!match) {
+        return [];
+      }
+      const found = [];
+      for (const root of nodesById.values()) {
+        walkFake(root, (node) => {
+          if (node.attributes['data-evidence'] === match[1]) {
+            found.push(node);
+          }
+        });
+      }
+      return found;
+    },
   };
   return { document, nodesById, makeNode };
 }
@@ -5367,6 +5401,13 @@ function webviewSnapshot(agents) {
 
 function runChatWebview(snapshot) {
   const source = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+  // The real webview loads the composer draft policy BEFORE chat.js (see
+  // src/webview.ts); the fake context mirrors that exact script order so the
+  // draft-clearing contract is exercised, not the fallback.
+  const composerSource = readFileSync(
+    new URL('../media/composer-state.js', import.meta.url),
+    'utf8',
+  );
   const posted = [];
   const dom = makeFakeDom();
   let messageHandler = null;
@@ -5384,6 +5425,7 @@ function runChatWebview(snapshot) {
     clearTimeout: () => {},
   };
   vm.createContext(sandbox);
+  vm.runInContext(composerSource, sandbox);
   vm.runInContext(source, sandbox);
   assert(messageHandler, 'chat.js must register a window message listener');
   messageHandler({ data: { type: 'snapshot', snapshot } });
@@ -5450,6 +5492,717 @@ async function presentationWebviewTests() {
       action: 'presentation',
       state: 'background',
     });
+  });
+}
+
+// ------------------- submission single-flight + verification authority + scroll
+
+function submissionEnvelope(overrides = {}) {
+  return {
+    text: 'ship it',
+    sessionId: null,
+    draftId: null,
+    messageId: null,
+    files: [],
+    attachments: [],
+    ...overrides,
+  };
+}
+
+/**
+ * A fake host + daemon around the REAL `TaskStartGate` and admission path.
+ * The daemon persists the receipt BEFORE the injected failure, so a lost
+ * response has a durable original to dedupe the retry against.
+ */
+function fakeStartHost() {
+  const gate = new ts.TaskStartGate();
+  const calls = [];
+  const receipts = new Map();
+  let nextRun = 0;
+  let idCounter = 0;
+  let failNextStart = null;
+  const newId = () => {
+    idCounter += 1;
+    return `00000000-0000-4000-8000-${String(idCounter).padStart(12, '0')}`;
+  };
+  const client = {
+    uploadAttachment: async (sessionId, request) => ({
+      ref_id: 1,
+      digest: 'd'.repeat(64),
+      mime: request.mime,
+      filename: request.filename ?? null,
+      size: Buffer.from(request.data_base64, 'base64').byteLength,
+    }),
+    startTaskRun: async (sessionId, request) => {
+      calls.push({ sessionId, request: clone(request) });
+      const id = request.submission_id;
+      if (typeof id === 'string' && receipts.has(id)) {
+        return receipts.get(id);
+      }
+      nextRun += 1;
+      const receipt = { task_id: 1, run_id: `run-${nextRun}`, state: 'Pending' };
+      if (typeof id === 'string') {
+        receipts.set(id, receipt);
+      }
+      if (failNextStart !== null) {
+        const error = failNextStart;
+        failNextStart = null;
+        throw error;
+      }
+      return receipt;
+    },
+  };
+  const run = async (envelope, contract = null, submissionId = null) => {
+    if (gate.inFlight()) {
+      return { ignored: true };
+    }
+    const decision = gate.admit({
+      submissionId,
+      pending: envelope,
+      files: envelope.files,
+      contract,
+      newId,
+    });
+    if (decision.action !== 'start') {
+      return { ignored: true, reason: decision.action };
+    }
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: decision.snapshot.pending,
+      settings: {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0n,
+        files: decision.snapshot.files,
+        completionContract: decision.snapshot.contract,
+        submissionId: decision.snapshot.submissionId,
+      },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {},
+    });
+    gate.settle(
+      decision.snapshot.submissionId,
+      outcome.ok
+        ? 'started'
+        : ts.submissionRetryable(outcome.failure)
+          ? 'transport'
+          : 'refused',
+    );
+    return { outcome, submissionId: decision.snapshot.submissionId };
+  };
+  return {
+    gate,
+    calls,
+    receipts,
+    run,
+    failNextStart: (error) => {
+      failNextStart = error;
+    },
+  };
+}
+
+async function submissionSingleFlightTests() {
+  await test('double click / Enter+click / triple submit admit exactly ONE start', async () => {
+    for (const label of ['double click', 'Enter+click race', 'three rapid submits']) {
+      const host = fakeStartHost();
+      const count = label === 'three rapid submits' ? 3 : 2;
+      const running = [];
+      for (let i = 0; i < count; i += 1) {
+        running.push(host.run(submissionEnvelope()));
+      }
+      const results = await Promise.all(running);
+      assertEqual(host.calls.length, 1, `${label}: the daemon must see exactly one start`);
+      assertEqual(results[0].outcome.ok, true, `${label}: the first submit starts`);
+      for (const late of results.slice(1)) {
+        assertEqual(late.ignored, true, `${label}: every later submit is ignored`);
+      }
+      assert(
+        typeof host.calls[0].request.submission_id === 'string',
+        `${label}: the start must carry a submission_id`,
+      );
+    }
+  });
+
+  await test('lost HTTP response + same-body retry reuses the id and the daemon returns one receipt', async () => {
+    const host = fakeStartHost();
+    host.failNextStart(new Error('socket closed after the daemon durably admitted'));
+    const first = await host.run(submissionEnvelope());
+    assertEqual(first.outcome.ok, false, 'the lost response is a failure');
+    assertEqual(first.outcome.failure.kind, 'transport');
+    assertEqual(host.calls.length, 1);
+    // The explicit retry of the SAME immutable submission: same id, and the
+    // daemon returns the original receipt instead of a second run.
+    const retry = await host.run(submissionEnvelope());
+    assertEqual(host.calls.length, 2);
+    assertEqual(
+      host.calls[0].request.submission_id,
+      host.calls[1].request.submission_id,
+      'the retry must reuse the same submission_id',
+    );
+    assertEqual(retry.outcome.ok, true);
+    assertEqual(retry.outcome.runId, 'run-1', 'the original receipt is returned');
+    assertEqual(host.receipts.size, 1, 'the daemon holds exactly one receipt');
+  });
+
+  await test('success and typed refusal clear the logical submission; transport keeps it retryable', async () => {
+    // Success: the next identical body is a NEW logical submission.
+    const success = fakeStartHost();
+    const first = await success.run(submissionEnvelope());
+    const second = await success.run(submissionEnvelope());
+    assert(first.submissionId !== second.submissionId, 'success must end the submission');
+    assertEqual(success.calls.length, 2);
+    assert(
+      success.calls[0].request.submission_id !== success.calls[1].request.submission_id,
+      'a new logical start carries a new submission_id',
+    );
+
+    // Typed 4xx refusal: cleared as well.
+    const refused = fakeStartHost();
+    refused.failNextStart(new nc.NativeApiError(400, 'malformed', 'bad body', false));
+    const refusal = await refused.run(submissionEnvelope());
+    assertEqual(refusal.outcome.failure.kind, 'validation');
+    const next = await refused.run(submissionEnvelope());
+    assert(
+      next.submissionId !== refusal.submissionId,
+      'a typed refusal must end the submission',
+    );
+
+    // Explicit retry naming the pending id restarts the stored snapshot.
+    const retry = fakeStartHost();
+    retry.failNextStart(new Error('lost'));
+    const pendingStart = await retry.run(submissionEnvelope());
+    const explicit = await retry.run(
+      submissionEnvelope(),
+      null,
+      pendingStart.submissionId,
+    );
+    assertEqual(retry.calls.length, 2);
+    assertEqual(
+      retry.calls[0].request.submission_id,
+      retry.calls[1].request.submission_id,
+      'an explicit same-id retry reuses the id',
+    );
+    assertEqual(explicit.submissionId, pendingStart.submissionId);
+
+    // The daemon's typed "submission id still in flight" 409 is the
+    // lost-response race: the id MUST be kept so the settled original
+    // replays instead of a fresh id admitting a second durable run.
+    const racing = fakeStartHost();
+    racing.failNextStart(
+      new nc.NativeApiError(
+        409,
+        'conflict',
+        'task start with submission id "abc" is already in flight; retry once it settles',
+        false,
+      ),
+    );
+    const racingStart = await racing.run(submissionEnvelope());
+    assertEqual(racingStart.outcome.ok, false);
+    const settled = await racing.run(submissionEnvelope());
+    assertEqual(racing.calls.length, 2);
+    assertEqual(
+      racing.calls[0].request.submission_id,
+      racing.calls[1].request.submission_id,
+      'an in-flight conflict must keep the submission id',
+    );
+    assertEqual(settled.outcome.ok, true);
+    assertEqual(settled.outcome.runId, 'run-1', 'the settled original receipt replays');
+  });
+
+  await test('text typed and attachment changes while pending never join the pending body', async () => {
+    const host = fakeStartHost();
+    const first = host.run(submissionEnvelope({ text: 'goal A' }));
+    const typed = host.run(submissionEnvelope({ text: 'goal B typed while pending' }));
+    const [started, late] = await Promise.all([first, typed]);
+    assertEqual(host.calls.length, 1, 'the pending start is the only daemon start');
+    assertEqual(host.calls[0].request.goal, 'goal A', 'the pending body keeps its snapshot text');
+    assertEqual(late.ignored, true);
+
+    const withBytes = fakeStartHost();
+    const original = submissionEnvelope({
+      text: 'with bytes',
+      attachments: [binaryAttachment()],
+    });
+    const changed = submissionEnvelope({
+      text: 'with bytes',
+      attachments: [binaryAttachment({ dataBase64: 'QUJDRA==', bytes: 4 })],
+    });
+    const [sent, ignored] = await Promise.all([
+      withBytes.run(original),
+      withBytes.run(changed),
+    ]);
+    assertEqual(withBytes.calls.length, 1, 'only the original attachment body is sent');
+    assertEqual(withBytes.calls[0].request.attachments.length, 1);
+    assertEqual(
+      withBytes.calls[0].request.attachments[0].size,
+      4,
+      'the sent attachment body is the immutable original',
+    );
+    assertEqual(ignored.ignored, true);
+    assertEqual(sent.outcome.ok, true);
+
+    // After a transport failure, a CHANGED body is a NEW logical submission
+    // (a changed attachment can never silently reuse the pending id).
+    const retry = fakeStartHost();
+    retry.failNextStart(new Error('lost'));
+    const failedStart = await retry.run(original);
+    const changedAfterFailure = await retry.run(changed);
+    assert(
+      changedAfterFailure.submissionId !== failedStart.submissionId,
+      'changed content after a transport failure is a new logical submission',
+    );
+
+    // The completion contract and the workspace file list are part of the
+    // retry identity too: changing either starts a new logical submission,
+    // while an unchanged body retries the stored id.
+    const identity = fakeStartHost();
+    const contractA = { include_commit: false, include_push: false, include_pr: false };
+    const contractB = { include_commit: true, include_push: false, include_pr: false };
+    identity.failNextStart(new Error('lost'));
+    const base = await identity.run(submissionEnvelope(), contractA);
+    const otherContract = await identity.run(submissionEnvelope(), contractB);
+    assert(
+      otherContract.submissionId !== base.submissionId,
+      'a changed completion contract is a new logical submission',
+    );
+    identity.failNextStart(new Error('lost'));
+    const withFiles = await identity.run(
+      submissionEnvelope({ files: ['src/a.ts'] }),
+      contractB,
+    );
+    assert(
+      withFiles.submissionId !== otherContract.submissionId,
+      'a changed file list is a new logical submission',
+    );
+    const sameAgain = await identity.run(
+      submissionEnvelope({ files: ['src/a.ts'] }),
+      contractB,
+    );
+    assertEqual(
+      sameAgain.submissionId,
+      withFiles.submissionId,
+      'an unchanged body retries the stored submission id',
+    );
+  });
+
+  await test('a transport retry reuses the retained uploads under the same submission id', async () => {
+    const retainer = new ts.PendingSubmissionRetainer();
+    const uploads = [];
+    const calls = [];
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        uploads.push(request);
+        return {
+          ref_id: uploads.length,
+          digest: String(uploads.length).repeat(64),
+          mime: request.mime,
+          filename: request.filename ?? null,
+          size: Buffer.from(request.data_base64, 'base64').byteLength,
+        };
+      },
+      startTaskRun: async (sessionId, request) => {
+        calls.push(clone(request));
+        if (calls.length === 1) {
+          throw new Error('lost after the upload');
+        }
+        return taskRunStartedJson;
+      },
+    };
+    const parsed = ts.parsePendingSubmission({
+      text: 'ship the screenshot',
+      sessionId: '7',
+      draftId: 'draft-1',
+      messageId: 'msg-1',
+      files: [],
+      attachments: [binaryAttachment()],
+    });
+    assert(parsed !== null, 'the envelope fixture must parse');
+    const first = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: retainer.restore(parsed),
+      settings: {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0n,
+        submissionId: '00000000-0000-4000-8000-000000000001',
+      },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure, enriched) => retainer.retain(enriched),
+    });
+    assertEqual(first.ok, false, 'the first attempt fails transport');
+    assertEqual(uploads.length, 1);
+    // Handler-style retry: the stored snapshot + retained uploads merge back.
+    const retryPending = retainer.restore(parsed);
+    assert(
+      retryPending.attachments[0].uploaded !== undefined,
+      'the retained upload must merge back into the retry envelope',
+    );
+    const second = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: retryPending,
+      settings: {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0n,
+        submissionId: '00000000-0000-4000-8000-000000000001',
+      },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {},
+    });
+    assertEqual(second.ok, true);
+    assertEqual(uploads.length, 1, 'the retry must not upload the same bytes twice');
+    assertEqual(calls.length, 2);
+    assertEqual(calls[0].submission_id, calls[1].submission_id);
+  });
+
+  await test('the request builder forwards only a canonical submission_id', () => {
+    assertDeepEqual(
+      ts.startTaskRequest('goal', {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0n,
+        submissionId: '00000000-0000-4000-8000-000000000001',
+      }),
+      { goal: 'goal', submission_id: '00000000-0000-4000-8000-000000000001' },
+    );
+    const junk = ts.startTaskRequest('goal', {
+      mutationMode: '',
+      maxTokens: 0,
+      maxCostMicro: 0n,
+      submissionId: 'not a submission id',
+    });
+    assert(!('submission_id' in junk), 'a non-canonical id must never reach the wire');
+    assertEqual(
+      ts.canonicalSubmissionId('ABCDEF00-0000-4000-8000-000000000001'),
+      'abcdef00-0000-4000-8000-000000000001',
+      'canonical ids normalize to lowercase hex',
+    );
+    assertEqual(ts.canonicalSubmissionId(''), null);
+    assertEqual(ts.canonicalSubmissionId('x'.repeat(500)), null);
+    // The retry classification: only failures that may have left a receipt
+    // keep the id.
+    assertEqual(ts.submissionRetryable({ status: null, message: 'socket closed' }), true);
+    assertEqual(ts.submissionRetryable({ status: 500, message: 'internal' }), true);
+    assertEqual(ts.submissionRetryable({ status: 408, message: 'timeout' }), true);
+    assertEqual(ts.submissionRetryable({ status: 429, message: 'busy' }), true);
+    assertEqual(
+      ts.submissionRetryable({
+        status: 409,
+        message: 'task start with submission id "abc" is already in flight; retry once it settles',
+      }),
+      true,
+    );
+    assertEqual(
+      ts.submissionRetryable({
+        status: 409,
+        message: 'submission id "abc" was already used for a different task start',
+      }),
+      false,
+    );
+    assertEqual(
+      ts.submissionRetryable({ status: 409, message: 'session has no registered worktree row' }),
+      false,
+    );
+    assertEqual(ts.submissionRetryable({ status: 400, message: 'malformed' }), false);
+    assertEqual(ts.submissionRetryable({ status: 403, message: 'forbidden' }), false);
+  });
+
+  await test('failed fetch / key helpers: verification authority is identity, never counts', () => {
+    const verification = {
+      owed: [{ opId: 'op-1', tool: 'bash', startedMs: 1, status: 'pending', effectStatus: null }],
+      failedChecks: [{ id: 'check-1', detail: 'cargo test failed' }],
+    };
+    const key = (over = {}) =>
+      ts.verificationAuthorityKey({
+        taskId: '42',
+        state: 'running',
+        revision: 'rev-1',
+        verification,
+        ...over,
+      });
+    const base = key();
+    assertEqual(key(), base, 'identical authority inputs yield the identical key');
+    // Same COUNTS, different failed-check identity.
+    assert(
+      key({
+        verification: {
+          ...verification,
+          failedChecks: [{ id: 'check-2', detail: 'cargo test failed' }],
+        },
+      }) !== base,
+      'a changed failed-check identity must invalidate the cache',
+    );
+    // Same counts, different evidence detail.
+    assert(
+      key({
+        verification: {
+          ...verification,
+          failedChecks: [{ id: 'check-1', detail: 'cargo test failed elsewhere' }],
+        },
+      }) !== base,
+      'changed evidence must invalidate the cache',
+    );
+    // Same counts, different owed op identity.
+    assert(
+      key({
+        verification: {
+          ...verification,
+          owed: [{ ...verification.owed[0], opId: 'op-2' }],
+        },
+      }) !== base,
+      'a changed owed op identity must invalidate the cache',
+    );
+    assert(key({ revision: 'rev-2' }) !== base, 'a task revision change invalidates');
+    assert(key({ state: 'done' }) !== base, 'a task state change invalidates');
+    assert(key({ taskId: '43' }) !== base, 'another task never reuses the cache');
+  });
+
+  await test('a failed fetch after an authority change never returns the previous view', () => {
+    const viewA = { records: [{ recordId: 'A', criteria: [], checks: [] }] };
+    const cache = new ts.EvidenceAuthorityCache();
+    cache.store('authority-A', viewA);
+    assertDeepEqual(cache.read('authority-A'), { view: viewA, unavailable: null });
+    // A success -> B changed -> B fetch fails: B is explicitly unavailable
+    // and the old A view is unreachable.
+    cache.fail('authority-B', 'verification read failed: 503');
+    assertDeepEqual(cache.read('authority-B'), {
+      view: null,
+      unavailable: 'verification read failed: 503',
+    });
+    assertEqual(cache.read('authority-A'), null, 'A must never render as B');
+    // A same-authority transient failure is explicit, never silently verified.
+    const fresh = new ts.EvidenceAuthorityCache();
+    fresh.store('authority-A', viewA);
+    fresh.fail('authority-A', 'transient network failure');
+    assertDeepEqual(fresh.read('authority-A'), {
+      view: null,
+      unavailable: 'transient network failure',
+    });
+    // Recovery stores the fresh read again.
+    fresh.store('authority-A', viewA);
+    assertDeepEqual(fresh.read('authority-A'), { view: viewA, unavailable: null });
+  });
+
+  await test('architectural: no proof-like cache returns data after its authority key changed', () => {
+    const source = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    const verificationStart = source.indexOf('async function taskVerificationFor(');
+    assert(verificationStart >= 0, 'taskVerificationFor must exist');
+    const verificationBody = source.slice(
+      verificationStart,
+      source.indexOf('\n}', verificationStart),
+    );
+    assert(
+      !verificationBody.includes('return active.taskVerification'),
+      'taskVerificationFor must never hand back the previous view',
+    );
+    assert(
+      verificationBody.includes('taskVerificationCache.fail('),
+      'a failed verification fetch must drop the cached view to explicit unavailable',
+    );
+    assert(
+      verificationBody.includes('verificationAuthorityKey('),
+      'the verification cache key must come from durable authority, not counts',
+    );
+    const proofStart = source.indexOf('async function taskProofFor(');
+    assert(proofStart >= 0, 'taskProofFor must exist');
+    const proofBody = source.slice(proofStart, source.indexOf('\n}', proofStart));
+    assert(
+      proofBody.includes('active.taskProof = null'),
+      'the proof cache must drop its view on a failed read',
+    );
+    const library = readFileSync(new URL('../src/taskStart.ts', import.meta.url), 'utf8');
+    assert(
+      library.includes('class EvidenceAuthorityCache'),
+      'the authority-keyed cache policy must live in the dependency-free module',
+    );
+  });
+}
+
+function transcriptEntry(seq, text, overrides = {}) {
+  return {
+    id: `m-${seq}`,
+    role: seq % 2 === 0 ? 'assistant' : 'user',
+    seq,
+    createdMs: seq,
+    text,
+    reasoning: '',
+    summary: '',
+    tools: [],
+    ...overrides,
+  };
+}
+
+function transcriptSnapshot(entries) {
+  return { ...webviewSnapshot([]), transcript: entries };
+}
+
+async function transcriptScrollTests() {
+  await test('transcript scroll ownership: pinned follows, initial pins, no delta is a no-op', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    container.clientHeight = 200;
+    const entries = [transcriptEntry(1, 'one'), transcriptEntry(2, 'two')];
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.scrollTop, container.scrollHeight, 'initial load pins to the bottom');
+
+    // At the bottom + message -> stays pinned.
+    entries.push(transcriptEntry(3, 'three'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.scrollTop, container.scrollHeight, 'a pinned view follows the bottom');
+    assertEqual(container.children.length, 3, 'the rebuilt transcript carries every entry');
+
+    // 3px from the bottom (inside the slack) -> still pinned.
+    container.scrollTop = container.scrollHeight - container.clientHeight - 3;
+    entries.push(transcriptEntry(4, 'four'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(
+      container.scrollTop,
+      container.scrollHeight,
+      '3px from the bottom is still pinned',
+    );
+  });
+
+  await test('an unpinned reader keeps the first visible entry and pixel offset', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    container.clientHeight = 200;
+    const entries = [];
+    for (let seq = 1; seq <= 20; seq += 1) {
+      entries.push(transcriptEntry(seq, `message ${seq}`));
+    }
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    // 500px above the bottom of an 800px transcript.
+    container.scrollTop = 500;
+    const anchorNode = container.children[12];
+    const anchorOffset = 500 - anchorNode.offsetTop;
+    entries.push(transcriptEntry(21, 'message 21'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.scrollTop, anchorNode.offsetTop + anchorOffset);
+    assertEqual(container.scrollTop, 500, 'the reading position survives the rebuild');
+    assert(container.scrollTop < container.scrollHeight - container.clientHeight);
+  });
+
+  await test('background refresh with no transcript delta mutates zero scroll and keeps evidence', () => {
+    const tool = {
+      toolCallId: 't-1',
+      name: 'bash',
+      state: 'done',
+      input: null,
+      excerpt: 'output',
+      exitCode: 0,
+      artifact: 'evidence:42',
+    };
+    const entries = [transcriptEntry(1, 'one', { tools: [tool] })];
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    container.clientHeight = 200;
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    container.scrollTop = 0;
+    harness.deliver({ type: 'evidence', id: 42, text: 'DETAIL', truncated: false });
+    assert(
+      fakeText(container).includes('DETAIL'),
+      'the expanded evidence must render into its holder',
+    );
+    const before = container.children.slice();
+    const scrollBefore = container.scrollTop;
+    // The SAME transcript arrives from a background snapshot: no rebuild, no
+    // scroll mutation, and the expanded evidence survives.
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.scrollTop, scrollBefore, 'no delta must not move the scroll');
+    assertEqual(
+      container.children.length,
+      before.length,
+      'no delta must not rebuild the transcript DOM',
+    );
+    for (let index = 0; index < before.length; index += 1) {
+      assert(
+        container.children[index] === before[index],
+        'no delta must keep the exact rendered entry nodes',
+      );
+    }
+    assert(fakeText(container).includes('DETAIL'), 'the expanded evidence survives the refresh');
+  });
+
+  await test('own submission explicitly pins the transcript', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    container.clientHeight = 200;
+    const entries = [];
+    for (let seq = 1; seq <= 20; seq += 1) {
+      entries.push(transcriptEntry(seq, `message ${seq}`));
+    }
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    container.scrollTop = 500;
+    // The user's own submission requests the pin; the next changed render
+    // consumes it and jumps to the bottom.
+    harness.dom.document.getElementById('goal').value = 'my new goal';
+    harness.dom.document
+      .getElementById('composer')
+      .dispatch('submit', { preventDefault() {} });
+    entries.push(transcriptEntry(21, 'the user message'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.scrollTop, container.scrollHeight, 'own submission pins to the bottom');
+    // The one-shot pin was consumed: a later changed render respects the
+    // reading position again.
+    container.scrollTop = 500;
+    entries.push(transcriptEntry(22, 'assistant reply'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assert(container.scrollTop < container.scrollHeight - container.clientHeight);
+  });
+
+  await test('the composer is single-flight: submit locks controls and only an explicit result releases', () => {
+    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    const goal = dom.document.getElementById('goal');
+    const composer = dom.document.getElementById('composer');
+    const send = dom.document.getElementById('btn-send');
+    const newTask = dom.document.getElementById('btn-new-task');
+    goal.value = 'first goal';
+    composer.dispatch('submit', { preventDefault() {} });
+    // posted[0] is the initial ready message.
+    assertEqual(posted.length, 2, 'the first submit posts exactly one sendGoal');
+    assertDeepEqual(posted[1], { type: 'sendGoal', goal: 'first goal' });
+    assertEqual(send.disabled, true, 'Run task is disabled while submitting');
+    assertEqual(newTask.disabled, true, 'New task is disabled while submitting');
+    assertEqual(
+      dom.document.getElementById('contract-commit').disabled,
+      true,
+      'contract mutation is disabled while submitting',
+    );
+    // Text typed while pending and a second submit never join the request.
+    goal.value = 'second goal typed while pending';
+    composer.dispatch('submit', { preventDefault() {} });
+    assertEqual(posted.length, 2, 'a second submit while pending must not post');
+    assert(!('completionContract' in posted[1]), 'the pending message body is immutable');
+    // An explicit failure releases the lock and preserves draft + contract.
+    dom.document.getElementById('contract-commit').checked = true;
+    deliver({ type: 'startResult', goal: 'first goal', ok: false });
+    assertEqual(send.disabled, false, 'a failure re-enables Run task');
+    assertEqual(newTask.disabled, false, 'a failure re-enables New task');
+    assertEqual(
+      goal.value,
+      'second goal typed while pending',
+      'the draft typed while pending is preserved on failure',
+    );
+    assertEqual(dom.document.getElementById('contract-commit').checked, true, 'contract kept for retry');
+    assertEqual(dom.document.getElementById('contract-commit').disabled, false);
+    // The next submit is a new logical submission with the current body.
+    composer.dispatch('submit', { preventDefault() {} });
+    assertEqual(posted.length, 3);
+    assertEqual(posted[2].goal, 'second goal typed while pending');
+    assertDeepEqual(posted[2].completionContract, {
+      include_commit: true,
+      include_push: false,
+      include_pr: false,
+    });
+    deliver({ type: 'startResult', goal: 'second goal typed while pending', ok: true });
+    assertEqual(goal.value, '', 'a success clears the unchanged draft');
+    assertEqual(send.disabled, false, 'a success leaves the composer enabled');
   });
 }
 
@@ -7000,6 +7753,8 @@ async function main() {
   await moneyTests();
   await controlPlaneCredentialTests();
   await presentationWebviewTests();
+  await submissionSingleFlightTests();
+  await transcriptScrollTests();
   await tournamentWebviewTests();
   await reducedMotionTests();
   if (packagedDir !== null && packagedDir !== undefined) {

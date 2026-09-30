@@ -37,6 +37,12 @@ use crate::api::AppState;
 pub struct PromptRequest {
     /// The prompt text (also the run goal).
     pub prompt: String,
+    /// The client's submission UUID when this prompt is a submission-keyed
+    /// native task start (`POST /native/session/{id}/task-runs`): the
+    /// executor admits the run durably under that key and replays the
+    /// original receipt on a repeated key. `None` (ACP and the plain prompt
+    /// route) keeps the unkeyed legacy prompt path.
+    pub submission_id: Option<String>,
     /// Attached file paths (the SDK prompt vocabulary).
     pub files: Vec<String>,
     /// Durable typed binary/image attachments (`AttachmentId` rows),
@@ -183,6 +189,7 @@ impl PromptExecutionService {
         let run = TaskRunRequest {
             goal: request.prompt,
             work_items: vec![item],
+            submission_id: request.submission_id,
             model: request.model,
             criteria: request.criteria,
             files: request.files,

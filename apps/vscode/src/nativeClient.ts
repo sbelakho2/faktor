@@ -551,6 +551,9 @@ export interface NativeTaskView {
   readonly verification: NativeVerificationFact[];
   readonly progress: Json;
   readonly budget: NativeTaskBudget | null;
+  /** Additive (served when present): the task's durable optimistic-lock
+   * revision. `null` on a daemon that does not serve it — never fabricated. */
+  readonly revision: string | null;
   /** Additive (served when present): acceptance criteria, plan/DAG steps,
    * blockers and explicit evidence refs. */
   readonly acceptanceCriteria: string[];
@@ -1408,6 +1411,13 @@ export interface NativeAbortAck {
 
 export interface StartTaskRunRequest {
   readonly goal: string;
+  /**
+   * Client-generated UUID of ONE logical submission (documented snake_case
+   * wire field; the daemon's idempotency key). A retried start after a lost
+   * response reuses it and the daemon returns the original receipt; a
+   * successful start or a typed refusal ends the logical submission.
+   */
+  readonly submission_id?: string;
   readonly criteria?: string[];
   readonly work_items?: Array<{
     readonly id: string;
@@ -1960,6 +1970,7 @@ export function validateTaskViews(json: Json): NativeTaskView[] {
       ),
       progress: fJson(object, 'progress', itemPath),
       budget: budgetRaw === null ? null : validateBudget(budgetRaw, `${itemPath}.budget`),
+      revision: optionalString(object, ['revision', 'task_revision'], itemPath),
       acceptanceCriteria: optionalStringArray(
         object,
         ['acceptanceCriteria', 'acceptance_criteria'],

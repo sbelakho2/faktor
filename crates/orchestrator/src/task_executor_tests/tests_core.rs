@@ -165,6 +165,8 @@ pub(crate) async fn refused_isolation_record_close_loss_is_marked_and_reconstruc
             &h,
             &req,
             ExecError::Oversized("bounded caps refused the candidate".into()),
+            None,
+            &mut false,
         )
         .expect("the typed refusal outcome survives the lost record close");
     assert_eq!(receipt.mode, TaskRunMode::InSession);

@@ -42,6 +42,7 @@ pub mod criteria;
 pub mod derive;
 pub mod exec;
 pub mod inventory;
+pub mod manifest;
 pub mod review;
 
 pub use inventory::{
@@ -50,6 +51,7 @@ pub use inventory::{
     InventoryBudget, InventoryCompleteness, InventorySource, ManifestProbe, ManifestProbeRefusal,
     RepoInventory, MAX_INVENTORY_DEPTH,
 };
+pub use manifest::{read_manifest_bounded, ManifestReadError, MAX_MANIFEST_READ};
 
 /// The ONE check-command identity surface of the verification crate: the
 /// canonical BLAKE3 authority digests over the structured (program, argv)

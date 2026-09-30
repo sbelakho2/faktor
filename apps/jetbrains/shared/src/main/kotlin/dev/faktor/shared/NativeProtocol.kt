@@ -2530,7 +2530,14 @@ object NativeRequests {
         mutationMode: String? = null,
         files: List<String>? = null,
         attachments: List<NativeAttachmentId>? = null,
-        completionContract: NativeCompletionContract? = null
+        completionContract: NativeCompletionContract? = null,
+        /**
+         * Client idempotency identity of ONE logical start (a fresh UUID per
+         * logical submission; a transport-failure retry reuses it). The daemon
+         * replays the original receipt for an already-recorded id, so a lost
+         * response can never create a second durable run.
+         */
+        submissionId: String? = null
     ): String {
         val builder = JsonObjectBuilder()
             .put("goal", goal)
@@ -2544,6 +2551,7 @@ object NativeRequests {
                 "attachments",
                 attachments.orEmpty().filterNotNull().map { attachmentJson(it) }
             )
+            .put("submission_id", submissionId)
         // A non-default completion contract requires explicit work items (the
         // daemon refuses it on the plain-prompt path). ONE mutating `main`
         // item keeps the same in-session drive with the durable contract seam;

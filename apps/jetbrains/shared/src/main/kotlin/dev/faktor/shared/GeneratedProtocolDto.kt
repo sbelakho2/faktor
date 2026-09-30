@@ -147,9 +147,10 @@ data class ProtocolTaskRunWorkItem(
     val requiredCapabilities: JsonValue?
 )
 
-/** Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. (unknown_fields: reject) */
+/** Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. `submission_id` is the required client submission UUID of the logical start (idempotency key: a repeated key replays the original run receipt byte-for-byte). (unknown_fields: reject) */
 data class ProtocolTaskRunStartRequest(
     val goal: String,
+    val submissionId: String,
     val criteria: List<String>?,
     val workItems: List<ProtocolTaskRunWorkItem>?,
     val ownership: JsonValue?,
@@ -377,12 +378,13 @@ fun parseProtocolTaskRunWorkItem(v: JsonView): ProtocolTaskRunWorkItem {
 fun parseProtocolTaskRunStartRequest(v: JsonView): ProtocolTaskRunStartRequest {
     val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
     for (key in fields.keys) {
-        if (key !in listOf("goal", "criteria", "work_items", "ownership", "model", "max_tokens", "max_cost_micro", "mutation_mode", "routing_mode", "files", "attachments", "completion_contract")) {
+        if (key !in listOf("goal", "submission_id", "criteria", "work_items", "ownership", "model", "max_tokens", "max_cost_micro", "mutation_mode", "routing_mode", "files", "attachments", "completion_contract")) {
             throw NativeProtocolException(v.path, "unknown field " + key)
         }
     }
     return ProtocolTaskRunStartRequest(
         goal = v.field("goal").string(),
+        submissionId = v.field("submission_id").string(),
         criteria = v.optionalField("criteria")?.array()?.map { it.string() },
         workItems = v.optionalField("work_items")?.array()?.map { parseProtocolTaskRunWorkItem(it) },
         ownership = v.optionalField("ownership")?.value,

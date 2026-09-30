@@ -12,6 +12,16 @@
     },
   };
 
+  // One logical submission at a time. The flag gates the composer BEFORE the
+  // post, so a double click / Enter+click race can never emit a second
+  // sendGoal; it is released ONLY by an explicit host result.
+  var submitting = false;
+  // Scroll-ownership state: the signature of the rendered transcript and the
+  // one-shot pin requested by the user's own submission.
+  var transcriptKey = null;
+  var transcriptPinRequested = false;
+  var TRANSCRIPT_PIN_SLACK_PX = 24;
+
   function byId(id) {
     return document.getElementById(id);
   }
@@ -531,6 +541,122 @@
     return match ? Number(match[1]) : null;
   }
 
+  /**
+   * The PURE scroll-ownership decision of one rebuild, computed BEFORE the
+   * DOM mutates: the distance from the bottom and whether the view was
+   * pinned (within the slack). Pinned-before stays pinned; otherwise the
+   * first visible entry is preserved as the anchor.
+   */
+  function transcriptScrollPlan(input) {
+    var distance = input.scrollHeight - input.scrollTop - input.clientHeight;
+    return {
+      distanceFromBottom: distance,
+      pinned: distance <= TRANSCRIPT_PIN_SLACK_PX,
+    };
+  }
+
+  /** Cheap structural signature of the rendered entries (host-mirroring). */
+  function transcriptKeyOf(entries) {
+    if (!entries || entries.length === 0) {
+      return 'empty';
+    }
+    var out = '';
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      var tools = entry.tools || [];
+      out +=
+        entry.seq +
+        ':' +
+        entry.role +
+        ':' +
+        (entry.text || '').length +
+        ':' +
+        (entry.reasoning || '').length +
+        ':' +
+        (entry.summary || '').length +
+        ':';
+      for (var t = 0; t < tools.length; t++) {
+        out +=
+          tools[t].state +
+          ':' +
+          ((tools[t].excerpt || '').length) +
+          ':' +
+          (tools[t].exitCode === null || tools[t].exitCode === undefined
+            ? 'n'
+            : tools[t].exitCode) +
+          ';';
+      }
+      out += '|';
+    }
+    return out;
+  }
+
+  /** The first visible entry (index + pixel offset) of the CURRENT list. */
+  function transcriptAnchorOf(container) {
+    var offset = container.scrollTop;
+    var children = container.children || [];
+    for (var i = 0; i < children.length; i++) {
+      var node = children[i];
+      var top = typeof node.offsetTop === 'number' ? node.offsetTop : 0;
+      var height = typeof node.offsetHeight === 'number' ? node.offsetHeight : 0;
+      if (top + height > offset) {
+        return { index: i, offset: offset - top };
+      }
+    }
+    return { index: Math.max(0, children.length - 1), offset: 0 };
+  }
+
+  /** Restore the anchor pixel position of `anchor.index` after a rebuild. */
+  function scrollToTranscriptAnchor(container, anchor) {
+    var children = container.children || [];
+    if (children.length === 0) {
+      return;
+    }
+    var index = Math.min(Math.max(0, anchor.index), children.length - 1);
+    var node = children[index];
+    var top = typeof node.offsetTop === 'number' ? node.offsetTop : 0;
+    container.scrollTop = top + anchor.offset;
+  }
+
+  function renderTranscript(entries) {
+    var container = byId('entries');
+    var key = transcriptKeyOf(entries);
+    if (transcriptKey !== null && key === transcriptKey) {
+      // No transcript delta: no rebuild and ZERO scroll mutation, so an
+      // expanded evidence block and the reading position both survive a
+      // background snapshot.
+      return;
+    }
+    var plan = transcriptScrollPlan({
+      scrollHeight: container.scrollHeight,
+      scrollTop: container.scrollTop,
+      clientHeight: container.clientHeight,
+    });
+    // Initial load, a previously pinned view and the user's own submission
+    // all pin to the bottom; an unpinned reader keeps the first visible
+    // entry and its pixel offset across the rebuild.
+    var pin = transcriptKey === null || plan.pinned || transcriptPinRequested;
+    var anchor = pin ? null : transcriptAnchorOf(container);
+    clear(container);
+    transcriptKey = key;
+    transcriptPinRequested = false;
+    if (!entries || entries.length === 0) {
+      line(container, 'No messages yet.', 'muted');
+      if (pin) {
+        container.scrollTop = 0;
+      }
+      return;
+    }
+    for (var i = 0; i < entries.length; i++) {
+      container.appendChild(renderEntry(entries[i]));
+    }
+    if (pin) {
+      container.scrollTop = container.scrollHeight;
+    } else {
+      scrollToTranscriptAnchor(container, anchor);
+    }
+  }
+
   function renderTool(container, tool) {
     var row = document.createElement('div');
     row.className = 'tool';
@@ -603,19 +729,6 @@
     return wrapper;
   }
 
-  function renderTranscript(entries) {
-    var container = byId('entries');
-    clear(container);
-    if (!entries || entries.length === 0) {
-      line(container, 'No messages yet.', 'muted');
-      return;
-    }
-    for (var i = 0; i < entries.length; i++) {
-      container.appendChild(renderEntry(entries[i]));
-    }
-    container.scrollTop = container.scrollHeight;
-  }
-
   function setDaemon(status, detail) {
     var dot = byId('daemon-dot');
     dot.className = 'dot dot-' + (status || 'stopped');
@@ -671,6 +784,33 @@
     }
   }
 
+  /**
+   * The composer submitting lock. While a logical submission awaits its
+   * explicit result, Run task / New task and every completion-contract or
+   * attachment control is disabled; the goal textarea stays editable, but
+   * text typed while pending can never join the pending request. Every
+   * outcome (success, typed refusal, transport failure) re-enables.
+   */
+  function setSubmitting(value) {
+    submitting = value;
+    var ids = [
+      'btn-send',
+      'btn-new-task',
+      'contract-commit',
+      'contract-push',
+      'contract-pr',
+      'btn-attach',
+      'attachment-input',
+      'files-input',
+    ];
+    for (var i = 0; i < ids.length; i++) {
+      var node = byId(ids[i]);
+      if (node) {
+        node.disabled = value;
+      }
+    }
+  }
+
   window.addEventListener('message', function (event) {
     var message = event.data || {};
     if (message.type === 'snapshot') {
@@ -678,6 +818,8 @@
     } else if (message.type === 'evidence') {
       deliverEvidence(message.id, message.text, message.truncated);
     } else if (message.type === 'startResult') {
+      // The explicit result releases the submitting lock on EVERY outcome.
+      setSubmitting(false);
       var goalNode = byId('goal');
       if (goalNode) {
         goalNode.value = composerPolicy.afterStart(
@@ -725,6 +867,11 @@
 
   byId('composer').addEventListener('submit', function (event) {
     event.preventDefault();
+    if (submitting) {
+      // Single-flight: Enter+click, a double click or a rapid triple submit
+      // can only ever post ONE sendGoal for this logical submission.
+      return;
+    }
     var goal = byId('goal').value.trim();
     if (!goal) {
       return;
@@ -732,15 +879,22 @@
     // Draft preservation: the goal is NOT cleared here. The extension posts
     // a startResult; only a successful start clears the (unchanged) draft.
     // The Task-mode completion contract rides only THIS task start; plain
-    // chat never carries it.
+    // chat never carries it. The message is the IMMUTABLE snapshot of the
+    // submission: later composer/control mutations build a new message, not
+    // a change to this one.
     var contract = completionContractFromControls();
     var message = { type: 'sendGoal', goal: goal };
     if (contract) {
       message.completionContract = contract;
     }
+    transcriptPinRequested = true;
+    setSubmitting(true);
     vscode.postMessage(message);
   });
   byId('btn-new-task').addEventListener('click', function () {
+    if (submitting) {
+      return;
+    }
     vscode.postMessage({ type: 'newTask' });
   });
   byId('btn-cancel-run').addEventListener('click', function () {

@@ -176,6 +176,27 @@ generated into both IDE clients (`ProtocolAttachmentId`,
   daemon's single executor entry: `{session_id, prompt, files?}` (the body
   id must match the path) → `{op_id, run_id, accepted, queued}`. Empty
   prompts are a typed 400; unknown sessions 404.
+- `POST /native/session/{id}/task-runs` — start ONE task through the same
+  executor: strict body `{goal, submission_id, criteria?, work_items?,
+  model?, max_tokens?, max_cost_micro?, files?, attachments?,
+  completion_contract?, mutation_mode?, ownership?, routing_mode?}`
+  (unknown fields refused; absent `work_items` = one mutating `main` item).
+  `submission_id` is REQUIRED: the client submission UUID of this logical
+  start, 1..=64 ASCII `[0-9a-f-]` (UUID-shaped, lowercase hex); any other
+  shape is a typed 400. It is the durable idempotency key (finding 1):
+  the executor claims a `task_admission` row BEFORE any task mutation, so
+  - a repeated key with the SAME normalized request (goal, files, the
+    effective attachments/criteria, the completion contract and the run
+    envelope) returns the original run receipt byte-for-byte and performs
+    NO further mutation — no task-row re-goal, no completion-contract
+    record, no budget adjustment, no shadow start, no prompt enqueue;
+  - a repeated key with a DIFFERENT request is a typed `conflict` (409)
+    naming the stored digest mismatch;
+  - a concurrent duplicate while the first start is still pending is a
+    retryable typed `conflict`; a start that fails before acceptance
+    releases its key so the same submission may be retried.
+  Response: `{task_id, run_id, state}` (the run projection served by the
+  task-run list/state endpoints).
 - `POST /native/session/{id}/attachments` — upload ONE durable typed
   attachment: `{mime, filename?, data_base64}` (strict DTO) →
   `{ref_id, digest, mime, filename, size}` (`ref_id` is the stable

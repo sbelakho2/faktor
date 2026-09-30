@@ -467,6 +467,8 @@ pub(crate) fn done_script() -> Vec<Vec<ScriptedResponse>> {
 
 // ------------------------------------------------------------------- tests
 #[cfg(test)]
+mod tests_admission;
+#[cfg(test)]
 mod tests_control;
 #[cfg(test)]
 mod tests_core;

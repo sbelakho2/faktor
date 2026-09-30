@@ -62,6 +62,7 @@ import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.ProtocolAttachmentRef
 import java.math.BigInteger
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Bridge facade over one daemon. All mutating calls are synchronized on the
@@ -96,6 +97,9 @@ class FaktorFrontendService(
 
     /** Stops an externally adopted connection (test/embedding hook). */
     private var externalStop: (() -> Unit)? = null
+
+    /** Single-flight gate of the task-start surface (see [startTaskRun]). */
+    private val taskStartInFlight = AtomicBoolean(false)
 
     @Volatile
     private var listener: Listener? = null
@@ -382,6 +386,13 @@ class FaktorFrontendService(
 
     fun taskRuns(): List<NativeTaskRun> = clientOrThrow().taskRuns(requireSession())
 
+    /**
+     * Single-flight: ONE task start may be in flight per service. A second
+     * concurrent call is a typed [BackendException], never a queued duplicate
+     * request; the caller's own guard should prevent it from ever getting
+     * here. [submissionId] is the client idempotency identity of the logical
+     * start (see NativeClient.startTaskRun).
+     */
     fun startTaskRun(
         goal: String,
         criteria: List<String>? = null,
@@ -391,11 +402,21 @@ class FaktorFrontendService(
         mutationMode: String? = null,
         files: List<String>? = null,
         attachments: List<NativeAttachmentId>? = null,
-        completionContract: NativeCompletionContract? = null
-    ): NativeTaskRunStarted = clientOrThrow().startTaskRun(
-        requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
-        attachments, completionContract
-    )
+        completionContract: NativeCompletionContract? = null,
+        submissionId: String? = null
+    ): NativeTaskRunStarted {
+        if (!taskStartInFlight.compareAndSet(false, true)) {
+            throw BackendException("a task start is already in flight; the duplicate was refused")
+        }
+        try {
+            return clientOrThrow().startTaskRun(
+                requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
+                attachments, completionContract, submissionId
+            )
+        } finally {
+            taskStartInFlight.set(false)
+        }
+    }
 
     /**
      * Upload ONE bounded binary attachment (standard base64) into the

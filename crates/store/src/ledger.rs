@@ -502,7 +502,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 26, "v25 is the migration head");
+            assert_eq!(version, 27, "v26 (task admission) is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",

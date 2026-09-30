@@ -706,6 +706,12 @@ object FrontendSmoke {
                 "{\"goal\":\"g\"}",
                 NativeRequests.startTaskRun("g")
             )
+            // The logical-start idempotency identity rides the strict body
+            // member; absent id keeps the default path byte-identical.
+            assertEquals(
+                "{\"goal\":\"g\",\"submission_id\":\"sub-1\"}",
+                NativeRequests.startTaskRun("g", submissionId = "sub-1")
+            )
             // Image parity: a durable attachment id rides the SAME task-run
             // DTO member in the same representation the VS Code client uses.
             val attachmentId = NativeAttachmentId(
@@ -2457,7 +2463,8 @@ object FrontendSmoke {
                         val started = client.startTaskRun(
                             sid,
                             "frontend smoke attachment",
-                            files = listOf("seed.txt")
+                            files = listOf("seed.txt"),
+                            submissionId = java.util.UUID.randomUUID().toString()
                         )
                         if (started.runId.isEmpty()) fail("no run id")
                         println("  run=${started.runId} state=${started.state}")

@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Fifteen structural invariants are locked by scanning the repository's
+//! Sixteen structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -138,6 +138,13 @@
 //!     Grandfathered call sites are exact-line allowlisted, asserted
 //!     load-bearing and non-stale, and a planted violation in every family
 //!     fails the scan.
+//! 16. **Bounded, rooted manifest reads in the verification crate** (audit
+//!     finding 4) — every production source under `crates/verify/src` reads
+//!     build manifests ONLY through `crate::manifest::read_manifest_bounded`
+//!     (anchored no-follow root, `take(max + 1)`-bounded content). A raw
+//!     `fs::read(` / `read_to_end(` there allocates up to a hostile, sparse
+//!     or growing manifest size before any length check runs; the allowlist
+//!     is empty and a planted raw read fails the scan.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -6490,6 +6497,9 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/terminal/src/budget.rs", 1),
         ("crates/terminal/src/sandbox/linux.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
+        // fd-identity exec of the verified updater artifact (`fexecve`); the
+        // single unsafe block exists solely to bind exec to the hashed inode.
+        ("crates/updater/src/fd_exec.rs", 1),
         // --- function-level allows in mixed files ---
         ("crates/terminal/src/lib.rs", 10),
         ("crates/fs/src/tree_manifest.rs", 3),
@@ -8423,5 +8433,126 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
                 .any(|offender| offender.contains("nativeClient.ts")),
             "the audit-15 tripwire must fire on a planted VS Code regression: {offenders:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // scan 16: bounded, rooted build-manifest reads in faktor-verify
+    // ------------------------------------------------------------------
+
+    /// The raw unbounded read shapes that must never reappear in the
+    /// verification crate's manifest handling: pathname reads (`fs::read(`,
+    /// which covers `std::fs::read(`) and `read_to_end(`. Either allocates
+    /// up to the whole hostile/sparse (or grown-after-stat) manifest before
+    /// any length check runs, defeating `MAX_MANIFEST_READ`.
+    const MANIFEST_RAW_READ_MARKERS: &[&str] = &["fs::read(", "read_to_end("];
+
+    /// Raw-read offenders inside the PRODUCTION ranges of one verification
+    /// source. The scan is scoped to `crates/verify/src`: build-manifest
+    /// reads there are the surface where
+    /// `crate::manifest::read_manifest_bounded` is the ONE authority
+    /// (anchored no-follow root, literal-size refusal, `take(max + 1)` read).
+    fn manifest_raw_read_offenders(f: &File<'_>) -> Vec<String> {
+        if !normalize_rel(&f.rel).starts_with("crates/verify/src/") {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for marker in MANIFEST_RAW_READ_MARKERS {
+            let mb = marker.as_bytes();
+            let mut pos = 0usize;
+            while let Some(rel) = f.src[pos..].find(marker) {
+                let at = pos + rel;
+                let in_kept = f.kept.iter().any(|&(s, e)| at >= s && at < e);
+                let is_code = f
+                    .code
+                    .get(at..at + mb.len())
+                    .map(|c| c.iter().all(|b| *b))
+                    .unwrap_or(false);
+                if in_kept && is_code {
+                    hits.push(format!(
+                        "{}:{}: {}  [build-manifest reads must go through \
+                         crate::manifest::read_manifest_bounded (rooted, \
+                         take(max + 1)-bounded); a raw read allocates past the cap]",
+                        f.rel,
+                        line_of(f.src, at),
+                        trim_line(f.src, at)
+                    ));
+                }
+                pos = at + mb.len();
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        hits
+    }
+
+    /// Every production verification source is scanned; the allowlist is
+    /// empty by construction, so a new raw manifest read anywhere in
+    /// `crates/verify/src` is a red test.
+    #[test]
+    fn verification_manifest_reads_are_bounded_and_rooted() {
+        let mut scanned = 0usize;
+        let mut offenders = Vec::new();
+        for rel in walk_crate_sources() {
+            if is_test_file(&rel) {
+                continue;
+            }
+            let Some(f) = load(&rel) else { continue };
+            if !f.kept.is_empty() && normalize_rel(&f.rel).starts_with("crates/verify/src/") {
+                scanned += 1;
+            }
+            offenders.extend(manifest_raw_read_offenders(&f));
+        }
+        assert_no_offenders(
+            "manifest-read scan: crates/verify production code must read build manifests only \
+             through the bounded rooted reader; raw fs::read / read_to_end is refused",
+            &offenders,
+            scanned,
+            5,
+        );
+    }
+
+    #[test]
+    fn manifest_read_scan_fires_on_planted_raw_reads() {
+        for planted in [
+            "fn default_preset_name(root: &std::path::Path) { let _ = \
+             std::fs::read(root.join(\"CMakePresets.json\")); }\n",
+            "fn manifest_has_target() { let mut b = Vec::new(); f.read_to_end(&mut b).unwrap(); }\n",
+            "fn compile_commands_entries(p: &Path) { let _ = std::fs::read(p); }\n",
+        ] {
+            let f = synthetic_file("crates/verify/src/evil.rs", planted);
+            assert!(
+                !manifest_raw_read_offenders(&f).is_empty(),
+                "the manifest-read gate must fire on a planted raw read: {planted}"
+            );
+        }
+        // Test-gated code can never certify production.
+        let f = synthetic_file(
+            "crates/verify/src/evil.rs",
+            "#[cfg(test)]\nmod tests {\n    fn t() { let _ = std::fs::read(\"/tmp/x\"); }\n}\n",
+        );
+        assert!(manifest_raw_read_offenders(&f).is_empty());
+        // The scan is scoped to the verification crate: another crate's raw
+        // read is surfaced by its own authority, not this gate.
+        let f = synthetic_file(
+            "crates/store/src/evil.rs",
+            "fn f() { let _ = std::fs::read(\"/tmp/x\"); }\n",
+        );
+        assert!(manifest_raw_read_offenders(&f).is_empty());
+        // The sanctioned shape — anchored open, take(max + 1), read into a
+        // bounded chunk — passes.
+        let f = synthetic_file(
+            "crates/verify/src/manifest.rs",
+            "fn f(root: &Path, rel: &str, max: u64) -> Result<Vec<u8>, E> {\n    \
+             let mut file = rooted.open_read(Path::new(rel))?;\n    \
+             let mut limited = file.by_ref().take(max.saturating_add(1));\n    \
+             let n = limited.read(&mut chunk[..want])?;\n    Ok(bytes)\n}\n",
+        );
+        assert!(manifest_raw_read_offenders(&f).is_empty());
+        // A Windows-style rel still normalizes into the scanned crate.
+        let f = synthetic_file(
+            "crates\\verify\\src\\evil.rs",
+            "fn f() { let _ = std::fs::read(\"/tmp/x\"); }\n",
+        );
+        assert!(!manifest_raw_read_offenders(&f).is_empty());
     }
 }

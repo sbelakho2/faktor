@@ -311,9 +311,10 @@ export interface ProtocolTaskRunWorkItem {
   readonly required_capabilities: ProtocolJson | null;
 }
 
-/** Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. (unknown_fields: reject) */
+/** Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. `submission_id` is the required client submission UUID of the logical start (idempotency key: a repeated key replays the original run receipt byte-for-byte). (unknown_fields: reject) */
 export interface ProtocolTaskRunStartRequest {
   readonly goal: string;
+  readonly submission_id: string;
   readonly criteria: readonly string[] | null;
   readonly work_items: readonly ProtocolTaskRunWorkItem[] | null;
   readonly ownership: ProtocolJson | null;
@@ -586,13 +587,14 @@ export function validateProtocolTaskRunWorkItem(value: ProtocolJson, path = "Pro
 
 export function validateProtocolTaskRunStartRequest(value: ProtocolJson, path = "ProtocolTaskRunStartRequest"): ProtocolTaskRunStartRequest {
   const object = dtoObject(value, path);
-  const required = ["goal"];
+  const required = ["goal","submission_id"];
   for (const key of required) {
     dtoRequired(object, key, path);
   }
-  dtoRejectUnknown(object, path, ["goal","criteria","work_items","ownership","model","max_tokens","max_cost_micro","mutation_mode","routing_mode","files","attachments","completion_contract"]);
+  dtoRejectUnknown(object, path, ["goal","submission_id","criteria","work_items","ownership","model","max_tokens","max_cost_micro","mutation_mode","routing_mode","files","attachments","completion_contract"]);
   return {
     goal: dtoString(object, "goal", path),
+    submission_id: dtoString(object, "submission_id", path),
     criteria: dtoOptionalNullableList(object, "criteria", path)?.map((item, index) => dtoStringElement(item, path + ".criteria[" + index + "]")) ?? null,
     work_items: dtoOptionalNullableList(object, "work_items", path)?.map((item, index) => validateProtocolTaskRunWorkItem(item, path + ".work_items[" + index + "]")) ?? null,
     ownership: dtoOptionalNullableJson(object, "ownership"),
