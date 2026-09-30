@@ -369,5 +369,7 @@ steps:
       # conventionally tagged and lane-assigned in .woodpecker/trusted/nightly.yaml
       # or documented as manual/live-paid (scripts/certification/ignored-tests.json).
       - node scripts/check-ignored-tests.mjs
+      # Invariant registry coverage (node-only; the rust static lane has no node).
+      - node scripts/check-invariants.mjs
       - node scripts/certification/evidence.mjs verify-markers --workflow pr --yaml-dir .woodpecker/untrusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
       - node scripts/certification/evidence.mjs write --kind ci_certification_pr --status passed --from-markers target/certification/lanes --commands "woodpecker pr workflow certificate"
