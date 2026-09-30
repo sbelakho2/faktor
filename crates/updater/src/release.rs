@@ -46,11 +46,34 @@
 //! digest — is a failed launch: it is terminated and the launcher exits
 //! non-zero with a typed refusal (never a silent `Ok(0)`).
 //!
-//! Honest limit: the digest re-hash and the exec are two syscalls; a writer
-//! with write access to the version directory could race between them. The
-//! install root is operator-owned (0700-style) state, and activation only
-//! ever writes into content-addressed version directories, so this is the
-//! documented race window, not a silent trust path.
+//! Exec identity: on unix platforms with an fd-exec the launcher opens
+//! `versions/<release-id>/faktor` ONCE, re-hashes that descriptor, and then
+//! executes the SAME descriptor — `fexecve` on Linux/Android and
+//! FreeBSD/DragonFly (this crate's `fd_exec` seam), the `/dev/fd/<n>` magic
+//! link on Darwin (which has no `fexecve` symbol). The version-directory
+//! pathname is never reopened between the digest check and the exec, so a
+//! writer that swaps the directory entry — or the whole release directory —
+//! after verification cannot redirect the launch: the executed file IS the
+//! inode that was hashed, and a swapped-in inode would have to reproduce the
+//! signed digest to pass.
+//!
+//! The launcher additionally refuses an install tree whose chain from the
+//! install root down to the executable contains a symlink, crosses owners
+//! (every component must belong to the install root's owner), or is writable
+//! by group or others (`mode & 0o022`). What this proves: no other-privileged
+//! account can redirect or replace the version directory under the checked
+//! path. What it does NOT prove: a same-owner (or root) writer can still
+//! rewrite the verified inode's bytes in place after the hash — that writer
+//! owns the install and is outside the trust boundary — and the check reads
+//! mode bits only (an ACL or mount option can grant write despite them).
+//!
+//! Honest residual gap: where no fd-exec exists (non-unix, and unix platforms
+//! outside the list above) the launcher keeps the re-hash-then-exec-by-
+//! pathname order, so the documented verify→exec swap window remains there.
+//! The readiness handshake observes the child's claimed digest, which a
+//! swapped-in binary could claim too; it is a health proof, not an
+//! independent hash of the child's bytes. A verified fd-exec is the only
+//! mechanism here that closes the swap race.
 //!
 //! `verify_manifest_at_launch` deliberately does NOT re-check the validity
 //! window or the channel pin: those govern update SELECTION at check time.
@@ -365,7 +388,7 @@ impl InstallLayout {
             });
         }
         let versions = self.versions_dir();
-        fs::create_dir_all(&versions).map_err(|e| {
+        crate::install::create_private_dir_all(&versions).map_err(|e| {
             UpdateError::Install(format!("create versions dir {}: {e}", versions.display()))
         })?;
         let dir = self.release_dir(release_id);
@@ -414,7 +437,7 @@ impl InstallLayout {
             std::process::id(),
             unique_nonce()
         ));
-        if let Err(e) = fs::create_dir_all(&tmp) {
+        if let Err(e) = crate::install::create_private_dir_all(&tmp) {
             return Err(UpdateError::Install(format!(
                 "create release staging dir {}: {e}",
                 tmp.display()
@@ -818,9 +841,18 @@ pub fn resolve_launch(
     })
 }
 
-/// Launch one resolved target: re-verify the binary digest immediately
-/// before the exec (the documented TOCTOU window is the exec syscall
-/// itself), export the verified release identity, and replace this process.
+/// Launch one resolved target: re-verify the binary and replace this process.
+///
+/// On unix the artifact is opened ONCE (after the install-ancestry check); the
+/// digest is re-verified FROM that descriptor and the platform fd-exec then
+/// executes the SAME descriptor (`fexecve` on Linux/Android and
+/// FreeBSD/DragonFly; the `/dev/fd/<n>` magic link on Darwin, which has no
+/// `fexecve` symbol), so a writer that swaps the directory entry after
+/// verification cannot change which inode launches. On unix platforms without
+/// an fd-exec and on non-unix the launcher keeps the re-hash-then-exec-by-
+/// pathname order — the documented residual swap window, stated in the module
+/// docs — and the release identity is exported only to the verified bytes it
+/// actually handed to the OS.
 ///
 /// On unix the bootstrap IS replaced by the release binary (execve), so the
 /// supervisor observes exactly one live process and the release's own exit
@@ -847,33 +879,24 @@ pub fn launch(
     install_root: &Path,
     args: &[OsString],
 ) -> Result<i32, UpdateError> {
-    let actual = file_digest(&target.binary).map_err(|e| UpdateError::LaunchRefused {
-        detail: format!("hash {} before exec: {e}", target.binary.display()),
-    })?;
-    if actual != target.digest {
-        return Err(UpdateError::LaunchRefused {
-            detail: format!(
-                "release digest changed between verification and exec: expected {}, found {actual}",
-                target.digest
-            ),
-        });
-    }
-    let mut command = std::process::Command::new(&target.binary);
-    command
-        .args(args)
-        .env(RELEASE_ID_ENV, &target.release_id)
-        .env(RELEASE_DIGEST_ENV, &target.digest)
-        .env(INSTALL_ROOT_ENV, install_root);
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
-        let error = command.exec();
-        Err(UpdateError::LaunchRefused {
-            detail: format!("exec {}: {error}", target.binary.display()),
-        })
+        launch_verified(target, install_root, args)
     }
     #[cfg(not(unix))]
     {
+        let actual = file_digest(&target.binary).map_err(|e| UpdateError::LaunchRefused {
+            detail: format!("hash {} before exec: {e}", target.binary.display()),
+        })?;
+        if actual != target.digest {
+            return Err(UpdateError::LaunchRefused {
+                detail: format!(
+                    "release digest changed between verification and exec: expected {}, found {actual}",
+                    target.digest
+                ),
+            });
+        }
+        let mut command = launch_command(target, install_root, args);
         // The startup/health handshake: the release's stdout rides a
         // launcher-owned pipe so the launcher can observe the child's own
         // digest attestation + frozen startup line while still forwarding
@@ -911,6 +934,379 @@ pub fn launch(
             );
         }
         conclude_launch(&mut process, decision, &target.digest)
+    }
+}
+
+#[cfg(not(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+)))]
+use std::process;
+
+/// Build the release command with the exact argv/env the launch contract
+/// requires. This is the ONE process construct site of this file (the
+/// bootstrap static exemption is pinned to the `Command::new` line below);
+/// the fd-exec platforms never reach it.
+#[cfg(not(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+)))]
+fn launch_command(
+    target: &ReleaseTarget,
+    install_root: &Path,
+    args: &[OsString],
+) -> process::Command {
+    let mut command = std::process::Command::new(&target.binary);
+    command
+        .args(args)
+        .env(RELEASE_ID_ENV, &target.release_id)
+        .env(RELEASE_DIGEST_ENV, &target.digest)
+        .env(INSTALL_ROOT_ENV, install_root);
+    command
+}
+
+/// The unix launch: ancestry gate, ONE open descriptor, digest FROM that
+/// descriptor, then the platform exec on the same descriptor.
+#[cfg(unix)]
+fn launch_verified(
+    target: &ReleaseTarget,
+    install_root: &Path,
+    args: &[OsString],
+) -> Result<i32, UpdateError> {
+    verify_install_ancestry(install_root, &target.binary)?;
+    let mut file = fs::File::open(&target.binary).map_err(|e| UpdateError::LaunchRefused {
+        detail: format!("open {} before exec: {e}", target.binary.display()),
+    })?;
+    let meta = file.metadata().map_err(|e| UpdateError::LaunchRefused {
+        detail: format!("stat {} before exec: {e}", target.binary.display()),
+    })?;
+    if !meta.is_file() {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!(
+                "release binary {} is not a regular file (symlinks/directories are refused)",
+                target.binary.display()
+            ),
+        });
+    }
+    let actual = crate::install::file_digest_of(&mut file, &target.binary).map_err(|e| {
+        UpdateError::LaunchRefused {
+            detail: format!("hash {} before exec: {e}", target.binary.display()),
+        }
+    })?;
+    if actual != target.digest {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!(
+                "release digest changed between verification and exec: expected {}, found {actual}",
+                target.digest
+            ),
+        });
+    }
+    // Deterministic test seam: runs after the digest check and before the
+    // exec, so a test can swap the inode exactly where the old path-based
+    // launcher reopened it.
+    #[cfg(test)]
+    run_launch_seam(&target.binary)?;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        let argv = launch_argv(target, args);
+        let env = launch_environment(target, install_root);
+        crate::fd_exec::exec_verified_fd(&file, &argv, &env, &target.binary)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        exec_path_fallback(&file, target, install_root, args)
+    }
+}
+
+/// The launch argv: the original release path as `argv[0]` (exactly what the
+/// path-based `Command` used) followed by the caller's arguments.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn launch_argv(target: &ReleaseTarget, args: &[OsString]) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(target.binary.clone().into_os_string());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+/// The launch environment with the same semantics as `Command`'s inherited
+/// environment plus the three `env()` overrides: the current environment with
+/// the launcher-owned keys removed, then re-appended with the verified
+/// release identity.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn launch_environment(target: &ReleaseTarget, install_root: &Path) -> Vec<(OsString, OsString)> {
+    let overrides = [RELEASE_ID_ENV, RELEASE_DIGEST_ENV, INSTALL_ROOT_ENV];
+    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| {
+            !overrides
+                .iter()
+                .any(|name| key == std::ffi::OsStr::new(*name))
+        })
+        .collect();
+    env.push((
+        OsString::from(RELEASE_ID_ENV),
+        OsString::from(&target.release_id),
+    ));
+    env.push((
+        OsString::from(RELEASE_DIGEST_ENV),
+        OsString::from(&target.digest),
+    ));
+    env.push((
+        OsString::from(INSTALL_ROOT_ENV),
+        install_root.as_os_str().to_os_string(),
+    ));
+    env
+}
+
+/// The path-based exec for unix platforms without an fd-exec. Darwin still
+/// executes the verified descriptor through the `/dev/fd/<n>` magic link
+/// (the kernel resolves it from the descriptor table, not the version
+/// directory); if that fails, and on every other non-fd-exec unix platform,
+/// the launcher re-hashes the pathname immediately before exec — the
+/// documented residual swap window.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn exec_path_fallback(
+    file: &fs::File,
+    target: &ReleaseTarget,
+    install_root: &Path,
+    args: &[OsString],
+) -> Result<i32, UpdateError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut fd_target = target.clone();
+        fd_target.binary = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
+        let fd_path = fd_target.binary.clone();
+        let mut command = launch_command(&fd_target, install_root, args);
+        command.arg0(&target.binary);
+        let error = command.exec();
+        tracing::warn!(
+            "exec {} for the verified descriptor of {} failed ({error}); falling back to the \
+             re-hashed pathname exec (the documented non-fd-exec gap applies)",
+            fd_path.display(),
+            target.binary.display()
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+    }
+    let actual = file_digest(&target.binary).map_err(|e| UpdateError::LaunchRefused {
+        detail: format!("hash {} before exec: {e}", target.binary.display()),
+    })?;
+    if actual != target.digest {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!(
+                "release digest changed between verification and exec: expected {}, found {actual}",
+                target.digest
+            ),
+        });
+    }
+    use std::os::unix::process::CommandExt as _;
+    let mut command = launch_command(target, install_root, args);
+    let error = command.exec();
+    Err(UpdateError::LaunchRefused {
+        detail: format!("exec {}: {error}", target.binary.display()),
+    })
+}
+
+/// Refuse an install tree whose exec path is writable by anyone but its
+/// owner. Walks the CANONICAL install root down to the release binary and
+/// requires every component to be a real (non-symlink) directory and the
+/// binary a real file, all owned by the install root's owner and not writable
+/// by group or others (`mode & 0o022`). The install root itself is resolved
+/// once, so a symlinked install root is legitimate while a symlink INSIDE the
+/// checked chain is refused.
+///
+/// What this proves: the checked path cannot be redirected by another
+/// privileged account. What it does NOT prove: a same-owner (or root) writer
+/// can still rewrite the release in place after the hash; the check reads
+/// mode bits only, so an ACL or mount option can grant write despite them;
+/// and the walk is a snapshot — the fd-exec still binds the executed inode to
+/// the verified bytes, which is the actual guarantee.
+#[cfg(unix)]
+fn verify_install_ancestry(install_root: &Path, binary: &Path) -> Result<(), UpdateError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let root = fs::canonicalize(install_root).map_err(|e| UpdateError::LaunchRefused {
+        detail: format!(
+            "install root {} cannot be resolved: {e}",
+            install_root.display()
+        ),
+    })?;
+    let relative = binary
+        .strip_prefix(install_root)
+        .map_err(|_| UpdateError::LaunchRefused {
+            detail: format!(
+                "release binary {} is not under the install root {}",
+                binary.display(),
+                install_root.display()
+            ),
+        })?;
+    let root_meta = fs::symlink_metadata(&root).map_err(|e| UpdateError::LaunchRefused {
+        detail: format!("stat install root {}: {e}", root.display()),
+    })?;
+    if !root_meta.file_type().is_dir() {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!("install root {} is not a directory", root.display()),
+        });
+    }
+    let owner = root_meta.uid();
+    require_operator_owned(&root, &root_meta, owner, "install root")?;
+    let mut path = root.clone();
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!(
+                "release binary {} resolves to the install root itself",
+                binary.display()
+            ),
+        });
+    }
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(UpdateError::LaunchRefused {
+                detail: format!(
+                    "release path {} is not a plain child of the install root",
+                    binary.display()
+                ),
+            });
+        };
+        path.push(name);
+        let meta = fs::symlink_metadata(&path).map_err(|e| UpdateError::LaunchRefused {
+            detail: format!("stat release path {}: {e}", path.display()),
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(UpdateError::LaunchRefused {
+                detail: format!(
+                    "release path {} is a symlink; the install chain from the root to the \
+                     executable must be real directories",
+                    path.display()
+                ),
+            });
+        }
+        let what = if components.peek().is_none() {
+            "release binary"
+        } else {
+            "release directory"
+        };
+        if what == "release binary" {
+            if !meta.file_type().is_file() {
+                return Err(UpdateError::LaunchRefused {
+                    detail: format!(
+                        "release binary {} is not a regular file (symlinks/directories are \
+                         refused)",
+                        path.display()
+                    ),
+                });
+            }
+        } else if !meta.file_type().is_dir() {
+            return Err(UpdateError::LaunchRefused {
+                detail: format!("release path {} is not a directory", path.display()),
+            });
+        }
+        require_operator_owned(&path, &meta, owner, what)?;
+    }
+    Ok(())
+}
+
+/// One component of the install chain must belong to the install root's
+/// owner and carry no group/other write bit. The refusal names the path, the
+/// observed mode and the fix (`chmod go-w`).
+#[cfg(unix)]
+fn require_operator_owned(
+    path: &Path,
+    meta: &fs::Metadata,
+    owner: u32,
+    what: &str,
+) -> Result<(), UpdateError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if meta.uid() != owner {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!(
+                "{what} {} is owned by uid {} but the install root is owned by uid {}; refusing \
+                 to launch from a mixed-ownership install chain",
+                path.display(),
+                meta.uid(),
+                owner
+            ),
+        });
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(UpdateError::LaunchRefused {
+            detail: format!(
+                "{what} {} is writable by group or others (mode 0{:03o}); the operator-owned \
+                 install tree must not be group/other writable — chmod go-w and retry",
+                path.display(),
+                meta.mode() & 0o7777
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The test-only launch seam: a hook invoked exactly after the digest check
+/// and before the exec, so a test can replace the release path/inode while the
+/// launcher holds the verified descriptor. Never compiled into a release.
+#[cfg(all(unix, test))]
+type LaunchSeam = Box<dyn FnOnce(&Path) -> Result<(), UpdateError> + Send + 'static>;
+
+#[cfg(all(unix, test))]
+static LAUNCH_SEAM: std::sync::Mutex<Option<LaunchSeam>> = std::sync::Mutex::new(None);
+
+#[cfg(all(unix, test))]
+fn set_launch_seam(seam: LaunchSeam) {
+    *LAUNCH_SEAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(seam);
+}
+
+#[cfg(all(unix, test))]
+fn run_launch_seam(path: &Path) -> Result<(), UpdateError> {
+    let seam = LAUNCH_SEAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    match seam {
+        Some(seam) => seam(path),
+        None => Ok(()),
     }
 }
 
@@ -2075,6 +2471,236 @@ mod tests {
         assert!(
             process.child.try_wait().unwrap().is_some(),
             "the unconfirmed release is killed and reaped (no orphan)"
+        );
+    }
+
+    // ------------------------------------------------ verify->exec identity
+
+    /// The launch fixture: the running test executable's bytes are the
+    /// verified artifact, materialized under a private (0o700) install tree so
+    /// the ancestry gate passes; the release path is REAL, nothing is mocked.
+    #[cfg(unix)]
+    fn launch_target_fixture() -> (tempfile::TempDir, PathBuf, ReleaseTarget, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("install");
+        let layout = InstallLayout::open(&root).unwrap();
+        let verified = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let digest = manifest::sha256_hex(&verified);
+        let release_id = release_id_for("9.9.9", &digest);
+        let release_dir = layout.release_dir(&release_id);
+        crate::install::create_private_dir_all(&release_dir).unwrap();
+        let binary = layout.release_binary(&release_id);
+        fs::write(&binary, &verified).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let target = ReleaseTarget {
+            release_id,
+            version: "9.9.9".into(),
+            channel: "stable".into(),
+            digest,
+            binary: binary.clone(),
+        };
+        (dir, root, target, release_dir)
+    }
+
+    /// The outer test spawns THIS binary with [`SEAM_LAUNCHER_FILTER`]; the
+    /// inner process installs the swap seam and calls the real `launch()`.
+    #[cfg(unix)]
+    const SEAM_LAUNCHER_FILTER: &str = "seam_launch_target_from_env";
+    /// The post-exec helper test the verified copied binary runs.
+    #[cfg(unix)]
+    const SEAM_HELPER_FILTER: &str = "seam_identity_helper";
+    #[cfg(unix)]
+    const SEAM_ENV_ROOT: &str = "FAKTOR_SEAM_TEST_ROOT";
+    #[cfg(unix)]
+    const SEAM_ENV_BINARY: &str = "FAKTOR_SEAM_TEST_BINARY";
+    #[cfg(unix)]
+    const SEAM_ENV_DIGEST: &str = "FAKTOR_SEAM_TEST_DIGEST";
+    #[cfg(unix)]
+    const SEAM_ENV_RELEASE_ID: &str = "FAKTOR_SEAM_TEST_RELEASE_ID";
+    #[cfg(unix)]
+    const SEAM_ENV_EVIL: &str = "FAKTOR_SEAM_TEST_EVIL";
+    #[cfg(unix)]
+    const SEAM_ENV_MARKER: &str = "FAKTOR_SEAM_TEST_MARKER";
+    /// Printed by the post-exec helper — only the verified copied test binary
+    /// can print it.
+    #[cfg(unix)]
+    const SEAM_VERIFIED_MARKER: &str = "faktor-seam-verified-";
+    /// Printed by the swapped-in stand-in script.
+    #[cfg(unix)]
+    const SEAM_EVIL_MARKER: &str = "faktor-seam-evil-";
+
+    /// The in-process half of the swap test: runs ONLY in the process the
+    /// outer test re-executes (the env gate makes a normal test run return
+    /// immediately). It swaps the release PATH after the digest check and
+    /// after the verified descriptor is open; `launch()` must execute the
+    /// verified descriptor, so the swapped-in script can never run.
+    #[cfg(unix)]
+    #[test]
+    fn seam_launch_target_from_env() {
+        let Ok(root) = std::env::var(SEAM_ENV_ROOT) else {
+            return;
+        };
+        let binary = PathBuf::from(std::env::var(SEAM_ENV_BINARY).unwrap());
+        let digest = std::env::var(SEAM_ENV_DIGEST).unwrap();
+        let release_id = std::env::var(SEAM_ENV_RELEASE_ID).unwrap();
+        let evil = PathBuf::from(std::env::var(SEAM_ENV_EVIL).unwrap());
+        set_launch_seam(Box::new(move |binary_path| {
+            // Inode swap, not an in-place rewrite: the verified inode stays
+            // alive through the launcher's open descriptor while the PATH now
+            // names the attacker's bytes.
+            std::fs::rename(&evil, binary_path).map_err(|e| {
+                UpdateError::Install(format!(
+                    "seam swap {} -> {}: {e}",
+                    evil.display(),
+                    binary_path.display()
+                ))
+            })
+        }));
+        let target = ReleaseTarget {
+            release_id,
+            version: "9.9.9".into(),
+            channel: "stable".into(),
+            digest,
+            binary,
+        };
+        let args = [
+            OsString::from(SEAM_HELPER_FILTER),
+            OsString::from("--nocapture"),
+            OsString::from("--test-threads=1"),
+        ];
+        match launch(&target, Path::new(&root), &args) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("seam launcher refused: {e}");
+                std::process::exit(3);
+            }
+        }
+    }
+
+    /// The harmless identity helper: only the post-exec copied test binary has
+    /// the marker env, and printing it proves the launched process IS the
+    /// verified bytes.
+    #[cfg(unix)]
+    #[test]
+    fn seam_identity_helper() {
+        let Ok(marker) = std::env::var(SEAM_ENV_MARKER) else {
+            return;
+        };
+        println!("{marker}");
+    }
+
+    /// The verify->exec race, deterministically: the release path is replaced
+    /// (different inode, different bytes) after a successful digest check and
+    /// before the exec. The launched process must be the verified bytes; the
+    /// swapped-in script must never execute.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_swapped_between_verification_and_exec_never_executes() {
+        let (_dir, root, target, release_dir) = launch_target_fixture();
+        let evil_bytes = format!("#!/bin/sh\necho {SEAM_EVIL_MARKER}\n").into_bytes();
+        let evil = release_dir.join("swapped");
+        fs::write(&evil, &evil_bytes).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&evil, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let token = "identity-token-1";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([SEAM_LAUNCHER_FILTER, "--nocapture", "--test-threads=1"])
+            .env(SEAM_ENV_ROOT, &root)
+            .env(SEAM_ENV_BINARY, &target.binary)
+            .env(SEAM_ENV_DIGEST, &target.digest)
+            .env(SEAM_ENV_RELEASE_ID, &target.release_id)
+            .env(SEAM_ENV_EVIL, &evil)
+            .env(SEAM_ENV_MARKER, format!("{SEAM_VERIFIED_MARKER}{token}"))
+            .output()
+            .expect("spawn the seam launcher test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the seam launcher process failed (status {:?}):\nstdout: {stdout}\nstderr: {stderr}",
+            output.status.code()
+        );
+        assert!(
+            stdout.contains(&format!("{SEAM_VERIFIED_MARKER}{token}")),
+            "the VERIFIED bytes must be the launched process:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains(SEAM_EVIL_MARKER),
+            "the swapped-in binary must never execute:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The seam really did replace the path: the release binary now holds
+        // the attacker's bytes while the verified inode was the one launched.
+        assert_eq!(
+            fs::read(&target.binary).unwrap(),
+            evil_bytes,
+            "the fixture must prove the swap happened, or the test would pass vacuously"
+        );
+    }
+
+    /// The permission refusal path: a group/other-writable component between
+    /// the install root and the executable refuses the launch typed (the
+    /// ownership half of the same check cannot be exercised without root, but
+    /// runs through the same [`require_operator_owned`] gate).
+    #[cfg(unix)]
+    #[test]
+    fn launch_refuses_a_group_or_other_writable_install_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, root, target, release_dir) = launch_target_fixture();
+        assert!(verify_install_ancestry(&root, &target.binary).is_ok());
+        fs::set_permissions(&release_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = launch(&target, &root, &[]).unwrap_err();
+        assert_eq!(err.code(), "launch_refused");
+        assert!(
+            err.to_string().contains("writable by group or others"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("chmod go-w"), "{err}");
+        fs::set_permissions(&release_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(verify_install_ancestry(&root, &target.binary).is_ok());
+        // The install root itself is part of the checked chain.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        let err = launch(&target, &root, &[]).unwrap_err();
+        assert_eq!(err.code(), "launch_refused");
+        assert!(
+            err.to_string().contains("writable by group or others"),
+            "{err}"
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A symlink anywhere in the chain from the install root to the executable
+    /// is refused: the path could be repointed after the check.
+    #[cfg(unix)]
+    #[test]
+    fn launch_refuses_a_symlinked_release_ancestor() {
+        let (_dir, root, target, _release_dir) = launch_target_fixture();
+        let real = root.join("versions-real");
+        fs::rename(root.join("versions"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("versions")).unwrap();
+        let err = launch(&target, &root, &[]).unwrap_err();
+        assert_eq!(err.code(), "launch_refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// A release binary that is not lexically under the install root is
+    /// refused before anything is opened.
+    #[cfg(unix)]
+    #[test]
+    fn launch_refuses_a_binary_outside_the_install_root() {
+        let (dir, root, mut target, _release_dir) = launch_target_fixture();
+        let outside = dir.path().join("outside-faktor");
+        fs::write(&outside, b"outside").unwrap();
+        target.binary = outside;
+        let err = launch(&target, &root, &[]).unwrap_err();
+        assert_eq!(err.code(), "launch_refused");
+        assert!(
+            err.to_string().contains("not under the install root"),
+            "{err}"
         );
     }
 }

@@ -1624,6 +1624,7 @@ async fn legacy_plan_global_ownership_converts_once_at_the_native_dto_boundary()
         .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "goal": "legacy ownership",
+            "submission_id": "99999999-9999-4999-8999-999999999999",
             "ownership": "IsolatedWorktree",
             "work_items": [
                 {"id": "a", "kind": "Implementation"},

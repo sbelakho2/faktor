@@ -199,6 +199,8 @@ mod task_completion_guard;
 pub use ledger::*;
 mod attachments;
 pub use attachments::*;
+mod task_admission;
+pub use task_admission::*;
 mod index;
 pub use index::*;
 mod billing;

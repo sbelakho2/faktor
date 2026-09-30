@@ -946,12 +946,14 @@ fn rel_to_posix(rel: &Path) -> String {
     out
 }
 
-/// Test seam: fired with one entry's workspace-relative POSIX path after the
-/// rooted walker classified it and BEFORE any descent/read, so adversarial
-/// tests can swap the entry deterministically in that window. Production has
-/// no hook.
+/// Test seam: fired with the walked (canonical) root and one entry's
+/// workspace-relative POSIX path after the rooted walker classified it and
+/// BEFORE any descent/read, so adversarial tests can swap the entry
+/// deterministically in that window. The root is part of the signal because
+/// the hook slot is process-global: a hook must never act on another test's
+/// concurrent walk. Production has no hook.
 #[cfg(test)]
-pub(crate) type NativeWalkSeam = Box<dyn Fn(&str) + Send>;
+pub(crate) type NativeWalkSeam = Box<dyn Fn(&Path, &str) + Send>;
 #[cfg(test)]
 pub(crate) static NATIVE_WALK_SEAM: std::sync::OnceLock<std::sync::Mutex<Option<NativeWalkSeam>>> =
     std::sync::OnceLock::new();
@@ -959,15 +961,15 @@ pub(crate) static NATIVE_WALK_SEAM: std::sync::OnceLock<std::sync::Mutex<Option<
 pub(crate) static NATIVE_WALK_SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn native_walk_seam(rel: &str) {
+fn native_walk_seam(root: &Path, rel: &str) {
     if let Some(lock) = NATIVE_WALK_SEAM.get() {
         if let Some(hook) = lock.lock().expect("native walk seam poisoned").as_ref() {
-            hook(rel);
+            hook(root, rel);
         }
     }
 }
 #[cfg(not(test))]
-fn native_walk_seam(_rel: &str) {}
+fn native_walk_seam(_root: &Path, _rel: &str) {}
 
 /// The bounded native traversal. ONE [`RootedDir`] is opened for the whole
 /// discovery and every step resolves through it: children are enumerated
@@ -1031,7 +1033,7 @@ fn native_inventory(root: &Path, budget: &InventoryBudget, deadline: Instant) ->
                 return Err(Error::cancelled());
             }
             let rel = rel_to_posix(&entry.rel);
-            native_walk_seam(&rel);
+            native_walk_seam(&canonical, &rel);
             let parent = rel.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
             let count = per_dir.entry(parent.to_string()).or_insert(0);
             *count += 1;
@@ -2083,9 +2085,11 @@ mod tests {
     }
 
     /// Install the native-walk swap seam and clear it on drop; the global lock
-    /// serializes every test that uses the process-global hook slot.
+    /// serializes every test that uses the process-global hook slot. The hook
+    /// sees the walked canonical root, so it can never act on another test's
+    /// concurrent walk of a same-named entry.
     fn install_native_walk_seam(
-        f: impl Fn(&str) + Send + 'static,
+        f: impl Fn(&Path, &str) + Send + 'static,
     ) -> (std::sync::MutexGuard<'static, ()>, NativeSeamClear) {
         let guard = NATIVE_WALK_SEAM_LOCK
             .lock()
@@ -2110,10 +2114,10 @@ mod tests {
         fs::write(root.join("sub/honest.rs"), b"honest").unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("EXTERNAL.rs"), b"EXTERNAL-MARKER-7c41").unwrap();
-        let swap_root = root.clone();
+        let swap_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         let swap_outside = outside.clone();
-        let (_lock, _clear) = install_native_walk_seam(move |rel| {
-            if rel == "sub" {
+        let (_lock, _clear) = install_native_walk_seam(move |walk_root, rel| {
+            if walk_root == swap_root.as_path() && rel == "sub" {
                 fs::rename(swap_root.join("sub"), swap_root.join("sub-real")).unwrap();
                 std::os::unix::fs::symlink(&swap_outside, swap_root.join("sub")).unwrap();
             }
@@ -2192,10 +2196,10 @@ mod tests {
             b"add_subdirectory(EXTERNAL-MARKER-5e13)\n",
         )
         .unwrap();
-        let swap_root = root.clone();
+        let swap_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         let outside_manifest = outside.join("Makefile");
-        let (_lock, _clear) = install_native_walk_seam(move |rel| {
-            if rel == "Makefile" {
+        let (_lock, _clear) = install_native_walk_seam(move |walk_root, rel| {
+            if walk_root == swap_root.as_path() && rel == "Makefile" {
                 fs::remove_file(swap_root.join("Makefile")).unwrap();
                 std::os::unix::fs::symlink(&outside_manifest, swap_root.join("Makefile")).unwrap();
             }

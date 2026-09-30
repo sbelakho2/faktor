@@ -44,6 +44,9 @@ import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 object JetBrainsParitySmoke {
 
@@ -101,6 +104,30 @@ object JetBrainsParitySmoke {
         }
         step("fake daemon: reconnect resumes the SSE cursor") {
             fakeReconnectSuite()
+        }
+        step("task start single-flight: queued double click enqueues ONE request") {
+            taskStartDoubleClickStep()
+        }
+        step("task start single-flight: Enter + click race enqueues one start") {
+            taskStartEnterClickStep()
+        }
+        step("task start single-flight: three rapid submits enqueue one start") {
+            taskStartBurstStep()
+        }
+        step("task start submission id: lost response retry reuses the id, receipt and no second prompt") {
+            taskStartRetryStep()
+        }
+        step("task start single-flight: success re-enables and the next start gets a new id") {
+            taskStartSuccessStep()
+        }
+        step("task start single-flight: typed refusal re-enables, keeps the draft and starts fresh next") {
+            taskStartRefusalStep()
+        }
+        step("task start single-flight: transport failure re-enables and keeps draft + attachments") {
+            taskStartTransportPreservationStep()
+        }
+        step("task start immutability: edits while pending never reach the in-flight request") {
+            taskStartImmutabilityStep()
         }
         step("real daemon: history/task/permissions/terminal/restart/reconnect") {
             realDaemonSuite(args[0])
@@ -996,6 +1023,297 @@ object JetBrainsParitySmoke {
         }
     }
 
+    // ------------------------------------- fake daemon: task-start single flight
+
+    /**
+     * One harness per scenario: a fresh fake daemon, a real
+     * FaktorFrontendService attached to it, and the real panel. The task-run
+     * POST route is the observable under test and can be overridden per
+     * scenario; every other route is the shared parity fixture.
+     */
+    private fun startTaskHarness(
+        runs: ((ParityRequest, ParityResponse) -> Unit)? = null
+    ): TaskStartHarness {
+        val daemon = ParityFakeDaemon()
+        registerRoutes(daemon)
+        if (runs != null) daemon.on("POST", "/native/session/7/task-runs", runs)
+        daemon.start()
+        val process = ProcessBuilder(javaBinary(), "-version").start()
+        val connection = BackendConnection(
+            daemon.server.localPort, PARITY_PASSWORD, process, StdoutSink(process)
+        )
+        val service = FaktorFrontendService(
+            Paths.get("unused"),
+            Paths.get(System.getProperty("java.io.tmpdir"), "faktor-parity-single-flight")
+        )
+        service.attachConnection(connection, stopAction = { process.destroyForcibly() })
+        service.createSession("alpha", "m", title = "single flight")
+        service.watchSession("7", 0)
+        return TaskStartHarness(daemon, service, FaktorChatPanel(service), process)
+    }
+
+    private fun taskStartBodies(daemon: ParityFakeDaemon): List<String> =
+        synchronized(daemon.requests) {
+            daemon.requests
+                .filter { it.method == "POST" && it.path == "/native/session/7/task-runs" }
+                .map { it.body }
+        }
+
+    private fun submissionIdOf(body: String): String =
+        JsonCodec.parse(body).view("task start").field("submission_id").string()
+
+    private fun countOccurrences(text: String, needle: String): Int {
+        var count = 0
+        var index = text.indexOf(needle)
+        while (index >= 0) {
+            count += 1
+            index = text.indexOf(needle, index + needle.length)
+        }
+        return count
+    }
+
+    private fun taskStartDoubleClickStep() {
+        val harness = startTaskHarness()
+        try {
+            harness.panel.setTaskFieldsForTest("double click goal", "")
+            harness.panel.submitTaskForTest()
+            harness.panel.submitTaskForTest()
+            await("one start request after a queued double click") {
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 1
+            }
+            await("the single start completes") {
+                harness.panel.transcriptTextForTest().contains("run-9 started")
+            }
+            assertEquals(
+                1,
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
+                "a queued double click must enqueue exactly ONE start request"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartEnterClickStep() {
+        val harness = startTaskHarness()
+        try {
+            harness.panel.setTaskFieldsForTest("enter race goal", "")
+            harness.panel.submitTaskViaEnterForTest()
+            harness.panel.submitTaskForTest()
+            await("one start request after the Enter + click race") {
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 1
+            }
+            await("the single start completes") {
+                harness.panel.transcriptTextForTest().contains("run-9 started")
+            }
+            assertEquals(
+                1,
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
+                "Enter + click must enqueue exactly ONE start request"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartBurstStep() {
+        val harness = startTaskHarness()
+        try {
+            harness.panel.setTaskFieldsForTest("burst goal", "")
+            harness.panel.submitTaskForTest()
+            harness.panel.submitTaskForTest()
+            harness.panel.submitTaskForTest()
+            await("the single start completes") {
+                harness.panel.transcriptTextForTest().contains("run-9 started")
+            }
+            assertEquals(
+                1,
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
+                "three rapid submits must enqueue exactly ONE start request"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartRetryStep() {
+        val attempts = AtomicInteger()
+        val harness = startTaskHarness { _, response ->
+            // The first attempt closes without a response: a lost HTTP response.
+            if (attempts.incrementAndGet() > 1) response.json(200, TASK_RUN_STARTED_JSON)
+        }
+        try {
+            harness.panel.setTaskFieldsForTest("retry goal", "")
+            harness.panel.submitTaskForTest()
+            await("first attempt recorded and transport failure surfaced") {
+                attempts.get() == 1 &&
+                    harness.panel.transcriptTextForTest().contains("transport failure")
+            }
+            await("controls re-enabled after the transport failure") {
+                harness.panel.startTaskEnabledForTest()
+            }
+            harness.panel.submitTaskForTest()
+            await("the same-id retry is accepted") {
+                harness.panel.transcriptTextForTest().contains("run-9 started")
+            }
+            val bodies = taskStartBodies(harness.daemon)
+            assertEquals(2, bodies.size, "a lost response retry is ONE extra immutable submission")
+            assertEquals(
+                submissionIdOf(bodies[0]),
+                submissionIdOf(bodies[1]),
+                "the retry of the same immutable submission must reuse its id: $bodies"
+            )
+            assertTrue(
+                harness.daemon.requests.none { it.path.contains("prompt") },
+                "a task-start retry must not re-prompt"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartSuccessStep() {
+        val harness = startTaskHarness()
+        try {
+            val panel = harness.panel
+            panel.setTaskFieldsForTest("success goal", "")
+            panel.submitTaskForTest()
+            await("first start completes") {
+                panel.transcriptTextForTest().contains("run-9 started")
+            }
+            assertTrue(panel.startTaskEnabledForTest(), "the start control re-enables on success")
+            assertTrue(panel.newSessionEnabledForTest(), "the new-task action re-enables on success")
+            panel.submitTaskForTest()
+            await("second start completes") {
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 2 &&
+                    countOccurrences(panel.transcriptTextForTest(), "run-9 started") == 2
+            }
+            val bodies = taskStartBodies(harness.daemon)
+            assertTrue(
+                submissionIdOf(bodies[0]) != submissionIdOf(bodies[1]),
+                "success clears the submission, so the next start gets a NEW id: $bodies"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartRefusalStep() {
+        val attempts = AtomicInteger()
+        val harness = startTaskHarness { _, response ->
+            if (attempts.incrementAndGet() == 1) {
+                response.json(409, TASK_START_CONFLICT_JSON)
+            } else {
+                response.json(200, TASK_RUN_STARTED_JSON)
+            }
+        }
+        try {
+            val panel = harness.panel
+            val source = Files.createTempFile("faktor-single-flight-refusal-", ".rs")
+            Files.write(source, "fn main() {}".toByteArray())
+            panel.attachmentsView().addFiles(listOf(source.toString()))
+            panel.setTaskFieldsForTest("refusal goal", "a, b")
+            panel.submitTaskForTest()
+            await("typed refusal surfaced") {
+                panel.transcriptTextForTest().contains("task start refused: 409 conflict")
+            }
+            assertTrue(panel.startTaskEnabledForTest(), "the start control re-enables on refusal")
+            assertEquals("refusal goal", panel.goalTextForTest(), "a typed refusal keeps the draft")
+            assertEquals(1, panel.attachmentsCountForTest(), "a typed refusal keeps attachments")
+            panel.submitTaskForTest()
+            await("the next logical start completes") {
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs") == 2
+            }
+            val bodies = taskStartBodies(harness.daemon)
+            assertTrue(
+                submissionIdOf(bodies[0]) != submissionIdOf(bodies[1]),
+                "a typed refusal clears the submission, so the next start gets a NEW id: $bodies"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartTransportPreservationStep() {
+        val attempts = AtomicInteger()
+        val harness = startTaskHarness { _, response ->
+            if (attempts.incrementAndGet() > 1) response.json(200, TASK_RUN_STARTED_JSON)
+        }
+        try {
+            val panel = harness.panel
+            val source = Files.createTempFile("faktor-single-flight-transport-", ".rs")
+            Files.write(source, "fn main() {}".toByteArray())
+            panel.attachmentsView().addFiles(listOf(source.toString()))
+            panel.setTaskFieldsForTest("transport goal", "c1")
+            panel.submitTaskForTest()
+            await("transport failure surfaced") {
+                panel.transcriptTextForTest().contains("transport failure")
+            }
+            assertTrue(panel.startTaskEnabledForTest(), "the start control re-enables on failure")
+            assertEquals("transport goal", panel.goalTextForTest(), "the draft survives the failure")
+            assertEquals(1, panel.attachmentsCountForTest(), "attachments survive the failure")
+            panel.submitTaskForTest()
+            await("the retained submission is accepted") {
+                panel.transcriptTextForTest().contains("run-9 started")
+            }
+            val bodies = taskStartBodies(harness.daemon)
+            assertEquals(2, bodies.size, "exactly one retry reached the daemon")
+            assertEquals(
+                submissionIdOf(bodies[0]),
+                submissionIdOf(bodies[1]),
+                "the failure retry reuses the retained submission id: $bodies"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    private fun taskStartImmutabilityStep() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val harness = startTaskHarness { _, response ->
+            entered.countDown()
+            release.await(10, TimeUnit.SECONDS)
+            response.json(200, TASK_RUN_STARTED_JSON)
+        }
+        try {
+            val panel = harness.panel
+            val captured = Files.createTempFile("faktor-single-flight-captured-", ".rs")
+            Files.write(captured, "fn main() {}".toByteArray())
+            panel.attachmentsView().addFiles(listOf(captured.toString()))
+            panel.setTaskFieldsForTest("captured goal", "c1")
+            panel.submitTaskForTest()
+            assertTrue(entered.await(10, TimeUnit.SECONDS), "the start request must reach the daemon")
+            val inFlight = harness.daemon.lastRequest("POST", "/native/session/7/task-runs")!!.body
+            // Edits while pending: a new goal, new criteria, a new attachment
+            // and a completion contract toggle must not reach the in-flight
+            // request, and the submit itself must not enqueue a second start.
+            panel.setTaskFieldsForTest("edited while pending", "c2")
+            panel.completionCommit.isSelected = true
+            val late = Files.createTempFile("faktor-single-flight-late-", ".rs")
+            Files.write(late, "fn main() {}".toByteArray())
+            panel.attachmentsView().addFiles(listOf(late.toString()))
+            panel.submitTaskForTest()
+            release.countDown()
+            await("the captured submission completes") {
+                panel.transcriptTextForTest().contains("run-9 started")
+            }
+            assertTrue(inFlight.contains("\"goal\":\"captured goal\""), inFlight)
+            assertTrue(inFlight.contains("\"criteria\":[\"c1\"]"), inFlight)
+            assertTrue(!inFlight.contains("edited while pending"), inFlight)
+            assertTrue(!inFlight.contains(late.toString()), inFlight)
+            assertTrue(!inFlight.contains("completion_contract"), inFlight)
+            assertEquals(
+                1,
+                harness.daemon.requestCount("POST", "/native/session/7/task-runs"),
+                "a submit while pending must not enqueue a second start"
+            )
+        } finally {
+            release.countDown()
+            harness.close()
+        }
+    }
+
     // ----------------------------------------------------- real daemon suite
 
     private fun realDaemonSuite(binaryPath: String) {
@@ -1026,7 +1344,8 @@ object JetBrainsParitySmoke {
                 val started = service.startTaskRun(
                     "parity real goal",
                     listOf("criterion A"),
-                    mutationMode = "shadow"
+                    mutationMode = "shadow",
+                    submissionId = java.util.UUID.randomUUID().toString()
                 )
                 assertTrue(started.runId.isNotEmpty(), "no run id")
             }
@@ -1231,6 +1550,10 @@ object JetBrainsParitySmoke {
 
     private const val TASK_RUN_STARTED_JSON =
         "{\"task_id\":3,\"run_id\":\"run-9\",\"state\":\"Running\"}"
+
+    private const val TASK_START_CONFLICT_JSON =
+        "{\"error\":{\"code\":\"conflict\",\"message\":\"task run already exists\"," +
+            "\"retryable\":false}}"
 
     private const val TASK_RUNS_JSON = "[" +
         "{\"task_id\":3,\"run_id\":\"run-9\",\"mode\":\"in_session\",\"state\":\"Running\"," +
@@ -1465,5 +1788,20 @@ private class ParityFakeDaemon {
             if (c != '\r'.toInt()) out.append(c.toChar())
             if (out.length > 65536) return out.toString()
         }
+    }
+}
+
+/** One task-start scenario: the fake daemon, the attached service and the real panel. */
+private class TaskStartHarness(
+    val daemon: ParityFakeDaemon,
+    val service: FaktorFrontendService,
+    val panel: FaktorChatPanel,
+    private val process: Process
+) {
+    fun close() {
+        panel.shutdown()
+        service.stop()
+        daemon.stop()
+        process.destroyForcibly()
     }
 }

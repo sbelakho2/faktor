@@ -3581,10 +3581,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(
-            v, 26,
-            "schema target 26 after the v25 attachment-reference rebuild"
-        );
+        assert_eq!(v, 27, "schema target 27 after the v26 task-admission table");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()

@@ -31,6 +31,7 @@ import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
 import java.math.BigInteger
+import java.util.UUID
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
@@ -79,6 +80,17 @@ class FaktorChatPanel(
     }
 
     private val refreshQueued = AtomicBoolean(false)
+
+    // Single-flight gate of the task-start surface: set BEFORE the start job
+    // is enqueued, so repeated clicks can never accumulate duplicate start
+    // jobs in the worker queue. Cleared only by an explicit result.
+    private val startInFlight = AtomicBoolean(false)
+
+    // The immutable submission retried after a TRANSPORT failure: the same
+    // submission id and the exact captured draft, reused by the next logical
+    // click (a changed draft is a new logical start and gets a new id).
+    @Volatile
+    private var pendingTaskSubmission: TaskStartSubmission? = null
 
     private val transcript = JTextArea()
 
@@ -449,7 +461,13 @@ class FaktorChatPanel(
     /**
      * The Task composer's start path (also reachable from tests without an
      * EDT click): criteria, attachments, the settings mutation default and
-     * the checked completion contract ride ONE native task-run request.
+     * the checked completion contract are captured into ONE immutable
+     * submission at click time, then ride ONE native task-run request.
+     *
+     * Single-flight: the in-flight flag is claimed BEFORE the job reaches the
+     * worker queue, so a double click / Enter race / burst of submits can
+     * never enqueue a second start. The ONE per-submission id is the durable
+     * idempotency identity the daemon replays after a lost response.
      */
     private fun startTaskFromControls() {
         val goal = goalField.text.trim()
@@ -457,12 +475,55 @@ class FaktorChatPanel(
             appendSystem("task goal must not be empty")
             return
         }
+        if (!startInFlight.compareAndSet(false, true)) {
+            appendSystem("a task start is already in flight; this submit was ignored")
+            return
+        }
+        val draft = try {
+            captureTaskStartDraft(goal)
+        } catch (e: Throwable) {
+            startInFlight.set(false)
+            throw e
+        }
+        // A transport-failure retry of the SAME immutable draft reuses the
+        // submission id (the daemon replays the original receipt); any other
+        // start is a new logical submission with a fresh id.
+        val pending = pendingTaskSubmission
+        val submission = if (pending != null && pending.draft.sameDraftAs(draft)) {
+            pending
+        } else {
+            TaskStartSubmission(UUID.randomUUID().toString(), draft)
+        }
+        // Disable the start surface for the whole flight; the retry click
+        // cannot even reach the queue while a start is pending.
+        onEdt { setStartControlsEnabled(false) }
+        try {
+            runAsync("start task") { runTaskStart(submission) }
+        } catch (e: Throwable) {
+            startInFlight.set(false)
+            throw e
+        }
+    }
+
+    private fun captureTaskStartDraft(goal: String): TaskStartDraft {
         val criteria = criteriaField.text.split(',')
             .map { it.trim() }
             .filter { it.isNotEmpty() }
-        val files = attachments.files()
-        val contract = completionContractFromControls()
-        runAsync("start task") {
+        return TaskStartDraft(
+            goal = goal,
+            criteria = if (criteria.isEmpty()) null else criteria,
+            mutationMode = settingsPanel.mutationMode(),
+            files = attachments.files(),
+            binaries = attachments.binaryAttachments(),
+            completionContract = completionContractFromControls()
+        )
+    }
+
+    private fun runTaskStart(submission: TaskStartSubmission) {
+        val draft = submission.draft
+        var succeeded = false
+        var message: String
+        try {
             // Binary + document parity (same representation as the VS Code
             // client): the ADVERTISED model contract governs every entry.
             // Deliverable documents (application/pdf, text/plain) upload as
@@ -474,7 +535,7 @@ class FaktorChatPanel(
             // undeliverable or oversize entry is a typed refusal BEFORE any
             // upload, so nothing partial reaches the durable store.
             val policy = resolveAttachmentPolicy()
-            val plan = planAttachments(files, attachments.binaryAttachments(), policy)
+            val plan = planAttachments(draft.files, draft.binaries, policy)
             // Upload plan in ENTRY order: binaries first, then image and
             // document paths. The retry key binds kind + mime + SHA-256 of
             // the exact bytes (the path is metadata only, never identity),
@@ -493,34 +554,60 @@ class FaktorChatPanel(
                 service.uploadAttachment(upload.mime, upload.filename, upload.base64)
             }
             val started = service.startTaskRun(
-                goal,
-                if (criteria.isEmpty()) null else criteria,
-                mutationMode = settingsPanel.mutationMode(),
+                draft.goal,
+                draft.criteria,
+                mutationMode = draft.mutationMode,
                 files = if (plan.pathFiles.isEmpty()) null else plan.pathFiles,
                 attachments = if (binary.isEmpty()) null else binary,
-                completionContract = contract
+                completionContract = draft.completionContract,
+                submissionId = submission.submissionId
             )
             // Durable acceptance: this submission's retained ids are no longer
             // pending; a later submission uploads from scratch.
             pendingAttachmentRetry.release(sessionId, uploadKeys)
-            submittedCompletion = contract
-            onEdt {
-                val contractText = if (contract == null) {
-                    ""
-                } else {
-                    " completion=" + contract.requestedSteps().joinToString(",")
-                }
-                val attached = plan.pathFiles.size + plan.uploads.size
-                appendSystem(
-                    "task run ${started.runId} started (${started.state})" +
-                        if (attached == 0) "" else " with $attached attachment(s)" +
-                        contractText
-                )
-                resetCompletionControls()
+            pendingTaskSubmission = null
+            submittedCompletion = draft.completionContract
+            succeeded = true
+            val contractText = if (draft.completionContract == null) {
+                ""
+            } else {
+                " completion=" +
+                    draft.completionContract.requestedSteps().joinToString(",")
             }
-            refreshTaskRunsBlocking()
-            refreshTaskTreeBlocking()
+            val attached = plan.pathFiles.size + plan.uploads.size
+            message = "task run ${started.runId} started (${started.state})" +
+                if (attached == 0) "" else " with $attached attachment(s)" +
+                contractText
+        } catch (e: AttachmentRefusal) {
+            pendingTaskSubmission = null
+            message = "error: start task: ${e.message}"
+        } catch (e: NativeApiException) {
+            if (isTransportFailure(e)) {
+                // The request may have reached the daemon; the retry MUST
+                // present the same immutable submission id so the daemon
+                // replays the original receipt instead of starting a second
+                // run. The captured draft is retained for that retry.
+                pendingTaskSubmission = submission
+                message = "task start transport failure (${e.detail}); retrying reuses " +
+                    "submission ${submission.submissionId}"
+            } else {
+                pendingTaskSubmission = null
+                message = "task start refused: ${e.status} ${e.code}: ${e.detail}"
+            }
+        } catch (e: Exception) {
+            pendingTaskSubmission = null
+            message = "error: start task: ${e.message ?: e.javaClass.simpleName}"
+        } finally {
+            startInFlight.set(false)
         }
+        val succeededStart = succeeded
+        onEdt {
+            setStartControlsEnabled(true)
+            appendSystem(message)
+            if (succeededStart) resetCompletionControls()
+        }
+        refreshTaskRunsBlocking()
+        refreshTaskTreeBlocking()
     }
 
     // ------------------------------------------------ control-plane credential
@@ -723,6 +810,9 @@ class FaktorChatPanel(
             }
         }
         startTaskButton.addActionListener { startTaskFromControls() }
+        // Enter in the goal field is the keyboard twin of the Start task
+        // control: both route through the same guarded single-flight path.
+        goalField.addActionListener { startTaskFromControls() }
         cancelRunButton.addActionListener {
             val run = runsCombo.selectedItem as? NativeTaskRun
             if (run == null) {
@@ -1055,6 +1145,10 @@ class FaktorChatPanel(
      * cursor 0 and a full refresh.
      */
     private fun newSessionFromControls() {
+        if (startInFlight.get()) {
+            appendSystem("a task start is in flight; wait for its result before starting a new task")
+            return
+        }
         runAsync("new session") {
             val provider = settingsPanel.selectedProvider()
                 ?: providerField.text.trim().ifEmpty { "default" }
@@ -1753,6 +1847,19 @@ class FaktorChatPanel(
         startTaskFromControls()
     }
 
+    /** The keyboard twin of the Start task control (Enter in the goal field). */
+    internal fun submitTaskViaEnterForTest() {
+        goalField.postActionEvent()
+    }
+
+    internal fun startTaskEnabledForTest(): Boolean = startTaskButton.isEnabled
+
+    internal fun newSessionEnabledForTest(): Boolean = newSessionButton.isEnabled
+
+    internal fun goalTextForTest(): String = goalField.text
+
+    internal fun attachmentsCountForTest(): Int = attachments.count()
+
     internal fun setTaskFieldsForTest(goal: String, criteria: String) {
         goalField.text = goal
         criteriaField.text = criteria
@@ -1821,13 +1928,31 @@ class FaktorChatPanel(
     private fun setControlsEnabled(running: Boolean) {
         startButton.isEnabled = !running
         stopButton.isEnabled = running
-        newSessionButton.isEnabled = running
         refreshButton.isEnabled = running
         sendButton.isEnabled = running
         abortButton.isEnabled = running
-        startTaskButton.isEnabled = running
         cancelRunButton.isEnabled = running
+        setStartControlsEnabled(running)
     }
+
+    /**
+     * The start-surface controls (Start task, New session, the completion
+     * contract): disabled while a start is in flight, so a pending submission
+     * cannot be mutated or duplicated from the UI. Attachment/goal edits are
+     * additionally ignored by design: the in-flight request rides the
+     * immutable captured draft.
+     */
+    private fun setStartControlsEnabled(enabled: Boolean) {
+        val effective = enabled && service.isRunning() && !startInFlight.get()
+        startTaskButton.isEnabled = effective
+        newSessionButton.isEnabled = effective
+        completionCommit.isEnabled = effective
+        completionPush.isEnabled = effective
+        completionPr.isEnabled = effective
+    }
+
+    private fun isTransportFailure(e: NativeApiException): Boolean =
+        e.status == 0 && e.code == "transport"
 
     private fun runAsync(label: String, work: () -> Unit) {
         worker.execute {
@@ -1872,6 +1997,43 @@ class FaktorChatPanel(
         }
     }
 }
+
+/**
+ * The immutable description of ONE logical task start, captured from the
+ * composer at click time. Edits during a pending start can never alter the
+ * in-flight request; the captured draft is also what a transport-failure
+ * retry re-submits.
+ */
+private data class TaskStartDraft(
+    val goal: String,
+    val criteria: List<String>?,
+    val mutationMode: String?,
+    val files: List<String>,
+    val binaries: List<PendingBinaryAttachment>,
+    val completionContract: NativeCompletionContract?
+) {
+    /** Exact-draft comparison of a retry against the retained submission. */
+    fun sameDraftAs(other: TaskStartDraft): Boolean =
+        goal == other.goal &&
+            criteria == other.criteria &&
+            mutationMode == other.mutationMode &&
+            files == other.files &&
+            completionContract == other.completionContract &&
+            binaries.size == other.binaries.size &&
+            binaries.indices.all { index ->
+                val mine = binaries[index]
+                val theirs = other.binaries[index]
+                mine.mime == theirs.mime &&
+                    mine.filename == theirs.filename &&
+                    mine.bytes.contentEquals(theirs.bytes)
+            }
+}
+
+/** One logical start: the client submission id plus its immutable draft. */
+private data class TaskStartSubmission(
+    val submissionId: String,
+    val draft: TaskStartDraft
+)
 
 /** Standalone launcher for the Swing panel (the tool-window host entry). */
 object FaktorFrontendApp {

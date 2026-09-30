@@ -402,6 +402,23 @@ fn run_no_op_disposition(
         .unwrap_or_else(NoOpDisposition::default_for_mutating_task))
 }
 
+/// Bound and shape of a client submission id (the idempotency key of ONE
+/// logical task start): 1..=64 ASCII bytes of `[0-9a-f-]` (UUID-shaped,
+/// lowercase hex only). The native wire validates this at the DTO boundary;
+/// [`TaskRunRequest::validate`] enforces the same predicate for every
+/// programmatic caller so no start can carry a malformed key.
+pub const MAX_SUBMISSION_ID_BYTES: usize = 64;
+
+/// True when `id` is a well-shaped client submission id (see
+/// [`MAX_SUBMISSION_ID_BYTES`]).
+pub fn valid_submission_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SUBMISSION_ID_BYTES
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
+}
+
 /// One native task start: a goal plus one or more work items. Dispatch is
 /// by item count: one item drives the existing session (single-agent case),
 /// two or more spawn real children through the orchestrator runtime.
@@ -409,6 +426,13 @@ fn run_no_op_disposition(
 pub struct TaskRunRequest {
     pub goal: String,
     pub work_items: Vec<WorkItem>,
+    /// The client's submission UUID of this logical start (idempotency
+    /// finding 1): `Some` claims a durable admission row BEFORE any task
+    /// mutation and completes it with the exact run receipt once the run was
+    /// accepted, so a repeated key replays that receipt byte-for-byte and a
+    /// different request under the same key is a typed KeyReused conflict.
+    /// `None` (programmatic/test callers) is the unkeyed legacy start.
+    pub submission_id: Option<String>,
     /// Model selector used for the single-item drive / child default.
     pub model: Option<String>,
     /// Durable token budget cap applied to the run (task row / children).
@@ -494,6 +518,7 @@ impl Default for TaskRunRequest {
         Self {
             goal: String::new(),
             work_items: Vec::new(),
+            submission_id: None,
             model: None,
             max_tokens: None,
             max_cost_micro: None,
@@ -522,6 +547,13 @@ impl TaskRunRequest {
     pub fn validate(&self) -> Result<(), ExecError> {
         if self.goal.trim().is_empty() {
             return Err(ExecError::InvalidPlan("goal is empty".into()));
+        }
+        if let Some(submission_id) = &self.submission_id {
+            if !valid_submission_id(submission_id) {
+                return Err(ExecError::Malformed(format!(
+                    "submission_id must be 1..={MAX_SUBMISSION_ID_BYTES} ASCII [0-9a-f-] characters"
+                )));
+            }
         }
         if self.goal.chars().count() > MAX_GOAL_CHARS {
             return Err(ExecError::Oversized(format!(
@@ -650,12 +682,195 @@ impl TaskRunRequest {
 /// REAL session op id + queued state of the submitted prompt (byte
 /// compatible with the daemon's prompt path); orchestrated receipts carry
 /// the durable run id (children appear under it in the operation graph).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serde round-trips are byte-stable: a submission-keyed replay returns the
+/// EXACT JSON the first success stored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskRunReceipt {
     pub run_id: String,
     pub mode: TaskRunMode,
     pub op_id: Option<OpId>,
     pub queued: bool,
+}
+
+/// The durable admission of ONE submission-keyed task start (idempotency
+/// finding 1): the client submission key claimed in `task_admission` before
+/// any task mutation of this start.
+struct TaskStartAdmission {
+    key: String,
+}
+
+/// The admission decision of [`TaskExecutor::start_task`] for one start.
+enum StartAdmission {
+    /// Proceed. `Some` = an admission row was claimed for this start
+    /// (complete it at acceptance / release it on a pre-acceptance
+    /// failure); `None` = the caller carried no submission id (unkeyed
+    /// programmatic/test start).
+    Fresh(Option<TaskStartAdmission>),
+    /// The submission key already completed: replay the stored receipt
+    /// without touching anything.
+    Replay(TaskRunReceipt),
+}
+
+/// The canonical request digest of ONE submission-keyed start: a stable
+/// JSON serialization of the normalized start inputs (goal, files, the
+/// effective criteria/attachment patches, the completion contract and the
+/// run envelope) under a domain-separated BLAKE3. Computed on the caller's
+/// thread, never on the store's writer owner.
+fn task_start_digest(req: &TaskRunRequest) -> Result<String, ExecError> {
+    #[derive(serde::Serialize)]
+    struct DigestInput<'a> {
+        goal: &'a str,
+        files: &'a [String],
+        attachments: &'a [AttachmentId],
+        criteria: Option<&'a Vec<String>>,
+        completion_contract: Option<CompletionContract>,
+        model: Option<&'a str>,
+        max_tokens: Option<u64>,
+        max_cost_micro: Option<u64>,
+        work_items: &'a [WorkItem],
+    }
+    let attachments = req.effective_attachments_patch().unwrap_or_default();
+    let criteria = req.effective_criteria_patch();
+    let input = DigestInput {
+        goal: &req.goal,
+        files: &req.files,
+        attachments: &attachments,
+        criteria: criteria.as_ref(),
+        completion_contract: req.completion_contract,
+        model: req.model.as_deref(),
+        max_tokens: req.max_tokens,
+        max_cost_micro: req.max_cost_micro,
+        work_items: &req.work_items,
+    };
+    let bytes = serde_json::to_vec(&input)
+        .map_err(|e| ExecError::Internal(format!("task start digest serialization: {e}")))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"faktor.task-start-admission/v1");
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Claim the durable admission of ONE submission-keyed start: the FIRST
+/// durable act of the start, before any shadow/task/budget/prompt work. An
+/// equal-digest completion replays the stored receipt; a pending row and a
+/// digest/session mismatch are typed conflicts.
+fn begin_start_admission(
+    session: &SessionManager,
+    parent: SessionId,
+    req: &TaskRunRequest,
+    now: i64,
+) -> Result<StartAdmission, ExecError> {
+    let Some(key) = req.submission_id.as_deref() else {
+        return Ok(StartAdmission::Fresh(None));
+    };
+    let digest = task_start_digest(req)?;
+    let claim = session
+        .store()
+        .task_admission_claim(parent, key, &digest, now)
+        .map_err(|e| ExecError::Internal(format!("submission admission claim: {e}")))?;
+    if let Some(receipt_json) = claim.complete_receipt() {
+        let receipt: TaskRunReceipt = serde_json::from_str(receipt_json).map_err(|e| {
+            ExecError::Internal(format!(
+                "stored run receipt of submission {key:?} did not decode: {e}"
+            ))
+        })?;
+        return Ok(StartAdmission::Replay(receipt));
+    }
+    if claim.is_in_flight() {
+        return Err(ExecError::Conflict(format!(
+            "task start with submission id {key:?} is already in flight; retry once it settles"
+        )));
+    }
+    if let Some(stored_digest) = claim.key_reused_digest() {
+        return Err(ExecError::Conflict(format!(
+            "submission id {key:?} was already used for a different task start (stored request digest {stored_digest}, this request digest {digest}); use a fresh submission id for a new start"
+        )));
+    }
+    debug_assert!(claim.is_fresh(), "unknown admission claim outcome");
+    Ok(StartAdmission::Fresh(Some(TaskStartAdmission {
+        key: key.to_owned(),
+    })))
+}
+
+/// READ-ONLY pre-run decision for one submission-keyed start: `Ok(None)`
+/// means no row exists yet (a fresh claim may proceed); `Ok(Some(receipt))`
+/// is the stored replay; pending and digest-mismatched keys are typed
+/// refusals. Never writes: the authoritative claim is
+/// [`begin_start_admission`].
+fn peek_start_admission(
+    session: &SessionManager,
+    parent: SessionId,
+    req: &TaskRunRequest,
+) -> Result<Option<TaskRunReceipt>, ExecError> {
+    let Some(key) = req.submission_id.as_deref() else {
+        return Ok(None);
+    };
+    let digest = task_start_digest(req)?;
+    let Some(claim) = session
+        .store()
+        .task_admission_peek(parent, key, &digest)
+        .map_err(|e| ExecError::Internal(format!("submission admission peek: {e}")))?
+    else {
+        return Ok(None);
+    };
+    if let Some(receipt_json) = claim.complete_receipt() {
+        let receipt: TaskRunReceipt = serde_json::from_str(receipt_json).map_err(|e| {
+            ExecError::Internal(format!(
+                "stored run receipt of submission {key:?} did not decode: {e}"
+            ))
+        })?;
+        return Ok(Some(receipt));
+    }
+    if claim.is_in_flight() {
+        return Err(ExecError::Conflict(format!(
+            "task start with submission id {key:?} is already in flight; retry once it settles"
+        )));
+    }
+    if let Some(stored_digest) = claim.key_reused_digest() {
+        return Err(ExecError::Conflict(format!(
+            "submission id {key:?} was already used for a different task start (stored request digest {stored_digest}, this request digest {digest}); use a fresh submission id for a new start"
+        )));
+    }
+    debug_assert!(claim.is_fresh(), "unknown admission peek outcome");
+    Ok(None)
+}
+
+/// Complete one claimed admission with the byte-exact serialized receipt.
+fn complete_start_admission(
+    session: &SessionManager,
+    parent: SessionId,
+    admission: Option<&TaskStartAdmission>,
+    receipt: &TaskRunReceipt,
+) -> Result<(), ExecError> {
+    let Some(admission) = admission else {
+        return Ok(());
+    };
+    let receipt_json = serde_json::to_string(receipt)
+        .map_err(|e| ExecError::Internal(format!("run receipt serialization: {e}")))?;
+    session
+        .store()
+        .task_admission_complete(parent, &admission.key, &receipt_json)
+        .map_err(|e| ExecError::Internal(format!("submission admission complete: {e}")))
+}
+
+/// Release a claimed admission that failed BEFORE acceptance (a completed
+/// receipt is never deleted; the store's release only touches pending rows).
+fn release_start_admission(
+    session: &SessionManager,
+    parent: SessionId,
+    admission: Option<&TaskStartAdmission>,
+) {
+    let Some(admission) = admission else {
+        return;
+    };
+    if let Err(e) = session
+        .store()
+        .task_admission_release(parent, &admission.key)
+    {
+        eprintln!(
+            "submission admission release for session {parent} failed (a retry may answer in flight): {e}"
+        );
+    }
 }
 
 /// Which durable run one [`TaskExecutor::settle_run`] pass settles.
@@ -1761,6 +1976,17 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        // Idempotency finding 1: the submission-keyed decision is made
+        // BEFORE every pre-run step (attachment resolution, identity
+        // adoption, live-run blockers, worker placement, shadow
+        // settlement). A completed key replays the stored receipt with zero
+        // mutation; a pending or digest-mismatched key refuses typed. A
+        // fresh key still CLAIMS inside `start_in_session` /
+        // `start_orchestrated` (that claim is authoritative; this peek only
+        // keeps duplicates from touching pre-run state).
+        if let Some(receipt) = peek_start_admission(&self.session, parent, &req)? {
+            return Ok(receipt);
+        }
         // Admit-time binary-attachment resolution (defense in depth behind
         // the server DTO): every digest must resolve to a byte-identical
         // durable row of THIS session BEFORE any shadow/run/task write —
@@ -1849,7 +2075,7 @@ impl TaskExecutor {
             self.settle_existing_shadow(parent, &handle)?;
         }
         if req.work_items.len() == 1 {
-            self.start_in_session(parent, req)
+            self.start_in_session(parent, &handle, req)
         } else {
             self.start_orchestrated(parent, req)
         }
@@ -2096,15 +2322,41 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// The submission-keyed wrapper (idempotency finding 1): the durable
+    /// admission decision is the FIRST act of a keyed start, BEFORE any
+    /// shadow/task/budget/prompt work. A completed key replays the stored
+    /// receipt byte-for-byte; a pending or digest-mismatched key is a typed
+    /// conflict; only a fresh claim proceeds into the admitted body.
     fn start_in_session(
         self: &Arc<Self>,
         parent: SessionId,
+        handle: &faktor_session::SessionHandle,
         req: TaskRunRequest,
     ) -> Result<TaskRunReceipt, ExecError> {
-        let handle = self
-            .session
-            .get_session(parent)?
-            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let admission = match begin_start_admission(&self.session, parent, &req, handle.now_ms())? {
+            StartAdmission::Replay(receipt) => return Ok(receipt),
+            StartAdmission::Fresh(admission) => admission,
+        };
+        let mut accepted = false;
+        let result =
+            self.start_in_session_admitted(parent, handle, req, admission.as_ref(), &mut accepted);
+        if result.is_err() && !accepted {
+            release_start_admission(&self.session, parent, admission.as_ref());
+        }
+        result
+    }
+
+    /// The admitted body of ONE in-session start: the existing single-item
+    /// drive, wrapped so acceptance is durably admitted (the wrapper above
+    /// owns the claim/replay/release decision).
+    fn start_in_session_admitted(
+        self: &Arc<Self>,
+        parent: SessionId,
+        handle: &faktor_session::SessionHandle,
+        req: TaskRunRequest,
+        admission: Option<&TaskStartAdmission>,
+        accepted: &mut bool,
+    ) -> Result<TaskRunReceipt, ExecError> {
         let item = &req.work_items[0];
         // P0 isolation: a MUTATING single-item run ALWAYS works in a
         // daemon-owned isolated candidate (the shadow machinery); the drive
@@ -2116,7 +2368,7 @@ impl TaskExecutor {
         // (no shadow service) drives the owner directly.
         let shadowed = self.shadows.is_some() && item.kind.is_mutating();
         let base_root = if shadowed {
-            Some(self.owner_root_of(parent, &handle)?)
+            Some(self.owner_root_of(parent, handle)?)
         } else {
             None
         };
@@ -2135,7 +2387,9 @@ impl TaskExecutor {
                     // recoverable failure — never a hang, and never a
                     // promptable-but-idle machine. Protocol adapters project
                     // the typed state (the frozen wire answers its 502).
-                    return self.admit_refused_isolation(parent, &handle, &req, refusal);
+                    return self.admit_refused_isolation(
+                        parent, handle, &req, refusal, admission, accepted,
+                    );
                 }
                 return Err(refusal);
             }
@@ -2207,7 +2461,7 @@ impl TaskExecutor {
         }
         // P2 record-first: the accepted completion contract lands durably
         // BEFORE the run's first model call (the submit below drives it).
-        record_completion_contract(&handle, task_id, req.completion_contract)?;
+        record_completion_contract(handle, task_id, req.completion_contract)?;
         // Durable monetary cap (audit 9/H): `TaskRunRequest.max_cost_micro`
         // flows to the task row's cost cap — the single authority every paid
         // model call of this drive is admitted against (the guarded ledger
@@ -2253,17 +2507,29 @@ impl TaskExecutor {
             budget_max_tokens: req.max_tokens,
             created_ms: now,
         };
-        put_run_row(&handle, &run_id, &row)?;
+        put_run_row(handle, &run_id, &row)?;
         // P0 no-op policy: the run's disposition is durable BEFORE the drive
         // is dispatched. The shadow settlement reads it under the synthetic
         // per-session run id (`tx-session-<session>`), so the row is written
         // under BOTH the real run id and that id.
-        write_run_policy_row(&handle, &run_id, req.no_op_disposition)?;
+        write_run_policy_row(handle, &run_id, req.no_op_disposition)?;
         write_run_policy_row(
-            &handle,
+            handle,
             &format!("tx-session-{}", parent.raw()),
             req.no_op_disposition,
         )?;
+        // Acceptance: the prompt is durably recorded and the run's linkage +
+        // policy rows exist. The exact receipt is admitted BEFORE the spawn
+        // attempt, so a shut-down refusal below keeps the completed receipt
+        // (a same-key retry replays it instead of starting a second run).
+        let run_receipt = TaskRunReceipt {
+            run_id: run_id.clone(),
+            mode: TaskRunMode::InSession,
+            op_id: Some(receipt.op_id),
+            queued: receipt.queued,
+        };
+        *accepted = true;
+        complete_start_admission(&self.session, parent, admission, &run_receipt)?;
         // Detached drive — the daemon's own entries, identical to the
         // direct prompt path (the drive runs session recovery first; an
         // interrupted drive resumes the SAME recorded turn on daemon start).
@@ -2319,12 +2585,7 @@ impl TaskExecutor {
                 }
             }
         }
-        Ok(TaskRunReceipt {
-            run_id,
-            mode: TaskRunMode::InSession,
-            op_id: Some(receipt.op_id),
-            queued: receipt.queued,
-        })
+        Ok(run_receipt)
     }
 
     /// Admit a single-item run whose isolation candidate the BOUNDED copy
@@ -2340,6 +2601,8 @@ impl TaskExecutor {
         handle: &faktor_session::SessionHandle,
         req: &TaskRunRequest,
         refusal: ExecError,
+        admission: Option<&TaskStartAdmission>,
+        accepted: &mut bool,
     ) -> Result<TaskRunReceipt, ExecError> {
         let receipt = self
             .agent
@@ -2393,23 +2656,29 @@ impl TaskExecutor {
             created_ms: handle.now_ms(),
         };
         put_run_row(handle, &run_id, &row)?;
+        // Acceptance: the refused-isolation run is durably admitted (prompt,
+        // failed event, linkage row). The exact receipt is admitted so a
+        // same-key retry replays it instead of admitting a second run.
+        let run_receipt = TaskRunReceipt {
+            run_id,
+            mode: TaskRunMode::InSession,
+            op_id: Some(receipt.op_id),
+            queued: false,
+        };
+        *accepted = true;
+        complete_start_admission(&self.session, parent, admission, &run_receipt)?;
         tracing::info!(
             target: "faktor::task_executor",
             session = %parent,
             "shadow phase refused (bounded caps); turn admitted and landed failed_recoverable: {message}"
         );
-        Ok(TaskRunReceipt {
-            run_id,
-            mode: TaskRunMode::InSession,
-            op_id: Some(receipt.op_id),
-            queued: false,
-        })
+        Ok(run_receipt)
     }
 
-    /// The multi-agent case: a durable plan row + REAL child sessions
-    /// through `execute_task`, driven in the background (the receipt is
-    /// returned once the plan is durably registered; children appear under
-    /// the run id immediately afterwards).
+    /// The submission-keyed wrapper of the multi-item path (idempotency
+    /// finding 1): same claim-first/replay/release contract as
+    /// [`Self::start_in_session`]; acceptance is the drive registry
+    /// accepting the detached run.
     fn start_orchestrated(
         self: &Arc<Self>,
         parent: SessionId,
@@ -2419,6 +2688,34 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let admission = match begin_start_admission(&self.session, parent, &req, handle.now_ms())? {
+            StartAdmission::Replay(receipt) => return Ok(receipt),
+            StartAdmission::Fresh(admission) => admission,
+        };
+        let mut accepted = false;
+        let result = self.start_orchestrated_admitted(
+            parent,
+            handle,
+            req,
+            admission.as_ref(),
+            &mut accepted,
+        );
+        if result.is_err() && !accepted {
+            release_start_admission(&self.session, parent, admission.as_ref());
+        }
+        result
+    }
+
+    /// The admitted body of ONE orchestrated start (see
+    /// [`Self::start_orchestrated`]).
+    fn start_orchestrated_admitted(
+        self: &Arc<Self>,
+        parent: SessionId,
+        handle: faktor_session::SessionHandle,
+        req: TaskRunRequest,
+        admission: Option<&TaskStartAdmission>,
+        accepted: &mut bool,
+    ) -> Result<TaskRunReceipt, ExecError> {
         let row = handle.row()?;
         let owner_root = {
             let wts = self
@@ -2626,12 +2923,18 @@ impl TaskExecutor {
                 "executor is shut down; orchestrated run '{run_id2}' was not driven and stays resumable from its durable rows"
             )));
         }
-        Ok(TaskRunReceipt {
+        // Acceptance: the drive registry owns the detached run. The exact
+        // receipt is admitted so a same-key retry replays it instead of
+        // registering a second orchestrated run.
+        let run_receipt = TaskRunReceipt {
             run_id,
             mode: TaskRunMode::Orchestrated,
             op_id: None,
             queued: false,
-        })
+        };
+        *accepted = true;
+        complete_start_admission(&self.session, parent, admission, &run_receipt)?;
+        Ok(run_receipt)
     }
 
     // ------------------------------------------- completion steps (P2 follow-up)

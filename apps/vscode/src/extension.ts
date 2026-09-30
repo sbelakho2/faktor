@@ -84,17 +84,24 @@ import {
 import {
   AdmitFailure,
   AttachmentAdmissionPolicy,
+  CachedEvidenceView,
   EMERGENCY_ATTACHMENT_POLICY,
+  EvidenceAuthorityCache,
   PendingSubmission,
   PendingSubmissionRetainer,
   StartFailure,
+  StartSubmissionSnapshot,
   StartTaskSettings,
+  TaskStartGate,
   admitPendingSubmission,
   attachmentPolicyForModel,
   boundedWebviewFiles,
+  canonicalSubmissionId,
   hasCompletionSteps,
   parseCompletionContract,
   parsePendingSubmission,
+  submissionRetryable,
+  verificationAuthorityKey,
 } from './taskStart';
 import {
   SessionBindings,
@@ -138,9 +145,10 @@ interface ActiveSession {
   activeRunId: string | null;
   refreshing: boolean;
   refreshTimer: NodeJS.Timeout | null;
-  /** Reuse the last task-verification read while its inputs are unchanged. */
-  taskVerificationKey: string | null;
-  taskVerification: NativeTaskVerification | null;
+  /** Reuse the last task-verification read while its authority key is
+   * unchanged; a key change or a failed fetch drops the cached view and
+   * records an explicit unavailable — stale evidence is never handed back. */
+  taskVerificationCache: EvidenceAuthorityCache<NativeTaskVerification>;
   /** Reuse the last strict proof read while its inputs are unchanged. */
   taskProofKey: string | null;
   taskProof: NativeTaskProof | null;
@@ -174,8 +182,7 @@ const active: ActiveSession = {
   activeRunId: null,
   refreshing: false,
   refreshTimer: null,
-  taskVerificationKey: null,
-  taskVerification: null,
+  taskVerificationCache: new EvidenceAuthorityCache<NativeTaskVerification>(),
   taskProofKey: null,
   taskProof: null,
   taskProofUnavailable: null,
@@ -197,6 +204,10 @@ let statusBar: vscode.StatusBarItem | null = null;
 // attachment ids survive a failed start and a retry resolves them first,
 // uploading only the attachments still absent.
 const pendingSubmissionRetainer = new PendingSubmissionRetainer();
+// Host single-flight of task starts (audit 32): one in-flight logical
+// submission per host; a lost-response retry reuses its immutable snapshot
+// and submission id so the daemon returns the original receipt.
+const taskStartGate = new TaskStartGate();
 
 // ------------------------------------------------------------------ helpers
 
@@ -753,8 +764,7 @@ function stopServer(): void {
   active.sessionId = null;
   active.activeRunId = null;
   active.refreshing = false;
-  active.taskVerificationKey = null;
-  active.taskVerification = null;
+  active.taskVerificationCache.clear();
   active.taskProofKey = null;
   active.taskProof = null;
   active.taskProofUnavailable = null;
@@ -767,6 +777,7 @@ function stopServer(): void {
   active.billingUsage = null;
   active.billingCursor = null;
   active.billingPrevCursors = [];
+  taskStartGate.reset();
   store.patch({
     daemon: 'stopped',
     daemonDetail: '',
@@ -979,8 +990,14 @@ async function refresh(): Promise<void> {
     active.pixelPresence = nextPixelPresence(active.pixelPresence, agentFrame);
     const verificationView = verificationSummary(verification);
     const usageView = usageSummary(usage);
-    const taskVerification = cockpitTaskVerificationView(
-      await taskVerificationFor(client, sessionId, runs, task, verification),
+    const taskRevision = tasks.length > 0 ? tasks[0]!.revision : null;
+    const taskVerification = await taskVerificationFor(
+      client,
+      sessionId,
+      runs,
+      task,
+      verification,
+      taskRevision,
     );
     // The strict proof summary feeds the top-level VERIFIED view: a failed
     // read is an EXPLICIT unavailable state (the cached proof is dropped),
@@ -998,7 +1015,7 @@ async function refresh(): Promise<void> {
       agents: agentSummaries,
       verification: verificationView,
       usage: usageView,
-      taskVerification,
+      taskVerification: cockpitTaskVerificationView(taskVerification.view),
       tournament,
       proof: proofRead.proof,
       proofUnavailable: proofRead.unavailable,
@@ -1056,8 +1073,11 @@ function modelInfoOf(info: NativeModelInfo): {
 
 /**
  * Fetch the durable task verification (criteria + checks) for the cockpit,
- * reusing the cached read while its inputs are unchanged. Optional: a
- * failure degrades to the previous read (or null), never an error patch.
+ * reusing the cached read while its AUTHORITY KEY is unchanged. The key is
+ * durable identity (task id + state + the task view's revision) plus a
+ * fingerprint of the FULL verification summary response — never list counts.
+ * A key change or a failed fetch drops the cached view and returns an
+ * explicit unavailable; the previous view can never masquerade as current.
  */
 async function taskVerificationFor(
   client: NativeClient,
@@ -1065,24 +1085,31 @@ async function taskVerificationFor(
   runs: readonly NativeTaskRun[],
   task: TaskSummary | null,
   verification: NativeVerificationView,
-): Promise<NativeTaskVerification | null> {
+  revision: string | null,
+): Promise<CachedEvidenceView<NativeTaskVerification>> {
   if (task === null || runs.length === 0) {
-    active.taskVerificationKey = null;
-    active.taskVerification = null;
-    return null;
+    active.taskVerificationCache.clear();
+    return { view: null, unavailable: null };
   }
   const taskId = String(runs[0]!.task_id);
-  const key = `${taskId}:${task.state}:${verification.failedChecks.length}:${verification.owed.length}`;
-  if (key === active.taskVerificationKey) {
-    return active.taskVerification;
+  const key = verificationAuthorityKey({
+    taskId,
+    state: task.state,
+    revision,
+    verification,
+  });
+  const cached = active.taskVerificationCache.read(key);
+  if (cached !== null) {
+    return cached;
   }
   try {
     const view = await client.taskVerification(sessionId, taskId);
-    active.taskVerificationKey = key;
-    active.taskVerification = view;
-    return view;
-  } catch {
-    return active.taskVerification;
+    active.taskVerificationCache.store(key, view);
+    return { view, unavailable: null };
+  } catch (error) {
+    const reason = messageOf(error);
+    active.taskVerificationCache.fail(key, reason);
+    return { view: null, unavailable: reason };
   }
 }
 
@@ -1460,21 +1487,34 @@ function pendingEnvelope(text: string): PendingSubmission {
 }
 
 async function startTask(
-  goal: string,
-  files: readonly string[],
-  contract: NativeCompletionContract | null,
+  snapshot: StartSubmissionSnapshot,
   context: vscode.ExtensionContext,
-  pending: PendingSubmission,
 ): Promise<void> {
+  const { submissionId, pending, files, contract } = snapshot;
+  const goal = pending.text;
   const restore = (failure: AdmitFailure, enriched: PendingSubmission): void => {
     // Audit 29: the enriched envelope keeps every successful upload, so a
     // retry resolves the durable ids first and uploads only absent
     // attachments. ONLY a durable acceptance may release the retained state.
     pendingSubmissionRetainer.retain(enriched);
     reportError(new Error(failure.message));
+    // Audit 32: a failure that may have left a durable receipt (status null,
+    // 5xx, 408/429, or the daemon's "submission id still in flight" 409)
+    // keeps the logical submission retryable under the SAME submission id;
+    // an explicit 4xx refusal ends it.
+    taskStartGate.settle(
+      submissionId,
+      submissionRetryable(failure) ? 'transport' : 'refused',
+    );
     // NEVER clear before acceptance: the restore callback carries the
     // original text back to the composer and rebuilds the draft.
     chatProvider?.postSendMessageFailed(enriched, failure.message);
+  };
+  const refuse = (message: string, enriched: PendingSubmission): void => {
+    pendingSubmissionRetainer.retain(enriched);
+    reportError(new Error(message));
+    taskStartGate.settle(submissionId, 'refused');
+    chatProvider?.postSendMessageFailed(enriched, message);
   };
   try {
     if (!active.client || !active.sessionId) {
@@ -1519,10 +1559,9 @@ async function startTask(
       // A configured micro amount above 2^53-1 cannot be represented exactly
       // by a VS Code number setting; refusing is the only honest option (the
       // run must never start with a silently rounded budget).
-      reportError(
-        new Error(
-          `faktor.budgetCostMicro ${budgetCostRaw} is not an exact non-negative integer micro amount (max 2^53-1); the task was not started`,
-        ),
+      refuse(
+        `faktor.budgetCostMicro ${budgetCostRaw} is not an exact non-negative integer micro amount (max 2^53-1); the task was not started`,
+        pending,
       );
       return;
     }
@@ -1535,6 +1574,7 @@ async function startTask(
       maxCostMicro,
       files,
       completionContract: contract,
+      submissionId,
     };
     const outcome = await admitPendingSubmission({
       client,
@@ -1564,10 +1604,12 @@ async function startTask(
       // Durable acceptance: ONLY now may the pending envelope (and its
       // retained uploads) be dropped.
       pendingSubmissionRetainer.release(outcome.pending);
+      taskStartGate.settle(submissionId, 'started');
       chatProvider?.postStartResult(goal, true);
     }
   } catch (error) {
     reportError(error);
+    taskStartGate.settle(submissionId, 'transport');
     chatProvider?.postSendMessageFailed(
       pending,
       error instanceof Error ? error.message : String(error),
@@ -1615,7 +1657,24 @@ async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<voi
     return;
   }
   const contract = await promptCompletionContract();
-  await startTask(goal.trim(), [], contract, context, pendingEnvelope(goal.trim()));
+  const pending = pendingEnvelope(goal.trim());
+  const decision = taskStartGate.admit({
+    submissionId: null,
+    pending,
+    files: [],
+    contract,
+    newId: randomUUID,
+  });
+  if (decision.action !== 'start') {
+    chatProvider?.postNotice(
+      'error',
+      decision.action === 'busy'
+        ? decision.reason
+        : 'a task start is already in flight; the duplicate command was ignored',
+    );
+    return;
+  }
+  await startTask(decision.snapshot, context);
 }
 
 async function cancelActiveRun(): Promise<void> {
@@ -2058,6 +2117,16 @@ async function handleWebviewMessage(
       if (goal.length === 0) {
         return;
       }
+      // Host single-flight (audit 32): while one logical submission is in
+      // flight, every further sendGoal is ignored — a double click, an
+      // Enter+click race and a hostile burst can never admit a second
+      // durable prompt/run. After a lost response the gate is retryable and
+      // an identical resubmission (or an explicit retry of the same
+      // submission id) restarts the SAME immutable snapshot.
+      if (taskStartGate.inFlight()) {
+        return;
+      }
+      const submissionId = canonicalSubmissionId(message.submissionId);
       // Files ride the workspace-relative attachment vocabulary
       // (`sendGoal.files`); malformed entries are refused individually (with
       // their exact reason) and never discard the goal. The completion
@@ -2110,7 +2179,34 @@ async function handleWebviewMessage(
         }
         pending = pendingSubmissionRetainer.restore(parsed);
       }
-      await startTask(goal, files, contract.contract, context, pending);
+      const decision = taskStartGate.admit({
+        submissionId,
+        pending,
+        files,
+        contract: contract.contract,
+        newId: randomUUID,
+      });
+      if (decision.action !== 'start') {
+        // Unreachable after the in-flight guard; a raced gate is still a
+        // loud no-op rather than a second start.
+        chatProvider?.postNotice(
+          'error',
+          decision.action === 'busy'
+            ? decision.reason
+            : 'a task start is already in flight; the duplicate submit was ignored',
+        );
+        return;
+      }
+      // A retry restarts the STORED immutable snapshot (never the incoming
+      // body), with the retained uploads merged back in so the same bytes
+      // are not uploaded twice and the attachment ids stay byte-identical.
+      const snapshot = decision.retry
+        ? {
+            ...decision.snapshot,
+            pending: pendingSubmissionRetainer.restore(decision.snapshot.pending),
+          }
+        : decision.snapshot;
+      await startTask(snapshot, context);
       return;
     }
     case 'newTask':

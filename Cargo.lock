@@ -1996,6 +1996,7 @@ dependencies = [
  "faktor-core",
  "faktor-fs",
  "faktor-provider",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

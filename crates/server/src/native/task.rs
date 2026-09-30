@@ -140,7 +140,12 @@ pub(crate) async fn native_task_run_state(
 }
 
 /// The strict request DTO of ONE native task start
-/// (`POST /native/session/{id}/task-runs`). `work_items` is optional: an
+/// (`POST /native/session/{id}/task-runs`). `submission_id` is the REQUIRED
+/// client submission UUID of this logical start (1..=64 ASCII `[0-9a-f-]`,
+/// UUID-shaped): the executor admits the start durably under that key BEFORE
+/// any task mutation, so a repeated key replays the original run receipt
+/// byte-for-byte (a lost response is retried with the SAME submission id;
+/// a new start uses a fresh one). `work_items` is optional: an
 /// absent list starts the goal as a single MUTATING work item (`main`) —
 /// that run ALWAYS works in a daemon-owned isolated candidate and
 /// integrates on a verified completion. `criteria` ride the durable task
@@ -158,6 +163,7 @@ pub(crate) async fn native_task_run_state(
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartTaskRunRequest {
     goal: String,
+    submission_id: String,
     criteria: Option<Vec<String>>,
     work_items: Option<Vec<NativeTaskRunWorkItem>>,
     /// Legacy plan-global ownership (old clients only): converted at THIS
@@ -242,6 +248,25 @@ fn completion_contract_needs_work_items(
     !has_work_items && completion_contract.is_some_and(|c| !c.is_default())
 }
 
+/// The strict shape of the required `submission_id`: non-empty, at most
+/// [`MAX_SUBMISSION_ID_BYTES`] ASCII bytes of `[0-9a-f-]` (UUID-shaped;
+/// lowercase hex only). Anything else is a typed 400 at the wire boundary,
+/// before any session resolution or executor dispatch.
+fn validate_submission_id(id: &str) -> Result<(), ApiError> {
+    if faktor_orchestrator::runtime::task_executor::valid_submission_id(id) {
+        return Ok(());
+    }
+    Err(ApiError {
+        code: "malformed",
+        message: format!(
+            "submission_id must be 1..={} ASCII [0-9a-f-] characters",
+            faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES
+        ),
+        http_status: 400,
+        retryable: false,
+    })
+}
+
 /// `POST /native/session/{id}/task-runs` — start ONE task through the
 /// daemon's TaskExecutor ([`ServerDeps::tasks`]; the ONLY task-start
 /// authority the server reaches). The strict DTO is validated by the
@@ -277,6 +302,9 @@ pub(crate) async fn native_task_run_start(
             })
         }
     };
+    if let Err(e) = validate_submission_id(&req.submission_id) {
+        return wire_status(e);
+    }
     let handle = match native_resolve_session(&state, &id) {
         Ok(h) => h,
         Err(r) => return *r,
@@ -369,6 +397,7 @@ pub(crate) async fn native_task_run_start(
             let request = faktor_orchestrator::runtime::task_executor::TaskRunRequest {
                 goal: req.goal,
                 work_items,
+                submission_id: Some(req.submission_id),
                 model: req.model,
                 max_tokens: req.max_tokens,
                 max_cost_micro: req.max_cost_micro,
@@ -390,6 +419,7 @@ pub(crate) async fn native_task_run_start(
             // through the SAME PromptExecutionService (shadow by default).
             let request = PromptRequest {
                 prompt: req.goal,
+                submission_id: Some(req.submission_id),
                 files,
                 attachments,
                 model: req.model,
@@ -857,6 +887,7 @@ mod attachment_dto_tests {
         let digest = "a".repeat(64);
         let valid = serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "files": ["src/a.rs"],
             "attachments": [
                 {"digest": digest, "mime": "application/pdf", "filename": "spec.pdf", "size": 7},
@@ -871,12 +902,14 @@ mod attachment_dto_tests {
         // silently partial id); `filename` is legitimately optional.
         let missing = serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "attachments": [{"digest": digest, "mime": "application/pdf"}],
         });
         assert!(serde_json::from_value::<StartTaskRunRequest>(missing).is_err());
         // An unknown id member is a 400 (AttachmentId is deny_unknown_fields).
         let unknown_member = serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "attachments": [
                 {"digest": digest, "mime": "application/pdf", "filename": null, "size": 7, "url": "data:x"},
             ],
@@ -886,12 +919,14 @@ mod attachment_dto_tests {
         // attachments into a run that never declared them.
         let typo = serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "attachment": [{"digest": digest, "mime": "application/pdf", "filename": null, "size": 7}],
         });
         assert!(serde_json::from_value::<StartTaskRunRequest>(typo).is_err());
         // A malformed digest (not 64 hex) is a 400.
         let bad_digest = serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "attachments": [{"digest": "zz", "mime": "application/pdf", "filename": null, "size": 7}],
         });
         assert!(serde_json::from_value::<StartTaskRunRequest>(bad_digest).is_err());
@@ -942,11 +977,16 @@ mod completion_contract_dto_tests {
     #[test]
     fn completion_contract_is_strict_typed_and_never_defaults_silently() {
         // Absent = today's behavior (no contract, no durable row, no gate).
-        let req = parse(serde_json::json!({"goal": "g"})).unwrap();
+        let req = parse(serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+        }))
+        .unwrap();
         assert!(req.completion_contract.is_none());
         // An explicit all-false contract parses and IS the default behavior.
         let req = parse(serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "completion_contract": {
                 "include_commit": false,
                 "include_push": false,
@@ -958,6 +998,7 @@ mod completion_contract_dto_tests {
         // A full non-default contract parses.
         let req = parse(serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "completion_contract": {
                 "include_commit": true,
                 "include_push": true,
@@ -977,12 +1018,14 @@ mod completion_contract_dto_tests {
         // A missing member is a 400, never a silent false.
         let err = expect_err(serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "completion_contract": {"include_commit": true},
         }));
         assert!(err.contains("missing field"), "{err}");
         // A non-boolean member is a 400.
         let err = expect_err(serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "completion_contract": {
                 "include_commit": "yes",
                 "include_push": false,
@@ -993,6 +1036,7 @@ mod completion_contract_dto_tests {
         // An unknown member inside the contract is a 400.
         let err = expect_err(serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "completion_contract": {
                 "include_commit": true,
                 "include_push": false,
@@ -1009,6 +1053,7 @@ mod completion_contract_dto_tests {
         ] {
             let err = expect_err(serde_json::json!({
                 "goal": "g",
+                "submission_id": "11111111-1111-4111-8111-111111111111",
                 "completion_contract": hostile,
             }));
             assert!(err.contains("invalid type"), "{err}");
@@ -1017,9 +1062,76 @@ mod completion_contract_dto_tests {
         // unchanged by the additive field).
         let err = expect_err(serde_json::json!({
             "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
             "completion_contracts": {"include_commit": true},
         }));
         assert!(err.contains("unknown field"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod submission_id_dto_tests {
+    //! Adversarial strict-DTO cover for the REQUIRED `submission_id` of a
+    //! native task start: absent, empty, oversized, uppercase, non-hex and
+    //! non-ASCII shapes are all typed refusals (mapped to plain 400s by the
+    //! handler), never a silently generated or dropped key.
+    use super::{validate_submission_id, StartTaskRunRequest};
+
+    fn parse(value: serde_json::Value) -> Result<StartTaskRunRequest, String> {
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn submission_id_is_required_and_survives_a_valid_parse() {
+        let valid = serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+        });
+        let req = parse(valid).expect("a UUID-shaped submission id parses");
+        assert_eq!(req.submission_id, "11111111-1111-4111-8111-111111111111");
+        // Missing is a typed parse error (never a silent fresh key).
+        let err = match parse(serde_json::json!({"goal": "g"})) {
+            Ok(_) => panic!("missing submission_id must refuse"),
+            Err(e) => e,
+        };
+        assert!(err.contains("missing field"), "{err}");
+        // A typo of the field name is a 400, never a dropped key.
+        let err = match parse(serde_json::json!({
+            "goal": "g",
+            "submissionId": "11111111-1111-4111-8111-111111111111",
+        })) {
+            Ok(_) => panic!("a camelCase typo must refuse"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown field"), "{err}");
+        // `null` is not a string.
+        assert!(parse(serde_json::json!({"goal": "g", "submission_id": null})).is_err());
+    }
+
+    #[test]
+    fn hostile_submission_id_shapes_are_typed_400s() {
+        for hostile in [
+            "",
+            " ",
+            "11111111-1111-4111-8111-11111111111Z",
+            "11111111-1111-4111-8111-1111111111_1",
+            "..111111-1111-4111-8111-111111111111",
+            "no-uuid-here",
+            "☃",
+        ] {
+            let err =
+                validate_submission_id(hostile).expect_err("hostile shape must be a typed refusal");
+            assert_eq!(err.http_status, 400, "{hostile:?}");
+            assert_eq!(err.code, "malformed", "{hostile:?}");
+        }
+        let oversized =
+            "a".repeat(faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES + 1);
+        assert!(validate_submission_id(&oversized).is_err());
+        let at_bound =
+            "a".repeat(faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES);
+        assert!(validate_submission_id(&at_bound).is_ok());
+        assert!(validate_submission_id("11111111-1111-4111-8111-111111111111").is_ok());
+        assert!(validate_submission_id("deadbeef-dead-beef-dead-beefdeadbeef").is_ok());
     }
 }
 
@@ -1039,21 +1151,27 @@ mod money_dto_tests {
         for amount in BOUNDARIES {
             let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
                 "goal": "g",
+                "submission_id": "11111111-1111-4111-8111-111111111111",
                 "max_cost_micro": amount.to_string(),
             }))
             .unwrap();
             assert_eq!(req.max_cost_micro, Some(amount), "string form");
             let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
                 "goal": "g",
+                "submission_id": "11111111-1111-4111-8111-111111111111",
                 "max_cost_micro": amount,
             }))
             .unwrap();
             assert_eq!(req.max_cost_micro, Some(amount), "legacy number form");
-            let req: StartTaskRunRequest =
-                serde_json::from_value(serde_json::json!({"goal": "g"})).unwrap();
+            let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
+                "goal": "g",
+                "submission_id": "11111111-1111-4111-8111-111111111111",
+            }))
+            .unwrap();
             assert_eq!(req.max_cost_micro, None, "absent = no cap");
             let req: StartTaskRunRequest = serde_json::from_value(serde_json::json!({
                 "goal": "g",
+                "submission_id": "11111111-1111-4111-8111-111111111111",
                 "max_cost_micro": null,
             }))
             .unwrap();
@@ -1109,6 +1227,7 @@ mod money_dto_tests {
             assert!(
                 serde_json::from_value::<StartTaskRunRequest>(serde_json::json!({
                     "goal": "g",
+                    "submission_id": "11111111-1111-4111-8111-111111111111",
                     "max_cost_micro": bad,
                 }))
                 .is_err(),

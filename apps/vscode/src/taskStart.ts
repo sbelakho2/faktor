@@ -600,6 +600,13 @@ export interface StartTaskSettings {
   readonly attachments?: readonly TaskAttachmentId[];
   /** The Task-mode completion contract (null / all-false = default path). */
   readonly completionContract?: NativeCompletionContract | null;
+  /**
+   * The client submission UUID of THIS logical submission. A retry of the
+   * same immutable submission (lost response) reuses it so the daemon
+   * returns the original receipt; a success or a typed refusal ends it. A
+   * non-canonical value is never forwarded.
+   */
+  readonly submissionId?: string | null;
 }
 
 /** The typed classification of a refused task start. */
@@ -671,8 +678,10 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
   const contract = hasCompletionSteps(settings.completionContract ?? null)
     ? (settings.completionContract as NativeCompletionContract)
     : null;
+  const submissionId = canonicalSubmissionId(settings.submissionId ?? null);
   const request: StartTaskRunRequest = {
     goal,
+    ...(submissionId !== null ? { submission_id: submissionId } : {}),
     ...(settings.maxTokens > 0 ? { max_tokens: settings.maxTokens } : {}),
     ...(settings.maxCostMicro > 0n
       ? { max_cost_micro: microWireValue(settings.maxCostMicro) }
@@ -1220,6 +1229,334 @@ export class PendingSubmissionRetainer {
   /** Bounded-state probe (tests). */
   size(): number {
     return this.entries.size;
+  }
+}
+
+// ------------------------------------------------- submission single-flight
+
+/**
+ * The canonical wire form of one client submission UUID. Only this shape
+ * participates in daemon-side idempotency: a foreign id can never dedupe a
+ * retried start and is never forwarded.
+ */
+const SUBMISSION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Strict parse of one raw submission id; `null` = absent/foreign shape. */
+export function canonicalSubmissionId(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const value = raw.trim().toLowerCase();
+  return SUBMISSION_ID_PATTERN.test(value) ? value : null;
+}
+
+/**
+ * The immutable snapshot of ONE logical task-start submission: the parsed
+ * pending envelope (goal text, file/attachment payload), the
+ * workspace-relative file list and the completion contract as captured at
+ * admission. Every attempt of that logical submission — including a
+ * transport-failure retry — reuses THIS snapshot, so text typed, or
+ * contract/attachment state mutated, after submit can never join the
+ * pending request.
+ */
+export interface StartSubmissionSnapshot {
+  readonly submissionId: string;
+  readonly pending: PendingSubmission;
+  readonly files: readonly string[];
+  readonly contract: NativeCompletionContract | null;
+}
+
+export type SubmissionStartDecision =
+  | {
+      readonly action: 'start';
+      readonly retry: boolean;
+      readonly snapshot: StartSubmissionSnapshot;
+    }
+  | { readonly action: 'duplicate' }
+  | { readonly action: 'busy'; readonly reason: string };
+
+/** The terminal outcome of one start attempt for the logical submission. */
+export type SubmissionOutcome = 'started' | 'refused' | 'transport';
+
+/**
+ * TRUE when a failed admission may have left a durable receipt (a lost
+ * response) or none at all, so the SAME logical submission must be retried
+ * with the SAME submission id. An explicit 4xx refusal is terminal and
+ * clears the submission — with ONE exception: the daemon's typed `conflict`
+ * naming the SAME submission id as still in flight, which is exactly the
+ * lost-response race, so the id must be kept (a fresh id there would admit
+ * a second durable run).
+ */
+export function submissionRetryable(failure: {
+  readonly status: number | null;
+  readonly message: string;
+}): boolean {
+  if (failure.status === null || failure.status >= 500) {
+    return true;
+  }
+  if (failure.status === 408 || failure.status === 429) {
+    return true;
+  }
+  return failure.status === 409 && /is already in flight/i.test(failure.message);
+}
+
+function sameAttachment(a: PendingBinaryAttachment, b: PendingBinaryAttachment): boolean {
+  return (
+    a.mime === b.mime &&
+    a.filename === b.filename &&
+    a.bytes === b.bytes &&
+    a.dataBase64 === b.dataBase64 &&
+    a.isImage === b.isImage
+  );
+}
+
+/**
+ * Structural equality of two pending envelopes: the retry identity of one
+ * logical submission. Content bytes are compared directly (never by array
+ * index or count only), so a changed attachment, a renamed file or an edited
+ * goal never matches the pending submission. The workspace-relative file
+ * list and the completion contract are gate fields and are compared by the
+ * gate's own helpers.
+ */
+export function samePendingSubmission(a: PendingSubmission, b: PendingSubmission): boolean {
+  if (
+    a.text !== b.text ||
+    a.sessionId !== b.sessionId ||
+    a.draftId !== b.draftId ||
+    a.messageId !== b.messageId ||
+    a.files.length !== b.files.length ||
+    a.attachments.length !== b.attachments.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < a.attachments.length; index += 1) {
+    if (!sameAttachment(a.attachments[index], b.attachments[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sameFileList(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sameContract(
+  a: NativeCompletionContract | null,
+  b: NativeCompletionContract | null,
+): boolean {
+  if (a === null || b === null) {
+    return a === b;
+  }
+  return (
+    a.include_commit === b.include_commit &&
+    a.include_push === b.include_push &&
+    a.include_pr === b.include_pr
+  );
+}
+
+/**
+ * The host single-flight gate of task starts. It holds the ONE in-flight
+ * logical submission and rejects/ignores every other `sendGoal` while that
+ * attempt runs. After a transport failure the snapshot stays RETRYABLE: an
+ * identical resubmission (or an explicit retry of the same incoming id)
+ * restarts the SAME immutable snapshot under the SAME submission id, so the
+ * daemon returns the original receipt instead of admitting a second durable
+ * prompt/run. A success or a typed refusal clears the gate.
+ */
+export class TaskStartGate {
+  private current: {
+    readonly snapshot: StartSubmissionSnapshot;
+    state: 'in_flight' | 'retryable';
+  } | null = null;
+
+  /** TRUE while an attempt of the current logical submission is running. */
+  inFlight(): boolean {
+    return this.current !== null && this.current.state === 'in_flight';
+  }
+
+  /**
+   * Admit one parsed `sendGoal` body. `submissionId` is the optional
+   * client-generated id (canonical UUID or null): a retry naming the exact
+   * pending id restarts the stored snapshot; anything else while an attempt
+   * is in flight is a duplicate (same body) or busy (different body).
+   */
+  admit(input: {
+    readonly submissionId: string | null;
+    readonly pending: PendingSubmission;
+    readonly files: readonly string[];
+    readonly contract: NativeCompletionContract | null;
+    readonly newId: () => string;
+  }): SubmissionStartDecision {
+    const current = this.current;
+    if (current !== null) {
+      const explicitRetry =
+        input.submissionId !== null && input.submissionId === current.snapshot.submissionId;
+      const sameBody =
+        samePendingSubmission(input.pending, current.snapshot.pending) &&
+        sameFileList(input.files, current.snapshot.files) &&
+        sameContract(input.contract, current.snapshot.contract);
+      if (current.state === 'in_flight') {
+        if (explicitRetry || sameBody) {
+          return { action: 'duplicate' };
+        }
+        return {
+          action: 'busy',
+          reason:
+            'another task start is already in flight; the second submission was ignored and ' +
+            'the pending start is unchanged',
+        };
+      }
+      if (explicitRetry && !sameBody) {
+        return {
+          action: 'busy',
+          reason:
+            'a retry of the pending submission arrived with a different body; the pending ' +
+            'submission is unchanged and was not resent',
+        };
+      }
+      if (explicitRetry || sameBody) {
+        current.state = 'in_flight';
+        return { action: 'start', retry: true, snapshot: current.snapshot };
+      }
+    }
+    const snapshot: StartSubmissionSnapshot = {
+      submissionId: input.submissionId ?? input.newId(),
+      pending: input.pending,
+      files: input.files,
+      contract: input.contract,
+    };
+    this.current = { snapshot, state: 'in_flight' };
+    return { action: 'start', retry: false, snapshot };
+  }
+
+  /**
+   * Record the terminal outcome of the current attempt. A transport failure
+   * keeps the snapshot retryable under the same id; every other outcome
+   * (durable acceptance or a typed refusal) clears the logical submission.
+   */
+  settle(submissionId: string, outcome: SubmissionOutcome): void {
+    const current = this.current;
+    if (current === null || current.snapshot.submissionId !== submissionId) {
+      return;
+    }
+    if (outcome === 'transport') {
+      current.state = 'retryable';
+      return;
+    }
+    this.current = null;
+  }
+
+  /** Drop the pending submission (session switch, daemon stop). */
+  reset(): void {
+    this.current = null;
+  }
+}
+
+// -------------------------------------------- evidence-authority cache
+
+/**
+ * Stable JSON encoding: object keys sorted recursively, arrays in order, so
+ * a fingerprint is identity-derived and never depends on key order or
+ * whitespace. Used when a served response carries no explicit fingerprint.
+ */
+export function stableJson(value: unknown): string {
+  return JSON.stringify(stableJsonValue(value)) ?? 'null';
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableJsonValue);
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(record).sort()) {
+      sorted[key] = stableJsonValue(record[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+/** SHA-256 of the stable encoding: the content fingerprint of one read. */
+export function responseFingerprint(value: unknown): string {
+  return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+/**
+ * The AUTHORITY KEY of one verification-detail cache entry. It is durable
+ * identity, never list counts: the task id, the served durable state and
+ * task revision, and a fingerprint of the FULL verification summary
+ * response — so a changed failed-check id, a changed evidence detail or a
+ * changed owed op id invalidates the cache even when every count is
+ * identical.
+ */
+export function verificationAuthorityKey(input: {
+  readonly taskId: string;
+  readonly state: string;
+  readonly revision: string | null;
+  readonly verification: unknown;
+}): string {
+  return [
+    input.taskId,
+    input.state,
+    input.revision ?? '',
+    responseFingerprint(input.verification),
+  ].join('\u0000');
+}
+
+/** The cached read of one authority key: a null view is EXPLICIT unavailable. */
+export interface CachedEvidenceView<T> {
+  readonly view: T | null;
+  readonly unavailable: string | null;
+}
+
+/**
+ * A correctness-sensitive read cache keyed by a durable authority key. A key
+ * change makes every previous read unreachable (`read` returns null and the
+ * caller must fetch), and a failed fetch drops the cached view and records
+ * the explicit unavailable reason. This cache never implements a stale
+ * fallback: data from a previous authority can never be returned without an
+ * explicit `stale: true` marker, which this client does not use.
+ */
+export class EvidenceAuthorityCache<T> {
+  private key: string | null = null;
+  private view: T | null = null;
+  private unavailable: string | null = null;
+
+  read(key: string): CachedEvidenceView<T> | null {
+    if (this.key === null || this.key !== key) {
+      return null;
+    }
+    return { view: this.view, unavailable: this.unavailable };
+  }
+
+  store(key: string, view: T): void {
+    this.key = key;
+    this.view = view;
+    this.unavailable = null;
+  }
+
+  fail(key: string, reason: string): void {
+    this.key = key;
+    this.view = null;
+    this.unavailable = reason;
+  }
+
+  clear(): void {
+    this.key = null;
+    this.view = null;
+    this.unavailable = null;
   }
 }
 

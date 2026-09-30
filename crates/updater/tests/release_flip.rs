@@ -287,7 +287,7 @@ async fn the_running_binary_changes_with_the_activated_release() {
             channel: faktor_updater::Channel::Stable,
             install_root: root.clone(),
             keys: trusted,
-            max_artifact_bytes: 1024 * 1024,
+            max_artifact_bytes: 16 * 1024 * 1024,
             clock_skew_ms: manifest::DEFAULT_CLOCK_SKEW_MS,
             host_os: OS.into(),
             host_arch: ARCH.into(),

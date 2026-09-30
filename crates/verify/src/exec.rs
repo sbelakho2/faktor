@@ -25,6 +25,8 @@ use faktor_core::cancellation::CancellationToken;
 use faktor_core::error::Error;
 use faktor_core::id::SessionId;
 
+use crate::manifest::{read_manifest_bounded, MAX_MANIFEST_READ};
+
 /// How heavy a check is. Drives the execution budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CheckCategory {
@@ -465,11 +467,10 @@ fn build_summary_from_text(excerpt: &str) -> Option<String> {
 // ------------------------------------------------------------------ budget
 
 /// Full-repository builder markers, checked in manifest order. Root-aware
-/// derivation reads ONLY the named manifest files, bounded, and produces
-/// typed specs whose `cwd_rel` pins the exact build directory. Program
-/// availability is NOT checked here — the executor reports Unavailable.
-const MAX_MANIFEST_READ: u64 = 256 * 1024;
-
+/// derivation reads ONLY the named manifest files through the bounded rooted
+/// reader ([`read_manifest_bounded`]) and produces typed specs whose
+/// `cwd_rel` pins the exact build directory. Program availability is NOT
+/// checked here — the executor reports Unavailable.
 fn has_file(files: &[String], marker: &str) -> bool {
     let needle = format!("/{marker}");
     files.iter().any(|f| f == marker || f.ends_with(&needle))
@@ -484,16 +485,17 @@ const C_SOURCES: &[&str] = &[
 ];
 const CMAKE_FILES: &[&str] = &["CMakeLists.txt", "CMakePresets.json"];
 
-/// Bound-read a manifest and probe it for a target line. Never more than
-/// MAX_MANIFEST_READ bytes; a bigger file yields `None` (documented skip —
-/// never a partial parse used as truth).
+/// Bound-read a manifest through the shared rooted reader and probe it for a
+/// target line. Never more than [`MAX_MANIFEST_READ`] bytes; a bigger file
+/// yields `None` (documented skip — never a partial parse used as truth, and
+/// never a read that allocates past the cap first).
 fn manifest_has_target(root: &Path, rel: &str, needles: &[&str]) -> Option<bool> {
     let path = root.join(rel);
     let meta = std::fs::metadata(&path).ok()?;
     if meta.len() > MAX_MANIFEST_READ {
         return None;
     }
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = read_manifest_bounded(root, rel, MAX_MANIFEST_READ).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let mut result = false;
     for line in text.lines().take(4096) {
@@ -900,17 +902,14 @@ fn ninja_build_dir(files: &[String]) -> String {
 }
 
 fn default_preset_name(root: &Path) -> String {
-    // Bounded read of CMakePresets.json; the first configurePreset name is
-    // the deterministic default. Malformed/hostile -> "default" is NOT
-    // guessed: fall back to a plain configure (empty preset list = no
-    // presets usable). The caller's spec builder handles absence.
-    let path = root.join("CMakePresets.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    // Bounded rooted read of CMakePresets.json; the first configurePreset
+    // name is the deterministic default. Malformed/hostile/oversized or
+    // invalid-UTF-8 content -> "default" is NOT guessed: fall back to a
+    // plain configure (empty preset list = no presets usable). The caller's
+    // spec builder handles absence.
+    let Ok(bytes) = read_manifest_bounded(root, "CMakePresets.json", MAX_MANIFEST_READ) else {
         return String::new();
     };
-    if bytes.len() as u64 > MAX_MANIFEST_READ {
-        return String::new();
-    }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return String::new();
     };
@@ -1424,6 +1423,133 @@ mod tests {
         let checks3 = derive_typed_checks(dir3.path(), &names3);
         assert!(checks3.iter().any(|c| c.id == "make_build"), "{checks3:?}");
         assert!(!checks3.iter().any(|c| c.id == "make_test"));
+    }
+
+    #[test]
+    fn cmake_presets_at_the_cap_are_used_and_one_byte_over_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let names: Vec<String> = vec![
+            "CMakeLists.txt".into(),
+            "CMakePresets.json".into(),
+            "src/main.c".into(),
+        ];
+        std::fs::write(
+            root.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\nproject(x)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/main.c"),
+            "int main(void){return 0;}\n",
+        )
+        .unwrap();
+        let json = r#"{"configurePresets":[{"name":"dev"}]}"#;
+        let padded = |len: u64| {
+            let mut s = String::from(json);
+            s.push_str(&" ".repeat((len - json.len() as u64) as usize));
+            s
+        };
+        let configure_args = |checks: &[CheckSpec]| {
+            checks
+                .iter()
+                .find(|c| c.id == "cmake_configure")
+                .expect("configure check")
+                .args
+                .clone()
+        };
+        // Exactly the cap is still accepted: the preset is used.
+        let at_cap = padded(MAX_MANIFEST_READ);
+        assert_eq!(at_cap.len() as u64, MAX_MANIFEST_READ);
+        std::fs::write(root.path().join("CMakePresets.json"), &at_cap).unwrap();
+        let args = configure_args(&derive_typed_checks(root.path(), &names));
+        assert_eq!(args[0], "--preset");
+        assert_eq!(args[1], "dev");
+        // One byte over the cap is refused and cleanly falls back to a
+        // plain configure: never a partial parse, never a guessed preset.
+        let over = padded(MAX_MANIFEST_READ + 1);
+        std::fs::write(root.path().join("CMakePresets.json"), &over).unwrap();
+        let args = configure_args(&derive_typed_checks(root.path(), &names));
+        assert_eq!(args[0], "-S");
+    }
+
+    #[test]
+    fn malformed_cmake_presets_at_the_cap_fall_back_to_plain_configure() {
+        let root = tempfile::tempdir().unwrap();
+        let names: Vec<String> = vec![
+            "CMakeLists.txt".into(),
+            "CMakePresets.json".into(),
+            "src/main.c".into(),
+        ];
+        std::fs::write(
+            root.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\nproject(x)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/main.c"),
+            "int main(void){return 0;}\n",
+        )
+        .unwrap();
+        let mut malformed = String::from(r#"{"configurePresets":[{"name":"#);
+        malformed.push_str(&" ".repeat(MAX_MANIFEST_READ as usize - malformed.len()));
+        assert_eq!(malformed.len() as u64, MAX_MANIFEST_READ);
+        std::fs::write(root.path().join("CMakePresets.json"), &malformed).unwrap();
+        assert_eq!(default_preset_name(root.path()), "");
+        let checks = derive_typed_checks(root.path(), &names);
+        let configure = checks
+            .iter()
+            .find(|c| c.id == "cmake_configure")
+            .expect("configure check");
+        assert_eq!(configure.args[0], "-S");
+    }
+
+    #[test]
+    fn invalid_utf8_cmake_presets_are_a_deterministic_plain_configure() {
+        let root = tempfile::tempdir().unwrap();
+        let names: Vec<String> = vec![
+            "CMakeLists.txt".into(),
+            "CMakePresets.json".into(),
+            "src/main.c".into(),
+        ];
+        std::fs::write(
+            root.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\nproject(x)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/main.c"),
+            "int main(void){return 0;}\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("CMakePresets.json"), vec![0xffu8; 1024]).unwrap();
+        // serde_json requires UTF-8, so invalid bytes are a documented
+        // malformed-JSON fallback — deterministic across calls.
+        assert_eq!(default_preset_name(root.path()), "");
+        assert_eq!(default_preset_name(root.path()), "");
+        let checks = derive_typed_checks(root.path(), &names);
+        let configure = checks
+            .iter()
+            .find(|c| c.id == "cmake_configure")
+            .expect("configure check");
+        assert_eq!(configure.args[0], "-S");
+    }
+
+    #[test]
+    fn invalid_utf8_makefile_probe_is_deterministic_lossy() {
+        let (dir, mut names) = fixture(&[("main.c", "x\n")]);
+        std::fs::write(
+            dir.path().join("Makefile"),
+            b"\xff\xfe\nall:\n\ttrue\ntest:\n\ttrue\n",
+        )
+        .unwrap();
+        names.push("Makefile".into());
+        let first = manifest_has_target(dir.path(), "Makefile", &["test"]);
+        let second = manifest_has_target(dir.path(), "Makefile", &["test"]);
+        assert_eq!(first, Some(true));
+        assert_eq!(first, second);
     }
 
     #[test]

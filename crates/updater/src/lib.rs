@@ -54,6 +54,19 @@ pub mod store;
 pub mod transport;
 pub mod version;
 
+/// The fd-identity exec seam (unix platforms whose libc exposes `fexecve`):
+/// the launcher executes the exact descriptor it hashed. See the module docs.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+mod fd_exec;
+
 pub use channel::{select, Channel, ChannelCandidate};
 pub use compat::{
     check as check_compatibility, CompatibilityReport, Component, RunningComponents, SchemaRange,

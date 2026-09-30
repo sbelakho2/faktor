@@ -756,6 +756,23 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON attachment(session_id, digest, mime, COALESCE(filename, ''), size);
      CREATE INDEX IF NOT EXISTS idx_attachment_blob_order
         ON attachment(session_id, digest, id);",
+    // v26 — durable task-start admission (idempotency finding 1; schema
+    // target 27; array index 26). ONE row per client submission key: the
+    // canonical request digest of the normalized start inputs and, once the
+    // run was accepted, the exact serialized run receipt. A repeated key
+    // with the equal digest replays that receipt byte-for-byte without any
+    // further mutation; a pending row refuses a concurrent duplicate typed;
+    // a different digest (or a foreign session) under the same key is a
+    // typed KeyReused conflict. `receipt_json` is NULL while pending; the
+    // store bounds key/digest/receipt sizes on every write AND read.
+    "CREATE TABLE IF NOT EXISTS task_admission (
+        key TEXT PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending','complete')),
+        receipt_json TEXT,
+        created_ms INTEGER NOT NULL
+     );",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

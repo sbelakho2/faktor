@@ -402,11 +402,12 @@ fn type_defs() -> Vec<TypeDef> {
         },
         TypeDef {
             name: "TaskRunStartRequest",
-            doc: "Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here.",
+            doc: "Strict request body of POST /native/session/{id}/task-runs. The daemon validates every member strictly; money accepts a decimal string or a lossless JSON integer and is documented as json here. `submission_id` is the required client submission UUID of the logical start (idempotency key: a repeated key replays the original run receipt byte-for-byte).",
             unknown_fields: "reject",
             shape: Shape::Struct {
                 fields: vec![
                     text_field("goal"),
+                    text_field("submission_id"),
                     field(
                         "criteria",
                         Ty::List {

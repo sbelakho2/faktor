@@ -1928,10 +1928,14 @@ async fn native_task_run_start_shadowed_drive_keeps_checkout_then_integrates() {
     // POST the strict native start (goal only: absent work_items = one
     // MUTATING main item; absent mutation_mode = the daemon default
     // Shadow).
+    let start_body = serde_json::json!({
+        "goal": "implement the change",
+        "submission_id": "11111111-1111-4111-8111-111111111111",
+    });
     let resp = client
         .post(format!("{base}/native/session/{sid}/task-runs"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"goal": "implement the change"}))
+        .json(&start_body)
         .send()
         .await
         .unwrap();
@@ -2004,6 +2008,36 @@ async fn native_task_run_start_shadowed_drive_keeps_checkout_then_integrates() {
     for key in ["task_id", "run_id", "mode", "goal", "item_ids"] {
         assert_eq!(one.get(key), entry.get(key), "{key}");
     }
+
+    // Idempotency finding 1 through the HTTP edge: the SAME submission id
+    // replays the stored receipt (same run id) without a second prompt or
+    // a second shadow while the first run is still mid-drive.
+    let messages_before_replay = manager
+        .get_session(sid)
+        .unwrap()
+        .unwrap()
+        .message_count()
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/native/session/{sid}/task-runs"))
+        .bearer_auth(token.as_str())
+        .json(&start_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let replay: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(replay["run_id"], start["run_id"], "{replay}");
+    assert_eq!(
+        manager
+            .get_session(sid)
+            .unwrap()
+            .unwrap()
+            .message_count()
+            .unwrap(),
+        messages_before_replay,
+        "the replay enqueues no second prompt"
+    );
 
     // Release the drive; the executor's own isolation pipeline
     // (prepare the candidate from the shadow run base → verify the
@@ -2144,7 +2178,10 @@ async fn native_shadow_run_via_extension_client_session_survives_worktree_id_shi
     let resp = client
         .post(format!("{base}/native/session/{sid}/task-runs"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"goal": "implement the change"}))
+        .json(&serde_json::json!({
+            "goal": "implement the change",
+            "submission_id": "22222222-2222-4222-8222-222222222222",
+        }))
         .send()
         .await
         .unwrap();
@@ -2257,6 +2294,7 @@ async fn native_mutating_multi_agent_task_isolated_then_explicit_integration_and
         .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "goal": "3-stage change",
+            "submission_id": "33333333-3333-4333-8333-333333333333",
             "work_items": [
                 {"id": "analyze", "kind": "Analysis", "ownership": "no_writes"},
                 {
@@ -2512,7 +2550,10 @@ async fn native_ordinary_prompt_uses_the_shadow_executor_and_keeps_the_owner_unt
     let resp = client
         .post(format!("{base}/native/session/{sid}/task-runs"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"goal": "implement the change"}))
+        .json(&serde_json::json!({
+            "goal": "implement the change",
+            "submission_id": "44444444-4444-4444-8444-444444444444",
+        }))
         .send()
         .await
         .unwrap();
@@ -2592,6 +2633,7 @@ async fn native_task_run_start_always_isolates_and_direct_compat_is_a_400() {
         .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "goal": "implement the change",
+            "submission_id": "55555555-5555-4555-8555-555555555555",
             "mutation_mode": "direct_compat",
         }))
         .send()
@@ -2623,6 +2665,7 @@ async fn native_task_run_start_always_isolates_and_direct_compat_is_a_400() {
         .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "goal": "implement the change",
+            "submission_id": "66666666-6666-4666-8666-666666666666",
             "mutation_mode": "shadow",
         }))
         .send()
@@ -2698,25 +2741,36 @@ async fn native_task_run_start_hostile_dtos_are_typed_400s() {
     assert_eq!(resp.status(), 401);
 
     let oversized_goal = "x".repeat(2001);
+    let key = "11111111-1111-4111-8111-111111111111";
+    let oversized_key =
+        "a".repeat(faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES + 1);
     let hostile_bodies: Vec<serde_json::Value> = vec![
         serde_json::json!({}),
-        serde_json::json!({"goal": ""}),
-        serde_json::json!({"goal": "x", "bogus": 1}),
-        serde_json::json!({"goal": "x", "mutation_mode": "nonsense"}),
+        // The REQUIRED submission id: absent, null, empty, oversized,
+        // uppercase, non-hex and non-ASCII shapes are all typed 400s.
+        serde_json::json!({"goal": "x"}),
+        serde_json::json!({"goal": "x", "submission_id": null}),
+        serde_json::json!({"goal": "x", "submission_id": ""}),
+        serde_json::json!({"goal": "x", "submission_id": oversized_key}),
+        serde_json::json!({"goal": "x", "submission_id": "11111111-1111-4111-8111-11111111111Z"}),
+        serde_json::json!({"goal": "x", "submission_id": "not a uuid"}),
+        serde_json::json!({"goal": "", "submission_id": key}),
+        serde_json::json!({"goal": "x", "submission_id": key, "bogus": 1}),
+        serde_json::json!({"goal": "x", "submission_id": key, "mutation_mode": "nonsense"}),
         // The removed direct-owner mode stays a strict DTO 400.
-        serde_json::json!({"goal": "x", "mutation_mode": "direct_compat"}),
-        serde_json::json!({"goal": "x", "mutation_mode": "Shadow"}),
-        serde_json::json!({"goal": "x", "routing_mode": "economy"}),
-        serde_json::json!({"goal": oversized_goal}),
-        serde_json::json!({"goal": "x", "max_tokens": "many"}),
-        serde_json::json!({"goal": "x", "criteria": (0..=faktor_session::MAX_TASK_CRITERIA).map(|i| format!("criterion {i}")).collect::<Vec<_>>()}),
-        serde_json::json!({"goal": "x", "criteria": vec!["c".repeat(faktor_session::MAX_TASK_CRITERION_BYTES + 1)]}),
-        serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "Implementation"}, {"id": "b", "kind": "Implementation"}]}),
-        serde_json::json!({"goal": "x", "work_items": [{"id": "a a/..", "kind": "Analysis"}]}),
-        serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "Analysis"}, {"id": "a", "kind": "Analysis"}]}),
-        serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "NoSuchKind"}]}),
-        serde_json::json!({"goal": "x", "work_items": [{"id": "a", "kind": "Analysis", "extra": 1}]}),
-        serde_json::json!({"goal": "x", "work_items": "not-an-array"}),
+        serde_json::json!({"goal": "x", "submission_id": key, "mutation_mode": "direct_compat"}),
+        serde_json::json!({"goal": "x", "submission_id": key, "mutation_mode": "Shadow"}),
+        serde_json::json!({"goal": "x", "submission_id": key, "routing_mode": "economy"}),
+        serde_json::json!({"goal": oversized_goal, "submission_id": key}),
+        serde_json::json!({"goal": "x", "submission_id": key, "max_tokens": "many"}),
+        serde_json::json!({"goal": "x", "submission_id": key, "criteria": (0..=faktor_session::MAX_TASK_CRITERIA).map(|i| format!("criterion {i}")).collect::<Vec<_>>()}),
+        serde_json::json!({"goal": "x", "submission_id": key, "criteria": vec!["c".repeat(faktor_session::MAX_TASK_CRITERION_BYTES + 1)]}),
+        serde_json::json!({"goal": "x", "submission_id": key, "work_items": [{"id": "a", "kind": "Implementation"}, {"id": "b", "kind": "Implementation"}]}),
+        serde_json::json!({"goal": "x", "submission_id": key, "work_items": [{"id": "a a/..", "kind": "Analysis"}]}),
+        serde_json::json!({"goal": "x", "submission_id": key, "work_items": [{"id": "a", "kind": "Analysis"}, {"id": "a", "kind": "Analysis"}]}),
+        serde_json::json!({"goal": "x", "submission_id": key, "work_items": [{"id": "a", "kind": "NoSuchKind"}]}),
+        serde_json::json!({"goal": "x", "submission_id": key, "work_items": [{"id": "a", "kind": "Analysis", "extra": 1}]}),
+        serde_json::json!({"goal": "x", "submission_id": key, "work_items": "not-an-array"}),
     ];
     for body in hostile_bodies {
         let resp = client
@@ -2741,7 +2795,10 @@ async fn native_task_run_start_hostile_dtos_are_typed_400s() {
     let resp = client
         .post(format!("{base}/native/session/999999/task-runs"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"goal": "x"}))
+        .json(&serde_json::json!({
+            "goal": "x",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+        }))
         .send()
         .await
         .unwrap();
@@ -3272,6 +3329,7 @@ async fn native_task_run_list_state_and_cancel_reflect_the_durable_run() {
         .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "goal": "analyze the module boundaries",
+            "submission_id": "77777777-7777-4777-8777-777777777777",
             "criteria": ["the analysis names the seams"],
             "work_items": [{"id": "a1", "kind": "Analysis"}],
             "max_tokens": 100_000,
@@ -3389,6 +3447,7 @@ async fn native_task_run_cancel_aborts_a_mid_flight_in_session_run() {
         .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "goal": "long-running analysis",
+            "submission_id": "88888888-8888-4888-8888-888888888888",
             "work_items": [{"id": "a1", "kind": "Analysis"}],
         }))
         .send()
