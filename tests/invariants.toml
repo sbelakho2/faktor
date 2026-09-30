@@ -1,0 +1,227 @@
+# Invariant registry (audit release-program item).
+#
+# One [[invariant]] table per high-criticality invariant. Field semantics:
+#   id                stable identifier, INV-<UPPER-KEBAB>
+#   statement         one testable sentence
+#   owner             subsystem / crate path that owns the invariant
+#   authority         production symbol or module that enforces it
+#   unit_test         Rust test fn proving the invariant (crates/** or tests/**)
+#   production_wiring Rust test fn proving the production path is wired to it
+#   fault             optional #[ignore]-gated [fault] campaign fn ("" = none)
+#   mutation_witness  Rust test fn that plants a deliberate violation and
+#                     proves the oracle fires; "" only with a mutation_debt
+#   mutation_debt     one-line reason no witness fn exists ("" when set)
+#   platforms         platforms where the invariant must hold
+#   script_check      literal non-Rust gate: a VS Code selftest step label
+#                     (apps/vscode/scripts/selftest.mjs) or a command line
+#                     wired in a .woodpecker workflow. Replaces
+#                     unit_test/production_wiring for script-level checks.
+#
+# scripts/check-invariants.mjs is the gate: every named Rust fn must exist
+# exactly once across crates/**+tests/**, every script_check must resolve to
+# a selftest step or a wired CI command, and every invariant must either name
+# a mutation_witness or document the mutation_debt.
+
+[[invariant]]
+id = "INV-COMPACTION-SUMMARY-CAP"
+statement = "An oversized compaction summary stream is refused whole: the cap is checked before appending, no truncated prefix is ever accepted, and no provenance is captured."
+owner = "crates/agent runtime/compaction"
+authority = "crates/agent/src/runtime/provider_loop.rs StreamingSummarizer::run (SUMMARY_MAX_CHARS refusal)"
+unit_test = "compaction_summary_one_over_the_cap_is_refused"
+production_wiring = "try_compact_consumes_durable_projection_not_the_transcript"
+fault = ""
+mutation_witness = ""
+mutation_debt = "no planted-violation fixture yet; the boundary tests assert the refusal directly but no mutated oracle accepts over-cap text"
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-MAX-QUALITY-ONE-AUTHORITY"
+statement = "MaximumQuality tier formation reads the same authority-aware effective quality as router qualification: measured outcomes supersede descriptor priors and conservative-unknown authorizes nothing above floor 0."
+owner = "crates/agent routing + crates/router"
+authority = "crates/agent/src/lib.rs EconomicRoutingPolicy::route_maximum_quality; crates/router/src/lib.rs effective_quality_statement"
+unit_test = "maximum_quality_prefers_higher_measured_quality_over_equal_descriptor_priors"
+production_wiring = "maximum_quality_path_consumes_only_qualified_candidates"
+fault = ""
+mutation_witness = "measured_outcomes_supersede_declared_quality_in_both_directions"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-ATTACHMENT-REFERENCE-IDENTITY"
+statement = "Attachment references are keyed by full metadata (digest+mime+filename+size), each reference keeps its own MIME, and identical bytes under different metadata are distinct durable references."
+owner = "crates/store attachments + crates/server native attachments"
+authority = "crates/store/src/attachments.rs Store::put_attachment/attachment_row; crates/server/src/native/attachment.rs native_attachment_upload"
+unit_test = "attachment_references_are_keyed_by_full_metadata_and_survive_reopen"
+production_wiring = "upload_resolve_and_reference_identity_roundtrip_over_the_wire"
+fault = ""
+mutation_witness = "migration_v25_rebuilds_attachment_references_and_preserves_rows"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-ATTACHMENT-SEED-ATOMIC"
+statement = "The task row and its attachment references are seeded in one writer transaction: a hostile task update or reference insert rolls back leaving no task row and no references."
+owner = "crates/store attachments"
+authority = "crates/store/src/attachments.rs Store::seed_task_attachments_txn"
+unit_test = "seed_task_attachments_txn_create_lands_references_and_the_row_together"
+production_wiring = "seed_task_attachments_writer_closure_is_sql_only"
+fault = ""
+mutation_witness = "seed_task_attachments_txn_hostile_task_update_rolls_back_references"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES"
+statement = "A successful store shutdown means every store-owned authority is quiescent; a live maintenance task or an undrained writer yields the typed timeout, never success."
+owner = "crates/store connection"
+authority = "crates/store/src/connection.rs Store::shutdown; crates/store/src/writer.rs WriterService::shutdown"
+unit_test = "shutdown_reports_typed_error_when_maintenance_does_not_drain"
+production_wiring = "shutdown_drains_queued_mutations_deterministically"
+fault = ""
+mutation_witness = "register_after_shutdown_begins_is_refused"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PREPARED-WRITER-JOBS"
+statement = "Production writer-job closures execute SQL only (no filesystem I/O, serialization, hashing, sleeps or clocks) and the writer-job allowlist is empty."
+owner = "tests/static-authority + crates/store writer"
+authority = "tests/static-authority/src/lib.rs writer_job_offenders/WRITER_JOB_FORBIDDEN_MARKERS; crates/store/src/writer.rs WriterService::execute"
+unit_test = "prepared_writer_jobs_never_do_fs_serialization_hashing_sleeps_or_clocks"
+production_wiring = "writer_job_allowlist_is_empty"
+fault = ""
+mutation_witness = "writer_job_scan_fires_on_planted_unprepared_work"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-JOURNAL-INTEGRITY"
+statement = "A journal opens only with seq 1 = SessionCreated/Idle, gapless monotonic sequences and non-decreasing timestamps; torn, renumbered, gapped or drifted journals refuse typed on open and in doctor."
+owner = "crates/store ledger + crates/session handle"
+authority = "crates/store/src/ledger.rs Store::journal_session_problems; crates/session/src/handle.rs SessionHandle::journal_verify_open"
+unit_test = "journal_session_problems_flag_each_open_invariant"
+production_wiring = "journal_verify_open_maps_a_torn_journal_to_the_typed_corruption_surface"
+fault = "full_store_journal_boundaries"
+mutation_witness = "journal_consistency_flags_later_event_masquerading_as_seq_one"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CREATE-SESSION-SEED-ATOMIC"
+statement = "create_session commits the session row and its seq-1 SessionCreated seed event in one transaction; aborting at any pre-commit seam leaves neither and post-commit leaves both."
+owner = "crates/store sessions"
+authority = "crates/store/src/sessions.rs Store::create_session"
+unit_test = "create_session_seams_never_leave_a_row_without_its_seed_event"
+production_wiring = "reopen_replays_state_from_journal"
+fault = "full_session_command_boundaries"
+mutation_witness = "crash_at_each_seam_reopens_exactly_old_or_exactly_new"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-PERSISTENCE-SIGNED-DOMAIN"
+statement = "Page limits and monotonic sequences never cross the SQLite signed domain unchecked: event/ledger reads clamp or refuse typed and no production source casts a limit or sequence with `as i64`/`as u64` outside a checked conversion."
+owner = "crates/store persistence + tests/static-authority"
+authority = "crates/store/src/ledger.rs events_after/events_range/ledger append checked conversions; tests/static-authority/src/lib.rs unchecked_persistence_cast_offenders"
+unit_test = "event_page_cursors_and_limits_never_wrap_the_signed_domain"
+production_wiring = "ledger_page_limits_refuse_above_the_signed_range"
+fault = ""
+mutation_witness = "persistence_limits_and_sequences_are_never_cast_unchecked"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-TASK-START-IDEMPOTENT"
+statement = "One submission key admits one task: a completed key replays the byte-identical receipt with zero mutations, a pending key refuses in-flight, and a reused key with a different digest is the typed KeyReused."
+owner = "crates/store task_admission + crates/orchestrator task_executor"
+authority = "crates/store/src/task_admission.rs Store::task_admission_claim; crates/orchestrator/src/task_executor/mod.rs TaskExecutor::start_task"
+unit_test = "claim_fresh_then_complete_replays_the_exact_receipt_bytes"
+production_wiring = "submission_key_replay_returns_the_byte_identical_receipt_without_a_second_run"
+fault = ""
+mutation_witness = "same_key_with_a_different_digest_is_key_reused_even_before_completion"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-TRANSCRIPT-SCROLL-OWNERSHIP"
+statement = "A background transcript refresh never steals an unpinned reader's position: only the initial load, a pinned view and the user's own submission pin to the bottom."
+owner = "apps/vscode webview transcript"
+authority = "apps/vscode/media/chat.js renderTranscript/transcriptScrollPlan"
+script_check = "background refresh with no transcript delta mutates zero scroll and keeps evidence"
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VERIFICATION-CACHE-FRESHNESS"
+statement = "No proof/verification cache returns data after its authority key changed: a failed fetch is explicitly unavailable and a stale view is unreachable."
+owner = "apps/vscode verification cache"
+authority = "apps/vscode/src/taskStart.ts EvidenceAuthorityCache/verificationAuthorityKey; apps/vscode/src/extension.ts taskVerificationFor/taskProofFor"
+script_check = "architectural: no proof-like cache returns data after its authority key changed"
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-MANIFEST-READ-BOUNDED"
+statement = "Build-manifest reads go through one rooted bounded reader: literal-size refusal, take(max+1), no-follow and non-regular refusal, and no raw fs::read/read_to_end in the production verify crate."
+owner = "crates/verify manifest"
+authority = "crates/verify/src/manifest.rs read_manifest_bounded"
+unit_test = "huge_sparse_manifest_is_refused_from_literal_metadata_bounded"
+production_wiring = "verification_manifest_reads_are_bounded_and_rooted"
+fault = ""
+mutation_witness = "manifest_read_scan_fires_on_planted_raw_reads"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-UPDATER-EXEC-IDENTITY"
+statement = "The updater executes the verified inode: a binary swapped between verification and exec never executes, and a group/other-writable or symlinked install ancestor refuses the launch."
+owner = "crates/updater release/fd_exec"
+authority = "crates/updater/src/release.rs launch/verify_install_ancestry; crates/updater/src/fd_exec.rs exec_verified_fd"
+unit_test = "a_binary_swapped_between_verification_and_exec_never_executes"
+production_wiring = "launch_refuses_a_group_or_other_writable_install_ancestor"
+fault = ""
+mutation_witness = "a_binary_swapped_between_verification_and_exec_never_executes"
+mutation_debt = ""
+platforms = ["linux", "macos"]
+
+[[invariant]]
+id = "INV-MEMO-READ-ONLY-VIEW"
+statement = "The router's per-route outcome memo is a read-only snapshot implementing only OutcomeView: no append path, one consistent view per route, and a fresh memo per route."
+owner = "crates/router outcomes"
+authority = "crates/router/src/outcomes.rs MemoOutcomeStore"
+unit_test = "memo_outcome_store_is_a_read_only_view_scoped_to_one_route"
+production_wiring = "store_backed_outcomes_serve_routing_after_reopen_and_failures_flip_cheap_to_strong"
+fault = ""
+mutation_witness = ""
+mutation_debt = "no planted-violation fixture: immutability holds by the absent append path (type system) plus the snapshot assertions inside the invariant test"
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-DURABLE-CORRUPTION-LOUD"
+statement = "Durable corruption is loud and distinct: present-but-corrupt rows are Corrupt/CorruptDurableState, genuine state conflicts are Conflict, and failed reads are the typed store error, never absent, defaulted or satisfied."
+owner = "crates/store + crates/session task"
+authority = "crates/store/src/lib.rs StoreError::Corrupt/Conflict; crates/session/src/task/mod.rs TaskError::CorruptDurableState"
+unit_test = "missing_corrupt_and_failed_durable_reads_are_distinct"
+production_wiring = "corrupt_journals_refuse_open_list_and_recovery_typed"
+fault = ""
+mutation_witness = "corrupt_injected_rows_are_loud_never_guessed"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-QUEUE-ADMISSION-FILES"
+statement = "Queue-head admission accepts ordinary non-empty string file arrays (and the empty array) exactly once and refuses non-string JSON typed with zero mutation."
+owner = "crates/store queue admission + crates/agent turn queue"
+authority = "crates/store/src/ledger.rs Store::admit_queue_head"
+unit_test = "queue_admission_files_column_accepts_only_json_string_arrays"
+production_wiring = "second_prompt_while_active_is_queued_and_delivered_after"
+fault = ""
+mutation_witness = ""
+mutation_debt = "the accept/refuse matrix lives inside the invariant test; no separate planted-oracle fixture"
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-GENERATED-DTO-PARITY"
+statement = "The generated protocol DTOs and parsers match the checked-in canonical schema artifact; --check-clients fails on any drift."
+owner = "scripts/protocol-codegen"
+authority = "scripts/protocol-codegen.mjs --check-clients (wired in .woodpecker/trusted/trusted.yaml vscode lane)"
+script_check = "node scripts/protocol-codegen.mjs --check-clients"
+platforms = ["linux"]
