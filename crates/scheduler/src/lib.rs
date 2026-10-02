@@ -21,7 +21,6 @@
 //! operation deadline instead of sleeping blind.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -34,6 +33,9 @@ use faktor_core::resource::{ResourceClass, ResourceGauge, ResourceLimits};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OwnershipSet(Vec<String>);
+
+#[path = "path_identity.rs"]
+mod path_identity;
 
 impl OwnershipSet {
     pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
@@ -50,34 +52,6 @@ impl OwnershipSet {
     /// The canonical sorted path list (for ledger/journal bookkeeping).
     pub fn entries(&self) -> &[String] {
         &self.0
-    }
-
-    /// Resolve every entry against `base` (real `canonicalize` when the path
-    /// exists, lexical join otherwise) so spellings like `src/../src/a.rs`
-    /// collapse to one canonical path. Entries with a trailing `/` stay
-    /// directory markers and keep their directory semantics.
-    pub fn canonicalized(&self, base: &Path) -> Self {
-        let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-        let mut v: Vec<String> = Vec::new();
-        for p in &self.0 {
-            let is_dir = p.ends_with('/');
-            let trimmed = p.trim_end_matches('/');
-            if trimmed.is_empty() {
-                continue;
-            }
-            let joined = base.join(trimmed);
-            let canon = std::fs::canonicalize(&joined).unwrap_or(joined);
-            let mut s = canon.to_string_lossy().to_string();
-            if is_dir {
-                s.push('/');
-            }
-            v.push(s);
-            // keep the raw form; comparison normalizes per-platform in
-            // `path_overlaps` (Windows: verbatim/case/separators).
-        }
-        v.sort();
-        v.dedup();
-        Self(v)
     }
 
     /// True when both sets touch any common path (edits must serialize).

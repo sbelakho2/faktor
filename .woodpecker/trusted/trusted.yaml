@@ -87,7 +87,13 @@
 # attestation step.
 #
 # Commit-status contexts (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
-#   push: ci/woodpecker/push/trusted   tag: ci/woodpecker/tag/trusted
+#   push: ci/faktor/trusted-certified   tag: ci/faktor/tag-certified
+#
+# Matrix status semantics (Woodpecker 3.x): a matrix workflow publishes one
+# status PER AXIS (contexts like `ci/woodpecker/push/trusted/<axis_id>`).
+# Those per-axis contexts are informational; branch protection and release
+# certification require ONLY the dedicated non-matrix aggregate below, which
+# the certificate step publishes after every required lane passed.
 
 matrix:
   platform:
@@ -752,7 +758,7 @@ steps:
         fi
         node scripts/certification/publish-status.mjs publish \
           --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" \
-          --context "${CI_STATUS_CONTEXT:-ci/woodpecker/push/trusted}" \
+          --context "${CI_STATUS_CONTEXT:-ci/faktor/trusted-certified}" \
           --state "$state" --description "$description" \
           --target-url "${CI_PIPELINE_URL:-https://woodpecker.invalid/pipelines/$CI_PIPELINE_NUMBER}"
 
