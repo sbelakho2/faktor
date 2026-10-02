@@ -30,8 +30,8 @@ authority = "crates/agent/src/runtime/provider_loop.rs StreamingSummarizer::run 
 unit_test = "compaction_summary_one_over_the_cap_is_refused"
 production_wiring = "try_compact_consumes_durable_projection_not_the_transcript"
 fault = ""
-mutation_witness = ""
-mutation_debt = "no planted-violation fixture yet; the boundary tests assert the refusal directly but no mutated oracle accepts over-cap text"
+mutation_witness = "compaction_cap_guard_is_pinned_against_mutation"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -148,6 +148,8 @@ statement = "A background transcript refresh never steals an unpinned reader's p
 owner = "apps/vscode webview transcript"
 authority = "apps/vscode/media/chat.js renderTranscript/transcriptScrollPlan"
 script_check = "background refresh with no transcript delta mutates zero scroll and keeps evidence"
+mutation_witness = "an unpinned reader keeps the first visible entry and pixel offset"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -156,6 +158,8 @@ statement = "No proof/verification cache returns data after its authority key ch
 owner = "apps/vscode verification cache"
 authority = "apps/vscode/src/taskStart.ts EvidenceAuthorityCache/verificationAuthorityKey; apps/vscode/src/extension.ts taskVerificationFor/taskProofFor"
 script_check = "architectural: no proof-like cache returns data after its authority key changed"
+mutation_witness = "a failed fetch after an authority change never returns the previous view"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -180,7 +184,7 @@ production_wiring = "launch_refuses_a_group_or_other_writable_install_ancestor"
 fault = ""
 mutation_witness = "a_binary_swapped_between_verification_and_exec_never_executes"
 mutation_debt = ""
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-MEMO-READ-ONLY-VIEW"
@@ -190,8 +194,8 @@ authority = "crates/router/src/outcomes.rs MemoOutcomeStore"
 unit_test = "memo_outcome_store_is_a_read_only_view_scoped_to_one_route"
 production_wiring = "store_backed_outcomes_serve_routing_after_reopen_and_failures_flip_cheap_to_strong"
 fault = ""
-mutation_witness = ""
-mutation_debt = "no planted-violation fixture: immutability holds by the absent append path (type system) plus the snapshot assertions inside the invariant test"
+mutation_witness = "memo_read_only_view_is_pinned_against_mutation"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -214,8 +218,8 @@ authority = "crates/store/src/ledger.rs Store::admit_queue_head"
 unit_test = "queue_admission_files_column_accepts_only_json_string_arrays"
 production_wiring = "second_prompt_while_active_is_queued_and_delivered_after"
 fault = ""
-mutation_witness = ""
-mutation_debt = "the accept/refuse matrix lives inside the invariant test; no separate planted-oracle fixture"
+mutation_witness = "queue_file_array_predicate_is_pinned_against_mutation"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -224,4 +228,86 @@ statement = "The generated protocol DTOs and parsers match the checked-in canoni
 owner = "scripts/protocol-codegen"
 authority = "scripts/protocol-codegen.mjs --check-clients (wired in .woodpecker/trusted/trusted.yaml vscode lane)"
 script_check = "node scripts/protocol-codegen.mjs --check-clients"
+mutation_witness = "node scripts/protocol-codegen.mjs --check-clients"
+mutation_debt = ""
 platforms = ["linux"]
+
+[[invariant]]
+id = "INV-IDE-SSE-FRAME-BOUNDED"
+statement = "An SSE frame is bounded by cumulative UTF-8 bytes across data/event/id/comment lines: an unterminated frame made of endless short lines is refused with bounded retention, an exactly-at-cap frame is accepted, and a durable oversized frame becomes a terminal protocol block."
+owner = "apps/vscode event stream"
+authority = "apps/vscode/src/eventStream.ts cumulative frame budget"
+script_check = "one hundred thousand tiny data lines are refused early with bounded retention"
+mutation_witness = "frame budget: exactly max cumulative bytes is accepted, one line above is refused"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-IDE-SSE-BLOCKED-DURABLE"
+statement = "A malformed, oversized, cursor-impossible or version-unknown DURABLE SSE frame enters a stable blocked state instead of an endless reconnect/replay loop, and a following valid frame is never silently delivered."
+owner = "apps/vscode event stream"
+authority = "apps/vscode/src/eventStream.ts ProtocolBlocked"
+script_check = "an oversized durable frame blocks and a following valid frame is never delivered"
+mutation_witness = "an oversized durable frame blocks and a following valid frame is never delivered"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-IDE-SSE-BLOCKED-DURABLE-JB"
+statement = "The JetBrains client latches a typed ProtocolBlocked for malformed/discriminator/cursor/version/oversized durable frames, stops reconnecting, and resumes only through explicit recovery at the unadvanced cursor."
+owner = "apps/jetbrains event stream"
+authority = "apps/jetbrains/backend NativeEventStream.kt ProtocolBlocked"
+script_check = "assertSseBlockedShape"
+mutation_witness = "assertSseBlockedRecovery"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED"
+statement = "IDE subprocess helpers drain output concurrently under a hard byte cap while waiting, so a child producing many pipe capacities cannot deadlock lifecycle authority; a timeout kills and reaps."
+owner = "apps/jetbrains process manager"
+authority = "apps/jetbrains/backend BackendProcessManager.kt BoundedDrainer/runCommand"
+script_check = "assertCommandDrain"
+mutation_witness = "assertCommandDrain"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-ATTACHMENT-UI-REACHABILITY"
+statement = "Binary attachments are reachable from the real VS Code composer: the markup ships the attachment surface and the DOM->sendGoal->validator->upload->durable-ref->task-start path works; removing the control or dropping attachments from the payload fails the gate."
+owner = "apps/vscode composer"
+authority = "apps/vscode/src/webview.ts + media/chat.js + src/extension.ts attachment envelope"
+script_check = "DOM -> sendGoal -> validator -> upload -> durable ids -> task start (mutation witness)"
+mutation_witness = "DOM -> sendGoal -> validator -> upload -> durable ids -> task start (mutation witness)"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES"
+statement = "Stopping the event stream is prompt at the maximum reconnect backoff: the abort-aware delay ends, no later fetch occurs, and zero timer/connection authority remains."
+owner = "apps/vscode event stream"
+authority = "apps/vscode/src/eventStream.ts abortableDelay/stop"
+script_check = "stop() during the maximum backoff is prompt with no later fetch"
+mutation_witness = "stop() during the maximum backoff is prompt with no later fetch"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-ACCESSIBILITY"
+statement = "The composer goal control has a real accessible name and the transcript is a polite log live region that announces additions without re-announcing history."
+owner = "apps/vscode webview"
+authority = "apps/vscode/src/webview.ts label/role=log"
+script_check = "the real composer markup ships the attachment surface, the a11y log and recovery affordances"
+mutation_witness = "the transcript live region appends only new entries"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VSCODE-KEYBOARD-SUBMISSION"
+statement = "The VS Code composer is fully keyboard-operable: Enter inserts a newline, Ctrl/Cmd+Enter starts, Escape dismisses, and focus returns after success."
+owner = "apps/vscode webview"
+authority = "apps/vscode/media/chat.js key handling"
+script_check = "Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns"
+mutation_witness = "Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns"
+mutation_debt = ""
+platforms = ["linux", "macos", "windows"]

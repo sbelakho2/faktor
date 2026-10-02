@@ -17,6 +17,7 @@
 package dev.faktor.frontend
 
 import dev.faktor.backend.NativeSseEvent
+import dev.faktor.backend.ProtocolBlocked
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
@@ -1784,6 +1785,16 @@ class FaktorChatPanel(
             historyPanel.setConnection(
                 service.daemonDescription(), status, service.streamCursor(), service.currentSessionId()
             )
+        }
+    }
+
+    override fun onStreamBlocked(block: ProtocolBlocked) {
+        onEdt {
+            // Stable durable-stream block: the stream stopped reconnecting and
+            // the cursor did not move past the offending event. Surface the
+            // typed class and the explicit recovery affordances.
+            appendSystem("stream blocked (${block.kind}) at cursor ${block.cursor}: ${block.detail}")
+            appendSystem("recovery: ${block.recovery.joinToString(" / ")}")
         }
     }
 

@@ -265,6 +265,59 @@ details summary {
   gap: 4px;
 }
 
+.composer-label {
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+#attachment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
+}
+
+.attachment-refused {
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+}
+
+.attachment-label {
+  flex: 1;
+  word-break: break-all;
+}
+
+.attachment-refusal {
+  flex-basis: 100%;
+  font-size: 0.9em;
+}
+
+.attachment-remove {
+  font-size: 0.85em;
+  padding: 1px 6px;
+}
+
+#stream-recovery {
+  border-color: var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
+}
+
+#stream-recovery-reason {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 4px;
+}
+
 #goal {
   width: 100%;
   box-sizing: border-box;

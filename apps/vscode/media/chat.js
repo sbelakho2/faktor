@@ -21,6 +21,19 @@
   var transcriptKey = null;
   var transcriptPinRequested = false;
   var TRANSCRIPT_PIN_SLACK_PX = 24;
+  // Host-side attachment metadata (id + filename + mime + size only: the
+  // host owns the bytes). Paste/drop bytes transit once through the webview,
+  // bounded; a picker selection never ships base64 through here.
+  var attachments = [];
+  // The logical submission identity: one id per immutable submitted body
+  // (goal + attachment ids), so a transport-failure retry reuses it and a
+  // changed draft starts a fresh logical submission.
+  var submission = null;
+  var currentSessionId = null;
+  var streamBlockedReason = null;
+  var WEBVIEW_MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
+  var WEBVIEW_MAX_ATTACHMENTS = 8;
+  var B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
   function byId(id) {
     return document.getElementById(id);
@@ -627,6 +640,7 @@
       // background snapshot.
       return;
     }
+    var previousKey = transcriptKey;
     var plan = transcriptScrollPlan({
       scrollHeight: container.scrollHeight,
       scrollTop: container.scrollTop,
@@ -637,19 +651,37 @@
     // entry and its pixel offset across the rebuild.
     var pin = transcriptKey === null || plan.pinned || transcriptPinRequested;
     var anchor = pin ? null : transcriptAnchorOf(container);
-    clear(container);
+    // A strict prefix extension (the common snapshot append) adds ONLY the
+    // new entries: existing DOM nodes are never re-inserted, so the live
+    // region announces additions instead of re-announcing the history.
+    var appended =
+      previousKey !== null &&
+      previousKey !== 'empty' &&
+      key.length > previousKey.length &&
+      key.indexOf(previousKey) === 0 &&
+      container.children.length > 0 &&
+      entries.length >= container.children.length;
+    if (appended) {
+      for (var a = container.children.length; a < entries.length; a++) {
+        container.appendChild(renderEntry(entries[a]));
+      }
+    } else {
+      clear(container);
+      if (!entries || entries.length === 0) {
+        transcriptKey = key;
+        transcriptPinRequested = false;
+        line(container, 'No messages yet.', 'muted');
+        if (pin) {
+          container.scrollTop = 0;
+        }
+        return;
+      }
+      for (var i = 0; i < entries.length; i++) {
+        container.appendChild(renderEntry(entries[i]));
+      }
+    }
     transcriptKey = key;
     transcriptPinRequested = false;
-    if (!entries || entries.length === 0) {
-      line(container, 'No messages yet.', 'muted');
-      if (pin) {
-        container.scrollTop = 0;
-      }
-      return;
-    }
-    for (var i = 0; i < entries.length; i++) {
-      container.appendChild(renderEntry(entries[i]));
-    }
     if (pin) {
       container.scrollTop = container.scrollHeight;
     } else {
@@ -739,14 +771,275 @@
     setText('daemon-text', text);
   }
 
+  // ---------------------------------------------------------- attachments
+
+  function newSubmissionId() {
+    if (typeof crypto !== 'undefined' && crypto && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    var hex = '0123456789abcdef';
+    function block(length) {
+      var out = '';
+      for (var i = 0; i < length; i++) {
+        out += hex.charAt(Math.floor(Math.random() * 16));
+      }
+      return out;
+    }
+    return block(8) + '-' + block(4) + '-4' + block(3) + '-a' + block(3) + '-' + block(12);
+  }
+
+  function formatBytes(value) {
+    if (typeof value !== 'number' || !isFinite(value) || value < 0) {
+      return '?';
+    }
+    if (value < 1024) {
+      return String(value) + ' B';
+    }
+    if (value < 1024 * 1024) {
+      return (value / 1024).toFixed(1) + ' KiB';
+    }
+    return (value / (1024 * 1024)).toFixed(1) + ' MiB';
+  }
+
+  function sanitizeAttachment(raw) {
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+    if (typeof raw.id !== 'string' || raw.id.length === 0 || raw.id.length > 128) {
+      return null;
+    }
+    var bytes =
+      typeof raw.bytes === 'number' && isFinite(raw.bytes) && raw.bytes >= 0 ? raw.bytes : 0;
+    return {
+      id: raw.id,
+      filename: typeof raw.filename === 'string' ? raw.filename.slice(0, 255) : null,
+      mime: typeof raw.mime === 'string' ? raw.mime.slice(0, 128) : '',
+      bytes: bytes,
+      isImage: raw.isImage === true,
+      refusal: typeof raw.refusal === 'string' && raw.refusal.length > 0 ? raw.refusal : null,
+    };
+  }
+
+  function setAttachments(items) {
+    var next = [];
+    if (Array.isArray(items)) {
+      for (var i = 0; i < items.length && next.length < WEBVIEW_MAX_ATTACHMENTS; i++) {
+        var item = sanitizeAttachment(items[i]);
+        if (item) {
+          next.push(item);
+        }
+      }
+    }
+    attachments = next;
+    renderAttachments();
+  }
+
+  function renderAttachments() {
+    var list = byId('attachment-list');
+    var clearButton = byId('btn-clear-attachments');
+    var notice = byId('attachment-notice');
+    if (!list || !clearButton) {
+      return;
+    }
+    clear(list);
+    var firstRefusal = null;
+    for (var i = 0; i < attachments.length; i++) {
+      (function (item) {
+        var row = document.createElement('li');
+        row.className = 'attachment' + (item.refusal ? ' attachment-refused' : '');
+        row.setAttribute('data-attachment-id', item.id);
+        var label = document.createElement('span');
+        label.className = 'attachment-label';
+        label.textContent =
+          (item.filename || '(unnamed)') + ' · ' + item.mime + ' · ' + formatBytes(item.bytes);
+        row.appendChild(label);
+        if (item.refusal) {
+          if (firstRefusal === null) {
+            firstRefusal = item.refusal;
+          }
+          var refusal = document.createElement('span');
+          refusal.className = 'attachment-refusal warn';
+          refusal.textContent = item.refusal;
+          row.appendChild(refusal);
+        }
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'attachment-remove';
+        remove.textContent = 'Remove';
+        remove.setAttribute('aria-label', 'Remove attachment ' + (item.filename || item.mime));
+        remove.disabled = submitting;
+        remove.addEventListener('click', function () {
+          if (submitting) {
+            return;
+          }
+          vscode.postMessage({ type: 'removeAttachment', id: item.id });
+        });
+        row.appendChild(remove);
+        list.appendChild(row);
+      })(attachments[i]);
+    }
+    clearButton.hidden = attachments.length === 0;
+    clearButton.disabled = submitting;
+    if (notice) {
+      notice.hidden = firstRefusal === null;
+      notice.textContent = firstRefusal === null ? '' : 'Attachment refused: ' + firstRefusal;
+    }
+  }
+
+  function resetSubmissionIdentity() {
+    submission = null;
+  }
+
+  /** The immutable submitted body identity (goal + attachment id order). */
+  function bodyKeyOf(goal) {
+    var ids = [];
+    for (var i = 0; i < attachments.length; i++) {
+      ids.push(attachments[i].id);
+    }
+    return goal + '\u0000' + ids.join(',');
+  }
+
+  function ensureSubmission(goal) {
+    var key = bodyKeyOf(goal);
+    if (submission === null || submission.bodyKey !== key) {
+      submission = { id: newSubmissionId(), bodyKey: key };
+    }
+    return submission.id;
+  }
+
+  function base64FromBytes(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i += 3) {
+      var b0 = bytes[i];
+      var b1 = i + 1 < bytes.length ? bytes[i + 1] : -1;
+      var b2 = i + 2 < bytes.length ? bytes[i + 2] : -1;
+      out += B64_ALPHABET.charAt(b0 >> 2);
+      out += B64_ALPHABET.charAt(((b0 & 3) << 4) | (b1 >= 0 ? b1 >> 4 : 0));
+      out += b1 >= 0 ? B64_ALPHABET.charAt(((b1 & 15) << 2) | (b2 >= 0 ? b2 >> 6 : 0)) : '=';
+      out += b2 >= 0 ? B64_ALPHABET.charAt(b2 & 63) : '=';
+    }
+    return out;
+  }
+
+  function readAttachmentFile(file) {
+    if (file && typeof file.arrayBuffer === 'function') {
+      return file.arrayBuffer().then(function (buffer) {
+        return new Uint8Array(buffer);
+      });
+    }
+    return Promise.reject(new Error('file bytes are unavailable in this webview'));
+  }
+
+  function ingestFiles(fileList) {
+    if (submitting || !fileList || fileList.length === 0) {
+      return;
+    }
+    var room = WEBVIEW_MAX_ATTACHMENTS - attachments.length;
+    if (room <= 0) {
+      showNotice('error', 'attachment limit reached (' + WEBVIEW_MAX_ATTACHMENTS + ')');
+      return;
+    }
+    var reads = [];
+    var refused = [];
+    for (var i = 0; i < fileList.length && reads.length < room; i++) {
+      (function (file) {
+        var name =
+          typeof file.name === 'string' && file.name.length > 0 ? file.name.slice(0, 255) : null;
+        var size = typeof file.size === 'number' ? file.size : -1;
+        if (size < 0 || size > WEBVIEW_MAX_ATTACHMENT_BYTES) {
+          refused.push(name || '(unnamed)');
+          return;
+        }
+        var mime =
+          typeof file.type === 'string' && file.type.length > 0
+            ? file.type.slice(0, 128)
+            : 'application/octet-stream';
+        reads.push(
+          readAttachmentFile(file).then(function (bytes) {
+            if (bytes.byteLength > WEBVIEW_MAX_ATTACHMENT_BYTES) {
+              refused.push(name || '(unnamed)');
+              return null;
+            }
+            return {
+              filename: name,
+              mime: mime,
+              bytes: bytes.byteLength,
+              dataBase64: base64FromBytes(bytes),
+            };
+          }),
+        );
+      })(fileList[i]);
+    }
+    if (reads.length === 0) {
+      showNotice(
+        'error',
+        'attachment refused: ' +
+          refused.join(', ') +
+          ' exceeds the ' +
+          formatBytes(WEBVIEW_MAX_ATTACHMENT_BYTES) +
+          ' bound',
+      );
+      return;
+    }
+    Promise.all(reads)
+      .then(function (items) {
+        var ready = [];
+        for (var i = 0; i < items.length; i++) {
+          if (items[i] !== null) {
+            ready.push(items[i]);
+          }
+        }
+        if (refused.length > 0) {
+          showNotice('error', 'attachment refused: ' + refused.join(', '));
+        }
+        if (ready.length > 0) {
+          vscode.postMessage({ type: 'attachData', items: ready });
+        }
+      })
+      .catch(function (error) {
+        showNotice('error', 'attachment read failed: ' + (error && error.message ? error.message : error));
+      });
+  }
+
+  function renderStreamRecovery(status) {
+    var section = byId('stream-recovery');
+    if (!section) {
+      return;
+    }
+    if (status === 'protocol_blocked') {
+      section.hidden = false;
+      setText('stream-recovery-reason', streamBlockedReason || 'the durable event stream is blocked');
+      return;
+    }
+    section.hidden = true;
+  }
+
+  function dismissTransient() {
+    var notice = byId('attachment-notice');
+    if (notice) {
+      notice.hidden = true;
+    }
+  }
+
   function renderSnapshot(snapshot) {
     if (!snapshot) {
       return;
     }
+    var sessionId = snapshot.session ? String(snapshot.session.id) : null;
+    if (currentSessionId !== null && sessionId !== currentSessionId) {
+      // The host clears its store on a session switch (uploads are bound to
+      // the session); the panel drops the same visible set and the pending
+      // submission identity so a stale id can never leak into a new session.
+      attachments = [];
+      resetSubmissionIdentity();
+      renderAttachments();
+    }
+    currentSessionId = sessionId;
     setDaemon(snapshot.daemon, snapshot.daemonDetail);
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', snapshot.streamStatus);
+    renderStreamRecovery(snapshot.streamStatus);
     renderTask(snapshot.task, snapshot.cockpit);
     renderCockpit(snapshot.cockpit, snapshot.cockpitSections);
     renderAgents(snapshot.agents);
@@ -786,10 +1079,11 @@
 
   /**
    * The composer submitting lock. While a logical submission awaits its
-   * explicit result, Run task / New task and every completion-contract or
-   * attachment control is disabled; the goal textarea stays editable, but
-   * text typed while pending can never join the pending request. Every
-   * outcome (success, typed refusal, transport failure) re-enables.
+   * explicit result, Run task / New task, every completion-contract control
+   * and the whole attachment surface (attach, clear, per-item remove) is
+   * disabled; the goal textarea stays editable, but text typed while pending
+   * can never join the pending request. Every outcome (success, typed
+   * refusal, transport failure) re-enables.
    */
   function setSubmitting(value) {
     submitting = value;
@@ -800,8 +1094,7 @@
       'contract-push',
       'contract-pr',
       'btn-attach',
-      'attachment-input',
-      'files-input',
+      'btn-clear-attachments',
     ];
     for (var i = 0; i < ids.length; i++) {
       var node = byId(ids[i]);
@@ -809,6 +1102,7 @@
         node.disabled = value;
       }
     }
+    renderAttachments();
   }
 
   window.addEventListener('message', function (event) {
@@ -820,18 +1114,40 @@
     } else if (message.type === 'startResult') {
       // The explicit result releases the submitting lock on EVERY outcome.
       setSubmitting(false);
+      var ok = message.ok === true;
       var goalNode = byId('goal');
       if (goalNode) {
-        goalNode.value = composerPolicy.afterStart(
-          goalNode.value,
-          message.goal,
-          message.ok === true,
-        );
+        goalNode.value = composerPolicy.afterStart(goalNode.value, message.goal, ok);
       }
-      // The completion contract is per task start: a successful ack resets
-      // the checkboxes; a failure keeps them for the retry.
-      if (message.ok === true) {
+      if (ok) {
+        // Durable acceptance: the host cleared its store, the panel drops
+        // the visible set and the submission identity, and focus returns to
+        // the composer for the next task.
+        attachments = [];
+        resetSubmissionIdentity();
+        renderAttachments();
+        // The completion contract is per task start: a successful ack
+        // resets the checkboxes; a failure keeps them for the retry.
         clearCompletionControls();
+        if (goalNode && typeof goalNode.focus === 'function') {
+          goalNode.focus();
+        }
+      }
+    } else if (message.type === 'attachments') {
+      setAttachments(message.items);
+    } else if (message.type === 'attachmentsCleared') {
+      attachments = [];
+      resetSubmissionIdentity();
+      renderAttachments();
+    } else if (message.type === 'streamBlocked') {
+      streamBlockedReason =
+        typeof message.reason === 'string' && message.reason.length > 0 ? message.reason : null;
+      if (streamBlockedReason !== null) {
+        var recovery = byId('stream-recovery');
+        if (recovery) {
+          recovery.hidden = false;
+        }
+        setText('stream-recovery-reason', streamBlockedReason);
       }
     } else if (message.type === 'notice') {
       showNotice(message.level, message.message);
@@ -865,11 +1181,15 @@
     }
   }
 
-  byId('composer').addEventListener('submit', function (event) {
-    event.preventDefault();
+  /**
+   * Start one logical submission. Single-flight: the flag gates the composer
+   * BEFORE the post, so a double click / Enter+click race can never emit a
+   * second sendGoal; it is released ONLY by an explicit host result. The
+   * message is the IMMUTABLE snapshot: the attachment envelope carries the
+   * host-side ids in visible order and the logical submission id.
+   */
+  function requestStart() {
     if (submitting) {
-      // Single-flight: Enter+click, a double click or a rapid triple submit
-      // can only ever post ONE sendGoal for this logical submission.
       return;
     }
     var goal = byId('goal').value.trim();
@@ -879,23 +1199,117 @@
     // Draft preservation: the goal is NOT cleared here. The extension posts
     // a startResult; only a successful start clears the (unchanged) draft.
     // The Task-mode completion contract rides only THIS task start; plain
-    // chat never carries it. The message is the IMMUTABLE snapshot of the
-    // submission: later composer/control mutations build a new message, not
-    // a change to this one.
+    // chat never carries it.
     var contract = completionContractFromControls();
     var message = { type: 'sendGoal', goal: goal };
+    if (attachments.length > 0) {
+      var ids = [];
+      for (var i = 0; i < attachments.length; i++) {
+        ids.push(attachments[i].id);
+      }
+      message.attachmentIds = ids;
+      message.submissionId = ensureSubmission(goal);
+      message.messageId = message.submissionId;
+    }
     if (contract) {
       message.completionContract = contract;
     }
     transcriptPinRequested = true;
     setSubmitting(true);
     vscode.postMessage(message);
+  }
+
+  byId('composer').addEventListener('submit', function (event) {
+    event.preventDefault();
+    requestStart();
+  });
+
+  // Keyboard: Enter inserts a newline; Ctrl/Cmd+Enter starts the task.
+  byId('goal').addEventListener('keydown', function (event) {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      if (event.preventDefault) {
+        event.preventDefault();
+      }
+      requestStart();
+    }
+  });
+
+  // Paste image affordance: bounded bytes transit once; the host validates,
+  // stores and later reports metadata only.
+  byId('goal').addEventListener('paste', function (event) {
+    var clipboard = event.clipboardData;
+    if (!clipboard) {
+      return;
+    }
+    var files = [];
+    var items = clipboard.items || [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (item && item.kind === 'file' && item.type && item.type.indexOf('image/') === 0) {
+        var file = typeof item.getAsFile === 'function' ? item.getAsFile() : null;
+        if (file) {
+          files.push(file);
+        }
+      }
+    }
+    if (files.length > 0) {
+      if (event.preventDefault) {
+        event.preventDefault();
+      }
+      ingestFiles(files);
+    }
+  });
+
+  // Drag/drop target.
+  byId('composer').addEventListener('dragover', function (event) {
+    if (event.preventDefault) {
+      event.preventDefault();
+    }
+  });
+  byId('composer').addEventListener('drop', function (event) {
+    if (event.preventDefault) {
+      event.preventDefault();
+    }
+    var transfer = event.dataTransfer || {};
+    ingestFiles(transfer.files);
+  });
+
+  // Escape dismisses the transient attachment-refusal notice.
+  window.addEventListener('keydown', function (event) {
+    if (event && event.key === 'Escape') {
+      dismissTransient();
+    }
+  });
+
+  byId('btn-attach').addEventListener('click', function () {
+    if (submitting) {
+      return;
+    }
+    // The HOST opens the native picker and reads the files: no file bytes
+    // ever transit the webview for a picker selection.
+    vscode.postMessage({ type: 'attachPick' });
+  });
+  byId('btn-clear-attachments').addEventListener('click', function () {
+    if (submitting) {
+      return;
+    }
+    vscode.postMessage({ type: 'clearAttachments' });
+  });
+  byId('btn-refresh-snapshot').addEventListener('click', function () {
+    vscode.postMessage({ type: 'refresh' });
+  });
+  byId('btn-reconnect-stream').addEventListener('click', function () {
+    vscode.postMessage({ type: 'recoverStream' });
   });
   byId('btn-new-task').addEventListener('click', function () {
     if (submitting) {
       return;
     }
     vscode.postMessage({ type: 'newTask' });
+    var goalNode = byId('goal');
+    if (goalNode && typeof goalNode.focus === 'function') {
+      goalNode.focus();
+    }
   });
   byId('btn-cancel-run').addEventListener('click', function () {
     vscode.postMessage({ type: 'cancelRun' });

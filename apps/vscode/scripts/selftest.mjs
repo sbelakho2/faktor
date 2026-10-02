@@ -732,6 +732,59 @@ function frame(event, id, data) {
   return `${head}${idLine}data: ${data}\n\n`;
 }
 
+/** A fake SSE response over an injected reader (bounded/endless streams). */
+function sseReaderResponse(reader) {
+  return {
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    body: { getReader: () => reader },
+    text: async () => '',
+  };
+}
+
+/** One reader over explicit byte chunks (read/cancel counters for bounds). */
+function chunkReader(chunks) {
+  let index = 0;
+  return {
+    reads: 0,
+    cancelled: 0,
+    async read() {
+      this.reads += 1;
+      if (index >= chunks.length) {
+        return { done: true };
+      }
+      const value = chunks[index];
+      index += 1;
+      return { done: false, value };
+    },
+    async cancel() {
+      this.cancelled += 1;
+    },
+  };
+}
+
+/** A reader that yields the same line `count` times without an array. */
+function lineSeriesReader(line, count) {
+  const value = typeof line === 'string' ? new TextEncoder().encode(line) : line;
+  let emitted = 0;
+  return {
+    reads: 0,
+    cancelled: 0,
+    async read() {
+      this.reads += 1;
+      if (emitted >= count) {
+        return { done: true };
+      }
+      emitted += 1;
+      return { done: false, value };
+    },
+    async cancel() {
+      this.cancelled += 1;
+    },
+  };
+}
+
 // ----------------------------------------------------- 1. validator accepts
 
 async function validatorAccepts() {
@@ -1519,8 +1572,49 @@ async function clientRejects() {
 
 // ------------------------------------------------------------ 4. eventStream
 
+/** One real EventStream over a single finite body, instrumented for asserts. */
+function streamOutcome(text, options = {}) {
+  let stream = null;
+  const events = [];
+  const errors = [];
+  const statuses = [];
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(url);
+    return sseReaderResponse(chunkReader([Buffer.from(text)]));
+  };
+  stream = new es.EventStream({
+    baseUrl: 'http://127.0.0.1:9',
+    bearerToken: 'tok',
+    sessionId: '5',
+    maxFrameBytes: options.maxFrameBytes,
+    fetch: fetchImpl,
+    sleep: async () => {},
+    onEvent: (event) => events.push(event.id),
+    onStatus: (status, detail) => {
+      statuses.push([status, String(detail ?? '')]);
+      // A healthy finite body ends with 'stream ended'; stop instead of
+      // reconnecting to the same fixture forever. A durable block never
+      // reaches this branch (its loop exits with protocol_blocked).
+      if (status === 'retrying' && String(detail).startsWith('stream ended')) {
+        stream.stop();
+      }
+    },
+    onError: (error) => {
+      errors.push(error);
+      // A durable block exits the loop itself; every other typed protocol
+      // failure is a reconnectable transport-level error this helper stops.
+      if (!(error instanceof es.EventStreamProtocolBlockedError)) {
+        stream.stop();
+      }
+    },
+    ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+  });
+  return { stream, events, errors, statuses, urls };
+}
+
 async function eventStreamTests() {
-  await test('eventStream tolerates heartbeats, suppresses replay, reports bad frames', async () => {
+  await test('eventStream tolerates heartbeats, suppresses replay, reports non-durable bad frames', async () => {
     const urls = [];
     const delivered = [];
     const errors = [];
@@ -1534,8 +1628,11 @@ async function eventStreamTests() {
         ': keep-alive\n\n',
         frame('agent_state_changed', 2, '{"event":"agent_state_changed","session_id":"5","state":"streaming","label":"streaming"}'),
         frame('agent_state_changed', 2, '{"event":"agent_state_changed","session_id":"5","state":"streaming","label":"streaming"}'),
-        frame('error', 3, 'not-json'),
-        frame('error', 4, '{"event":"agent_state_changed","session_id":"5"}'),
+        // A malformed frame WITHOUT an id is not durable: it is reported and
+        // the healthy stream continues (a durable malformed frame BLOCKS —
+        // covered by the protocol-blocked tests below).
+        frame('error', null, 'not-json'),
+        frame('error', null, '{"event":"agent_state_changed","session_id":"5"}'),
         frame('heartbeat', 5, '{}'),
       ]);
     };
@@ -1654,6 +1751,487 @@ async function eventStreamTests() {
     await bounded.whenStopped();
     assertEqual(frameErrors.length, 1);
     assert(/unterminated frame exceeded/.test(frameErrors[0].message), frameErrors[0].message);
+  });
+
+  await test('frame budget: exactly max cumulative bytes is accepted, one line above is refused', async () => {
+    const line = 'data: ' + 'x'.repeat(32);
+    const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+    // Exactly max: the frame is mid-flight but the budget is not crossed, so
+    // the stream ends normally and reports no budget error.
+    const exactErrors = [];
+    let exact = null;
+    exact = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: lineBytes,
+      fetch: async () => sseReaderResponse(chunkReader([Buffer.from(line + '\n')])),
+      sleep: async () => {},
+      onEvent: () => {},
+      onStatus: (status, detail) => {
+        if (status === 'retrying' && String(detail).startsWith('stream ended')) {
+          exact.stop();
+        }
+      },
+      onError: (error) => exactErrors.push(error),
+    });
+    exact.start();
+    await exact.whenStopped();
+    assertDeepEqual(exactErrors, [], 'exactly max bytes must be accepted');
+    // One byte above: refused with the typed bounded-frame error and no
+    // retained payload.
+    const overErrors = [];
+    let over = null;
+    over = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: lineBytes - 1,
+      fetch: async () => sseReaderResponse(chunkReader([Buffer.from(line + '\n')])),
+      sleep: async () => {},
+      onEvent: () => {},
+      onError: (error) => {
+        overErrors.push(error);
+        over.stop();
+      },
+    });
+    over.start();
+    await over.whenStopped();
+    assertEqual(overErrors.length, 1);
+    assert(/unterminated frame exceeded/.test(overErrors[0].message), overErrors[0].message);
+    assert(overErrors[0] instanceof es.EventStreamProtocolError);
+    assert(!(overErrors[0] instanceof es.EventStreamProtocolBlockedError));
+  });
+
+  await test('frame budget counts comments, event and id lines cumulatively', async () => {
+    const comment = ': ' + 'c'.repeat(40);
+    // A comment-only frame with no id: the cumulative budget is crossed and
+    // the connection fails typed (no durable cursor to block on).
+    const commentRun = streamOutcome(comment + '\n', { maxFrameBytes: 16 });
+    commentRun.stream.start();
+    await commentRun.stream.whenStopped();
+    assertEqual(commentRun.errors.length, 1);
+    assert(commentRun.errors[0] instanceof es.EventStreamProtocolError);
+    assert(
+      !(commentRun.errors[0] instanceof es.EventStreamProtocolBlockedError),
+      'a non-durable oversized frame is not a protocol block',
+    );
+    // The same comment after an `id:` line is durable: the frame blocks at
+    // that sequence instead of reconnecting and replaying forever.
+    const commentDurable = streamOutcome(`id: 3\n${comment}\n`, { maxFrameBytes: 16 });
+    commentDurable.stream.start();
+    await commentDurable.stream.whenStopped();
+    assertEqual(commentDurable.stream.status, 'protocol_blocked');
+    assertEqual(commentDurable.stream.blocked.offending_seq, 3);
+    assert(commentDurable.stream.blocked.reason.includes('exceeded'));
+
+    // An event line is budgeted too: the id fits, the event plus the data
+    // line crosses.
+    const eventRun = streamOutcome(
+      `id: 4\nevent: agent_state_changed\ndata: {"event":"agent_state_changed"}\n`,
+      { maxFrameBytes: 24 },
+    );
+    eventRun.stream.start();
+    await eventRun.stream.whenStopped();
+    assertEqual(eventRun.stream.status, 'protocol_blocked');
+    assertEqual(eventRun.stream.blocked.offending_seq, 4);
+  });
+
+  await test('frame budget is UTF-8 byte-accurate at a multibyte boundary', async () => {
+    const payload = '{"event":"agent_state_changed","session_id":"5","label":"héllo 🚀"}';
+    const text = frame('agent_state_changed', 9, payload);
+    const size = Buffer.byteLength(text, 'utf8');
+    assert(size > text.length, 'the fixture must contain multibyte code points');
+    // The terminating blank line is the frame delimiter, not frame content:
+    // the cumulative budget is every consumed line including its newline.
+    const cumulative = size - 1;
+    // Exactly the UTF-8 cumulative size is accepted.
+    const exact = streamOutcome(text, { maxFrameBytes: cumulative });
+    exact.stream.start();
+    await exact.stream.whenStopped();
+    assertDeepEqual(exact.events, [9]);
+    // One UTF-8 byte less refuses (a UTF-16 .length budget would wrongly
+    // accept it because the string is shorter than its byte length).
+    const over = streamOutcome(text, { maxFrameBytes: cumulative - 1 });
+    over.stream.start();
+    await over.stream.whenStopped();
+    assertEqual(over.stream.status, 'protocol_blocked');
+    assert(over.stream.blocked.reason.includes('exceeded'));
+    assertDeepEqual(over.events, []);
+  });
+
+  await test('one hundred thousand tiny data lines are refused early with bounded retention', async () => {
+    const reader = lineSeriesReader('data: x\n', 100_000);
+    let stream = null;
+    const errors = [];
+    stream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: 1024,
+      fetch: async () => sseReaderResponse(reader),
+      sleep: async () => {},
+      onEvent: () => {},
+      onError: (error) => {
+        errors.push(error);
+        stream.stop();
+      },
+    });
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(errors.length, 1);
+    assert(errors[0] instanceof es.EventStreamProtocolError);
+    assert(
+      reader.reads < 200,
+      `the budget must refuse after ~${1024 / 8} lines, not consume 100000 (reads ${reader.reads})`,
+    );
+    assert(reader.cancelled >= 1, 'the oversized reader must be cancelled');
+
+    // Durable variant: an id line first makes the same flood a terminal
+    // protocol block (never a reconnect loop), still with bounded reads.
+    const durable = (() => {
+      let emitted = 0;
+      return {
+        reads: 0,
+        cancelled: 0,
+        async read() {
+          this.reads += 1;
+          emitted += 1;
+          if (emitted === 1) {
+            return { done: false, value: Buffer.from('id: 4\n') };
+          }
+          return { done: false, value: Buffer.from('data: x\n') };
+        },
+        async cancel() {
+          this.cancelled += 1;
+        },
+      };
+    })();
+    let blockedStream = null;
+    blockedStream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: 1024,
+      fetch: async () => sseReaderResponse(durable),
+      sleep: async () => {},
+      onEvent: () => {},
+      onError: () => {
+        blockedStream.stop();
+      },
+    });
+    blockedStream.start();
+    await blockedStream.whenStopped();
+    assertEqual(blockedStream.status, 'protocol_blocked');
+    assertEqual(blockedStream.blocked.offending_seq, 4);
+    assert(durable.reads < 200, `durable flood reads bounded: ${durable.reads}`);
+  });
+
+  await test('endless short lines never allocate unboundedly and the reader is cancelled', async () => {
+    const reader = lineSeriesReader('data: y\n', Number.MAX_SAFE_INTEGER);
+    let stream = null;
+    const errors = [];
+    stream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: 512,
+      fetch: async () => sseReaderResponse(reader),
+      sleep: async () => {},
+      onEvent: () => {},
+      onError: (error) => {
+        errors.push(error);
+        stream.stop();
+      },
+    });
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(errors.length, 1);
+    assert(reader.reads < 100, `reads must stop at the budget: ${reader.reads}`);
+    assert(reader.cancelled >= 1);
+  });
+
+  await test('every chunk boundary produces an identical frame-budget result', async () => {
+    const payload = '{"event":"agent_state_changed","session_id":"5","label":"é🚀 ok"}';
+    const text = frame('agent_state_changed', 9, payload);
+    const bytes = new TextEncoder().encode(text);
+    const runSplit = async (split, limit) => {
+      const chunks =
+        split <= 0 || split >= bytes.length
+          ? [bytes]
+          : [bytes.slice(0, split), bytes.slice(split)];
+      let stream = null;
+      const events = [];
+      const errors = [];
+      stream = new es.EventStream({
+        baseUrl: 'http://127.0.0.1:9',
+        bearerToken: 'tok',
+        sessionId: '5',
+        maxFrameBytes: limit,
+        fetch: async () => sseReaderResponse(chunkReader(chunks)),
+        sleep: async () => {},
+        onEvent: (event) => events.push(event.id),
+        onStatus: (status, detail) => {
+          if (status === 'retrying' && String(detail).startsWith('stream ended')) {
+            stream.stop();
+          }
+        },
+        onError: (error) => errors.push(error),
+      });
+      stream.start();
+      await stream.whenStopped();
+      return {
+        events,
+        errored: errors.length,
+        blocked: stream.blocked ? stream.blocked.reason : null,
+      };
+    };
+    const exactWhole = await runSplit(0, bytes.byteLength - 1);
+    assertDeepEqual(exactWhole.events, [9], 'the whole frame at exactly max must be accepted');
+    const overWhole = await runSplit(0, bytes.byteLength - 2);
+    assertEqual(overWhole.blocked !== null, true);
+    for (let split = 1; split < bytes.length; split += 1) {
+      const exact = await runSplit(split, bytes.byteLength - 1);
+      assertDeepEqual(exact.events, exactWhole.events, `split ${split} (exact)`);
+      assertEqual(exact.errored, exactWhole.errored, `split ${split} (exact errors)`);
+      const over = await runSplit(split, bytes.byteLength - 2);
+      assertEqual(over.blocked, overWhole.blocked, `split ${split} (over reason)`);
+      assertDeepEqual(over.events, [], `split ${split} (over events)`);
+    }
+  });
+
+  await test('an oversized durable frame blocks and a following valid frame is never delivered', async () => {
+    let calls = 0;
+    const events = [];
+    const urls = [];
+    const errors = [];
+    let stream = null;
+    const valid = frame(
+      'agent_state_changed',
+      8,
+      '{"event":"agent_state_changed","session_id":"5","state":"x","label":"x"}',
+    );
+    const fetchImpl = async (url) => {
+      urls.push(url);
+      calls += 1;
+      if (calls === 1) {
+        return sseReaderResponse(
+          chunkReader([
+            Buffer.from('id: 7\nevent: agent_state_changed\ndata: ' + 'x'.repeat(256) + '\n'),
+          ]),
+        );
+      }
+      return sseReaderResponse(chunkReader([Buffer.from(valid)]));
+    };
+    stream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: 128,
+      fetch: fetchImpl,
+      sleep: async () => {},
+      onEvent: (event) => {
+        events.push(event.id);
+        stream.stop();
+      },
+      onError: (error) => errors.push(error),
+    });
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(stream.status, 'protocol_blocked');
+    assertEqual(stream.blocked.offending_seq, 7);
+    assertEqual(stream.cursor, 0, 'the offending frame is never skipped');
+    assertDeepEqual(events, [], 'the following valid frame must not be delivered');
+    assertEqual(calls, 1, 'a blocked durable frame never reconnects');
+    assertEqual(errors.length, 1);
+    // The explicit post-upgrade recovery replays from the last good cursor.
+    stream.recover();
+    await stream.whenStopped();
+    assertDeepEqual(events, [8]);
+    assertEqual(calls, 2);
+    assertEqual(new URL(urls[1]).searchParams.get('events_after'), '0');
+  });
+
+  await test('an oversized non-durable frame fails typed and reconnects with backoff', async () => {
+    let calls = 0;
+    const events = [];
+    const urls = [];
+    const sleeps = [];
+    let stream = null;
+    const fetchImpl = async (url) => {
+      urls.push(url);
+      calls += 1;
+      if (calls === 1) {
+        return sseReaderResponse(chunkReader([Buffer.from('data: ' + 'x'.repeat(256))]));
+      }
+      return sseReaderResponse(chunkReader([
+        Buffer.from(
+          frame(
+            'agent_state_changed',
+            3,
+            '{"event":"agent_state_changed","session_id":"5","state":"x","label":"x"}',
+          ),
+        ),
+      ]));
+    };
+    stream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      maxFrameBytes: 128,
+      fetch: fetchImpl,
+      minBackoffMs: 5,
+      jitter: () => 0,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      onEvent: (event) => {
+        events.push(event.id);
+        stream.stop();
+      },
+    });
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(stream.blocked, null);
+    assertDeepEqual(events, [3]);
+    assertEqual(calls, 2);
+    assertEqual(new URL(urls[1]).searchParams.get('events_after'), '0');
+    assert(sleeps.length >= 1, 'the failed frame reconnects with backoff');
+  });
+
+  await test('durable malformed JSON blocks at the offending sequence and never reconnects', async () => {
+    const cases = [
+      {
+        label: 'malformed JSON',
+        text: frame('agent_state_changed', 5, 'not-json'),
+        needle: 'not JSON',
+        seq: 5,
+        max: 512,
+      },
+      {
+        label: 'discriminator mismatch',
+        text: frame('agent_state_changed', 5, '{"event":"message_created","session_id":"5"}'),
+        needle: 'disagrees',
+        seq: 5,
+        max: 512,
+      },
+      {
+        label: 'missing discriminator',
+        text: frame(null, 5, '{}'),
+        needle: 'no event discriminator',
+        seq: 5,
+        max: 512,
+      },
+      {
+        label: 'impossible cursor',
+        text: 'id: nope\ndata: {}\n\n',
+        needle: 'not a valid journal sequence',
+        seq: null,
+        max: 512,
+      },
+      {
+        label: 'negative cursor',
+        text: 'id: -3\ndata: {}\n\n',
+        needle: 'not a valid journal sequence',
+        seq: null,
+        max: 512,
+      },
+      {
+        label: 'unknown event version',
+        text: frame(
+          'agent_state_changed',
+          5,
+          '{"event":"agent_state_changed","version":2,"session_id":"5"}',
+        ),
+        needle: 'unsupported event version',
+        seq: 5,
+        max: 512,
+      },
+      {
+        label: 'oversized durable frame',
+        text: 'id: 5\nevent: agent_state_changed\ndata: ' + 'x'.repeat(256) + '\n',
+        needle: 'exceeded',
+        seq: 5,
+        max: 64,
+      },
+    ];
+    for (const entry of cases) {
+      const run = streamOutcome(entry.text, { maxFrameBytes: entry.max });
+      run.stream.start();
+      await run.stream.whenStopped();
+      assertEqual(run.stream.status, 'protocol_blocked', entry.label);
+      assertEqual(run.errors.length, 1, entry.label);
+      assert(
+        run.errors[0] instanceof es.EventStreamProtocolBlockedError,
+        `${entry.label}: expected a typed block, got ${run.errors[0] && run.errors[0].name}`,
+      );
+      assertEqual(run.stream.blocked.offending_seq, entry.seq, entry.label);
+      assertEqual(run.stream.blocked.cursor, 0, entry.label);
+      assert(run.stream.blocked.reason.includes(entry.needle), `${entry.label}: ${run.stream.blocked.reason}`);
+      assertDeepEqual(run.events, [], entry.label);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      assertEqual(run.urls.length, 1, `${entry.label}: a blocked durable frame never reconnects`);
+    }
+    // A supported version is a normal durable event.
+    const accepted = streamOutcome(
+      frame(
+        'agent_state_changed',
+        5,
+        '{"event":"agent_state_changed","version":1,"session_id":"5","state":"x","label":"x"}',
+      ),
+    );
+    accepted.stream.start();
+    await accepted.stream.whenStopped();
+    assertDeepEqual(accepted.events, [5]);
+  });
+
+  await test('stop() during the maximum backoff is prompt with no later fetch', async () => {
+    let calls = 0;
+    let reachedBackoff = null;
+    const backoffReached = new Promise((resolve) => {
+      reachedBackoff = resolve;
+    });
+    let stream = null;
+    stream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      fetch: async () => {
+        calls += 1;
+        return sseReaderResponse(chunkReader([]));
+      },
+      minBackoffMs: 8000,
+      maxBackoffMs: 8000,
+      jitter: () => 0,
+      onEvent: () => {},
+      onStatus: (status, detail) => {
+        if (status === 'retrying' && String(detail).startsWith('reconnect in')) {
+          reachedBackoff();
+        }
+      },
+    });
+    stream.start();
+    await backoffReached;
+    const callsBeforeStop = calls;
+    const started = Date.now();
+    stream.stop();
+    await stream.whenStopped();
+    const elapsed = Date.now() - started;
+    assert(elapsed < 100, `stop() must abort the backoff promptly, took ${elapsed}ms`);
+    assertEqual(stream.status, 'stopped');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assertEqual(calls, callsBeforeStop, 'no fetch may follow stop()');
+  });
+
+  await test('abortableDelay resolves on abort and never rejects', async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = es.abortableDelay(30_000, controller.signal);
+    setTimeout(() => controller.abort(), 10);
+    await pending;
+    assert(Date.now() - started < 1000, 'abort must resolve the delay promptly');
+    const already = await es.abortableDelay(30_000, controller.signal);
+    assertEqual(already, undefined, 'an already-aborted signal resolves immediately');
   });
 }
 
@@ -5268,6 +5846,10 @@ function makeFakeDom() {
       // article a fixed height so anchor preservation is measurable.
       offsetHeight: tagName === 'article' ? 40 : 0,
       clientHeight: 0,
+      focused: false,
+    };
+    node.focus = () => {
+      node.focused = true;
     };
     Object.defineProperty(node, 'scrollHeight', {
       get: () =>
@@ -5411,12 +5993,16 @@ function runChatWebview(snapshot) {
   const posted = [];
   const dom = makeFakeDom();
   let messageHandler = null;
+  let keydownHandler = null;
   const sandbox = {
     document: dom.document,
     window: {
       addEventListener(type, callback) {
         if (type === 'message') {
           messageHandler = callback;
+        }
+        if (type === 'keydown') {
+          keydownHandler = callback;
         }
       },
     },
@@ -5433,6 +6019,11 @@ function runChatWebview(snapshot) {
     posted,
     dom,
     deliver: (message) => messageHandler({ data: message.data ? message.data : message }),
+    keydown: (event) => {
+      if (keydownHandler) {
+        keydownHandler(event);
+      }
+    },
   };
 }
 
@@ -5492,6 +6083,671 @@ async function presentationWebviewTests() {
       action: 'presentation',
       state: 'background',
     });
+  });
+}
+
+// ---------------------------- composer attachments + a11y (findings 2/7/8)
+
+function attachmentMeta(id, overrides = {}) {
+  return {
+    id,
+    filename: 'spec.pdf',
+    mime: 'application/pdf',
+    bytes: 8,
+    isImage: false,
+    refusal: null,
+    ...overrides,
+  };
+}
+
+/**
+ * The REAL host mapping of one webview `sendGoal` as the extension performs
+ * it: posted message -> ComposerAttachmentStore.select -> strict validator
+ * (parsePendingSubmission) -> durable upload -> task start with the durable
+ * ids. `retainer` mirrors the host's retry-reuse state.
+ */
+function realComposerHost(sessionId = '7') {
+  let counter = 0;
+  const store = new ts.ComposerAttachmentStore(() => `att-${++counter}`);
+  const retainer = new ts.PendingSubmissionRetainer();
+  const uploads = [];
+  const starts = [];
+  let failStartOnce = null;
+  const client = {
+    uploadAttachment: async (sid, request) => {
+      uploads.push({ sid, mime: request.mime, filename: request.filename });
+      const n = uploads.length;
+      return {
+        ref_id: n,
+        digest: n.toString(16).padStart(64, '0'),
+        mime: request.mime,
+        filename: request.filename ?? null,
+        size: Buffer.from(request.data_base64, 'base64').byteLength,
+      };
+    },
+    startTaskRun: async (sid, request) => {
+      starts.push({ sid, request: clone(request) });
+      if (failStartOnce !== null) {
+        const error = failStartOnce;
+        failStartOnce = null;
+        throw error;
+      }
+      return { task_id: 1, run_id: 'r1', state: 'Pending' };
+    },
+  };
+  const submit = async (message, policy) => {
+    if (message.attachmentIds === undefined) {
+      return { refused: 'the sendGoal payload carried no attachment envelope' };
+    }
+    const selected = store.select(message.attachmentIds);
+    if (selected.reason !== null) {
+      return { refused: selected.reason };
+    }
+    const parsed = ts.parsePendingSubmission({
+      text: message.goal,
+      sessionId,
+      draftId: null,
+      messageId: message.messageId,
+      files: message.files ?? [],
+      attachments: selected.attachments,
+    });
+    if (parsed === null) {
+      return { refused: 'malformed binary attachment envelope' };
+    }
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId,
+      pending: retainer.restore(parsed),
+      settings: {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0n,
+        completionContract: null,
+        submissionId: message.submissionId ?? null,
+      },
+      attachmentLimits: policy,
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {},
+    });
+    if (outcome.ok) {
+      retainer.release(outcome.pending);
+    } else {
+      retainer.retain(outcome.pending);
+    }
+    return { outcome };
+  };
+  return {
+    store,
+    uploads,
+    starts,
+    submit,
+    failNextStart: (error) => {
+      failStartOnce = error;
+    },
+  };
+}
+
+async function composerAttachmentTests() {
+  await test('the real composer markup ships the attachment surface, the a11y log and recovery affordances', () => {
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    // Mutation witness (markup half): removing any required control fails
+    // HERE in CI, before any browser is involved.
+    for (const id of [
+      'goal',
+      'btn-attach',
+      'btn-clear-attachments',
+      'attachment-list',
+      'attachment-notice',
+      'btn-send',
+      'btn-new-task',
+      'stream-recovery',
+      'btn-refresh-snapshot',
+      'btn-reconnect-stream',
+    ]) {
+      assert(markup.includes(`id="${id}"`), `the markup must carry #${id}`);
+    }
+    assert(/<label for="goal"/.test(markup), 'the goal textarea must have a real <label for>');
+    assert(markup.includes('>Task goal</label>'), 'the accessible name must be the visible label text');
+    assert(markup.includes('never skipped'), 'the recovery affordance must say the frame is replayed');
+    assert(markup.includes('faktor-cli doctor'), 'the recovery affordance must name the daemon doctor');
+    const entries = /<div id="entries"([^>]*)>/.exec(markup);
+    assert(entries, 'the transcript container must exist');
+    assert(entries[1].includes('role="log"'), entries[1]);
+    assert(entries[1].includes('aria-live="polite"'), entries[1]);
+    assert(entries[1].includes('aria-relevant="additions"'), entries[1]);
+    // Predictable Tab traversal: the composer markup order IS the tab order.
+    const composer = markup.slice(markup.indexOf('<form id="composer">'), markup.indexOf('</form>'));
+    const order = [
+      'id="goal"',
+      'id="btn-attach"',
+      'id="btn-clear-attachments"',
+      'id="contract-commit"',
+      'id="contract-push"',
+      'id="contract-pr"',
+      'id="btn-send"',
+      'id="btn-new-task"',
+    ].map((needle) => composer.indexOf(needle));
+    for (let i = 0; i < order.length; i += 1) {
+      assert(order[i] >= 0, `composer control ${i} must exist in the markup`);
+      if (i > 0) {
+        assert(order[i] > order[i - 1], 'composer controls must keep their documented tab order');
+      }
+    }
+    // Every static id chat.js resolves must exist in the markup: a control
+    // removed from the markup is detectable from the source pin alone.
+    const chat = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    const referenced = new Set();
+    const re = /byId\('([^']+)'\)/g;
+    let match = null;
+    while ((match = re.exec(chat)) !== null) {
+      referenced.add(match[1]);
+    }
+    assert(referenced.size > 20, `the byId scan must see the real references (${referenced.size})`);
+    for (const id of referenced) {
+      assert(markup.includes(`id="${id}"`), `chat.js references #${id} but the markup lacks it`);
+    }
+  });
+
+  await test('host attachment metadata renders filename/MIME/size with refusal, remove and clear', () => {
+    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    deliver({
+      type: 'attachments',
+      items: [
+        attachmentMeta('att-1', { filename: 'spec.pdf', mime: 'application/pdf', bytes: 2048 }),
+        attachmentMeta('att-2', {
+          filename: 'shot.png',
+          mime: 'image/png',
+          bytes: 3,
+          isImage: true,
+          refusal: 'image attachment shot.png cannot be delivered: the selected model does not advertise vision',
+        }),
+      ],
+    });
+    const list = dom.document.getElementById('attachment-list');
+    assertEqual(list.children.length, 2);
+    const label = findFake(list, (node) => String(node.className).includes('attachment-label'));
+    assert(
+      label &&
+        label.textContent.includes('spec.pdf') &&
+        label.textContent.includes('application/pdf') &&
+        label.textContent.includes('2.0 KiB'),
+      label && label.textContent,
+    );
+    const refused = findFake(list, (node) => String(node.className).includes('attachment-refused'));
+    assert(refused && fakeText(refused).includes('does not advertise vision'), fakeText(refused));
+    assertEqual(dom.document.getElementById('attachment-notice').hidden, false);
+    // Remove-one posts the exact host id; clear-all posts the clear command.
+    const remove = findFake(list, (node) => node.tagName === 'button' && node.textContent === 'Remove');
+    assert(remove, 'every attachment renders a Remove control');
+    remove.click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'removeAttachment', id: 'att-1' });
+    dom.document.getElementById('btn-clear-attachments').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'clearAttachments' });
+  });
+
+  await test('attach opens the host picker; paste/drop ingest bounded bytes exactly once', async () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const { posted, dom } = harness;
+    dom.document.getElementById('btn-attach').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'attachPick' });
+    // Paste an image: bounded bytes transit the webview once.
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const file = {
+      name: 'clip.png',
+      type: 'image/png',
+      size: bytes.length,
+      arrayBuffer: async () => bytes.buffer,
+    };
+    dom.document.getElementById('goal').dispatch('paste', {
+      clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }] },
+      preventDefault() {},
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const attachData = posted[posted.length - 1];
+    assertEqual(attachData.type, 'attachData');
+    assertEqual(attachData.items.length, 1);
+    assertEqual(attachData.items[0].mime, 'image/png');
+    assertEqual(attachData.items[0].bytes, 4);
+    assertEqual(attachData.items[0].dataBase64, Buffer.from(bytes).toString('base64'));
+    // An over-limit drop is refused BEFORE any post.
+    const count = posted.length;
+    const huge = {
+      name: 'huge.png',
+      type: 'image/png',
+      size: 8 * 1024 * 1024,
+      arrayBuffer: async () => new ArrayBuffer(0),
+    };
+    dom.document.getElementById('composer').dispatch('drop', {
+      dataTransfer: { files: [huge] },
+      preventDefault() {},
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(posted.length, count, 'an over-limit file never posts');
+    // A valid drop posts the same bounded envelope.
+    dom.document.getElementById('composer').dispatch('drop', {
+      dataTransfer: {
+        files: [
+          {
+            name: 'a.pdf',
+            type: 'application/pdf',
+            size: 8,
+            arrayBuffer: async () => new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]).buffer,
+          },
+        ],
+      },
+      preventDefault() {},
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEqual(posted[posted.length - 1].type, 'attachData');
+  });
+
+  await test('DOM -> sendGoal -> validator -> upload -> durable ids -> task start (mutation witness)', async () => {
+    const host = realComposerHost();
+    const added = host.store.add({
+      filename: 'spec.pdf',
+      mime: 'application/pdf',
+      bytes: 8,
+      dataBase64: Buffer.from('%PDF-1.4').toString('base64'),
+    });
+    assert(added.view !== null, 'the host-read bytes enter the bounded store');
+    const harness = runChatWebview(webviewSnapshot([]));
+    harness.deliver({ type: 'attachments', items: [{ ...added.view, refusal: null }] });
+    const goal = harness.dom.document.getElementById('goal');
+    goal.value = 'ship the spec';
+    harness.dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const message = harness.posted[harness.posted.length - 1];
+    // Mutation witness (payload half): dropping the attachment envelope from
+    // chat.js fails this assertion, and the host submission below then has
+    // nothing to resolve.
+    assertEqual(message.type, 'sendGoal');
+    assertDeepEqual(message.attachmentIds, [added.view.id], 'sendGoal must carry the attachment ids');
+    assert(
+      typeof message.submissionId === 'string' && message.submissionId.length > 0,
+      'an attachment submission carries a logical submission id',
+    );
+    const policy = ts.attachmentPolicyFromLimits(clone(attachmentLimitsJson));
+    const result = await host.submit(message, policy);
+    assertEqual(result.refused, undefined);
+    assertEqual(result.outcome.ok, true);
+    assertDeepEqual(result.outcome.attachmentIds, ['0'.repeat(63) + '1']);
+    assertEqual(result.outcome.pending.attachments[0].uploaded.attachment.filename, 'spec.pdf');
+    assert(result.outcome.runId !== null, 'the caller gets the daemon receipt');
+    // The durable start carries ONLY the typed attachment ids.
+    assertDeepEqual(host.starts[0].request.attachments, [
+      { digest: '0'.repeat(63) + '1', mime: 'application/pdf', filename: 'spec.pdf', size: 8 },
+    ]);
+    assertEqual(host.uploads.length, 1);
+    // A durable success clears the visible set; the failed path is covered
+    // by the retry row below.
+    harness.deliver({ type: 'startResult', goal: 'ship the spec', ok: true });
+    assertEqual(harness.dom.document.getElementById('attachment-list').children.length, 0);
+  });
+
+  await test('a failed start keeps the visible attachments and the retry reuses the durable uploads', async () => {
+    const host = realComposerHost();
+    const added = host.store.add({
+      filename: 'spec.pdf',
+      mime: 'application/pdf',
+      bytes: 8,
+      dataBase64: Buffer.from('%PDF-1.4').toString('base64'),
+    });
+    const harness = runChatWebview(webviewSnapshot([]));
+    harness.deliver({ type: 'attachments', items: [{ ...added.view, refusal: null }] });
+    const goal = harness.dom.document.getElementById('goal');
+    const composer = harness.dom.document.getElementById('composer');
+    goal.value = 'retry me';
+    host.failNextStart(new Error('socket closed after admission'));
+    composer.dispatch('submit', { preventDefault() {} });
+    const first = harness.posted[harness.posted.length - 1];
+    const firstResult = await host.submit(
+      first,
+      ts.attachmentPolicyFromLimits(clone(attachmentLimitsJson)),
+    );
+    assertEqual(firstResult.outcome.ok, false);
+    assertEqual(firstResult.outcome.failure.kind, 'transport');
+    harness.deliver({ type: 'startResult', goal: 'retry me', ok: false });
+    assertEqual(
+      harness.dom.document.getElementById('attachment-list').children.length,
+      1,
+      'the failed start keeps the visible attachment',
+    );
+    // Retry: same body -> same logical submission id -> the retained upload
+    // is reused and no bytes are uploaded twice.
+    composer.dispatch('submit', { preventDefault() {} });
+    const retry = harness.posted[harness.posted.length - 1];
+    assertEqual(retry.submissionId, first.submissionId, 'the retry reuses the submission id');
+    assertDeepEqual(retry.attachmentIds, first.attachmentIds);
+    const retryResult = await host.submit(
+      retry,
+      ts.attachmentPolicyFromLimits(clone(attachmentLimitsJson)),
+    );
+    assertEqual(retryResult.outcome.ok, true);
+    assertEqual(host.uploads.length, 1, 'the retry must not upload the same bytes twice');
+    assertDeepEqual(retryResult.outcome.attachmentIds, firstResult.outcome.attachmentIds);
+  });
+
+  await test('attachment order is preserved; a changed body or session drops the stale identity', async () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const goal = harness.dom.document.getElementById('goal');
+    const composer = harness.dom.document.getElementById('composer');
+    harness.deliver({
+      type: 'attachments',
+      items: [
+        attachmentMeta('att-a', { filename: 'a.txt', mime: 'text/plain' }),
+        attachmentMeta('att-b', { filename: 'b.txt', mime: 'text/plain' }),
+      ],
+    });
+    goal.value = 'ordered';
+    composer.dispatch('submit', { preventDefault() {} });
+    const first = harness.posted[harness.posted.length - 1];
+    assertDeepEqual(first.attachmentIds, ['att-a', 'att-b']);
+    harness.deliver({ type: 'startResult', goal: 'ordered', ok: false });
+    // The host reorders the same set (drag semantics): the next submission
+    // carries the host order and is a NEW logical submission (changed body).
+    harness.deliver({
+      type: 'attachments',
+      items: [
+        attachmentMeta('att-b', { filename: 'b.txt', mime: 'text/plain' }),
+        attachmentMeta('att-a', { filename: 'a.txt', mime: 'text/plain' }),
+      ],
+    });
+    composer.dispatch('submit', { preventDefault() {} });
+    const second = harness.posted[harness.posted.length - 1];
+    assertDeepEqual(second.attachmentIds, ['att-b', 'att-a']);
+    assert(second.submissionId !== first.submissionId, 'a changed body is a new logical submission');
+    harness.deliver({ type: 'startResult', goal: 'ordered', ok: false });
+    // Session switch: the visible set and the pending identity drop.
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), session: { ...clone(sessionSummaryJson), id: '9' } } });
+    assertEqual(harness.dom.document.getElementById('attachment-list').children.length, 0);
+    goal.value = 'after switch';
+    composer.dispatch('submit', { preventDefault() {} });
+    const afterSwitch = harness.posted[harness.posted.length - 1];
+    assert(!('attachmentIds' in afterSwitch), 'a switched session carries no stale attachments');
+  });
+
+  await test('the retry identity is content+metadata: renamed or re-mimed bytes upload fresh', async () => {
+    const retainer = new ts.PendingSubmissionRetainer();
+    const pendingOf = (name, mime) =>
+      ts.parsePendingSubmission({
+        text: 'x',
+        sessionId: '7',
+        messageId: 'm1',
+        draftId: null,
+        files: [],
+        attachments: [
+          { filename: name, mime, bytes: 8, dataBase64: Buffer.from('%PDF-1.4').toString('base64') },
+        ],
+      });
+    let pending = retainer.restore(pendingOf('a.pdf', 'application/pdf'));
+    pending = ts.withPendingUpload(pending, 0, {
+      sessionId: '7',
+      contentDigest: ts.pendingAttachmentContentDigest(pending.attachments[0]),
+      attachment: { ref_id: 1, digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'a.pdf', size: 8 },
+    });
+    retainer.retain(pending);
+    // Same bytes, different filename: a distinct reference -> fresh upload.
+    assertEqual(
+      retainer.restore(pendingOf('b.pdf', 'application/pdf')).attachments[0].uploaded,
+      undefined,
+      'a renamed file must not reuse the durable id',
+    );
+    // Same bytes, different MIME: a distinct reference -> fresh upload.
+    assertEqual(
+      retainer.restore(pendingOf('a.pdf', 'text/plain')).attachments[0].uploaded,
+      undefined,
+      'a changed MIME must not reuse the durable id',
+    );
+    // The byte-identical reference reuses its id.
+    assertEqual(
+      retainer.restore(pendingOf('a.pdf', 'application/pdf')).attachments[0].uploaded.attachment.ref_id,
+      1,
+    );
+  });
+
+  await test('over-limit, wrong-MIME and vision-less attachments refuse typed before any upload', async () => {
+    const store = new ts.ComposerAttachmentStore(() => 'id');
+    const tooBig = store.add({
+      filename: 'big.bin',
+      mime: 'application/octet-stream',
+      bytes: ts.MAX_PENDING_ATTACHMENT_BYTES + 1,
+      dataBase64: 'AA==',
+    });
+    assert(tooBig.view === null && tooBig.reason.includes('bytes must be an integer'), tooBig.reason);
+    const mismatch = store.add({
+      filename: 'x.pdf',
+      mime: 'application/pdf',
+      bytes: 2,
+      dataBase64: 'AA==',
+    });
+    assert(mismatch.view === null && mismatch.reason.includes('decodes to'), mismatch.reason);
+    // Picker MIME guess: SVG is an image the allowlist refuses.
+    assertEqual(ts.composerMimeForFilename('logo.svg'), 'image/svg+xml');
+    const svgRefusal = ts.composerAttachmentRefusal(
+      { filename: 'logo.svg', mime: 'image/svg+xml', bytes: 10, isImage: true },
+      ts.EMERGENCY_ATTACHMENT_POLICY,
+    );
+    assert(svgRefusal && svgRefusal.includes('unsupported mime'), svgRefusal);
+    // A vision-less advertised model refuses images with the capability
+    // reason; a vision model passes the same gate.
+    const catalog = nc.validateModelCatalog([
+      { ...clone(modelInfoJson), provider: 'p', model: 'novision', vision: false },
+      { ...clone(modelInfoJson), provider: 'p', model: 'vision', vision: true },
+    ]);
+    const noVision = ts.attachmentPolicyForModel(catalog, 'p', 'novision');
+    assertEqual(noVision.imageCapable, false);
+    const visionRefusal = ts.composerAttachmentRefusal(
+      { filename: 'shot.png', mime: 'image/png', bytes: 1024, isImage: true },
+      noVision,
+    );
+    assert(visionRefusal && visionRefusal.includes('vision'), visionRefusal);
+    assertEqual(
+      ts.composerAttachmentRefusal(
+        { filename: 'shot.png', mime: 'image/png', bytes: 1024, isImage: true },
+        ts.attachmentPolicyForModel(catalog, 'p', 'vision'),
+      ),
+      null,
+    );
+    // Document capability: an advertised incapable model refuses PDFs.
+    const docLess = ts.attachmentPolicyFromLimits({
+      ...clone(attachmentLimitsJson),
+      document: { ...clone(attachmentLimitsJson.document), capable: false },
+    });
+    const docRefusal = ts.composerAttachmentRefusal(
+      { filename: 'spec.pdf', mime: 'application/pdf', bytes: 10, isImage: false },
+      docLess,
+    );
+    assert(docRefusal && docRefusal.includes('does not advertise document input'), docRefusal);
+    // Admission-level: a refused wrong-MIME never reaches the upload route.
+    let uploads = 0;
+    const outcome = await ts.admitPendingSubmission({
+      client: {
+        uploadAttachment: async () => {
+          uploads += 1;
+          throw new Error('a refused attachment must not upload');
+        },
+        startTaskRun: async () => {
+          throw new Error('a refused attachment must not start');
+        },
+      },
+      sessionId: '7',
+      pending: ts.parsePendingSubmission({
+        text: 'x',
+        sessionId: '7',
+        messageId: 'm',
+        draftId: null,
+        files: [],
+        attachments: [
+          { filename: 'logo.svg', mime: 'image/svg+xml', bytes: 8, dataBase64: 'PHN2Zz4=' },
+        ],
+      }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0n },
+      onStarted: () => {
+        throw new Error('a refused attachment must not start');
+      },
+      onFailure: () => {},
+      restore: () => {},
+    });
+    assertEqual(outcome.ok, false);
+    assertEqual(outcome.failure.code, 'unsupported_image_type');
+    assertEqual(uploads, 0, 'no bytes reach the wire for a refused attachment');
+  });
+
+  await test('a vision-less model refuses an attached image at admission and keeps it visible', async () => {
+    const host = realComposerHost();
+    const added = host.store.add({
+      filename: 'shot.png',
+      mime: 'image/png',
+      bytes: 4,
+      dataBase64: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      isImage: true,
+    });
+    const harness = runChatWebview(webviewSnapshot([]));
+    harness.deliver({ type: 'attachments', items: [{ ...added.view, refusal: null }] });
+    harness.dom.document.getElementById('goal').value = 'look at this';
+    harness.dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    const message = harness.posted[harness.posted.length - 1];
+    const catalog = nc.validateModelCatalog([
+      { ...clone(modelInfoJson), provider: 'fake', model: 'm', vision: false },
+    ]);
+    const result = await host.submit(message, ts.attachmentPolicyForModel(catalog, 'fake', 'm'));
+    assertEqual(result.outcome.ok, false);
+    assertEqual(result.outcome.failure.kind, 'image_unsupported');
+    assertEqual(host.uploads.length, 0, 'a vision-less refusal precedes any upload');
+    harness.deliver({ type: 'startResult', goal: 'look at this', ok: false });
+    assertEqual(
+      harness.dom.document.getElementById('attachment-list').children.length,
+      1,
+      'the refused submission keeps the visible attachment for removal or model switch',
+    );
+  });
+
+  await test('the transcript live region appends only new entries', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    const entries = [transcriptEntry(1, 'one'), transcriptEntry(2, 'two')];
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.children.length, 2);
+    const firstNode = container.children[0];
+    entries.push(transcriptEntry(3, 'three'));
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.children.length, 3);
+    assertEqual(
+      container.children[0],
+      firstNode,
+      'existing entry nodes are preserved: a snapshot append never re-announces the history',
+    );
+    // A changed prefix still rebuilds, so no stale row survives.
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: transcriptSnapshot([
+        transcriptEntry(1, 'one changed'),
+        transcriptEntry(2, 'two'),
+        transcriptEntry(3, 'three'),
+      ]),
+    });
+    assert(fakeText(container).includes('one changed'), fakeText(container).slice(0, 120));
+  });
+
+  await test('the extension host reads picked files, resolves host ids and exposes stream recovery', () => {
+    const extension = readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8');
+    assert(extension.includes('showOpenDialog'), 'the Attach button must use the host-native picker');
+    assert(
+      extension.includes('composerAttachments.select('),
+      'sendGoal must resolve host-side attachment ids into the immutable byte snapshot',
+    );
+    assert(
+      extension.includes('parsePendingSubmission('),
+      'the resolved envelope must still pass the strict host validator',
+    );
+    assert(
+      extension.includes("case 'recoverStream'"),
+      'the blocked stream must have an explicit recovery handler',
+    );
+    assert(
+      extension.includes("'protocol_blocked'"),
+      'the host must branch on the typed blocked status (no auto-reconnect)',
+    );
+    assert(
+      extension.includes('postStreamBlocked('),
+      'the blocked reason must reach the panel',
+    );
+    assert(
+      extension.includes('composerAttachments.clear()'),
+      'a durable start or session switch must clear the host-side bytes',
+    );
+  });
+
+  await test('a protocol-blocked snapshot surfaces recovery affordances wired to the host', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const section = harness.dom.document.getElementById('stream-recovery');
+    assertEqual(section.hidden, true, 'no recovery surface on a healthy stream');
+    harness.deliver({ type: 'streamBlocked', reason: 'durable frame 5 data is not JSON' });
+    harness.deliver({
+      type: 'snapshot',
+      snapshot: {
+        ...webviewSnapshot([]),
+        streamStatus: 'protocol_blocked',
+        lastError: 'durable frame 5 data is not JSON',
+      },
+    });
+    assertEqual(section.hidden, false, 'a blocked status shows the recovery surface');
+    assert(
+      harness.dom.document
+        .getElementById('stream-recovery-reason')
+        .textContent.includes('durable frame 5 data is not JSON'),
+      harness.dom.document.getElementById('stream-recovery-reason').textContent,
+    );
+    harness.dom.document.getElementById('btn-reconnect-stream').click();
+    assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'recoverStream' });
+    harness.dom.document.getElementById('btn-refresh-snapshot').click();
+    assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'refresh' });
+    harness.deliver({ type: 'streamBlocked', reason: null });
+    harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), streamStatus: 'open' } });
+    assertEqual(section.hidden, true, 'a recovered stream hides the recovery surface');
+  });
+
+  await test('Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const goal = harness.dom.document.getElementById('goal');
+    goal.value = 'keyboard task';
+    const count = harness.posted.length;
+    goal.dispatch('keydown', {
+      key: 'Enter',
+      preventDefault() {
+        throw new Error('plain Enter must keep the textarea newline behavior');
+      },
+    });
+    assertEqual(harness.posted.length, count, 'plain Enter never submits');
+    let prevented = false;
+    goal.dispatch('keydown', {
+      key: 'Enter',
+      ctrlKey: true,
+      preventDefault() {
+        prevented = true;
+      },
+    });
+    assertEqual(prevented, true, 'Ctrl+Enter prevents the default newline');
+    assertEqual(harness.posted.length, count + 1);
+    assertDeepEqual(harness.posted[harness.posted.length - 1], {
+      type: 'sendGoal',
+      goal: 'keyboard task',
+    });
+    // The single-flight lock holds for keyboard starts too.
+    goal.dispatch('keydown', { key: 'Enter', metaKey: true, preventDefault() {} });
+    assertEqual(harness.posted.length, count + 1, 'single-flight holds for a keyboard start');
+    // A successful start returns focus to the composer.
+    harness.deliver({ type: 'startResult', goal: 'keyboard task', ok: true });
+    assertEqual(goal.focused, true, 'a successful start returns focus to the composer');
+    // Escape dismisses the transient attachment notice.
+    harness.deliver({ type: 'attachments', items: [attachmentMeta('att-1', { refusal: 'nope' })] });
+    assertEqual(harness.dom.document.getElementById('attachment-notice').hidden, false);
+    harness.keydown({ key: 'Escape' });
+    assertEqual(harness.dom.document.getElementById('attachment-notice').hidden, true);
+    // New task returns focus to the composer as well.
+    goal.focused = false;
+    harness.dom.document.getElementById('btn-new-task').click();
+    assertEqual(goal.focused, true, 'New task returns focus to the composer');
   });
 }
 
@@ -7753,6 +9009,7 @@ async function main() {
   await moneyTests();
   await controlPlaneCredentialTests();
   await presentationWebviewTests();
+  await composerAttachmentTests();
   await submissionSingleFlightTests();
   await transcriptScrollTests();
   await tournamentWebviewTests();

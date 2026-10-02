@@ -35,6 +35,7 @@ object BackendProcessManagerTest {
         assertNativeRequestShapes()
         assertNativeResponseParsers()
         assertMissingBinaryFailsLoudly()
+        assertCommandDrain()
         println("PASS all unit assertions")
     }
 }
@@ -701,5 +702,111 @@ private fun assertMissingBinaryFailsLoudly() {
         fail("start() must fail loudly for a missing binary")
     } catch (e: BackendException) {
         assertTrue(e.message!!.contains("not found"), "message: ${e.message}")
+    }
+}
+
+// ------------------------------------------------------- command drain (P2)
+
+/**
+ * The bounded concurrent drain of external command capture: a child
+ * producing several multiples of the OS pipe capacity must finish well
+ * inside the timeout (the old wait-before-read order deadlocked both), the
+ * retained output must honor the cap, a quiet stall must not time out, and
+ * an over-deadline child must be killed AND reaped before the typed result
+ * returns.
+ */
+private fun assertCommandDrain() {
+    val cap = 64 * 1024
+    val flood = runCommand(fixtureCommand("emit", (4 shl 20).toString()), 10_000L, cap)
+    assertTrue(
+        !flood.timedOut,
+        "a concurrent drain must let a 4 MiB child finish: ${flood.launchFailure ?: "timeout"}"
+    )
+    assertTrue(flood.complete, "the 4 MiB child must be reaped")
+    assertEquals(0, flood.exitCode, "4 MiB emitter exit code")
+    assertTrue(flood.truncated, "output past the cap must be recorded as truncated")
+    assertEquals(
+        cap, flood.output.toByteArray(Charsets.UTF_8).size,
+        "retained output must be exactly the configured cap"
+    )
+    assertTrue(flood.output.startsWith("x"), "the retained prefix must be the stream head")
+    println("  command drain: 4 MiB concurrent emit finished, retained $cap bytes, truncated=true")
+
+    val stalled = runCommand(fixtureCommand("stall", "300"), 10_000L, cap)
+    assertEquals(0, stalled.exitCode, "a stall-then-exit child must complete")
+    assertTrue(!stalled.timedOut, "a quiet stall must not be reported as a timeout")
+    assertTrue(stalled.output.isEmpty(), "a quiet stall retains no output")
+    println("  command drain: quiet stall exited 0 without a timeout")
+
+    val pidfile = Files.createTempFile("faktor-cmd-", ".pid")
+    try {
+        val started = System.currentTimeMillis()
+        // A generous deadline: the fixture JVM must reach main() and record
+        // its pid before the kill, even on a loaded CI host.
+        val held = runCommand(fixtureCommand("hold", "60000", pidfile.toString()), 4_000L, cap)
+        val elapsed = System.currentTimeMillis() - started
+        assertTrue(held.timedOut, "the deadline must force the kill")
+        assertTrue(
+            held.exitCode != null,
+            "a timed-out child must be reaped (exit status observable), not left a zombie"
+        )
+        assertTrue(elapsed < 15_000L, "kill+reap must return promptly, took ${elapsed}ms")
+        val pid = String(Files.readAllBytes(pidfile), Charsets.UTF_8).trim().toLongOrNull()
+        assertTrue(pid != null && pid > 0, "the held child must have recorded its pid")
+        assertTrue(waitUntil(5_000) { !pidAlive(pid!!) }, "the killed child must be gone")
+        println("  command drain: timeout killed+reaped pid $pid in ${elapsed}ms")
+    } finally {
+        Files.deleteIfExists(pidfile)
+    }
+}
+
+private fun fixtureCommand(vararg args: String): List<String> =
+    listOf(
+        javaBinary(), "-cp", System.getProperty("java.class.path"),
+        "dev.faktor.backend.CommandFixtureMain"
+    ) + args
+
+/**
+ * The command-capture fixture: `emit <bytes>` floods stdout and exits 0;
+ * `stall <ms>` is quiet, sleeps, then exits 0; `hold <ms> <pidfile>`
+ * records its pid, floods past the pipe capacity, then sleeps far past the
+ * caller's deadline.
+ */
+object CommandFixtureMain {
+    @JvmStatic
+    fun main(args: Array<String>) {
+        val out = java.io.BufferedOutputStream(
+            java.io.FileOutputStream(java.io.FileDescriptor.out), 1 shl 16
+        )
+        when (args.getOrNull(0)) {
+            "emit" -> {
+                val total = args.getOrNull(1)?.toLongOrNull() ?: 0L
+                val chunk = ByteArray(1 shl 16) { 'x'.toByte() }
+                var written = 0L
+                while (written < total) {
+                    val n = minOf(chunk.size.toLong(), total - written).toInt()
+                    out.write(chunk, 0, n)
+                    written += n.toLong()
+                }
+                out.flush()
+            }
+            "stall" -> Thread.sleep(args.getOrNull(1)?.toLongOrNull() ?: 0L)
+            "hold" -> {
+                val ms = args.getOrNull(1)?.toLongOrNull() ?: 60_000L
+                val pidfile = args.getOrNull(2)
+                if (pidfile != null) {
+                    val pid = java.lang.management.ManagementFactory.getRuntimeMXBean()
+                        .name.substringBefore('@')
+                    Files.write(Paths.get(pidfile), pid.toByteArray(Charsets.UTF_8))
+                }
+                val chunk = ByteArray(1 shl 16) { 'y'.toByte() }
+                for (i in 0 until 32) {
+                    out.write(chunk)
+                    out.flush()
+                }
+                Thread.sleep(ms)
+            }
+            else -> fail("unknown command fixture mode: ${args.getOrNull(0)}")
+        }
     }
 }

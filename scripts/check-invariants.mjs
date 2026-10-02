@@ -233,6 +233,57 @@ function selftestLabels(root) {
   return labels;
 }
 
+function kotlinTestFiles(root) {
+  const base = join(root, 'apps/jetbrains');
+  const files = [];
+  const walk = (dir) => {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.kt')) files.push(full);
+    }
+  };
+  walk(base);
+  return files;
+}
+
+function jetbrainsStepLabels(root) {
+  const labels = [];
+  for (const file of kotlinTestFiles(root)) {
+    const text = readFileSync(file, 'utf8');
+    const marker = 'step(';
+    let from = 0;
+    for (;;) {
+      const at = text.indexOf(marker, from);
+      if (at === -1) break;
+      let i = at + marker.length;
+      while (i < text.length && text[i] === ' ') i += 1;
+      const quote = text[i];
+      if (quote === '"' || quote === "'") {
+        const end = text.indexOf(quote, i + 1);
+        if (end !== -1) labels.push(text.slice(i + 1, end));
+      }
+      from = at + marker.length;
+    }
+    // Kotlin helper test fns the smokes invoke (`fun assertX(...)`) are
+    // executable checks too and may witness an invariant.
+    const fnMarker = 'fun ';
+    from = 0;
+    for (;;) {
+      const at = text.indexOf(fnMarker, from);
+      if (at === -1) break;
+      let i = at + fnMarker.length;
+      const start = i;
+      while (i < text.length && /[A-Za-z0-9_]/.test(text[i])) i += 1;
+      const name = text.slice(start, i);
+      if (name.startsWith('assert')) labels.push(name);
+      from = at + fnMarker.length;
+    }
+  }
+  return labels;
+}
+
 function ciCommands(root) {
   const commands = [];
   for (const rel of WORKFLOWS) {
@@ -266,7 +317,7 @@ function runCheck({ root, registryPath }) {
   }
 
   const fnIndex = buildFnIndex(root);
-  const labels = selftestLabels(root);
+  const labels = [...selftestLabels(root), ...jetbrainsStepLabels(root)];
   const commands = ciCommands(root);
   const hasScriptCheck = (value) =>
     labels.includes(value) || commands.some((command) => command.includes(value));
@@ -315,18 +366,17 @@ function runCheck({ root, registryPath }) {
       if (!hasScriptCheck(scriptCheck)) {
         add(
           'script-check-unwired',
-          `${id} script_check '${scriptCheck}' matches no VS Code selftest step and no .woodpecker command line`,
+          `${id} script_check '${scriptCheck}' matches no VS Code selftest step, JetBrains smoke step, or .woodpecker command line`,
         );
       }
-      continue;
-    }
-
-    for (const field of ['unit_test', 'production_wiring']) {
-      const value = typeof entry[field] === 'string' ? entry[field].trim() : '';
-      if (value === '') {
-        add('missing-field', `${id} requires '${field}' (or a script_check)`);
-      } else {
-        requireFn(entry, field, value);
+    } else {
+      for (const field of ['unit_test', 'production_wiring']) {
+        const value = typeof entry[field] === 'string' ? entry[field].trim() : '';
+        if (value === '') {
+          add('missing-field', `${id} requires '${field}' (or a script_check)`);
+        } else {
+          requireFn(entry, field, value);
+        }
       }
     }
 
@@ -339,8 +389,20 @@ function runCheck({ root, registryPath }) {
       add('witness-and-debt', `${id} sets both mutation_witness '${witness}' and mutation_debt`);
     }
     if (witness !== '') {
+      // A witness may be a Rust test fn OR a UI/script check label (VS Code
+      // selftest step, JetBrains smoke step, or workflow command): a removed
+      // control or dropped payload must make a real gate fail.
+      if (fnIndex.has(witness)) {
+        requireFn(entry, 'mutation_witness', witness);
+      } else if (hasScriptCheck(witness)) {
+        // wired: the label exists in a real suite
+      } else {
+        add(
+          'missing-test',
+          `${id} mutation_witness '${witness}' matches no fn and no script/smoke check`,
+        );
+      }
       witnesses += 1;
-      requireFn(entry, 'mutation_witness', witness);
     } else if (debt !== '') {
       debts += 1;
     }

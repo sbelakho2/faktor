@@ -10,9 +10,11 @@
 //!
 //! Platform gating: Darwin has no `fexecve` symbol (checked against Apple's
 //! `unistd.h`); the launcher there execs the `/dev/fd/<n>` magic link on the
-//! same descriptor instead (see `release::exec_path_fallback`). Every other
-//! unix platform and non-unix platforms keep the path-based exec with the
-//! documented gap.
+//! same descriptor instead (see `release::exec_path_fallback`). Windows has
+//! no `fexecve` either and pins the verified object through a no-replace
+//! share handle held across `CreateProcessW` instead (`crate::win_exec`); the
+//! remaining non-unix platforms keep the path-based exec with the documented
+//! gap.
 //!
 //! Honest limit: an fd exec binds the exec to the verified INODE, not to a
 //! frozen snapshot of its content. A same-owner (or root) writer can still

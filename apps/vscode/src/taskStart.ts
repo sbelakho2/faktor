@@ -11,7 +11,7 @@
 // Dependency-free (no vscode import) so scripts/selftest.mjs drives it
 // with a fake client.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { NativeApiError } from './nativeClient.ts';
 import { attachmentIdOf } from './nativeClient.ts';
@@ -180,6 +180,12 @@ export interface AttachmentAdmissionPolicy {
   readonly maxUploadBytes: number;
   readonly maxAttachmentBytes: number;
   readonly imageMimes: readonly string[];
+  /**
+   * The chosen model's image gate (`NativeModelInfo.vision`). Only an
+   * ADVERTISED policy may refuse on this capability (the emergency window
+   * never does: a legacy daemon decides at admission).
+   */
+  readonly imageCapable: boolean;
   /** Tightest advertised per-image bound across the deliverable MIMEs. */
   readonly maxImageBytes: number;
   readonly maxRequestImageBytes: number;
@@ -201,6 +207,9 @@ export const EMERGENCY_ATTACHMENT_POLICY: AttachmentAdmissionPolicy = {
   maxUploadBytes: MAX_PENDING_ATTACHMENT_BYTES,
   maxAttachmentBytes: 32 * 1024 * 1024,
   imageMimes: SUPPORTED_PENDING_IMAGE_MIMES,
+  // Unknown until advertised: the emergency window never refuses an image
+  // on capability grounds, exactly like documents.
+  imageCapable: true,
   maxImageBytes: MAX_PENDING_IMAGE_BYTES,
   maxRequestImageBytes: 16 * 1024 * 1024,
   // Unknown until advertised: a legacy daemon still decides at admission,
@@ -230,6 +239,9 @@ export function attachmentPolicyFromLimits(
     maxUploadBytes: limits.maxUploadBytes,
     maxAttachmentBytes: limits.maxAttachmentBytes,
     imageMimes,
+    // Limits alone carry no model context: only `attachmentPolicyForModel`
+    // overlays the model's vision gate.
+    imageCapable: true,
     maxImageBytes,
     maxRequestImageBytes: limits.image.maxRequestBytes,
     documentCapable: limits.document.capable,
@@ -243,7 +255,8 @@ export function attachmentPolicyFromLimits(
  * The admission policy for one provider/model from the fetched catalog. A
  * missing entry (unknown model) or a legacy entry without advertised limits
  * falls back to the conservative emergency ceiling — never to an unbounded
- * assumption.
+ * assumption. The model's `vision` gate is overlaid here (the daemon
+ * validates images against `vision` + the image contract at admission).
  */
 export function attachmentPolicyForModel(
   catalog: readonly NativeModelInfo[],
@@ -252,7 +265,10 @@ export function attachmentPolicyForModel(
 ): AttachmentAdmissionPolicy {
   const entry = catalog.find((row) => row.provider === provider && row.model === model);
   const limits = entry?.attachmentLimits ?? null;
-  return limits === null ? EMERGENCY_ATTACHMENT_POLICY : attachmentPolicyFromLimits(limits);
+  if (limits === null) {
+    return EMERGENCY_ATTACHMENT_POLICY;
+  }
+  return { ...attachmentPolicyFromLimits(limits), imageCapable: entry?.vision === true };
 }
 
 function pendingString(value: unknown, max = MAX_PENDING_ID_CHARS): string | null {
@@ -845,16 +861,27 @@ function uploadFailureOf(error: unknown, sessionId: string): AdmitFailure {
 }
 
 /**
+ * The minimal attachment shape every admission gate needs (bytes identity,
+ * MIME, filename, size, image flag): a `PendingBinaryAttachment` or a
+ * bounded composer-store view satisfies it without carrying base64.
+ */
+export type PendingAttachmentPart = Pick<
+  PendingBinaryAttachment,
+  'mime' | 'filename' | 'bytes' | 'isImage'
+>;
+
+/**
  * The typed refusal for attachments that can never reach a model as an
- * image part: a mime outside the ADVERTISED image allowlist (the emergency
- * list before the catalog is read) or an image over the advertised per-image
- * or request-wide image bound. Returns `null` when every attachment is
- * deliverable — a supported image is NOT refused (it uploads to the durable
- * artifact store like any other attachment, and the daemon's own admission
- * re-validates it against the chosen model's vision capability).
+ * image part: the ADVERTISED model vision gate, a mime outside the
+ * ADVERTISED image allowlist (the emergency list before the catalog is
+ * read) or an image over the advertised per-image or request-wide image
+ * bound. Returns `null` when every attachment is deliverable — a supported
+ * image is NOT refused (it uploads to the durable artifact store like any
+ * other attachment, and the daemon's own admission re-validates it against
+ * the chosen model's vision capability).
  */
 export function pendingImageRefusal(
-  attachments: readonly PendingBinaryAttachment[],
+  attachments: readonly PendingAttachmentPart[],
   policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
 ): AdmitFailure | null {
   let total = 0;
@@ -863,6 +890,17 @@ export function pendingImageRefusal(
       continue;
     }
     const name = attachment.filename ?? '(unnamed)';
+    if (policy.source === 'advertised' && !policy.imageCapable) {
+      return {
+        kind: 'image_unsupported',
+        stage: 'upload',
+        status: 400,
+        code: 'unsupported_image_type',
+        message:
+          `image attachment ${name} cannot be delivered: the selected model does not ` +
+          'advertise vision; remove it or select a vision model',
+      };
+    }
     if (!policy.imageMimes.includes(attachment.mime)) {
       return {
         kind: 'image_unsupported',
@@ -916,7 +954,7 @@ function isPendingDocumentMime(mime: string): boolean {
  * non-document mimes are opaque CAS-only artifacts and pass untouched.
  */
 export function pendingDocumentRefusal(
-  attachments: readonly PendingBinaryAttachment[],
+  attachments: readonly PendingAttachmentPart[],
   policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
 ): AdmitFailure | null {
   let total = 0;
@@ -984,7 +1022,7 @@ export function pendingDocumentRefusal(
  * the authority after upload.
  */
 export function pendingAttachmentRefusal(
-  attachments: readonly PendingBinaryAttachment[],
+  attachments: readonly PendingAttachmentPart[],
   policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
 ): AdmitFailure | null {
   for (const attachment of attachments) {
@@ -1006,6 +1044,258 @@ export function pendingAttachmentRefusal(
   }
   return pendingDocumentRefusal(attachments, policy);
 }
+
+/**
+ * The human-readable refusal of ONE composer attachment against the
+ * advertised (or emergency) contract, or `null` when it is deliverable.
+ * Displaying this next to the item is advisory: the whole-set admission
+ * gate above stays authoritative.
+ */
+export function composerAttachmentRefusal(
+  attachment: PendingAttachmentPart,
+  policy: AttachmentAdmissionPolicy = EMERGENCY_ATTACHMENT_POLICY,
+): string | null {
+  return pendingAttachmentRefusal([attachment], policy)?.message ?? null;
+}
+
+// -------------------------------------------------- composer attachments
+
+/** Bounds of the bounded host-side composer attachment store. */
+export const MAX_COMPOSER_ATTACHMENTS = 8;
+export const MAX_COMPOSER_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024;
+
+/** One attachment the webview renders (metadata only; never the bytes). */
+export interface ComposerAttachmentView {
+  readonly id: string;
+  readonly filename: string | null;
+  readonly mime: string;
+  readonly bytes: number;
+  readonly isImage: boolean;
+}
+
+/** Host-side MIME guess for a picked file (opaque when unknown). */
+const COMPOSER_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  pdf: 'application/pdf',
+  txt: 'text/plain',
+};
+
+export function composerMimeForFilename(filename: string | null): string {
+  const match = filename === null ? null : /\.([A-Za-z0-9]+)$/.exec(filename);
+  if (match === null) {
+    return 'application/octet-stream';
+  }
+  return COMPOSER_MIME_BY_EXTENSION[match[1].toLowerCase()] ?? 'application/octet-stream';
+}
+
+function composerFilenamePart(raw: unknown): string | null | undefined {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed.length <= 255 ? trimmed : undefined;
+}
+
+/** Strict bounded decode of one webview/picker attachment input. */
+function parseComposerAttachmentInput(
+  raw: unknown,
+): { readonly attachment: PendingBinaryAttachment } | { readonly reason: string } {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { reason: 'attachment entry must be an object' };
+  }
+  const record = raw as Record<string, unknown>;
+  const mime =
+    typeof record.mime === 'string' &&
+    record.mime.trim().length > 0 &&
+    record.mime.length <= 128 &&
+    !/[\u0000-\u001f\u007f]/.test(record.mime)
+      ? record.mime.trim()
+      : null;
+  const filename = composerFilenamePart(record.filename);
+  const bytes =
+    typeof record.bytes === 'number' && Number.isInteger(record.bytes) && record.bytes >= 0
+      ? record.bytes
+      : null;
+  const dataBase64 = typeof record.dataBase64 === 'string' ? record.dataBase64 : null;
+  if (mime === null) {
+    return { reason: 'mime must be a bounded non-empty string' };
+  }
+  if (filename === undefined) {
+    return { reason: 'filename must be null or a non-empty string of at most 255 characters' };
+  }
+  if (bytes === null || bytes > MAX_PENDING_ATTACHMENT_BYTES) {
+    return { reason: `bytes must be an integer in 0..${MAX_PENDING_ATTACHMENT_BYTES}` };
+  }
+  if (dataBase64 === null || dataBase64.length > MAX_PENDING_BASE64_CHARS) {
+    return { reason: `dataBase64 exceeds the ${MAX_PENDING_BASE64_CHARS} character upload bound` };
+  }
+  const decoded = Buffer.from(dataBase64, 'base64');
+  if (decoded.byteLength !== bytes) {
+    return {
+      reason: `declared ${bytes} bytes but the payload decodes to ${decoded.byteLength}`,
+    };
+  }
+  return {
+    attachment: {
+      mime,
+      filename,
+      bytes,
+      dataBase64,
+      isImage: typeof record.isImage === 'boolean' ? record.isImage : mime.startsWith('image/'),
+    },
+  };
+}
+
+/**
+ * Bounded host-side attachment store for the composer. The webview holds
+ * metadata ids only; the durable upload path reads the bytes from HERE, so
+ * a picker selection never ships its base64 through the webview and a
+ * submission snapshot can never be mutated by a later remove/clear. The
+ * store is pre-upload local state: it is cleared only by an explicit
+ * remove/clear, a session switch, or a DURABLE successful start.
+ */
+export class ComposerAttachmentStore {
+  private readonly entries = new Map<
+    string,
+    PendingBinaryAttachment & { readonly id: string }
+  >();
+  private totalBytes = 0;
+  private readonly newId: () => string;
+  private readonly maxEntries: number;
+  private readonly maxTotalBytes: number;
+
+  constructor(
+    newId?: () => string,
+    maxEntries: number = MAX_COMPOSER_ATTACHMENTS,
+    maxTotalBytes: number = MAX_COMPOSER_ATTACHMENT_TOTAL_BYTES,
+  ) {
+    this.newId = newId ?? (() => randomUUID());
+    this.maxEntries = maxEntries;
+    this.maxTotalBytes = maxTotalBytes;
+  }
+
+  /** Strict bounded add; a refusal names the exact reason and adds nothing. */
+  add(raw: unknown): {
+    readonly view: ComposerAttachmentView | null;
+    readonly reason: string | null;
+  } {
+    const parsed = parseComposerAttachmentInput(raw);
+    if ('reason' in parsed) {
+      return { view: null, reason: parsed.reason };
+    }
+    if (this.entries.size >= this.maxEntries) {
+      return { view: null, reason: `at most ${this.maxEntries} attachments per submission` };
+    }
+    if (this.totalBytes + parsed.attachment.bytes > this.maxTotalBytes) {
+      return {
+        view: null,
+        reason: `attachments would total more than ${this.maxTotalBytes} bytes`,
+      };
+    }
+    const id = this.newId();
+    const entry = Object.freeze({ id, ...parsed.attachment });
+    this.entries.set(id, entry);
+    this.totalBytes += parsed.attachment.bytes;
+    return { view: viewOfComposerAttachment(entry), reason: null };
+  }
+
+  remove(id: unknown): boolean {
+    if (typeof id !== 'string') {
+      return false;
+    }
+    const entry = this.entries.get(id);
+    if (entry === undefined) {
+      return false;
+    }
+    this.entries.delete(id);
+    this.totalBytes -= entry.bytes;
+    return true;
+  }
+
+  clear(): void {
+    this.entries.clear();
+    this.totalBytes = 0;
+  }
+
+  list(): readonly ComposerAttachmentView[] {
+    return [...this.entries.values()].map(viewOfComposerAttachment);
+  }
+
+  /**
+   * The IMMUTABLE snapshot of one submission: ids are resolved in entry
+   * order into fresh byte-carrying records. An unknown, duplicated or
+   * malformed id refuses the whole selection (never a silent skip).
+   */
+  select(rawIds: unknown): {
+    readonly attachments: readonly PendingBinaryAttachment[];
+    readonly reason: string | null;
+  } {
+    if (!Array.isArray(rawIds)) {
+      return { attachments: [], reason: 'attachmentIds must be an array of host ids' };
+    }
+    if (rawIds.length > this.maxEntries) {
+      return { attachments: [], reason: `more than ${this.maxEntries} attachments` };
+    }
+    const seen = new Set<string>();
+    const attachments: PendingBinaryAttachment[] = [];
+    for (const raw of rawIds) {
+      if (typeof raw !== 'string' || raw.length === 0 || raw.length > 128) {
+        return { attachments: [], reason: 'attachment id must be a bounded string' };
+      }
+      if (seen.has(raw)) {
+        return { attachments: [], reason: `attachment ${JSON.stringify(raw)} was selected twice` };
+      }
+      seen.add(raw);
+      const entry = this.entries.get(raw);
+      if (entry === undefined) {
+        return {
+          attachments: [],
+          reason: `attachment ${JSON.stringify(raw)} is no longer attached; re-attach it and retry`,
+        };
+      }
+      attachments.push({
+        mime: entry.mime,
+        filename: entry.filename,
+        bytes: entry.bytes,
+        dataBase64: entry.dataBase64,
+        isImage: entry.isImage,
+      });
+    }
+    return { attachments, reason: null };
+  }
+
+  size(): number {
+    return this.entries.size;
+  }
+
+  totalBytesValue(): number {
+    return this.totalBytes;
+  }
+}
+
+function viewOfComposerAttachment(
+  entry: PendingBinaryAttachment & { readonly id: string },
+): ComposerAttachmentView {
+  return {
+    id: entry.id,
+    filename: entry.filename,
+    mime: entry.mime,
+    bytes: entry.bytes,
+    isImage: entry.isImage,
+  };
+}
+
 
 /**
  * Admit ONE pending submission through the daemon: gate every attachment

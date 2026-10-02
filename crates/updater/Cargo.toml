@@ -29,5 +29,12 @@ tempfile.workspace = true
 # loopback-address-rule) client behind the test-utils gate.
 faktor-provider = { workspace = true, features = ["test-utils"] }
 
+# Same windows-sys 0.61.2 revision the workspace already locks (crates/pty,
+# crates/fs, crates/winjob): the Windows launch seam reads the verified file
+# object's identity (volume serial + file index + creation time) from its open
+# handle through `GetFileInformationByHandle`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [lints]
 workspace = true
