@@ -14,10 +14,18 @@
 //! network namespace, and a privileged child keeps mount/module authority
 //! too. After `unshare`/`setns` the hook therefore runs
 //! [`drop_isolated_child_privileges`]: `PR_SET_NO_NEW_PRIVS`, an empty
-//! capability bounding set, an empty capset (effective/permitted/
-//! inheritable), no supplementary groups, and `setresgid`/`setresuid` to
-//! the dedicated unprivileged [`SANDBOX_UID`]/[`SANDBOX_GID`]. Every step
-//! is fail-closed: a refusal refuses the spawn typed, so a child never
+//! capability bounding set, and an empty capset (effective/permitted/
+//! inheritable). With no capability and no way to gain one at exec, the
+//! child cannot `setns` back out (that needs CAP_SYS_ADMIN) or mount/load
+//! modules.
+//!
+//! The child deliberately keeps the DAEMON's uid/gid: sandboxed consumers
+//! (the browser authority above all) are launched with daemon-provisioned
+//! 0700 profiles/scratch and must remain able to use them. Pinning a foreign
+//! uid here would break every such spawn unless each consumer first
+//! provisioned its paths for that uid; that dedicated-uid migration is a
+//! separate hardening step, not a behavioral regression of this fix. Every
+//! step is fail-closed: a refusal refuses the spawn typed, so a child never
 //! execs half-privileged.
 //!
 //! Fail-closed contract: if the kernel or the user-namespace policy
@@ -30,9 +38,8 @@
 //! message still names the cause).
 //!
 //! The closure runs in the single-threaded post-fork child and only calls
-//! raw async-signal-safe syscalls (`unshare`/`setns`, `prctl`, `capset`,
-//! `setgroups`, `setresgid`, `setresuid`) and reads errno — no allocation,
-//! no locks.
+//! raw async-signal-safe syscalls (`unshare`/`setns`, `prctl`, `capset`)
+//! and reads errno — no allocation, no locks.
 
 #![allow(unsafe_code)] // platform authority module: every unsafe
                        // block/function in this module carries a `// SAFETY:` justification and is
@@ -51,21 +58,6 @@ static FORCE_UNSHARE_FAILURE: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) fn force_unshare_failure_for_tests(force: bool) {
     FORCE_UNSHARE_FAILURE.store(force, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// The id every isolated child is dropped to (tests report/assert it).
-#[cfg(test)]
-pub(crate) fn sandbox_uid_for_tests() -> u32 {
-    SANDBOX_UID
-}
-
-/// True when this process is privileged enough for the netns setup to
-/// succeed (the only case where the credential drop actually runs);
-/// unprivileged hosts refuse the spawn before the drop and skip typed.
-#[cfg(test)]
-pub(crate) fn running_privileged_for_tests() -> bool {
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    unsafe { libc::geteuid() == 0 }
 }
 
 /// Test-only escape probe (runs inside a spawned child): attempt exactly the
@@ -89,6 +81,184 @@ pub(crate) fn setns_escape_denied_for_tests() -> bool {
         libc::close(fd);
     }
     r != 0
+}
+
+/// Outcome of running the REAL [`drop_isolated_child_privileges`] in a
+/// forked probe process (tests). `Succeeded` carries the post-drop
+/// `PR_GET_NO_NEW_PRIVS` and capget state; `Refused` the raw errno.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropProbe {
+    Succeeded {
+        no_new_privs: bool,
+        caps_empty: bool,
+    },
+    Refused(i32),
+}
+
+/// True when the process currently holds no effective/permitted/inheritable
+/// capability (raw capget; usable in a forked child: no allocation).
+#[cfg(test)]
+fn caps_empty_now() -> bool {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: `header`/`data` are live, correctly sized buffers for the
+    // capget ABI; only the checked return is used.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    r == 0
+        && data
+            .iter()
+            .all(|d| d.effective == 0 && d.permitted == 0 && d.inheritable == 0)
+}
+
+/// `prctl(PR_GET_NO_NEW_PRIVS)` (raw scalar query; forked-child safe).
+#[cfg(test)]
+fn no_new_privs_now() -> bool {
+    // SAFETY: PR_GET_NO_NEW_PRIVS takes scalar arguments only.
+    unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            PR_GET_NO_NEW_PRIVS,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) == 1
+    }
+}
+
+/// Run the production [`drop_isolated_child_privileges`] in a forked child
+/// and report its outcome. The child performs only raw syscalls and `_exit`s
+/// (no allocator, no locks), so the probe is safe from a multithreaded test
+/// process. This is the ordering-regression guard: credentials must be
+/// changed while the child still holds CAP_SETGID/CAP_SETUID.
+#[cfg(test)]
+pub(crate) fn probe_privilege_drop_for_tests() -> DropProbe {
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a live two-element array; failure is refused.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return DropProbe::Refused(libc::EMFILE);
+    }
+    // SAFETY: fork in a test; the child branch below only calls the raw
+    // drop syscalls, the capget/prctl queries and write/_exit.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: child branch of the probe; `_exit` never unwinds or drops.
+        unsafe {
+            libc::close(fds[0]);
+            let mut record = [0u8; 8];
+            match drop_isolated_child_privileges() {
+                Ok(()) => {
+                    record[0] = 1;
+                    record[1] = no_new_privs_now() as u8;
+                    record[2] = caps_empty_now() as u8;
+                }
+                Err(e) => {
+                    record[0] = 0;
+                    record[1..5].copy_from_slice(&e.raw_os_error().unwrap_or(-1).to_ne_bytes());
+                }
+            }
+            let _ = libc::write(fds[1], record.as_ptr().cast(), record.len());
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: parent side: close the write end, drain the fixed record, close
+    // the read end and reap the child.
+    let record = unsafe {
+        libc::close(fds[1]);
+        let mut record = [0u8; 8];
+        let mut got = 0usize;
+        while got < record.len() {
+            let n = libc::read(
+                fds[0],
+                record[got..].as_mut_ptr().cast(),
+                record.len() - got,
+            );
+            if n <= 0 {
+                break;
+            }
+            got += n as usize;
+        }
+        libc::close(fds[0]);
+        let mut status = 0i32;
+        libc::waitpid(pid, &mut status, 0);
+        record
+    };
+    if record[0] == 1 {
+        DropProbe::Succeeded {
+            no_new_privs: record[1] == 1,
+            caps_empty: record[2] == 1,
+        }
+    } else {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&record[1..5]);
+        DropProbe::Refused(i32::from_ne_bytes(bytes))
+    }
+}
+
+/// Cached probe: can this kernel/host run `unshare(CLONE_NEWNET)`? Forked so
+/// the test process itself never changes namespaces. A host that can unshare
+/// must not accept a typed isolation refusal as "unprivileged environment".
+#[cfg(test)]
+pub(crate) fn netns_unshare_available_for_tests() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a live two-element array; failure means "unknown",
+        // reported as unavailable.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: fork in a test; the child branch only calls unshare, write
+        // and _exit.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: child branch; `_exit` never unwinds.
+            unsafe {
+                libc::close(fds[0]);
+                let byte = [u8::from(libc::unshare(libc::CLONE_NEWNET) == 0)];
+                let _ = libc::write(fds[1], byte.as_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: parent side: one-byte record, then reap.
+        unsafe {
+            libc::close(fds[1]);
+            let mut byte = [0u8; 1];
+            let n = libc::read(fds[0], byte.as_mut_ptr().cast(), 1);
+            libc::close(fds[0]);
+            let mut status = 0i32;
+            libc::waitpid(pid, &mut status, 0);
+            n == 1 && byte[0] == 1
+        }
+    })
+}
+
+/// True when this process can actually run the capability drop: root (so
+/// CAP_SETPCAP is available to empty the bounding set). The drop changes no
+/// credentials, so uid mapping in a user namespace does not matter.
+#[cfg(test)]
+pub(crate) fn privilege_drop_must_succeed_for_tests() -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// True when a full isolated spawn (unshare/setns + privilege drop) is known
+/// to be possible here, so ANY typed isolation refusal is a regression and
+/// never a skippable "unprivileged host" outcome. Tests gate their
+/// environment skips on the negation of this.
+#[cfg(test)]
+pub(crate) fn isolation_must_succeed_for_tests() -> bool {
+    privilege_drop_must_succeed_for_tests() && netns_unshare_available_for_tests()
 }
 
 /// Install the deny-all network isolation pre-exec hook on `cmd`.
@@ -126,36 +296,35 @@ fn unshare_netns_pre_exec() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 // Privilege drop for isolated children (THE confinement, not an add-on).
 //
-// An unshare/setns child that stays uid 0 keeps CAP_SYS_ADMIN: it can
-// `setns(2)` back to the host network namespace, and retains mount/module
-// capabilities. Every isolated child is therefore pinned to an unprivileged
-// identity with no way back up:
+// An unshare/setns child that keeps CAP_SYS_ADMIN can `setns(2)` back to the
+// host network namespace and retains mount/module authority. Every isolated
+// child is therefore stripped of every capability with no way to regain one:
 //
-//  * `PR_SET_NO_NEW_PRIVS` blocks regaining privilege at exec (setuid
-//    binaries, file capabilities);
+//  * `PR_SET_NO_NEW_PRIVS` blocks privilege gain at exec (setuid binaries,
+//    file capabilities);
 //  * the capability bounding set is emptied, so no exec can ever raise a
 //    capability again;
-//  * effective/permitted/inheritable are cleared with one `capset(2)`;
-//  * supplementary groups are cleared and real/effective/saved gid+uid are
-//    set to the dedicated unprivileged sandbox id.
+//  * effective/permitted/inheritable are then cleared with one `capset(2)`
+//    (emptying a set is always allowed, so this does not need privilege).
+//
+// The child KEEPS the daemon's uid/gid on purpose (see the module docs):
+// sandboxed consumers spawn with daemon-owned 0700 profiles/scratch, so a
+// foreign uid would break them unless each consumer provisioned its paths
+// for it. The capability drop alone closes the finding's escape — `setns`
+// needs CAP_SYS_ADMIN — and exec cannot restore capabilities.
 //
 // Every step is fail-closed: the first refusal returns the raw errno, the
 // pre-exec hook fails, and the spawn is refused typed — the child never
 // execs with a partially dropped privilege set. All calls are raw
 // async-signal-safe syscalls (no allocation, no locks).
 
-/// The unprivileged identity every isolated child is pinned to (`nobody` /
-/// `nogroup`, numeric so no `/etc/passwd` entry is required). The daemon's
-/// own user is irrelevant: even a root daemon hands the sandbox an identity
-/// with no capabilities and no path back to privilege.
-const SANDBOX_UID: libc::uid_t = 65534;
-const SANDBOX_GID: libc::gid_t = 65534;
-
 /// The two-block capability ABI version (caps 0..=63) and the raw prctl
 /// commands used below; not every libc version re-exports these names for
 /// every target.
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+#[cfg(test)]
+const PR_GET_NO_NEW_PRIVS: libc::c_int = 39;
 const PR_CAPBSET_DROP: libc::c_int = 24;
 
 /// `struct __user_cap_header_struct` (linux/capability.h).
@@ -177,6 +346,10 @@ struct CapData {
 /// Drop every privilege an isolated child could use to leave its namespace.
 /// See the comment block above for the exact sequence and the fail-closed
 /// contract. Runs in the post-fork, pre-exec child: raw syscalls only.
+///
+/// ORDER: the bounding set is dropped while CAP_SETPCAP is still effective;
+/// the empty `capset` follows (emptying a set is a subset operation and is
+/// always permitted). Credentials are deliberately not changed here.
 fn drop_isolated_child_privileges() -> io::Result<()> {
     // SAFETY: prctl(PR_SET_NO_NEW_PRIVS, 1, ...) takes scalar arguments
     // only; no pointer is dereferenced, and the raw errno read after a
@@ -219,6 +392,10 @@ fn drop_isolated_child_privileges() -> io::Result<()> {
         }
     }
 
+    // Credentials (uid/gid/groups) are deliberately untouched: sandboxed
+    // consumers are launched with daemon-owned 0700 profiles/scratch that
+    // they must keep using (module docs).
+
     // One capset drops all three sets (two 32-bit blocks cover caps 0..=63).
     let mut header = CapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
@@ -227,7 +404,8 @@ fn drop_isolated_child_privileges() -> io::Result<()> {
     let data = [CapData::default(); 2];
     // SAFETY: `header` and `data` are live, correctly sized buffers for the
     // capset ABI (header names the process itself with pid 0); the syscall
-    // only reads them and its return is checked.
+    // only reads them and its return is checked. Emptying a capability set
+    // is always permitted (each new set is a subset of the old one).
     let r = unsafe {
         libc::syscall(
             libc::SYS_capset,
@@ -236,20 +414,6 @@ fn drop_isolated_child_privileges() -> io::Result<()> {
         )
     };
     if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: setgroups(0, NULL) is the documented empty-supplementary-group
-    // request (a null pointer is valid because the count is zero).
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: setresgid/setresuid take scalar ids; all three (real,
-    // effective, saved) are pinned so no saved id can restore privilege.
-    if unsafe { libc::setresgid(SANDBOX_GID, SANDBOX_GID, SANDBOX_GID) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::setresuid(SANDBOX_UID, SANDBOX_UID, SANDBOX_UID) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1495,12 +1659,11 @@ pub(crate) use broker_only::{validate_endpoint, Inner};
 
 /// Install the BrokerOnly pre-exec hook on `cmd`: after fork, before exec,
 /// the child `setns()`es into the bridge's network namespace and then drops
-/// to the unprivileged [`SANDBOX_UID`] identity with an empty capability
-/// set and `PR_SET_NO_NEW_PRIVS` (see
+/// every capability with `PR_SET_NO_NEW_PRIVS` (see
 /// [`drop_isolated_child_privileges`]), so it cannot `setns` back out. Any
 /// failure is transported out of the forked child by std and refuses the
 /// spawn typed (see `spawn_failure`) — the child never runs outside the
-/// namespace and never runs privileged.
+/// namespace and never runs with capabilities.
 ///
 /// # Safety
 ///
