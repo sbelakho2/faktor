@@ -52,6 +52,76 @@ pub enum EventKind {
     Resumed,
     Failed,
 }
+impl EventKind {
+    /// The CANONICAL vocabulary (audit: 28 variants). Adding a variant fails
+    /// [`EventKind::exhaustive`] and the `ALL` length, so neither the
+    /// persistence vocabulary nor the documented contract can drift silently.
+    pub const ALL: [EventKind; 28] = [
+        EventKind::SessionCreated,
+        EventKind::PromptReceived,
+        EventKind::ContextPrepared,
+        EventKind::ModelStarted,
+        EventKind::ModelChunkReceived,
+        EventKind::ToolRequested,
+        EventKind::ToolStarted,
+        EventKind::FileChanged,
+        EventKind::ToolCompleted,
+        EventKind::ToolCancelled,
+        EventKind::CheckpointCreated,
+        EventKind::ContextCompacted,
+        EventKind::CompactRejected,
+        EventKind::SubagentStarted,
+        EventKind::SubagentCompleted,
+        EventKind::TurnCompleted,
+        EventKind::PermissionGranted,
+        EventKind::PermissionDenied,
+        EventKind::PermissionExpired,
+        EventKind::PromptAdmitted,
+        EventKind::PhaseChanged,
+        EventKind::ReplayStarted,
+        EventKind::CrashDetected,
+        EventKind::RecoveryApplied,
+        EventKind::SessionEnded,
+        EventKind::Suspended,
+        EventKind::Resumed,
+        EventKind::Failed,
+    ];
+
+    /// Exhaustiveness guard: a new variant breaks compilation here until the
+    /// authoritative vocabulary (`ALL`, persistence, docs check) catches up.
+    pub const fn exhaustive(self) {
+        match self {
+            EventKind::SessionCreated
+            | EventKind::PromptReceived
+            | EventKind::ContextPrepared
+            | EventKind::ModelStarted
+            | EventKind::ModelChunkReceived
+            | EventKind::ToolRequested
+            | EventKind::ToolStarted
+            | EventKind::FileChanged
+            | EventKind::ToolCompleted
+            | EventKind::ToolCancelled
+            | EventKind::CheckpointCreated
+            | EventKind::ContextCompacted
+            | EventKind::CompactRejected
+            | EventKind::SubagentStarted
+            | EventKind::SubagentCompleted
+            | EventKind::TurnCompleted
+            | EventKind::PermissionGranted
+            | EventKind::PermissionDenied
+            | EventKind::PermissionExpired
+            | EventKind::PromptAdmitted
+            | EventKind::PhaseChanged
+            | EventKind::ReplayStarted
+            | EventKind::CrashDetected
+            | EventKind::RecoveryApplied
+            | EventKind::SessionEnded
+            | EventKind::Suspended
+            | EventKind::Resumed
+            | EventKind::Failed => {}
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Event {
@@ -194,5 +264,25 @@ mod tests {
         // This is enforced in faktor-store; here we verify the marker types
         // used for that check exist and compare correctly.
         assert!(EventSeq::new(2) != EventSeq::new(3));
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+
+    /// The vocabulary is the authority: every variant compiles through the
+    /// exhaustive guard and appears in the documented contract.
+    #[test]
+    fn event_kind_vocabulary_is_complete_and_documented() {
+        assert_eq!(EventKind::ALL.len(), 28);
+        let doc = include_str!("../../../docs/api-contracts.md");
+        for kind in EventKind::ALL {
+            kind.exhaustive();
+            assert!(
+                doc.contains(&format!("{kind:?}")),
+                "api-contracts.md omits EventKind::{kind:?}"
+            );
+        }
     }
 }

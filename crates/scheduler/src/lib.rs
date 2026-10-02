@@ -166,12 +166,11 @@ pub enum DependencyPolicy {
     /// makes this edge dead: the dependent can never run and is marked
     /// `Blocked` (transitively through its own `Success` edges).
     Success,
-    /// The dependent runs after the upstream reaches ANY terminal state:
-    /// `Done | Failed | Cancelled | Blocked`. A `Blocked` upstream DOES
-    /// satisfy this edge (it can never run, so waiting for it is a false
-    /// deadlock). A `Terminal`-edge dependent behind a *chain* of blocked
-    /// tasks is released when the dependency graph is next rebuilt from
-    /// live state (a blocked task produces no terminal event of its own).
+    /// The dependent runs after any terminal EXECUTION state:
+    /// `Done | Failed | Cancelled`. A `Blocked` upstream does NOT satisfy
+    /// this edge (frozen architecture, docs/architecture.md 5.x): the
+    /// dependent can never run either and becomes `Blocked`, propagating
+    /// transitively like a dead `Success` edge; `Always` is the cleanup edge.
     Terminal,
     /// Cleanup/finalizer edge — defined by PURPOSE, not by a different
     /// state set: use this ONLY for teardown that must fire once its
@@ -280,12 +279,7 @@ fn edge_satisfied(policy: DependencyPolicy, upstream: TaskStatus) -> bool {
         DependencyPolicy::Success => upstream == TaskStatus::Done,
         DependencyPolicy::Terminal => matches!(
             upstream,
-            TaskStatus::Done
-                | TaskStatus::Failed
-                | TaskStatus::Cancelled
-                // A Blocked upstream is terminally unavailable: treating it
-                // as satisfied prevents a false deadlock (audit round 5).
-                | TaskStatus::Blocked
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
         ),
         DependencyPolicy::Always => matches!(
             upstream,
@@ -316,15 +310,11 @@ fn status_is_terminal(status: TaskStatus) -> bool {
 
 /// A task became terminal (`Done`/`Failed`/`Cancelled`/`Blocked`) — the
 /// upstream can make no further execution progress — so notify every
-/// dependent according to its edge policy: satisfied edges (`Terminal` and
-/// `Always` are both satisfied by a `Blocked` upstream; the upstream is
-/// terminal either way) decrement the pending-count, dead `Success` edges
-/// mark the dependent `Blocked` and propagate that transitively. `Always`
-/// edges through a blocked chain still fire immediately (cleanup); a
-/// `Terminal`-edge dependent behind a blocked chain stays pending until the
-/// graph is rebuilt from live state, which also releases it (a blocked task
-/// never produces a terminal event of its own, so this rebuild is the only
-/// release path for it).
+/// dependent according to its ONE truth table: an edge satisfied by the
+/// upstream state decrements the pending-count; `Always` is the only policy
+/// satisfied by a `Blocked` upstream (cleanup fires); `Success` AND
+/// `Terminal` edges whose upstream can never reach a satisfying state mark
+/// the dependent `Blocked` and propagate that transitively.
 fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) {
     // Terminal exactly-once: dependent notification and the ownership
     // release that accompanies it happen once per op. A second terminal
@@ -353,7 +343,7 @@ fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) 
                     guard.ready.push_back(dep_id);
                 }
             }
-        } else if policy == DependencyPolicy::Success {
+        } else if policy != DependencyPolicy::Always {
             if let Some(t) = guard.tasks.get_mut(&dep_id) {
                 t.blocked += 1;
                 if t.status == TaskStatus::Pending {
@@ -391,7 +381,15 @@ fn terminalize(guard: &mut std::sync::MutexGuard<'_, Inner>, upstream_id: OpId) 
                         }
                     }
                 }
-                DependencyPolicy::Terminal => {}
+                DependencyPolicy::Terminal => {
+                    if let Some(t) = guard.tasks.get_mut(&dep_id) {
+                        t.blocked += 1;
+                        if t.status == TaskStatus::Pending {
+                            t.status = TaskStatus::Blocked;
+                            worklist.push(dep_id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -3408,9 +3406,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_policy_accepts_blocked_upstream_no_false_deadlock() {
-        // A fails → B (Success) Blocked → C (Terminal edge on B) must RUN,
-        // and run_to_completion must NOT report a deadlock.
+    async fn terminal_policy_blocks_behind_a_blocked_upstream() {
+        // A fails -> B (Success) Blocked -> C (Terminal edge on B) can
+        // never reach a satisfying state either, so C is Blocked and no
+        // false deadlock is reported (frozen architecture).
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let counter = Arc::new(AtomicUsize::new(0));
         let c2 = counter.clone();
@@ -3467,21 +3466,20 @@ mod tests {
             },
         );
         let done = s.run_to_completion().await.unwrap();
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "only C runs");
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "C never runs");
         assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
-        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
-        assert!(done.contains(&OpId::new(3)));
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Blocked));
+        assert!(!done.contains(&OpId::new(3)));
     }
 
-    /// P0-19: locks the DOCUMENTED definitions to the executable ones.
-    /// Terminal = the upstream can make no further execution progress
-    /// (`Done | Failed | Cancelled | Blocked` — a blocked task can never
-    /// run, so a `Terminal` edge on it must not deadlock); Always = the
-    /// CLEANUP edge, defined by purpose (teardown fires once its upstream
-    /// settles, however it settled), satisfied by the same terminal set and
-    /// released through a blocked chain immediately.
+    /// Locks the DOCUMENTED truth table to the executable one
+    /// (docs/architecture.md): Terminal = `Done | Failed | Cancelled`; a
+    /// `Blocked` upstream can never reach a satisfying state, so a Terminal
+    /// edge on it blocks its dependent too. Always = the CLEANUP edge,
+    /// defined by purpose (teardown fires once its upstream settles,
+    /// however it settled, including Blocked).
     #[tokio::test]
-    async fn terminal_includes_blocked_and_always_is_cleanup() {
+    async fn terminal_excludes_blocked_and_always_is_cleanup() {
         let s = Scheduler::new(SessionId::new(1), Arc::new(SystemClock));
         let runs = Arc::new(AtomicUsize::new(0));
         // A fails. B waits on A with a Success edge → B blocks (dead path).
@@ -3585,11 +3583,13 @@ mod tests {
         let done = s.run_to_completion().await.expect("no false deadlock");
         assert_eq!(s.status(OpId::new(1)), Some(TaskStatus::Failed));
         assert_eq!(s.status(OpId::new(2)), Some(TaskStatus::Blocked));
-        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Done));
+        // Terminal excludes Blocked (frozen architecture): C behind a blocked
+        // upstream is itself Blocked and never runs.
+        assert_eq!(s.status(OpId::new(3)), Some(TaskStatus::Blocked));
         assert_eq!(s.status(OpId::new(4)), Some(TaskStatus::Done));
         assert_eq!(s.status(OpId::new(5)), Some(TaskStatus::Blocked));
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "C and D run exactly once");
-        assert!(done.contains(&OpId::new(3)) && done.contains(&OpId::new(4)));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "only Always cleanup D runs");
+        assert!(done.contains(&OpId::new(4)) && !done.contains(&OpId::new(3)));
     }
 
     // ---- audit round 18: duplicate submissions are conflicts, never

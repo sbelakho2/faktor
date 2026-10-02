@@ -26,7 +26,8 @@ pub struct StateMachine(AgentState); // ::new(s), state(), transition(to)->Resul
 pub enum EventKind { SessionCreated, PromptReceived, ContextPrepared, ModelStarted, ModelChunkReceived,
     ToolRequested, ToolStarted, FileChanged, ToolCompleted, ToolCancelled, CheckpointCreated,
     ContextCompacted, CompactRejected, SubagentStarted, SubagentCompleted, TurnCompleted,
-    PermissionGranted, PermissionDenied, CrashDetected, RecoveryApplied, SessionEnded,
+    PermissionGranted, PermissionDenied, PermissionExpired, PromptAdmitted, PhaseChanged,
+    ReplayStarted, CrashDetected, RecoveryApplied, SessionEnded,
     Suspended, Resumed, Failed }
 pub struct Event { pub seq: EventSeq, pub session_id: SessionId, pub op_id: Option<OpId>,
     pub kind: EventKind, pub state: AgentState, pub ts_ms: i64, pub payload: Option<serde_json::Value> }
