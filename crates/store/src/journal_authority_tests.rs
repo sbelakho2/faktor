@@ -616,3 +616,58 @@ fn queue_file_array_predicate_is_pinned_against_mutation() {
         "the witness must detect the json_type(value) wrap"
     );
 }
+
+/// The open/doctor checks must see ONE snapshot. The checks read the row
+/// projection, the gap aggregate and the tail event separately, so without a
+/// read transaction a concurrent append can tear the view (row read before
+/// the append, tail read after) and report a false projection disagreement
+/// on a legitimately in-flight transition. While a writer hammers appends,
+/// validation must never report that disagreement.
+#[test]
+fn journal_open_validation_never_tears_under_concurrent_append() {
+    let (_d, store) = tmp_store();
+    let ws = store.create_workspace("/w").unwrap();
+    let session = store.create_session(ws, "c", "p", "m").unwrap();
+    let sid = session.id;
+    let store = std::sync::Arc::new(store);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let store = store.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let states = [
+                AgentState::BuildingContext,
+                AgentState::WaitingForModel,
+                AgentState::Streaming,
+            ];
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let state = states[(i % 3) as usize];
+                store
+                    .append_event(
+                        sid,
+                        Some(OpId::new(1_000 + i)),
+                        EventKind::PhaseChanged,
+                        state,
+                        now_ms(),
+                        None,
+                    )
+                    .unwrap();
+                i += 1;
+            }
+        })
+    };
+    for _ in 0..2_000 {
+        let problems = store
+            .journal_session_problems(sid, JournalDepth::Open)
+            .unwrap();
+        for problem in &problems {
+            assert!(
+                !problem.contains("disagrees with the session row state"),
+                "a torn read reported a false projection disagreement: {problem}"
+            );
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+}

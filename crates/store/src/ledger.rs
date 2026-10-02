@@ -2110,7 +2110,15 @@ impl Store {
         depth: JournalDepth,
     ) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
-        Self::journal_session_problems_on(&conn, session_id, depth)
+        // One deferred read transaction: the checks compare several columns
+        // (row projection, gap aggregate, first/tail events) and MUST see one
+        // consistent snapshot. Without it, a concurrent append between reads
+        // looks like a projection disagreement (a false corruption report on
+        // a legitimate in-flight transition).
+        let tx = conn.unchecked_transaction()?;
+        let problems = Self::journal_session_problems_on(&tx, session_id, depth)?;
+        drop(tx);
+        Ok(problems)
     }
 
     fn journal_session_problems_on(
@@ -2283,18 +2291,25 @@ impl Store {
     /// human-readable problems; empty = consistent.
     pub fn journal_consistency_issues(&self) -> StoreResult<Vec<String>> {
         let conn = self.read()?;
+        // The sweep and every per-session comparison share ONE deferred read
+        // snapshot so a concurrently appending session cannot present a torn
+        // view (row projection read before an append, tail read after).
+        let tx = conn.unchecked_transaction()?;
         let mut issues = Vec::new();
-        let mut stmt = conn.prepare("SELECT id FROM session ORDER BY id ASC")?;
+        let mut stmt = tx.prepare("SELECT id FROM session ORDER BY id ASC")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let sid_raw: i64 = row.get(0)?;
             let sid = id_field::<SessionId>(&format!("session id {sid_raw}"), sid_raw)?;
             issues.extend(Self::journal_session_problems_on(
-                &conn,
+                &tx,
                 sid,
                 JournalDepth::Deep,
             )?);
         }
+        drop(rows);
+        drop(stmt);
+        drop(tx);
         Ok(issues)
     }
 
