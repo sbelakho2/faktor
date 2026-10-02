@@ -348,6 +348,83 @@ function signEvidence(evidence, privateKeyPath, identity) {
   return signEvidenceWithKey(evidence, createPrivateKey(readFileSync(privateKeyPath)), identity);
 }
 
+const CROSS_PLATFORM_REQUIRED = ['linux', 'darwin', 'windows'];
+const CROSS_PLATFORM_SCHEMA = 'faktor-ci-certification/v2';
+
+/**
+ * P0: a `cross_platform_lanes` envelope must not merely hash three files — it
+ * must prove each child certificate is a SUCCESSFUL, trusted, same-commit/
+ * same-tree certificate for exactly one of the required platforms, with no
+ * duplicates. Hashing alone lets a stale/failed/wrong-platform certificate
+ * hide behind a well-formed outer envelope.
+ */
+function verifyCrossPlatformEvidence(evidence, options = {}) {
+  const problems = [];
+  const label = 'cross-platform: ';
+  const cwd = options.cwd || ROOT;
+  const seen = new Map();
+  const artifacts = Array.isArray(evidence.artifacts) ? evidence.artifacts : [];
+  for (const artifact of artifacts) {
+    if (!artifact || typeof artifact.path !== 'string') {
+      problems.push(`${label}malformed artifact entry`);
+      continue;
+    }
+    const full = resolve(cwd, artifact.path);
+    if (!existsSync(full) || !statSync(full).isFile()) {
+      problems.push(`${label}${artifact.path} is missing`);
+      continue;
+    }
+    let child;
+    try {
+      child = readJsonStrict(full);
+    } catch (error) {
+      problems.push(`${label}${artifact.path} is not strict JSON: ${error.message}`);
+      continue;
+    }
+    if (child.schema !== CROSS_PLATFORM_SCHEMA) {
+      problems.push(
+        `${label}${artifact.path} schema '${child.schema}' != '${CROSS_PLATFORM_SCHEMA}'`,
+      );
+      continue;
+    }
+    if (!CROSS_PLATFORM_REQUIRED.includes(child.platform)) {
+      problems.push(
+        `${label}${artifact.path} platform '${child.platform}' is not one of ${CROSS_PLATFORM_REQUIRED.join(', ')}`,
+      );
+      continue;
+    }
+    if (seen.has(child.platform)) {
+      problems.push(`${label}duplicate platform certificate for ${child.platform}`);
+      continue;
+    }
+    seen.set(child.platform, artifact.path);
+    if (child.workflow !== 'trusted') {
+      problems.push(
+        `${label}${child.platform} certificate workflow '${child.workflow}' != 'trusted'`,
+      );
+    }
+    if (child.status !== 'pass') {
+      problems.push(`${label}${child.platform} certificate status '${child.status}' != 'pass'`);
+    }
+    if (child.commit !== evidence.commit_sha) {
+      problems.push(
+        `${label}${child.platform} certificate commit ${child.commit} != envelope ${evidence.commit_sha}`,
+      );
+    }
+    if (child.tree !== evidence.tree_hash) {
+      problems.push(
+        `${label}${child.platform} certificate tree ${child.tree} != envelope ${evidence.tree_hash}`,
+      );
+    }
+  }
+  for (const platform of CROSS_PLATFORM_REQUIRED) {
+    if (!seen.has(platform)) {
+      problems.push(`${label}missing the ${platform} certificate`);
+    }
+  }
+  return problems;
+}
+
 function verifyEvidenceObject(evidence, options = {}) {
   const problems = [];
   const { kind, expectedCommit, expectedTree, keys, requireSigned, file } = options;
@@ -433,6 +510,9 @@ function verifyEvidenceObject(evidence, options = {}) {
   }
   if (requireSigned && signature.signed && !signature.ok) {
     problems.push(`${label}signature-invalid: ${signature.reason}`);
+  }
+  if (evidence.kind === 'cross_platform_lanes') {
+    problems.push(...verifyCrossPlatformEvidence(evidence, options));
   }
   return { ok: problems.length === 0, signed: signature.signed, signatureOk: signature.ok, reason: signature.reason, problems };
 }
@@ -876,6 +956,19 @@ function writeEvidence(options) {
     artifacts,
     signature: null,
   };
+  if (kind === 'cross_platform_lanes') {
+    // The writer DERIVES the verdict from the child certificates; callers can
+    // never hand a passing status around arbitrary artifact files.
+    const semantic = verifyCrossPlatformEvidence(evidence, { cwd });
+    const derived = semantic.length === 0 ? 'passed' : 'failed';
+    if (derived === 'failed') {
+      for (const problem of semantic) console.error(`  ${problem}`);
+    }
+    if (status !== derived) {
+      console.log(`cross-platform evidence status derived '${derived}' (caller passed '${status}')`);
+    }
+    evidence.status = derived;
+  }
   if (signKey) {
     evidence = signEvidence(evidence, resolve(cwd, signKey), keyId || 'ci');
   }
@@ -1165,6 +1258,28 @@ function runSelftest() {
     const { privateKey, publicKey } = generateKeyPairSync('ed25519');
     const rawPublic = publicKey.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64');
     const identities = { 'selftest-ci': rawPublic };
+    const childDir = join(repo, 'target/certification/platforms');
+    mkdirSync(childDir, { recursive: true });
+    const childArtifacts = [];
+    for (const platform of ['linux', 'darwin', 'windows']) {
+      const childPath = join(childDir, `${platform}.json`);
+      writeFileSync(
+        childPath,
+        JSON.stringify({
+          schema: 'faktor-ci-certification/v2',
+          platform,
+          workflow: 'trusted',
+          commit,
+          tree,
+          pipeline: '1',
+          status: 'pass',
+        }),
+      );
+      childArtifacts.push({
+        path: `target/certification/platforms/${platform}.json`,
+        sha256: hashFile(childPath),
+      });
+    }
     const unsigned = {
       schema: EVIDENCE_SCHEMA,
       repository: 'selftest',
@@ -1175,9 +1290,9 @@ function runSelftest() {
       started_at: '2026-01-01T00:00:00Z',
       finished_at: '2026-01-01T00:01:00Z',
       commands_digest: `sha256:${sha256Hex('selftest commands')}`,
-      artifact_digest: EMPTY_ARTIFACT_DIGEST,
+      artifact_digest: artifactDigest(childArtifacts),
       runner: { os: 'linux', arch: 'amd64', ci: 'selftest', run_id: '1' },
-      artifacts: [],
+      artifacts: childArtifacts,
       signature: null,
     };
     const signed = signEvidenceWithKey(unsigned, privateKey, 'selftest-ci');
@@ -1188,6 +1303,7 @@ function runSelftest() {
         expectedTree: tree,
         keys: identities,
         requireSigned: true,
+        cwd: repo,
       });
       assert(!verdict.ok, 'unsigned evidence must not certify');
       assert(
@@ -1202,6 +1318,7 @@ function runSelftest() {
         expectedTree: tree,
         keys: identities,
         requireSigned: true,
+        cwd: repo,
       });
       assert(verdict.ok, `signed evidence must verify: ${JSON.stringify(verdict.problems)}`);
     });
@@ -1213,6 +1330,7 @@ function runSelftest() {
         expectedTree: tree,
         keys: identities,
         requireSigned: true,
+        cwd: repo,
       });
       assert(!verdict.ok, 'foreign identity must not certify');
       assert(
@@ -1228,6 +1346,7 @@ function runSelftest() {
         expectedTree: tree,
         keys: identities,
         requireSigned: true,
+        cwd: repo,
       });
       assert(!verdict.ok, 'tampered evidence must not certify');
     });
@@ -1243,6 +1362,107 @@ function runSelftest() {
         verdict.problems.some((problem) => problem.startsWith('other-commit:')),
         `expected other-commit, got ${JSON.stringify(verdict.problems)}`,
       );
+    });
+    const rewriteChild = (platform, overrides) => {
+      const childPath = join(childDir, `${platform}.json`);
+      writeFileSync(
+        childPath,
+        JSON.stringify({
+          schema: 'faktor-ci-certification/v2',
+          platform,
+          workflow: 'trusted',
+          commit,
+          tree,
+          pipeline: '1',
+          status: 'pass',
+          ...overrides,
+        }),
+      );
+      const artifact = childArtifacts.find((entry) => entry.path.endsWith(`${platform}.json`));
+      artifact.sha256 = hashFile(childPath);
+      return artifact;
+    };
+    run('cross-platform evidence refuses a missing platform', () => {
+      const artifacts = childArtifacts.filter((entry) => !entry.path.endsWith('windows.json'));
+      const envelope = { ...unsigned, artifacts, artifact_digest: artifactDigest(artifacts) };
+      const verdict = verifyEvidenceObject(envelope, { requirePassed: false, cwd: repo });
+      assert(
+        verdict.problems.some((problem) => problem.includes('missing the windows certificate')),
+        `expected a missing-platform problem, got ${JSON.stringify(verdict.problems)}`,
+      );
+    });
+    run('cross-platform evidence refuses a failed child certificate', () => {
+      rewriteChild('darwin', { status: 'fail' });
+      const envelope = {
+        ...unsigned,
+        artifacts: childArtifacts,
+        artifact_digest: artifactDigest(childArtifacts),
+      };
+      const verdict = verifyEvidenceObject(envelope, { requirePassed: false, cwd: repo });
+      assert(
+        verdict.problems.some((problem) => problem.includes("darwin certificate status 'fail'")),
+        `expected a failed-child problem, got ${JSON.stringify(verdict.problems)}`,
+      );
+      rewriteChild('darwin', { status: 'pass' });
+    });
+    run('cross-platform evidence refuses a duplicate platform', () => {
+      const artifacts = [...childArtifacts, childArtifacts[0]];
+      const envelope = { ...unsigned, artifacts, artifact_digest: artifactDigest(artifacts) };
+      const verdict = verifyEvidenceObject(envelope, { requirePassed: false, cwd: repo });
+      assert(
+        verdict.problems.some((problem) => problem.includes('duplicate platform certificate')),
+        `expected a duplicate problem, got ${JSON.stringify(verdict.problems)}`,
+      );
+    });
+    run('cross-platform evidence refuses a wrong-commit child', () => {
+      rewriteChild('windows', { commit: '0'.repeat(40) });
+      const envelope = {
+        ...unsigned,
+        artifacts: childArtifacts,
+        artifact_digest: artifactDigest(childArtifacts),
+      };
+      const verdict = verifyEvidenceObject(envelope, { requirePassed: false, cwd: repo });
+      assert(
+        verdict.problems.some((problem) => problem.includes('windows certificate commit')),
+        `expected a wrong-commit problem, got ${JSON.stringify(verdict.problems)}`,
+      );
+      rewriteChild('windows', { commit });
+    });
+    run('cross-platform evidence refuses a non-trusted child', () => {
+      rewriteChild('linux', { workflow: 'untrusted' });
+      const envelope = {
+        ...unsigned,
+        artifacts: childArtifacts,
+        artifact_digest: artifactDigest(childArtifacts),
+      };
+      const verdict = verifyEvidenceObject(envelope, { requirePassed: false, cwd: repo });
+      assert(
+        verdict.problems.some((problem) => problem.includes("linux certificate workflow 'untrusted'")),
+        `expected a trust problem, got ${JSON.stringify(verdict.problems)}`,
+      );
+      rewriteChild('linux', { workflow: 'trusted' });
+    });
+    run('cross-platform writer derives the verdict from the children', () => {
+      rewriteChild('windows', { status: 'fail' });
+      const outDir = join(repo, 'target/certification/evidence');
+      const written = writeEvidence({
+        kind: 'cross_platform_lanes',
+        status: 'passed',
+        outDir,
+        cwd: repo,
+        artifactsExplicit: childArtifacts.map((entry) => entry.path),
+      });
+      const record = readJsonStrict(written);
+      assert(record.status === 'failed', `writer must derive 'failed', got '${record.status}'`);
+      rewriteChild('windows', { status: 'pass' });
+      const healed = writeEvidence({
+        kind: 'cross_platform_lanes',
+        status: 'passed',
+        outDir,
+        cwd: repo,
+        artifactsExplicit: childArtifacts.map((entry) => entry.path),
+      });
+      assert(readJsonStrict(healed).status === 'passed', 'valid children must derive passed');
     });
     run('writeEvidence binds HEAD commit and tree', () => {
       const outDir = join(repo, 'target/certification/evidence');
