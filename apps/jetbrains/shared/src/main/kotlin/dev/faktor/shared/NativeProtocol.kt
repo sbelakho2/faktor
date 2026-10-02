@@ -2484,10 +2484,16 @@ object NativeRequests {
         .put("title", title)
         .toJson()
 
-    fun prompt(sessionId: String, prompt: String, files: List<String>? = null): String {
+    fun prompt(
+        sessionId: String,
+        prompt: String,
+        files: List<String>? = null,
+        submissionId: String
+    ): String {
         val builder = JsonObjectBuilder()
             .put("session_id", sessionId)
             .put("prompt", prompt)
+            .put("submission_id", submissionId)
         if (files != null && files.isNotEmpty()) builder.putStrings("files", files)
         return builder.toJson()
     }

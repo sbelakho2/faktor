@@ -3581,7 +3581,10 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 28, "schema target 28 after the v27 prompt-admission table");
+        assert_eq!(
+            v, 28,
+            "schema target 28 after the v27 prompt-admission table"
+        );
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()

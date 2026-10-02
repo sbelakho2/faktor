@@ -98,8 +98,15 @@ object BackendSmoke {
                 val sid = sessionId
                 if (sid != null) {
                     step("prompt (POST /native/session/{id}/prompt)") {
-                        val receipt = client.prompt(sid, "ping from kotlin smoke")
+                        val submissionId = java.util.UUID.randomUUID().toString()
+                        val receipt = client.prompt(sid, "ping from kotlin smoke", submissionId = submissionId)
                         if (!receipt.accepted) fail("prompt was not accepted")
+                        // Same key + same body replays the original receipt
+                        // (no second durable prompt row).
+                        val replay = client.prompt(sid, "ping from kotlin smoke", submissionId = submissionId)
+                        if (replay.opId != receipt.opId) {
+                            fail("a repeated submission id must replay the original receipt")
+                        }
                     }
                     step("session state settles (ready_for_next_turn | failed_*)") {
                         val deadline = System.currentTimeMillis() + 20_000L
@@ -669,8 +676,8 @@ private fun assertNativeRequestShapes() {
         "full native create-session body"
     )
     assertEquals(
-        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"files\":[\"a.txt\"]}",
-        NativeRequests.prompt("7", "hi", listOf("a.txt")),
+        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000001\",\"files\":[\"a.txt\"]}",
+        NativeRequests.prompt("7", "hi", listOf("a.txt"), "00000000-0000-4000-8000-000000000001"),
         "native prompt body"
     )
 }

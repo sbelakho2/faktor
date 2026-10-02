@@ -1126,11 +1126,7 @@ fn prompt_admission_digest(
         .text(&session.to_string())
         .text(prompt)
         .list(files);
-    faktor_core::authority::authority_digest_hex(
-        b"faktor.native-prompt-admission/v1",
-        1,
-        fields,
-    )
+    faktor_core::authority::authority_digest_hex(b"faktor.native-prompt-admission/v1", 1, fields)
 }
 
 /// Serialize one accepted prompt receipt into the exact response bytes the
@@ -1221,15 +1217,11 @@ pub(crate) async fn native_prompt(
     let files = req.files.unwrap_or_default();
     let store = state.deps.session.store();
     let digest = prompt_admission_digest(sid, &req.prompt, &files);
-    let claim = match store.prompt_admission_claim(
-        sid,
-        &req.submission_id,
-        &digest,
-        handle.now_ms(),
-    ) {
-        Ok(claim) => claim,
-        Err(e) => return api_err(&store_err_to_core(e)),
-    };
+    let claim =
+        match store.prompt_admission_claim(sid, &req.submission_id, &digest, handle.now_ms()) {
+            Ok(claim) => claim,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
     match claim {
         PromptAdmissionClaim::Complete(receipt_json) => {
             // The stored receipt is served byte-for-byte with ZERO journal,
@@ -1802,10 +1794,12 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("unknown field"), "{err}");
-        assert!(serde_json::from_value::<NativePromptRequestBody>(serde_json::json!({
-            "session_id": "1", "submission_id": null, "prompt": "hi",
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<NativePromptRequestBody>(serde_json::json!({
+                "session_id": "1", "submission_id": null, "prompt": "hi",
+            }))
+            .is_err()
+        );
         for hostile in [
             "",
             " ",
@@ -1819,9 +1813,8 @@ mod tests {
             assert_eq!(err.http_status, 400, "{hostile:?}");
             assert_eq!(err.code, "malformed", "{hostile:?}");
         }
-        let oversized = "a".repeat(
-            faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES + 1,
-        );
+        let oversized =
+            "a".repeat(faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES + 1);
         assert!(validate_prompt_submission_id(&oversized).is_err());
         assert!(validate_prompt_submission_id(PROMPT_KEY).is_ok());
     }
