@@ -6135,6 +6135,10 @@ function realComposerHost(sessionId = '7') {
       return { task_id: 1, run_id: 'r1', state: 'Pending' };
     },
   };
+  // The host owns the correlation slot id: the webview no longer mints one,
+  // so this harness models `hostMessageId()` with a stable per-host slot
+  // (production mints per message and the GATE reuses the stored snapshot).
+  const hostSlotId = 'webview-slot-1';
   const submit = async (message, policy) => {
     if (message.attachmentIds === undefined) {
       return { refused: 'the sendGoal payload carried no attachment envelope' };
@@ -6147,7 +6151,7 @@ function realComposerHost(sessionId = '7') {
       text: message.goal,
       sessionId,
       draftId: null,
-      messageId: message.messageId,
+      messageId: message.messageId ?? hostSlotId,
       files: message.files ?? [],
       attachments: selected.attachments,
     });
@@ -6363,8 +6367,8 @@ async function composerAttachmentTests() {
     assertEqual(message.type, 'sendGoal');
     assertDeepEqual(message.attachmentIds, [added.view.id], 'sendGoal must carry the attachment ids');
     assert(
-      typeof message.submissionId === 'string' && message.submissionId.length > 0,
-      'an attachment submission carries a logical submission id',
+      !('submissionId' in message),
+      'the webview never mints the logical submission id (the host owns it)',
     );
     const policy = ts.attachmentPolicyFromLimits(clone(attachmentLimitsJson));
     const result = await host.submit(message, policy);
@@ -6416,7 +6420,10 @@ async function composerAttachmentTests() {
     // is reused and no bytes are uploaded twice.
     composer.dispatch('submit', { preventDefault() {} });
     const retry = harness.posted[harness.posted.length - 1];
-    assertEqual(retry.submissionId, first.submissionId, 'the retry reuses the submission id');
+    assert(
+      !('submissionId' in first) && !('submissionId' in retry),
+      'the webview never mints a logical submission id (the host does)',
+    );
     assertDeepEqual(retry.attachmentIds, first.attachmentIds);
     const retryResult = await host.submit(
       retry,
@@ -6455,7 +6462,10 @@ async function composerAttachmentTests() {
     composer.dispatch('submit', { preventDefault() {} });
     const second = harness.posted[harness.posted.length - 1];
     assertDeepEqual(second.attachmentIds, ['att-b', 'att-a']);
-    assert(second.submissionId !== first.submissionId, 'a changed body is a new logical submission');
+    assert(
+      !('submissionId' in first) && !('submissionId' in second),
+      'the webview never mints a logical submission id (the host does)',
+    );
     harness.deliver({ type: 'startResult', goal: 'ordered', ok: false });
     // Session switch: the visible set and the pending identity drop.
     harness.deliver({ type: 'snapshot', snapshot: { ...webviewSnapshot([]), session: { ...clone(sessionSummaryJson), id: '9' } } });
@@ -6808,12 +6818,11 @@ function fakeStartHost() {
       return receipt;
     },
   };
-  const run = async (envelope, contract = null, submissionId = null) => {
+  const run = async (envelope, contract = null) => {
     if (gate.inFlight()) {
       return { ignored: true };
     }
     const decision = gate.admit({
-      submissionId,
       pending: envelope,
       files: envelope.files,
       contract,
@@ -6900,6 +6909,36 @@ async function submissionSingleFlightTests() {
     assertEqual(retry.outcome.ok, true);
     assertEqual(retry.outcome.runId, 'run-1', 'the original receipt is returned');
     assertEqual(host.receipts.size, 1, 'the daemon holds exactly one receipt');
+  });
+
+  await test('a changed completion contract after a transport failure mints a new id and starts fresh', async () => {
+    const contractA = { include_commit: true, include_push: false, include_pr: false };
+    const variants = [
+      { include_commit: false, include_push: false, include_pr: false, label: 'commit' },
+      { include_commit: true, include_push: true, include_pr: false, label: 'push' },
+      { include_commit: true, include_push: false, include_pr: true, label: 'PR' },
+    ];
+    for (const variant of variants) {
+      const host = fakeStartHost();
+      host.failNextStart(new Error('socket closed after the daemon durably admitted'));
+      const first = await host.run(submissionEnvelope(), contractA);
+      assertEqual(first.outcome.ok, false, `${variant.label}: the lost response is a failure`);
+      const changed = {
+        include_commit: variant.include_commit,
+        include_push: variant.include_push,
+        include_pr: variant.include_pr,
+      };
+      const second = await host.run(submissionEnvelope(), changed);
+      assertEqual(
+        host.calls.length,
+        2,
+        `${variant.label}: the changed body starts a NEW logical submission`,
+      );
+      assert(
+        host.calls[1].request.submission_id !== host.calls[0].request.submission_id,
+        `${variant.label}: changing the contract after failure must mint a new id`,
+      );
+    }
   });
 
   await test('success and typed refusal clear the logical submission; transport keeps it retryable', async () => {

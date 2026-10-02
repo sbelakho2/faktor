@@ -1609,16 +1609,27 @@ function sameAttachment(a: PendingBinaryAttachment, b: PendingBinaryAttachment):
  * list and the completion contract are gate fields and are compared by the
  * gate's own helpers.
  */
+/**
+ * Body identity of one pending submission: the USER-CONTROLLED content only
+ * (text, session, workspace files, ordered attachment references). The
+ * `draftId`/`messageId` correlation ids are transport bookkeeping, not body
+ * identity — the host mints a fresh `messageId` per message, so comparing it
+ * would make a lost-response retry of the identical body look different and
+ * re-upload/re-identify a submission that should replay under its stored id.
+ */
 export function samePendingSubmission(a: PendingSubmission, b: PendingSubmission): boolean {
   if (
     a.text !== b.text ||
     a.sessionId !== b.sessionId ||
-    a.draftId !== b.draftId ||
-    a.messageId !== b.messageId ||
     a.files.length !== b.files.length ||
     a.attachments.length !== b.attachments.length
   ) {
     return false;
+  }
+  for (let index = 0; index < a.files.length; index += 1) {
+    if (a.files[index] !== b.files[index]) {
+      return false;
+    }
   }
   for (let index = 0; index < a.attachments.length; index += 1) {
     if (!sameAttachment(a.attachments[index], b.attachments[index])) {
@@ -1675,13 +1686,17 @@ export class TaskStartGate {
   }
 
   /**
-   * Admit one parsed `sendGoal` body. `submissionId` is the optional
-   * client-generated id (canonical UUID or null): a retry naming the exact
-   * pending id restarts the stored snapshot; anything else while an attempt
-   * is in flight is a duplicate (same body) or busy (different body).
+   * Admit one parsed `sendGoal` body. The HOST owns the logical-submission
+   * id: it is minted here from the COMPLETE parsed snapshot (pending text,
+   * ordered files, completion contract), never from a webview-side partial
+   * key. While an attempt is in flight the only admitted repeat is the exact
+   * same body (duplicate); anything else is busy. After a transport failure
+   * (retryable) the same body retries under the stored id, while a changed
+   * body is a NEW logical submission and replaces the pending one with a
+   * fresh id — so a contract-only edit can never be refused as a
+   * different-body retry.
    */
   admit(input: {
-    readonly submissionId: string | null;
     readonly pending: PendingSubmission;
     readonly files: readonly string[];
     readonly contract: NativeCompletionContract | null;
@@ -1689,14 +1704,12 @@ export class TaskStartGate {
   }): SubmissionStartDecision {
     const current = this.current;
     if (current !== null) {
-      const explicitRetry =
-        input.submissionId !== null && input.submissionId === current.snapshot.submissionId;
       const sameBody =
         samePendingSubmission(input.pending, current.snapshot.pending) &&
         sameFileList(input.files, current.snapshot.files) &&
         sameContract(input.contract, current.snapshot.contract);
       if (current.state === 'in_flight') {
-        if (explicitRetry || sameBody) {
+        if (sameBody) {
           return { action: 'duplicate' };
         }
         return {
@@ -1706,21 +1719,16 @@ export class TaskStartGate {
             'the pending start is unchanged',
         };
       }
-      if (explicitRetry && !sameBody) {
-        return {
-          action: 'busy',
-          reason:
-            'a retry of the pending submission arrived with a different body; the pending ' +
-            'submission is unchanged and was not resent',
-        };
-      }
-      if (explicitRetry || sameBody) {
+      // Retryable: the SAME body retries under the stored id; a changed body
+      // is a new logical submission (host-owned identity), so it replaces the
+      // pending snapshot with a fresh id instead of being refused.
+      if (sameBody) {
         current.state = 'in_flight';
         return { action: 'start', retry: true, snapshot: current.snapshot };
       }
     }
     const snapshot: StartSubmissionSnapshot = {
-      submissionId: input.submissionId ?? input.newId(),
+      submissionId: input.newId(),
       pending: input.pending,
       files: input.files,
       contract: input.contract,

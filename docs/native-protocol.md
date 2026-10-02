@@ -173,9 +173,27 @@ generated into both IDE clients (`ProtocolAttachmentId`,
 - `GET /native/sessions` — the durable session listing (newest first,
   capped at 1000): `{sessions: [{id, title, provider, model, state}]}`.
 - `POST /native/session/{id}/prompt` — run ONE ordinary prompt through the
-  daemon's single executor entry: `{session_id, prompt, files?}` (the body
-  id must match the path) → `{op_id, run_id, accepted, queued}`. Empty
-  prompts are a typed 400; unknown sessions 404.
+  daemon's single executor entry: `{session_id, submission_id, prompt,
+  files?}` (the body id must match the path) → `{op_id, run_id, accepted,
+  queued}`. `submission_id` is REQUIRED: the client submission UUID of this
+  logical prompt, 1..=64 ASCII `[0-9a-f-]` (UUID-shaped, lowercase hex; the
+  SAME contract as the task-start field); any other shape is a typed 400.
+  It is the durable idempotency key (finding 1): the handler claims a
+  `prompt_admission` row BEFORE the `PromptReceived` journal append and any
+  queue/message mutation, so
+  - a repeated key with the SAME normalized body (session id, prompt text
+    and file list) returns the original receipt byte-for-byte and performs
+    NO further mutation — no journal append, no user message, no queue row;
+  - a repeated key with a DIFFERENT body is a typed `conflict` (409)
+    naming the stored digest mismatch;
+  - a concurrent duplicate while the first prompt is still pending is a
+    typed `conflict` (409) in-flight; a prompt refused before acceptance
+    releases its key so the same submission may be retried, while an
+    ambiguous failure keeps it pending (a retry answers in flight, never a
+    duplicate).
+  The prompt admission table is SEPARATE from `task_admission`: a prompt
+  key never aliases a task start. Empty prompts are a typed 400; unknown
+  sessions 404.
 - `POST /native/session/{id}/task-runs` — start ONE task through the same
   executor: strict body `{goal, submission_id, criteria?, work_items?,
   model?, max_tokens?, max_cost_micro?, files?, attachments?,

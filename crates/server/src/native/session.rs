@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use faktor_core::state::SessionLifecycle;
 use faktor_protocol::error::ApiError;
+use faktor_store::PromptAdmissionClaim;
 
 use super::verification::native_verification_facts;
 use super::*;
@@ -1075,20 +1076,112 @@ pub(crate) async fn native_list_sessions(
 pub(crate) const MAX_NATIVE_SESSION_LISTING: usize = 1000;
 
 /// Strict native ordinary-prompt DTO (`POST /native/session/{id}/prompt`).
+/// `submission_id` is the REQUIRED client submission UUID of this logical
+/// prompt (1..=64 ASCII `[0-9a-f-]`, UUID-shaped — the SAME contract as the
+/// task-start field). It is the durable idempotency key (finding 1): the
+/// handler claims a `prompt_admission` row BEFORE the `PromptReceived`
+/// journal append and any queue/message mutation, so a repeated key with
+/// the same normalized body replays the original receipt byte-for-byte, a
+/// pending key refuses in flight, and a different body under the same key
+/// is a typed 409.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativePromptRequestBody {
     pub session_id: String,
+    pub submission_id: String,
     pub prompt: String,
     #[serde(default)]
-    pub files: Vec<String>,
+    pub files: Option<Vec<String>>,
+}
+
+/// The strict shape of the required prompt `submission_id`: the SAME
+/// predicate as the native task-start field (non-empty, at most 64 ASCII
+/// bytes of `[0-9a-f-]`). Anything else is a typed 400 at the wire
+/// boundary, before any session resolution or admission claim.
+fn validate_prompt_submission_id(id: &str) -> Result<(), ApiError> {
+    if faktor_orchestrator::runtime::task_executor::valid_submission_id(id) {
+        return Ok(());
+    }
+    Err(ApiError {
+        code: "malformed",
+        message: format!(
+            "submission_id must be 1..={} ASCII [0-9a-f-] characters",
+            faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES
+        ),
+        http_status: 400,
+        retryable: false,
+    })
+}
+
+/// The canonical request digest of ONE ordinary prompt: the session id, the
+/// prompt text and the attached file paths under a domain-separated BLAKE3
+/// (the crate's canonical authority-digest construction). Computed
+/// caller-side, before the admission claim enqueues anything.
+fn prompt_admission_digest(
+    session: faktor_core::id::SessionId,
+    prompt: &str,
+    files: &[String],
+) -> String {
+    let fields = faktor_core::authority::Fields::new()
+        .text(&session.to_string())
+        .text(prompt)
+        .list(files);
+    faktor_core::authority::authority_digest_hex(
+        b"faktor.native-prompt-admission/v1",
+        1,
+        fields,
+    )
+}
+
+/// Serialize one accepted prompt receipt into the exact response bytes the
+/// admission row stores, so a replay is byte-for-byte the first success.
+fn prompt_receipt_json(receipt: &PromptReceipt) -> String {
+    serde_json::json!({
+        "op_id": receipt.op_id.to_string(),
+        "run_id": receipt.run_id,
+        "accepted": receipt.accepted,
+        "queued": receipt.queued,
+    })
+    .to_string()
+}
+
+/// The raw-bytes 200 response of one prompt receipt (the stored JSON is
+/// served verbatim; it was already validated as JSON at the admission
+/// boundary).
+fn prompt_receipt_response(receipt_json: &str) -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        receipt_json.to_string(),
+    )
+        .into_response()
+}
+
+/// `true` for the orchestrator refusals that are PROVABLY before any
+/// durable admission mutation: a claimed prompt key may be released so the
+/// SAME submission can be retried. Ambiguous failures (internal, transport,
+/// persistence, injected crash) keep the key pending: a retry then answers
+/// in flight rather than ever duplicating the prompt.
+fn prompt_refusal_is_pre_admission(e: &faktor_orchestrator::runtime::ExecError) -> bool {
+    use faktor_orchestrator::runtime::ExecError as E;
+    matches!(
+        e,
+        E::InvalidPlan(_)
+            | E::Malformed(_)
+            | E::Oversized(_)
+            | E::AdmissionRefused { .. }
+            | E::PlacementRefused(_)
+    )
 }
 
 /// `POST /native/session/{id}/prompt` — run ONE ordinary prompt through
 /// the daemon's ONE executor entry ([`PromptExecutionService`]); the body's
-/// `session_id` must match the path id. Returns the durable receipt
-/// `{op_id, run_id, accepted, queued}`. Empty prompts are a typed 400;
-/// unknown sessions 404.
+/// `session_id` must match the path id. The required `submission_id` is
+/// claimed durably BEFORE any `PromptReceived` append or queue/message
+/// mutation: a repeated key with the equal body replays the stored receipt
+/// byte-for-byte with zero writes, a pending key is a typed 409 in-flight,
+/// and a reused key with a different body is a typed 409 conflict. Returns
+/// the durable receipt `{op_id, run_id, accepted, queued}`. Empty prompts
+/// are a typed 400; unknown sessions 404.
 pub(crate) async fn native_prompt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1115,26 +1208,109 @@ pub(crate) async fn native_prompt(
             "path session id {sid} does not match body session id {body_sid}"
         )));
     }
-    match state.deps.session.get_session(sid) {
-        Ok(Some(_)) => {}
+    if let Err(e) = validate_prompt_submission_id(&req.submission_id) {
+        return wire_status(e);
+    }
+    let handle = match state.deps.session.get_session(sid) {
+        Ok(Some(h)) => h,
         Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
         Err(e) => return api_err(&e),
+    };
+    // The admission claim is the FIRST durable act of the prompt: it
+    // precedes the `PromptReceived` append and every queue/message write.
+    let files = req.files.unwrap_or_default();
+    let store = state.deps.session.store();
+    let digest = prompt_admission_digest(sid, &req.prompt, &files);
+    let claim = match store.prompt_admission_claim(
+        sid,
+        &req.submission_id,
+        &digest,
+        handle.now_ms(),
+    ) {
+        Ok(claim) => claim,
+        Err(e) => return api_err(&store_err_to_core(e)),
+    };
+    match claim {
+        PromptAdmissionClaim::Complete(receipt_json) => {
+            // The stored receipt is served byte-for-byte with ZERO journal,
+            // queue or message writes; a hostile/corrupt injected row is
+            // refused loudly instead of returned as a phantom receipt.
+            if serde_json::from_str::<serde_json::Value>(&receipt_json).is_err() {
+                return wire_status(ApiError {
+                    code: "internal",
+                    message: "stored prompt admission receipt is not valid JSON".into(),
+                    http_status: 500,
+                    retryable: false,
+                });
+            }
+            return prompt_receipt_response(&receipt_json);
+        }
+        PromptAdmissionClaim::InFlight => {
+            return wire_status(ApiError {
+                code: "conflict",
+                message: format!(
+                    "prompt submission id {:?} is already in flight; retry once it settles",
+                    req.submission_id
+                ),
+                http_status: 409,
+                retryable: false,
+            });
+        }
+        PromptAdmissionClaim::KeyReused { stored_digest } => {
+            return wire_status(ApiError {
+                code: "conflict",
+                message: format!(
+                    "prompt submission id {:?} was already used for a different prompt (stored request digest {stored_digest}); use a fresh submission id for a new prompt",
+                    req.submission_id
+                ),
+                http_status: 409,
+                retryable: false,
+            });
+        }
+        PromptAdmissionClaim::Fresh => {}
     }
     let service = PromptExecutionService::from_state(&state);
     let request = PromptRequest {
         prompt: req.prompt,
-        files: req.files,
+        files,
+        // The server-level admission IS this path's durable key: the
+        // executor is called unkeyed so a prompt key can never alias a
+        // task-start key (separate tables, separate semantics).
+        submission_id: None,
         ..Default::default()
     };
     match service.prompt(sid, request).await {
-        Ok(receipt) => Json(serde_json::json!({
-            "op_id": receipt.op_id.to_string(),
-            "run_id": receipt.run_id,
-            "accepted": receipt.accepted,
-            "queued": receipt.queued,
-        }))
-        .into_response(),
-        Err(e) => exec_error_response(&e),
+        Ok(receipt) => {
+            let receipt_json = prompt_receipt_json(&receipt);
+            if let Err(e) = store.prompt_admission_complete(sid, &req.submission_id, &receipt_json)
+            {
+                tracing::error!(
+                    session_id = %sid,
+                    submission_id = %req.submission_id,
+                    error = %e,
+                    "prompt admission completion failed after the prompt was accepted; the key stays pending so a retry answers in flight instead of duplicating"
+                );
+                return api_err(&store_err_to_core(e));
+            }
+            prompt_receipt_response(&receipt_json)
+        }
+        Err(e) => {
+            // A provably pre-admission refusal releases the key so the SAME
+            // submission may be retried; an ambiguous failure keeps it
+            // pending (a retry then answers 409 in-flight, never a
+            // duplicate).
+            if prompt_refusal_is_pre_admission(&e) {
+                if let Err(release_err) = store.prompt_admission_release(sid, &req.submission_id) {
+                    tracing::error!(
+                        session_id = %sid,
+                        submission_id = %req.submission_id,
+                        error = %release_err,
+                        "prompt admission release failed after a pre-admission refusal; a retry may answer in flight"
+                    );
+                }
+            }
+            exec_error_response(&e)
+        }
     }
 }
 
@@ -1547,5 +1723,268 @@ mod tests {
             !frames.contains("heartbeat"),
             "no heartbeat may follow a failed authority read: {frames}"
         );
+    }
+
+    // ------------------------------------------------ prompt admission (v27)
+
+    const PROMPT_KEY: &str = "b0000000-0000-4000-8000-000000000001";
+
+    /// Call the native prompt handler directly with one JSON body and
+    /// return the status plus the RAW response text (byte-for-byte replay
+    /// assertions need the exact body, not a re-serialized value).
+    async fn prompt_call(
+        state: &AppState,
+        sid: faktor_core::id::SessionId,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let req: NativePromptRequestBody =
+            serde_json::from_value(body).expect("test prompt body parses");
+        let response = native_prompt(
+            State(state.clone()),
+            authed_headers(state),
+            Path(sid.to_string()),
+            Ok(Json(req)),
+        )
+        .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn prompt_body(sid: faktor_core::id::SessionId, key: &str, prompt: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": sid.to_string(),
+            "submission_id": key,
+            "prompt": prompt,
+        })
+    }
+
+    fn prompt_received_count(handle: &faktor_session::SessionHandle) -> usize {
+        handle
+            .events_range(1, Some(10_000))
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == faktor_core::event::EventKind::PromptReceived)
+            .count()
+    }
+
+    /// The REQUIRED prompt submission id is validated with the SAME strict
+    /// predicate as the task-start field: absent, empty, oversized,
+    /// uppercase, non-hex and non-ASCII shapes are typed refusals, never a
+    /// silently generated or dropped key.
+    #[test]
+    fn prompt_dto_requires_the_same_canonical_submission_id_shape() {
+        let valid = serde_json::json!({
+            "session_id": "1",
+            "submission_id": "b0000000-0000-4000-8000-0000000000ff",
+            "prompt": "hi",
+        });
+        let req: NativePromptRequestBody =
+            serde_json::from_value(valid).expect("a canonical prompt body parses");
+        assert_eq!(req.files, None, "absent files normalize to empty");
+        // Missing is a typed parse error (never a silent fresh key).
+        let err = match serde_json::from_value::<NativePromptRequestBody>(serde_json::json!({
+            "session_id": "1", "prompt": "hi",
+        })) {
+            Ok(_) => panic!("missing submission_id must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("missing field"), "{err}");
+        // A typo of the field name is a 400, never a dropped key.
+        let err = match serde_json::from_value::<NativePromptRequestBody>(serde_json::json!({
+            "session_id": "1",
+            "submissionId": "b0000000-0000-4000-8000-0000000000ff",
+            "prompt": "hi",
+        })) {
+            Ok(_) => panic!("a camelCase typo must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(serde_json::from_value::<NativePromptRequestBody>(serde_json::json!({
+            "session_id": "1", "submission_id": null, "prompt": "hi",
+        }))
+        .is_err());
+        for hostile in [
+            "",
+            " ",
+            "b0000000-0000-4000-8000-00000000000Z",
+            "b0000000-0000-4000-8000-00000000000_",
+            "no-uuid-here",
+            "☃",
+        ] {
+            let err = validate_prompt_submission_id(hostile)
+                .expect_err("hostile shape must be a typed refusal");
+            assert_eq!(err.http_status, 400, "{hostile:?}");
+            assert_eq!(err.code, "malformed", "{hostile:?}");
+        }
+        let oversized = "a".repeat(
+            faktor_orchestrator::runtime::task_executor::MAX_SUBMISSION_ID_BYTES + 1,
+        );
+        assert!(validate_prompt_submission_id(&oversized).is_err());
+        assert!(validate_prompt_submission_id(PROMPT_KEY).is_ok());
+    }
+
+    /// A lost response is retried with the SAME submission id and the SAME
+    /// body: the replay returns the stored receipt BYTE-FOR-BYTE and creates
+    /// no second prompt — exactly one `PromptReceived` row, no second user
+    /// message, no queue row, no admission row beyond the one.
+    #[tokio::test]
+    async fn prompt_replay_returns_the_stored_receipt_byte_for_byte_with_one_prompt_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-replay");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let store = state.deps.session.store();
+        let body = prompt_body(sid, PROMPT_KEY, "hi");
+
+        let (status, first_text) = prompt_call(&state, sid, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first_text}");
+        let first: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        assert!(!first["op_id"].as_str().unwrap().is_empty(), "{first}");
+        assert_eq!(first["accepted"], serde_json::json!(true), "{first}");
+        let messages_after_first = store.message_count(sid).unwrap();
+        let events_after_first = prompt_received_count(&handle);
+        let queued_after_first = handle.queued_prompt_count().unwrap();
+        assert_eq!(events_after_first, 1, "exactly one prompt was received");
+
+        // The lost-response retry: same key, same body.
+        let (status, second_text) = prompt_call(&state, sid, body).await;
+        assert_eq!(status, StatusCode::OK, "{second_text}");
+        assert_eq!(
+            first_text, second_text,
+            "the retry must replay the FIRST response byte-for-byte"
+        );
+        assert_eq!(
+            store.message_count(sid).unwrap(),
+            messages_after_first,
+            "the replay must create no second message row"
+        );
+        assert_eq!(
+            prompt_received_count(&handle),
+            events_after_first,
+            "the replay must append no second PromptReceived event"
+        );
+        assert_eq!(
+            handle.queued_prompt_count().unwrap(),
+            queued_after_first,
+            "the replay must not enqueue a second prompt"
+        );
+        // The key carries exactly ONE completed admission storing the exact
+        // response bytes (a claim for any other row would answer Fresh/
+        // KeyReused, and the byte compare pins the stored receipt).
+        let digest = prompt_admission_digest(sid, "hi", &[]);
+        assert_eq!(
+            store
+                .prompt_admission_claim(sid, PROMPT_KEY, &digest, 0)
+                .unwrap(),
+            PromptAdmissionClaim::Complete(first_text.clone()),
+            "exactly one completed admission storing the response bytes"
+        );
+    }
+
+    /// The same key with a DIFFERENT body is a typed 409 conflict with zero
+    /// mutation: no new prompt event, message or queue row.
+    #[tokio::test]
+    async fn prompt_same_key_different_body_is_a_typed_conflict_with_no_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-key-reused");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let store = state.deps.session.store();
+
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "hi")).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let messages = store.message_count(sid).unwrap();
+        let events = prompt_received_count(&handle);
+
+        let (status, text) =
+            prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "something else")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["code"], "conflict", "{body}");
+        assert_eq!(
+            store.message_count(sid).unwrap(),
+            messages,
+            "the refusal must create no message row"
+        );
+        assert_eq!(
+            prompt_received_count(&handle),
+            events,
+            "the refusal must append no prompt event"
+        );
+    }
+
+    /// A key whose claim is still pending is an in-flight 409 BEFORE any
+    /// `PromptReceived` append or queue/message write: the claim is the
+    /// first durable act of the prompt path.
+    #[tokio::test]
+    async fn prompt_pending_key_is_an_in_flight_409_before_any_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-in-flight");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let store = state.deps.session.store();
+        assert_eq!(
+            store
+                .prompt_admission_claim(sid, PROMPT_KEY, "digest-from-another-writer", 1)
+                .unwrap(),
+            PromptAdmissionClaim::Fresh,
+            "the test plants the pending claim an in-flight winner would hold"
+        );
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "hi")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["code"], "conflict", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("in flight"),
+            "{body}"
+        );
+        assert_eq!(
+            prompt_received_count(&handle),
+            0,
+            "an in-flight refusal must append no prompt event"
+        );
+        assert_eq!(store.message_count(sid).unwrap(), 0, "no message row");
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0, "no queue row");
+    }
+
+    /// A known pre-admission refusal (an empty prompt) releases the claimed
+    /// key so the SAME submission may be retried; the refusal itself leaves
+    /// no prompt event, message or queue row, and the retry admits fresh.
+    #[tokio::test]
+    async fn prompt_release_then_retry_admits_and_the_refusal_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-release-retry");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let store = state.deps.session.store();
+
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "   ")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(
+            prompt_received_count(&handle),
+            0,
+            "the pre-admission refusal must append no prompt event"
+        );
+        assert_eq!(store.message_count(sid).unwrap(), 0, "no message row");
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0, "no queue row");
+
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "hi")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the released key must admit the retry: {text}"
+        );
+        assert_eq!(
+            prompt_received_count(&handle),
+            1,
+            "the retry admits exactly one prompt"
+        );
+
+        // A reuse of the now-completed key with a different body still
+        // refuses typed: accepting the retry did not drop the receipt.
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "other")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
     }
 }

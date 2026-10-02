@@ -25,10 +25,6 @@
   // host owns the bytes). Paste/drop bytes transit once through the webview,
   // bounded; a picker selection never ships base64 through here.
   var attachments = [];
-  // The logical submission identity: one id per immutable submitted body
-  // (goal + attachment ids), so a transport-failure retry reuses it and a
-  // changed draft starts a fresh logical submission.
-  var submission = null;
   var currentSessionId = null;
   var streamBlockedReason = null;
   var WEBVIEW_MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
@@ -773,21 +769,6 @@
 
   // ---------------------------------------------------------- attachments
 
-  function newSubmissionId() {
-    if (typeof crypto !== 'undefined' && crypto && typeof crypto.randomUUID === 'function') {
-      return crypto.randomUUID();
-    }
-    var hex = '0123456789abcdef';
-    function block(length) {
-      var out = '';
-      for (var i = 0; i < length; i++) {
-        out += hex.charAt(Math.floor(Math.random() * 16));
-      }
-      return out;
-    }
-    return block(8) + '-' + block(4) + '-4' + block(3) + '-a' + block(3) + '-' + block(12);
-  }
-
   function formatBytes(value) {
     if (typeof value !== 'number' || !isFinite(value) || value < 0) {
       return '?';
@@ -884,27 +865,6 @@
       notice.hidden = firstRefusal === null;
       notice.textContent = firstRefusal === null ? '' : 'Attachment refused: ' + firstRefusal;
     }
-  }
-
-  function resetSubmissionIdentity() {
-    submission = null;
-  }
-
-  /** The immutable submitted body identity (goal + attachment id order). */
-  function bodyKeyOf(goal) {
-    var ids = [];
-    for (var i = 0; i < attachments.length; i++) {
-      ids.push(attachments[i].id);
-    }
-    return goal + '\u0000' + ids.join(',');
-  }
-
-  function ensureSubmission(goal) {
-    var key = bodyKeyOf(goal);
-    if (submission === null || submission.bodyKey !== key) {
-      submission = { id: newSubmissionId(), bodyKey: key };
-    }
-    return submission.id;
   }
 
   function base64FromBytes(bytes) {
@@ -1031,7 +991,6 @@
       // the session); the panel drops the same visible set and the pending
       // submission identity so a stale id can never leak into a new session.
       attachments = [];
-      resetSubmissionIdentity();
       renderAttachments();
     }
     currentSessionId = sessionId;
@@ -1124,8 +1083,7 @@
         // the visible set and the submission identity, and focus returns to
         // the composer for the next task.
         attachments = [];
-        resetSubmissionIdentity();
-        renderAttachments();
+          renderAttachments();
         // The completion contract is per task start: a successful ack
         // resets the checkboxes; a failure keeps them for the retry.
         clearCompletionControls();
@@ -1137,7 +1095,6 @@
       setAttachments(message.items);
     } else if (message.type === 'attachmentsCleared') {
       attachments = [];
-      resetSubmissionIdentity();
       renderAttachments();
     } else if (message.type === 'streamBlocked') {
       streamBlockedReason =
@@ -1186,7 +1143,8 @@
    * BEFORE the post, so a double click / Enter+click race can never emit a
    * second sendGoal; it is released ONLY by an explicit host result. The
    * message is the IMMUTABLE snapshot: the attachment envelope carries the
-   * host-side ids in visible order and the logical submission id.
+   * host-side ids in visible order; the host owns the logical submission id
+   * (minted from the complete parsed snapshot, never from a webview key).
    */
   function requestStart() {
     if (submitting) {
@@ -1208,8 +1166,6 @@
         ids.push(attachments[i].id);
       }
       message.attachmentIds = ids;
-      message.submissionId = ensureSubmission(goal);
-      message.messageId = message.submissionId;
     }
     if (contract) {
       message.completionContract = contract;
