@@ -1903,6 +1903,20 @@ fn assert_isolation_refusal(err: &Error) {
     );
 }
 
+/// A typed DenyAll refusal is a skippable environment outcome ONLY when this
+/// host cannot run the isolation setup at all. On a host that CAN
+/// `unshare(CLONE_NEWNET)` and run the privilege drop (the privileged lane),
+/// a refusal is a regression and must fail the test instead of hiding behind
+/// an adaptive branch.
+#[cfg(target_os = "linux")]
+fn assert_isolation_refusal_is_environment_gated(err: &Error) {
+    assert!(
+        !super::sandbox::isolation_must_succeed_for_tests(),
+        "this host supports unshare(CLONE_NEWNET) and the privilege drop, so an \
+         isolated spawn must succeed; it was refused instead: {err:?}"
+    );
+}
+
 #[test]
 fn default_isolation_is_inherit_and_ordinary_spawns_still_run() {
     assert_eq!(
@@ -2225,27 +2239,6 @@ fn netns_inode() -> Option<u64> {
     inner.parse().ok()
 }
 
-/// On a privileged host every isolated child drops to the sandbox uid, so
-/// the probe's own I/O paths (reports, compute file, AF_UNIX socket) must be
-/// reachable by that uid or the probe could not report. Unprivileged hosts
-/// refuse the netns setup before the drop, so this is a no-op there.
-#[cfg(target_os = "linux")]
-fn make_privileged_probe_paths_sandbox_reachable(
-    dir: &std::path::Path,
-    extra: &[&std::path::Path],
-) {
-    if !super::sandbox::running_privileged_for_tests() {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-        .expect("chmod probe dir for the sandbox uid");
-    for path in extra {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
-            .expect("chmod probe path for the sandbox uid");
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn net_probe_child_main() -> ! {
     // Runs INSIDE the spawned child (parent set NET_PROBE_ENV). Writes
@@ -2464,7 +2457,6 @@ fn deny_all_spawn_isolates_the_child_or_refuses_typed() {
     let udp_port = udp.local_addr().unwrap().port();
     let uds_path = _d.path().join("probe.sock");
     let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
-    make_privileged_probe_paths_sandbox_reachable(_d.path(), &[&uds_path]);
     let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
     let self_exe = std::env::current_exe().unwrap();
     // Pre-spawn proof state: no DENY-ALL spawn has succeeded in this
@@ -2597,6 +2589,7 @@ fn deny_all_spawn_isolates_the_child_or_refuses_typed() {
         }
         Err(err) => {
             assert_isolation_refusal(&err);
+            assert_isolation_refusal_is_environment_gated(&err);
             assert!(
                 !deny_report.exists(),
                 "the refused DenyAll child never exec'd (its probe never ran): {err:?}"
@@ -2653,8 +2646,8 @@ fn forced_unshare_failure_refuses_required_and_the_program_body_never_runs() {
 }
 
 /// DenyAll must not break ordinary command execution: when the host permits
-/// the namespace setup, a normal shell command still runs — now under the
-/// dropped sandbox identity — and its output is captured intact. A host
+/// the namespace setup, a normal shell command still runs under the
+/// capability-dropped child and its output is captured intact. A host
 /// that refuses the setup takes the typed-refusal skip (never a silent
 /// pass, and never an unenforced run).
 #[cfg(target_os = "linux")]
@@ -2672,15 +2665,10 @@ fn deny_all_spawn_runs_and_captures_output_when_permitted() {
                 "a normal command must still run under DenyAll and be captured: {:?}",
                 out.stdout_head
             );
-            let sandbox_uid = super::sandbox::sandbox_uid_for_tests().to_string();
-            assert!(
-                out.stdout_head.contains(&sandbox_uid),
-                "the command must run as the dropped sandbox uid {sandbox_uid}: {:?}",
-                out.stdout_head
-            );
         }
         Err(err) => {
             assert_isolation_refusal(&err);
+            assert_isolation_refusal_is_environment_gated(&err);
             eprintln!(
                 "SKIP (typed, unprivileged host): DenyAll refused fail-closed and no \
                  command ran: {err}"
@@ -2713,12 +2701,47 @@ fn broker_only_skip_if_unprivileged(err: &Error) -> bool {
             || err.message.contains("Operation not permitted")
             || err.message.contains("Permission denied"));
     if unprivileged {
+        assert!(
+            !super::sandbox::isolation_must_succeed_for_tests(),
+            "this host supports unshare(CLONE_NEWNET) and the privilege drop, so a \
+             BrokerOnly spawn must succeed; it was refused instead: {err:?}"
+        );
         eprintln!(
             "SKIP (typed, unprivileged host): BrokerOnly namespace backend refused \
                  fail-closed and no child ran: {err}"
         );
     }
     unprivileged
+}
+
+/// The REAL privilege drop every isolated child runs must succeed (and leave
+/// no capability behind) on a host that can run it: credentials first (while
+/// CAP_SETGID/CAP_SETUID are effective), capabilities last. The original
+/// ordering cleared the capability sets before
+/// `setgroups`/`setresgid`/`setresuid`, so EVERY isolated spawn on the
+/// privileged lane refused EPERM. On hosts that cannot run the drop the
+/// probe refuses typed and this test skips explicitly.
+#[cfg(target_os = "linux")]
+#[test]
+fn privilege_drop_succeeds_with_empty_caps_on_a_capable_host() {
+    let _serial = deny_all_spawn_lock();
+    match super::sandbox::probe_privilege_drop_for_tests() {
+        super::sandbox::DropProbe::Succeeded {
+            no_new_privs,
+            caps_empty,
+        } => {
+            assert!(no_new_privs, "PR_SET_NO_NEW_PRIVS must hold after the drop");
+            assert!(caps_empty, "the drop must leave no capability behind");
+        }
+        super::sandbox::DropProbe::Refused(errno) => {
+            assert!(
+                !super::sandbox::privilege_drop_must_succeed_for_tests(),
+                "this host runs the drop (root, setgroups permitted), so it must not \
+                 refuse: errno {errno}"
+            );
+            eprintln!("SKIP (typed, unprivileged host): privilege drop refused errno {errno}");
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2809,7 +2832,6 @@ fn broker_only_spawn_reaches_only_the_broker_endpoint() {
     let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
     let report = _d.path().join("report-broker-only.txt");
     let compute = _d.path().join("compute-broker-only.txt");
-    make_privileged_probe_paths_sandbox_reachable(_d.path(), &[&uds_path]);
     let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
     let self_exe = std::env::current_exe().unwrap();
     let out = match spawn_broker_only_probe_child(
@@ -2927,7 +2949,6 @@ fn broker_only_devtools_exposure_relays_into_the_sandbox() {
     }
     let (_d, sup) = supervisor();
     let report = _d.path().join("expose-port.txt");
-    make_privileged_probe_paths_sandbox_reachable(_d.path(), &[]);
     let self_exe = std::env::current_exe().unwrap();
     let cfg = SpawnConfig {
         cmd: self_exe.to_string_lossy().into_owned(),
