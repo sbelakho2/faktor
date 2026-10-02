@@ -696,6 +696,9 @@ object JetBrainsParitySmoke {
             registry.observables["permissions"] = {
                 // Pending list rendered; the reply posts the strict DTO with
                 // the OWNING session id (the entry belongs to session 9).
+                // Await the rendered list first: the fake daemon's list
+                // response races the panel's first paint under load.
+                await("permission list rendered") { chat.permissionsView().count() == 1 }
                 assertEquals(1, chat.permissionsView().count())
                 assertTrue(
                     chat.permissionsView().unitLabel(0).contains("capability=shell"),
