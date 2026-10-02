@@ -559,7 +559,7 @@ function asInt(value: Json | undefined): number | null {
   return typeof value === 'number' && Number.isInteger(value) ? value : null;
 }
 
-/** Message ids are strings on SSE frames and integers on durable pages. */
+/** Message ids are integers on durable pages; a string id is tolerated. */
 function asId(value: Json | undefined): string | null {
   if (typeof value === 'string' && value.length > 0) {
     return value;
@@ -704,26 +704,6 @@ function entryFromMessage(id: string, message: Record<string, Json>): Transcript
   return entry;
 }
 
-function upsertEntry(
-  entries: readonly TranscriptEntry[],
-  id: string,
-  mutator: (entry: TranscriptEntry) => TranscriptEntry,
-  fallback: () => TranscriptEntry,
-): TranscriptEntry[] {
-  const index = entries.findIndex((entry) => entry.id === id);
-  if (index >= 0) {
-    const current = entries[index] as TranscriptEntry;
-    const updated = mutator(current);
-    if (updated === current) {
-      return entries as TranscriptEntry[];
-    }
-    const next = [...entries];
-    next[index] = updated;
-    return next;
-  }
-  return boundTranscript([...entries, mutator(fallback())]);
-}
-
 function boundTranscript(entries: TranscriptEntry[]): TranscriptEntry[] {
   if (entries.length <= MAX_TRANSCRIPT_ENTRIES) {
     return entries;
@@ -746,75 +726,6 @@ export function transcriptFromMessages(messages: readonly Json[]): TranscriptEnt
     entries.push(entryFromMessage(id, message));
   }
   return boundTranscript(entries);
-}
-
-/** Apply one SSE frame to the transcript; returns the same array if unused. */
-export function applySseEvent(
-  entries: readonly TranscriptEntry[],
-  event: string,
-  data: Json,
-): TranscriptEntry[] {
-  const object = asObject(data);
-  if (!object) {
-    return entries as TranscriptEntry[];
-  }
-  if (event === 'message_created') {
-    const message = asObject(object.message);
-    if (!message) {
-      return entries as TranscriptEntry[];
-    }
-    const id = asId(message.id);
-    if (!id) {
-      return entries as TranscriptEntry[];
-    }
-    return upsertEntry(entries, id, () => entryFromMessage(id, message), () => emptyEntry(id, 'assistant', 0, 0));
-  }
-  if (event === 'message_part_updated') {
-    const id = asString(object.message_id);
-    if (!id) {
-      return entries as TranscriptEntry[];
-    }
-    const part = asObject(object.part);
-    if (!part) {
-      return entries as TranscriptEntry[];
-    }
-    const type = asString(part.type);
-    return upsertEntry(
-      entries,
-      id,
-      (entry) => {
-        if (type === 'text' || type === 'reasoning' || type === 'summary') {
-          const text = asString(part.text) ?? '';
-          return text.length === 0 ? entry : applyTextPart(entry, type, text);
-        }
-        const update = toolFromSsePart(part);
-        return update ? { ...entry, tools: mergeTool(entry.tools, update) } : entry;
-      },
-      () => emptyEntry(id, 'assistant', 0, 0),
-    );
-  }
-  if (event === 'tool_call_state') {
-    const toolCallId = asString(object.tool_call_id);
-    const state = asString(object.state);
-    if (!toolCallId || !state) {
-      return entries as TranscriptEntry[];
-    }
-    let changed = false;
-    const next = entries.map((entry) => {
-      if (!entry.tools.some((tool) => tool.toolCallId === toolCallId)) {
-        return entry;
-      }
-      changed = true;
-      return {
-        ...entry,
-        tools: entry.tools.map((tool) =>
-          tool.toolCallId === toolCallId ? { ...tool, state } : tool,
-        ),
-      };
-    });
-    return changed ? (next as TranscriptEntry[]) : (entries as TranscriptEntry[]);
-  }
-  return entries as TranscriptEntry[];
 }
 
 /** Recursively bound a JSON value (depth, array/keys, string lengths). */

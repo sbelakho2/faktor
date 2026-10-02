@@ -94,14 +94,16 @@ impl SessionHandle {
         Ok(bytes)
     }
 
-    /// The durable (summary, kind) row for an artifact.
+    /// The durable (summary, kind) row for an artifact of THIS session. A
+    /// present row whose metadata is undecodable is a typed store error,
+    /// never an absent artifact.
     pub fn artifact_summary(
         &self,
         hash: FileHash,
     ) -> faktor_core::Result<Option<(String, String)>> {
         self.manager
             .store()
-            .artifact(&hash.to_hex())
+            .artifact_for(self.id, &hash.to_hex())
             .map_err(|e| crate::map_store_err(e).into())
     }
 }
@@ -164,5 +166,42 @@ mod tests {
         let path = dir.path().join("cas").join(h.cas_path());
         std::fs::write(&path, b"corrupted").unwrap();
         assert!(s.artifact_blob(h, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn artifact_summary_is_scoped_per_session_and_hostile_rows_are_loud() {
+        let (_d, m) = test_manager();
+        let s1 = session(&m);
+        let s2 = session(&m);
+        let blob = b"shared artifact bytes".to_vec();
+        let h1 = s1.put_artifact("command_output", &blob, "first").unwrap();
+        let h2 = s2.put_artifact("tool_output", &blob, "second").unwrap();
+        assert_eq!(h1, h2, "the CAS content address is shared");
+        assert_eq!(
+            s1.artifact_summary(h1).unwrap(),
+            Some(("first".to_string(), "command_output".to_string()))
+        );
+        assert_eq!(
+            s2.artifact_summary(h2).unwrap(),
+            Some(("second".to_string(), "tool_output".to_string())),
+            "session two reads its own summary, never session one's"
+        );
+        // A hostile/corrupt row is a typed store error through the session
+        // route — never an absent artifact.
+        m.store()
+            .sql_execute(&format!(
+                "UPDATE artifact SET summary = x'FF' WHERE session_id = {} AND cas_hash = '{}'",
+                s1.id().raw(),
+                h1.to_hex()
+            ))
+            .unwrap();
+        let err = s1.artifact_summary(h1).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Store);
+        assert!(err.to_string().contains("summary"), "{err}");
+        // The other session's row is untouched and still reads.
+        assert_eq!(
+            s2.artifact_summary(h2).unwrap(),
+            Some(("second".to_string(), "tool_output".to_string()))
+        );
     }
 }

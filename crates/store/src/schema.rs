@@ -794,6 +794,29 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         receipt_json TEXT,
         created_ms INTEGER NOT NULL
      );",
+    // v28 — per-session artifact identity (schema target 29; array index 28).
+    // The v1 `artifact` table keyed `cas_hash` GLOBALLY unique while every
+    // read is per-session: session B's `put_artifact` for the same bytes was
+    // silently discarded by `INSERT OR IGNORE` (durable metadata loss), and
+    // an unscoped lookup could serve session A's row. The table is rebuilt
+    // with `UNIQUE(session_id, cas_hash)` — one artifact row per session and
+    // content address — and every pre-existing row keeps its id. Reads are
+    // scoped (`Store::artifact_for`) and decode fallibly, so a hostile row is
+    // a typed error instead of an absent artifact.
+    "ALTER TABLE artifact RENAME TO artifact_v28;
+     CREATE TABLE artifact (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        kind TEXT NOT NULL,
+        cas_hash TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        UNIQUE (session_id, cas_hash)
+     );
+     INSERT INTO artifact (id, session_id, kind, cas_hash, summary, created_ms, size)
+        SELECT id, session_id, kind, cas_hash, summary, created_ms, size FROM artifact_v28;
+     DROP TABLE artifact_v28;",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

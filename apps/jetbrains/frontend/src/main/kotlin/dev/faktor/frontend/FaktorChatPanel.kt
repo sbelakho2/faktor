@@ -32,6 +32,7 @@ import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
 import java.math.BigInteger
+import java.nio.file.Path
 import java.util.UUID
 import java.awt.BorderLayout
 import java.awt.Dimension
@@ -41,6 +42,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
@@ -72,7 +74,17 @@ class FaktorChatPanel(
     /** The NON-secret (endpoint, organization) coordinates. */
     private val controlPlaneScopeStore: ControlPlaneScopeStore? = null,
     /** The NON-secret auth-session id the sign-out revoke route names. */
-    private val controlPlaneSessionStore: ControlPlaneSessionStore? = null
+    private val controlPlaneSessionStore: ControlPlaneSessionStore? = null,
+    /**
+     * The session workspace root: the IntelliJ host passes `Project.basePath`
+     * and the standalone launcher its working directory. The SAME root rides
+     * `POST /native/session` (so the daemon resolves workspace-relative
+     * attachment paths against it) and attachment relativization; the daemon's
+     * session projection exposes no workspace path, so the project base path
+     * is the client authority. Null = no root: ordinary attachments are
+     * refused typed instead of being sent as absolute paths.
+     */
+    private val workspaceRoot: Path? = null
 ) : JPanel(BorderLayout()), FaktorFrontendService.Listener {
 
     private val worker = Executors.newSingleThreadExecutor { runnable ->
@@ -162,7 +174,7 @@ class FaktorChatPanel(
 
     private val criteriaField = JTextField(24)
 
-    private val attachments = AttachmentsPanel()
+    private val attachments = AttachmentsPanel(workspaceRoot)
 
     // Audit 29: bounded local pending-upload state. A failed start keeps the
     // already-uploaded ids; the retry resolves them first and uploads only
@@ -193,6 +205,23 @@ class FaktorChatPanel(
     private val agentsModel = DefaultComboBoxModel<NativeAgent>()
 
     private val agentsCombo = JComboBox(agentsModel)
+
+    /** The agent-control buttons by label, so tests can drive the dialog path. */
+    private val agentControlButtons = LinkedHashMap<String, JButton>()
+
+    /**
+     * The agent-control input resolver, invoked ON the EDT by
+     * [agentInputOnEdt] (the production default is the modal JOptionPane
+     * prompt; tests inject a recording / cancelling provider).
+     */
+    internal var agentInputProvider: ((java.awt.Component, String, String?) -> String?)? = null
+
+    /**
+     * Test seam observing the worker-side dispatch of one agent control: the
+     * callback runs on the `faktor-ui` worker immediately before the control
+     * call, so a smoke can prove the dialog never ran there.
+     */
+    internal var agentControlDispatchObserver: ((String) -> Unit)? = null
 
     private val agentsArea = JTextArea(5, 32)
 
@@ -410,30 +439,32 @@ class FaktorChatPanel(
         controls.add(agentButton("Cancel") { agent -> service.cancelAgent(agent.agentId) })
         controls.add(agentButton("Retry") { agent -> service.retryAgent(agent.agentId) })
         controls.add(agentButton("Steer") { agent ->
-            val text = JOptionPane.showInputDialog(this, "Steer note for ${agent.agentId}")
+            val text = agentInputOnEdt("Steer note for ${agent.agentId}", null)
             if (text != null && text.isNotEmpty()) service.steerAgent(agent.agentId, text)
         })
         controls.add(agentButton("Model") { agent ->
-            val model = JOptionPane.showInputDialog(this, "Model for ${agent.agentId}", agent.model ?: "")
+            val model = agentInputOnEdt("Model for ${agent.agentId}", agent.model ?: "")
             if (model != null && model.isNotEmpty()) service.setAgentModel(agent.agentId, model)
         })
         controls.add(agentButton("Token budget") { agent ->
-            val raw = JOptionPane.showInputDialog(this, "max_tokens for ${agent.agentId}", "10000")
+            val raw = agentInputOnEdt("max_tokens for ${agent.agentId}", "10000")
             val tokens = raw?.trim()?.toLongOrNull()
             if (tokens != null && tokens > 0) service.setAgentBudget(agent.agentId, maxTokens = tokens)
         })
         controls.add(agentButton("Cost budget") { agent ->
-            val raw = JOptionPane.showInputDialog(this, "max_cost_micro for ${agent.agentId}", "1000000")
+            val raw = agentInputOnEdt("max_cost_micro for ${agent.agentId}", "1000000")
             // Exact money: a plain decimal amount within i64::MAX; a junk or
             // out-of-range value is refused loudly, never truncated.
             val micro = raw?.trim()?.let { MicroMoney.parseDecimal(it) }
             when {
                 raw == null -> Unit
                 micro == null || micro.signum() <= 0 ->
-                    appendSystem(
-                        "refused max_cost_micro \"${raw.trim()}\": enter a positive decimal " +
-                            "integer no larger than ${MicroMoney.I64_MAX}"
-                    )
+                    onEdt {
+                        appendSystem(
+                            "refused max_cost_micro \"${raw.trim()}\": enter a positive decimal " +
+                                "integer no larger than ${MicroMoney.I64_MAX}"
+                        )
+                    }
                 else -> service.setAgentBudget(agent.agentId, maxCostMicro = micro)
             }
         })
@@ -449,6 +480,7 @@ class FaktorChatPanel(
         control: (NativeAgent) -> Any?
     ): JButton {
         val button = JButton(label)
+        agentControlButtons[label] = button
         button.addActionListener {
             val agent = agentsCombo.selectedItem as? NativeAgent
             if (agent == null) {
@@ -456,11 +488,49 @@ class FaktorChatPanel(
                 return@addActionListener
             }
             runAsync("agent $label") {
+                agentControlDispatchObserver?.invoke(label)
                 control(agent)
                 refreshAgentsBlocking()
             }
         }
         return button
+    }
+
+    /**
+     * Resolve one agent-control input ON the EDT and hand the value back to
+     * the `faktor-ui` worker: the modal dialog never runs on (and never
+     * blocks) the single worker, so abort/refresh work cannot queue behind a
+     * pumping/modal LAf. The control call itself still runs on the worker,
+     * and Swing is touched only on the EDT.
+     */
+    private fun agentInputOnEdt(title: String, initial: String?): String? {
+        val show: () -> String? = {
+            val provider = agentInputProvider
+            if (provider != null) {
+                provider(this, title, initial)
+            } else {
+                JOptionPane.showInputDialog(this, title, initial)
+            }
+        }
+        if (SwingUtilities.isEventDispatchThread()) return show()
+        val result = AtomicReference<String?>()
+        val thrown = AtomicReference<Throwable?>()
+        try {
+            SwingUtilities.invokeAndWait {
+                try {
+                    result.set(show())
+                } catch (t: Throwable) {
+                    thrown.set(t)
+                }
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return null
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            thrown.set(e.targetException)
+        }
+        thrown.get()?.let { throw it }
+        return result.get()
     }
 
     /** The checked Task-mode contract, or null for today's default path. */
@@ -578,7 +648,7 @@ class FaktorChatPanel(
             // undeliverable or oversize entry is a typed refusal BEFORE any
             // upload, so nothing partial reaches the durable store.
             val policy = resolveAttachmentPolicy()
-            val plan = planAttachments(draft.files, draft.binaries, policy)
+            val plan = planAttachments(draft.files, draft.binaries, policy, workspaceRoot)
             // Upload plan in ENTRY order: binaries first, then image and
             // document paths. The retry key binds kind + mime + SHA-256 of
             // the exact bytes (the path is metadata only, never identity),
@@ -1184,8 +1254,10 @@ class FaktorChatPanel(
 
     /**
      * The New-session composer path: the Settings provider selection (or the
-     * composer text fields), one native session, then the SSE stream at
-     * cursor 0 and a full refresh.
+     * composer text fields), one native session on the panel's workspace root
+     * (the same root attachment paths are relativized against; the daemon
+     * refuses absolute `files`, so both halves must agree), then the SSE
+     * stream at cursor 0 and a full refresh.
      */
     private fun newSessionFromControls() {
         if (startInFlight.get()) {
@@ -1197,7 +1269,9 @@ class FaktorChatPanel(
                 ?: providerField.text.trim().ifEmpty { "default" }
             val model = settingsPanel.selectedModel()
                 ?: modelField.text.trim().ifEmpty { "default" }
-            val created = service.createSession(provider, model, title = "JetBrains session")
+            val created = service.createSession(
+                provider, model, workspace = workspaceRoot?.toString(), title = "JetBrains session"
+            )
             submittedCompletion = null
             onEdt {
                 boardPanel.reset()
@@ -1961,6 +2035,28 @@ class FaktorChatPanel(
 
     internal fun attachmentsView(): AttachmentsPanel = attachments
 
+    /** Selects one agent in the Agents combo (the dialog-path smoke hook). */
+    internal fun selectAgentForTest(agentId: String): Boolean {
+        for (i in 0 until agentsModel.size) {
+            if (agentsModel.getElementAt(i).agentId == agentId) {
+                agentsCombo.selectedIndex = i
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Clicks one agent-control button on the EDT (the dialog-path smoke hook). */
+    internal fun triggerAgentControlForTest(label: String): Boolean {
+        val button = agentControlButtons[label] ?: return false
+        if (SwingUtilities.isEventDispatchThread()) {
+            button.doClick(0)
+        } else {
+            SwingUtilities.invokeAndWait { button.doClick(0) }
+        }
+        return true
+    }
+
     /** The rendered transcript (smoke assertions on typed refusals). */
     internal fun transcriptTextForTest(): String = transcript.text
 
@@ -2174,9 +2270,14 @@ object FaktorFrontendApp {
             java.nio.file.Paths.get(binary),
             java.nio.file.Paths.get(dataDir)
         )
+        // The standalone launcher's session workspace is its working
+        // directory (the daemon child inherits the same cwd); relative
+        // attachments resolve against it.
+        val workspaceRoot = java.nio.file.Paths.get(System.getProperty("user.dir"))
+            .toAbsolutePath().normalize()
         SwingUtilities.invokeLater {
             val frame = JFrame("Faktor")
-            val panel = FaktorChatPanel(service)
+            val panel = FaktorChatPanel(service, workspaceRoot = workspaceRoot)
             frame.contentPane.add(panel)
             frame.defaultCloseOperation = WindowConstants.DO_NOTHING_ON_CLOSE
             frame.addWindowListener(object : java.awt.event.WindowAdapter() {

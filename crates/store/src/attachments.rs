@@ -309,6 +309,10 @@ enum SeedMode {
 
 impl Store {
     /// Artifact rows reference CAS hashes; the blob itself lives in the CAS.
+    /// Insert-or-ignore ONE `(session_id, cas_hash)` identity and return the
+    /// id of the row that identity actually OWNS: a repeated put within the
+    /// session returns the SAME id, never `last_insert_rowid()` from an
+    /// ignored insert and never another session's row.
     pub fn put_artifact(
         &self,
         session_id: SessionId,
@@ -323,6 +327,10 @@ impl Store {
         // The timestamp is acquired on the CALLER's thread (never inside the
         // writer job): writer closures stay SQL-only.
         let created_ms = now_ms();
+        // Caller-prepared corrupt diagnostic: the closure formats nothing.
+        let vanished = format!(
+            "artifact (session {session_id}, hash {cas_hash:?}) not found after INSERT OR IGNORE"
+        );
         self.writer.execute("put_artifact", move |conn| {
             conn.execute(
             "INSERT OR IGNORE INTO artifact(session_id, kind, cas_hash, summary, created_ms, size)
@@ -336,20 +344,52 @@ impl Store {
                 size
             ],
         )?;
-            Ok(conn.last_insert_rowid())
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM artifact WHERE session_id = ?1 AND cas_hash = ?2",
+                    params![session_id.raw() as i64, cas_hash],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match id {
+                Some(id) if id > 0 => Ok(id),
+                _ => Err(StoreError::Corrupt(vec![vanished])),
+            }
         })
     }
 
-    pub fn artifact(&self, cas_hash: &str) -> StoreResult<Option<(String, String)>> {
+    /// The durable `(summary, kind)` row for ONE artifact of THIS session,
+    /// keyed by its CAS hash. Absent is `Ok(None)`; a present row whose
+    /// `summary`/`kind` column is undecodable (hostile/corrupt row) is a
+    /// typed [`StoreError::Corrupt`] naming the row — never `None`, never
+    /// another session's metadata.
+    pub fn artifact_for(
+        &self,
+        session_id: SessionId,
+        cas_hash: &str,
+    ) -> StoreResult<Option<(String, String)>> {
         let conn = self.read()?;
-        let out = conn
-            .query_row(
-                "SELECT summary, kind FROM artifact WHERE cas_hash = ?1",
-                params![cas_hash],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .ok();
-        Ok(out)
+        query_row_optional(
+            &conn,
+            "SELECT id, summary, kind FROM artifact WHERE session_id = ?1 AND cas_hash = ?2",
+            params![session_id.raw() as i64, cas_hash],
+            |r| {
+                let id: i64 = r.get(0)?;
+                let summary = r.get::<_, String>(1).map_err(|e| {
+                    StoreError::Corrupt(vec![format!(
+                        "artifact row {id} (session {session_id}, hash {cas_hash:?}): \
+                         summary column is undecodable: {e}"
+                    )])
+                })?;
+                let kind = r.get::<_, String>(2).map_err(|e| {
+                    StoreError::Corrupt(vec![format!(
+                        "artifact row {id} (session {session_id}, hash {cas_hash:?}): \
+                         kind column is undecodable: {e}"
+                    )])
+                })?;
+                Ok((summary, kind))
+            },
+        )
     }
 
     // -------------------------------------------------------------- attachments
@@ -900,20 +940,150 @@ mod tests {
     }
 
     #[test]
-    fn artifact_hash_unique_across_sessions() {
+    fn artifact_identity_is_per_session_and_never_silently_discarded() {
         let (_d, store) = tmp_store();
         let ws = store.create_workspace("/w").unwrap();
         let s1 = store.create_session(ws, "a", "p", "m").unwrap();
         let s2 = store.create_session(ws, "b", "p", "m").unwrap();
-        store
-            .put_artifact(s1.id, "command_output", "hash1", "sum", 10)
+        let first = store
+            .put_artifact(s1.id, "command_output", "hash1", "session one sum", 10)
             .unwrap();
-        store
-            .put_artifact(s2.id, "command_output", "hash1", "sum", 10)
+        // Session B stores the SAME bytes with DIFFERENT metadata: its row
+        // must exist with its own kind/summary, never be ignored by a global
+        // cas_hash uniqueness rule.
+        let second = store
+            .put_artifact(s2.id, "tool_output", "hash1", "session two sum", 20)
             .unwrap();
-        let a = store.artifact("hash1").unwrap().unwrap();
-        assert_eq!(a.0, "sum");
-        assert_eq!(store.artifact("nope").unwrap(), None);
+        assert!(first >= 1 && second >= 1);
+        assert_ne!(first, second, "each session owns its own artifact row");
+        assert_eq!(
+            store.artifact_for(s1.id, "hash1").unwrap(),
+            Some(("session one sum".to_string(), "command_output".to_string()))
+        );
+        assert_eq!(
+            store.artifact_for(s2.id, "hash1").unwrap(),
+            Some(("session two sum".to_string(), "tool_output".to_string())),
+            "a second session's metadata is durable and read back scoped"
+        );
+        // A repeat put is idempotent for that session and returns its row.
+        assert_eq!(
+            store
+                .put_artifact(s1.id, "command_output", "hash1", "ignored", 10)
+                .unwrap(),
+            first
+        );
+        assert_eq!(store.artifact_for(s1.id, "nope").unwrap(), None);
+        assert_eq!(store.artifact_for(s2.id, "nope").unwrap(), None);
+    }
+
+    #[test]
+    fn put_artifact_returns_the_row_it_owns_on_the_ignored_path() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "a", "p", "m").unwrap();
+        let a = store.put_artifact(s.id, "k", "hash-a", "s", 1).unwrap();
+        let b = store.put_artifact(s.id, "k", "hash-b", "s", 1).unwrap();
+        assert_ne!(a, b);
+        // The ignored re-insert must return hash-a's OWN row id, never the
+        // writer connection's `last_insert_rowid()` (which is hash-b's).
+        assert_eq!(
+            store
+                .put_artifact(s.id, "k", "hash-a", "changed", 1)
+                .unwrap(),
+            a
+        );
+        assert_eq!(
+            store
+                .put_artifact(s.id, "k", "hash-b", "changed", 1)
+                .unwrap(),
+            b
+        );
+    }
+
+    #[test]
+    fn concurrent_identical_artifact_put_is_idempotent_for_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path(), true).unwrap());
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "a", "p", "m").unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                store
+                    .put_artifact(s.id, "k", "hash-race", "sum", 3)
+                    .unwrap()
+            }));
+        }
+        let ids: Vec<i64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            ids.iter().all(|id| *id == ids[0]),
+            "one row per session+hash, every put returns it: {ids:?}"
+        );
+        let conn = store.raw_conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifact WHERE session_id = ?1 AND cas_hash = 'hash-race'",
+                params![s.id.raw() as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn artifact_read_refuses_hostile_columns_never_absent() {
+        let (_d, store) = tmp_store();
+        let ws = store.create_workspace("/w").unwrap();
+        let s = store.create_session(ws, "a", "p", "m").unwrap();
+        let other = store.create_session(ws, "b", "p", "m").unwrap();
+        store
+            .put_artifact(s.id, "command_output", "hash-a", "sum", 5)
+            .unwrap();
+        assert_eq!(
+            store.artifact_for(s.id, "hash-a").unwrap(),
+            Some(("sum".to_string(), "command_output".to_string()))
+        );
+        // An absent hash in the SAME session stays an honest absence.
+        assert_eq!(store.artifact_for(s.id, "absent").unwrap(), None);
+        // A BLOB summary (hostile/corrupt row) is a typed refusal naming the
+        // row — never `None`, never a silent default.
+        {
+            let conn = store.raw_conn();
+            conn.execute(
+                "UPDATE artifact SET summary = x'FF' WHERE session_id = ?1 AND cas_hash = 'hash-a'",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        let err = store
+            .artifact_for(s.id, "hash-a")
+            .expect_err("an undecodable summary must never read as absent");
+        assert!(
+            matches!(err, StoreError::Corrupt(_) | StoreError::Sqlite(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("summary"), "{err}");
+        // A BLOB kind refuses the same way; the hostile row is never readable
+        // through any other session either.
+        {
+            let conn = store.raw_conn();
+            conn.execute(
+                "UPDATE artifact SET summary = 'sum', kind = x'FE'
+                 WHERE session_id = ?1 AND cas_hash = 'hash-a'",
+                params![s.id.raw() as i64],
+            )
+            .unwrap();
+        }
+        let err = store
+            .artifact_for(s.id, "hash-a")
+            .expect_err("an undecodable kind");
+        assert!(
+            matches!(err, StoreError::Corrupt(_) | StoreError::Sqlite(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("kind"), "{err}");
+        assert_eq!(store.artifact_for(other.id, "hash-a").unwrap(), None);
     }
 
     #[test]
@@ -934,14 +1104,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .artifact(big["blob_hash"].as_str().unwrap())
+                .artifact_for(s.id, big["blob_hash"].as_str().unwrap())
                 .unwrap()
                 .unwrap()
                 .1,
             "tool_output"
         );
         // A different hash is not found.
-        assert_eq!(store.artifact(&"0".repeat(63)).unwrap(), None);
+        assert_eq!(store.artifact_for(s.id, &"0".repeat(63)).unwrap(), None);
     }
 
     #[test]

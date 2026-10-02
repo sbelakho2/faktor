@@ -659,6 +659,38 @@ impl WorkspaceHandle {
         move |_dest: &Path| Ok(())
     }
 
+    /// Free-function twin of the handle's `verify_parent_before_rename` for
+    /// the CAS merge writers: immediately before the mutation the
+    /// destination's parent chain is re-walked handle-relative under the
+    /// canonical `root`, so a parent swapped for an outside symlink/reparse
+    /// point since resolution fails the write typed instead of redirecting
+    /// rename/link/unlink/chmod out of the workspace. The check-to-syscall
+    /// gap is the documented rename-by-path residual (POSIX has no
+    /// compare-and-swap rename).
+    #[cfg(any(unix, windows))]
+    fn verify_parent_under_root(root: &Path) -> impl Fn(&Path) -> Result<(), Error> + '_ {
+        move |dest: &Path| {
+            let parent = dest.parent().ok_or_else(|| {
+                Error::malformed(format!("{} has no parent directory", dest.display()))
+            })?;
+            let parent_rel = parent.strip_prefix(root).map_err(|_| {
+                Error::permission(format!(
+                    "write destination {} is outside the workspace root",
+                    dest.display()
+                ))
+            })?;
+            platform::open_no_follow_walk(root, parent_rel, platform::OpenKind::Directory)?;
+            Ok(())
+        }
+    }
+
+    /// Platforms without a handle-relative walk keep the digest/CAS recheck
+    /// as the only write-time guard.
+    #[cfg(not(any(unix, windows)))]
+    fn verify_parent_under_root(_root: &Path) -> impl Fn(&Path) -> Result<(), Error> + '_ {
+        move |_dest: &Path| Ok(())
+    }
+
     /// stat via the resolved handle (unix: fstat of the walked entry;
     /// Windows: `GetFileInformationByHandle`-backed metadata of the walked
     /// HANDLE — the file is never re-opened by path; the walk is the
@@ -1193,9 +1225,12 @@ pub fn copy_tree_skip(
 /// Replay semantics: when the destination already equals the source digest
 /// (a crashed run applied it, or the state converged), the apply is
 /// [`CasMergeResult::AlreadyCurrent`] — idempotent, never an error. The
-/// destination write itself goes through `atomic::atomic_replace_cas` /
-/// `atomic::atomic_create` (the shared per-path commit discipline), so a
-/// crash at any point leaves either the old or the new whole file.
+/// destination write goes through the guarded
+/// `atomic::atomic_replace_cas_guarded` discipline (a create is a
+/// CAS-ABSENT publish) with the parent chain re-verified handle-relative
+/// immediately before the rename, so a parent swapped for an outside
+/// symlink since resolution refuses the write typed; a crash at any point
+/// leaves either the old or the new whole file.
 pub fn merge_apply_content(
     dst_root: &Path,
     dst_rel: &Path,
@@ -1307,7 +1342,13 @@ pub fn merge_apply_content(
                 digest: Some(base),
                 modified_ms: None,
             };
-            atomic::atomic_replace_cas(&dst, &expected, &bytes).map_err(|e| {
+            atomic::atomic_replace_cas_guarded(
+                &dst,
+                &expected,
+                &bytes,
+                &WorkspaceHandle::verify_parent_under_root(&dst_root),
+            )
+            .map_err(|e| {
                 if e.kind == ErrorKind::Conflict {
                     Error::conflict(format!(
                         "{}: {}",
@@ -1322,7 +1363,17 @@ pub fn merge_apply_content(
             })?;
         }
         None => {
-            atomic::atomic_create(&dst, &bytes).map_err(|e| {
+            // Exclusive create as a CAS-ABSENT publish: absent at the
+            // commit-time recheck (a concurrent creator is a typed Conflict)
+            // and the parent re-verified immediately before the rename, so a
+            // create can neither bypass the CAS guard nor be redirected.
+            atomic::atomic_replace_cas_guarded(
+                &dst,
+                &atomic::FileState::absent(),
+                &bytes,
+                &WorkspaceHandle::verify_parent_under_root(&dst_root),
+            )
+            .map_err(|e| {
                 if e.kind == ErrorKind::Conflict {
                     Error::conflict(format!(
                         "{} appeared since the base snapshot; the merge did not overwrite it",
@@ -1345,7 +1396,10 @@ pub fn merge_apply_content(
 /// end state — absent — already holds). POSIX offers no atomic
 /// compare-and-unlink: the digest recheck happens immediately before the
 /// unlink, the same recheck-rename window wave-10 documents for CAS
-/// content writes.
+/// content writes. Immediately before the unlink the destination's parent
+/// chain is re-verified handle-relative, so a parent swapped for an outside
+/// symlink since resolution refuses the deletion instead of unlinking an
+/// outside file.
 pub fn merge_delete(
     dst_root: &Path,
     dst_rel: &Path,
@@ -1369,6 +1423,7 @@ pub fn merge_delete(
     }
     match state.digest {
         Some(cur) if cur == expected => {
+            WorkspaceHandle::verify_parent_under_root(&dst_root)(&dst)?;
             fs::remove_file(&dst)
                 .map_err(|e| Error::internal(format!("remove {}: {e}", dst.display())))?;
             if let Some(parent) = dst.parent() {
@@ -1396,11 +1451,14 @@ pub fn merge_delete(
 /// - `Some(base)`: the destination must still hold `base` (or already hold
 ///   the new digest — an idempotent replay → [`CasMergeResult::AlreadyCurrent`]);
 ///   anything else is a typed Conflict and the destination is untouched;
-/// - `None`: the destination must not exist (exclusive create); a
+/// - `None`: the destination must not exist (a CAS-ABSENT publish); a
 ///   concurrent creation is a typed Conflict.
 ///
-/// The write goes through the shared atomic commit discipline, so a crash
-/// leaves either the old or the new whole file.
+/// The write goes through the shared atomic commit discipline with the
+/// destination's parent chain re-verified handle-relative immediately
+/// before the rename, so a parent swapped for an outside symlink since
+/// resolution refuses the write typed; a crash leaves either the old or the
+/// new whole file.
 pub fn cas_write_content(
     dst_root: &Path,
     dst_rel: &Path,
@@ -1446,7 +1504,16 @@ pub fn cas_write_content(
             dst.display()
         ))),
         (false, None, _) => {
-            atomic::atomic_create(&dst, bytes).map_err(|e| {
+            // Exclusive create as a CAS-ABSENT publish (parent re-verified
+            // immediately before the rename, absent digest rechecked at
+            // commit time); a concurrent creator is a typed Conflict.
+            atomic::atomic_replace_cas_guarded(
+                &dst,
+                &atomic::FileState::absent(),
+                bytes,
+                &WorkspaceHandle::verify_parent_under_root(&dst_root),
+            )
+            .map_err(|e| {
                 if e.kind == ErrorKind::Conflict {
                     Error::conflict(format!(
                         "{} appeared during the landing; refusing to overwrite it",
@@ -1465,7 +1532,13 @@ pub fn cas_write_content(
                 digest: Some(base),
                 modified_ms: None,
             };
-            atomic::atomic_replace_cas(&dst, &expected, bytes).map_err(|e| {
+            atomic::atomic_replace_cas_guarded(
+                &dst,
+                &expected,
+                bytes,
+                &WorkspaceHandle::verify_parent_under_root(&dst_root),
+            )
+            .map_err(|e| {
                 if e.kind == ErrorKind::Conflict {
                     Error::conflict(format!(
                         "{}: {}",
@@ -3210,6 +3283,287 @@ mod tests {
                 hook(&root);
             }
         }));
+    }
+
+    // ============================================ rooted-write TOCTOU seams
+    // The writers below resolve a destination ONCE and then mutate by
+    // pathname; these tests swap the parent for an outside symlink in the
+    // seam fired by the pre-mutation parent re-verification and assert the
+    // call refuses typed BEFORE mutating, with the outside file untouched.
+
+    /// A canonical `root` with `root/sub` materialized plus an OUTSIDE victim dir.
+    #[cfg(unix)]
+    fn swap_fixture(
+        root_dir: &tempfile::TempDir,
+        outside_dir: &tempfile::TempDir,
+    ) -> (PathBuf, PathBuf) {
+        let root = root_dir.path().canonicalize().unwrap();
+        let outside = outside_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(outside.join("victim.txt"), b"OUTSIDE-VICTIM").unwrap();
+        (root, outside)
+    }
+
+    /// Swap `root/sub` for a symlink to `outside` inside the walk seam.
+    #[cfg(unix)]
+    fn swap_sub_for_outside(root: &Path, outside: &Path) {
+        swap_seam(root, "sub", {
+            let outside = outside.to_path_buf();
+            move |root| {
+                fs::rename(root.join("sub"), root.join("sub-moved")).unwrap();
+                symlink(&outside, root.join("sub")).unwrap();
+            }
+        });
+    }
+
+    /// `merge_apply_content` replace + exclusive-create must refuse a parent
+    /// swapped to an outside symlink; the outside file (the rename's would-be
+    /// victim) and the absent create target stay untouched.
+    #[cfg(unix)]
+    #[test]
+    fn merge_apply_content_refuses_a_parent_swapped_to_an_outside_symlink() {
+        let _seam = SeamTest::new();
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let child_dir = tempfile::tempdir().unwrap();
+        let (root, outside) = swap_fixture(&root_dir, &outside_dir);
+        let child = child_dir.path().canonicalize().unwrap();
+        fs::write(root.join("sub/f.txt"), b"base-content").unwrap();
+        fs::write(outside.join("f.txt"), b"OUTSIDE-VICTIM").unwrap();
+        fs::write(child.join("f.txt"), b"child-edit").unwrap();
+        let base = FileHash::from(blake3::hash(b"base-content").into());
+        let landed = FileHash::from(blake3::hash(b"child-edit").into());
+        swap_sub_for_outside(&root, &outside);
+        let err = merge_apply_content(
+            &root,
+            Path::new("sub/f.txt"),
+            &child,
+            Path::new("f.txt"),
+            landed,
+            Some(base),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert_eq!(
+            fs::read(outside.join("f.txt")).unwrap(),
+            b"OUTSIDE-VICTIM",
+            "the swap redirected the merge outside the root"
+        );
+        assert_eq!(
+            fs::read(outside.join("victim.txt")).unwrap(),
+            b"OUTSIDE-VICTIM"
+        );
+        // Refused BEFORE the mutation: the destination (moved aside by the seam hook) still holds its base bytes.
+        assert_eq!(
+            fs::read(root.join("sub-moved/f.txt")).unwrap(),
+            b"base-content",
+            "the merge mutated the destination before refusing"
+        );
+
+        // Exclusive create (expected None): without the parent re-verification
+        // the hard link/rename would publish the child's file outside.
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let (root, outside) = swap_fixture(&root_dir, &outside_dir);
+        fs::write(child.join("new.txt"), b"child-new").unwrap();
+        let landed = FileHash::from(blake3::hash(b"child-new").into());
+        swap_sub_for_outside(&root, &outside);
+        let err = merge_apply_content(
+            &root,
+            Path::new("sub/new.txt"),
+            &child,
+            Path::new("new.txt"),
+            landed,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(
+            !outside.join("new.txt").exists(),
+            "the exclusive create landed outside the root"
+        );
+        assert!(
+            !root.join("sub-moved/new.txt").exists(),
+            "the exclusive create mutated inside the root before refusing"
+        );
+    }
+
+    /// `merge_delete` must refuse a parent swapped to an outside symlink: the
+    /// outside namesake the unlink would have removed stays present.
+    #[cfg(unix)]
+    #[test]
+    fn merge_delete_refuses_a_parent_swapped_to_an_outside_symlink() {
+        let _seam = SeamTest::new();
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let (root, outside) = swap_fixture(&root_dir, &outside_dir);
+        fs::write(root.join("sub/gone.rs"), b"base-content").unwrap();
+        fs::write(outside.join("gone.rs"), b"OUTSIDE-VICTIM").unwrap();
+        let base = FileHash::from(blake3::hash(b"base-content").into());
+        swap_sub_for_outside(&root, &outside);
+        let err = merge_delete(&root, Path::new("sub/gone.rs"), base).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert_eq!(
+            fs::read(outside.join("gone.rs")).unwrap(),
+            b"OUTSIDE-VICTIM",
+            "the swap redirected the unlink outside the root"
+        );
+        assert_eq!(
+            fs::read(root.join("sub-moved/gone.rs")).unwrap(),
+            b"base-content",
+            "the deletion mutated the destination before refusing"
+        );
+    }
+
+    /// `cas_write_content` (landing/rollback writer) must refuse a parent
+    /// swapped to an outside symlink on both the replace and the create arm.
+    #[cfg(unix)]
+    #[test]
+    fn cas_write_content_refuses_a_parent_swapped_to_an_outside_symlink() {
+        let _seam = SeamTest::new();
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let (root, outside) = swap_fixture(&root_dir, &outside_dir);
+        fs::write(root.join("sub/f.txt"), b"base-content").unwrap();
+        fs::write(outside.join("f.txt"), b"OUTSIDE-VICTIM").unwrap();
+        let base = FileHash::from(blake3::hash(b"base-content").into());
+        swap_sub_for_outside(&root, &outside);
+        let err =
+            cas_write_content(&root, Path::new("sub/f.txt"), b"landed", Some(base)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert_eq!(
+            fs::read(outside.join("f.txt")).unwrap(),
+            b"OUTSIDE-VICTIM",
+            "the swap redirected the CAS write outside the root"
+        );
+        assert_eq!(
+            fs::read(root.join("sub-moved/f.txt")).unwrap(),
+            b"base-content",
+            "the CAS write mutated the destination before refusing"
+        );
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let (root, outside) = swap_fixture(&root_dir, &outside_dir);
+        swap_sub_for_outside(&root, &outside);
+        let err = cas_write_content(&root, Path::new("sub/new.txt"), b"landed", None).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(
+            !outside.join("new.txt").exists(),
+            "the CAS-absent create landed outside the root"
+        );
+        assert!(
+            !root.join("sub-moved/new.txt").exists(),
+            "the CAS-absent create mutated inside the root before refusing"
+        );
+    }
+
+    /// Every `entry_state` transition shape (create, replace, mode-only,
+    /// to-symlink, retarget, remove) must refuse a parent swapped to an
+    /// outside symlink; the outside namesake stays byte-identical.
+    #[cfg(unix)]
+    #[test]
+    fn entry_state_transitions_refuse_a_parent_swapped_to_an_outside_symlink() {
+        use crate::entry_state::{apply_tree_entry_cas, EntryState};
+        use crate::tree_manifest::CanonicalMode;
+
+        let regular = |bytes: &[u8], mode| {
+            EntryState::regular(mode, FileHash::from(blake3::hash(bytes).into())).unwrap()
+        };
+        let shapes: Vec<(&str, EntryState, EntryState, Vec<u8>)> = vec![
+            (
+                "create",
+                EntryState::Absent,
+                regular(b"created", CanonicalMode::RegularFile),
+                b"created".to_vec(),
+            ),
+            (
+                "replace",
+                regular(b"base", CanonicalMode::RegularFile),
+                regular(b"next", CanonicalMode::RegularFile),
+                b"next".to_vec(),
+            ),
+            (
+                "mode-only",
+                regular(b"same", CanonicalMode::RegularFile),
+                regular(b"same", CanonicalMode::ExecutableFile),
+                b"same".to_vec(),
+            ),
+            (
+                "to-symlink",
+                regular(b"base", CanonicalMode::RegularFile),
+                EntryState::symlink(b"target-x".to_vec()).unwrap(),
+                b"target-x".to_vec(),
+            ),
+            (
+                "retarget",
+                EntryState::symlink(b"target-a".to_vec()).unwrap(),
+                EntryState::symlink(b"target-b".to_vec()).unwrap(),
+                b"target-b".to_vec(),
+            ),
+            (
+                "remove",
+                regular(b"base", CanonicalMode::RegularFile),
+                EntryState::Absent,
+                Vec::new(),
+            ),
+        ];
+        for (name, expected, next, material) in shapes {
+            let _seam = SeamTest::new();
+            let root_dir = tempfile::tempdir().unwrap();
+            let outside_dir = tempfile::tempdir().unwrap();
+            let (root, outside) = swap_fixture(&root_dir, &outside_dir);
+            // Materialize the starting state at root/sub/f and the outside namesake.
+            match &expected {
+                EntryState::Absent => {}
+                EntryState::Regular { mode, .. } => {
+                    let bytes: &[u8] = if name == "mode-only" {
+                        b"same"
+                    } else {
+                        b"base"
+                    };
+                    fs::write(root.join("sub/f"), bytes).unwrap();
+                    let bits = if *mode == CanonicalMode::ExecutableFile {
+                        0o755
+                    } else {
+                        0o644
+                    };
+                    fs::set_permissions(
+                        root.join("sub/f"),
+                        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(bits),
+                    )
+                    .unwrap();
+                }
+                EntryState::Symlink { target, .. } => {
+                    symlink(
+                        String::from_utf8(target.clone()).unwrap(),
+                        root.join("sub/f"),
+                    )
+                    .unwrap();
+                }
+            }
+            let victim: Vec<u8> = match &expected {
+                EntryState::Absent => b"OUTSIDE-VICTIM".to_vec(),
+                EntryState::Regular { .. } => fs::read(root.join("sub/f")).unwrap(),
+                EntryState::Symlink { target, .. } => target.clone(),
+            };
+            fs::write(outside.join("f"), &victim).unwrap();
+            swap_sub_for_outside(&root, &outside);
+            let err = apply_tree_entry_cas(&root, Path::new("sub/f"), &expected, &next, &material)
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Permission, "{name}: {err:?}");
+            assert_eq!(
+                fs::read(outside.join("f")).unwrap(),
+                victim,
+                "{name}: the swap redirected the transition outside the root"
+            );
+            // Refused BEFORE the mutation: the moved-aside real entry still carries the expected state.
+            assert_eq!(
+                crate::entry_state::state_of_path(&root.join("sub-moved/f")).unwrap(),
+                expected,
+                "{name}: the transition mutated the destination before refusing"
+            );
+        }
     }
 
     /// (a1) An intermediate directory swapped for an OUTSIDE symlink BEFORE

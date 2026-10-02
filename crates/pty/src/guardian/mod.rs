@@ -375,6 +375,242 @@ fn raw_errno() -> i32 {
     }
 }
 
+/// Create the control pipe with BOTH ends close-on-exec at the moment they
+/// exist, or refuse typed: the daemon-death contract depends on no other
+/// process holding a copy of the write end.
+///
+/// * Platforms with `pipe2(2)` (linux, the BSDs, illumos): one atomic
+///   `pipe2(O_CLOEXEC)` — there is no instant at which a descriptor exists
+///   without `FD_CLOEXEC`, so a concurrent fork/exec can never leak one.
+/// * Platforms without `pipe2(2)` (macOS): open both ends of a private
+///   unlinked FIFO with `O_CLOEXEC` (see [`create_control_pipe_fifo`]) —
+///   same guarantee without the non-atomic `pipe` + `F_SETFD` pair.
+///
+/// Failure is a typed refusal; the caller must not fork a guardian over a
+/// channel whose inheritance is not already impossible.
+fn create_control_pipe() -> Result<[RawFd; 2], Error> {
+    #[cfg(test)]
+    if FORCE_FIFO_CONTROL_PIPE.load(std::sync::atomic::Ordering::SeqCst)
+        || std::env::var_os("FAKTOR_TEST_FORCE_FIFO_GUARDIAN").is_some()
+    {
+        return create_control_pipe_fifo();
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "redox"
+    ))]
+    {
+        create_control_pipe_pipe2()
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "redox"
+    )))]
+    {
+        create_control_pipe_fifo()
+    }
+}
+
+/// `pipe2(O_CLOEXEC)`: both descriptors are close-on-exec atomically at
+/// creation (the one syscall that makes the guarantee on these platforms).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "redox"
+))]
+fn create_control_pipe_pipe2() -> Result<[RawFd; 2], Error> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a live two-element array; `pipe2` writes exactly both
+    // descriptors on success, and any non-zero return is refused before the
+    // values are read. `O_CLOEXEC` is applied by the kernel at creation.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(Error::internal(format!(
+            "guardian control pipe2 failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    control_pipe_seam(&fds);
+    Ok(fds)
+}
+
+/// Platforms without `pipe2(2)` (macOS): there is no atomic
+/// `pipe`+`FD_CLOEXEC`, and a concurrent fork between `pipe` and
+/// `fcntl(F_SETFD)` would leak an unprotected write end. Instead, create a
+/// private 0700 `mkdtemp` directory holding a FIFO, open the read end with
+/// `O_RDONLY|O_NONBLOCK|O_CLOEXEC` and the write end with `O_WRONLY|O_CLOEXEC`,
+/// then clear `O_NONBLOCK` on the reader (both ends already carry `FD_CLOEXEC`,
+/// so this fcntl pair cannot expose anything) and unlink the FIFO + remove
+/// the directory: the open descriptors keep the channel alive, and every
+/// step either produces a CLOEXEC descriptor or refuses. Any failure after
+/// an endpoint exists closes it and removes the private path.
+#[cfg(any(
+    test,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "redox"
+    ))
+))]
+fn create_control_pipe_fifo() -> Result<[RawFd; 2], Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut template = std::env::temp_dir().as_os_str().as_bytes().to_vec();
+    if template.last() == Some(&b'/') {
+        template.pop();
+    }
+    template.extend_from_slice(b"/faktor-guardian-XXXXXX\0");
+    // SAFETY: `template` is a writable NUL-terminated buffer whose final six
+    // bytes are the `X` placeholder `mkdtemp` replaces; it outlives the call,
+    // and a null return is refused before the buffer is read further.
+    let created = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    if created.is_null() {
+        return Err(Error::internal(format!(
+            "guardian control fifo: mkdtemp failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    template.pop(); // strip the trailing NUL: `template` now names the dir
+    let dir = CString::new(template).expect("mkdtemp output has no interior NUL");
+    let mut fifo_bytes = dir.as_bytes().to_vec();
+    fifo_bytes.extend_from_slice(b"/c");
+    let fifo = CString::new(fifo_bytes).expect("no interior NUL");
+    let cleanup = |read: Option<RawFd>, write: Option<RawFd>| {
+        // SAFETY: each `Some` descriptor was returned by a successful `open`
+        // below and is owned by this call, so closing it exactly once cannot
+        // touch another descriptor; the unlink/rmdir are best-effort removal
+        // of this call's private, unguessable path (the live descriptors do
+        // not depend on it).
+        unsafe {
+            if let Some(fd) = read {
+                libc::close(fd);
+            }
+            if let Some(fd) = write {
+                libc::close(fd);
+            }
+            libc::unlink(fifo.as_ptr());
+            libc::rmdir(dir.as_ptr());
+        }
+    };
+    // SAFETY: `fifo` is a NUL-terminated path inside the private 0700
+    // directory just created; mode 0600 grants only the owner.
+    if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } != 0 {
+        let err = std::io::Error::last_os_error();
+        cleanup(None, None);
+        return Err(Error::internal(format!(
+            "guardian control fifo: mkfifo failed: {err}"
+        )));
+    }
+    // SAFETY: `fifo` is the validated NUL-terminated path; O_RDONLY on a
+    // FIFO with O_NONBLOCK returns immediately with no writer present, and
+    // O_CLOEXEC makes this descriptor close-on-exec at creation.
+    let read = unsafe {
+        libc::open(
+            fifo.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if read < 0 {
+        let err = std::io::Error::last_os_error();
+        cleanup(None, None);
+        return Err(Error::internal(format!(
+            "guardian control fifo: read open failed: {err}"
+        )));
+    }
+    // SAFETY: the read end is already open, so O_WRONLY cannot block;
+    // `O_CLOEXEC` makes the write end close-on-exec at creation.
+    let write = unsafe { libc::open(fifo.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if write < 0 {
+        let err = std::io::Error::last_os_error();
+        cleanup(Some(read), None);
+        return Err(Error::internal(format!(
+            "guardian control fifo: write open failed: {err}"
+        )));
+    }
+    // SAFETY: `read` is live and this is the only owner; F_GETFL/F_SETFL
+    // only read/update its status flags, and the descriptor already carries
+    // FD_CLOEXEC, so a fork/exec here inherits `read` closed at exec.
+    let flags = unsafe { libc::fcntl(read, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(read, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        let err = std::io::Error::last_os_error();
+        cleanup(Some(read), Some(write));
+        return Err(Error::internal(format!(
+            "guardian control fifo: cannot restore blocking reads: {err}"
+        )));
+    }
+    control_pipe_seam(&[read, write]);
+    cleanup(None, None); // remove the name and directory; fds keep it alive
+    Ok([read, write])
+}
+
+/// Test seam fired inside [`create_control_pipe`] at the instant both
+/// descriptors exist (and, on every platform, already carry `FD_CLOEXEC`):
+/// a fork/exec has no earlier window in which to inherit an unprotected end.
+#[cfg(test)]
+type ControlPipeSeam = Box<dyn Fn(&[RawFd; 2]) + Send>;
+#[cfg(test)]
+static CONTROL_PIPE_SEAM: std::sync::OnceLock<std::sync::Mutex<Option<ControlPipeSeam>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn install_control_pipe_seam(hook: ControlPipeSeam) {
+    let m = CONTROL_PIPE_SEAM.get_or_init(|| std::sync::Mutex::new(None));
+    *m.lock().expect("control-pipe seam poisoned") = Some(hook);
+}
+#[cfg(test)]
+pub(crate) fn clear_control_pipe_seam() {
+    if let Some(lock) = CONTROL_PIPE_SEAM.get() {
+        *lock.lock().expect("control-pipe seam poisoned") = None;
+    }
+}
+#[cfg(test)]
+fn control_pipe_seam(fds: &[RawFd; 2]) {
+    if let Some(lock) = CONTROL_PIPE_SEAM.get() {
+        if let Some(hook) = lock.lock().expect("control-pipe seam poisoned").as_ref() {
+            hook(fds);
+        }
+    }
+}
+#[cfg(not(test))]
+fn control_pipe_seam(_fds: &[RawFd; 2]) {}
+
+/// Tests can force the FIFO fallback on a `pipe2` platform so the macOS
+/// control-channel path is exercised (end to end) on every unix host.
+#[cfg(test)]
+pub(crate) static FORCE_FIFO_CONTROL_PIPE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force the next control-pipe creations onto the FIFO fallback (tests).
+#[cfg(test)]
+pub(crate) fn force_fifo_control_pipe_for_tests(force: bool) {
+    FORCE_FIFO_CONTROL_PIPE.store(force, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The daemon-side handle of ONE guardian process: owns the control pipe's
 /// write end (closing it is the death signal) and the guardian pid.
 ///
@@ -406,26 +642,18 @@ impl GuardianHandle {
     ///
     /// SAFETY (fork-only discipline): the child never touches heap, locks,
     /// or any Rust runtime state — it closes its inherited descriptors and
-    /// runs `guardian_main` with raw syscalls only, then `_exit`s. Both pipe
-    /// ends are `FD_CLOEXEC`, so no exec'd process (the PTY child, other
-    /// supervised children) can inherit the pipe and mask daemon death.
+    /// runs `guardian_main` with raw syscalls only, then `_exit`s.
+    ///
+    /// CLOEXEC guarantee (not a race): both ends are close-on-exec from the
+    /// instant they exist — `pipe2(O_CLOEXEC)` where the platform has it,
+    /// otherwise a private unlinked FIFO whose ends are opened with
+    /// `O_CLOEXEC` — so a concurrent fork/exec ANYWHERE in the process (the
+    /// PTY child spawn on another reader thread, a supervised spawn, any
+    /// library fork) can never inherit either end and mask daemon death.
+    /// [`create_control_pipe`] refuses typed when it cannot make that
+    /// guarantee, so a guardian is never created over a racy channel.
     pub fn spawn(identity: ProcessIdentity) -> Result<Self, Error> {
-        let mut fds = [0i32; 2];
-        // SAFETY: `fds` is a live two-element array; `pipe` writes exactly
-        // both descriptors on success, and any non-zero return is refused
-        // before the values are read.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(Error::internal("guardian pipe failed"));
-        }
-        for fd in fds {
-            // SAFETY: `fd` is a descriptor returned by the successful `pipe`
-            // above; `F_SETFD` with `FD_CLOEXEC` cannot invalidate it, and
-            // the (ignored) failure only means another close-on-exec race we
-            // do not rely on — fork below does not exec.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
+        let fds = create_control_pipe()?;
         // SAFETY: called from the runtime with no other guard: the child
         // branch (pid == 0) touches only the raw syscalls of `guardian_main`
         // — no allocation, locks, or Rust runtime state — then `_exit`s, so
@@ -433,12 +661,11 @@ impl GuardianHandle {
         // handlers) do not apply. A negative return is handled below.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            for fd in fds {
-                // SAFETY: both descriptors belong to this failed spawn (the
-                // fork did not happen), so each is closed exactly once here.
-                unsafe {
-                    libc::close(fd);
-                }
+            // SAFETY: both descriptors belong to this failed spawn (the
+            // fork did not happen), so each is closed exactly once here.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
             }
             return Err(Error::internal("guardian fork failed"));
         }
@@ -850,7 +1077,10 @@ mod tests {
             libc::kill(-(identity.pgid as libc::pid_t), libc::SIGKILL);
         }
         child.wait().expect("reap the killed child");
-        assert!(!group_alive(identity.pgid));
+        // The group might briefly hold a reparented zombie member after its
+        // leader is reaped; the bounded wait is the same extinction proof the
+        // other guardian tests use.
+        wait_group_gone(identity.pgid, Duration::from_secs(5));
         assert_eq!(
             guardian.release(),
             Some(GUARDIAN_EXIT_NOTHING_TO_DO),
@@ -900,5 +1130,131 @@ mod tests {
         assert_eq!(decide_on_eof(&huge), GuardianAction::RefusedMalformed);
         assert!(!group_exists(u32::MAX));
         assert!(!group_exists(0));
+    }
+
+    // ------------------------------------------ control-pipe CLOEXEC race
+
+    /// The seam fires at the first instant both control descriptors exist
+    /// (before `create_control_pipe` returns, i.e. while a concurrent
+    /// fork/exec is still possible) and asserts both already carry
+    /// `FD_CLOEXEC`: this is the exact window the old `pipe` + later
+    /// `fcntl(F_SETFD)` pair exposed. Both production paths (pipe2 and the
+    /// FIFO fallback) are checked.
+    #[test]
+    fn control_pipe_is_cloexec_at_creation() {
+        let _serial = crate::test_serial();
+        for forced_fifo in [false, true] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<RawFd>::new()));
+            let sink = seen.clone();
+            install_control_pipe_seam(Box::new(move |fds| {
+                for fd in fds {
+                    // SAFETY: `fd` is a live descriptor created by the
+                    // production helper that fired this seam immediately
+                    // after creation; F_GETFD only reads its flags.
+                    let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                    assert!(flags >= 0, "F_GETFD on a live control fd");
+                    assert_ne!(
+                        flags & libc::FD_CLOEXEC,
+                        0,
+                        "control fd {fd} lacks FD_CLOEXEC at creation"
+                    );
+                    sink.lock().unwrap().push(*fd);
+                }
+            }));
+            force_fifo_control_pipe_for_tests(forced_fifo);
+            let fds = create_control_pipe().expect("control pipe");
+            force_fifo_control_pipe_for_tests(false);
+            clear_control_pipe_seam();
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                2,
+                "the seam must observe both ends (forced_fifo={forced_fifo})"
+            );
+            // SAFETY: both descriptors were just created for this test and
+            // are closed exactly once here.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+        }
+    }
+
+    /// A child forked+exec'd from INSIDE control-pipe creation — the exact
+    /// concurrent-spawn window — must not hold either end: if it did, the
+    /// daemon's death would never close the write end and the guardian would
+    /// never kill the owned PTY group. Runs against pipe2 AND the forced
+    /// FIFO fallback; `/proc` identifies an inherited end by pipe inode (and
+    /// by the private FIFO path marker).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_spawned_during_creation_cannot_hold_the_control_pipe() {
+        let _serial = crate::test_serial();
+        for forced_fifo in [false, true] {
+            let violations = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let sink = violations.clone();
+            install_control_pipe_seam(Box::new(move |fds| {
+                let mut markers = Vec::new();
+                for fd in fds {
+                    // SAFETY: `fd` is a live control descriptor; fstat only
+                    // fills the live output buffer.
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    let r = unsafe { libc::fstat(*fd, &mut st) };
+                    assert_eq!(r, 0, "fstat of a live control fd");
+                    markers.push(format!("pipe:[{}]", st.st_ino));
+                }
+                let out = Command::new("sh")
+                    .args(["-c", "ls -l /proc/self/fd 2>/dev/null"])
+                    .output()
+                    .expect("concurrent child spawn");
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                for marker in markers {
+                    if text.contains(&marker) {
+                        sink.lock().unwrap().push(marker);
+                    }
+                }
+                if text.contains("faktor-guardian") {
+                    sink.lock().unwrap().push("fifo path".to_string());
+                }
+            }));
+            force_fifo_control_pipe_for_tests(forced_fifo);
+            let fds = create_control_pipe().expect("control pipe");
+            force_fifo_control_pipe_for_tests(false);
+            clear_control_pipe_seam();
+            // SAFETY: both descriptors were just created for this test and
+            // are closed exactly once here.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            let found = violations.lock().unwrap();
+            assert!(
+                found.is_empty(),
+                "a child spawned during creation inherited the control pipe \
+                 (forced_fifo={forced_fifo}): {found:?}"
+            );
+        }
+    }
+
+    /// The FIFO fallback (the macOS control-channel path) delivers the same
+    /// daemon-death protocol as pipe2: EOF on the (blocking) read end makes
+    /// the guardian kill the recorded group and exit `KILLED`.
+    #[test]
+    fn forced_fifo_control_pipe_reaps_and_kills() {
+        let _serial = crate::test_serial();
+        if !probe_supported() {
+            return;
+        }
+        let (mut child, identity) = spawn_group_sleeper();
+        force_fifo_control_pipe_for_tests(true);
+        let guardian = GuardianHandle::spawn(identity);
+        force_fifo_control_pipe_for_tests(false);
+        let mut guardian = guardian.expect("fifo control pipe must work");
+        assert_eq!(
+            guardian.release(),
+            Some(GUARDIAN_EXIT_KILLED),
+            "the FIFO channel must deliver EOF and kill the group"
+        );
+        let _ = child.wait();
+        wait_group_gone(identity.pgid, Duration::from_secs(5));
     }
 }

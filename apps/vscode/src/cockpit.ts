@@ -913,7 +913,7 @@ export function usagePanelLines(panel: CockpitUsagePanel): string[] {
   const expires =
     subscription.expiresMs === null
       ? ''
-      : ` (expires ${utcSeconds(subscription.expiresMs)})`;
+      : ` (expires ${utcSeconds(subscription.expiresMs) ?? 'unavailable'})`;
   switch (subscription.state) {
     case 'active':
       lines.push(`subscription active${expires}`);
@@ -961,8 +961,8 @@ export function usagePanelLines(panel: CockpitUsagePanel): string[] {
   }
   for (const txn of panel.inFlight) {
     lines.push(
-      `in-flight ${txn.kind} ${txn.id} (${txn.reference}) since ${utcSeconds(txn.startedMs)}${
-        txn.endedMs === null ? '' : ` — ended ${utcSeconds(txn.endedMs)}`
+      `in-flight ${txn.kind} ${txn.id} (${txn.reference}) since ${utcSeconds(txn.startedMs) ?? 'unavailable'}${
+        txn.endedMs === null ? '' : ` — ended ${utcSeconds(txn.endedMs) ?? 'unavailable'}`
       }`,
     );
   }
@@ -1298,9 +1298,18 @@ function digestLabel(value: string | null): string | null {
   return bounded.length > 8 ? `${bounded.slice(0, 8)}…` : bounded;
 }
 
-/** Second-precision UTC of one epoch-ms stamp (bounded line rendering). */
-function utcSeconds(ms: number): string {
-  return `${new Date(ms).toISOString().slice(0, 19)}Z`;
+/**
+ * Second-precision UTC of one epoch-ms stamp (bounded line rendering). A
+ * non-finite or out-of-Date-range stamp is unrenderable, so it is an explicit
+ * `null` (the caller renders `unavailable`) instead of a RangeError that would
+ * abort the whole cockpit projection.
+ */
+function utcSeconds(ms: number): string | null {
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) {
+    return null;
+  }
+  return `${date.toISOString().slice(0, 19)}Z`;
 }
 
 /** Split the record's evidence string into its typed refs (bounded). */
@@ -1968,6 +1977,35 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     completion: task?.completion ?? null,
     proof: proofViewOf(input.proof ?? null, input.proofUnavailable ?? null),
   };
+}
+
+/**
+ * The failure-isolated cockpit projection the refresh patch consumes: one
+ * malformed verification/cockpit payload yields an explicit error plus an
+ * empty cockpit, never a thrown exception that would skip the rest of the
+ * snapshot patch (task, transcript, agents, runs).
+ */
+export interface CockpitProjection {
+  readonly cockpit: CockpitView | null;
+  readonly sections: CockpitSection[];
+  readonly error: string | null;
+}
+
+export function projectCockpit(input: CockpitInput): CockpitProjection {
+  try {
+    const cockpit = buildCockpit(input);
+    return {
+      cockpit,
+      sections: cockpit === null ? [] : cockpitSections(cockpit),
+      error: null,
+    };
+  } catch (error) {
+    return {
+      cockpit: null,
+      sections: [],
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 /** The render plan of the persistent cockpit panel, in fixed order. */

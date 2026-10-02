@@ -580,10 +580,37 @@ fn payload_for(state: &EntryState, material: &[u8]) -> Result<(), Error> {
     }
 }
 
+/// Re-verify `rel`'s parent chain as genuine in-root directory content,
+/// immediately before a pathname mutation. `confined_path` resolved the
+/// parent ONCE; a same-uid writer can swap that (already-canonicalized)
+/// parent for an outside symlink between resolution and the syscall, which
+/// would redirect a rename/hard link/unlink/chmod out of the root. The
+/// handle-relative walk refuses a swapped component, so the mutation is
+/// skipped and the caller gets a typed refusal; the window between this
+/// check and the syscall itself is the documented rename-by-path residual
+/// (identical to `WorkspaceHandle::write_atomic`).
+#[cfg(any(unix, windows))]
+fn verify_parent_before_mutation(root: &Path, rel: &Path) -> Result<(), Error> {
+    let parent_rel = rel.parent().unwrap_or(Path::new(""));
+    crate::platform::open_no_follow_walk(root, parent_rel, crate::platform::OpenKind::Directory)?;
+    Ok(())
+}
+
+/// Platforms without a handle-relative walk cannot re-verify the parent;
+/// the historical path discipline applies there.
+#[cfg(not(any(unix, windows)))]
+fn verify_parent_before_mutation(_root: &Path, _rel: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
 /// Perform the state change `from -> to` at `dst` (the caller has already
 /// proved the live state equals `from`). `material` is the payload of `to`
-/// (whole content / literal target). Never follows a final symlink.
+/// (whole content / literal target). Never follows a final symlink. `root`
+/// and `rel` name `dst` canonically so every mutating syscall is preceded by
+/// [`verify_parent_before_mutation`].
 fn transition(
+    root: &Path,
+    rel: &Path,
     dst: &Path,
     from: &EntryState,
     to: &EntryState,
@@ -600,6 +627,7 @@ fn transition(
         .unwrap_or_default();
     match (from, to) {
         (_, EntryState::Absent) => {
+            verify_parent_before_mutation(root, rel)?;
             fs::remove_file(dst).map_err(|e| io_failure("remove", dst, e))?;
             seam(TransitionStep::Published)?;
             crate::atomic::fsync_parent(parent);
@@ -608,12 +636,14 @@ fn transition(
         (EntryState::Absent, EntryState::Regular { mode, .. }) => {
             // Exclusive create: the staged temp is hard-linked, and link(2)
             // fails atomically when the destination was taken meanwhile.
+            verify_parent_before_mutation(root, rel)?;
             let tmp = unique_temp_path(parent, &name);
             if let Err(e) = write_staged_file(&tmp, material, *mode) {
                 let _ = fs::remove_file(&tmp);
                 return Err(e);
             }
             seam(TransitionStep::Staged)?;
+            verify_parent_before_mutation(root, rel)?;
             let linked = fs::hard_link(&tmp, dst);
             let _ = fs::remove_file(&tmp);
             match linked {
@@ -632,6 +662,7 @@ fn transition(
             }
         }
         (EntryState::Absent, EntryState::Symlink { target, .. }) => {
+            verify_parent_before_mutation(root, rel)?;
             let os_target = os_string_from_bytes(target);
             create_literal_symlink(&os_target, dst)?;
             seam(TransitionStep::Published)?;
@@ -642,12 +673,14 @@ fn transition(
             if from.payload_digest() == Some(*payload) =>
         {
             // Mode-only transition: the atomic permission path.
+            verify_parent_before_mutation(root, rel)?;
             set_executable_bits(dst, *mode)?;
             seam(TransitionStep::Published)?;
             Ok(())
         }
         (EntryState::Symlink { .. }, EntryState::Symlink { target, .. })
         | (EntryState::Regular { .. }, EntryState::Symlink { target, .. }) => {
+            verify_parent_before_mutation(root, rel)?;
             let tmp = unique_temp_path(parent, &name);
             let os_target = os_string_from_bytes(target);
             if let Err(e) = create_literal_symlink(&os_target, &tmp) {
@@ -656,6 +689,7 @@ fn transition(
             }
             seam(TransitionStep::Staged)?;
             // rename over a symlink replaces the LINK itself, never the target.
+            verify_parent_before_mutation(root, rel)?;
             fs::rename(&tmp, dst).map_err(|e| {
                 let _ = fs::remove_file(&tmp);
                 io_failure("rename", dst, e)
@@ -668,12 +702,14 @@ fn transition(
             EntryState::Symlink { .. } | EntryState::Regular { .. },
             EntryState::Regular { mode, .. },
         ) => {
+            verify_parent_before_mutation(root, rel)?;
             let tmp = unique_temp_path(parent, &name);
             if let Err(e) = write_staged_file(&tmp, material, *mode) {
                 let _ = fs::remove_file(&tmp);
                 return Err(e);
             }
             seam(TransitionStep::Staged)?;
+            verify_parent_before_mutation(root, rel)?;
             fs::rename(&tmp, dst).map_err(|e| {
                 let _ = fs::remove_file(&tmp);
                 io_failure("rename", dst, e)
@@ -744,6 +780,12 @@ pub(crate) fn apply_tree_entry_cas_inner(
         }
         Err(e) => return Err(e),
     };
+    // `confined_path` canonicalized the root on its way to `dst`; take the
+    // same canonical spelling for the pre-mutation parent verification (a
+    // no-follow walk over a symlinked root spelling would refuse itself).
+    let root = root
+        .canonicalize()
+        .map_err(|e| Error::not_found(format!("root {}: {e}", root.display())))?;
     let current = state_of_path(&dst)?;
     if current == *next {
         return Ok(crate::CasMergeResult::AlreadyCurrent);
@@ -756,7 +798,7 @@ pub(crate) fn apply_tree_entry_cas_inner(
             current.describe()
         )));
     }
-    transition(&dst, &current, next, material, seam)?;
+    transition(&root, rel, &dst, &current, next, material, seam)?;
     verify_final(&dst, next)?;
     Ok(crate::CasMergeResult::Applied)
 }
@@ -801,6 +843,9 @@ pub(crate) fn restore_tree_entry_cas_inner(
         }
         Err(e) => return Err(e),
     };
+    let root = root
+        .canonicalize()
+        .map_err(|e| Error::not_found(format!("root {}: {e}", root.display())))?;
     let live = state_of_path(&dst)?;
     if live == *base {
         return Ok(crate::CasMergeResult::AlreadyCurrent);
@@ -817,7 +862,7 @@ pub(crate) fn restore_tree_entry_cas_inner(
     if current == base {
         return Ok(crate::CasMergeResult::AlreadyCurrent);
     }
-    transition(&dst, current, base, material, seam)?;
+    transition(&root, rel, &dst, current, base, material, seam)?;
     verify_final(&dst, base)?;
     Ok(crate::CasMergeResult::Applied)
 }

@@ -2229,6 +2229,88 @@ mod tests {
     }
 
     #[test]
+    fn migration_v28_rebuilds_artifact_identity_per_session_and_preserves_rows() {
+        // A pre-v28 database carries the globally-unique cas_hash artifact
+        // table. Seed one row in that exact shape, rewind the cursor, and
+        // reopen: the rebuild must preserve the row (id and metadata) and let
+        // a SECOND session store the same bytes with its own metadata.
+        let dir = tempfile::tempdir().unwrap();
+        let sid = {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "att", "p", "m").unwrap();
+            {
+                let conn = store.raw_conn();
+                conn.execute("DROP TABLE artifact", []).unwrap();
+                conn.execute(
+                    "CREATE TABLE artifact (
+                        id INTEGER PRIMARY KEY,
+                        session_id INTEGER NOT NULL REFERENCES session(id),
+                        kind TEXT NOT NULL,
+                        cas_hash TEXT NOT NULL UNIQUE,
+                        summary TEXT NOT NULL,
+                        created_ms INTEGER NOT NULL,
+                        size INTEGER NOT NULL
+                     )",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO artifact(session_id, kind, cas_hash, summary, created_ms, size)
+                     VALUES (?1, 'command_output', 'hash-legacy', 'legacy sum', 7, 42)",
+                    params![s.id.raw() as i64],
+                )
+                .unwrap();
+                conn.execute("PRAGMA user_version = 28", []).unwrap();
+            }
+            s.id
+        };
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(
+            store.artifact_for(sid, "hash-legacy").unwrap(),
+            Some(("legacy sum".to_string(), "command_output".to_string())),
+            "the pre-v28 row survives the rebuild"
+        );
+        // The preserved row keeps its id through the id-preserving rebuild.
+        assert_eq!(
+            store
+                .put_artifact(sid, "command_output", "hash-legacy", "legacy sum", 42)
+                .unwrap(),
+            1,
+            "the legacy artifact row keeps its id"
+        );
+        // A second session's identical bytes are no longer discarded: both
+        // rows coexist with their own metadata.
+        let ws2 = store.create_workspace("/w2").unwrap();
+        let s2 = store.create_session(ws2, "other", "p", "m").unwrap();
+        let other_id = store
+            .put_artifact(s2.id, "tool_output", "hash-legacy", "other sum", 42)
+            .unwrap();
+        assert_ne!(other_id, 1, "per-session artifact rows coexist");
+        assert_eq!(
+            store.artifact_for(s2.id, "hash-legacy").unwrap(),
+            Some(("other sum".to_string(), "tool_output".to_string()))
+        );
+        // Reopen again: both rows and the per-session uniqueness are durable.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(
+            store.artifact_for(sid, "hash-legacy").unwrap(),
+            Some(("legacy sum".to_string(), "command_output".to_string()))
+        );
+        assert_eq!(
+            store.artifact_for(s2.id, "hash-legacy").unwrap(),
+            Some(("other sum".to_string(), "tool_output".to_string()))
+        );
+        assert_eq!(
+            store
+                .put_artifact(sid, "command_output", "hash-legacy", "legacy sum", 42)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn fast_open_recovers_migrations_and_data_and_refuses_corruption() {
         // Audit 43: the fast production open must still run WAL recovery +
         // migrations and refuse a corrupt store — it just skips the full

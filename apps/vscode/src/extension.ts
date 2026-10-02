@@ -1,8 +1,7 @@
 // The Faktor VS Code product surface over the native daemon:
 //
 //   - daemon.ts        spawns and owns the faktor-cli process
-//   - nativeClient.ts  strict typed fetch client of /native/* (+ the
-//                      minimal /session/create|/session/list surface)
+//   - nativeClient.ts  strict typed fetch client of the daemon's /native/* routes
 //   - eventStream.ts   SSE journal stream with cursor resume
 //   - state.ts         the observable snapshot store + transcript reducer
 //   - webview.ts       the chat panel (strict CSP, nonce, no remote code)
@@ -69,7 +68,6 @@ import {
   UsageSummary,
   VerificationSummary,
   activeRunIdAfter,
-  applySseEvent,
   boardStateFromPage,
   cancelRunTarget,
   nextPixelPresence,
@@ -79,7 +77,7 @@ import {
   transcriptFromMessages,
   unavailableBoardState,
 } from './state';
-import { CockpitTaskVerification, CockpitUsagePanel, buildCockpit, buildUsagePanel, cockpitSections, tournamentViewOf, usagePanelSections } from './cockpit';
+import { CockpitTaskVerification, CockpitUsagePanel, buildUsagePanel, projectCockpit, tournamentViewOf, usagePanelSections } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
 import {
   microBalance,
@@ -942,12 +940,11 @@ function startStream(): void {
     bearerToken: daemon.bearerToken,
     sessionId,
     fetch: sseAdapter(),
-    onEvent: (frame) => {
-      const snapshot = store.snapshot();
-      const transcript = applySseEvent(snapshot.transcript, frame.event, frame.data);
-      if (transcript !== snapshot.transcript) {
-        store.patch({ transcript });
-      }
+    onEvent: () => {
+      // The journal stream is a LIVENESS signal only: its `EventKind` frames
+      // do not carry the bounded message/part page shapes, so the reducer
+      // deliberately does not fabricate incremental transcript state from
+      // them. Every durable frame schedules one bounded page refresh.
       scheduleRefresh();
     },
     onStatus: (status: EventStreamStatus, detail) => {
@@ -1056,7 +1053,10 @@ async function refresh(): Promise<void> {
     // The commercial-metering panel is best-effort like the board: a refusal
     // becomes an explicit disabled/unavailable panel, never a snapshot error.
     const usagePanel = await billingPanelFor(client);
-    const cockpit = buildCockpit({
+    // The cockpit projection is FAILURE-ISOLATED: a malformed verification
+    // or cockpit payload degrades the cockpit panel to an explicit error
+    // while every other snapshot field still patches.
+    const cockpitProjection = projectCockpit({
       task,
       agents: agentSummaries,
       verification: verificationView,
@@ -1066,7 +1066,6 @@ async function refresh(): Promise<void> {
       proof: proofRead.proof,
       proofUnavailable: proofRead.unavailable,
     });
-    const sections = cockpit === null ? [] : cockpitSections(cockpit);
     store.patch({
       sessions,
       machineState: projection.state.machine,
@@ -1078,13 +1077,16 @@ async function refresh(): Promise<void> {
       runs: runs.map(runSummary),
       activeRunId,
       busy: activeRunId !== null,
-      cockpit,
-      cockpitSections: [...sections, ...usagePanelSections(usagePanel)],
+      cockpit: cockpitProjection.cockpit,
+      cockpitSections: [
+        ...cockpitProjection.sections,
+        ...usagePanelSections(usagePanel),
+      ],
       usagePanel,
-      tournament: cockpit?.tournament ?? null,
+      tournament: cockpitProjection.cockpit?.tournament ?? null,
       board,
       indexCoverage,
-      lastError: null,
+      lastError: cockpitProjection.error,
     });
     // Assistant/status/tool lines are durable message rows; re-render the
     // bounded newest page only when its structure actually changed.

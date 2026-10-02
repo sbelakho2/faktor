@@ -28,14 +28,16 @@ use std::sync::{Arc, Mutex};
 use reqwest::header::HeaderMap;
 
 use faktor_security::registry::SecretRegistry;
-use faktor_security::{redact, SecretPolicy};
+use faktor_security::{redact, SecretPolicy, REDACTION_TRUNCATION_MARKER};
 
 /// Hard bound on the scrubbed diagnostic carried inside one
 /// [`crate::ProviderError`] message (bytes).
 pub const MAX_ERROR_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
 /// Bounded output growth on hostile input (at most this many exact-value
-/// redactions replace one span each).
+/// redactions replace one span each). When more remain, the entire
+/// unprocessed tail becomes one [`REDACTION_TRUNCATION_MARKER`] instead of
+/// being appended raw.
 const MAX_SCRUB_HITS: usize = 64;
 
 /// Header names whose VALUE is a credential (case-insensitive). The value
@@ -144,7 +146,10 @@ impl ErrorScrubber {
     }
 
     /// Redact every registered value and every pattern hit. Never panics,
-    /// whatever the input.
+    /// whatever the input. If either redaction stage finds more hits than
+    /// its cap, the ENTIRE unprocessed tail is replaced by
+    /// [`REDACTION_TRUNCATION_MARKER`] — no occurrence past a cap is ever
+    /// copied through raw.
     pub fn scrub(&self, text: &str) -> String {
         let after_patterns = redact(text, &self.inner.policy);
         let exact = self.lock_registry().scan_exact(after_patterns.as_bytes());
@@ -152,6 +157,7 @@ impl ErrorScrubber {
             return after_patterns;
         }
         let bytes = after_patterns.as_bytes();
+        let capped = exact.len() > MAX_SCRUB_HITS;
         let mut out = String::with_capacity(after_patterns.len() + 32);
         let mut cursor = 0usize;
         for hit in exact.into_iter().take(MAX_SCRUB_HITS) {
@@ -170,7 +176,11 @@ impl ErrorScrubber {
             out.push_str(&hit.redacted);
             cursor = end;
         }
-        out.push_str(&after_patterns[cursor..]);
+        if capped {
+            out.push_str(REDACTION_TRUNCATION_MARKER);
+        } else {
+            out.push_str(&after_patterns[cursor..]);
+        }
         out
     }
 
@@ -316,6 +326,136 @@ mod tests {
         assert!(!scrubbed.contains(PLANTED_EXACT), "{scrubbed}");
         assert!(scrubbed.contains("leaked"), "non-secret text survives");
         assert!(scrubbed.contains("<redacted:"));
+    }
+
+    const DECOY_EXACT: &str = "decoy-credential-value-1a2b";
+
+    #[test]
+    fn exact_decoys_never_shield_the_real_credential() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(DECOY_EXACT);
+        scrubber.register_secret(PLANTED_EXACT);
+        let mut body = (0..MAX_SCRUB_HITS)
+            .map(|_| DECOY_EXACT)
+            .collect::<Vec<_>>()
+            .join(" ");
+        body.push(' ');
+        body.push_str(PLANTED_EXACT);
+        let scrubbed = scrubber.scrub(&body);
+        assert_eq!(scrubbed.matches(DECOY_EXACT).count(), 0, "{scrubbed}");
+        assert_eq!(
+            scrubbed.matches(PLANTED_EXACT).count(),
+            0,
+            "real credential past the cap leaked: {scrubbed}"
+        );
+        assert!(scrubbed.contains(REDACTION_TRUNCATION_MARKER), "{scrubbed}");
+    }
+
+    #[test]
+    fn pattern_decoys_never_shield_a_registered_credential() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(PLANTED_EXACT);
+        let decoy = "AKIA0123456789ABCDEF";
+        let mut body = (0..33).map(|_| decoy).collect::<Vec<_>>().join(" ");
+        body.push(' ');
+        body.push_str(PLANTED_EXACT);
+        let scrubbed = scrubber.scrub(&body);
+        assert!(!scrubbed.contains(decoy), "{scrubbed}");
+        assert!(!scrubbed.contains(PLANTED_EXACT), "{scrubbed}");
+        assert!(scrubbed.contains(REDACTION_TRUNCATION_MARKER), "{scrubbed}");
+    }
+
+    #[test]
+    fn over_cap_exact_repetitions_never_pass_through() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(PLANTED_EXACT);
+        let body = (0..MAX_SCRUB_HITS + 7)
+            .map(|_| PLANTED_EXACT)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let scrubbed = scrubber.scrub(&body);
+        assert_eq!(scrubbed.matches(PLANTED_EXACT).count(), 0, "{scrubbed}");
+        assert_eq!(
+            scrubbed.matches("<redacted:configured_secret>").count(),
+            MAX_SCRUB_HITS
+        );
+        assert!(scrubbed.contains(REDACTION_TRUNCATION_MARKER), "{scrubbed}");
+    }
+
+    #[test]
+    fn exact_cap_boundary_is_exact_and_fail_closed() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(PLANTED_EXACT);
+        let at_cap = (0..MAX_SCRUB_HITS)
+            .map(|_| PLANTED_EXACT)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let scrubbed = scrubber.scrub(&at_cap);
+        assert_eq!(scrubbed.matches(PLANTED_EXACT).count(), 0);
+        assert!(
+            !scrubbed.contains(REDACTION_TRUNCATION_MARKER),
+            "a cap-sized input must keep its tail: {scrubbed}"
+        );
+        let over = format!("{at_cap} {PLANTED_EXACT}");
+        let scrubbed = scrubber.scrub(&over);
+        assert_eq!(scrubbed.matches(PLANTED_EXACT).count(), 0);
+        assert!(scrubbed.contains(REDACTION_TRUNCATION_MARKER), "{scrubbed}");
+    }
+
+    #[test]
+    fn multibyte_text_at_the_exact_cap_never_panics() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(PLANTED_EXACT);
+        let mut body = (0..MAX_SCRUB_HITS)
+            .map(|i| format!("é{i} {PLANTED_EXACT} ü"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        body.push_str(" finale é ");
+        body.push_str(PLANTED_EXACT);
+        let scrubbed = scrubber.scrub(&body);
+        assert!(!scrubbed.contains(PLANTED_EXACT), "{scrubbed}");
+        assert!(scrubbed.contains(REDACTION_TRUNCATION_MARKER), "{scrubbed}");
+    }
+
+    #[test]
+    fn under_cap_exact_redaction_preserves_clean_text() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(PLANTED_EXACT);
+        let body = format!("before {PLANTED_EXACT} after words");
+        let scrubbed = scrubber.scrub(&body);
+        assert_eq!(scrubbed, "before <redacted:configured_secret> after words");
+        assert!(!scrubbed.contains(REDACTION_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn property_no_registered_secret_survives_any_decoy_count() {
+        let scrubber = ErrorScrubber::new();
+        scrubber.register_secret(DECOY_EXACT);
+        scrubber.register_secret(PLANTED_EXACT);
+        for decoy_count in [
+            0usize,
+            1,
+            MAX_SCRUB_HITS - 1,
+            MAX_SCRUB_HITS,
+            MAX_SCRUB_HITS + 1,
+            3 * MAX_SCRUB_HITS,
+        ] {
+            let mut body = (0..decoy_count)
+                .map(|_| DECOY_EXACT)
+                .collect::<Vec<_>>()
+                .join(" ");
+            body.push(' ');
+            body.push_str(PLANTED_EXACT);
+            let scrubbed = scrubber.scrub(&body);
+            assert!(
+                !scrubbed.contains(DECOY_EXACT),
+                "decoy_count={decoy_count}: {scrubbed}"
+            );
+            assert!(
+                !scrubbed.contains(PLANTED_EXACT),
+                "decoy_count={decoy_count}: {scrubbed}"
+            );
+        }
     }
 
     #[test]

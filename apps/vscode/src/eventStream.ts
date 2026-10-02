@@ -1,6 +1,9 @@
-// SSE client for the daemon's journal event stream
-// (`GET /api/session/{id}/events?events_after=<cursor>`), the stream the
-// native server projects from the durable journal (faktor_protocol::sse).
+// SSE client for the daemon's native journal event stream
+// (`GET /native/session/{id}/events?after=<cursor>` — lifecycle.rs route,
+// native/session.rs `native_session_events`), the stream the native server
+// projects from the durable journal. Frames are `id: <seq>`,
+// `event: <EventKind snake_case>` and one JSON `data:` line carrying the
+// native event row (`{seq, kind, state, opId, tsMs, payload}`).
 //
 // Contract: every frame carries `event:` (type), `id:` (the journal
 // sequence — the resume cursor) and one JSON `data:` line. Heartbeats
@@ -55,7 +58,7 @@ export type SseFetchLike = (url: string, init: SseInitLike) => Promise<SseRespon
 export interface SseFrame {
   /** `id:` — the journal sequence, monotonic per session. */
   readonly id: number;
-  /** `event:` — the projection type (`agent_state_changed`, ...). */
+  /** `event:` — the daemon's `EventKind` snake_case tag (`prompt_received`, ...). */
   readonly event: string;
   readonly data: Json;
 }
@@ -104,6 +107,19 @@ export interface EventStreamOptions {
 export const DEFAULT_MIN_BACKOFF_MS = 250;
 export const DEFAULT_MAX_BACKOFF_MS = 15_000;
 export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+
+/**
+ * HTTP statuses a reconnect can plausibly fix: 408/425/429 are transient
+ * pressure, 5xx a transient server fault. Every other non-ok answer is a
+ * route/credential/contract failure (a 404 on a daemon that does not serve
+ * this path, a 401 with a stale bearer, ...) and must terminate in the
+ * blocked state instead of retrying forever.
+ */
+export function isRetryableHttpStatus(status: number): boolean {
+  return (
+    status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599)
+  );
+}
 /**
  * Top-level event-row version this client understands; an ABSENT version
  * means v1. A frame that explicitly declares another version is a durable
@@ -111,6 +127,12 @@ export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
  * being silently dropped.
  */
 export const SUPPORTED_EVENT_VERSION = 1;
+/**
+ * The daemon's keep-alive SSE tag; the ONLY event name this client
+ * special-cases. Durable journal frames are delivered opaquely (the client
+ * does not claim to reduce an EventKind it does not parse).
+ */
+export const HEARTBEAT_EVENT_NAME = 'heartbeat';
 const ERROR_BODY_BYTES = 64 * 1024;
 
 export class EventStreamProtocolError extends Error {
@@ -305,7 +327,7 @@ export class EventStream {
   /** Connects and pumps frames until the stream ends. Throws on connect failure. */
   private async connectOnce(signal: AbortSignal): Promise<void> {
     const base = this.options.baseUrl.replace(/\/+$/, '');
-    const url = `${base}/api/session/${encodeURIComponent(this.options.sessionId)}/events?events_after=${this.cursorValue}`;
+    const url = `${base}/native/session/${encodeURIComponent(this.options.sessionId)}/events?after=${this.cursorValue}`;
     const response = await this.fetchImpl(url, {
       method: 'GET',
       headers: {
@@ -318,7 +340,14 @@ export class EventStream {
     });
     if (!response.ok) {
       const detail = await readErrorBody(response);
-      throw new EventStreamProtocolError(`stream rejected with HTTP ${response.status}${detail}`);
+      const label = `stream rejected with HTTP ${response.status}${detail}`;
+      if (!isRetryableHttpStatus(response.status)) {
+        // Terminal: the route/credential/contract is wrong, so a reconnect
+        // loop would 404 (or 401/...) forever. `block()` retains the cursor
+        // and the explicit recover() is the post-fix reconnect.
+        this.block(`${label}; reconnecting cannot fix this`, null);
+      }
+      throw new EventStreamProtocolError(label);
     }
     const reader = response.body?.getReader();
     if (!reader) {
@@ -484,7 +513,7 @@ export class EventStream {
       );
       return;
     }
-    if (tagged === 'heartbeat') {
+    if (tagged === HEARTBEAT_EVENT_NAME) {
       // A heartbeat may carry an id (advances the resume cursor) or not
       // (pure keep-alive). It is never delivered to the UI.
       if (frameId !== null) {
