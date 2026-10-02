@@ -344,9 +344,13 @@ class FaktorFrontendService(
         sessionId = id
     }
 
-    fun prompt(text: String, files: List<String>? = null): NativePromptReceipt {
+    fun prompt(
+        text: String,
+        files: List<String>? = null,
+        submissionId: String
+    ): NativePromptReceipt {
         val sid = requireSession()
-        return clientOrThrow().prompt(sid, text, files)
+        return clientOrThrow().prompt(sid, text, files, submissionId)
     }
 
     fun abort(opId: String? = null): NativeAbortAck {

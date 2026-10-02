@@ -333,7 +333,9 @@ mod prompt_admission_tests {
             PromptAdmissionClaim::Fresh,
             "a released pre-acceptance claim may re-execute"
         );
-        store.prompt_admission_complete(sid, KEY, "receipt").unwrap();
+        store
+            .prompt_admission_complete(sid, KEY, "receipt")
+            .unwrap();
         // Release NEVER deletes a completed receipt.
         store.prompt_admission_release(sid, KEY).unwrap();
         assert_eq!(
@@ -503,7 +505,9 @@ mod prompt_admission_tests {
         assert_eq!(in_flight, claims.len() - 1, "{claims:?}");
         // And one completion turns every later duplicate into the SAME
         // byte-exact replay.
-        store.prompt_admission_complete(sid, KEY, "receipt").unwrap();
+        store
+            .prompt_admission_complete(sid, KEY, "receipt")
+            .unwrap();
         for claim in [
             store.prompt_admission_claim(sid, KEY, DIGEST, 9).unwrap(),
             store.prompt_admission_claim(sid, KEY, DIGEST, 10).unwrap(),

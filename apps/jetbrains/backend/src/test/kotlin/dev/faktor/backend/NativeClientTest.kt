@@ -365,8 +365,8 @@ private fun assertRequestBodies() {
     )
     assertEquals("{\"provider\":\"p\",\"model\":\"m\"}", NativeRequests.createSession("p", "m"))
     assertEquals(
-        "{\"session_id\":\"7\",\"prompt\":\"hi\"}",
-        NativeRequests.prompt("7", "hi")
+        "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000001\"}",
+        NativeRequests.prompt("7", "hi", null, "00000000-0000-4000-8000-000000000001")
     )
     assertEquals("{\"session_id\":\"7\"}", NativeRequests.abort("7"))
     assertEquals(
@@ -1065,7 +1065,7 @@ private fun assertClientRoutes() {
         val client = NativeClient(daemon.baseUrl, "tok")
         assertEquals(true, client.health().ok)
         client.createSession("p", "m", "/ws", "T")
-        client.prompt("7", "hi")
+        client.prompt("7", "hi", submissionId = "00000000-0000-4000-8000-000000000002")
         client.abortSession("7", "op-1")
         assertEquals("streaming", client.projection("7").machine)
         assertEquals(2, client.messages("7", limit = 20).messages.size)
@@ -1123,7 +1123,10 @@ private fun assertClientRoutes() {
             create.body
         )
         val prompt = daemon.requests.first { it.path == "/native/session/7/prompt" }
-        assertEquals("{\"session_id\":\"7\",\"prompt\":\"hi\"}", prompt.body)
+        assertEquals(
+            "{\"session_id\":\"7\",\"prompt\":\"hi\",\"submission_id\":\"00000000-0000-4000-8000-000000000002\"}",
+            prompt.body
+        )
         val coverageRead = client.indexCoverage("7")
         assertEquals(512L, coverageRead.snapshot!!.coverage.filesIndexed)
         assertEquals(null, client.indexCoverage("9").snapshot)
@@ -1657,7 +1660,7 @@ object NativeBridgeSmoke {
                         s.start()
                     }
                     step("prompt (POST /native/session/{id}/prompt)") {
-                        val receipt = client.prompt(sid, "ping from native bridge smoke")
+                        val receipt = client.prompt(sid, "ping from native bridge smoke", submissionId = java.util.UUID.randomUUID().toString())
                         if (!receipt.accepted) fail("prompt not accepted")
                         println("  op=${receipt.opId} queued=${receipt.queued}")
                     }

@@ -129,6 +129,21 @@ object JetBrainsParitySmoke {
         step("task start immutability: edits while pending never reach the in-flight request") {
             taskStartImmutabilityStep()
         }
+
+        step("prompt submission identity: identical retry reuses the id, edits mint new") {
+            val first = selectPromptSubmission(null, "7", "ship it") { "id-1" }
+            assertEquals("id-1", first.submissionId)
+            val retried = selectPromptSubmission(first, "7", "ship it") { "id-2" }
+            assertEquals(
+                "id-1",
+                retried.submissionId,
+                "an identical retry must reuse the submission id"
+            )
+            val edited = selectPromptSubmission(first, "7", "ship it now") { "id-2" }
+            assertEquals("id-2", edited.submissionId, "a changed draft mints a new id")
+            val otherSession = selectPromptSubmission(first, "8", "ship it") { "id-3" }
+            assertEquals("id-3", otherSession.submissionId, "a changed session mints a new id")
+        }
         step("real daemon: history/task/permissions/terminal/restart/reconnect") {
             realDaemonSuite(args[0])
         }

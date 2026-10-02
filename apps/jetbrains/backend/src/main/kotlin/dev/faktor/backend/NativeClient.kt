@@ -236,11 +236,16 @@ class NativeClient(
     fun modelCatalog(): List<NativeModelInfo> =
         parseNativeModelCatalog(request("GET", "/models"))
 
-    fun prompt(sessionId: String, prompt: String, files: List<String>? = null): NativePromptReceipt =
+    fun prompt(
+        sessionId: String,
+        prompt: String,
+        files: List<String>? = null,
+        submissionId: String
+    ): NativePromptReceipt =
         parseNativePromptReceipt(
             request(
                 "POST", "/native/session/" + encode(sessionId) + "/prompt", null,
-                NativeRequests.prompt(sessionId, prompt, files)
+                NativeRequests.prompt(sessionId, prompt, files, submissionId)
             )
         )
 

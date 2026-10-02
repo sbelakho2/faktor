@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
+import javax.swing.JComponent
 import javax.swing.JCheckBox
 import javax.swing.JComboBox
 import javax.swing.JFrame
@@ -82,6 +83,17 @@ class FaktorChatPanel(
 
     private val refreshQueued = AtomicBoolean(false)
 
+    /**
+     * Urgent control-plane actions (abort/cancel/stop/permission reply) must
+     * NOT serialize behind slow refresh/read work: they get their own
+     * single-thread authority (bounded, daemon thread, reaped on shutdown).
+     */
+    private val controlWorker = Executors.newSingleThreadExecutor { runnable ->
+        val thread = Thread(runnable, "faktor-control")
+        thread.isDaemon = true
+        thread
+    }
+
     // Single-flight gate of the task-start surface: set BEFORE the start job
     // is enqueued, so repeated clicks can never accumulate duplicate start
     // jobs in the worker queue. Cleared only by an explicit result.
@@ -96,6 +108,17 @@ class FaktorChatPanel(
     private val transcript = JTextArea()
 
     private val input = JTextArea(3, 60)
+
+    /** Single-flight for the ordinary prompt path: one logical prompt at a time. */
+    private val promptInFlight = AtomicBoolean(false)
+
+    /**
+     * The immutable logical prompt held across a RETRYABLE failure: the same
+     * draft retries under the same submission id (the daemon replays the
+     * receipt), a typed refusal or a changed draft starts a fresh one.
+     */
+    @Volatile
+    private var pendingPromptSubmission: PromptSubmission? = null
 
     private val providerField = JTextField("default", 10)
 
@@ -260,9 +283,9 @@ class FaktorChatPanel(
         toolbar.add(startButton)
         toolbar.add(stopButton)
         toolbar.add(newSessionButton)
-        toolbar.add(JLabel("provider"))
+        toolbar.add(fieldLabel("provider", providerField))
         toolbar.add(providerField)
-        toolbar.add(JLabel("model"))
+        toolbar.add(fieldLabel("model", modelField))
         toolbar.add(modelField)
         toolbar.add(refreshButton)
 
@@ -313,13 +336,32 @@ class FaktorChatPanel(
         return panel
     }
 
-    private fun buildTaskTab(): JPanel {
+    /**
+     * A visually adjacent label PROGRAMMATICALLY associated with its control
+     * (`labelFor`), so screen readers and mnemonic traversal see the pair —
+     * not just two adjacent widgets (INV-JETBRAINS-A11Y).
+     */
+    private fun fieldLabel(text: String, target: JComponent): JLabel =
+        JLabel(text).apply { labelFor = target }
+
+    /**
+     * Whole configuration surfaces scroll instead of clipping: a tall form in
+     * a short JetBrains tool window must remain reachable without resizing.
+     */
+    private fun scrollable(content: JComponent): JScrollPane =
+        JScrollPane(content).apply {
+            border = null
+            verticalScrollBar.unitIncrement = 16
+            horizontalScrollBar.unitIncrement = 16
+        }
+
+    private fun buildTaskTab(): JScrollPane {
         val panel = JPanel(BorderLayout())
         panel.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
         val form = JPanel(GridLayout(0, 1, 4, 4))
-        form.add(JLabel("goal"))
+        form.add(fieldLabel("goal", goalField))
         form.add(goalField)
-        form.add(JLabel("criteria (comma separated, optional)"))
+        form.add(fieldLabel("criteria (comma separated, optional)", criteriaField))
         form.add(criteriaField)
         val contractBox = JPanel(GridLayout(3, 1, 2, 2))
         contractBox.add(completionCommit)
@@ -338,7 +380,7 @@ class FaktorChatPanel(
         taskArea.isEditable = false
         form.add(JScrollPane(taskArea))
         panel.add(form, BorderLayout.NORTH)
-        return panel
+        return scrollable(panel)
     }
 
     private fun buildTaskTreeTab(): JPanel {
@@ -350,7 +392,7 @@ class FaktorChatPanel(
         return panel
     }
 
-    private fun buildAgentsTab(): JPanel {
+    private fun buildAgentsTab(): JScrollPane {
         val panel = JPanel(BorderLayout())
         panel.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
         val form = JPanel(GridLayout(0, 1, 4, 4))
@@ -399,7 +441,7 @@ class FaktorChatPanel(
         agentsArea.isEditable = false
         form.add(JScrollPane(agentsArea))
         panel.add(form, BorderLayout.NORTH)
-        return panel
+        return scrollable(panel)
     }
 
     private fun agentButton(
@@ -789,7 +831,7 @@ class FaktorChatPanel(
     private fun wireActions() {
         startButton.addActionListener { startDaemon() }
         stopButton.addActionListener {
-            runAsync("stop daemon") {
+            runControl("stop daemon") {
                 service.stop()
                 submittedCompletion = null
                 onEdt {
@@ -805,7 +847,7 @@ class FaktorChatPanel(
         }
         sendButton.addActionListener { sendPrompt() }
         abortButton.addActionListener {
-            runAsync("abort") {
+            runControl("abort") {
                 val ack = service.abort()
                 onEdt { appendSystem("abort requested: ${ack.aborted}") }
             }
@@ -820,7 +862,7 @@ class FaktorChatPanel(
                 appendSystem("select a task run first")
                 return@addActionListener
             }
-            runAsync("cancel task run") {
+            runControl("cancel task run") {
                 val ack = service.cancelTaskRun(run.runId)
                 onEdt { appendSystem("cancel ${ack.runId}: cancelled=${ack.cancelled}") }
                 refreshTaskRunsBlocking()
@@ -868,7 +910,7 @@ class FaktorChatPanel(
             }
 
             override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
-                runAsync("permission ${permission.id} $decision") {
+                runControl("permission ${permission.id} $decision") {
                     replyPermissionBlocking(permission, decision)
                 }
             }
@@ -974,7 +1016,7 @@ class FaktorChatPanel(
             }
 
             override fun onAbortTournament(tournamentId: String, reason: String) {
-                runAsync("abort tournament") {
+                runControl("abort tournament") {
                     try {
                         val aborted = service.abortTournament(tournamentId, reason)
                         onEdt { appendSystem("tournament ${aborted.id} aborted [${aborted.state}]") }
@@ -1031,7 +1073,7 @@ class FaktorChatPanel(
         })
         permissionsPanel.setListener(object : PermissionsPanel.Listener {
             override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
-                runAsync("permission ${permission.id} $decision") {
+                runControl("permission ${permission.id} $decision") {
                     replyPermissionBlocking(permission, decision)
                 }
             }
@@ -1171,19 +1213,59 @@ class FaktorChatPanel(
             appendSystem("start the daemon first")
             return
         }
-        if (service.currentSessionId() == null) {
+        val sessionId = service.currentSessionId()
+        if (sessionId == null) {
             appendSystem("create a session first")
             return
         }
         val text = input.text.trim()
         if (text.isEmpty()) return
-        input.text = ""
-        appendUser(text)
-        runAsync("prompt") {
-            val receipt = service.prompt(text)
-            onEdt { appendSystem("turn ${receipt.opId} accepted (queued=${receipt.queued})") }
-            refreshAllBlocking()
+        if (!promptInFlight.compareAndSet(false, true)) {
+            return
         }
+        // The host owns the logical prompt id: it is reused ONLY for a retry
+        // of the byte-identical draft in the same session, so a lost response
+        // replays the original receipt instead of duplicating a prompt.
+        val pending = selectPromptSubmission(
+            pendingPromptSubmission,
+            sessionId,
+            text
+        ) { UUID.randomUUID().toString() }
+        pendingPromptSubmission = pending
+        runAsync("prompt") {
+            try {
+                val receipt = service.prompt(text, submissionId = pending.submissionId)
+                pendingPromptSubmission = null
+                onEdt {
+                    // Clear ONLY the exact submitted draft; text typed while
+                    // the prompt was in flight is never destroyed.
+                    if (input.text.trim() == pending.text) {
+                        input.text = ""
+                    }
+                    appendUser(pending.text)
+                    appendSystem("turn ${receipt.opId} accepted (queued=${receipt.queued})")
+                }
+                refreshAllBlocking()
+            } catch (error: Exception) {
+                // Retryable (transport/5xx/408/429): keep the draft AND the
+                // id. Typed refusal: mint a new id on the next attempt.
+                if (!promptFailureIsRetryable(error)) {
+                    pendingPromptSubmission = null
+                }
+                onEdt { appendSystem("error: prompt: ${error.message}") }
+            } finally {
+                promptInFlight.set(false)
+            }
+        }
+    }
+
+    private fun promptFailureIsRetryable(error: Exception): Boolean {
+        val api = error as? NativeApiException ?: return true
+        return api.retryable ||
+            api.status == 0 ||
+            api.status == 408 ||
+            api.status == 429 ||
+            api.status >= 500
     }
 
     // ----------------------------------------------------------- refreshers
@@ -1843,6 +1925,7 @@ class FaktorChatPanel(
         controlPlaneWatcher?.stop()
         service.stopStream()
         worker.shutdownNow()
+        controlWorker.shutdownNow()
     }
 
     /** One synchronous credential-watch poll (internal smoke hook). */
@@ -1967,6 +2050,18 @@ class FaktorChatPanel(
 
     private fun runAsync(label: String, work: () -> Unit) {
         worker.execute {
+            try {
+                work()
+            } catch (e: Throwable) {
+                val message = e.message ?: e.javaClass.simpleName
+                onEdt { appendSystem("error: $label: $message") }
+            }
+        }
+    }
+
+    /** The urgent-control twin of [runAsync]: never queued behind refresh work. */
+    private fun runControl(label: String, work: () -> Unit) {
+        controlWorker.execute {
             try {
                 work()
             } catch (e: Throwable) {
@@ -2107,3 +2202,24 @@ object FaktorFrontendApp {
         }
     }
 }
+
+/** One immutable logical prompt held across a retryable failure. */
+internal data class PromptSubmission(
+    val submissionId: String,
+    val sessionId: String,
+    val text: String
+)
+
+/**
+ * Selects the logical prompt to send: the retained submission is reused ONLY
+ * for the byte-identical draft in the same session (a lost-response retry
+ * replays the original receipt); anything else mints a fresh id.
+ */
+internal fun selectPromptSubmission(
+    retained: PromptSubmission?,
+    sessionId: String,
+    text: String,
+    newId: () -> String
+): PromptSubmission =
+    retained?.takeIf { it.sessionId == sessionId && it.text == text }
+        ?: PromptSubmission(newId(), sessionId, text)
