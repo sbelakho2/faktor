@@ -16,6 +16,15 @@
 import * as vscode from 'vscode';
 import { basename, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+/** The attachment-envelope correlation id: the host mints one when the
+ *  webview did not supply an id, so the webview is never an id authority. */
+function hostMessageId(raw: unknown): string {
+  if (typeof raw === 'string' && raw.length > 0 && raw.length <= 64) {
+    return raw;
+  }
+  return randomUUID();
+}
 import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
 import {
   FetchLike,
@@ -99,7 +108,6 @@ import {
   admitPendingSubmission,
   attachmentPolicyForModel,
   boundedWebviewFiles,
-  canonicalSubmissionId,
   composerAttachmentRefusal,
   composerMimeForFilename,
   hasCompletionSteps,
@@ -1860,7 +1868,6 @@ async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<voi
   const contract = await promptCompletionContract();
   const pending = pendingEnvelope(goal.trim());
   const decision = taskStartGate.admit({
-    submissionId: null,
     pending,
     files: [],
     contract,
@@ -2337,12 +2344,11 @@ async function handleWebviewMessage(
       // flight, every further sendGoal is ignored — a double click, an
       // Enter+click race and a hostile burst can never admit a second
       // durable prompt/run. After a lost response the gate is retryable and
-      // an identical resubmission (or an explicit retry of the same
-      // submission id) restarts the SAME immutable snapshot.
+      // an identical resubmission restarts the SAME immutable snapshot under
+      // the host-owned id.
       if (taskStartGate.inFlight()) {
         return;
       }
-      const submissionId = canonicalSubmissionId(message.submissionId);
       // Files ride the workspace-relative attachment vocabulary
       // (`sendGoal.files`); malformed entries are refused individually (with
       // their exact reason) and never discard the goal. The completion
@@ -2394,7 +2400,7 @@ async function handleWebviewMessage(
           text: goal,
           sessionId: hostSessionId,
           draftId: message.draftId,
-          messageId: message.messageId,
+          messageId: hostMessageId(message.messageId),
           files: message.files,
           attachments: selected.attachments,
         });
@@ -2414,7 +2420,7 @@ async function handleWebviewMessage(
           text: goal,
           sessionId: hostSessionId,
           draftId: message.draftId,
-          messageId: message.messageId,
+          messageId: hostMessageId(message.messageId),
           files: message.files,
           attachments: binaryAttachments,
         });
@@ -2429,7 +2435,6 @@ async function handleWebviewMessage(
         pending = pendingSubmissionRetainer.restore(parsed);
       }
       const decision = taskStartGate.admit({
-        submissionId,
         pending,
         files,
         contract: contract.contract,

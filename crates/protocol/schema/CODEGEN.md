@@ -12,7 +12,7 @@ portion for the two IDE clients is regenerated from that artifact by
 
 | Artifact | Contents |
 | --- | --- |
-| `crates/protocol/schema/faktor-protocol.schema.json` | DTO shapes (`Message`, `Part`, `ToolResultBody`, `PageMeta`, `MessagesPage`, `SessionState`, `AgentStateView`) plus the migrated native wire DTOs (`AttachmentId`, `AttachmentUpload`, `TaskRun`, `TaskRunStarted`, `TaskRunCancelled`, `TaskRunWorkItem`, `TaskRunStartRequest`) and the error-code table derived from `faktor_protocol::error::from_core`. |
+| `crates/protocol/schema/faktor-protocol.schema.json` | DTO shapes (`Message`, `Part`, `ToolResultBody`, `PageMeta`, `MessagesPage`, `SessionState`, `AgentStateView`) plus the migrated native wire DTOs (`AttachmentId`, `AttachmentUpload`, `TaskRun`, `TaskRunStarted`, `TaskRunCancelled`, `TaskRunWorkItem`, `TaskRunStartRequest`, `SessionPromptRequest`, `SessionPromptReceipt`) and the error-code table derived from `faktor_protocol::error::from_core`. |
 | `apps/vscode/src/generated/protocolDto.ts` | TypeScript DTO types, strict validators, default constructors, error-code constants and `parseProtocolErrorEnvelope`. |
 | `apps/jetbrains/shared/src/main/kotlin/dev/faktor/shared/GeneratedProtocolDto.kt` | Kotlin data classes / sealed enum, parsers, error-code constants and `parseProtocolErrorEnvelope`. |
 
@@ -113,7 +113,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET,POST /native/session/{id}/board` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/checkpoints` | handwritten-grandfathered |  |
 | `GET /native/session/{id}/events` | streaming-special-case |  |
-| `POST /native/session/{id}/prompt` | handwritten-grandfathered |  |
+| `POST /native/session/{id}/prompt` | generated | `SessionPromptRequest`, `SessionPromptReceipt` |
 | `GET,POST /native/session/{id}/task-runs` | generated | `TaskRun`, `TaskRunStartRequest`, `TaskRunStarted` |
 | `GET /native/session/{id}/task-runs/{run_id}` | generated | `TaskRun` |
 | `POST /native/session/{id}/task-runs/{run_id}/cancel` | generated | `TaskRunCancelled` |
@@ -183,6 +183,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | 2 (open) | Page metadata (`page`, `hasMore`, `nextCursor`/`nextBefore`) | The clients' page DTOs are projections of the native wire routes (camelCase `sessionId`, `nextCursor`), not of `faktor_protocol::native`; migrate only when the server route DTOs are moved into `faktor-protocol`. |
 | 3 (open) | Conversation messages/parts | The native wire message rows differ from `faktor_protocol::native::Message` (wire: `createdMs`/`data`/`kind` parts; protocol: snake_case typed parts used by ACP). Do not generate the wire projections from the protocol shapes until the two converge. |
 | 4 | Attachments + task-run DTOs (audit 15) | `AttachmentId`, `AttachmentRef`, `AttachmentUpload`, `TaskRun`, `TaskRunStarted`, `TaskRunCancelled`, `TaskRunWorkItem`, `TaskRunStartRequest` are canonical schema types now; both IDEs' parsed surfaces delegate to the generated `ProtocolAttachmentId`/`ProtocolAttachmentRef`/`ProtocolTaskRun*` parsers (the VS Code `NativeTaskRun`/`NativeAttachmentId` names and the JetBrains `NativeTaskRun*`/`NativeAttachmentId` names are aliases), and the six routes are classified `generated` in the inventory (the attachment routes split the ref-id and digest grammars: `ref/{ref_id}` metadata/bytes vs `blob/{digest}` metadata/bytes). The server stays the strict authority: `NativeAttachmentUpload`/`StartTaskRunRequest` keep their `deny_unknown_fields` serde DTOs, mirrored field-for-field by the schema. |
+| 5 | Ordinary-prompt DTO (idempotency finding 1) | `SessionPromptRequest` (strict: `session_id`, the REQUIRED `submission_id` 1..=64 ASCII `[0-9a-f-]`, `prompt`, optional `files`) and `SessionPromptReceipt` (`op_id`, `run_id`, `accepted`, `queued`) are canonical schema types now; the prompt route is classified `generated`. The server's `NativePromptRequestBody` stays the strict `deny_unknown_fields` authority, mirrored field-for-field; a repeated `submission_id` with the equal body replays the stored receipt byte-for-byte through the durable `prompt_admission` claim. |
 
 The migration is deliberately conservative: a generated client may only
 replace a handwritten DTO when the wire shape is provably identical.

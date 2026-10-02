@@ -73,12 +73,15 @@ impl ChunkSink {
     pub fn try_send(&self, event: ChunkEvent) {
         use tokio::sync::mpsc::error::TrySendError;
         let mut st = self.state.lock().unwrap();
+        let event_bytes = event.text.len() as u64;
         let Some(tx) = st.tx.clone() else {
             // The drainer is gone: drop content instead of buffering a
-            // garbage pile nobody can ever consume.
+            // garbage pile nobody can ever consume. Every byte that never
+            // reaches a consumer must be accounted, including this event.
             if let Some(p) = st.pending.take() {
-                st.dropped_bytes += p.text.len() as u64;
+                st.dropped_bytes = st.dropped_bytes.saturating_add(p.text.len() as u64);
             }
+            st.dropped_bytes = st.dropped_bytes.saturating_add(event_bytes);
             return;
         };
         // 1. FIFO recovery: flush the buffered frame first so coalesced
@@ -89,7 +92,11 @@ impl ChunkSink {
                 Ok(()) => {}
                 Err(TrySendError::Full(p)) => st.pending = Some(p),
                 Err(TrySendError::Closed(p)) => {
-                    st.dropped_bytes += p.text.len() as u64;
+                    // The pending frame AND this incoming event are lost.
+                    st.dropped_bytes = st
+                        .dropped_bytes
+                        .saturating_add(p.text.len() as u64)
+                        .saturating_add(event_bytes);
                     st.tx = None;
                     return;
                 }
@@ -104,7 +111,10 @@ impl ChunkSink {
                     st.pending = Some(event);
                     return;
                 }
-                Err(TrySendError::Closed(_)) => {
+                Err(TrySendError::Closed(p)) => {
+                    // The receiver closed on this event: it never reached a
+                    // consumer and must be counted, not discarded silently.
+                    st.dropped_bytes = st.dropped_bytes.saturating_add(p.text.len() as u64);
                     st.tx = None;
                     return;
                 }
@@ -119,9 +129,10 @@ impl ChunkSink {
         if same_key {
             let p = st.pending.as_mut().unwrap();
             p.text.push_str(&event.text);
-            st.dropped_bytes += front_trim(&mut p.text, CHUNK_COALESCE_CAP_BYTES) as u64;
+            let trimmed = front_trim(&mut p.text, CHUNK_COALESCE_CAP_BYTES) as u64;
+            st.dropped_bytes = st.dropped_bytes.saturating_add(trimmed);
         } else if let Some(p) = st.pending.replace(event) {
-            st.dropped_bytes += p.text.len() as u64;
+            st.dropped_bytes = st.dropped_bytes.saturating_add(p.text.len() as u64);
         }
     }
 

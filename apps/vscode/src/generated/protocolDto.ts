@@ -328,6 +328,22 @@ export interface ProtocolTaskRunStartRequest {
   readonly completion_contract: ProtocolJson | null;
 }
 
+/** Strict request body of POST /native/session/{id}/prompt. `submission_id` is the required client submission UUID of the logical prompt (idempotency key: a repeated key with the equal normalized body returns the original receipt byte-for-byte; a different body under the same key is a typed conflict). The daemon validates every member strictly (`deny_unknown_fields`; an unknown field or typo is a 400). (unknown_fields: reject) */
+export interface ProtocolSessionPromptRequest {
+  readonly session_id: string;
+  readonly submission_id: string;
+  readonly prompt: string;
+  readonly files: readonly string[] | null;
+}
+
+/** Response of a native prompt: the accepted in-session run identity and queued flag (additive: unknown fields ignored). A submission-keyed replay returns the stored receipt byte-for-byte. (unknown_fields: ignore) */
+export interface ProtocolSessionPromptReceipt {
+  readonly op_id: string;
+  readonly run_id: string;
+  readonly accepted: boolean;
+  readonly queued: boolean;
+}
+
 // ------------------------------------------------------------ defaults
 
 function dtoDefaultProtocolPageMeta(): ProtocolPageMeta {
@@ -606,6 +622,35 @@ export function validateProtocolTaskRunStartRequest(value: ProtocolJson, path = 
     files: dtoOptionalNullableList(object, "files", path)?.map((item, index) => dtoStringElement(item, path + ".files[" + index + "]")) ?? null,
     attachments: dtoOptionalNullableList(object, "attachments", path)?.map((item, index) => validateProtocolAttachmentId(item, path + ".attachments[" + index + "]")) ?? null,
     completion_contract: dtoOptionalNullableJson(object, "completion_contract"),
+  };
+}
+
+export function validateProtocolSessionPromptRequest(value: ProtocolJson, path = "ProtocolSessionPromptRequest"): ProtocolSessionPromptRequest {
+  const object = dtoObject(value, path);
+  const required = ["session_id","submission_id","prompt"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  dtoRejectUnknown(object, path, ["session_id","submission_id","prompt","files"]);
+  return {
+    session_id: dtoString(object, "session_id", path),
+    submission_id: dtoString(object, "submission_id", path),
+    prompt: dtoString(object, "prompt", path),
+    files: dtoOptionalNullableList(object, "files", path)?.map((item, index) => dtoStringElement(item, path + ".files[" + index + "]")) ?? null,
+  };
+}
+
+export function validateProtocolSessionPromptReceipt(value: ProtocolJson, path = "ProtocolSessionPromptReceipt"): ProtocolSessionPromptReceipt {
+  const object = dtoObject(value, path);
+  const required = ["op_id","run_id","accepted","queued"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    op_id: dtoString(object, "op_id", path),
+    run_id: dtoString(object, "run_id", path),
+    accepted: dtoBool(object, "accepted", path),
+    queued: dtoBool(object, "queued", path),
   };
 }
 

@@ -153,10 +153,15 @@ async fn native_bootstrap_strict_dtos_and_cursor_stream() {
         .any(|s| s["id"] == sid && s["title"] == "t-bootstrap"));
 
     // Prompt strictness: id mismatch, empty prompt, unknown session.
+    // Every prompt body carries the REQUIRED submission_id (the durable
+    // idempotency key); a missing/empty key is its own typed 400 below.
     let resp = client
         .post(format!("{base}/native/session/{sid}/prompt"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"session_id": "999", "prompt": "x"}))
+        .json(&serde_json::json!({
+            "session_id": "999", "prompt": "x",
+            "submission_id": "a0000000-0000-4000-8000-000000000001",
+        }))
         .send()
         .await
         .unwrap();
@@ -164,7 +169,10 @@ async fn native_bootstrap_strict_dtos_and_cursor_stream() {
     let resp = client
         .post(format!("{base}/native/session/{sid}/prompt"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"session_id": sid, "prompt": "   "}))
+        .json(&serde_json::json!({
+            "session_id": sid, "prompt": "   ",
+            "submission_id": "a0000000-0000-4000-8000-000000000002",
+        }))
         .send()
         .await
         .unwrap();
@@ -172,17 +180,31 @@ async fn native_bootstrap_strict_dtos_and_cursor_stream() {
     let resp = client
         .post(format!("{base}/native/session/999999/prompt"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"session_id": "999999", "prompt": "x"}))
+        .json(&serde_json::json!({
+            "session_id": "999999", "prompt": "x",
+            "submission_id": "a0000000-0000-4000-8000-000000000003",
+        }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+    let resp = client
+        .post(format!("{base}/native/session/{sid}/prompt"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({"session_id": sid, "prompt": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "a missing submission_id is a typed 400");
 
     // A real prompt is accepted and lands on the ONE executor entry.
     let resp = client
         .post(format!("{base}/native/session/{sid}/prompt"))
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({"session_id": sid, "prompt": "hi"}))
+        .json(&serde_json::json!({
+            "session_id": sid, "prompt": "hi",
+            "submission_id": "a0000000-0000-4000-8000-000000000004",
+        }))
         .send()
         .await
         .unwrap();

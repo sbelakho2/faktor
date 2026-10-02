@@ -1026,7 +1026,6 @@ const HANDWRITTEN_FROZEN = new Set([
   '/native/session/{id}/agents/{child}/presentation',
   '/native/session/{id}/board',
   '/native/session/{id}/checkpoints',
-  '/native/session/{id}/prompt',
   '/native/session/{id}/tasks',
   '/native/session/{id}/tasks/{task_id}/verification',
   '/native/session/{id}/terminal',
@@ -1068,6 +1067,7 @@ const MIGRATED_ROUTES = [
   '/native/session/{id}/attachments',
   '/native/session/{id}/attachments/blob/{digest}',
   '/native/session/{id}/attachments/ref/{ref_id}',
+  '/native/session/{id}/prompt',
   '/native/session/{id}/task-runs',
   '/native/session/{id}/task-runs/{run_id}',
   '/native/session/{id}/task-runs/{run_id}/cancel',
@@ -1307,9 +1307,11 @@ function modeSelftest() {
     ['TS attachment validator', ts.includes('export function validateProtocolAttachmentId(')],
     ['TS task-run validator', ts.includes('export function validateProtocolTaskRun(')],
     ['TS task-run start validator', ts.includes('export function validateProtocolTaskRunStartRequest(')],
+    ['TS prompt validator', ts.includes('export function validateProtocolSessionPromptRequest(')],
     ['TS optional-nullable list helper', ts.includes('function dtoOptionalNullableList(')],
     ['Kotlin attachment parser', kt.includes('fun parseProtocolAttachmentId(')],
     ['Kotlin task-run parser', kt.includes('fun parseProtocolTaskRun(')],
+    ['Kotlin prompt parser', kt.includes('fun parseProtocolSessionPromptRequest(')],
     ['Kotlin optional list parse', kt.includes('optionalField("attachments")?.array()')],
   ];
   let failed = 0;

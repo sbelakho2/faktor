@@ -164,6 +164,22 @@ data class ProtocolTaskRunStartRequest(
     val completionContract: JsonValue?
 )
 
+/** Strict request body of POST /native/session/{id}/prompt. `submission_id` is the required client submission UUID of the logical prompt (idempotency key: a repeated key with the equal normalized body returns the original receipt byte-for-byte; a different body under the same key is a typed conflict). The daemon validates every member strictly (`deny_unknown_fields`; an unknown field or typo is a 400). (unknown_fields: reject) */
+data class ProtocolSessionPromptRequest(
+    val sessionId: String,
+    val submissionId: String,
+    val prompt: String,
+    val files: List<String>?
+)
+
+/** Response of a native prompt: the accepted in-session run identity and queued flag (additive: unknown fields ignored). A submission-keyed replay returns the stored receipt byte-for-byte. (unknown_fields: ignore) */
+data class ProtocolSessionPromptReceipt(
+    val opId: String,
+    val runId: String,
+    val accepted: Boolean,
+    val queued: Boolean
+)
+
 // -------------------------------------------------------- parse functions
 
 fun parseProtocolMessage(v: JsonView): ProtocolMessage {
@@ -396,6 +412,30 @@ fun parseProtocolTaskRunStartRequest(v: JsonView): ProtocolTaskRunStartRequest {
         files = v.optionalField("files")?.array()?.map { it.string() },
         attachments = v.optionalField("attachments")?.array()?.map { parseProtocolAttachmentId(it) },
         completionContract = v.optionalField("completion_contract")?.value
+    )
+}
+
+fun parseProtocolSessionPromptRequest(v: JsonView): ProtocolSessionPromptRequest {
+    val fields = (v.value as? JsonValue.Obj)?.fields ?: emptyMap()
+    for (key in fields.keys) {
+        if (key !in listOf("session_id", "submission_id", "prompt", "files")) {
+            throw NativeProtocolException(v.path, "unknown field " + key)
+        }
+    }
+    return ProtocolSessionPromptRequest(
+        sessionId = v.field("session_id").string(),
+        submissionId = v.field("submission_id").string(),
+        prompt = v.field("prompt").string(),
+        files = v.optionalField("files")?.array()?.map { it.string() }
+    )
+}
+
+fun parseProtocolSessionPromptReceipt(v: JsonView): ProtocolSessionPromptReceipt {
+    return ProtocolSessionPromptReceipt(
+        opId = v.field("op_id").string(),
+        runId = v.field("run_id").string(),
+        accepted = v.field("accepted").bool(),
+        queued = v.field("queued").bool()
     )
 }
 

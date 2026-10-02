@@ -644,7 +644,7 @@ mod task_admission_tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 27, "v26 (task admission) is the migration head");
+        assert_eq!(version, 28, "v27 (prompt admission) is the migration head");
         // The CHECK vocabulary refuses an unknown state at the SQL level.
         let pid = SessionId::new(1);
         conn.execute(

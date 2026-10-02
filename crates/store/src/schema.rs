@@ -773,6 +773,27 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         receipt_json TEXT,
         created_ms INTEGER NOT NULL
      );",
+    // v27 — durable ordinary-prompt admission (idempotency finding 1,
+    // backend half; schema target 28; array index 27). ONE row per client
+    // submission key of the plain prompt path: the canonical digest over
+    // the normalized prompt body (text + the user-controlled file list)
+    // and, once the prompt was accepted, the exact serialized prompt
+    // receipt. A repeated key with the equal digest replays that receipt
+    // byte-for-byte WITHOUT any journal/queue/message write; a pending row
+    // refuses a concurrent duplicate typed; a different digest (or a
+    // foreign session) under the same key is a typed KeyReused conflict.
+    // `receipt_json` is NULL while pending; the store bounds
+    // key/digest/receipt sizes on every write AND read. The table is
+    // SEPARATE from `task_admission`: task-start semantics are untouched
+    // and a prompt key never aliases a task start.
+    "CREATE TABLE IF NOT EXISTS prompt_admission (
+        key TEXT PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending','complete')),
+        receipt_json TEXT,
+        created_ms INTEGER NOT NULL
+     );",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

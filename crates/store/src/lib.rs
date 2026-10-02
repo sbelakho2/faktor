@@ -201,6 +201,8 @@ mod attachments;
 pub use attachments::*;
 mod task_admission;
 pub use task_admission::*;
+mod prompt_admission;
+pub use prompt_admission::*;
 mod index;
 pub use index::*;
 mod billing;

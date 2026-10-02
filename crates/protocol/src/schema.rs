@@ -454,6 +454,39 @@ fn type_defs() -> Vec<TypeDef> {
                 ],
             },
         },
+        TypeDef {
+            name: "SessionPromptRequest",
+            doc: "Strict request body of POST /native/session/{id}/prompt. `submission_id` is the required client submission UUID of the logical prompt (idempotency key: a repeated key with the equal normalized body returns the original receipt byte-for-byte; a different body under the same key is a typed conflict). The daemon validates every member strictly (`deny_unknown_fields`; an unknown field or typo is a 400).",
+            unknown_fields: "reject",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("session_id"),
+                    text_field("submission_id"),
+                    text_field("prompt"),
+                    field(
+                        "files",
+                        Ty::List {
+                            of: Box::new(Ty::String),
+                        },
+                        true,
+                        true,
+                    ),
+                ],
+            },
+        },
+        TypeDef {
+            name: "SessionPromptReceipt",
+            doc: "Response of a native prompt: the accepted in-session run identity and queued flag (additive: unknown fields ignored). A submission-keyed replay returns the stored receipt byte-for-byte.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("op_id"),
+                    text_field("run_id"),
+                    req("accepted", Ty::Bool),
+                    req("queued", Ty::Bool),
+                ],
+            },
+        },
     ]
 }
 
