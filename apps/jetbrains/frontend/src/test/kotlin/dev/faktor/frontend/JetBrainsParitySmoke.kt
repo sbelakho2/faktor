@@ -47,6 +47,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import javax.swing.SwingUtilities
 
 object JetBrainsParitySmoke {
 
@@ -128,6 +129,9 @@ object JetBrainsParitySmoke {
         }
         step("task start immutability: edits while pending never reach the in-flight request") {
             taskStartImmutabilityStep()
+        }
+        step("agent-control dialogs: input on the EDT, control on the worker, cancel is a no-op") {
+            agentControlDialogsStep()
         }
 
         step("prompt submission identity: identical retry reuses the id, edits mint new") {
@@ -675,6 +679,10 @@ object JetBrainsParitySmoke {
             Paths.get("unused"),
             Paths.get(System.getProperty("java.io.tmpdir"), "faktor-parity-fake")
         )
+        // The session workspace root: attachment picks are relativized
+        // against it and session creation carries it, so workspace source
+        // files reach the `files` array as relative paths.
+        val workspace = Files.createTempDirectory("faktor-parity-fake-workspace-")
         var panel: FaktorChatPanel? = null
         val registry = ParityMatrixRegistry
         // The parity matrix owns `current` for this run; only the observable
@@ -682,10 +690,10 @@ object JetBrainsParitySmoke {
         registry.observables.clear()
         try {
             service.attachConnection(connection, stopAction = { process.destroyForcibly() })
-            val created = service.createSession("alpha", "m", title = "parity")
+            val created = service.createSession("alpha", "m", workspace.toString(), title = "parity")
             assertEquals("7", created.id)
             service.watchSession("7", 0)
-            panel = FaktorChatPanel(service)
+            panel = FaktorChatPanel(service, workspaceRoot = workspace)
             assertTrue(panel.refreshNowForTest(), "one refresh cycle must finish")
             val chat = panel
 
@@ -798,9 +806,10 @@ object JetBrainsParitySmoke {
                 chat.settingsView().selectMutationMode("shadow")
                 chat.completionCommit.isSelected = true
                 // Audit 13: an ordinary workspace SOURCE file stays on the
-                // repository-context `files` vocabulary and is never
-                // uploaded (no blind uploads).
-                val source = Files.createTempFile("faktor-parity-source-", ".rs")
+                // workspace-relative `files` vocabulary and is never uploaded
+                // (no blind uploads): the absolute pick is relativized
+                // against the session workspace root.
+                val source = Files.createTempFile(workspace, "faktor-parity-source-", ".rs")
                 Files.write(source, "fn main() {}".toByteArray())
                 chat.attachmentsView().addFiles(listOf(source.toString()))
                 chat.setTaskFieldsForTest("parity goal", "criterion A, criterion B")
@@ -816,8 +825,14 @@ object JetBrainsParitySmoke {
                 assertTrue(taskBody.contains("\"mutation_mode\":\"shadow\""), taskBody)
                 assertTrue(taskBody.contains("\"completion_contract\":{\"include_commit\":true"), taskBody)
                 assertTrue(
-                    taskBody.contains("\"files\":[\"" + source.toString() + "\"]"),
-                    "the source file must ride the repository-context `files` array: $taskBody"
+                    taskBody.contains(
+                        "\"files\":[\"" + source.fileName.toString() + "\"]"
+                    ),
+                    "the source file must ride the WORKSPACE-RELATIVE `files` array: $taskBody"
+                )
+                assertTrue(
+                    !taskBody.contains(source.toString()),
+                    "an absolute pick must never ride the request: $taskBody"
                 )
                 assertEquals(
                     0,
@@ -832,9 +847,9 @@ object JetBrainsParitySmoke {
                 // Audit 13: the advertised document contract accepts
                 // application/pdf + text/plain as durable attachments; the
                 // run carries their typed ids, never the filesystem paths.
-                val pdf = Files.createTempFile("faktor-parity-doc-", ".pdf")
+                val pdf = Files.createTempFile(workspace, "faktor-parity-doc-", ".pdf")
                 Files.write(pdf, "%PDF-1.4 parity".toByteArray())
-                val txt = Files.createTempFile("faktor-parity-doc-", ".txt")
+                val txt = Files.createTempFile(workspace, "faktor-parity-doc-", ".txt")
                 Files.write(txt, "plain parity".toByteArray())
                 chat.attachmentsView().addFiles(listOf(pdf.toString(), txt.toString()))
                 val runsBeforeDocs = daemon.requestCount("POST", "/native/session/7/task-runs")
@@ -902,7 +917,7 @@ object JetBrainsParitySmoke {
 
                 // Typed refusal: an over-bound document is refused BEFORE any
                 // upload and surfaces its exact advertised bound.
-                val oversize = Files.createTempFile("faktor-parity-big-", ".pdf")
+                val oversize = Files.createTempFile(workspace, "faktor-parity-big-", ".pdf")
                 Files.write(oversize, ByteArray(5000) { 1 })
                 chat.attachmentsView().addFiles(listOf(oversize.toString()))
                 val uploadsBeforeRefusal = attachmentBodies(daemon).size
@@ -1003,6 +1018,7 @@ object JetBrainsParitySmoke {
             service.stop()
             daemon.stop()
             registry.observables.clear()
+            workspace.toFile().deleteRecursively()
         }
     }
 
@@ -1064,10 +1080,16 @@ object JetBrainsParitySmoke {
             Paths.get("unused"),
             Paths.get(System.getProperty("java.io.tmpdir"), "faktor-parity-single-flight")
         )
+        // The session workspace root: the panel relativizes attachment picks
+        // against it and the daemon refuses absolute `files`, so session
+        // creation carries the same root.
+        val workspace = Files.createTempDirectory("faktor-parity-single-flight-ws-")
         service.attachConnection(connection, stopAction = { process.destroyForcibly() })
-        service.createSession("alpha", "m", title = "single flight")
+        service.createSession("alpha", "m", workspace.toString(), title = "single flight")
         service.watchSession("7", 0)
-        return TaskStartHarness(daemon, service, FaktorChatPanel(service), process)
+        return TaskStartHarness(
+            daemon, service, FaktorChatPanel(service, workspaceRoot = workspace), process, workspace
+        )
     }
 
     private fun taskStartBodies(daemon: ParityFakeDaemon): List<String> =
@@ -1227,7 +1249,7 @@ object JetBrainsParitySmoke {
         }
         try {
             val panel = harness.panel
-            val source = Files.createTempFile("faktor-single-flight-refusal-", ".rs")
+            val source = Files.createTempFile(harness.workspace, "faktor-single-flight-refusal-", ".rs")
             Files.write(source, "fn main() {}".toByteArray())
             panel.attachmentsView().addFiles(listOf(source.toString()))
             panel.setTaskFieldsForTest("refusal goal", "a, b")
@@ -1259,7 +1281,7 @@ object JetBrainsParitySmoke {
         }
         try {
             val panel = harness.panel
-            val source = Files.createTempFile("faktor-single-flight-transport-", ".rs")
+            val source = Files.createTempFile(harness.workspace, "faktor-single-flight-transport-", ".rs")
             Files.write(source, "fn main() {}".toByteArray())
             panel.attachmentsView().addFiles(listOf(source.toString()))
             panel.setTaskFieldsForTest("transport goal", "c1")
@@ -1296,7 +1318,7 @@ object JetBrainsParitySmoke {
         }
         try {
             val panel = harness.panel
-            val captured = Files.createTempFile("faktor-single-flight-captured-", ".rs")
+            val captured = Files.createTempFile(harness.workspace, "faktor-single-flight-captured-", ".rs")
             Files.write(captured, "fn main() {}".toByteArray())
             panel.attachmentsView().addFiles(listOf(captured.toString()))
             panel.setTaskFieldsForTest("captured goal", "c1")
@@ -1308,7 +1330,7 @@ object JetBrainsParitySmoke {
             // request, and the submit itself must not enqueue a second start.
             panel.setTaskFieldsForTest("edited while pending", "c2")
             panel.completionCommit.isSelected = true
-            val late = Files.createTempFile("faktor-single-flight-late-", ".rs")
+            val late = Files.createTempFile(harness.workspace, "faktor-single-flight-late-", ".rs")
             Files.write(late, "fn main() {}".toByteArray())
             panel.attachmentsView().addFiles(listOf(late.toString()))
             panel.submitTaskForTest()
@@ -1318,8 +1340,15 @@ object JetBrainsParitySmoke {
             }
             assertTrue(inFlight.contains("\"goal\":\"captured goal\""), inFlight)
             assertTrue(inFlight.contains("\"criteria\":[\"c1\"]"), inFlight)
+            assertTrue(
+                inFlight.contains("\"files\":[\"" + captured.fileName.toString() + "\"]"),
+                "the captured attachment must ride the request as a workspace-relative path: $inFlight"
+            )
             assertTrue(!inFlight.contains("edited while pending"), inFlight)
-            assertTrue(!inFlight.contains(late.toString()), inFlight)
+            assertTrue(
+                !inFlight.contains(late.fileName.toString()),
+                "an attachment added while pending must not reach the request: $inFlight"
+            )
             assertTrue(!inFlight.contains("completion_contract"), inFlight)
             assertEquals(
                 1,
@@ -1332,8 +1361,119 @@ object JetBrainsParitySmoke {
         }
     }
 
-    // ----------------------------------------------------- real daemon suite
+    /**
+     * All four agent-control dialogs (Steer / Model / Token budget / Cost
+     * budget): with an injectable input provider the dialog is resolved ON
+     * the EDT while the control call is dispatched on the `faktor-ui`
+     * worker and reaches the daemon; a cancelled dialog calls no service.
+     */
+    private fun agentControlDialogsStep() {
+        val harness = startTaskHarness()
+        try {
+            val panel = harness.panel
+            assertTrue(panel.refreshNowForTest(), "one refresh cycle must populate the agents combo")
+            val providerTitles = Collections.synchronizedList(ArrayList<String>())
+            val providerEdt = Collections.synchronizedList(ArrayList<Boolean>())
+            val dispatchThreads = Collections.synchronizedList(ArrayList<String>())
+            panel.agentControlDispatchObserver = { label ->
+                dispatchThreads.add(label + ":" + Thread.currentThread().name)
+            }
+            panel.agentInputProvider = { _, title, _ ->
+                providerTitles.add(title)
+                providerEdt.add(SwingUtilities.isEventDispatchThread())
+                when {
+                    title.startsWith("Steer") -> "steer now"
+                    title.startsWith("Model") -> "m2"
+                    title.contains("max_tokens") -> "4096"
+                    else -> "2500000"
+                }
+            }
 
+            fun selectChild() {
+                assertTrue(panel.refreshNowForTest(), "a refresh cycle must finish")
+                assertTrue(
+                    panel.selectAgentForTest("child-1"),
+                    "the agents fixture must list child-1"
+                )
+            }
+
+            selectChild()
+            assertTrue(panel.triggerAgentControlForTest("Steer"))
+            await("steer routed") {
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/steer") != null
+            }
+            assertEquals(
+                "{\"text\":\"steer now\"}",
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/steer")!!.body
+            )
+
+            selectChild()
+            assertTrue(panel.triggerAgentControlForTest("Model"))
+            await("model routed") {
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/model") != null
+            }
+            assertEquals(
+                "{\"model\":\"m2\"}",
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/model")!!.body
+            )
+
+            selectChild()
+            assertTrue(panel.triggerAgentControlForTest("Token budget"))
+            await("token budget routed") {
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/budget") != null
+            }
+            assertEquals(
+                "{\"max_tokens\":4096}",
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/budget")!!.body
+            )
+
+            selectChild()
+            assertTrue(panel.triggerAgentControlForTest("Cost budget"))
+            await("cost budget routed") {
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/budget")!!.body
+                    .contains("\"max_cost_micro\"")
+            }
+            assertEquals(
+                "{\"max_cost_micro\":2500000}",
+                harness.daemon.lastRequest("POST", "/native/agents/child-1/budget")!!.body
+            )
+
+            assertEquals(4, providerTitles.size, "every dialog resolved through the provider")
+            assertTrue(
+                providerEdt.all { it },
+                "every agent-control dialog must run ON the EDT: $providerEdt"
+            )
+            assertTrue(
+                dispatchThreads.size == 4 && dispatchThreads.all { it.endsWith(":faktor-ui") },
+                "every control call must be dispatched on the faktor-ui worker: $dispatchThreads"
+            )
+
+            // A cancelled dialog (null input) calls NO service: the agent and
+            // budget POST counts stay frozen while the worker still drains
+            // the job (the observer proves the dispatch happened).
+            panel.agentInputProvider = { _, _, _ -> null }
+            val modelCallsBefore = harness.daemon.requestCount("POST", "/native/agents/child-1/model")
+            val budgetCallsBefore = harness.daemon.requestCount("POST", "/native/agents/child-1/budget")
+            selectChild()
+            assertTrue(panel.triggerAgentControlForTest("Model"))
+            selectChild()
+            assertTrue(panel.triggerAgentControlForTest("Cost budget"))
+            assertEquals(
+                modelCallsBefore,
+                harness.daemon.requestCount("POST", "/native/agents/child-1/model"),
+                "a cancelled model dialog never calls the service"
+            )
+            assertEquals(
+                budgetCallsBefore,
+                harness.daemon.requestCount("POST", "/native/agents/child-1/budget"),
+                "a cancelled cost-budget dialog never calls the service"
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    // ----------------------------------------------------- real daemon suite
     private fun realDaemonSuite(binaryPath: String) {
         val binary = Paths.get(binaryPath)
         val dataDir = Files.createTempDirectory("faktor-parity-real-")
@@ -1478,6 +1618,18 @@ object JetBrainsParitySmoke {
             }
         }
         daemon.on("GET", "/native/agents") { _, response -> response.json(200, PARITY_AGENTS_JSON) }
+        // Agent-control routes: the dialog-path smoke drives all four input
+        // dialogs and asserts the service call reached the daemon from the
+        // worker (never from the EDT).
+        daemon.on("POST", "/native/agents/child-1/steer") { _, response ->
+            response.json(200, AGENT_CONTROL_ACK_JSON)
+        }
+        daemon.on("POST", "/native/agents/child-1/model") { _, response ->
+            response.json(200, AGENT_CONTROL_ACK_JSON)
+        }
+        daemon.on("POST", "/native/agents/child-1/budget") { _, response ->
+            response.json(200, AGENT_CONTROL_ACK_JSON)
+        }
         daemon.on("GET", "/native/terminals") { _, response -> response.json(200, PARITY_TERMINALS_JSON) }
         daemon.on("GET", "/native/session/7/terminal/events") { _, response ->
             response.json(200, PARITY_TERMINAL_EVENTS_JSON)
@@ -1572,6 +1724,8 @@ object JetBrainsParitySmoke {
     private const val TASK_START_CONFLICT_JSON =
         "{\"error\":{\"code\":\"conflict\",\"message\":\"task run already exists\"," +
             "\"retryable\":false}}"
+
+    private const val AGENT_CONTROL_ACK_JSON = "{}"
 
     private const val TASK_RUNS_JSON = "[" +
         "{\"task_id\":3,\"run_id\":\"run-9\",\"mode\":\"in_session\",\"state\":\"Running\"," +
@@ -1814,12 +1968,14 @@ private class TaskStartHarness(
     val daemon: ParityFakeDaemon,
     val service: FaktorFrontendService,
     val panel: FaktorChatPanel,
-    private val process: Process
+    private val process: Process,
+    val workspace: java.nio.file.Path
 ) {
     fun close() {
         panel.shutdown()
         service.stop()
         daemon.stop()
         process.destroyForcibly()
+        workspace.toFile().deleteRecursively()
     }
 }

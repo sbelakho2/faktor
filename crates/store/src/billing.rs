@@ -3582,8 +3582,8 @@ mod typed_ledger_tests {
                 .unwrap()
         };
         assert_eq!(
-            v, 28,
-            "schema target 28 after the v27 prompt-admission table"
+            v, 29,
+            "schema target 29 after the v28 per-session artifact rebuild"
         );
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)

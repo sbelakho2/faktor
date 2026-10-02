@@ -2225,6 +2225,27 @@ fn netns_inode() -> Option<u64> {
     inner.parse().ok()
 }
 
+/// On a privileged host every isolated child drops to the sandbox uid, so
+/// the probe's own I/O paths (reports, compute file, AF_UNIX socket) must be
+/// reachable by that uid or the probe could not report. Unprivileged hosts
+/// refuse the netns setup before the drop, so this is a no-op there.
+#[cfg(target_os = "linux")]
+fn make_privileged_probe_paths_sandbox_reachable(
+    dir: &std::path::Path,
+    extra: &[&std::path::Path],
+) {
+    if !super::sandbox::running_privileged_for_tests() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
+        .expect("chmod probe dir for the sandbox uid");
+    for path in extra {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod probe path for the sandbox uid");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn net_probe_child_main() -> ! {
     // Runs INSIDE the spawned child (parent set NET_PROBE_ENV). Writes
@@ -2306,6 +2327,26 @@ fn net_probe_child_main() -> ! {
     lines.push(format!(
         "compute={}",
         if compute_ok { "ok" } else { "failed" }
+    ));
+    // Sandbox credential posture (Linux /proc): the parent asserts these
+    // only on the isolation Ok branches; a pass-through child never reaches
+    // this code under a different confinement.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for field in ["CapInh", "CapPrm", "CapEff", "CapBnd", "NoNewPrivs"] {
+            let prefix = format!("{field}:");
+            if let Some(line) = status.lines().find(|l| l.starts_with(&prefix)) {
+                lines.push(format!(
+                    "{}={}",
+                    field.to_ascii_lowercase(),
+                    line[prefix.len()..].trim()
+                ));
+            }
+        }
+    }
+    let escaped = !super::sandbox::setns_escape_denied_for_tests();
+    lines.push(format!(
+        "setns_escape={}",
+        if escaped { "succeeded" } else { "denied" }
     ));
     let report_ok = std::fs::write(&report, lines.join("\n")).is_ok();
     std::process::exit(if report_ok { 0 } else { 3 });
@@ -2423,6 +2464,7 @@ fn deny_all_spawn_isolates_the_child_or_refuses_typed() {
     let udp_port = udp.local_addr().unwrap().port();
     let uds_path = _d.path().join("probe.sock");
     let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
+    make_privileged_probe_paths_sandbox_reachable(_d.path(), &[&uds_path]);
     let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
     let self_exe = std::env::current_exe().unwrap();
     // Pre-spawn proof state: no DENY-ALL spawn has succeeded in this
@@ -2521,6 +2563,30 @@ fn deny_all_spawn_isolates_the_child_or_refuses_typed() {
                 "computed-42",
                 "the isolated child's non-network filesystem work must land intact"
             );
+            // Namespace membership is not confinement: the child must hold
+            // no capabilities at all, must be under no-new-privs, and must
+            // NOT be able to setns back into the parent namespace.
+            assert!(
+                report.contains("capprm=0000000000000000"),
+                "the isolated child must have no permitted capabilities: {report}"
+            );
+            assert!(
+                report.contains("capeff=0000000000000000"),
+                "the isolated child must have no effective capabilities: {report}"
+            );
+            assert!(
+                report.contains("capbnd=0000000000000000"),
+                "the isolated child's capability bounding set must be empty: {report}"
+            );
+            assert!(
+                report.contains("nonewprivs=1"),
+                "the isolated child must run under PR_SET_NO_NEW_PRIVS: {report}"
+            );
+            assert!(
+                report.contains("setns_escape=denied"),
+                "the isolated child must not be able to setns back to the host \
+                 network namespace: {report}"
+            );
             // This successful DenyAll spawn PROVES the unshare path
             // active at spawn: the report may now claim OsLevel.
             assert_eq!(
@@ -2584,6 +2650,43 @@ fn forced_unshare_failure_refuses_required_and_the_program_body_never_runs() {
         .unwrap();
     assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
     assert!(out.stdout_head.contains("recovered"));
+}
+
+/// DenyAll must not break ordinary command execution: when the host permits
+/// the namespace setup, a normal shell command still runs — now under the
+/// dropped sandbox identity — and its output is captured intact. A host
+/// that refuses the setup takes the typed-refusal skip (never a silent
+/// pass, and never an unenforced run).
+#[cfg(target_os = "linux")]
+#[test]
+fn deny_all_spawn_runs_and_captures_output_when_permitted() {
+    let _serial = deny_all_spawn_lock();
+    let (_d, sup) = supervisor();
+    let mut cfg = sh("echo pass-through-ok; id -u");
+    cfg.network_isolation = NetworkIsolation::DenyAll;
+    match sup.run_sync(cfg, Duration::from_secs(10), 4096, 4096) {
+        Ok(out) => {
+            assert_eq!(out.exit_code, Some(0), "{:?}", out.stdout_head);
+            assert!(
+                out.stdout_head.contains("pass-through-ok"),
+                "a normal command must still run under DenyAll and be captured: {:?}",
+                out.stdout_head
+            );
+            let sandbox_uid = super::sandbox::sandbox_uid_for_tests().to_string();
+            assert!(
+                out.stdout_head.contains(&sandbox_uid),
+                "the command must run as the dropped sandbox uid {sandbox_uid}: {:?}",
+                out.stdout_head
+            );
+        }
+        Err(err) => {
+            assert_isolation_refusal(&err);
+            eprintln!(
+                "SKIP (typed, unprivileged host): DenyAll refused fail-closed and no \
+                 command ran: {err}"
+            );
+        }
+    }
 }
 
 // ------------------------- linux: the real BrokerOnly backend --------
@@ -2706,6 +2809,7 @@ fn broker_only_spawn_reaches_only_the_broker_endpoint() {
     let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
     let report = _d.path().join("report-broker-only.txt");
     let compute = _d.path().join("compute-broker-only.txt");
+    make_privileged_probe_paths_sandbox_reachable(_d.path(), &[&uds_path]);
     let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
     let self_exe = std::env::current_exe().unwrap();
     let out = match spawn_broker_only_probe_child(
@@ -2823,6 +2927,7 @@ fn broker_only_devtools_exposure_relays_into_the_sandbox() {
     }
     let (_d, sup) = supervisor();
     let report = _d.path().join("expose-port.txt");
+    make_privileged_probe_paths_sandbox_reachable(_d.path(), &[]);
     let self_exe = std::env::current_exe().unwrap();
     let cfg = SpawnConfig {
         cmd: self_exe.to_string_lossy().into_owned(),

@@ -1192,6 +1192,67 @@ async function validatorRejects() {
       'null coverage is the honest unhosted answer',
     );
   });
+
+  await test('epoch-ms validation is bounded to the JS Date range', () => {
+    // Long-established small stamps still parse.
+    assertEqual(nc.validateSessionCreated(clone(sessionCreatedJson)).created_ms, 1);
+    // Both boundaries of the JS Date range are exactly renderable.
+    for (const boundary of [8_640_000_000_000_000, -8_640_000_000_000_000]) {
+      assertEqual(
+        nc.validateSessionCreated({ ...clone(sessionCreatedJson), created_ms: boundary }).created_ms,
+        boundary,
+      );
+    }
+    // i64::MAX (as a JS number), one past each boundary, NaN, Infinity and
+    // Number.MAX_SAFE_INTEGER (still outside the Date range) are all refused
+    // at the wire boundary so no renderer ever sees them.
+    for (const bad of [
+      9223372036854775807,
+      8_640_000_000_000_001,
+      -8_640_000_000_000_001,
+      Number.MAX_SAFE_INTEGER,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ]) {
+      assertProtocol(
+        () => nc.validateSessionCreated({ ...clone(sessionCreatedJson), created_ms: bad }),
+        'expected an epoch-ms integer',
+      );
+      assertProtocol(
+        () =>
+          nc.validateTaskVerification({
+            ...clone(taskVerificationJson),
+            records: [{ ...clone(verificationRecordJson), startedMs: bad }],
+          }),
+        'expected an epoch-ms integer',
+      );
+      assertProtocol(
+        () =>
+          nc.validateTaskVerification({
+            ...clone(taskVerificationJson),
+            records: [{ ...clone(verificationRecordJson), completedMs: bad }],
+          }),
+        'expected an epoch-ms integer',
+      );
+    }
+    // A nested check stamp is held to the same bound.
+    assertProtocol(
+      () =>
+        nc.validateTaskVerification({
+          ...clone(taskVerificationJson),
+          records: [
+            {
+              ...clone(verificationRecordJson),
+              checks: [
+                { ...clone(verificationRecordJson.checks[0]), startedMs: 8_640_000_000_000_001 },
+              ],
+            },
+          ],
+        }),
+      'expected an epoch-ms integer',
+    );
+  });
 }
 
 // -------------------------------------------------------------- 3. client IO
@@ -1201,8 +1262,8 @@ async function clientAccepts() {
     const routes = {
       'GET /native/health': () => jsonResponse(healthJson),
       'GET /native/ready': () => jsonResponse(readyJson),
-      'POST /session/create': () => jsonResponse(sessionCreatedJson),
-      'GET /session/list': () => jsonResponse({ sessions: [sessionSummaryJson] }),
+      'POST /native/session': () => jsonResponse(sessionCreatedJson),
+      'GET /native/sessions': () => jsonResponse({ sessions: [sessionSummaryJson] }),
       'GET /session/7/projection': () => jsonResponse(projectionJson),
       'GET /models': () => jsonResponse([modelInfoJson]),
       'GET /native/session/7/turns': () => jsonResponse([]),
@@ -1366,12 +1427,13 @@ async function clientAccepts() {
     // Request construction: auth, bodies, paths, cursor paging.
     const health = findCall(calls, 'GET', '/native/health');
     assertEqual(health.headers.Authorization, 'Bearer selftest-token');
-    assertDeepEqual(findCall(calls, 'POST', '/session/create').body, {
+    assertDeepEqual(findCall(calls, 'POST', '/native/session').body, {
       provider: 'fake',
       model: 'm',
       workspace: '/w',
       title: 'selftest',
     });
+    findCall(calls, 'GET', '/native/sessions');
     assertDeepEqual(findCall(calls, 'POST', '/native/session/7/task-runs').body, { goal: 'ship it' });
     assertDeepEqual(findCall(calls, 'POST', '/native/session/7/attachments').body, {
       mime: 'application/pdf',
@@ -1444,6 +1506,55 @@ async function clientAccepts() {
     assertDeepEqual(findCall(calls, 'POST', '/native/credits/grant').body, {
       amount_micro: 1_000_000,
       reason: 'top up',
+    });
+  });
+
+  await test('session create/list speak ONLY the daemon router contract', async () => {
+    const { client, calls } = makeClient({
+      'POST /native/session': () => jsonResponse(sessionCreatedJson),
+      'GET /native/sessions': () => jsonResponse({ sessions: [sessionSummaryJson] }),
+      // The removed SDK-shaped routes are deliberately NOT served: a client
+      // that called them would reject with "unexpected request".
+      'POST /session/create': () => {
+        throw new Error('POST /session/create is not a daemon route');
+      },
+      'GET /session/list': () => {
+        throw new Error('GET /session/list is not a daemon route');
+      },
+    });
+    assertEqual(
+      (
+        await client.createSession({
+          provider: 'fake',
+          model: 'm',
+          workspace: '/w',
+          title: 't',
+        })
+      ).id,
+      '7',
+    );
+    assertEqual((await client.listSessions())[0].id, '7');
+    findCall(calls, 'POST', '/native/session');
+    findCall(calls, 'GET', '/native/sessions');
+    assertDeepEqual(findCall(calls, 'POST', '/native/session').body, {
+      provider: 'fake',
+      model: 'm',
+      workspace: '/w',
+      title: 't',
+    });
+    assert(
+      !calls.some((call) => call.path === '/session/create' || call.path === '/session/list'),
+      'the removed SDK-shaped routes must never be called',
+    );
+    // An omitted optional field stays omitted (the daemon's strict DTO fills
+    // its server-side defaults; the client never rewrites the body).
+    const minimal = makeClient({
+      'POST /native/session': () => jsonResponse(sessionCreatedJson),
+    });
+    await minimal.client.createSession({ provider: 'fake', model: 'm' });
+    assertDeepEqual(findCall(minimal.calls, 'POST', '/native/session').body, {
+      provider: 'fake',
+      model: 'm',
     });
   });
 
@@ -1570,7 +1681,122 @@ async function clientRejects() {
   });
 }
 
-// ------------------------------------------------------------ 4. eventStream
+// ------------------------------------------------- 4. daemon contract drift
+
+/**
+ * Parse the daemon authority and fail if the client's routes or event
+ * vocabulary drift from it. In a `--packaged` run there is no crates/ tree,
+ * so the source-anchored half is skipped (the behavioral halves still run).
+ */
+async function contractDriftTests() {
+  const lifecycleUrl = new URL('../../../crates/server/src/api/lifecycle.rs', import.meta.url);
+  const eventKindUrl = new URL('../../../crates/core/src/event.rs', import.meta.url);
+  const nativeSessionUrl = new URL(
+    '../../../crates/server/src/native/session.rs',
+    import.meta.url,
+  );
+  if (!existsSync(lifecycleUrl)) {
+    return;
+  }
+
+  await test('client routes match the daemon router (no /session/* fallback)', () => {
+    const lifecycle = readFileSync(lifecycleUrl, 'utf8');
+    assert(
+      lifecycle.includes('.route("/native/session", post(native_create_session))'),
+      'the daemon must serve POST /native/session',
+    );
+    assert(
+      lifecycle.includes('.route("/native/sessions", get(native_list_sessions))'),
+      'the daemon must serve GET /native/sessions',
+    );
+    assert(
+      lifecycle.includes('.route("/native/session/{id}/events", get(native_session_events))'),
+      'the daemon must serve GET /native/session/{id}/events',
+    );
+    assert(!lifecycle.includes('"/session/create"'), 'the old create route must not return');
+    assert(!lifecycle.includes('"/session/list"'), 'the old list route must not return');
+    assert(!lifecycle.includes('"/api/session'), 'the old SSE route must not return');
+
+    const nativeClientSource = readFileSync(
+      new URL('../src/nativeClient.ts', import.meta.url),
+      'utf8',
+    );
+    assert(
+      nativeClientSource.includes("this.request('POST', '/native/session'"),
+      'the client must POST /native/session',
+    );
+    assert(
+      nativeClientSource.includes("this.request('GET', '/native/sessions'"),
+      'the client must GET /native/sessions',
+    );
+    assert(!nativeClientSource.includes('/session/create'), 'the client must not call the old create route');
+    assert(!nativeClientSource.includes('/session/list'), 'the client must not call the old list route');
+
+    const eventStreamSource = readFileSync(
+      new URL('../src/eventStream.ts', import.meta.url),
+      'utf8',
+    );
+    assert(
+      eventStreamSource.includes(
+        '/native/session/${encodeURIComponent(this.options.sessionId)}/events?after=',
+      ),
+      'the client must stream from /native/session/{id}/events?after=',
+    );
+    assert(!eventStreamSource.includes('events_after'), 'the old cursor query must not return');
+    assert(!eventStreamSource.includes('/api/session'), 'the old SSE path must not return');
+  });
+
+  await test('client event vocabulary matches the daemon EventKind list', () => {
+    const eventRs = readFileSync(eventKindUrl, 'utf8');
+    const enumStart = eventRs.indexOf('pub enum EventKind');
+    const enumEnd = eventRs.indexOf('impl EventKind');
+    assert(enumStart >= 0 && enumEnd > enumStart, 'EventKind enum must be parseable');
+    const kinds = new Set();
+    for (const match of eventRs.slice(enumStart, enumEnd).matchAll(/^ {4}([A-Z][A-Za-z0-9]*),/gm)) {
+      kinds.add(match[1].replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase());
+    }
+    for (const canonical of [
+      'prompt_received',
+      'model_chunk_received',
+      'tool_requested',
+      'tool_completed',
+      'phase_changed',
+    ]) {
+      assert(kinds.has(canonical), `EventKind must include ${canonical}`);
+    }
+    assert(
+      !kinds.has(es.HEARTBEAT_EVENT_NAME),
+      'heartbeat is a keep-alive tag, not a durable EventKind',
+    );
+    // The client special-cases exactly one event name (the heartbeat); every
+    // other name it compares against must be a real daemon EventKind.
+    const sources = [
+      readFileSync(new URL('../src/eventStream.ts', import.meta.url), 'utf8'),
+      readFileSync(new URL('../src/state.ts', import.meta.url), 'utf8'),
+      readFileSync(new URL('../src/extension.ts', import.meta.url), 'utf8'),
+    ].join('\n');
+    for (const match of sources.matchAll(/\b(?:event|tagged)\s*===\s*'([a-z][a-z0-9_]*)'/g)) {
+      assert(
+        match[1] === es.HEARTBEAT_EVENT_NAME || kinds.has(match[1]),
+        `client special-cases ${match[1]}, which is not a daemon EventKind`,
+      );
+    }
+    for (const stale of ['message_created', 'message_part_updated', 'tool_call_state']) {
+      assert(!sources.includes(stale), `stale foreign event vocabulary ${stale} must not return`);
+    }
+    // The native event row shape the client validates must match the daemon's.
+    const nativeSession = readFileSync(nativeSessionUrl, 'utf8');
+    const rowStart = nativeSession.indexOf('fn native_event_row');
+    const rowEnd = nativeSession.indexOf('/// Strict native SSE query', rowStart);
+    assert(rowStart >= 0 && rowEnd > rowStart, 'native_event_row must be parseable');
+    const row = nativeSession.slice(rowStart, rowEnd);
+    for (const field of ['seq', 'kind', 'state', 'opId', 'tsMs', 'payload']) {
+      assert(row.includes(`"${field}"`), `native_event_row must carry ${field}`);
+    }
+  });
+}
+
+// ------------------------------------------------------------ 5. eventStream
 
 /** One real EventStream over a single finite body, instrumented for asserts. */
 function streamOutcome(text, options = {}) {
@@ -1623,16 +1849,28 @@ async function eventStreamTests() {
     const fetchImpl = async (url) => {
       urls.push(url);
       return sseResponse([
-        frame('message_created', 1, '{"event":"message_created","session_id":"5","message":{"id":"1"}}'),
+        frame(
+          'prompt_received',
+          1,
+          '{"seq":1,"kind":"prompt_received","state":"preparing","opId":null,"tsMs":1000,"payload":{"text":"hi"}}',
+        ),
         frame('heartbeat', null, '{}'),
         ': keep-alive\n\n',
-        frame('agent_state_changed', 2, '{"event":"agent_state_changed","session_id":"5","state":"streaming","label":"streaming"}'),
-        frame('agent_state_changed', 2, '{"event":"agent_state_changed","session_id":"5","state":"streaming","label":"streaming"}'),
+        frame(
+          'model_chunk_received',
+          2,
+          '{"seq":2,"kind":"model_chunk_received","state":"streaming","opId":"3","tsMs":1100,"payload":{"text":"chunk"}}',
+        ),
+        frame(
+          'model_chunk_received',
+          2,
+          '{"seq":2,"kind":"model_chunk_received","state":"streaming","opId":"3","tsMs":1100,"payload":{"text":"chunk"}}',
+        ),
         // A malformed frame WITHOUT an id is not durable: it is reported and
         // the healthy stream continues (a durable malformed frame BLOCKS —
         // covered by the protocol-blocked tests below).
         frame('error', null, 'not-json'),
-        frame('error', null, '{"event":"agent_state_changed","session_id":"5"}'),
+        frame('error', null, '{"event":"prompt_received","seq":1,"kind":"prompt_received"}'),
         frame('heartbeat', 5, '{}'),
       ]);
     };
@@ -1655,6 +1893,7 @@ async function eventStreamTests() {
     stream.start();
     await stream.whenStopped();
     assertDeepEqual(delivered.map((event) => event.id), [1, 2]);
+    assertEqual(delivered[0].event, 'prompt_received');
     assertEqual(stream.cursor, 5, 'heartbeat ids must advance the cursor');
     assert(statuses.includes('open'), `statuses included open: ${statuses.join(',')}`);
     assertEqual(errors.length, 2);
@@ -1662,8 +1901,41 @@ async function eventStreamTests() {
       errors.every((error) => error instanceof es.EventStreamProtocolError),
       `protocol errors expected: ${errors.map((e) => e.message).join(' | ')}`,
     );
-    assertEqual(new URL(urls[0]).searchParams.get('events_after'), '0');
+    // The URL is the daemon's native journal route and cursor query.
+    assertEqual(new URL(urls[0]).pathname, '/native/session/5/events');
+    assertEqual(new URL(urls[0]).searchParams.get('after'), '0');
+    assertEqual(new URL(urls[0]).searchParams.get('events_after'), null);
     assertEqual(new URL(urls[0]).searchParams.get('session'), null);
+  });
+
+  await test('EventStream connects to the native journal route with the after= cursor', async () => {
+    const urls = [];
+    let stream = null;
+    stream = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9/',
+      bearerToken: 'tok',
+      sessionId: 'a b/7',
+      cursor: 12,
+      fetch: async (url) => {
+        urls.push(url);
+        return sseResponse([]);
+      },
+      sleep: async () => {},
+      onEvent: () => {},
+      onStatus: (status, detail) => {
+        if (status === 'retrying' && String(detail).startsWith('stream ended')) {
+          stream.stop();
+        }
+      },
+    });
+    stream.start();
+    await stream.whenStopped();
+    assertEqual(urls.length, 1);
+    const url = new URL(urls[0]);
+    assertEqual(url.pathname, '/native/session/a%20b%2F7/events');
+    assertEqual(url.searchParams.get('after'), '12');
+    assertEqual(url.searchParams.get('events_after'), null, 'the old cursor query is gone');
+    assert(urls[0].startsWith('http://127.0.0.1:9/native/'), urls[0]);
   });
 
   await test('eventStream resumes from the cursor with backoff', async () => {
@@ -1679,8 +1951,16 @@ async function eventStreamTests() {
         return sseResponse([frame('heartbeat', 7, '{}')]);
       }
       return sseResponse([
-        frame('agent_state_changed', 7, '{"event":"agent_state_changed","session_id":"5","state":"x","label":"x"}'),
-        frame('agent_state_changed', 8, '{"event":"agent_state_changed","session_id":"5","state":"y","label":"y"}'),
+        frame(
+          'tool_requested',
+          7,
+          '{"seq":7,"kind":"tool_requested","state":"validating","opId":"3","tsMs":1200,"payload":{"tool":"bash"}}',
+        ),
+        frame(
+          'tool_completed',
+          8,
+          '{"seq":8,"kind":"tool_completed","state":"validating","opId":"3","tsMs":1300,"payload":{"tool":"bash"}}',
+        ),
       ]);
     };
     stream = new es.EventStream({
@@ -1705,11 +1985,101 @@ async function eventStreamTests() {
     stream.start();
     await stream.whenStopped();
     assertEqual(urls.length, 2, 'one reconnect was expected');
-    assertEqual(new URL(urls[0]).searchParams.get('events_after'), '6');
-    assertEqual(new URL(urls[1]).searchParams.get('events_after'), '7');
+    assertEqual(new URL(urls[0]).searchParams.get('after'), '6');
+    assertEqual(new URL(urls[1]).searchParams.get('after'), '7');
     assertDeepEqual(delivered, [8], 'the replayed frame behind the cursor must not redeliver');
     assert(sleeps.length >= 1 && sleeps[0] >= 5, `backoff slept: ${JSON.stringify(sleeps)}`);
     assertEqual(stream.status, 'stopped');
+  });
+
+  await test('a non-retryable HTTP answer is a terminal configuration failure, not a retry loop', async () => {
+    assertEqual(es.isRetryableHttpStatus(404), false, '404 is terminal');
+    assertEqual(es.isRetryableHttpStatus(401), false, '401 is terminal');
+    assertEqual(es.isRetryableHttpStatus(429), true, '429 is backpressure');
+    assertEqual(es.isRetryableHttpStatus(408), true, '408 is transient');
+    assertEqual(es.isRetryableHttpStatus(503), true, '5xx is a transient server fault');
+    for (const status of [400, 401, 403, 404, 405, 410, 422]) {
+      let calls = 0;
+      const errors = [];
+      const statuses = [];
+      let stream = null;
+      stream = new es.EventStream({
+        baseUrl: 'http://127.0.0.1:9',
+        bearerToken: 'tok',
+        sessionId: '5',
+        fetch: async () => {
+          calls += 1;
+          return new Response(JSON.stringify({ status }), { status });
+        },
+        sleep: async () => {
+          throw new Error(`HTTP ${status} must not back off`);
+        },
+        onEvent: () => {},
+        onStatus: (status2, detail) => statuses.push([status2, String(detail)]),
+        onError: (error) => errors.push(error),
+      });
+      stream.start();
+      await stream.whenStopped();
+      assertEqual(calls, 1, `HTTP ${status} must not reconnect`);
+      assertEqual(stream.status, 'protocol_blocked', `HTTP ${status}`);
+      assert(stream.blocked, `HTTP ${status} carries the stable blocked state`);
+      assertEqual(stream.blocked.offending_seq, null, `${status}: no durable frame exists`);
+      assert(
+        stream.blocked.reason.includes(`HTTP ${status}`),
+        `${status}: ${stream.blocked.reason}`,
+      );
+      assert(
+        errors[0] instanceof es.EventStreamProtocolBlockedError,
+        `${status}: expected the terminal blocked error`,
+      );
+      assert(statuses.some(([s]) => s === 'protocol_blocked'), `${status}: terminal status`);
+    }
+    // A retryable status still reconnects with backoff and can recover.
+    let retryCalls = 0;
+    const sleeps = [];
+    const delivered = [];
+    let retrying = null;
+    retrying = new es.EventStream({
+      baseUrl: 'http://127.0.0.1:9',
+      bearerToken: 'tok',
+      sessionId: '5',
+      cursor: 4,
+      minBackoffMs: 5,
+      maxBackoffMs: 5,
+      jitter: () => 0,
+      fetch: async () => {
+        retryCalls += 1;
+        if (retryCalls === 1) {
+          return new Response('busy', { status: 503 });
+        }
+        return sseResponse([
+          frame(
+            'turn_completed',
+            5,
+            '{"seq":5,"kind":"turn_completed","state":"completed","opId":null,"tsMs":1400,"payload":{}}',
+          ),
+        ]);
+      },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      onEvent: (event) => {
+        delivered.push(event.id);
+        retrying.stop();
+      },
+      onStatus: (status, detail) => {
+        if (status === 'retrying' && String(detail).startsWith('stream ended')) {
+          retrying.stop();
+        }
+      },
+      onError: () => {},
+    });
+    retrying.start();
+    await retrying.whenStopped();
+    assertEqual(retryCalls, 2, 'a 503 must reconnect');
+    assert(sleeps.length >= 1, 'the reconnect must back off');
+    assertDeepEqual(delivered, [5]);
+    assertEqual(retrying.blocked, null, 'a retryable status never blocks');
   });
 
   await test('eventStream surfaces transport rejection and bounds frames', async () => {
@@ -1731,6 +2101,8 @@ async function eventStreamTests() {
     await stream.whenStopped();
     assertEqual(errors.length, 1);
     assert(errors[0].message.includes('HTTP 401'), errors[0].message);
+    assertEqual(stream.status, 'protocol_blocked', 'a 401 is terminal, never an endless retry');
+    assertEqual(stream.blocked.offending_seq, null);
 
     const frameErrors = [];
     let bounded = null;
@@ -1828,7 +2200,7 @@ async function eventStreamTests() {
     // An event line is budgeted too: the id fits, the event plus the data
     // line crosses.
     const eventRun = streamOutcome(
-      `id: 4\nevent: agent_state_changed\ndata: {"event":"agent_state_changed"}\n`,
+      `id: 4\nevent: phase_changed\ndata: {"event":"phase_changed"}\n`,
       { maxFrameBytes: 24 },
     );
     eventRun.stream.start();
@@ -1838,8 +2210,8 @@ async function eventStreamTests() {
   });
 
   await test('frame budget is UTF-8 byte-accurate at a multibyte boundary', async () => {
-    const payload = '{"event":"agent_state_changed","session_id":"5","label":"héllo 🚀"}';
-    const text = frame('agent_state_changed', 9, payload);
+    const payload = '{"event":"phase_changed","session_id":"5","label":"héllo 🚀"}';
+    const text = frame('phase_changed', 9, payload);
     const size = Buffer.byteLength(text, 'utf8');
     assert(size > text.length, 'the fixture must contain multibyte code points');
     // The terminating blank line is the frame delimiter, not frame content:
@@ -1952,8 +2324,8 @@ async function eventStreamTests() {
   });
 
   await test('every chunk boundary produces an identical frame-budget result', async () => {
-    const payload = '{"event":"agent_state_changed","session_id":"5","label":"é🚀 ok"}';
-    const text = frame('agent_state_changed', 9, payload);
+    const payload = '{"event":"phase_changed","session_id":"5","label":"é🚀 ok"}';
+    const text = frame('phase_changed', 9, payload);
     const bytes = new TextEncoder().encode(text);
     const runSplit = async (split, limit) => {
       const chunks =
@@ -2007,9 +2379,9 @@ async function eventStreamTests() {
     const errors = [];
     let stream = null;
     const valid = frame(
-      'agent_state_changed',
+      'phase_changed',
       8,
-      '{"event":"agent_state_changed","session_id":"5","state":"x","label":"x"}',
+      '{"event":"phase_changed","session_id":"5","state":"x","label":"x"}',
     );
     const fetchImpl = async (url) => {
       urls.push(url);
@@ -2017,7 +2389,7 @@ async function eventStreamTests() {
       if (calls === 1) {
         return sseReaderResponse(
           chunkReader([
-            Buffer.from('id: 7\nevent: agent_state_changed\ndata: ' + 'x'.repeat(256) + '\n'),
+            Buffer.from('id: 7\nevent: phase_changed\ndata: ' + 'x'.repeat(256) + '\n'),
           ]),
         );
       }
@@ -2049,7 +2421,8 @@ async function eventStreamTests() {
     await stream.whenStopped();
     assertDeepEqual(events, [8]);
     assertEqual(calls, 2);
-    assertEqual(new URL(urls[1]).searchParams.get('events_after'), '0');
+    assertEqual(new URL(urls[1]).searchParams.get('after'), '0');
+    assertEqual(new URL(urls[1]).pathname, '/native/session/5/events');
   });
 
   await test('an oversized non-durable frame fails typed and reconnects with backoff', async () => {
@@ -2067,9 +2440,9 @@ async function eventStreamTests() {
       return sseReaderResponse(chunkReader([
         Buffer.from(
           frame(
-            'agent_state_changed',
+            'phase_changed',
             3,
-            '{"event":"agent_state_changed","session_id":"5","state":"x","label":"x"}',
+            '{"event":"phase_changed","session_id":"5","state":"x","label":"x"}',
           ),
         ),
       ]));
@@ -2095,7 +2468,7 @@ async function eventStreamTests() {
     assertEqual(stream.blocked, null);
     assertDeepEqual(events, [3]);
     assertEqual(calls, 2);
-    assertEqual(new URL(urls[1]).searchParams.get('events_after'), '0');
+    assertEqual(new URL(urls[1]).searchParams.get('after'), '0');
     assert(sleeps.length >= 1, 'the failed frame reconnects with backoff');
   });
 
@@ -2103,14 +2476,14 @@ async function eventStreamTests() {
     const cases = [
       {
         label: 'malformed JSON',
-        text: frame('agent_state_changed', 5, 'not-json'),
+        text: frame('phase_changed', 5, 'not-json'),
         needle: 'not JSON',
         seq: 5,
         max: 512,
       },
       {
         label: 'discriminator mismatch',
-        text: frame('agent_state_changed', 5, '{"event":"message_created","session_id":"5"}'),
+        text: frame('phase_changed', 5, '{"event":"prompt_received","seq":5,"kind":"prompt_received"}'),
         needle: 'disagrees',
         seq: 5,
         max: 512,
@@ -2139,9 +2512,9 @@ async function eventStreamTests() {
       {
         label: 'unknown event version',
         text: frame(
-          'agent_state_changed',
+          'phase_changed',
           5,
-          '{"event":"agent_state_changed","version":2,"session_id":"5"}',
+          '{"event":"phase_changed","version":2,"session_id":"5"}',
         ),
         needle: 'unsupported event version',
         seq: 5,
@@ -2149,7 +2522,7 @@ async function eventStreamTests() {
       },
       {
         label: 'oversized durable frame',
-        text: 'id: 5\nevent: agent_state_changed\ndata: ' + 'x'.repeat(256) + '\n',
+        text: 'id: 5\nevent: phase_changed\ndata: ' + 'x'.repeat(256) + '\n',
         needle: 'exceeded',
         seq: 5,
         max: 64,
@@ -2175,9 +2548,9 @@ async function eventStreamTests() {
     // A supported version is a normal durable event.
     const accepted = streamOutcome(
       frame(
-        'agent_state_changed',
+        'phase_changed',
         5,
-        '{"event":"agent_state_changed","version":1,"session_id":"5","state":"x","label":"x"}',
+        '{"event":"phase_changed","version":1,"session_id":"5","state":"x","label":"x"}',
       ),
     );
     accepted.stream.start();
@@ -2235,7 +2608,7 @@ async function eventStreamTests() {
   });
 }
 
-// ------------------------------------------------------------ 5. state store
+// ------------------------------------------------------------ 6. state store
 
 async function stateTests() {
   await test('store notifies subscribers exactly once per change', () => {
@@ -2278,7 +2651,7 @@ async function stateTests() {
     assertEqual(store.snapshot().indexCoverage, null);
   });
 
-  await test('transcript reducer renders durable message pages and SSE frames', () => {
+  await test('transcript renders durable message pages (no foreign SSE vocabulary)', () => {
     const messages = [
       {
         seq: 2,
@@ -2320,32 +2693,11 @@ async function stateTests() {
     assertEqual(entries[1].tools[0].excerpt, 'ok');
     assertEqual(entries[1].tools[0].exitCode, 0);
     assertEqual(entries[1].tools[0].artifact, 'evidence:41');
-
-    let sse = st.applySseEvent([], 'message_created', {
-      event: 'message_created',
-      session_id: '7',
-      message: {
-        id: '9',
-        role: 'assistant',
-        seq: 9,
-        created_ms: 1,
-        parts: [{ type: 'text', text: 'hi' }],
-      },
-    });
-    assertEqual(sse.length, 1);
-    sse = st.applySseEvent(sse, 'message_part_updated', {
-      message_id: '9',
-      part: { type: 'text', text: ' there' },
-    });
-    assertEqual(sse[0].text, 'hi there');
-    sse = st.applySseEvent(sse, 'message_part_updated', {
-      message_id: '9',
-      part: { type: 'tool_call', tool_call_id: 'c1', name: 'bash', input: {}, state: 'running' },
-    });
-    assertEqual(sse[0].tools[0].state, 'running');
-    sse = st.applySseEvent(sse, 'tool_call_state', { tool_call_id: 'c1', state: 'completed' });
-    assertEqual(sse[0].tools[0].state, 'completed');
-    assert(st.applySseEvent(sse, 'unrelated_event', {}) === sse, 'unrelated events must not clone');
+    assertEqual(
+      st.applySseEvent,
+      undefined,
+      'the delta reducer is removed: a daemon EventKind frame cannot claim incremental message handling',
+    );
   });
 
   await test('transcript is bounded to MAX_TRANSCRIPT_ENTRIES', () => {
@@ -5820,6 +6172,122 @@ async function acceptanceProofTests() {
     button.click();
     assertDeepEqual(posted[posted.length - 1], { type: 'retrieveEvidence', evidenceId: 42 });
   });
+
+  await test('out-of-range epoch stamps degrade to unavailable, never a RangeError', () => {
+    const hostile = proofCockpit({
+      records: [
+        {
+          recordId: 'hostile-time',
+          status: 'passed',
+          startedMs: 9_223_372_036_854_775_000,
+          completedMs: -8_640_000_000_000_001,
+          criteria: [{ criterionKey: 'timed', passed: true }],
+          checks: [],
+        },
+      ],
+    });
+    const row = hostile.criteriaProof[0];
+    assertEqual(
+      row.timestamp.startedMs,
+      9_223_372_036_854_775_000,
+      'the served stamp is preserved on the structured row',
+    );
+    const rendered = cp.criterionProofLine(row);
+    assert(rendered.includes('timestamp unavailable'), rendered);
+    // One renderable stamp still renders; only the broken side is absent.
+    const mixed = proofCockpit({
+      records: [
+        {
+          recordId: 'mixed-time',
+          status: 'passed',
+          startedMs: 1700000000000,
+          completedMs: Number.NaN,
+          criteria: [{ criterionKey: 'mixed', passed: true }],
+          checks: [],
+        },
+      ],
+    });
+    const mixedLine = cp.criterionProofLine(mixed.criteriaProof[0]);
+    assert(mixedLine.includes('2023-11-14T22:13:20Z'), mixedLine);
+    assert(!mixedLine.includes('NaN'), mixedLine);
+    // The webview renderer holds the same guarantee.
+    const snapshot = webviewSnapshot([]);
+    snapshot.cockpit = hostile;
+    snapshot.cockpitSections = cp.cockpitSections(hostile);
+    const { dom } = runChatWebview(snapshot);
+    const text = fakeText(dom.document.getElementById('cockpit'));
+    assert(text.includes('verification timestamp unavailable'), text);
+    assert(!text.includes('Invalid Date'), text);
+  });
+
+  await test('a cockpit projection failure is isolated from the rest of the snapshot patch', () => {
+    // A malformed verification payload (criteria is not an array) throws
+    // inside buildCockpit; projectCockpit degrades it to an explicit error.
+    const broken = cp.projectCockpit({
+      task: proofTask([]),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: {
+        records: [
+          {
+            recordId: 'broken',
+            status: 'passed',
+            startedMs: 1700000000000,
+            completedMs: null,
+            criteria: null,
+            checks: [],
+          },
+        ],
+      },
+    });
+    assertEqual(broken.cockpit, null, 'the broken cockpit is dropped');
+    assertDeepEqual(broken.sections, [], 'no partial sections are patched');
+    assert(
+      typeof broken.error === 'string' && broken.error.length > 0,
+      'the exact failure is surfaced',
+    );
+    // The healthy path is unchanged.
+    const healthy = cp.projectCockpit({
+      task: proofTask([]),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: {
+        records: [
+          {
+            recordId: 'ok',
+            status: 'passed',
+            startedMs: 1700000000000,
+            completedMs: null,
+            criteria: [{ criterionKey: 'c', passed: true }],
+            checks: [],
+          },
+        ],
+      },
+    });
+    assert(healthy.cockpit !== null, 'the healthy projection must build');
+    assertEqual(healthy.error, null);
+    assert(
+      healthy.sections.some((section) => section.key === 'acceptance'),
+      `the healthy projection must carry the acceptance section: ${healthy.sections
+        .map((section) => section.key)
+        .join(',')}`,
+    );
+    // The rest of the snapshot still renders when the cockpit block is the
+    // explicit unavailable fallback (the patch isolation guarantee).
+    const snapshot = webviewSnapshot([]);
+    snapshot.task = { state: 'running', goal: 'still patched', completion: null };
+    snapshot.cockpit = null;
+    snapshot.cockpitSections = [];
+    const { dom } = runChatWebview(snapshot);
+    assertEqual(
+      dom.document.getElementById('task-goal').textContent,
+      'still patched',
+      'task state must still render when the cockpit is unavailable',
+    );
+    assertEqual(dom.document.getElementById('task-card').hidden, false);
+  });
 }
 
 // ----------------------------------------- presentation webview (fake DOM)
@@ -6681,6 +7149,14 @@ async function composerAttachmentTests() {
     assert(
       extension.includes('postStreamBlocked('),
       'the blocked reason must reach the panel',
+    );
+    assert(
+      extension.includes('projectCockpit('),
+      'a cockpit projection failure must be isolated from the rest of the snapshot patch',
+    );
+    assert(
+      !extension.includes('buildCockpit('),
+      'the refresh must use only the failure-isolated cockpit projection',
     );
     assert(
       extension.includes('composerAttachments.clear()'),
@@ -9027,6 +9503,7 @@ async function main() {
   await validatorRejects();
   await clientAccepts();
   await clientRejects();
+  await contractDriftTests();
   await eventStreamTests();
   await stateTests();
   await daemonTests();

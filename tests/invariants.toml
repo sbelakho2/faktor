@@ -344,3 +344,85 @@ script_check = "prompt submission identity: identical retry reuses the id, edits
 mutation_witness = "prompt submission identity: identical retry reuses the id, edits mint new"
 mutation_debt = "witness is the selection rule's oracle; no planted-mutation run wired yet"
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-SANDBOX-PRIVILEGE-DROP"
+statement = "A confined shell drops every capability, sets NO_NEW_PRIVS, and cannot setns back to the host network namespace; any failed drop refuses typed."
+owner = "crates/terminal sandbox/linux.rs"
+authority = "crates/terminal sandbox/linux.rs"
+unit_test = "deny_all_spawn_isolates_the_child_or_refuses_typed"
+production_wiring = "deny_all_is_refused_before_spawn_without_a_backend"
+mutation_witness = "deny_all_spawn_isolates_the_child_or_refuses_typed"
+mutation_debt = "privilege-gated: positive capability assertions run only on a root lane; no planted-mutation run yet"
+platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-FS-MUTATION-PARENT-REVERIFY"
+statement = "Merge/rollback/CAS writers re-verify the parent immediately before every mutation, so a parent swapped to an outside symlink after resolution refuses typed and never touches the victim."
+owner = "crates/fs entry_state/lib writers"
+authority = "crates/fs entry_state/lib writers"
+unit_test = "merge_apply_content_refuses_a_parent_swapped_to_an_outside_symlink"
+production_wiring = "entry_state_transitions_refuse_a_parent_swapped_to_an_outside_symlink"
+mutation_witness = "cas_write_content_refuses_a_parent_swapped_to_an_outside_symlink"
+mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-PTY-CONTROL-PIPE-CLOEXEC"
+statement = "The guardian control pipe is created atomically close-on-exec (pipe2 on Linux/BSD, O_CLOEXEC FIFO fallback), so a concurrently spawned child can never hold either end."
+owner = "crates/pty guardian/mod.rs"
+authority = "crates/pty guardian/mod.rs"
+unit_test = "control_pipe_is_cloexec_at_creation"
+production_wiring = "child_spawned_during_creation_cannot_hold_the_control_pipe"
+mutation_witness = "control_pipe_is_cloexec_at_creation"
+mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-REDACTION-CAP-FAIL-CLOSED"
+statement = "A redaction cap never passes the unprocessed tail through: decoys cannot shield a later real secret and the tail becomes a fixed truncation marker."
+owner = "crates/security + provider sanitize + commerce-connectors"
+authority = "crates/security + provider sanitize + commerce-connectors"
+unit_test = "decoy_hits_before_the_real_secret_never_expose_it"
+production_wiring = "property_no_pattern_secret_survives_any_decoy_count"
+mutation_witness = "at_most_32_occurrences_are_redacted"
+mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-TERMINAL-EVENTS-SESSION-ISOLATED"
+statement = "Terminal lifetime event pages are session-isolated: refresh+page under one lock and every emitted frame filtered by the resolved session, even under interleaved or concurrent reads."
+owner = "crates/server native/terminal.rs"
+authority = "crates/server native/terminal.rs"
+unit_test = "interleaved_foreign_refresh_cannot_cross_into_a_terminal_event_page"
+production_wiring = "concurrent_terminal_event_reads_never_cross_session_frames"
+mutation_witness = "interleaved_foreign_refresh_cannot_cross_into_a_terminal_event_page"
+mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-ARTIFACT-READ-LOUD-SCOPED"
+statement = "Artifact reads are session-scoped and fallible: an undecodable or SQL-failing row is a typed Corrupt error, never absent, and per-session metadata is never silently discarded."
+owner = "crates/store attachments.rs + session artifacts.rs"
+authority = "crates/store attachments.rs + session artifacts.rs"
+unit_test = "artifact_read_refuses_hostile_columns_never_absent"
+production_wiring = "artifact_identity_is_per_session_and_never_silently_discarded"
+mutation_witness = "migration_v28_rebuilds_artifact_identity_per_session_and_preserves_rows"
+mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+platforms = ["linux", "macos", "windows"]
+
+
+[[invariant]]
+id = "INV-CLIENT-ROUTE-CONTRACT"
+statement = "Every VS Code client route and handled event name matches the daemon router and EventKind vocabulary, enforced by a source-parsed drift test."
+owner = "apps/vscode nativeClient/eventStream"
+authority = "apps/vscode/src/nativeClient.ts + eventStream.ts"
+script_check = "client routes match the daemon router (no /session/* fallback)"
+mutation_witness = "client routes match the daemon router (no /session/* fallback)"
+mutation_debt = "source-parsed drift test is the oracle; no planted-mutation run wired yet"
+platforms = ["linux", "macos", "windows"]

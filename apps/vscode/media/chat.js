@@ -175,6 +175,22 @@
   }
 
   /**
+   * ISO text of one epoch-ms stamp, or null when the value is non-finite or
+   * outside the JS Date range: an unrenderable stamp is an honest absence,
+   * never a RangeError that aborts the whole panel render.
+   */
+  function utcMs(value) {
+    if (typeof value !== 'number' || !isFinite(value)) {
+      return null;
+    }
+    var date = new Date(value);
+    if (!isFinite(date.getTime())) {
+      return null;
+    }
+    return date.toISOString();
+  }
+
+  /**
    * One acceptance-criterion PROOF row: verdict (pass/fail/unavailable,
    * each with a distinct class), requirement/origin/binding with its exact
    * reference, the proven snapshots and verification timestamps, and the
@@ -242,11 +258,13 @@
 
     var timestamp = value.timestamp || {};
     var atBits = [];
-    if (typeof timestamp.startedMs === 'number') {
-      atBits.push('started ' + new Date(timestamp.startedMs).toISOString());
+    var startedText = utcMs(timestamp.startedMs);
+    if (startedText !== null) {
+      atBits.push('started ' + startedText);
     }
-    if (typeof timestamp.completedMs === 'number') {
-      atBits.push('completed ' + new Date(timestamp.completedMs).toISOString());
+    var completedText = utcMs(timestamp.completedMs);
+    if (completedText !== null) {
+      atBits.push('completed ' + completedText);
     }
     line(
       card,

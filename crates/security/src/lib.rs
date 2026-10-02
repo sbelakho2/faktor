@@ -20,7 +20,10 @@
 //!      (tool inputs/outputs). These scan the FULL text — there is no
 //!      truncation window that silently ignores a suffix (audit P0-37: the
 //!      old 256 KiB prefix cap let a secret past the boundary go undetected
-//!      while reporting `Clean`).
+//!      while reporting `Clean`). Redaction replaces up to
+//!      [`MAX_REDACTIONS`] hits and, when more remain, replaces the ENTIRE
+//!      unprocessed tail with [`REDACTION_TRUNCATION_MARKER`] — a cap is
+//!      never a raw pass-through for occurrences past it.
 //!    - **Whole-payload** [`payload::scan_payload`] /
 //!      [`payload::Scanner`] for outbound byte bodies. The scanner STREAMS
 //!      the entire payload through a bounded overlap window (the longest
@@ -704,14 +707,18 @@ impl CompiledSecretPolicy {
             .collect()
     }
 
-    /// Redact the first [`MAX_REDACTIONS`] hits using the compiled policy
-    /// (same semantics as [`redact`]).
+    /// Redact up to the first [`MAX_REDACTIONS`] hits using the compiled
+    /// policy (same semantics as [`redact`]). When more hits remain, the
+    /// ENTIRE unprocessed tail is replaced by
+    /// [`REDACTION_TRUNCATION_MARKER`] — occurrences past the cap are never
+    /// copied through raw.
     pub fn redact_text(&self, text: &str) -> String {
         let spans =
             collect_spans_from_compiled(text, self.compiled.iter().map(Vec::as_slice).enumerate());
         if spans.is_empty() {
             return text.to_string();
         }
+        let capped = spans.len() > MAX_REDACTIONS;
         let mut out = String::with_capacity(text.len() + 64);
         let mut cursor = 0usize;
         for span in spans.into_iter().take(MAX_REDACTIONS) {
@@ -725,7 +732,11 @@ impl CompiledSecretPolicy {
             out.push('>');
             cursor = span.end;
         }
-        out.push_str(&text[cursor..]);
+        if capped {
+            out.push_str(REDACTION_TRUNCATION_MARKER);
+        } else {
+            out.push_str(&text[cursor..]);
+        }
         out
     }
 
@@ -819,14 +830,18 @@ pub fn scan_secrets(text: &str, policy: &SecretPolicy) -> Vec<SecretHit> {
         .collect()
 }
 
-/// Replace the first 32 detected hits of `text` with
+/// Replace up to the first 32 detected hits of `text` with
 /// `<redacted:{kind}>`. Text outside the hits is left byte-for-byte
 /// untouched. A disabled policy (or no hits) returns the input unchanged.
+/// When more than 32 hits exist, the ENTIRE unprocessed tail (from the end
+/// of the 32nd hit) is replaced by [`REDACTION_TRUNCATION_MARKER`] — hits
+/// past the cap are never copied through raw.
 pub fn redact(text: &str, policy: &SecretPolicy) -> String {
     let spans = collect_spans(text, policy);
     if spans.is_empty() {
         return text.to_string();
     }
+    let capped = spans.len() > MAX_REDACTIONS;
     let mut out = String::with_capacity(text.len() + 64);
     let mut cursor = 0usize;
     for span in spans.into_iter().take(MAX_REDACTIONS) {
@@ -837,13 +852,23 @@ pub fn redact(text: &str, policy: &SecretPolicy) -> String {
         out.push('>');
         cursor = span.end;
     }
-    out.push_str(&text[cursor..]);
+    if capped {
+        out.push_str(REDACTION_TRUNCATION_MARKER);
+    } else {
+        out.push_str(&text[cursor..]);
+    }
     out
 }
 
 /// Only the first this-many hits per redaction call are replaced (bounded
-/// output growth on hostile inputs).
+/// output growth on hostile inputs). When more hits remain, the entire
+/// unprocessed tail becomes one [`REDACTION_TRUNCATION_MARKER`] instead of
+/// being appended raw: a cap is a bound on work, never a pass-through
+/// window for occurrences past it.
 const MAX_REDACTIONS: usize = 32;
+
+/// Replacement for the entire unprocessed tail once a redaction cap fires.
+pub const REDACTION_TRUNCATION_MARKER: &str = "<redacted:truncated>";
 
 /// At most this many chars a [`SecretHit::snippet`] spans.
 const SNIPPET_CAP_CHARS: usize = 40;
@@ -1623,7 +1648,143 @@ mod tests {
         let text = (0..40).map(|_| one).collect::<Vec<_>>().join(" ");
         let out = redact(&text, &policy);
         assert_eq!(out.matches("<redacted:github_token>").count(), 32);
-        assert_eq!(out.matches(one).count(), 8); // remaining hits untouched
+        assert_eq!(
+            out.matches(one).count(),
+            0,
+            "occurrences past the cap must never survive"
+        );
+        assert!(
+            out.contains(REDACTION_TRUNCATION_MARKER),
+            "the unprocessed tail must be replaced by the truncation marker: {out}"
+        );
+    }
+
+    #[test]
+    fn decoy_hits_before_the_real_secret_never_expose_it() {
+        let policy = SecretPolicy::default();
+        let decoy = "AKIA0123456789ABCDEF";
+        let real = "ghp_0123456789abcdefghijklmnopqrstuv";
+        let mut text = (0..MAX_REDACTIONS)
+            .map(|_| decoy)
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push(' ');
+        text.push_str(real);
+        let out = redact(&text, &policy);
+        assert_eq!(out.matches(decoy).count(), 0, "{out}");
+        assert_eq!(out.matches(real).count(), 0, "real secret leaked: {out}");
+        assert!(out.contains(REDACTION_TRUNCATION_MARKER), "{out}");
+    }
+
+    #[test]
+    fn redaction_cap_boundary_is_exact_and_fail_closed() {
+        let policy = SecretPolicy::default();
+        let one = "AKIA0123456789ABCDEF";
+        // Exactly the cap: every occurrence replaced, tail preserved.
+        let at_cap = (0..MAX_REDACTIONS)
+            .map(|_| one)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = redact(&at_cap, &policy);
+        assert_eq!(out.matches("<redacted:aws_key>").count(), MAX_REDACTIONS);
+        assert_eq!(out.matches(one).count(), 0);
+        assert!(
+            !out.contains(REDACTION_TRUNCATION_MARKER),
+            "a cap-sized input must keep its tail: {out}"
+        );
+        // Cap + 1: the whole unprocessed tail (including occurrence cap+1)
+        // is replaced by the marker.
+        let over = format!("{at_cap} {one}");
+        let out = redact(&over, &policy);
+        assert_eq!(out.matches("<redacted:aws_key>").count(), MAX_REDACTIONS);
+        assert_eq!(out.matches(one).count(), 0);
+        assert!(out.contains(REDACTION_TRUNCATION_MARKER), "{out}");
+    }
+
+    #[test]
+    fn multibyte_text_at_the_redaction_cap_never_panics() {
+        let policy = SecretPolicy::default();
+        let one = "AKIA0123456789ABCDEF";
+        let decoys = (0..MAX_REDACTIONS)
+            .map(|i| format!("é{i} {one}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let real = "ghp_0123456789abcdefghijklmnopqrstuv";
+        let text = format!("{decoys} é {real} é");
+        let out = redact(&text, &policy);
+        assert!(!out.contains(one), "{out}");
+        assert!(!out.contains(real), "{out}");
+        assert!(out.contains(REDACTION_TRUNCATION_MARKER), "{out}");
+    }
+
+    #[test]
+    fn under_cap_redaction_preserves_the_non_secret_tail() {
+        let policy = SecretPolicy::default();
+        let text = "AKIA0123456789ABCDEF middle tail words";
+        let out = redact(text, &policy);
+        assert_eq!(out, "<redacted:aws_key> middle tail words");
+        assert!(!out.contains(REDACTION_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn compiled_redact_text_never_passes_hits_past_the_cap() {
+        let compiled = CompiledSecretPolicy::try_from(SecretPolicy::default()).unwrap();
+        let decoy = "ghp_0123456789abcdefghijklmnopqrstuv";
+        let real = "AKIA0123456789ABCDEF";
+        let mut text = (0..MAX_REDACTIONS)
+            .map(|_| decoy)
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push(' ');
+        text.push_str(real);
+        let out = compiled.redact_text(&text);
+        assert_eq!(out.matches(decoy).count(), 0, "{out}");
+        assert_eq!(out.matches(real).count(), 0, "compiled tail leaked: {out}");
+        assert_eq!(
+            out.matches("<redacted:github_token>").count(),
+            MAX_REDACTIONS
+        );
+        assert!(out.contains(REDACTION_TRUNCATION_MARKER), "{out}");
+    }
+
+    #[test]
+    fn property_no_pattern_secret_survives_any_decoy_count() {
+        let policy = SecretPolicy::default();
+        let decoys = [
+            "AKIA0123456789ABCDEF",
+            "ghp_0123456789abcdefghijklmnopqrstuv",
+        ];
+        let reals = [
+            "sk-0123456789abcdefghijklmnopqrstuv",
+            "xoxb-1234567890-abcdefghij-1234567890",
+        ];
+        for decoy_count in [
+            0usize,
+            1,
+            MAX_REDACTIONS - 1,
+            MAX_REDACTIONS,
+            MAX_REDACTIONS + 1,
+            3 * MAX_REDACTIONS,
+        ] {
+            let decoy_text = (0..decoy_count)
+                .map(|i| decoys[i % decoys.len()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            for real in reals {
+                let text = format!("{decoy_text} {real} {decoy_text}");
+                let out = redact(&text, &policy);
+                for secret in decoys.iter().chain(reals.iter()) {
+                    assert!(
+                        !out.contains(secret),
+                        "decoy_count={decoy_count} leaked {secret}: {out}"
+                    );
+                }
+                assert!(
+                    scan_secrets(&out, &policy).is_empty(),
+                    "decoy_count={decoy_count}: redacted output still scans dirty"
+                );
+            }
+        }
     }
 
     #[test]

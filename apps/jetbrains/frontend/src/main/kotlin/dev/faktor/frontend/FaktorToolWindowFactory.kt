@@ -33,7 +33,12 @@ class FaktorToolWindowFactory : ToolWindowFactory {
             dataDir,
             controlToken = credentialStore.resolve(scopeStore.read())
         )
-        val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore)
+        // The session workspace root is the project base path: attachment
+        // paths are relativized against it and session creation carries it,
+        // so the daemon resolves the submitted workspace-relative `files`
+        // against the same root (the projection exposes no workspace path).
+        val workspaceRoot = project.basePath?.let { Paths.get(it) }
+        val panel = FaktorChatPanel(service, credentialStore, scopeStore, sessionStore, workspaceRoot)
         val content = ContentFactory.getInstance().createContent(panel, "Faktor", false)
         Disposer.register(
             content,

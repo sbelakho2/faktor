@@ -1,6 +1,7 @@
-// Typed client of the Faktor Native Protocol v1 (docs/native-protocol.md)
-// plus the minimal SDK-shaped session surface (`/session/create`,
-// `/session/list`) the native surface does not duplicate.
+// Typed client of the Faktor Native Protocol v1 (docs/native-protocol.md).
+// Session bootstrap and listing use the daemon's own native routes
+// (`POST /native/session`, `GET /native/sessions`); there is no foreign
+// SDK-shaped `/session/*` surface to fall back to.
 //
 // Design rules:
 //   - Dependency-free: no axios, no vscode import, no DOM lib. The fetch
@@ -210,6 +211,31 @@ function fInt(object: JsonObject, key: string, path: string): number {
 }
 
 /**
+ * The JS `Date` range: `new Date(ms).toISOString()` throws RangeError outside
+ * ±8.64e15, so a durable epoch-ms stamp beyond it can never be rendered and is
+ * refused at the wire boundary instead of crashing a renderer later. The bound
+ * is tighter than `Number.MAX_SAFE_INTEGER`, so it also covers the generated
+ * DTOs' `Number.isSafeInteger` strictness.
+ */
+export const MAX_EPOCH_MS = 8_640_000_000_000_000;
+
+function epochMsValue(value: Json, path: string): number {
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    Math.abs(value) > MAX_EPOCH_MS
+  ) {
+    const got = typeof value === 'number' ? String(value) : describe(value);
+    fail(path, `expected an epoch-ms integer within ±${MAX_EPOCH_MS}, got ${got}`);
+  }
+  return value;
+}
+
+function fEpochMs(object: JsonObject, key: string, path: string): number {
+  return epochMsValue(field(object, key, path), `${path}.${key}`);
+}
+
+/**
  * Parse one exact non-negative integer money/limit value. The daemon's
  * canonical form for money is a decimal string (exact for the full
  * u64/i64::MAX range); a legacy JSON number is accepted only while it is
@@ -309,6 +335,14 @@ function fNullableInt(object: JsonObject, key: string, path: string): number | n
     fail(`${path}.${key}`, `expected an integer or null, got ${describe(value)}`);
   }
   return value;
+}
+
+function fNullableEpochMs(object: JsonObject, key: string, path: string): number | null {
+  const value = field(object, key, path);
+  if (value === null) {
+    return null;
+  }
+  return epochMsValue(value, `${path}.${key}`);
 }
 
 function fNullableObject(object: JsonObject, key: string, path: string): JsonObject | null {
@@ -837,7 +871,7 @@ export interface NativeMessagePart {
 
 export interface NativeMessage {
   readonly seq: number;
-  /** Numeric durable message id (SSE `message_created` uses the wire string id). */
+  /** Numeric durable message id. */
   readonly id: number;
   readonly role: string;
   readonly createdMs: number;
@@ -1463,18 +1497,18 @@ export function validateReady(json: Json): NativeReady {
 }
 
 export function validateSessionCreated(json: Json): NativeSessionCreated {
-  const path = 'POST /session/create';
+  const path = 'POST /native/session';
   const object = asObject(json, path);
   checkResponseKeys(object, path, ['id', 'title', 'created_ms']);
   return {
     id: fString(object, 'id', path),
     title: fString(object, 'title', path),
-    created_ms: fInt(object, 'created_ms', path),
+    created_ms: fEpochMs(object, 'created_ms', path),
   };
 }
 
 export function validateSessionList(json: Json): NativeSessionSummary[] {
-  const path = 'GET /session/list';
+  const path = 'GET /native/sessions';
   const object = asObject(json, path);
   checkResponseKeys(object, path, ['sessions']);
   return fObjectArray(object, 'sessions', path).map((entry, index) =>
@@ -1643,7 +1677,7 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
     activeTool = {
       tool: fString(activeToolRaw, 'tool', `${path}.activeTool`),
       opId: fString(activeToolRaw, 'opId', `${path}.activeTool`),
-      startedMs: fInt(activeToolRaw, 'startedMs', `${path}.activeTool`),
+      startedMs: fEpochMs(activeToolRaw, 'startedMs', `${path}.activeTool`),
       status: fString(activeToolRaw, 'status', `${path}.activeTool`),
     };
   }
@@ -1656,8 +1690,8 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
     lastCheckpoint = {
       sequence: fInt(checkpointRaw, 'sequence', checkpointPath),
       path: fString(checkpointRaw, 'path', checkpointPath),
-      createdMs: fInt(checkpointRaw, 'createdMs', checkpointPath),
-      restoredMs: fNullableInt(checkpointRaw, 'restoredMs', checkpointPath),
+      createdMs: fEpochMs(checkpointRaw, 'createdMs', checkpointPath),
+      restoredMs: fNullableEpochMs(checkpointRaw, 'restoredMs', checkpointPath),
     };
   }
 
@@ -1667,7 +1701,7 @@ function validateProjectionAt(json: Json, path: string): NativeProjection {
     return {
       opId: fString(entry, 'opId', entryPath),
       tool: fString(entry, 'tool', entryPath),
-      startedMs: fInt(entry, 'startedMs', entryPath),
+      startedMs: fEpochMs(entry, 'startedMs', entryPath),
       effectStatus: fNullableString(entry, 'effectStatus', entryPath),
     };
   });
@@ -1737,8 +1771,8 @@ export function validateTurns(json: Json): NativeTurn[] {
       model: fString(object, 'model', itemPath),
       variant: fNullableString(object, 'variant', itemPath),
       toolMode: fNullableString(object, 'toolMode', itemPath),
-      startedAt: fInt(object, 'startedAt', itemPath),
-      updatedMs: fInt(object, 'updatedMs', itemPath),
+      startedAt: fEpochMs(object, 'startedAt', itemPath),
+      updatedMs: fEpochMs(object, 'updatedMs', itemPath),
       queueSeq: fNullableInt(object, 'queueSeq', itemPath),
       promptMessageId: fNullableInt(object, 'promptMessageId', itemPath),
     };
@@ -1914,7 +1948,7 @@ function optionalCompletion(object: JsonObject, path: string): NativeTaskComplet
       step: fString(entry, 'step', itemPath),
       status: fString(entry, 'status', itemPath),
       detail: fString(entry, 'detail', itemPath),
-      atMs: 'at_ms' in entry ? fNullableInt(entry, 'at_ms', itemPath) : null,
+      atMs: 'at_ms' in entry ? fNullableEpochMs(entry, 'at_ms', itemPath) : null,
       seq: 'seq' in entry ? fNullableInt(entry, 'seq', itemPath) : null,
     };
   });
@@ -2010,8 +2044,8 @@ export function validateCheckpoints(json: Json): NativeCheckpoint[] {
       afterHash: fNullableString(object, 'afterHash', itemPath),
       beforeExists: fBool(object, 'beforeExists', itemPath),
       afterExists: fBool(object, 'afterExists', itemPath),
-      createdMs: fInt(object, 'createdMs', itemPath),
-      restoredMs: fNullableInt(object, 'restoredMs', itemPath),
+      createdMs: fEpochMs(object, 'createdMs', itemPath),
+      restoredMs: fNullableEpochMs(object, 'restoredMs', itemPath),
     };
   });
 }
@@ -2027,7 +2061,7 @@ export function validateVerificationView(json: Json): NativeVerificationView {
       return {
         opId: fString(entry, 'opId', itemPath),
         tool: fString(entry, 'tool', itemPath),
-        startedMs: fInt(entry, 'startedMs', itemPath),
+        startedMs: fEpochMs(entry, 'startedMs', itemPath),
         status: fString(entry, 'status', itemPath),
         effectStatus: fNullableString(entry, 'effectStatus', itemPath),
       };
@@ -2315,7 +2349,7 @@ export function validateTournamentSummaries(json: Json): NativeTournamentSummary
       state: fString(object, 'state', itemPath),
       candidateCount: fInt(object, 'candidate_count', itemPath),
       winner: fNullableString(object, 'winner', itemPath),
-      decidedMs: fNullableInt(object, 'decided_ms', itemPath),
+      decidedMs: fNullableEpochMs(object, 'decided_ms', itemPath),
     };
   });
 }
@@ -2406,7 +2440,7 @@ function validateBoardPostAt(object: JsonObject, path: string): NativeBoardPost 
     // A hostile daemon cannot force an unbounded ref list into the frame.
     refs: fStringArray(object, 'refs', path).slice(0, 64),
     revision: fPositiveInt(object, 'revision', path),
-    created_ms: fInt(object, 'created_ms', path),
+    created_ms: fEpochMs(object, 'created_ms', path),
   };
 }
 
@@ -2528,14 +2562,14 @@ export function validateMessagePage(json: Json): NativeMessagePage {
         seq: fInt(entry, 'seq', itemPath),
         id: fInt(entry, 'id', itemPath),
         role: fString(entry, 'role', itemPath),
-        createdMs: fInt(entry, 'createdMs', itemPath),
+        createdMs: fEpochMs(entry, 'createdMs', itemPath),
         data: fJson(entry, 'data', itemPath),
         parts: fObjectArray(entry, 'parts', itemPath).map((part, partIndex) => {
           const partPath = `${itemPath}.parts[${partIndex}]`;
           checkResponseKeys(part, partPath, ['kind', 'createdMs', 'data']);
           return {
             kind: fString(part, 'kind', partPath),
-            createdMs: fInt(part, 'createdMs', partPath),
+            createdMs: fEpochMs(part, 'createdMs', partPath),
             data: fJson(part, 'data', partPath),
           };
         }),
@@ -2560,7 +2594,7 @@ export function validateEventPage(json: Json): NativeEventPage {
         kind: fString(entry, 'kind', itemPath),
         state: fString(entry, 'state', itemPath),
         opId: fNullableString(entry, 'opId', itemPath),
-        tsMs: fInt(entry, 'tsMs', itemPath),
+        tsMs: fEpochMs(entry, 'tsMs', itemPath),
         payload: fJson(entry, 'payload', itemPath),
       };
     }),
@@ -2844,7 +2878,7 @@ export function validateEntitlements(json: Json): NativeEntitlements {
       plan_id: fNullableString(view, 'plan_id', `${path}.entitlements`),
       plan_found: fBool(view, 'plan_found', `${path}.entitlements`),
       subscription_status: fNullableString(view, 'subscription_status', `${path}.entitlements`),
-      subscription_expires_ms: fNullableInt(view, 'subscription_expires_ms', `${path}.entitlements`),
+      subscription_expires_ms: fNullableEpochMs(view, 'subscription_expires_ms', `${path}.entitlements`),
       subscription_active: fBool(view, 'subscription_active', `${path}.entitlements`),
       features: fStringArray(view, 'features', `${path}.entitlements`),
       limits,
@@ -2870,11 +2904,11 @@ export function validateEntitlements(json: Json): NativeEntitlements {
           organization: fString(entry, 'organization', itemPath),
           kind: fString(entry, 'kind', itemPath),
           reference: fString(entry, 'reference', itemPath),
-          started_ms: fInt(entry, 'started_ms', itemPath),
-          ended_ms: fNullableInt(entry, 'ended_ms', itemPath),
+          started_ms: fEpochMs(entry, 'started_ms', itemPath),
+          ended_ms: fNullableEpochMs(entry, 'ended_ms', itemPath),
         };
       }),
-      now_ms: fInt(view, 'now_ms', `${path}.entitlements`),
+      now_ms: fEpochMs(view, 'now_ms', `${path}.entitlements`),
     },
   };
 }
@@ -2948,7 +2982,7 @@ function validateProofStep(object: JsonObject, path: string): NativeProofStep {
     detail: fNullableString(object, 'detail', path),
     snapshot: fNullableString(object, 'snapshot', path),
     seq: fNullableInt(object, 'seq', path),
-    atMs: fNullableInt(object, 'atMs', path),
+    atMs: fNullableEpochMs(object, 'atMs', path),
   };
 }
 
@@ -3125,7 +3159,7 @@ export function validateTaskProof(json: Json): NativeTaskProof {
             state: fString(task, 'state', `${path}.task`),
             revision: fNullableString(task, 'revision', `${path}.task`),
             goal: fString(task, 'goal', `${path}.task`),
-            updatedMs: fInt(task, 'updatedMs', `${path}.task`),
+            updatedMs: fEpochMs(task, 'updatedMs', `${path}.task`),
           },
     criteria: {
       recordId: fNullableString(criteria, 'recordId', `${path}.criteria`),
@@ -3424,8 +3458,8 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
         category: fString(entry, 'category', itemPath),
         required: fBool(entry, 'required', itemPath),
         status: fString(entry, 'status', itemPath),
-        startedMs: fInt(entry, 'startedMs', itemPath),
-        finishedMs: fNullableInt(entry, 'finishedMs', itemPath),
+        startedMs: fEpochMs(entry, 'startedMs', itemPath),
+        finishedMs: fNullableEpochMs(entry, 'finishedMs', itemPath),
         exit: fNullableInt(entry, 'exit', itemPath),
         summary: fNullableString(entry, 'summary', itemPath),
       };
@@ -3442,8 +3476,8 @@ function validateVerificationRecord(object: JsonObject, path: string): NativeVer
     unrelatedChanges: fStringArray(object, 'unrelatedChanges', path),
     reviewer: fJson(object, 'reviewer', path),
     status: fString(object, 'status', path),
-    startedMs: fInt(object, 'startedMs', path),
-    completedMs: fNullableInt(object, 'completedMs', path),
+    startedMs: fEpochMs(object, 'startedMs', path),
+    completedMs: fNullableEpochMs(object, 'completedMs', path),
     candidateProof: parseCandidateProof(looseObject(object, 'candidateProof')),
     verifiedSnapshot: looseString(object, 'verifiedSnapshot'),
     basedOnSnapshot: looseString(object, 'basedOnSnapshot'),
@@ -3825,14 +3859,14 @@ export class NativeClient {
     workspace?: string;
     title?: string;
   }): Promise<NativeSessionCreated> {
-    return this.request('POST', '/session/create', {
+    return this.request('POST', '/native/session', {
       body: { ...request },
       validate: validateSessionCreated,
     });
   }
 
   listSessions(): Promise<NativeSessionSummary[]> {
-    return this.request('GET', '/session/list', { validate: validateSessionList });
+    return this.request('GET', '/native/sessions', { validate: validateSessionList });
   }
 
   projection(sessionId: string): Promise<NativeProjection> {

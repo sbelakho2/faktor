@@ -1995,20 +1995,52 @@ object FrontendSmoke {
             assertEquals(3, navigator.evidenceCount())
             assertEquals(2, navigator.messageCount())
             assertEquals("{\"selector\":\"all\"}", navigator.selectorJson())
-            val attachments = AttachmentsPanel()
-            val dir = Files.createTempDirectory("faktor-attach-smoke-")
-            val file = Files.createFile(Paths.get(dir.toString(), "note.txt"))
+            val workspace = Files.createTempDirectory("faktor-attach-smoke-")
+            val srcDir = Files.createDirectory(Paths.get(workspace.toString(), "src"))
+            val file = Files.createFile(Paths.get(srcDir.toString(), "note.txt"))
+            val attachments = AttachmentsPanel(workspace)
             attachments.addFiles(listOf(file.toString(), file.toString()))
             assertEquals(1, attachments.count())
             assertEquals(1, attachments.files().size)
-            assertTrue(!attachments.files()[0].startsWith(".."), "paths must be absolute")
+            assertEquals(
+                "src/note.txt",
+                attachments.files()[0],
+                "a picked absolute path inside the workspace is submitted relative"
+            )
+            assertEquals(0, attachments.refusalCount(), "an inside-workspace pick is never refused")
+            // An outside-workspace pick is refused TYPED and stays visible in
+            // the refusal list; it never enters the submitted path list.
+            val outside = Files.createTempFile("faktor-attach-outside-", ".txt")
+            attachments.addFiles(listOf(outside.toString()))
+            assertEquals(1, attachments.count(), "an outside-workspace entry is never staged")
+            assertEquals(1, attachments.refusalCount())
+            assertEquals("outside_workspace", attachments.refusals()[0].code)
+            assertTrue(
+                attachments.refusals()[0].message!!.contains("outside the session workspace"),
+                attachments.refusals()[0].message ?: "no message"
+            )
+            // Without a known workspace root every path entry is refused
+            // typed instead of being forwarded absolute (the daemon refuses
+            // absolute attached files).
+            val rootless = AttachmentsPanel()
+            rootless.addFiles(listOf(file.toString()))
+            assertEquals(0, rootless.count())
+            assertEquals("workspace_unknown", rootless.refusals()[0].code)
+            // Traversal and control characters are refused with the VS Code
+            // client's vocabulary, never normalized into the workspace.
+            attachments.addFiles(listOf("../escape.rs", "bad\u0001name.rs"))
+            assertEquals(3, attachments.refusalCount())
+            assertEquals("outside_workspace", attachments.refusals()[1].code)
+            assertEquals("invalid_path", attachments.refusals()[2].code)
             attachments.clear()
             assertEquals(0, attachments.count())
+            assertEquals(0, attachments.refusalCount(), "clear also drops the refusals")
+            rootless.clear()
             // Image parity: the classifier mirrors the daemon allowlist and
             // the bounded read refuses an oversized image before base64.
             assertEquals("image/png", AttachmentImages.mimeOf("shot.PNG"))
-            assertEquals("image/jpeg", AttachmentImages.mimeOf(dir.toString() + "/a.jpeg"))
-            assertTrue(AttachmentImages.mimeOf(dir.toString() + "/spec.pdf") == null)
+            assertEquals("image/jpeg", AttachmentImages.mimeOf(workspace.toString() + "/a.jpeg"))
+            assertTrue(AttachmentImages.mimeOf(workspace.toString() + "/spec.pdf") == null)
             val shot = Files.createTempFile("faktor-attach-image-", ".png")
             Files.write(shot, byteArrayOf(1, 2, 3, 4))
             val read = AttachmentImages.readBounded(shot.toFile())
@@ -2097,12 +2129,12 @@ object FrontendSmoke {
             val policy = AttachmentImages.emergencyPolicy()
             Files.write(file, bytesA)
             file.toFile().setLastModified(stamp)
-            val keyA = planAttachments(listOf(file.toString()), emptyList(), policy)
+            val keyA = planAttachments(listOf(file.toString()), emptyList(), policy, dir)
                 .uploads.single().key
             // Same path, same length, same mtime; different bytes => fresh identity.
             Files.write(file, bytesB)
             file.toFile().setLastModified(stamp)
-            val keyB = planAttachments(listOf(file.toString()), emptyList(), policy)
+            val keyB = planAttachments(listOf(file.toString()), emptyList(), policy, dir)
                 .uploads.single().key
             assertTrue(
                 keyA != keyB,
@@ -2114,14 +2146,14 @@ object FrontendSmoke {
             val twin = Paths.get(otherDir.toString(), "doc.txt")
             Files.write(twin, bytesB)
             twin.toFile().setLastModified(stamp + 1)
-            val keyTwin = planAttachments(listOf(twin.toString()), emptyList(), policy)
+            val keyTwin = planAttachments(listOf(twin.toString()), emptyList(), policy, dir)
                 .uploads.single().key
             assertEquals(keyB, keyTwin, "identity is content+filename, not path or mtime")
             // Identical bytes under a DIFFERENT filename is a distinct
             // reference: a rename/re-select must upload fresh.
             val renamed = Paths.get(otherDir.toString(), "renamed.txt")
             Files.write(renamed, bytesB)
-            val keyRenamed = planAttachments(listOf(renamed.toString()), emptyList(), policy)
+            val keyRenamed = planAttachments(listOf(renamed.toString()), emptyList(), policy, dir)
                 .uploads.single().key
             assertTrue(
                 keyB != keyRenamed,
@@ -2270,9 +2302,11 @@ object FrontendSmoke {
         }
 
         // Document delivery (audit 13): the advertised document contract
-        // drives the plan; source files stay repository paths; unsupported
-        // MIME / oversize entries are typed refusals before any upload.
-        step("attachment plan: documents upload when advertised, source files stay paths") {
+        // drives the plan; ordinary source files stay WORKSPACE-RELATIVE
+        // paths (absolute picks inside the root are relativized, never sent
+        // absolute); outside-workspace entries are typed refusals before any
+        // upload, exactly like unsupported MIME / oversize entries.
+        step("attachment plan: documents upload when advertised, source files stay workspace-relative") {
             val root = System.getProperty("faktor.repo.root")
             val fixturePath =
                 if (root.isNullOrBlank()) Paths.get("fixtures", "attachment-limits.json")
@@ -2301,14 +2335,19 @@ object FrontendSmoke {
             val plan = planAttachments(
                 listOf(pdf.toString(), txt.toString(), source.toString(), "Makefile"),
                 listOf(binary),
-                policy
+                policy,
+                dir
             )
             assertEquals(
                 listOf(binary.mime, "application/pdf", "text/plain"),
                 plan.uploads.map { it.mime },
                 "binaries first, then deliverable documents (images must exist on disk)"
             )
-            assertEquals(listOf(source.toString(), "Makefile"), plan.pathFiles)
+            assertEquals(
+                listOf("Main.kt", "Makefile"),
+                plan.pathFiles,
+                "absolute picks inside the root are relativized; relative entries stay relative"
+            )
             assertTrue(
                 plan.uploads.all { it.base64.isNotEmpty() && it.key.isNotEmpty() },
                 "every upload is keyed and base64-ready"
@@ -2317,14 +2356,29 @@ object FrontendSmoke {
             // decides admission until the catalog is advertised.
             val emergency = planAttachments(
                 listOf(pdf.toString(), txt.toString()), emptyList(),
-                AttachmentImages.emergencyPolicy()
+                AttachmentImages.emergencyPolicy(), dir
             )
             assertEquals(2, emergency.uploads.size)
             assertEquals(0, emergency.pathFiles.size)
+            // Outside the workspace: an ordinary file is refused typed and
+            // never becomes a `files` entry, and an image upload is refused
+            // too (the session workspace is the one admitted root).
+            val outside = Files.createTempFile("faktor-plan-outside-", ".kt")
+            val outsideRefusal = refusalOf {
+                planAttachments(listOf(outside.toString()), emptyList(), policy, dir)
+            }
+            assertEquals("outside_workspace", outsideRefusal.code)
+            // Without a known workspace root NO path entry can be admitted:
+            // the absolute form would deterministically be refused by the
+            // daemon, so the client refuses it typed before any request.
+            val rootlessRefusal = refusalOf {
+                planAttachments(listOf(txt.toString()), emptyList(), policy)
+            }
+            assertEquals("workspace_unknown", rootlessRefusal.code)
             // Unsupported document MIME: the advertised list lacks text/plain.
             val pdfOnly = policy.copy(documentMimes = listOf("application/pdf"))
             val mimeRefusal = refusalOf {
-                planAttachments(listOf(txt.toString()), emptyList(), pdfOnly)
+                planAttachments(listOf(txt.toString()), emptyList(), pdfOnly, dir)
             }
             assertEquals("unsupported_document_type", mimeRefusal.code)
             assertTrue(
@@ -2333,7 +2387,9 @@ object FrontendSmoke {
             )
             // Advertised model without document input.
             val incapable = refusalOf {
-                planAttachments(listOf(pdf.toString()), emptyList(), policy.copy(documentCapable = false))
+                planAttachments(
+                    listOf(pdf.toString()), emptyList(), policy.copy(documentCapable = false), dir
+                )
             }
             assertEquals("unsupported_document_type", incapable.code)
             assertTrue(
@@ -2344,7 +2400,7 @@ object FrontendSmoke {
             val oversized = refusalOf {
                 planAttachments(
                     listOf(pdf.toString()), emptyList(),
-                    policy.copy(maxDocumentBytes = 4L)
+                    policy.copy(maxDocumentBytes = 4L), dir
                 )
             }
             assertEquals("oversized_document", oversized.code)
@@ -2363,7 +2419,7 @@ object FrontendSmoke {
             val partial = runCatching {
                 planAttachments(
                     listOf(pdf.toString(), txt.toString()), emptyList(),
-                    policy.copy(maxDocumentBytes = 4L)
+                    policy.copy(maxDocumentBytes = 4L), dir
                 )
             }
             assertTrue(partial.isFailure, "a refused entry fails the whole plan")
@@ -2459,11 +2515,36 @@ object FrontendSmoke {
                 }
                 val sid = sessionId
                 if (sid != null) {
-                    step("task-run accepts `files` (workspace-relative attachments path)") {
+                    step("task-run accepts the planned workspace-relative `files` (real daemon)") {
+                        // The full client path: pick an absolute file inside the
+                        // workspace, let the attachment panel relativize it,
+                        // plan it, and post the planned `files` — the daemon
+                        // must ACCEPT the relative list (absolute paths are
+                        // deterministically refused server-side). A source
+                        // file (not a deliverable document) stays a path.
+                        val attachmentRelative = "seed-attachment.rs"
+                        Files.write(
+                            Paths.get(workspace.toString(), attachmentRelative),
+                            "fn main() {}".toByteArray()
+                        )
+                        val panel = AttachmentsPanel(workspace)
+                        panel.addFiles(
+                            listOf(Paths.get(workspace.toString(), attachmentRelative).toString())
+                        )
+                        assertEquals(
+                            listOf(attachmentRelative),
+                            panel.files(),
+                            "the picked absolute path must relativize to the workspace root"
+                        )
+                        assertEquals(0, panel.refusalCount())
+                        val policy = AttachmentImages.emergencyPolicy()
+                        val plan = planAttachments(panel.files(), emptyList(), policy, workspace)
+                        assertEquals(listOf(attachmentRelative), plan.pathFiles)
+                        assertEquals(0, plan.uploads.size)
                         val started = client.startTaskRun(
                             sid,
                             "frontend smoke attachment",
-                            files = listOf("seed.txt"),
+                            files = plan.pathFiles,
                             submissionId = java.util.UUID.randomUUID().toString()
                         )
                         if (started.runId.isEmpty()) fail("no run id")

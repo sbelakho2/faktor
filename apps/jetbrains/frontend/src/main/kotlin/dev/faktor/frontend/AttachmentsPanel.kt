@@ -1,7 +1,14 @@
 // File attachments for the Task entry: a file chooser plus a drop list
 // (java.awt.dnd via Swing's TransferHandler) whose paths are submitted as
-// the `files` array of the native task-run request. Pure presentation: the
-// panel only owns the path list; callers read [files] when starting a run.
+// the `files` array of the native task-run request. Picked/dropped paths
+// are relativized against the SESSION WORKSPACE ROOT the panel was built
+// with (the IntelliJ host passes `Project.basePath`, the standalone
+// launcher its working directory; the same root rides session creation, so
+// the daemon resolves the relative paths against it — its projection
+// exposes no workspace path). An entry outside the root is refused TYPED
+// and stays visible in the refusal list, never silently dropped and never
+// sent as an absolute path (the daemon refuses absolute attached files).
+// Pure presentation otherwise: callers read [files] when starting a run.
 //
 // Binary parity with the VS Code client ([AttachmentImages]): allowlisted
 // image files and deliverable documents (PDF/plain text) picked here are
@@ -33,6 +40,7 @@ import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
+import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Base64
 import javax.imageio.ImageIO
@@ -257,7 +265,7 @@ class PlannedAttachmentUpload(
 
 /** The validated attachment plan of one task start. */
 class AttachmentPlan(
-    /** Workspace-relative/repository-context paths (`files`), never uploaded. */
+    /** Workspace-relative paths (`files`), never uploaded and never absolute. */
     val pathFiles: List<String>,
     /** Durable binary uploads (images + deliverable documents), in entry order. */
     val uploads: List<PlannedAttachmentUpload>
@@ -272,23 +280,118 @@ class AttachmentPlan(
 class AttachmentRefusal(
     val code: String,
     message: String
-) : IllegalStateException(message)
+) : IllegalStateException(message) {
+    override fun toString(): String = message ?: code
+}
+
+/** The composer-side path bound (parity with the VS Code client's cap). */
+const val MAX_ATTACHMENT_PATH_CHARS = 4096
+
+/** The normalized absolute session workspace root, or null when none is known. */
+private fun normalizedWorkspaceRoot(workspaceRoot: Path?): Path? =
+    workspaceRoot?.toAbsolutePath()?.normalize()
+
+/** The `/`-separated wire form of one workspace-relative path. */
+private fun relativeWireForm(path: Path): String =
+    path.joinToString("/") { it.toString() }
+
+/**
+ * The workspace-relative wire path of one attachment entry (a picked/dropped
+ * absolute path or an already-relative composer path), or a typed
+ * [AttachmentRefusal] when the entry is not a bounded, hostile-safe path
+ * inside the session workspace. An absolute entry outside [workspaceRoot]
+ * (or any entry when no root is known) is refused typed — never silently
+ * dropped and never forwarded as an absolute path; `..` traversal and
+ * control characters are refused with the VS Code client's vocabulary.
+ */
+fun workspaceRelativePath(path: String, workspaceRoot: Path?): String {
+    val trimmed = path.trim()
+    if (trimmed.isEmpty()) {
+        throw AttachmentRefusal("invalid_path", "an attachment path is empty or whitespace-only")
+    }
+    if (trimmed.length > MAX_ATTACHMENT_PATH_CHARS) {
+        throw AttachmentRefusal(
+            "invalid_path",
+            "attachment path exceeds $MAX_ATTACHMENT_PATH_CHARS characters"
+        )
+    }
+    if (trimmed.any { it.isISOControl() }) {
+        throw AttachmentRefusal("invalid_path", "attachment path \"$trimmed\" carries control characters")
+    }
+    val parsed = try {
+        Paths.get(trimmed)
+    } catch (e: Exception) {
+        throw AttachmentRefusal("invalid_path", "attachment path \"$trimmed\" is not a valid path")
+    }
+    // Platform-independent absolute forms: a Unix root separator, a Windows
+    // drive prefix or UNC backslash, or the platform's own absolute path.
+    val windowsDrive = trimmed.length >= 2 && trimmed[0].isLetter() && trimmed[1] == ':' &&
+        (trimmed.length == 2 || trimmed[2] == '/' || trimmed[2] == '\\')
+    val rootRelative = trimmed.startsWith("/") || trimmed.startsWith("\\")
+    if (parsed.isAbsolute || windowsDrive || rootRelative) {
+        val root = normalizedWorkspaceRoot(workspaceRoot)
+            ?: throw AttachmentRefusal(
+                "workspace_unknown",
+                "attachment \"$trimmed\" is absolute and no session workspace root is known to relativize it"
+            )
+        if (!parsed.isAbsolute) {
+            throw AttachmentRefusal(
+                "outside_workspace",
+                "attachment \"$trimmed\" is outside the session workspace $root"
+            )
+        }
+        val absolute = parsed.normalize()
+        if (absolute == root || !absolute.startsWith(root)) {
+            throw AttachmentRefusal(
+                "outside_workspace",
+                "attachment \"$trimmed\" is outside the session workspace $root"
+            )
+        }
+        return relativeWireForm(root.relativize(absolute))
+    }
+    if (parsed.any { it.toString() == ".." }) {
+        throw AttachmentRefusal(
+            "outside_workspace",
+            "attachment \"$trimmed\" traverses outside the workspace"
+        )
+    }
+    val relative = relativeWireForm(parsed.normalize())
+    if (relative.isEmpty()) {
+        throw AttachmentRefusal("invalid_path", "attachment path \"$trimmed\" names no file")
+    }
+    return relative
+}
+
+/** The local [File] one attachment path resolves to for a bounded read. */
+private fun readableAttachmentFile(path: String, workspaceRoot: Path?): File {
+    val relative = workspaceRelativePath(path, workspaceRoot)
+    val root = normalizedWorkspaceRoot(workspaceRoot)
+        ?: throw AttachmentRefusal(
+            "workspace_unknown",
+            "attachment \"$path\" cannot be resolved without a session workspace root"
+        )
+    return root.resolve(relative).toFile()
+}
 
 /**
  * Validate every composer attachment against the daemon-advertised policy
  * and build the exact start plan: pending in-memory binaries first, then
  * allowlisted image paths, then deliverable document paths (application/pdf,
  * text/plain when the advertised model supports them), and finally every
- * other path untouched on the repository-context `files` vocabulary (no
- * blind uploads of workspace source files). An undeliverable or oversize
- * entry throws a typed [AttachmentRefusal] BEFORE any upload, so nothing
- * partial ever reaches the durable store. A legacy (emergency) policy
- * leaves document admission to the daemon, exactly like the VS Code client.
+ * other path untouched on the workspace-relative `files` vocabulary (no
+ * blind uploads of workspace source files). Every entry is resolved against
+ * [workspaceRoot]: an absolute path inside the root is relativized, an
+ * entry outside it (or any entry without a known root) is a typed
+ * [AttachmentRefusal] BEFORE any upload, so nothing partial ever reaches
+ * the durable store and no absolute path ever rides the request. A legacy
+ * (emergency) policy leaves document admission to the daemon, exactly like
+ * the VS Code client.
  */
 fun planAttachments(
     files: List<String>,
     binaries: List<PendingBinaryAttachment>,
-    policy: AttachmentImages.Policy
+    policy: AttachmentImages.Policy,
+    workspaceRoot: Path? = null
 ): AttachmentPlan {
     val pathFiles = ArrayList<String>()
     val uploads = ArrayList<PlannedAttachmentUpload>()
@@ -343,8 +446,7 @@ fun planAttachments(
     for (path in files) {
         val imageMime = AttachmentImages.mimeOf(path)
         if (imageMime != null) {
-            val file = File(path)
-            val name = file.name
+            val name = File(path).name
             if (!policy.imageMimes.contains(imageMime)) {
                 throw AttachmentRefusal(
                     "unsupported_image_type",
@@ -353,6 +455,7 @@ fun planAttachments(
                         policy.imageMimes.joinToString(", ") + ")"
                 )
             }
+            val file = readableAttachmentFile(path, workspaceRoot)
             val bytes = AttachmentImages.readBounded(file, policy.maxImageBytes)
                 ?: throw AttachmentRefusal(
                     "oversized_image",
@@ -380,8 +483,7 @@ fun planAttachments(
         }
         val documentMime = AttachmentImages.documentMimeOf(path)
         if (documentMime != null) {
-            val file = File(path)
-            val name = file.name
+            val name = File(path).name
             if (policy.source == "advertised") {
                 if (!policy.documentCapable) {
                     throw AttachmentRefusal(
@@ -399,6 +501,7 @@ fun planAttachments(
                     )
                 }
             }
+            val file = readableAttachmentFile(path, workspaceRoot)
             val bytes = AttachmentImages.readBounded(file, policy.maxDocumentBytes)
                 ?: throw AttachmentRefusal(
                     "oversized_document",
@@ -424,9 +527,10 @@ fun planAttachments(
             )
             continue
         }
-        // Ordinary workspace source files keep the repository-context path
-        // vocabulary: the run reads them from the workspace, never re-uploads.
-        pathFiles.add(path)
+        // Ordinary workspace source files keep the workspace-relative path
+        // vocabulary: the run reads them from the session workspace, never
+        // re-uploads, and an entry outside the workspace is refused typed.
+        pathFiles.add(workspaceRelativePath(path, workspaceRoot))
     }
     return AttachmentPlan(pathFiles, uploads)
 }
@@ -583,11 +687,27 @@ class PendingAttachmentRetry(private val maxEntries: Int = MAX_PENDING_UPLOADS) 
 fun ProtocolAttachmentRef.attachmentId(): NativeAttachmentId =
     NativeAttachmentId(digest, mime, filename, size)
 
-class AttachmentsPanel : JPanel(BorderLayout()) {
+/**
+ * The Task composer's attachment list. [workspaceRoot] is the SESSION
+ * workspace root the picked/dropped paths are relativized against (the
+ * IntelliJ host passes `Project.basePath`, the standalone launcher its
+ * working directory); the same root rides session creation, so the daemon
+ * resolves the submitted `files` against it. A path outside the root (or
+ * any path when the root is unknown) is refused typed and shown in the
+ * refusal list — visible, never silently dropped and never sent absolute.
+ */
+class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderLayout()) {
 
     private val paths = DefaultListModel<String>()
 
     private val list = JList(paths)
+
+    /** Typed refusals of entries that never entered [paths]. */
+    private val refusals = DefaultListModel<AttachmentRefusal>()
+
+    private val refusalList = JList(refusals)
+
+    private val refusalScroll = JScrollPane(refusalList)
 
     /** In-memory binary attachments (clipboard images): NEVER filesystem paths. */
     private val binaries = DefaultListModel<PendingBinaryAttachment>()
@@ -610,6 +730,10 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
     init {
         list.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
         list.toolTipText = "drop files here to attach them to the task"
+        refusalList.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
+        refusalList.toolTipText = "refused attachments (outside the session workspace)"
+        refusalScroll.preferredSize = Dimension(0, 48)
+        refusalScroll.isVisible = false
         binaryList.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
         binaryList.toolTipText = "clipboard images staged in memory (uploaded as durable attachments)"
         binaryScroll.preferredSize = Dimension(0, 48)
@@ -629,8 +753,11 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
         removeButton.addActionListener {
             val selected = list.selectedValuesList
             for (path in selected) paths.removeElement(path)
+            val selectedRefusals = refusalList.selectedValuesList
+            for (refusal in selectedRefusals) refusals.removeElement(refusal)
             val selectedBinaries = binaryList.selectedValuesList
             for (binary in selectedBinaries) binaries.removeElement(binary)
+            updateRefusalVisibility()
             updateBinaryVisibility()
         }
         clearButton.addActionListener { clear() }
@@ -641,18 +768,29 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
         val body = JPanel(BorderLayout(0, 2))
         body.add(JScrollPane(list), BorderLayout.CENTER)
         val south = JPanel(BorderLayout())
-        south.add(binaryScroll, BorderLayout.NORTH)
+        south.add(refusalScroll, BorderLayout.NORTH)
+        south.add(binaryScroll, BorderLayout.CENTER)
         south.add(buttons, BorderLayout.SOUTH)
         body.add(south, BorderLayout.SOUTH)
         add(body, BorderLayout.CENTER)
     }
 
-    /** The attached absolute paths, in list order (the task-run `files` array). */
+    /** The attached workspace-relative paths, in list order (the task-run `files` array). */
     fun files(): List<String> {
         val out = ArrayList<String>()
         for (i in 0 until paths.size()) out.add(paths.getElementAt(i))
         return out
     }
+
+    /** The typed refusals of entries that stayed out of [files], in order. */
+    fun refusals(): List<AttachmentRefusal> {
+        val out = ArrayList<AttachmentRefusal>()
+        for (i in 0 until refusals.size()) out.add(refusals.getElementAt(i))
+        return out
+    }
+
+    /** The refused-entry count (visible in the refusal list, never staged). */
+    fun refusalCount(): Int = refusals.size()
 
     /** The in-memory binary attachments, in staging order (images only today). */
     fun binaryAttachments(): List<PendingBinaryAttachment> {
@@ -661,10 +799,24 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
         return out
     }
 
+    /**
+     * Stage picked/dropped paths: each entry is relativized against the
+     * session workspace root and held as a workspace-relative path. An entry
+     * outside the root, or any entry when no root is known, becomes a typed
+     * [AttachmentRefusal] recorded in the refusal list (and announced via
+     * [onNotice]) — never silently dropped and never staged as absolute.
+     */
     fun addFiles(pathsToAdd: List<String>) {
         for (path in pathsToAdd) {
-            val normalized = normalize(path) ?: continue
-            if (!contains(normalized)) paths.addElement(normalized)
+            val relative = try {
+                workspaceRelativePath(path, workspaceRoot)
+            } catch (e: AttachmentRefusal) {
+                refusals.addElement(e)
+                onNotice?.invoke("attachment refused: ${e.message}")
+                updateRefusalVisibility()
+                continue
+            }
+            if (!contains(relative)) paths.addElement(relative)
         }
     }
 
@@ -731,7 +883,9 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
 
     fun clear() {
         paths.clear()
+        refusals.clear()
         binaries.clear()
+        updateRefusalVisibility()
         updateBinaryVisibility()
     }
 
@@ -817,6 +971,12 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
         repaint()
     }
 
+    private fun updateRefusalVisibility() {
+        refusalScroll.isVisible = refusals.size() > 0
+        revalidate()
+        repaint()
+    }
+
     private fun DefaultListModel<PendingBinaryAttachment>.lastElementOrNull(): PendingBinaryAttachment? =
         if (size() == 0) null else getElementAt(size() - 1)
 
@@ -827,16 +987,6 @@ class AttachmentsPanel : JPanel(BorderLayout()) {
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             val selected = chooser.selectedFiles ?: emptyArray()
             addFiles(selected.map { it.absolutePath })
-        }
-    }
-
-    private fun normalize(path: String): String? {
-        val trimmed = path.trim()
-        if (trimmed.isEmpty()) return null
-        return try {
-            Paths.get(trimmed).toAbsolutePath().normalize().toString()
-        } catch (e: Exception) {
-            null
         }
     }
 
