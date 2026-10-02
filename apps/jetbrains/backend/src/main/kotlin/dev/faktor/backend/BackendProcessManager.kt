@@ -25,6 +25,11 @@
 //    the drain thread stops with the process (no orphans, no leak).
 //  - a crashed/missing daemon fails loudly: start() throws with the exit
 //    code and a bounded stdout tail.
+//  - external command capture (pid probes) drains the child CONCURRENTLY
+//    with the wait under a hard byte cap: output larger than the OS pipe
+//    capacity can never deadlock the lifecycle authority, output past the
+//    cap is discarded (the child still reaches exit), and a timeout kills
+//    AND reaps the process before the typed result is returned.
 package dev.faktor.backend
 
 import dev.faktor.shared.ReleaseDigest
@@ -33,7 +38,9 @@ import dev.faktor.shared.ReleasePidLine
 import dev.faktor.shared.StartupLine
 import dev.faktor.shared.asciiLowerCase
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.nio.file.Files
 import java.nio.file.Path
@@ -62,6 +69,19 @@ private const val PID_PROBE_TIMEOUT_MS = 5_000L
 private const val STOP_POLL_MS = 50L
 private const val HEALTH_PROBE_TIMEOUT_MS = 2_000L
 private const val ANNOUNCEMENT_VERIFY_MS = 3_000L
+
+/**
+ * The default retained-output cap of one external command ([runCommand]);
+ * the drainer keeps reading past it (discarding) so the child never blocks.
+ */
+internal const val COMMAND_OUTPUT_CAP_BYTES = 1 shl 20
+
+/** A wider cap for the pid probes: netstat/tasklist on a busy host is large. */
+private const val PID_PROBE_OUTPUT_CAP_BYTES = 4 shl 20
+
+private const val COMMAND_REAP_MS = 1_000L
+private const val COMMAND_DRAIN_JOIN_MS = 1_000L
+private const val DRAIN_CHUNK_BYTES = 8 shl 10
 
 /**
  * A running daemon plus everything needed to talk to and stop it.
@@ -403,11 +423,11 @@ private fun isWindows(): Boolean =
 internal fun pidAlive(pid: Long): Boolean {
     if (pid <= 0) return false
     return if (isWindows()) {
-        val out = runCommand(
+        val result = runCommand(
             listOf("tasklist", "/FI", "PID eq $pid", "/FO", "CSV", "/NH"),
             PID_PROBE_TIMEOUT_MS
         )
-        out != null && out.contains(",\"$pid\",")
+        result.exitCode == 0 && result.output.contains(",\"$pid\",")
     } else {
         exitCode(listOf("kill", "-0", pid.toString())) == 0
     }
@@ -428,8 +448,13 @@ internal fun terminatePid(pid: Long, force: Boolean) {
 /** The owning pid of `127.0.0.1:<port>` (or `[::1]:<port>`) in LISTENING. */
 private fun probeListeningPid(port: Int): Long? {
     if (!isWindows()) return null
-    val output = runCommand(listOf("netstat", "-ano", "-p", "tcp"), PID_PROBE_TIMEOUT_MS) ?: return null
-    for (line in output.lines()) {
+    val result = runCommand(
+        listOf("netstat", "-ano", "-p", "tcp"),
+        PID_PROBE_TIMEOUT_MS,
+        PID_PROBE_OUTPUT_CAP_BYTES
+    )
+    if (result.exitCode != 0) return null
+    for (line in result.output.lines()) {
         val columns = line.trim().split(Regex("\\s+"))
         if (columns.size >= 5 &&
             columns[0].equals("TCP", ignoreCase = true) &&
@@ -443,33 +468,150 @@ private fun probeListeningPid(port: Int): Long? {
     return null
 }
 
-/** Bounded command capture; null on launch failure, timeout or nonzero exit. */
-private fun runCommand(command: List<String>, timeoutMs: Long): String? {
-    return try {
-        val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
-            process.destroyForcibly()
-            return null
+/**
+ * The typed outcome of one bounded external command. [exitCode] is the
+ * reaped exit status (null only on launch failure or when the process could
+ * not be reaped after the forced kill); [output] is the retained merged
+ * stdout/stderr prefix (at most the configured cap); [truncated] records
+ * that the child produced more than the cap; [timedOut] records that the
+ * deadline forced the kill; [launchFailure] carries the launch error text.
+ */
+internal data class CommandResult(
+    val exitCode: Int?,
+    val output: String,
+    val truncated: Boolean,
+    val timedOut: Boolean,
+    val launchFailure: String? = null
+) {
+    /** True when the process was reaped before the deadline. */
+    val complete: Boolean
+        get() = exitCode != null && !timedOut
+}
+
+/**
+ * Concurrently-drained collector of the child's merged stdout/stderr: it
+ * reads until EOF so a full OS pipe can never block the child or the
+ * waiting manager, retains at most [cap] bytes, and keeps reading
+ * (discarding) past the cap so the child always reaches its own exit.
+ */
+private class BoundedDrainer(
+    private val stream: InputStream,
+    private val cap: Int
+) : Runnable {
+    private val lock = Object()
+    private val retained = ByteArrayOutputStream()
+
+    @Volatile
+    var truncated: Boolean = false
+        private set
+
+    @Volatile
+    private var finished = false
+
+    override fun run() {
+        val chunk = ByteArray(DRAIN_CHUNK_BYTES)
+        try {
+            while (true) {
+                val read = stream.read(chunk)
+                if (read < 0) break
+                if (read == 0) continue
+                synchronized(lock) {
+                    val room = cap - retained.size()
+                    if (room > 0) {
+                        retained.write(chunk, 0, minOf(room, read))
+                        if (read > room) truncated = true
+                    } else {
+                        truncated = true
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            // The stream closed under us (destroyForcibly / process exit).
+        } finally {
+            finished = true
         }
-        val bytes = process.inputStream.readBytes()
-        if (process.exitValue() != 0) null else String(bytes, Charsets.UTF_8)
-    } catch (e: Exception) {
-        null
+    }
+
+    fun awaitFinish(timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!finished && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5L)
+        }
+        return finished
+    }
+
+    fun text(): String = synchronized(lock) {
+        String(retained.toByteArray(), Charsets.UTF_8)
     }
 }
 
-private fun exitCode(command: List<String>): Int? {
-    return try {
-        val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        if (!process.waitFor(PID_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-            process.destroyForcibly()
-            null
-        } else {
-            process.exitValue()
-        }
+/**
+ * Runs [command] with a HARD deadline and a bounded, CONCURRENT drain: the
+ * merged stdout/stderr is consumed on a dedicated drainer thread while this
+ * thread waits, so output larger than the pipe capacity can never deadlock
+ * the caller (pid discovery must never stall on `netstat`). Retained output
+ * is at most [maxOutputBytes]; the drainer keeps reading past the cap so
+ * the child still reaches exit. On timeout the process is killed AND
+ * reaped, and the drainer is joined (bounded) so no reader thread outlives
+ * the call. Never throws: [CommandResult] carries launch failure, timeout,
+ * exit status and truncation.
+ */
+internal fun runCommand(
+    command: List<String>,
+    timeoutMs: Long,
+    maxOutputBytes: Int = COMMAND_OUTPUT_CAP_BYTES
+): CommandResult {
+    val cap = if (maxOutputBytes < 0) 0 else maxOutputBytes
+    val process = try {
+        ProcessBuilder(command).redirectErrorStream(true).start()
     } catch (e: Exception) {
+        return CommandResult(
+            exitCode = null,
+            output = "",
+            truncated = false,
+            timedOut = false,
+            launchFailure = e.message ?: e.javaClass.simpleName
+        )
+    }
+    val drainer = BoundedDrainer(process.inputStream, cap)
+    val drainThread = Thread(drainer, "faktor-command-drain")
+    drainThread.isDaemon = true
+    drainThread.start()
+    val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+    if (!finished) {
+        process.destroyForcibly()
+        try {
+            process.waitFor(COMMAND_REAP_MS, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+    // EOF reaches the drainer once the (killed) child's pipe writers close;
+    // join bounded so a wedged child can never leak a reader thread.
+    if (!drainer.awaitFinish(COMMAND_DRAIN_JOIN_MS)) {
+        try {
+            process.inputStream.close()
+        } catch (e: IOException) {
+            // Already closed.
+        }
+        drainer.awaitFinish(COMMAND_DRAIN_JOIN_MS)
+    }
+    val reaped = try {
+        process.exitValue()
+    } catch (e: IllegalThreadStateException) {
         null
     }
+    return CommandResult(
+        exitCode = reaped,
+        output = drainer.text(),
+        truncated = drainer.truncated,
+        timedOut = !finished
+    )
+}
+
+private fun exitCode(command: List<String>): Int? {
+    val result = runCommand(command, PID_PROBE_TIMEOUT_MS)
+    return if (result.timedOut || result.launchFailure != null) null else result.exitCode
 }
 
 /**

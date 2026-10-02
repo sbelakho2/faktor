@@ -1715,3 +1715,39 @@ async fn compaction_summary_cap_met_then_provider_error_is_refused() {
     );
     assert_slot_empty(&summarizer);
 }
+
+/// Mutation witness for INV-COMPACTION-SUMMARY-CAP: the guard structure that
+/// makes the cap a refusal — the pre-append capacity check and the `oversized`
+/// term in the acceptance condition — is pinned; the same checker detects a
+/// mutated source that drops or neuters either guard, so a future edit that
+/// turns the cap back into silent completion cannot pass the suite.
+fn compaction_cap_guard_present(source: &str) -> bool {
+    source.contains("if t.len() > SUMMARY_MAX_CHARS.saturating_sub(text.len())")
+        && source.contains("oversized = true;")
+        && source.contains("if !complete || oversized || text.is_empty()")
+}
+
+#[test]
+fn compaction_cap_guard_is_pinned_against_mutation() {
+    const SOURCE: &str = include_str!("provider_loop.rs");
+    assert!(
+        compaction_cap_guard_present(SOURCE),
+        "the compaction cap guard changed: the cap must stay a refusal checked before appending"
+    );
+    let dropped_cap = SOURCE.replace(
+        "if t.len() > SUMMARY_MAX_CHARS.saturating_sub(text.len())",
+        "if false",
+    );
+    assert!(
+        !compaction_cap_guard_present(&dropped_cap),
+        "the witness must detect a dropped cap check"
+    );
+    let accepted_oversize = SOURCE.replace(
+        "if !complete || oversized || text.is_empty()",
+        "if !complete || text.is_empty()",
+    );
+    assert!(
+        !compaction_cap_guard_present(&accepted_oversize),
+        "the witness must detect oversized acceptance"
+    );
+}

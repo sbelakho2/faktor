@@ -14,7 +14,7 @@
 // response.
 
 import * as vscode from 'vscode';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
 import {
@@ -85,8 +85,11 @@ import {
   AdmitFailure,
   AttachmentAdmissionPolicy,
   CachedEvidenceView,
+  ComposerAttachmentStore,
   EMERGENCY_ATTACHMENT_POLICY,
   EvidenceAuthorityCache,
+  MAX_COMPOSER_ATTACHMENTS,
+  MAX_PENDING_ATTACHMENT_BYTES,
   PendingSubmission,
   PendingSubmissionRetainer,
   StartFailure,
@@ -97,6 +100,8 @@ import {
   attachmentPolicyForModel,
   boundedWebviewFiles,
   canonicalSubmissionId,
+  composerAttachmentRefusal,
+  composerMimeForFilename,
   hasCompletionSteps,
   parseCompletionContract,
   parsePendingSubmission,
@@ -208,6 +213,14 @@ const pendingSubmissionRetainer = new PendingSubmissionRetainer();
 // submission per host; a lost-response retry reuses its immutable snapshot
 // and submission id so the daemon returns the original receipt.
 const taskStartGate = new TaskStartGate();
+// Bounded HOST-SIDE composer attachment state. The webview holds metadata
+// ids only; picker-selected bytes are read here (never through the webview)
+// and every sendGoal resolves the ids into an immutable snapshot. The store
+// survives a failed start (retry reuses the durable uploads) and is cleared
+// ONLY by a durable acceptance, an explicit remove/clear, or a session
+// switch.
+const composerAttachments = new ComposerAttachmentStore();
+let composerAttachmentsSessionId: string | null = null;
 
 // ------------------------------------------------------------------ helpers
 
@@ -778,6 +791,10 @@ function stopServer(): void {
   active.billingCursor = null;
   active.billingPrevCursors = [];
   taskStartGate.reset();
+  composerAttachments.clear();
+  composerAttachmentsSessionId = null;
+  chatProvider?.postAttachmentsCleared();
+  chatProvider?.postStreamBlocked(null);
   store.patch({
     daemon: 'stopped',
     daemonDetail: '',
@@ -872,6 +889,13 @@ async function ensureSession(
     // The board watermark belongs to ONE session/run family.
     active.boardSeenRevision = 0;
   }
+  if (composerAttachmentsSessionId !== null && composerAttachmentsSessionId !== sessionId) {
+    // Uploads are bound to ONE session; the visible set and its pending
+    // submission identity cannot leak into a different session.
+    composerAttachments.clear();
+    chatProvider?.postAttachmentsCleared();
+  }
+  composerAttachmentsSessionId = sessionId;
   try {
     const page = await client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT });
     store.patch({ transcript: transcriptOf(page) });
@@ -918,8 +942,22 @@ function startStream(): void {
       }
       scheduleRefresh();
     },
-    onStatus: (status: EventStreamStatus) => {
-      store.patch({ streamStatus: status });
+    onStatus: (status: EventStreamStatus, detail) => {
+      if (status === 'protocol_blocked') {
+        // A durable event the client cannot consume is terminal: keep the
+        // exact reason, patch the typed unavailable status and surface the
+        // recovery affordances (refresh / reconnect / daemon doctor). No
+        // automatic reconnect loop replays the offending frame.
+        const reason = detail ?? 'the durable event stream is blocked';
+        store.patch({ streamStatus: status, lastError: reason });
+        chatProvider?.postStreamBlocked(reason);
+        chatProvider?.postNotice('error', `event stream blocked: ${reason}`);
+      } else {
+        store.patch({ streamStatus: status });
+        if (status === 'open' || status === 'connecting') {
+          chatProvider?.postStreamBlocked(null);
+        }
+      }
       updateStatusBar();
     },
     onError: (error) => {
@@ -1486,6 +1524,164 @@ function pendingEnvelope(text: string): PendingSubmission {
   };
 }
 
+// ------------------------------------------------- composer attachments
+
+/** The advertised admission policy of the session's chosen model, else the
+ *  conservative emergency ceiling (only when bytes are actually attached). */
+async function composerAttachmentPolicy(): Promise<AttachmentAdmissionPolicy> {
+  const client = active.client;
+  const session = store.snapshot().session;
+  if (!client || session === null) {
+    return EMERGENCY_ATTACHMENT_POLICY;
+  }
+  try {
+    const catalog = await client.modelCatalog();
+    return attachmentPolicyForModel(catalog, session.provider, session.model);
+  } catch {
+    return EMERGENCY_ATTACHMENT_POLICY;
+  }
+}
+
+/** Post the bounded metadata list (never bytes) with its refusal display. */
+function postComposerAttachments(policy: AttachmentAdmissionPolicy): void {
+  chatProvider?.postAttachments(
+    composerAttachments.list().map((entry) => ({
+      ...entry,
+      refusal: composerAttachmentRefusal(entry, policy),
+    })),
+  );
+}
+
+/**
+ * The Attach button: the HOST opens the native picker and reads the chosen
+ * files itself (bounded by the 7 MiB upload contract and the store's total
+ * bound), so no picker bytes transit the webview. The panel only ever sees
+ * metadata ids, filename/mime/size and the refusal reason.
+ */
+async function pickComposerAttachments(): Promise<void> {
+  const selection = await vscode.window.showOpenDialog({
+    canSelectMany: true,
+    title: 'Faktor: attach files',
+    openLabel: 'Attach',
+  });
+  if (!selection || selection.length === 0) {
+    return;
+  }
+  const policy = await composerAttachmentPolicy();
+  const refused: string[] = [];
+  for (const uri of selection) {
+    if (composerAttachments.size() >= MAX_COMPOSER_ATTACHMENTS) {
+      refused.push(`at most ${MAX_COMPOSER_ATTACHMENTS} attachments per submission`);
+      break;
+    }
+    const filename = basename(uri.fsPath);
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.size > MAX_PENDING_ATTACHMENT_BYTES) {
+        refused.push(
+          `${filename}: ${stat.size} bytes exceeds the ${MAX_PENDING_ATTACHMENT_BYTES} byte upload bound`,
+        );
+        continue;
+      }
+      const data = await vscode.workspace.fs.readFile(uri);
+      if (data.byteLength > MAX_PENDING_ATTACHMENT_BYTES) {
+        refused.push(
+          `${filename}: ${data.byteLength} bytes exceeds the ${MAX_PENDING_ATTACHMENT_BYTES} byte upload bound`,
+        );
+        continue;
+      }
+      const mime = composerMimeForFilename(filename);
+      const added = composerAttachments.add({
+        filename,
+        mime,
+        bytes: data.byteLength,
+        dataBase64: Buffer.from(data).toString('base64'),
+        isImage: mime.startsWith('image/'),
+      });
+      if (added.reason !== null) {
+        refused.push(`${filename}: ${added.reason}`);
+      }
+    } catch (error) {
+      refused.push(`${filename}: ${messageOf(error)}`);
+    }
+  }
+  postComposerAttachments(policy);
+  if (refused.length > 0) {
+    chatProvider?.postNotice('error', `attachment refused: ${refused.slice(0, 5).join('; ')}`);
+  }
+}
+
+/**
+ * Paste/drop ingestion: the ONE path where bytes originate in the webview
+ * (a clipboard image or a dropped File has no host path). The host
+ * re-validates the strict bounded shape and re-bounds it again before the
+ * bytes enter the store; everything after this point is id-based.
+ */
+async function addComposerAttachmentData(message: ChatMessage): Promise<void> {
+  const items = message.items;
+  if (!Array.isArray(items) || items.length === 0) {
+    return;
+  }
+  const policy = await composerAttachmentPolicy();
+  const refused: string[] = [];
+  for (const item of items.slice(0, MAX_COMPOSER_ATTACHMENTS)) {
+    const name =
+      typeof item === 'object' &&
+      item !== null &&
+      typeof (item as { filename?: unknown }).filename === 'string'
+        ? (item as { filename: string }).filename
+        : 'attachment';
+    const added = composerAttachments.add(item);
+    if (added.reason !== null) {
+      refused.push(`${name}: ${added.reason}`);
+    }
+  }
+  if (items.length > MAX_COMPOSER_ATTACHMENTS) {
+    refused.push(`only the first ${MAX_COMPOSER_ATTACHMENTS} items were kept`);
+  }
+  postComposerAttachments(policy);
+  if (refused.length > 0) {
+    chatProvider?.postNotice('error', `attachment refused: ${refused.slice(0, 5).join('; ')}`);
+  }
+}
+
+async function removeComposerAttachment(message: ChatMessage): Promise<void> {
+  // An in-flight submission owns its immutable snapshot; visible mutations
+  // are ignored until its explicit result arrives.
+  if (taskStartGate.inFlight()) {
+    return;
+  }
+  if (composerAttachments.remove(message.id)) {
+    postComposerAttachments(await composerAttachmentPolicy());
+  }
+}
+
+async function clearComposerAttachments(): Promise<void> {
+  if (taskStartGate.inFlight()) {
+    return;
+  }
+  composerAttachments.clear();
+  postComposerAttachments(await composerAttachmentPolicy());
+}
+
+/** The explicit post-upgrade stream recovery (never an automatic loop). */
+function recoverEventStream(): void {
+  const stream = active.stream;
+  const blocked = stream?.blocked ?? null;
+  if (!stream || blocked === null) {
+    chatProvider?.postNotice('info', 'the event stream is not blocked');
+    return;
+  }
+  stream.recover();
+  store.patch({ streamStatus: 'connecting', lastError: null });
+  chatProvider?.postStreamBlocked(null);
+  chatProvider?.postNotice(
+    'info',
+    `reconnecting the event stream from cursor ${blocked.cursor}; the blocked frame is replayed, never skipped`,
+  );
+  scheduleRefresh(0);
+}
+
 async function startTask(
   snapshot: StartSubmissionSnapshot,
   context: vscode.ExtensionContext,
@@ -1602,9 +1798,14 @@ async function startTask(
     });
     if (outcome.ok) {
       // Durable acceptance: ONLY now may the pending envelope (and its
-      // retained uploads) be dropped.
+      // retained uploads) be dropped, together with the host-side composer
+      // bytes the panel still shows.
       pendingSubmissionRetainer.release(outcome.pending);
       taskStartGate.settle(submissionId, 'started');
+      if (snapshot.pending.attachments.length > 0) {
+        composerAttachments.clear();
+        chatProvider?.postAttachmentsCleared();
+      }
       chatProvider?.postStartResult(goal, true);
     }
   } catch (error) {
@@ -2112,6 +2313,21 @@ async function handleWebviewMessage(
     case 'refresh':
       await refresh();
       return;
+    case 'attachPick':
+      await pickComposerAttachments();
+      return;
+    case 'attachData':
+      await addComposerAttachmentData(message);
+      return;
+    case 'removeAttachment':
+      await removeComposerAttachment(message);
+      return;
+    case 'clearAttachments':
+      await clearComposerAttachments();
+      return;
+    case 'recoverStream':
+      recoverEventStream();
+      return;
     case 'sendGoal': {
       const goal = typeof message.goal === 'string' ? message.goal.trim() : '';
       if (goal.length === 0) {
@@ -2151,19 +2367,52 @@ async function handleWebviewMessage(
         return;
       }
       // Binary attachments (pasted/attached images and screenshots) ride the
-      // strict pending-submission envelope: each entry is re-validated at the
-      // host boundary, uploaded to the durable artifact store, and only the
-      // typed artifact ids reach the task start. A malformed envelope refuses
-      // the START loudly (the composer draft is kept) rather than silently
+      // strict pending-submission envelope: the REAL composer path carries
+      // HOST-SIDE attachment ids (`sendGoal.attachmentIds`) that resolve into
+      // an immutable byte snapshot here; the legacy raw envelope
+      // (`sendGoal.attachments`) is still accepted. Either way each entry is
+      // re-validated at the host boundary, uploaded to the durable artifact
+      // store, and only the typed artifact ids reach the task start. A
+      // malformed/unknown envelope refuses the START loudly (the composer
+      // draft and its visible attachments are kept) rather than silently
       // dropping bytes the user attached.
+      const attachmentIds = message.attachmentIds;
       const binaryAttachments = message.attachments;
+      const hostSessionId = active.sessionId ?? message.sessionId;
       let pending: PendingSubmission;
-      if (binaryAttachments === undefined || binaryAttachments === null) {
+      if (attachmentIds !== undefined && attachmentIds !== null) {
+        const selected = composerAttachments.select(attachmentIds);
+        if (selected.reason !== null) {
+          chatProvider?.postNotice(
+            'error',
+            `task start refused: ${selected.reason}; the draft was kept`,
+          );
+          chatProvider?.postStartResult(goal, false);
+          return;
+        }
+        const parsed = parsePendingSubmission({
+          text: goal,
+          sessionId: hostSessionId,
+          draftId: message.draftId,
+          messageId: message.messageId,
+          files: message.files,
+          attachments: selected.attachments,
+        });
+        if (parsed === null) {
+          chatProvider?.postNotice(
+            'error',
+            'task start refused: malformed binary attachment envelope; the draft was kept',
+          );
+          chatProvider?.postStartResult(goal, false);
+          return;
+        }
+        pending = pendingSubmissionRetainer.restore(parsed);
+      } else if (binaryAttachments === undefined || binaryAttachments === null) {
         pending = pendingEnvelope(goal);
       } else {
         const parsed = parsePendingSubmission({
           text: goal,
-          sessionId: message.sessionId,
+          sessionId: hostSessionId,
           draftId: message.draftId,
           messageId: message.messageId,
           files: message.files,
@@ -2304,6 +2553,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('faktor.cancelTask', () => cancelActiveRun()),
     vscode.commands.registerCommand('faktor.replyPermission', () => replyPermissionFromCommand()),
     vscode.commands.registerCommand('faktor.refresh', () => refresh()),
+    vscode.commands.registerCommand('faktor.reconnectStream', () => recoverEventStream()),
     vscode.commands.registerCommand('faktor.controlPlaneSignIn', async () => {
       await controlPlaneSignIn(context);
     }),

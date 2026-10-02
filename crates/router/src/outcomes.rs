@@ -923,4 +923,37 @@ mod tests {
             .phase_stats("p", "m", RouterPhase::Implement)
             .is_none());
     }
+    /// Mutation witness for INV-MEMO-READ-ONLY-VIEW: the memo implements the
+    /// read-only view and never the mutable store; the same checker detects a
+    /// source that adds an `impl OutcomeStore for MemoOutcomeStore`.
+    fn memo_is_read_only_view(source: &str) -> bool {
+        let mut view_impl = false;
+        let mut store_impl = false;
+        for line in source.lines() {
+            let line = line.trim_start();
+            if line.starts_with("impl OutcomeView for MemoOutcomeStore") {
+                view_impl = true;
+            }
+            if line.starts_with("impl OutcomeStore for MemoOutcomeStore") {
+                store_impl = true;
+            }
+        }
+        view_impl && !store_impl
+    }
+
+    #[test]
+    fn memo_read_only_view_is_pinned_against_mutation() {
+        const SOURCE: &str = include_str!("outcomes.rs");
+        assert!(
+            memo_is_read_only_view(SOURCE),
+            "the memo must keep implementing only the read-only view"
+        );
+        let mutated = format!(
+            "{SOURCE}\nimpl OutcomeStore for MemoOutcomeStore {{ fn append_sample(&self, _k: &OutcomeKey, _s: OutcomeSample) {{}} }}"
+        );
+        assert!(
+            !memo_is_read_only_view(&mutated),
+            "the witness must detect a reintroduced mutable impl"
+        );
+    }
 }

@@ -67,13 +67,23 @@
 //! owns the install and is outside the trust boundary — and the check reads
 //! mode bits only (an ACL or mount option can grant write despite them).
 //!
-//! Honest residual gap: where no fd-exec exists (non-unix, and unix platforms
-//! outside the list above) the launcher keeps the re-hash-then-exec-by-
-//! pathname order, so the documented verify→exec swap window remains there.
-//! The readiness handshake observes the child's claimed digest, which a
-//! swapped-in binary could claim too; it is a health proof, not an
-//! independent hash of the child's bytes. A verified fd-exec is the only
-//! mechanism here that closes the swap race.
+//! Honest residual gap: on unix platforms without an fd-exec the launcher
+//! keeps the re-hash-then-exec-by-pathname order, so the documented
+//! verify→exec swap window remains there. On Windows the release file is
+//! opened ONCE with a share mode that refuses later writes, deletes and
+//! renames while the launcher holds it (`crate::win_exec`): the digest AND the
+//! object identity (volume serial + file index + creation time) are read from
+//! that HANDLE, the handle stays live across `CreateProcessW`, and the
+//! identity is re-checked from the handle and from the pathname after the
+//! child exists — a changed object is a typed refusal that terminates the
+//! just-created process, so the launcher never detaches an unverified child.
+//! The same-owner in-place rewrite residual is unchanged on Windows (an
+//! already-writable mapping survives the share mode; an already-open writer
+//! makes the restricted open itself fail typed). The readiness handshake
+//! observes the child's claimed digest, which a swapped-in binary could claim
+//! too; it is a health proof, not an independent hash of the child's bytes. A
+//! verified fd-exec or a pinned Windows handle is the only mechanism here
+//! that closes the swap race.
 //!
 //! `verify_manifest_at_launch` deliberately does NOT re-check the validity
 //! window or the channel pin: those govern update SELECTION at check time.
@@ -849,10 +859,15 @@ pub fn resolve_launch(
 /// FreeBSD/DragonFly; the `/dev/fd/<n>` magic link on Darwin, which has no
 /// `fexecve` symbol), so a writer that swaps the directory entry after
 /// verification cannot change which inode launches. On unix platforms without
-/// an fd-exec and on non-unix the launcher keeps the re-hash-then-exec-by-
-/// pathname order — the documented residual swap window, stated in the module
-/// docs — and the release identity is exported only to the verified bytes it
-/// actually handed to the OS.
+/// an fd-exec the launcher keeps the re-hash-then-exec-by-pathname order — the
+/// documented residual swap window, stated in the module docs. On Windows the
+/// launcher opens the release ONCE with a no-write/no-delete share mode,
+/// verifies the digest and captures the object identity FROM that handle,
+/// keeps it live across `CreateProcessW` (the pathname is bound to the
+/// verified object while it is held), and re-checks the identity from the
+/// handle and the pathname after creation, terminating and refusing typed
+/// otherwise (see `crate::win_exec`). On every platform the release identity
+/// is exported only to the verified bytes it actually handed to the OS.
 ///
 /// On unix the bootstrap IS replaced by the release binary (execve), so the
 /// supervisor observes exactly one live process and the release's own exit
@@ -885,16 +900,25 @@ pub fn launch(
     }
     #[cfg(not(unix))]
     {
-        let actual = file_digest(&target.binary).map_err(|e| UpdateError::LaunchRefused {
-            detail: format!("hash {} before exec: {e}", target.binary.display()),
-        })?;
-        if actual != target.digest {
-            return Err(UpdateError::LaunchRefused {
-                detail: format!(
-                    "release digest changed between verification and exec: expected {}, found {actual}",
-                    target.digest
-                ),
-            });
+        // Windows pins the verified object through an open no-replace handle
+        // and re-checks its identity after creation (`crate::win_exec`); every
+        // other non-unix platform keeps the re-hash-then-spawn pathname order
+        // with the documented swap window.
+        #[cfg(windows)]
+        let pinned = crate::win_exec::VerifiedRelease::open(&target.binary, &target.digest)?;
+        #[cfg(not(windows))]
+        {
+            let actual = file_digest(&target.binary).map_err(|e| UpdateError::LaunchRefused {
+                detail: format!("hash {} before exec: {e}", target.binary.display()),
+            })?;
+            if actual != target.digest {
+                return Err(UpdateError::LaunchRefused {
+                    detail: format!(
+                        "release digest changed between verification and exec: expected {}, found {actual}",
+                        target.digest
+                    ),
+                });
+            }
         }
         let mut command = launch_command(target, install_root, args);
         // The startup/health handshake: the release's stdout rides a
@@ -906,34 +930,86 @@ pub fn launch(
                 detail: format!("create the launch handshake pipe: {e}"),
             })?;
         command.stdout(handshake_writer);
+        // Deterministic Windows test seam: runs after the object is verified
+        // and pinned and before `CreateProcessW`, exactly where the old
+        // pathname launcher was swappable. The pinned share mode must make the
+        // seam's replace/rename attempt fail.
+        #[cfg(all(windows, test))]
+        run_win_launch_seam(&target.binary)?;
         let child = command.spawn().map_err(|e| UpdateError::LaunchRefused {
             detail: format!("spawn {}: {e}", target.binary.display()),
         })?;
-        let mut process = ProcessChild { child };
-        // Frozen supervisor handshake: the REAL release pid and the digest
-        // verified immediately above, written before any release line is
-        // forwarded so a supervisor can keep tracking the daemon after this
-        // launcher exits at readiness. A vanished supervisor is a typed
-        // refusal to detach, never a silent success: the release is
-        // terminated so no unannounced process is left behind.
-        announce_release_started(&mut process, &mut std::io::stdout().lock(), &target.digest)?;
-        let mut readiness = StdoutReadiness::start_with(handshake_reader, forward_stdout_line);
-        let clock = MonotonicClock::new();
-        let decision = run_launch_window(
-            &mut process,
-            &mut readiness,
-            &clock,
-            &target.digest,
-            Duration::from_millis(LAUNCH_FORWARD_WINDOW_MS),
-        )?;
-        if decision == LaunchDecision::Ready {
-            tracing::info!(
-                "release {} proved readiness with digest {}; the launcher detaches",
-                target.binary.display(),
-                target.digest
-            );
+        // The pinned handle stays live through creation AND the readiness
+        // handshake, so the pathname cannot be repointed while the launcher
+        // is still deciding. The post-creation identity re-check runs BEFORE
+        // the release-started announcement: an unverified child is terminated,
+        // never announced and never detached.
+        #[cfg(windows)]
+        if let Err(e) = pinned.require_unchanged() {
+            let mut created = ProcessChild { child };
+            return Err(terminate_unverified(&mut created, e));
         }
-        conclude_launch(&mut process, decision, &target.digest)
+        run_spawned_launch(child, handshake_reader, target)
+    }
+}
+
+/// The shared non-unix readiness handshake after the release process exists:
+/// the launcher-owned release-started line, the child's own digest attestation
+/// + frozen startup line inside the bounded window, and the resulting exit.
+/// The pathname fallback and the Windows object-pinned launch run the SAME
+/// launch contract here.
+#[cfg(not(unix))]
+fn run_spawned_launch(
+    child: std::process::Child,
+    handshake_reader: impl std::io::Read + Send + 'static,
+    target: &ReleaseTarget,
+) -> Result<i32, UpdateError> {
+    let mut process = ProcessChild { child };
+    // Frozen supervisor handshake: the REAL release pid and the digest
+    // verified immediately above, written before any release line is
+    // forwarded so a supervisor can keep tracking the daemon after this
+    // launcher exits at readiness. A vanished supervisor is a typed
+    // refusal to detach, never a silent success: the release is
+    // terminated so no unannounced process is left behind.
+    announce_release_started(&mut process, &mut std::io::stdout().lock(), &target.digest)?;
+    let mut readiness = StdoutReadiness::start_with(handshake_reader, forward_stdout_line);
+    let clock = MonotonicClock::new();
+    let decision = run_launch_window(
+        &mut process,
+        &mut readiness,
+        &clock,
+        &target.digest,
+        Duration::from_millis(LAUNCH_FORWARD_WINDOW_MS),
+    )?;
+    if decision == LaunchDecision::Ready {
+        tracing::info!(
+            "release {} proved readiness with digest {}; the launcher detaches",
+            target.binary.display(),
+            target.digest
+        );
+    }
+    conclude_launch(&mut process, decision, &target.digest)
+}
+
+/// The post-creation object-identity re-check failed: the just-created child
+/// is not the verified object, so it is terminated (zero-orphans) and the
+/// refusal names both the identity failure and the termination outcome. A
+/// failed termination is named, never swallowed.
+#[cfg(any(windows, test))]
+fn terminate_unverified<C: LaunchChild>(child: &mut C, refusal: UpdateError) -> UpdateError {
+    let terminated = match child.terminate() {
+        Ok(()) => "the unverified process was terminated".to_string(),
+        Err(e) => format!("terminating it FAILED ({e}); it may still be running"),
+    };
+    let detail = match refusal {
+        UpdateError::LaunchRefused { detail } => detail,
+        other => other.to_string(),
+    };
+    UpdateError::LaunchRefused {
+        detail: format!(
+            "{detail}; the created process did not pass the post-creation identity re-check: \
+             {terminated}"
+        ),
     }
 }
 
@@ -1301,6 +1377,37 @@ fn set_launch_seam(seam: LaunchSeam) {
 #[cfg(all(unix, test))]
 fn run_launch_seam(path: &Path) -> Result<(), UpdateError> {
     let seam = LAUNCH_SEAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    match seam {
+        Some(seam) => seam(path),
+        None => Ok(()),
+    }
+}
+
+/// The Windows test-only launch seam: a hook invoked exactly after the
+/// verified object is pinned (digest + identity from the open handle) and
+/// before `CreateProcessW`, so a test can attempt a replace/rename in the
+/// documented swap window. The pinned share mode must refuse the attempt; the
+/// post-creation identity re-check refuses the launch if it did not. Never
+/// compiled into a release.
+#[cfg(all(windows, test))]
+type WinLaunchSeam = Box<dyn FnOnce(&Path) -> Result<(), UpdateError> + Send + 'static>;
+
+#[cfg(all(windows, test))]
+static WIN_LAUNCH_SEAM: std::sync::Mutex<Option<WinLaunchSeam>> = std::sync::Mutex::new(None);
+
+#[cfg(all(windows, test))]
+fn set_win_launch_seam(seam: WinLaunchSeam) {
+    *WIN_LAUNCH_SEAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(seam);
+}
+
+#[cfg(all(windows, test))]
+fn run_win_launch_seam(path: &Path) -> Result<(), UpdateError> {
+    let seam = WIN_LAUNCH_SEAM
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
@@ -2074,6 +2181,52 @@ mod tests {
         assert!(err.to_string().contains("may still be running"), "{err}");
     }
 
+    /// The post-creation identity refusal terminates the just-created child
+    /// (zero-orphans) and keeps the identity failure in the typed refusal; a
+    /// failed termination is named, never swallowed. Exercised on every
+    /// platform through the same generic child seam the Windows launch uses.
+    #[test]
+    fn a_post_creation_identity_failure_terminates_the_unverified_process() {
+        let mut child = MockChild::running();
+        let err = terminate_unverified(
+            &mut child,
+            UpdateError::LaunchRefused {
+                detail: "release object identity changed for /install/faktor".into(),
+            },
+        );
+        assert_eq!(err.code(), "launch_refused");
+        assert!(
+            err.to_string().contains("release object identity changed"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("did not pass"), "{err}");
+        assert!(
+            err.to_string().contains("was terminated"),
+            "the successful termination is reported: {err}"
+        );
+        assert_eq!(
+            child.terminates.get(),
+            1,
+            "the unverified child is terminated, never detached"
+        );
+        // A failed termination is named in the refusal, not lost.
+        let mut child = MockChild {
+            exit_code: None,
+            terminate_error: Some("kill was refused".into()),
+            polls: std::cell::Cell::new(0),
+            terminates: std::cell::Cell::new(0),
+        };
+        let err = terminate_unverified(
+            &mut child,
+            UpdateError::LaunchRefused {
+                detail: "release object identity changed".into(),
+            },
+        );
+        assert!(err.to_string().contains("kill was refused"), "{err}");
+        assert!(err.to_string().contains("may still be running"), "{err}");
+        assert_eq!(child.terminates.get(), 1);
+    }
+
     /// The child digest attestation grammar: exactly the frozen prefix plus
     /// 64 lowercase hex; uppercase/short/long/embedded forms never attest.
     #[test]
@@ -2477,9 +2630,9 @@ mod tests {
     // ------------------------------------------------ verify->exec identity
 
     /// The launch fixture: the running test executable's bytes are the
-    /// verified artifact, materialized under a private (0o700) install tree so
-    /// the ancestry gate passes; the release path is REAL, nothing is mocked.
-    #[cfg(unix)]
+    /// verified artifact, materialized under a private install tree so the
+    /// unix ancestry gate passes; the release path is REAL, nothing is mocked.
+    #[cfg(any(unix, windows))]
     fn launch_target_fixture() -> (tempfile::TempDir, PathBuf, ReleaseTarget, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("install");
@@ -2491,6 +2644,7 @@ mod tests {
         crate::install::create_private_dir_all(&release_dir).unwrap();
         let binary = layout.release_binary(&release_id);
         fs::write(&binary, &verified).unwrap();
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2507,37 +2661,45 @@ mod tests {
 
     /// The outer test spawns THIS binary with [`SEAM_LAUNCHER_FILTER`]; the
     /// inner process installs the swap seam and calls the real `launch()`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_LAUNCHER_FILTER: &str = "seam_launch_target_from_env";
     /// The post-exec helper test the verified copied binary runs.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_HELPER_FILTER: &str = "seam_identity_helper";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_ENV_ROOT: &str = "FAKTOR_SEAM_TEST_ROOT";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_ENV_BINARY: &str = "FAKTOR_SEAM_TEST_BINARY";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_ENV_DIGEST: &str = "FAKTOR_SEAM_TEST_DIGEST";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_ENV_RELEASE_ID: &str = "FAKTOR_SEAM_TEST_RELEASE_ID";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_ENV_EVIL: &str = "FAKTOR_SEAM_TEST_EVIL";
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_ENV_MARKER: &str = "FAKTOR_SEAM_TEST_MARKER";
     /// Printed by the post-exec helper — only the verified copied test binary
     /// can print it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const SEAM_VERIFIED_MARKER: &str = "faktor-seam-verified-";
-    /// Printed by the swapped-in stand-in script.
-    #[cfg(unix)]
+    /// Printed by the swapped-in stand-in (the unix script, or on Windows the
+    /// test binary with [`SEAM_EVIL_SUFFIX`] appended).
+    #[cfg(any(unix, windows))]
     const SEAM_EVIL_MARKER: &str = "faktor-seam-evil-";
+    /// The Windows replacement stand-in: the verified test binary with this
+    /// suffix appended. A PE image stays executable with trailing bytes, and
+    /// the helper tells the two apart by reading its OWN image.
+    #[cfg(windows)]
+    const SEAM_EVIL_SUFFIX: &[u8] = b"\nFAKTOR-SEAM-EVIL-REPLACEMENT";
 
     /// The in-process half of the swap test: runs ONLY in the process the
     /// outer test re-executes (the env gate makes a normal test run return
-    /// immediately). It swaps the release PATH after the digest check and
-    /// after the verified descriptor is open; `launch()` must execute the
-    /// verified descriptor, so the swapped-in script can never run.
-    #[cfg(unix)]
+    /// immediately). On unix it swaps the release PATH after the digest check
+    /// and after the verified descriptor is open, and `launch()` must execute
+    /// the verified descriptor. On Windows it attempts the same replacement
+    /// after the object is pinned, and the pinned no-replace share mode must
+    /// refuse it while `launch()` proceeds with the verified bytes.
+    #[cfg(any(unix, windows))]
     #[test]
     fn seam_launch_target_from_env() {
         let Ok(root) = std::env::var(SEAM_ENV_ROOT) else {
@@ -2547,6 +2709,7 @@ mod tests {
         let digest = std::env::var(SEAM_ENV_DIGEST).unwrap();
         let release_id = std::env::var(SEAM_ENV_RELEASE_ID).unwrap();
         let evil = PathBuf::from(std::env::var(SEAM_ENV_EVIL).unwrap());
+        #[cfg(unix)]
         set_launch_seam(Box::new(move |binary_path| {
             // Inode swap, not an in-place rewrite: the verified inode stays
             // alive through the launcher's open descriptor while the PATH now
@@ -2558,6 +2721,14 @@ mod tests {
                     binary_path.display()
                 ))
             })
+        }));
+        #[cfg(windows)]
+        set_win_launch_seam(Box::new(move |binary_path| {
+            // The pinned no-write/no-delete handle must make this replacement
+            // impossible; the launch then proceeds with the verified bytes
+            // (the outer test asserts the path still holds them).
+            let _ = std::fs::rename(&evil, binary_path);
+            Ok(())
         }));
         let target = ReleaseTarget {
             release_id,
@@ -2580,29 +2751,69 @@ mod tests {
         }
     }
 
-    /// The harmless identity helper: only the post-exec copied test binary has
-    /// the marker env, and printing it proves the launched process IS the
-    /// verified bytes.
-    #[cfg(unix)]
+    /// The harmless identity helper: only the launched release copy has the
+    /// marker env, and printing it proves which bytes ran. On Windows the
+    /// helper reads its own image: the attacker stand-in (the same test binary
+    /// plus [`SEAM_EVIL_SUFFIX`]) prints the evil marker instead. It then
+    /// attests the digest + readiness on stdout (the launcher-owned handshake
+    /// pipe) and stays alive briefly, so the launcher observes a Ready proof
+    /// only AFTER the marker line was forwarded — the outer assertions can
+    /// never race the forwarding thread.
+    #[cfg(any(unix, windows))]
     #[test]
     fn seam_identity_helper() {
         let Ok(marker) = std::env::var(SEAM_ENV_MARKER) else {
             return;
         };
-        println!("{marker}");
+        #[cfg(unix)]
+        {
+            println!("{marker}");
+        }
+        #[cfg(windows)]
+        {
+            let evil = std::env::current_exe()
+                .ok()
+                .and_then(|exe| fs::read(exe).ok())
+                .is_some_and(|bytes| bytes.ends_with(SEAM_EVIL_SUFFIX));
+            if evil {
+                println!("{SEAM_EVIL_MARKER}");
+            } else {
+                println!("{marker}");
+            }
+            if let Ok(digest) = std::env::var(RELEASE_DIGEST_ENV) {
+                if manifest::is_lower_hex(&digest, 64) {
+                    println!("{CHILD_DIGEST_PREFIX}{digest}");
+                    println!("{STARTUP_LINE_PREFIX}1");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
-    /// The verify->exec race, deterministically: the release path is replaced
-    /// (different inode, different bytes) after a successful digest check and
-    /// before the exec. The launched process must be the verified bytes; the
-    /// swapped-in script must never execute.
-    #[cfg(unix)]
+    /// The verify->exec race, deterministically, on both platforms. Unix
+    /// replaces the path (different inode, different bytes) after a successful
+    /// digest check and before the exec: the launched process must be the
+    /// verified bytes. Windows attempts the same replacement after the object
+    /// is pinned and before creation: the pinned share mode must refuse it, so
+    /// the launch path is still bound to the verified object and the attacker
+    /// stand-in can never execute.
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_binary_swapped_between_verification_and_exec_never_executes() {
         let (_dir, root, target, release_dir) = launch_target_fixture();
-        let evil_bytes = format!("#!/bin/sh\necho {SEAM_EVIL_MARKER}\n").into_bytes();
+        #[cfg(windows)]
+        let verified_bytes = fs::read(&target.binary).unwrap();
         let evil = release_dir.join("swapped");
+        #[cfg(unix)]
+        let evil_bytes = format!("#!/bin/sh\necho {SEAM_EVIL_MARKER}\n").into_bytes();
+        #[cfg(windows)]
+        let evil_bytes = {
+            let mut bytes = verified_bytes.clone();
+            bytes.extend_from_slice(SEAM_EVIL_SUFFIX);
+            bytes
+        };
         fs::write(&evil, &evil_bytes).unwrap();
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&evil, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2633,13 +2844,30 @@ mod tests {
             !stdout.contains(SEAM_EVIL_MARKER),
             "the swapped-in binary must never execute:\nstdout: {stdout}\nstderr: {stderr}"
         );
-        // The seam really did replace the path: the release binary now holds
-        // the attacker's bytes while the verified inode was the one launched.
+        // Unix: the seam really did replace the path — the release binary now
+        // holds the attacker's bytes while the verified inode was launched.
+        #[cfg(unix)]
         assert_eq!(
             fs::read(&target.binary).unwrap(),
             evil_bytes,
             "the fixture must prove the swap happened, or the test would pass vacuously"
         );
+        // Windows: the pinned handle refused the replacement — the release
+        // path still holds the verified bytes and the would-be replacement
+        // stayed where the attacker placed it.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                fs::read(&target.binary).unwrap(),
+                verified_bytes,
+                "the pinned share mode must refuse the replacement"
+            );
+            assert_eq!(
+                fs::read(&evil).unwrap(),
+                evil_bytes,
+                "the refused replacement must stay where the attacker placed it"
+            );
+        }
     }
 
     /// The permission refusal path: a group/other-writable component between

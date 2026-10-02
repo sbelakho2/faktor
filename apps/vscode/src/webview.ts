@@ -92,6 +92,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'notice', level, message });
   }
 
+  /** The bounded metadata list of the host-side composer attachments. */
+  postAttachments(items: readonly unknown[]): void {
+    this.post({ type: 'attachments', items });
+  }
+
+  /** The visible attachment set is gone (durable start, session switch). */
+  postAttachmentsCleared(): void {
+    this.post({ type: 'attachmentsCleared' });
+  }
+
+  /**
+   * The stable blocked-stream reason (`null` = the stream left the blocked
+   * state). The recovery affordances live in the panel; the reason itself
+   * is not part of the snapshot, so it travels on its own message.
+   */
+  postStreamBlocked(reason: string | null): void {
+    this.post({ type: 'streamBlocked', reason });
+  }
+
   focus(): void {
     void vscode.commands.executeCommand('faktor.chat.focus');
   }
@@ -156,11 +175,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </section>
   <section id="transcript-card" class="card">
     <h2>Conversation</h2>
-    <div id="entries"></div>
+    <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript"></div>
+  </section>
+  <section id="stream-recovery" class="card" hidden>
+    <h2>Event stream blocked</h2>
+    <div id="stream-recovery-reason" class="warn"></div>
+    <div class="composer-actions">
+      <button id="btn-refresh-snapshot" type="button" title="Re-read the durable state (the blocked cursor is not skipped)">Refresh from snapshot</button>
+      <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good cursor after the daemon is upgraded">Reconnect stream</button>
+    </div>
+    <div class="muted">The durable journal event that blocked the stream is never skipped. If the daemon predates this panel, upgrade it and reconnect; the daemon doctor (<code>faktor-cli doctor</code>) checks the journal.</div>
   </section>
   <section id="notices" aria-live="polite"></section>
   <form id="composer">
+    <label for="goal" class="composer-label">Task goal</label>
     <textarea id="goal" rows="3" placeholder="Describe the goal. It starts a task run."></textarea>
+    <div id="attachment-hint" class="muted">Attach files, drop them here, or paste an image (Ctrl/Cmd+V).</div>
+    <div class="composer-actions">
+      <button id="btn-attach" type="button" title="Attach files through the host file picker">Attach…</button>
+      <button id="btn-clear-attachments" type="button" hidden>Clear all attachments</button>
+    </div>
+    <ul id="attachment-list" aria-label="Attached files"></ul>
+    <div id="attachment-notice" class="muted" hidden role="status"></div>
     <fieldset id="completion-contract" class="completion-contract">
       <legend>Task completion contract (Task mode; never sent by plain chat)</legend>
       <label><input type="checkbox" id="contract-commit" /> Commit when verified</label>

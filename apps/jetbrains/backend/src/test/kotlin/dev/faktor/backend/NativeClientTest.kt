@@ -78,7 +78,8 @@ object NativeClientTest {
         assertErrorMapping()
         assertBodyBound()
         assertSseStreaming()
-        assertSseOversizedFrame()
+        assertSseBlockedStates()
+        assertSseBlockedRecovery()
         println("PASS all native client unit assertions")
     }
 }
@@ -1393,43 +1394,198 @@ private fun assertSseStreaming() {
     }
 }
 
-private fun assertSseOversizedFrame() {
+// ------------------------------------------------- durable stream blocking
+
+/** One blocked-scenario observation. */
+private class BlockedScenario(
+    val blocked: ProtocolBlocked,
+    val events: Int,
+    val cursor: Long,
+    val requests: Int,
+    val status: String
+)
+
+/**
+ * Drives one fake-SSE scenario that must enter the stable blocked state, and
+ * observes whether the client ever reconnects, delivers an event, or moves
+ * the cursor. The fake daemon keeps the stream open after the offending
+ * frame, so without the stable block the client would sit/reconnect forever.
+ */
+private fun runBlockedScenario(
+    sessionId: String,
+    maxFrameBytes: Int = NativeEventStream.DEFAULT_MAX_FRAME_BYTES,
+    frames: (FakeSseWriter) -> Unit
+): BlockedScenario {
     val daemon = FakeDaemon()
     val held = CountDownLatch(1)
-    val bigData = StringBuilder("{\"x\":\"")
-    for (i in 0 until 200) bigData.append('a')
-    bigData.append("\"}")
-    daemon.on("GET", "/native/session/9/events") { _, response ->
+    val path = "/native/session/$sessionId/events"
+    daemon.on("GET", path) { _, response ->
         response.stream(200, "text/event-stream") { writer ->
-            writer.frame(9, "agent_state_changed", bigData.toString())
-            writer.frame(10, "agent_state_changed", "{\"event\":\"agent_state_changed\"}")
+            frames(writer)
             held.await(10, TimeUnit.SECONDS)
         }
     }
     daemon.start()
+    val blockedLatch = CountDownLatch(1)
+    val blocks = Collections.synchronizedList(ArrayList<ProtocolBlocked>())
     val events = Collections.synchronizedList(ArrayList<NativeSseEvent>())
-    val delivered = CountDownLatch(1)
-    val errors = Collections.synchronizedList(ArrayList<String>())
     val stream = NativeEventStream(
-        daemon.baseUrl, "tok", "9", 0,
-        maxFrameBytes = 64, minBackoffMs = 10, maxBackoffMs = 50,
+        daemon.baseUrl, "tok", sessionId, 0,
+        maxFrameBytes = maxFrameBytes,
+        minBackoffMs = 10, maxBackoffMs = 20,
+        onEvent = { events.add(it) },
+        onBlocked = { block ->
+            blocks.add(block)
+            blockedLatch.countDown()
+        }
+    )
+    try {
+        stream.start()
+        awaitLatch(blockedLatch, 10_000, "the stable blocked state ($sessionId)")
+        // Longer than the whole backoff ladder needs: a reconnect would fire
+        // (and replay the same frame) well inside this window.
+        Thread.sleep(400)
+        // A blocked stream must also refuse an implicit restart.
+        stream.start()
+        Thread.sleep(100)
+        return BlockedScenario(
+            blocked = blocks[0],
+            events = events.size,
+            cursor = stream.cursor,
+            requests = daemon.requestCount("GET", path),
+            status = stream.status
+        )
+    } finally {
+        stream.stop()
+        held.countDown()
+        daemon.stop()
+    }
+}
+
+private fun assertSseBlockedShape(scenario: BlockedScenario, sessionId: String) {
+    assertEquals(0, scenario.events, "no durable event may be delivered after a block")
+    assertEquals(0L, scenario.cursor, "the cursor must never advance past the offending frame")
+    assertEquals("blocked", scenario.status, "the status must stay blocked ($sessionId)")
+    assertEquals(1, scenario.requests, "a blocked stream must never reconnect ($sessionId)")
+    assertTrue(
+        scenario.blocked.recovery.containsAll(
+            listOf("refresh from snapshot", "reconnect after daemon upgrade", "run doctor")
+        ),
+        "the typed block must carry its recovery affordances: ${scenario.blocked.recovery}"
+    )
+    println(
+        "  sse blocked: $sessionId -> ${scenario.blocked.kind} at cursor ${scenario.blocked.cursor}, " +
+            "requests=1, events=0"
+    )
+}
+
+/**
+ * Every durable-frame violation class enters the stable blocked state: no
+ * reconnect (request count stays 1), no event delivery, no cursor advance,
+ * no silent skip. The valid frame queued behind the corrupt one is proof
+ * that the client refused rather than skipped.
+ */
+private fun assertSseBlockedStates() {
+    val oversizedData = StringBuilder("{\"x\":\"")
+    for (i in 0 until 200) oversizedData.append('a')
+    oversizedData.append("\"}")
+
+    val malformed = runBlockedScenario("blk-json") { writer ->
+        writer.frame(5, "agent_state_changed", "{not json")
+        writer.frame(6, "agent_state_changed", "{\"event\":\"agent_state_changed\"}")
+    }
+    assertEquals(ProtocolBlocked.Kind.MALFORMED_FRAME, malformed.blocked.kind)
+    assertSseBlockedShape(malformed, "blk-json")
+
+    val mismatch = runBlockedScenario("blk-disc") { writer ->
+        writer.frame(5, "agent_state_changed", "{\"event\":\"message\"}")
+    }
+    assertEquals(ProtocolBlocked.Kind.DISCRIMINATOR_MISMATCH, mismatch.blocked.kind)
+    assertSseBlockedShape(mismatch, "blk-disc")
+
+    val cursorless = runBlockedScenario("blk-cursor") { writer ->
+        writer.frame(null, "agent_state_changed", "{\"event\":\"agent_state_changed\"}")
+    }
+    assertEquals(ProtocolBlocked.Kind.IMPOSSIBLE_CURSOR, cursorless.blocked.kind)
+    assertSseBlockedShape(cursorless, "blk-cursor")
+
+    val version = runBlockedScenario("blk-version") { writer ->
+        writer.frame(
+            5, "agent_state_changed",
+            "{\"event\":\"agent_state_changed\",\"schema\":\"faktor-native-event/v2\"}"
+        )
+    }
+    assertEquals(ProtocolBlocked.Kind.UNSUPPORTED_VERSION, version.blocked.kind)
+    assertSseBlockedShape(version, "blk-version")
+
+    val unreadable = runBlockedScenario("blk-journal") { writer ->
+        writer.frame(null, "error", "{\"code\":\"journal_read_failed\"}")
+    }
+    assertEquals(ProtocolBlocked.Kind.JOURNAL_UNREADABLE, unreadable.blocked.kind)
+    assertSseBlockedShape(unreadable, "blk-journal")
+
+    val oversized = runBlockedScenario("blk-big", maxFrameBytes = 64) { writer ->
+        writer.frame(9, "agent_state_changed", oversizedData.toString())
+    }
+    assertEquals(ProtocolBlocked.Kind.OVERSIZED_FRAME, oversized.blocked.kind)
+    assertSseBlockedShape(oversized, "blk-big")
+}
+
+/**
+ * Recovery is explicit: an implicit restart does nothing while blocked, a
+ * negative recovery cursor is refused, and `recoverFrom(snapshotCursor)`
+ * clears the block and resumes durably from the caller-supplied cursor.
+ */
+private fun assertSseBlockedRecovery() {
+    val daemon = FakeDaemon()
+    val held = CountDownLatch(1)
+    daemon.on("GET", "/native/session/rec/events") { request, response ->
+        val after = request.query["after"]?.toLongOrNull() ?: 0L
+        response.stream(200, "text/event-stream") { writer ->
+            if (after < 5L) {
+                writer.frame(5, "agent_state_changed", "{still not json")
+            } else {
+                writer.frame(
+                    after + 1, "agent_state_changed",
+                    "{\"event\":\"agent_state_changed\",\"state\":\"recovered\"}"
+                )
+                held.await(10, TimeUnit.SECONDS)
+            }
+        }
+    }
+    daemon.start()
+    val blockedLatch = CountDownLatch(1)
+    val delivered = CountDownLatch(1)
+    val blocks = Collections.synchronizedList(ArrayList<ProtocolBlocked>())
+    val events = Collections.synchronizedList(ArrayList<NativeSseEvent>())
+    val stream = NativeEventStream(
+        daemon.baseUrl, "tok", "rec", 0,
+        minBackoffMs = 10, maxBackoffMs = 20,
         onEvent = { event ->
             events.add(event)
             delivered.countDown()
         },
-        onError = { error -> errors.add(error.message ?: "error") }
+        onBlocked = { block ->
+            blocks.add(block)
+            blockedLatch.countDown()
+        }
     )
     try {
         stream.start()
-        awaitLatch(delivered, 10_000, "the valid frame after the oversized one")
+        awaitLatch(blockedLatch, 10_000, "the block before recovery")
+        assertEquals(ProtocolBlocked.Kind.MALFORMED_FRAME, blocks[0].kind)
+        assertEquals(false, stream.recoverFrom(-1L), "a negative recovery cursor is refused")
+        assertTrue(stream.recoverFrom(5L), "the explicit recovery cursor must clear the block")
+        awaitLatch(delivered, 10_000, "the recovered frame")
         assertEquals(1, events.size)
-        assertEquals(10L, events[0].id)
-        assertEquals(10L, stream.cursor)
-        assertTrue(errors.isNotEmpty(), "oversized frame must be reported loudly")
+        assertEquals(6L, stream.cursor, "the recovered stream resumes from the explicit cursor")
+        assertEquals(null, stream.blocked, "recovery clears the typed block")
+        assertEquals(false, stream.recoverFrom(6L), "a healthy stream refuses recovery")
         assertTrue(
-            errors.any { it.contains("exceeded") },
-            "error must name the bound: $errors"
+            daemon.requests.any { it.path == "/native/session/rec/events" && it.query["after"] == "5" },
+            "recovery must reconnect exactly at the caller-supplied cursor"
         )
+        println("  sse blocked: explicit recoverFrom(cursor=5) resumed and delivered id 6")
     } finally {
         stream.stop()
         held.countDown()

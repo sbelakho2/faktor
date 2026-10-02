@@ -6500,6 +6500,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // fd-identity exec of the verified updater artifact (`fexecve`); the
         // single unsafe block exists solely to bind exec to the hashed inode.
         ("crates/updater/src/fd_exec.rs", 1),
+        // Windows object-identity launch seam (`GetFileInformationByHandle`);
+        // the single unsafe block exists solely to read the verified file
+        // object's identity (volume serial + file index + creation time) from
+        // the pinned handle.
+        ("crates/updater/src/win_exec.rs", 1),
         // --- function-level allows in mixed files ---
         ("crates/terminal/src/lib.rs", 10),
         ("crates/fs/src/tree_manifest.rs", 3),

@@ -16,6 +16,7 @@ import dev.faktor.backend.BackendProcessManager
 import dev.faktor.backend.NativeClient
 import dev.faktor.backend.NativeEventStream
 import dev.faktor.backend.NativeSseEvent
+import dev.faktor.backend.ProtocolBlocked
 import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
@@ -81,6 +82,7 @@ class FaktorFrontendService(
     interface Listener {
         fun onDaemonStatus(status: String, detail: String?) {}
         fun onStreamStatus(status: String, detail: String?) {}
+        fun onStreamBlocked(block: ProtocolBlocked) {}
         fun onEvent(event: NativeSseEvent) {}
         fun onError(message: String) {}
     }
@@ -623,7 +625,8 @@ class FaktorFrontendService(
             backendConnection, id, cursor,
             onEvent = { listener?.onEvent(it) },
             onStatus = { status, detail -> listener?.onStreamStatus(status, detail) },
-            onError = { e -> listener?.onError(e.message ?: e.javaClass.simpleName) }
+            onError = { e -> listener?.onError(e.message ?: e.javaClass.simpleName) },
+            onBlocked = { block -> listener?.onStreamBlocked(block) }
         )
         synchronized(lifecycleLock) { stream = s }
         s.start()
@@ -639,6 +642,18 @@ class FaktorFrontendService(
     fun streamCursor(): Long = synchronized(lifecycleLock) { stream?.cursor ?: 0L }
 
     fun streamStatus(): String = synchronized(lifecycleLock) { stream?.status ?: "off" }
+
+    /**
+     * The typed durable-stream block of the current stream, or null while it
+     * is healthy or transiently retrying. A block is stable: the stream has
+     * stopped reconnecting; recovery is explicit (refresh from a snapshot
+     * cursor, reconnect after a daemon upgrade, run doctor) or a new stream.
+     */
+    fun streamBlock(): ProtocolBlocked? = synchronized(lifecycleLock) { stream?.blocked }
+
+    /** The recovery affordances of a blocked stream (empty when healthy). */
+    fun streamRecovery(): List<String> =
+        synchronized(lifecycleLock) { stream?.blocked?.recovery ?: emptyList() }
 
     // ------------------------------------------------------------- internals
 

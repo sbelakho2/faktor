@@ -588,3 +588,31 @@ fn journal_session_problems_are_bounded_on_a_large_journal() {
         .unwrap()
         .is_empty());
 }
+
+/// Mutation witness for INV-QUEUE-ADMISSION-FILES: the file-array predicate
+/// must use json_each's own `type` column (never `json_type(value)`, which
+/// re-parses the de-quoted text) behind the json_valid/json_type guards; the
+/// same checker detects the old wrapping form.
+fn queue_file_array_predicate_present(source: &str) -> bool {
+    source.contains("WHEN json_valid(?1) = 0 THEN 0")
+        && source.contains("WHEN json_type(?1) <> 'array' THEN 0")
+        && source.contains("SELECT 1 FROM json_each(?1) WHERE type <> 'text'")
+        && !source.contains("json_type(value)")
+}
+
+#[test]
+fn queue_file_array_predicate_is_pinned_against_mutation() {
+    const SOURCE: &str = include_str!("ledger.rs");
+    assert!(
+        queue_file_array_predicate_present(SOURCE),
+        "the queue file-array predicate changed: it must use json_each's type column"
+    );
+    let mutated = SOURCE.replace(
+        "SELECT 1 FROM json_each(?1) WHERE type <> 'text'",
+        "SELECT 1 FROM json_each(?1) WHERE json_type(value) <> 'text'",
+    );
+    assert!(
+        !queue_file_array_predicate_present(&mutated),
+        "the witness must detect the json_type(value) wrap"
+    );
+}

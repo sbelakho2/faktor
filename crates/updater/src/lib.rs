@@ -67,6 +67,13 @@ pub mod version;
 ))]
 mod fd_exec;
 
+/// The Windows object-identity launch seam: the release binary is hashed and
+/// pinned through ONE handle opened with a no-write/no-delete share mode, and
+/// that handle stays live across `CreateProcessW` so the pathname is bound to
+/// the verified object. See the module docs.
+#[cfg(windows)]
+mod win_exec;
+
 pub use channel::{select, Channel, ChannelCandidate};
 pub use compat::{
     check as check_compatibility, CompatibilityReport, Component, RunningComponents, SchemaRange,
