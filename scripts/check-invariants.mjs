@@ -21,6 +21,7 @@
 // Exit codes: 0 pass (or expected failure matched); 1 violations; 2 usage.
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -306,14 +307,14 @@ function runCheck({ root, registryPath }) {
 
   if (!existsSync(registryPath)) {
     add('missing-registry', `${relative(SCRIPT_ROOT, registryPath)} does not exist`);
-    return { problems, counts: { invariants: 0, witnesses: 0, debts: 0 } };
+    return { problems, counts: { invariants: 0, witnesses: 0, debts: 0 }, entries: [] };
   }
   const { entries, problems: parseProblems } = parseRegistry(readFileSync(registryPath, 'utf8'));
   for (const problem of parseProblems) {
     add('parse-error', `line ${problem.line}: ${problem.message}`);
   }
   if (parseProblems.length > 0) {
-    return { problems, counts: { invariants: entries.length, witnesses: 0, debts: 0 } };
+    return { problems, counts: { invariants: entries.length, witnesses: 0, debts: 0 }, entries };
   }
 
   const fnIndex = buildFnIndex(root);
@@ -382,11 +383,17 @@ function runCheck({ root, registryPath }) {
 
     const witness = typeof entry.mutation_witness === 'string' ? entry.mutation_witness.trim() : '';
     const debt = typeof entry.mutation_debt === 'string' ? entry.mutation_debt.trim() : '';
-    if (witness === '' && debt === '') {
-      add('missing-witness-or-debt', `${id} needs a mutation_witness fn or a mutation_debt reason`);
+    const mutationCommand =
+      typeof entry.mutation_command === 'string' ? entry.mutation_command.trim() : '';
+    // Proof model: a behavioral witness is evidence, not proof. Every
+    // invariant must either ship an executable `mutation_command` that plants
+    // the violation and is detected, or carry an explicit mutation_debt; the
+    // two are mutually exclusive.
+    if (mutationCommand === '' && debt === '') {
+      add('missing-mutation-proof', `${id} needs a mutation_command or a mutation_debt reason`);
     }
-    if (witness !== '' && debt !== '') {
-      add('witness-and-debt', `${id} sets both mutation_witness '${witness}' and mutation_debt`);
+    if (mutationCommand !== '' && debt !== '') {
+      add('mutation-proof-conflict', `${id} sets both mutation_command and mutation_debt`);
     }
     if (witness !== '') {
       // A witness may be a Rust test fn OR a UI/script check label (VS Code
@@ -403,7 +410,8 @@ function runCheck({ root, registryPath }) {
         );
       }
       witnesses += 1;
-    } else if (debt !== '') {
+    }
+    if (debt !== '') {
       debts += 1;
     }
 
@@ -412,7 +420,7 @@ function runCheck({ root, registryPath }) {
     }
   }
 
-  return { problems, counts: { invariants: entries.length, witnesses, debts } };
+  return { problems, counts: { invariants: entries.length, witnesses, debts }, entries };
 }
 
 function main() {
@@ -425,7 +433,8 @@ function main() {
   }
   const root = resolve(argValue(args, '--root', SCRIPT_ROOT));
   const registryPath = resolve(argValue(args, '--registry', join(root, 'tests/invariants.toml')));
-  const { problems, counts } = runCheck({ root, registryPath });
+  const mutations = args.includes('--mutations');
+  const { problems, counts, entries } = runCheck({ root, registryPath });
   const expectFail = argValue(args, '--expect-fail');
   if (expectFail) {
     if (problems.some((problem) => problem.startsWith(`${expectFail}:`))) {
@@ -441,6 +450,48 @@ function main() {
       `check-invariants: FAIL (${problems.length} problem(s) over ${counts.invariants} invariant(s))`,
     );
     return 1;
+  }
+  if (mutations) {
+    // Mutation mode: a witness is only credible when a PLANTED violation
+    // makes its gate fail. An invariant either ships a `mutation_command`
+    // that plants the violation (and must exit non-zero), or carries an
+    // explicit mutation_debt. This closes the audit's
+    // "a normal drift check is not a mutation witness" gap.
+    const missing = [];
+    const undetected = [];
+    let proven = 0;
+    for (const entry of entries) {
+      const command = typeof entry.mutation_command === 'string' ? entry.mutation_command.trim() : '';
+      if (command === '') {
+        if (typeof entry.mutation_debt !== 'string' || entry.mutation_debt.trim() === '') {
+          missing.push(entry.id);
+        }
+        continue;
+      }
+      // A mutation command exits 0 when its gate DETECTED the planted
+      // violation, and non-zero when the mutation slipped through.
+      try {
+        execSync(command, { cwd: root, stdio: 'pipe' });
+        proven += 1;
+      } catch {
+        undetected.push(`${entry.id} (${command})`);
+      }
+    }
+    if (missing.length > 0 || undetected.length > 0) {
+      for (const id of missing) {
+        console.error(`invariants-mutations: ${id} has neither a mutation_command nor a mutation_debt`);
+      }
+      for (const entry of undetected) {
+        console.error(`invariants-mutations: ${entry} exited 0; the planted violation was NOT detected`);
+      }
+      console.error(
+        `check-invariants --mutations: FAIL (${missing.length} missing, ${undetected.length} undetected)`,
+      );
+      return 1;
+    }
+    console.log(
+      `check-invariants --mutations: PASS (${proven} planted violation(s) detected by their gates; ${counts.debts} documented debt(s))`,
+    );
   }
   console.log(
     `check-invariants: PASS (${counts.invariants} invariants, ${counts.witnesses} mutation witnesses, ${counts.debts} documented debts)`,
