@@ -1,0 +1,9 @@
+{
+  "id": "INV-IDE-SSE-BLOCKED-DURABLE",
+  "file": "apps/vscode/src/eventStream.ts",
+  "find": "    const durable = frameId !== null;",
+  "replace": "    const durable = false;",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "Durable frames are classified as transient in dispatch: a malformed/oversized durable frame reports a retryable error instead of latching ProtocolBlocked."
+}

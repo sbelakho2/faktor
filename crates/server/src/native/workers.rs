@@ -390,11 +390,15 @@ pub(crate) async fn native_job_claim(
 pub(crate) async fn native_workers_list(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<WorkersQuery>,
+    query: Result<Query<WorkersQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),

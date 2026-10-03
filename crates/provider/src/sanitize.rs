@@ -190,7 +190,22 @@ impl ErrorScrubber {
     /// on a rejected-credentials response is server-authored data and is
     /// never preserved by default.
     pub fn diagnostic(&self, status: u16, raw_body: &str) -> String {
-        if is_auth_status(status) {
+        self.diagnostic_with_auth_disposition(status, raw_body, is_auth_status(status))
+    }
+
+    /// [`Self::diagnostic`] with the auth disposition supplied by the CALLER:
+    /// the error classifier is the authority on whether a response is an
+    /// auth failure (a 403 carrying `RESOURCE_EXHAUSTED` is rate-limit class,
+    /// a 400 carrying `invalid_api_key` is an auth failure), so the message
+    /// shape follows the classified kind rather than the bare status. The
+    /// body is still scrubbed and bounded whenever it is not withheld.
+    pub fn diagnostic_with_auth_disposition(
+        &self,
+        status: u16,
+        raw_body: &str,
+        auth_shaped: bool,
+    ) -> String {
+        if auth_shaped {
             return format!("HTTP {status} authentication failure (upstream body withheld)");
         }
         let scrubbed = self.scrub(raw_body);

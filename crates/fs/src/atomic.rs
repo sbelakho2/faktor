@@ -520,8 +520,18 @@ pub fn atomic_replace_cas_guarded(
     let hash = FileHash::from(blake3::hash(bytes).into());
     let tmp = nonce_temp(path)?;
     write_and_fsync(&tmp, bytes)?;
-    // Strong recheck (whole-file digest) immediately before the rename.
-    let actual = FileState::now_with_digest(path)?;
+    // Strong recheck (whole-file digest) immediately before the rename. A
+    // destination that became unreadable (swapped for a directory/special
+    // file since the cheap precheck) makes the recheck itself fail: that
+    // refusal must still remove the staged temp, exactly like every other
+    // post-stage failure, so a hostile swap cannot leak crash residue.
+    let actual = match FileState::now_with_digest(path) {
+        Ok(actual) => actual,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
     if !expected.satisfied_by(&actual) {
         let _ = fs::remove_file(&tmp);
         return Err(mismatch(path, expected, &actual));
@@ -1142,3 +1152,6 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+#[path = "fs_atomic_hostile.rs"]
+mod fs_atomic_hostile;

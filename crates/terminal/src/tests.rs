@@ -2421,14 +2421,16 @@ fn spawn_probe_child(
     sup.run_sync(cfg, Duration::from_secs(60), 64 * 1024, 64 * 1024)
 }
 
-/// Serializes the DenyAll spawn tests: the forced-unshare hook is
-/// process-global, so the real-backend test and the refusal test must
-/// never overlap (each asserts the global proof state).
+/// Serializes every DenyAll spawn test AND the hostile-corpus seam tests:
+/// the forced-unshare hook and the DenyAll proof flag are process-global,
+/// so a real-backend spawn, a forced-refusal spawn and the proof-state
+/// assertions must never overlap. Shared with `sandbox_hostile` so the two
+/// modules' seam tests exclude each other too.
 #[cfg(target_os = "linux")]
 static DENY_ALL_SPAWN_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "linux")]
-fn deny_all_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn deny_all_spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     DENY_ALL_SPAWN_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
@@ -2459,15 +2461,17 @@ fn deny_all_spawn_isolates_the_child_or_refuses_typed() {
     let _uds = std::os::unix::net::UnixListener::bind(&uds_path).unwrap();
     let parent_netns = netns_inode().expect("parent /proc/self/ns/net readable");
     let self_exe = std::env::current_exe().unwrap();
-    // Pre-spawn proof state: no DENY-ALL spawn has succeeded in this
-    // process, so the report must not claim OsLevel — capability
-    // existence (this test may even run as root) proves nothing by
-    // itself. A proven BrokerOnly backend is legitimate here: it is a
-    // different (weaker) proof that never implies the unshare path.
-    assert_ne!(
-        platform_network_enforcement(),
-        NetworkEnforcement::OsLevel,
-        "the DenyAll unshare path has not proven itself active at spawn yet"
+    // Pre-spawn proof state: OsLevel may only ever appear after a DenyAll
+    // spawn actually succeeded in this process — capability existence
+    // (this test may even run as root) proves nothing by itself. Another
+    // DenyAll test sharing the seam lock may legitimately have proven the
+    // backend already; the proof flag is then the only valid source. A
+    // proven BrokerOnly backend is a different (weaker) proof that never
+    // implies the unshare path.
+    let pre_proof = platform_network_enforcement();
+    assert!(
+        pre_proof != NetworkEnforcement::OsLevel || super::deny_all_proven_for_tests(),
+        "OsLevel must only ever follow a proven DenyAll spawn, got {pre_proof:?}"
     );
     // CONTROL under Inherit: the same probe must reach every endpoint
     // and report the PARENT netns inode — when it fails under DenyAll

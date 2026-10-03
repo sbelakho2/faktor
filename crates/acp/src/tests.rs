@@ -2621,3 +2621,7 @@ async fn terminal_shutdown_is_bounded_and_reported_typed() {
     *released = true;
     cond.notify_all();
 }
+
+#[cfg(test)]
+#[path = "acp_hostile_framing.rs"]
+mod acp_hostile_framing;

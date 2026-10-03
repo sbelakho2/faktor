@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
+use faktor_provider::classify::provider_error_for_http_with_scrubber;
 use faktor_provider::config::{bearer_auth_header, ProviderConfigError};
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
@@ -494,19 +495,11 @@ pub(crate) fn anthropic_stream(
                                     request_head_timeout_ms(deadlines),
                                 )
                                 .await;
-                                let kind = match status.as_u16() {
-                                    401 | 403 => ProviderErrorKind::Auth,
-                                    429 => ProviderErrorKind::RateLimited,
-                                    408 | 504 => ProviderErrorKind::Timeout,
-                                    500..=599 => ProviderErrorKind::Server,
-                                    _ => ProviderErrorKind::BadRequest,
-                                };
-                                let code = status.as_u16();
                                 return Some((
-                                    Err(ProviderError::with_code(
-                                        kind,
-                                        code.to_string(),
-                                        scrubber.diagnostic(code, &text),
+                                    Err(provider_error_for_http_with_scrubber(
+                                        status.as_u16(),
+                                        &text,
+                                        &scrubber,
                                     )),
                                     Stage::Done,
                                 ));

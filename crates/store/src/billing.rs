@@ -1281,8 +1281,17 @@ impl Store {
         // the reserved amount until reconcile/finalize closes it):
         // ceiling = spent + in-flight + free; two concurrent reservations can
         // never jointly overshoot the cap.
+        //
+        // The open sum is computed with `total()` (floating point, which
+        // never raises SQLite's integer-overflow error) and clamped back
+        // into the signed domain BEFORE the cast: individually valid
+        // predictions near i64::MAX must not poison every later reserve on
+        // the task with a raw "integer overflow" SQL failure — the free
+        // balance simply saturates to 0 instead.
         let open_sum: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(predicted_micro), 0) FROM cost_reservation
+            "SELECT CAST(MIN(total(CASE WHEN predicted_micro > 0 THEN predicted_micro ELSE 0 END),
+                              9223372036854774784.0) AS INTEGER)
+             FROM cost_reservation
              WHERE session_id = ?1 AND task_id = ?2 AND status IN ('reserved', 'dispatched', 'uncertain')",
             params![session_id.raw() as i64, task_id.raw() as i64],
             |r| r.get(0),

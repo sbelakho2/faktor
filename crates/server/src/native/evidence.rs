@@ -185,11 +185,15 @@ pub(crate) async fn native_evidence_get(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<NativeEvidenceQuery>,
+    query: Result<Query<NativeEvidenceQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let evidence_id = match id.parse::<EvidenceId>() {
         Ok(id) => id,
         Err(e) => return evidence_error_response(e),
@@ -220,12 +224,16 @@ pub(crate) async fn native_evidence_retrieve(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<NativeEvidenceQuery>,
+    query: Result<Query<NativeEvidenceQuery>, axum::extract::rejection::QueryRejection>,
     body: Result<Json<NativeRetrievalSelector>, JsonRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let Json(selector) = match body {
         Ok(b) => b,
         Err(_) => return wire_status(malformed_body("invalid native retrieval selector")),
@@ -435,10 +443,10 @@ mod tests {
             State(state.clone()),
             auth_headers(&state),
             Path("7".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: None,
-            }),
+            })),
             Ok(Json(NativeRetrievalSelector::All)),
         )
         .await;
@@ -488,10 +496,10 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Path("7".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: None,
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -501,10 +509,10 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Path("8".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: None,
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -514,10 +522,10 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Path("8".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: Some("admin".to_string()),
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -527,10 +535,10 @@ mod tests {
             State(state.clone()),
             headers,
             Path("8".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: Some("superuser".to_string()),
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -555,10 +563,10 @@ mod tests {
             State(state.clone()),
             auth_headers(&state),
             Path("7".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: None,
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -574,10 +582,10 @@ mod tests {
             State(state.clone()),
             auth_headers(&state),
             Path("999".to_string()),
-            Query(NativeEvidenceQuery {
+            Ok(Query(NativeEvidenceQuery {
                 session: row.id.raw().to_string(),
                 scope: None,
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

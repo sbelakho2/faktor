@@ -1011,3 +1011,6 @@ mod tests {
         assert_eq!(lease.record().purpose, "reclaimed");
     }
 }
+#[cfg(test)]
+#[path = "git_hostile.rs"]
+mod git_hostile;

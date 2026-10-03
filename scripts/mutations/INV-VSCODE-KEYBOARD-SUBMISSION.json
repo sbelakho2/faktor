@@ -1,0 +1,9 @@
+{
+  "id": "INV-VSCODE-KEYBOARD-SUBMISSION",
+  "file": "apps/vscode/media/chat.js",
+  "find": "    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {",
+  "replace": "    if (event.key === 'Enter') {",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "Plain Enter now starts the task instead of inserting a newline; the keyboard contract is broken."
+}

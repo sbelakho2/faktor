@@ -116,6 +116,10 @@ macro_rules! reject_zero {
 pub(crate) use reject_zero;
 
 #[cfg(test)]
+#[path = "hostile_corpus_tests.rs"]
+mod hostile_corpus_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::id::{
         EventSeq, OpId, ProviderCallId, SessionId, TaskId, TaskRevision, VerificationRecordId,

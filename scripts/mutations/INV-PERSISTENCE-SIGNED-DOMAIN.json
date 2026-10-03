@@ -1,0 +1,8 @@
+{
+  "id": "INV-PERSISTENCE-SIGNED-DOMAIN",
+  "file": "crates/store/src/ledger.rs",
+  "find": "    pub fn events_range(\n        &self,\n        session_id: SessionId,\n        from_seq: u64,\n        limit: Option<u64>,\n    ) -> StoreResult<Vec<Event>> {\n        let from = match i64::try_from(from_seq) {\n            Ok(from) => from,\n            // No durable seq is above i64::MAX: the page is empty.\n            Err(_) => return Ok(Vec::new()),\n        };",
+  "replace": "    pub fn events_range(\n        &self,\n        session_id: SessionId,\n        from_seq: u64,\n        limit: Option<u64>,\n    ) -> StoreResult<Vec<Event>> {\n        let from = from_seq as i64;",
+  "gate": "cargo test -p faktor-store --lib event_page_cursors_and_limits_never_wrap_the_signed_domain",
+  "note": "Casts an out-of-range cursor with `as i64`: u64::MAX wraps negative and replays the whole journal instead of an empty page."
+}

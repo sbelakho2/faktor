@@ -20,6 +20,10 @@ core.*
 # `core.*` dump rule silently drops it and the CLI no longer compiles from a
 # clean checkout.
 !crates/cli/src/config/core.rs
+# The core crate's hostile-corpus test module is real source too; the bare
+# `core` dump rule would silently drop it and a clean checkout would fail to
+# compile the core test target.
+!crates/core/src/hostile_corpus_tests.rs
 
 # Python bytecode from test mock servers (never source; the .py source is the
 # committed fixture). Enforced by the repository-hygiene scan in

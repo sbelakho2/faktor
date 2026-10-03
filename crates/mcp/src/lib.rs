@@ -1781,3 +1781,9 @@ while True:
         );
     }
 }
+#[cfg(test)]
+#[path = "framing_property_hostile.rs"]
+mod framing_property_hostile;
+#[cfg(test)]
+#[path = "mcp_hostile_framing.rs"]
+mod mcp_hostile_framing;

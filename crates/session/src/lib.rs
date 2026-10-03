@@ -359,3 +359,7 @@ pub(crate) fn map_store_err(e: faktor_store::StoreError) -> SessionError {
 pub(crate) fn json_bytes(v: &serde_json::Value) -> usize {
     serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX)
 }
+
+#[cfg(test)]
+#[path = "hostile_corpus_tests.rs"]
+mod hostile_corpus_tests;

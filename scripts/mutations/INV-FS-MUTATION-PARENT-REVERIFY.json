@@ -1,0 +1,8 @@
+{
+  "id": "INV-FS-MUTATION-PARENT-REVERIFY",
+  "file": "crates/fs/src/lib.rs",
+  "find": "            platform::open_no_follow_walk(root, parent_rel, platform::OpenKind::Directory)?;\n            Ok(())\n        }\n    }\n\n    /// Platforms without a handle-relative walk keep the digest/CAS recheck",
+  "replace": "            let _ = parent_rel;\n            Ok(())\n        }\n    }\n\n    /// Platforms without a handle-relative walk keep the digest/CAS recheck",
+  "gate": "cargo test -p faktor-fs --lib merge_apply_content_refuses_a_parent_swapped_to_an_outside_symlink",
+  "note": "Removes the handle-relative parent re-walk immediately before the rename: a parent swapped to an outside symlink redirects the writer."
+}

@@ -1,0 +1,8 @@
+{
+  "id": "INV-GENERATED-DTO-PARITY",
+  "file": "apps/vscode/src/generated/protocolDto.ts",
+  "find": "  return { code, message, retryable: object[\"retryable\"] === true };\n}",
+  "replace": "  return { code, message, retryable: object[\"retryable\"] === true };\n}\n// planted drift for the parity mutation witness",
+  "gate": "node scripts/protocol-codegen.mjs --check-clients",
+  "note": "Appends an out-of-band line to the generated client DTOs: the codegen parity gate must detect the drift."
+}

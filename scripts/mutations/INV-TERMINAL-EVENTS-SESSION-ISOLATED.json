@@ -1,0 +1,8 @@
+{
+  "id": "INV-TERMINAL-EVENTS-SESSION-ISOLATED",
+  "file": "crates/server/src/native/terminal.rs",
+  "find": "    ring.clear();\n    for record in records {\n        let cache_id = state\n            .next_terminal_event_id\n            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n        ring.push_back((cache_id, terminal_event_frame(&record)));\n    }\n    let mut page: Vec<serde_json::Value> = Vec::new();\n    let mut more = false;\n    let mut last: Option<u64> = None;\n    for (_cache_id, event) in ring.iter() {\n        if event.get(\"sessionId\").and_then(|v| v.as_str()) != Some(session_id) {\n            continue;\n        }\n",
+  "replace": "    for record in records {\n        let cache_id = state\n            .next_terminal_event_id\n            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n        ring.push_back((cache_id, terminal_event_frame(&record)));\n    }\n    let mut page: Vec<serde_json::Value> = Vec::new();\n    let mut more = false;\n    let mut last: Option<u64> = None;\n    for (_cache_id, event) in ring.iter() {\n",
+  "gate": "cargo test -p faktor-server --lib interleaved_foreign_refresh_cannot_cross_into_a_terminal_event_page",
+  "note": "Removes BOTH isolation guards of the shared ring (the pre-refill clear and the per-frame session filter): a foreign session's frames interleaved at the seam remain in the ring and are emitted in another session's page."
+}

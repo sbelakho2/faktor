@@ -1258,3 +1258,6 @@ mod tests {
         wait_group_gone(identity.pgid, Duration::from_secs(5));
     }
 }
+#[cfg(test)]
+#[path = "../guardian_hostile.rs"]
+mod guardian_hostile;

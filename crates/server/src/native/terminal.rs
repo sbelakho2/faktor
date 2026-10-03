@@ -237,11 +237,15 @@ pub(crate) struct NativeTerminalsQuery {
 pub(crate) async fn native_terminals(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NativeTerminalsQuery>,
+    query: Result<Query<NativeTerminalsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let handle = match native_resolve_session(&state, &q.session) {
         Ok(h) => h,
         Err(r) => return *r,
@@ -315,11 +319,15 @@ pub(crate) async fn native_terminal_events(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<NativeTerminalEventsQuery>,
+    query: Result<Query<NativeTerminalEventsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let handle = match native_resolve_session(&state, &id) {
         Ok(h) => h,
         Err(r) => return *r,
@@ -781,7 +789,7 @@ mod terminal_event_tests {
             State(state.clone()),
             auth_headers(state),
             Path(sid.to_string()),
-            Query(query),
+            Ok(Query(query)),
         )
         .await;
         let status = response.status();

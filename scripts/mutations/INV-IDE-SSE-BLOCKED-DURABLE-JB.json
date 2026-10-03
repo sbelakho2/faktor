@@ -1,0 +1,9 @@
+{
+  "id": "INV-IDE-SSE-BLOCKED-DURABLE-JB",
+  "file": "apps/jetbrains/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt",
+  "find": "            } catch (e: ProtocolBlocked) {\n                // Durable corruption/incompatibility: reconnect would replay\n                // the same offending sequence forever. Stable, no retry.\n                blockedHere = e\n                break\n            } catch (e: Exception) {",
+  "replace": "            } catch (e: ProtocolBlocked) {\n                attempt = minOf(attempt + 1, MAX_BACKOFF_ATTEMPT)\n            } catch (e: Exception) {",
+  "gate": "apps/jetbrains/gradlew -p apps/jetbrains --offline --console=plain --no-daemon :backend:smokeNativeBridge -PfaktorCliBin=\"$PWD/target/debug/faktor-cli\"",
+  "timeout_ms": 1800000,
+  "note": "Durable protocol violations no longer latch the blocked state: the client keeps reconnecting/replaying instead of stopping."
+}

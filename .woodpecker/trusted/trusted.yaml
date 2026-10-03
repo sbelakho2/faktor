@@ -16,13 +16,15 @@
 # Job graph (one workflow per matrix platform; all mandatory linux lanes run
 # as parallel steps of a single workflow so they share one workspace):
 #
-#   stage 1 (parallel): linux · static · docs · vscode · jetbrains-build
-#                       · jetbrains-smoke
+#   stage 1 (parallel): linux · static · docs · soak-smoke · vscode
+#                       · jetbrains-build · jetbrains-smoke
 #   stage 2:            perf (after linux, static, docs)
-#   stage 3:            certificate (after every linux lane)
+#   stage 3:            vscode-e2e (after vscode)
+#   stage 4:            certificate (after every linux lane)
 #
 #   darwin combo:  darwin-check · darwin-test · darwin-doctor -> certificate-darwin
-#   windows combo: windows-check · windows-test -> certificate-windows
+#   windows combo: windows-check · windows-test · windows-visual-baseline
+#                  -> certificate-windows
 #
 # Aggregation mechanism (the one Woodpecker actually supports):
 #   * Woodpecker workflows are filesystem-isolated, so markers only work
@@ -297,6 +299,50 @@ steps:
         artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/docs.json
+  # Bounded accelerated release-soak smoke (scripts/soak.sh): one representative
+  # ignored [soak]/[fault]/[perf] test per group, scale 1. The campaign records
+  # target/certification/soak.json and FAILS when it executes zero tests. The
+  # long scaled run is the nightly `soak` lane; this gate keeps the driver and
+  # its representative tests exercised on every push.
+  - name: soak-smoke
+    image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
+    when:
+      matrix:
+        platform: linux/amd64
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+      FAKTOR_SOAK_MODE: smoke
+      FAKTOR_SOAK_SCALE: "1"
+      # Bounded even though the first (cold) release build dominates: a
+      # non-positive budget is refused and a zero-test run fails the step.
+      FAKTOR_SOAK_MAX_WALL_SECONDS: "3600"
+      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "2700"
+    volumes:
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
+      - faktor-trusted-target-soak-smoke:/woodpecker-cache/target
+    commands:
+      - bash scripts/soak.sh
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        bash scripts/soak.sh
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || printf 'unknown')"
+        artifact_path="target/certification/soak.json"
+        artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
+        artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
+        artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"soak-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/soak-smoke.json
   - name: vscode
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     when:
@@ -353,6 +399,52 @@ steps:
         artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
         printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
           "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
+  # Real VS Code Extension Host / webview E2E behind the VS Code lane. Runs
+  # `--extensionDevelopmentPath=apps/vscode` against a PINNED linux-x64 VS Code
+  # tarball (version+commit+sha256 recorded in scripts/vscode-e2e.sh, sha
+  # verified before extraction) and executes scripts/vscode-e2e/extension-host-
+  # smoke.cjs INSIDE the real extension host: extension activated, commands
+  # registered, compiled webview provider HTML carries the strict CSP plus the
+  # composer/attachment surface. It is NOT a screenshot/pixel comparison and
+  # does not display the workbench UI (the record states its exact coverage).
+  # This image is digest-pinned because the Electron extension host needs the
+  # Chromium runtime libraries, which the node:24 baseline does not ship and
+  # which are installed via NO apt step here.
+  - name: vscode-e2e
+    image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:b27e719ecbfef153e13fd24e8341736733bf2658b229677eb21ff57ff5d7fb29 # mcr.microsoft.com/playwright:v1.55.0-noble @ 2026-10-02
+    depends_on: [vscode]
+    when:
+      matrix:
+        platform: linux/amd64
+    volumes:
+      - faktor-trusted-vscode-e2e-cache:/woodpecker-cache/vscode-e2e
+    commands:
+      - bash scripts/vscode-e2e.sh --cache-dir /woodpecker-cache/vscode-e2e/cache
+      - |
+        set -eu
+        mkdir -p target/certification/lanes
+        CMDS="$(cat <<'CMDS'
+        bash scripts/vscode-e2e.sh --cache-dir /woodpecker-cache/vscode-e2e/cache
+        CMDS
+        )"
+        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
+        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
+        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
+        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # The playwright image may lack git; the vscode lane's marker (this
+        # lane depends_on vscode) carries the same tree.
+        tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        if [ -z "$tree" ] && [ -f target/certification/lanes/vscode.json ]; then
+          tree="$(sed -n 's/.*"tree":"\([^"]*\)".*/\1/p' target/certification/lanes/vscode.json | head -n 1)"
+        fi
+        [ -n "$tree" ] || tree="unknown"
+        artifact_path="target/certification/vscode-e2e.json"
+        artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
+        artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
+        artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
+        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-e2e","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
+          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-e2e.json
   - name: jetbrains-build
     # Runs on the digest-pinned Faktor CI image: it carries git (the lane
     # marker's `git rev-parse 'HEAD^{tree}'` tree binding) and the JDK 17
@@ -426,6 +518,15 @@ steps:
         /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
       - . "$HOME/.cargo/env"
       - bash apps/jetbrains/compile-and-smoke.sh
+      # Node (pinned, sha256-verified) for the executable planted-mutation
+      # campaign: this lane is the only one carrying cargo, JDK/gradle and
+      # Node together.
+      - |
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.11.1/node-v24.11.1-linux-x64.tar.xz
+        printf '%s  %s\n' 60e3b0a8500819514aca603487c254298cd776de0698d3cd08f11dba5b8289a8 /tmp/node.tar.xz | sha256sum -c -
+        tar -xJf /tmp/node.tar.xz -C /opt
+      - export PATH="/opt/node-v24.11.1-linux-x64/bin:$PATH" && node --version && node scripts/check-invariants.mjs --mutations
       - |
         set -eu
         mkdir -p target/certification/lanes
@@ -439,6 +540,11 @@ steps:
         /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
         . "$HOME/.cargo/env"
         bash apps/jetbrains/compile-and-smoke.sh
+        set -eu
+        curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.11.1/node-v24.11.1-linux-x64.tar.xz
+        printf '%s  %s\n' 60e3b0a8500819514aca603487c254298cd776de0698d3cd08f11dba5b8289a8 /tmp/node.tar.xz | sha256sum -c -
+        tar -xJf /tmp/node.tar.xz -C /opt
+        export PATH="/opt/node-v24.11.1-linux-x64/bin:$PATH" && node --version && node scripts/check-invariants.mjs --mutations
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
@@ -650,6 +756,21 @@ steps:
           artifact_digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         } | ConvertTo-Json -Compress -Depth 6
         Set-Content -Path target/certification/lanes/windows-test.json -Value $marker
+  # Windows-owned JetBrains visual parity baseline gate: FAILS when the pinned
+  # baseline has no DISTINCT windows record (a platform is never certified by
+  # inheriting linux/macos digests), renders/compares with
+  # `bash apps/jetbrains/compile-and-smoke.sh`, and re-pins on demand with
+  # `-WriteBaselines` (which also copies the produced baseline to
+  # target/certification/visual-baselines-windows.json for retrieval).
+  - name: windows-visual-baseline
+    image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
+    when:
+      matrix:
+        platform: windows/amd64
+    commands:
+      - |
+        $ErrorActionPreference = "Stop"
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1
   - name: release-artifacts
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     depends_on: [static, vscode, jetbrains-build]
@@ -705,7 +826,9 @@ steps:
       - linux
       - static
       - docs
+      - soak-smoke
       - vscode
+      - vscode-e2e
       - jetbrains-build
       - jetbrains-smoke
       - perf
@@ -721,7 +844,10 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
-      - node scripts/check-invariants.mjs --mutations
+      # The planted-mutation campaign runs in the jetbrains-smoke lane, which
+      # carries cargo, JDK/gradle and Node; this node-only image has none of
+      # those toolchains, so running it here would count exit-127 environment
+      # failures as detections.
       - node scripts/certification/evidence.mjs verify-markers --workflow trusted --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
       - node scripts/certification/evidence.mjs write --kind ci_certification_trusted --status passed --from-markers target/certification/lanes --commands "woodpecker trusted linux workflow certificate"
 
@@ -886,7 +1012,7 @@ steps:
         [ "$rc" -eq 0 ]
   - name: certificate-windows
     image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
-    depends_on: [windows-check, windows-test]
+    depends_on: [windows-check, windows-test, windows-visual-baseline]
     when:
       matrix:
         platform: windows/amd64
@@ -897,7 +1023,7 @@ steps:
         New-Item -ItemType Directory -Force -Path target/certification | Out-Null
         $tree = (git rev-parse 'HEAD^{tree}').Trim()
         $rc = 0
-        foreach ($lane in @("windows-check", "windows-test")) {
+        foreach ($lane in @("windows-check", "windows-test", "windows-visual-baseline")) {
           $f = "target/certification/lanes/$lane.json"
           if ((Test-Path $f) -and (Select-String -Quiet -Path $f -Pattern '"schema":"faktor-woodpecker-lane/v2"') -and (Select-String -Quiet -Path $f -Pattern '"status":"passed"') -and (Select-String -Quiet -Path $f -Pattern ('"commit":"' + $env:CI_COMMIT_SHA + '"')) -and (Select-String -Quiet -Path $f -Pattern ('"tree":"' + $tree + '"'))) {
             Write-Host "passed $lane"

@@ -41,8 +41,10 @@ pub(crate) const TASK_COMPLETION_STEPS_SCHEMA: &str = "faktor-task-completion-st
 pub(crate) const MAX_PROOF_STEPS: usize = 64;
 
 /// The query scope of both task reads. `session` is REQUIRED (see the module
-/// docs); an unknown query member is ignored like every native query surface.
+/// docs); unknown query members are refused typed like every other native
+/// DTO surface (a typo must not silently broaden the read scope).
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NativeTaskScopeQuery {
     session: Option<String>,
 }
@@ -313,11 +315,15 @@ pub(crate) async fn native_task_proof(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<NativeTaskScopeQuery>,
+    query: Result<Query<NativeTaskScopeQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let scoped = match resolve_scoped_task(&state, query.session.as_deref(), &id) {
         Ok(s) => s,
         Err(r) => return *r,
@@ -628,11 +634,15 @@ pub(crate) async fn native_task_completion_steps(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<NativeTaskScopeQuery>,
+    query: Result<Query<NativeTaskScopeQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let scoped = match resolve_scoped_task(&state, query.session.as_deref(), &id) {
         Ok(s) => s,
         Err(r) => return *r,

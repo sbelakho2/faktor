@@ -1,0 +1,8 @@
+{
+  "id": "INV-CREATE-SESSION-SEED-ATOMIC",
+  "file": "crates/store/src/sessions.rs",
+  "find": "        Self::insert_event_locked(\n            &tx,\n            sid,\n            None,\n            EventKind::SessionCreated,\n            &idle_state_json,\n            now,\n            Some(created_payload_json),\n            1,\n            &seq_messages,\n        )?;",
+  "replace": "        let _ = (&tx, sid, &idle_state_json, now, &created_payload_json, &seq_messages);",
+  "gate": "cargo test -p faktor-store --lib create_session_seams_never_leave_a_row_without_its_seed_event",
+  "note": "Commits the session row without its seq-1 SessionCreated seed event: the atomic creation contract is broken."
+}

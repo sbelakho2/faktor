@@ -1,0 +1,8 @@
+{
+  "id": "INV-MAX-QUALITY-ONE-AUTHORITY",
+  "file": "crates/agent/src/lib.rs",
+  "find": "        tiers.reverse();",
+  "replace": "        // planted mutation: the descending tier order is dropped",
+  "gate": "cargo test -p faktor-agent --lib maximum_quality_prefers_higher_measured_quality_over_equal_descriptor_priors",
+  "note": "Drops highest-floor-first probing: MaximumQuality then takes the lowest servable tier, so the higher MEASURED quality loses."
+}

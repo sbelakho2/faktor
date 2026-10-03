@@ -6,15 +6,16 @@
 //!
 //! | HTTP status | hint (`error.type`/`error.code`/`error.status`) | kind |
 //! |---|---|---|
-//! | 401, 407 | ANY (even a `rate_limit`-looking body) | `Auth` |
+//! | 401, 407 | ANY (even a `rate_limit`-looking body) | `Permission` |
 //! | 403 | `permission_denied`-family (Google `PERMISSION_DENIED`) | `Permission` |
 //! | 403 | `rate_limit`-family (`RESOURCE_EXHAUSTED`, quota) | `RateLimited` |
-//! | 403 | auth-family or none | `Auth` |
-//! | 400 | auth/permission-family (OpenAI `code: invalid_api_key`) | `Auth` |
+//! | 403 | auth-family or none | `Permission` |
+//! | 400 | auth/permission-family (OpenAI `code: invalid_api_key`) | `Permission` |
 //! | 400 | none | `Malformed` |
 //! | 404 | — | `NotFound` |
 //! | 409 | — | `Conflict` |
-//! | 422, 501 | — | `Unsupported` |
+//! | 422 | — | `Malformed` |
+//! | 501 | — | `Internal` |
 //! | 429 | ANY | `RateLimited` |
 //! | 408, 425, 504 | — | `Timeout` |
 //! | 5xx (rest) | — | `Provider { retryable: true }` |
@@ -38,9 +39,10 @@
 //! text is NEVER scanned — a message saying "invalid api key" proves
 //! nothing.
 
-use faktor_core::error::{Error, ErrorKind};
+use faktor_core::error::ErrorKind;
 use serde_json::Value;
 
+use crate::sanitize::ErrorScrubber;
 use crate::{ProviderError, ProviderErrorKind};
 
 /// A hint token classified into its semantic family.
@@ -81,8 +83,13 @@ fn is_auth_token(folded: &str) -> bool {
             | "invalidcredentials"
             | "accesstokeninvalid"
             | "authenticationfailed"
-    ) || folded.starts_with("authentication_")
-        || folded.starts_with("apikey")
+    ) || folded.starts_with("apikey")
+        // Conservative family match: the in-stream classifier this table
+        // replaced used `contains("auth")`, so `authorization_error`,
+        // `oauth_error` and `authentication_failure` must stay auth-shaped
+        // (credential rejection), not fall through to the generic terminal
+        // kind. The explicit list above keeps the exact-token cases cheap.
+        || folded.contains("auth")
 }
 
 /// The permission-family token set (Google `PERMISSION_DENIED`, Anthropic
@@ -127,7 +134,7 @@ pub fn hint_kind(hint: &str) -> Option<ErrorHint> {
     }
 }
 
-/// Extract the strongest structured hint from an error body. Returns the
+/// Extract the strongest structured hint from a raw error body. Returns the
 /// normalized token (`invalid_api_key`, `PERMISSION_DENIED`, ...) of the
 /// highest-precedence classified field, or `None`.
 ///
@@ -136,12 +143,27 @@ pub fn hint_kind(hint: &str) -> Option<ErrorHint> {
 /// - Google: `{"error": {"status": "PERMISSION_DENIED" | "code": 7}}`
 /// - Google ErrorInfo detail rows (400-level auth/quota): `{"error": {"details": [{"reason": "API_KEY_INVALID"}]}}`
 /// - SSE error events: `{"type": "error", "error": {"code": ...}}`
+/// - Responses / SSE error events: `{"type": "error", "code": "invalid_api_key"}`
+///
+/// Non-JSON and non-object bodies yield `None`.
 pub fn body_error_hint(body: &str) -> Option<String> {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return None;
-    };
-    let error = find_ci(&value, "error")?;
-    let error = error.as_object()?;
+    let value: Value = serde_json::from_str(body).ok()?;
+    value_error_hint(&value)
+}
+
+/// The same structured scan for an already-parsed JSON value: the `error`
+/// member's object when present, else the value itself (SSE and Responses
+/// error events carry their structured fields at the top level). Never
+/// inspects message text.
+pub fn value_error_hint(value: &Value) -> Option<String> {
+    if let Some(error) = find_ci(value, "error").and_then(|e| e.as_object()) {
+        return error_object_hint(error);
+    }
+    value.as_object().and_then(error_object_hint)
+}
+
+/// Scan ONE structured error object for its strongest hint field.
+fn error_object_hint(error: &serde_json::Map<String, Value>) -> Option<String> {
     let mut best: Option<(u8, String)> = None;
     let mut push = |rank: u8, token: &str| {
         if best.as_ref().is_none_or(|(r, _)| rank > *r) {
@@ -216,29 +238,29 @@ fn find_ci<'v>(value: &'v Value, key: &str) -> Option<&'v Value> {
 pub fn classify_http(status: u16, body_hint: Option<&str>) -> ErrorKind {
     let hint = body_hint.and_then(hint_kind);
     match status {
-        // Credentials were rejected: NEVER retryable. Auth wins over any
-        // body hint — see the module docs.
-        401 | 407 => ErrorKind::Auth,
+        // Credentials were rejected: NEVER retryable. Permission wins over
+        // any body hint — see the module docs.
+        401 | 407 => ErrorKind::Permission,
         // 403: the server authenticated the request but refused it. The
         // hint decides the family — permission is NOT auth (Google
         // PERMISSION_DENIED), quota exhaustion is rate-limit class; a bare
-        // 403 (or an auth token) is treated as an auth denial exactly like
-        // the legacy adapters did.
+        // 403 (or an auth token) is a terminal credential/permission denial.
         403 => match hint {
             Some(ErrorHint::Permission) => ErrorKind::Permission,
             Some(ErrorHint::RateLimited) => ErrorKind::RateLimited,
-            _ => ErrorKind::Auth,
+            _ => ErrorKind::Permission,
         },
         // 400 with an auth/permission token: some providers 400 instead of
         // 401 on bad keys (OpenAI-style `code: invalid_api_key`); the hint
         // overrides the status. No hint: malformed request.
         400 => match hint {
-            Some(ErrorHint::Auth) | Some(ErrorHint::Permission) => ErrorKind::Auth,
+            Some(ErrorHint::Auth) | Some(ErrorHint::Permission) => ErrorKind::Permission,
             _ => ErrorKind::Malformed,
         },
         404 => ErrorKind::NotFound,
         409 => ErrorKind::Conflict,
-        422 | 501 => ErrorKind::Unsupported,
+        422 => ErrorKind::Malformed,
+        501 => ErrorKind::Internal,
         // Rate limits stay retryable with backoff; the status wins over any
         // hint (a throttled channel proved it reached a live endpoint).
         429 => ErrorKind::RateLimited,
@@ -268,11 +290,55 @@ pub fn classify_http(status: u16, body_hint: Option<&str>) -> ErrorKind {
 /// non-retryable kind then.
 pub fn classify_hint_only(body_hint: Option<&str>) -> Option<ErrorKind> {
     match body_hint.and_then(hint_kind) {
-        Some(ErrorHint::Auth) => Some(ErrorKind::Auth),
+        Some(ErrorHint::Auth) => Some(ErrorKind::Permission),
         Some(ErrorHint::Permission) => Some(ErrorKind::Permission),
         Some(ErrorHint::RateLimited) => Some(ErrorKind::RateLimited),
         None => None,
     }
+}
+
+/// Classify one HTTP error response end-to-end: the structured hint is
+/// extracted from `body` (structured fields only, never message text), the
+/// status and hint go through [`classify_http`], and the resulting core kind
+/// is rendered into its provider envelope with the numeric status as the
+/// code. The message is rendered from the SAME classification — the
+/// classified kind decides whether the upstream body is withheld (terminal
+/// auth-classified responses) or scrubbed and bounded — so the kind,
+/// retryability and message shape can never disagree. A 403 carrying
+/// `RESOURCE_EXHAUSTED` is retryable rate-limit class and keeps its scrubbed
+/// diagnostic; a 400 carrying `invalid_api_key` is auth-classified and
+/// withholds the body exactly like a 401. The raw body never reaches the
+/// error.
+pub fn provider_error_for_http_with_scrubber(
+    status: u16,
+    body: &str,
+    scrubber: &ErrorScrubber,
+) -> ProviderError {
+    let hint = hint_for_status(status, body);
+    let kind = classify_http(status, hint.as_deref());
+    let message = scrubber.diagnostic_with_auth_disposition(
+        status,
+        body,
+        matches!(kind, ErrorKind::Permission),
+    );
+    provider_error_for(kind, status.to_string(), message)
+}
+
+/// Only 400/403 consume a body hint; every other status classifies from the
+/// status alone, so the (up to 64 KiB) body is never JSON-parsed for them.
+fn hint_for_status(status: u16, body: &str) -> Option<String> {
+    if matches!(status, 400 | 403) {
+        body_error_hint(body)
+    } else {
+        None
+    }
+}
+
+/// Envelope for a structured hint with NO status context (SSE and Responses
+/// `error` events on an otherwise-2xx stream). `None` when the hint is not a
+/// typed family — callers keep their generic non-retryable kind then.
+pub fn provider_error_for_hint(hint: Option<&str>) -> Option<ProviderErrorKind> {
+    classify_hint_only(hint).map(|kind| provider_error_kind(&kind))
 }
 
 /// Build the transport error envelope for a classified kind. The envelope
@@ -283,32 +349,35 @@ pub fn provider_error_for(
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> ProviderError {
-    let envelope = match &kind {
-        ErrorKind::Auth => ProviderErrorKind::Auth,
-        ErrorKind::Permission => ProviderErrorKind::Permission,
+    ProviderError::with_code(provider_error_kind(&kind), code, message)
+}
+
+/// The envelope for one classified core kind. Exhaustive by construction —
+/// a new core kind forces a decision here. Kinds the provider envelope
+/// cannot represent keep the envelope's retryability: retryable storage and
+/// scheduler failures ride `Server`, every terminal kind folds to
+/// `BadRequest`.
+fn provider_error_kind(kind: &ErrorKind) -> ProviderErrorKind {
+    match kind {
+        ErrorKind::Permission => ProviderErrorKind::Auth,
         ErrorKind::RateLimited => ProviderErrorKind::RateLimited,
         ErrorKind::Timeout => ProviderErrorKind::Timeout,
         ErrorKind::Network => ProviderErrorKind::Network,
-        ErrorKind::NotFound => ProviderErrorKind::NotFound,
-        ErrorKind::Conflict => ProviderErrorKind::Conflict,
-        ErrorKind::Unsupported => ProviderErrorKind::Unsupported,
         ErrorKind::Malformed => ProviderErrorKind::Malformed,
+        ErrorKind::Cancelled => ProviderErrorKind::Cancelled,
         ErrorKind::Provider {
             retryable: true, ..
         } => ProviderErrorKind::Server,
-        // Oversized/Cancelled/Store/Internal/Deadlock/InvalidState and
-        // non-retryable Provider kinds all fold to the non-retryable
-        // BadRequest envelope (the classifier never emits them).
-        _ => ProviderErrorKind::BadRequest,
-    };
-    ProviderError::with_code(envelope, code, message)
-}
-
-/// Build a typed core error from a classified kind (the non-streaming
-/// adapter paths — ollama discovery/probing — return `faktor_core::Error`
-/// directly).
-pub fn core_error_for(kind: ErrorKind, message: impl Into<String>) -> Error {
-    Error::new(kind, message)
+        ErrorKind::Store | ErrorKind::Deadlock => ProviderErrorKind::Server,
+        ErrorKind::Provider {
+            retryable: false, ..
+        }
+        | ErrorKind::NotFound
+        | ErrorKind::Conflict
+        | ErrorKind::Internal
+        | ErrorKind::Oversized
+        | ErrorKind::InvalidState { .. } => ProviderErrorKind::BadRequest,
+    }
 }
 
 #[cfg(test)]
@@ -323,15 +392,15 @@ mod tests {
     fn classifier_matrix_status_x_hint() {
         use ErrorKind as K;
         // Auth rows: 401/407 win over EVERY hint, even a rate-limit body.
-        assert_eq!(kind_for(401, None), K::Auth);
-        assert_eq!(kind_for(401, Some("rate_limit")), K::Auth);
-        assert_eq!(kind_for(401, Some("invalid_api_key")), K::Auth);
-        assert_eq!(kind_for(407, None), K::Auth);
-        assert_eq!(kind_for(407, Some("rate_limit_exceeded")), K::Auth);
+        assert_eq!(kind_for(401, None), K::Permission);
+        assert_eq!(kind_for(401, Some("rate_limit")), K::Permission);
+        assert_eq!(kind_for(401, Some("invalid_api_key")), K::Permission);
+        assert_eq!(kind_for(407, None), K::Permission);
+        assert_eq!(kind_for(407, Some("rate_limit_exceeded")), K::Permission);
         // 403: hint decides; bare 403 is auth (legacy semantics).
-        assert_eq!(kind_for(403, None), K::Auth);
-        assert_eq!(kind_for(403, Some("invalid_api_key")), K::Auth);
-        assert_eq!(kind_for(403, Some("authentication_error")), K::Auth);
+        assert_eq!(kind_for(403, None), K::Permission);
+        assert_eq!(kind_for(403, Some("invalid_api_key")), K::Permission);
+        assert_eq!(kind_for(403, Some("authentication_error")), K::Permission);
         // Permission is NOT auth (Google PERMISSION_DENIED boundary).
         assert_eq!(kind_for(403, Some("PERMISSION_DENIED")), K::Permission);
         assert_eq!(kind_for(403, Some("permission_denied")), K::Permission);
@@ -344,16 +413,16 @@ mod tests {
         // 400: auth hint overrides the status (OpenAI code: invalid_api_key
         // on a 400 body); no hint is a malformed request.
         assert_eq!(kind_for(400, None), K::Malformed);
-        assert_eq!(kind_for(400, Some("invalid_api_key")), K::Auth);
-        assert_eq!(kind_for(400, Some("authentication_error")), K::Auth);
-        assert_eq!(kind_for(400, Some("unauthorized")), K::Auth);
-        assert_eq!(kind_for(400, Some("permission")), K::Auth);
+        assert_eq!(kind_for(400, Some("invalid_api_key")), K::Permission);
+        assert_eq!(kind_for(400, Some("authentication_error")), K::Permission);
+        assert_eq!(kind_for(400, Some("unauthorized")), K::Permission);
+        assert_eq!(kind_for(400, Some("permission")), K::Permission);
         assert_eq!(kind_for(400, Some("rate_limit")), K::Malformed);
         // Typed 4xx.
         assert_eq!(kind_for(404, None), K::NotFound);
         assert_eq!(kind_for(409, None), K::Conflict);
-        assert_eq!(kind_for(422, None), K::Unsupported);
-        assert_eq!(kind_for(501, None), K::Unsupported);
+        assert_eq!(kind_for(422, None), K::Malformed);
+        assert_eq!(kind_for(501, None), K::Internal);
         // Rate limits: status wins over every hint.
         assert_eq!(kind_for(429, None), K::RateLimited);
         assert_eq!(kind_for(429, Some("invalid_api_key")), K::RateLimited);
@@ -386,10 +455,9 @@ mod tests {
                 retryable: false
             }
         );
-        // Retryability follows the kind: Auth/typed 4xx are terminal.
-        assert!(!K::Auth.is_retryable());
+        // Retryability follows the kind: permission/typed 4xx are terminal.
         assert!(!K::Permission.is_retryable());
-        assert!(!K::Unsupported.is_retryable());
+        assert!(!K::Internal.is_retryable());
         assert!(!K::NotFound.is_retryable());
         assert!(!K::Conflict.is_retryable());
         assert!(!K::Malformed.is_retryable());
@@ -448,6 +516,101 @@ mod tests {
             .as_deref(),
             Some("authenticationerror")
         );
+        // SSE / Responses error events carry the structured code at the top
+        // level (there is no nested `error` object).
+        assert_eq!(
+            body_error_hint(r#"{"type":"error","code":"invalid_api_key","message":"bad"}"#)
+                .as_deref(),
+            Some("invalidapikey")
+        );
+    }
+
+    #[test]
+    fn parsed_event_hints_share_the_same_structured_scan() {
+        let ev: Value =
+            serde_json::from_str(r#"{"type":"error","code":"rate_limit_exceeded"}"#).unwrap();
+        assert_eq!(value_error_hint(&ev).as_deref(), Some("ratelimitexceeded"));
+        // A nested error object (Responses `response.failed`) is read the
+        // same way the HTTP envelope is.
+        let ev: Value = serde_json::from_str(
+            r#"{"type":"response.failed","response":{"error":{"type":"authentication_error"}}}"#,
+        )
+        .unwrap();
+        let nested = ev
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .expect("nested error");
+        assert_eq!(
+            value_error_hint(nested).as_deref(),
+            Some("authenticationerror")
+        );
+        // Message text is never a hint, parsed or not.
+        let ev: Value =
+            serde_json::from_str(r#"{"type":"error","message":"invalid api key"}"#).unwrap();
+        assert_eq!(value_error_hint(&ev), None);
+    }
+
+    #[test]
+    fn http_envelope_uses_structured_body_hints() {
+        let scrubber = ErrorScrubber::new();
+        // OpenAI-style 400 on a bad key: the auth hint overrides the status.
+        let err = provider_error_for_http_with_scrubber(
+            400,
+            r#"{"error":{"code":"invalid_api_key","message":"bad"}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        assert!(!err.retryable);
+        assert_eq!(err.code.as_deref(), Some("400"));
+        // Google quota denial rides 403: rate-limit class stays retryable.
+        let err = provider_error_for_http_with_scrubber(
+            403,
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED","code":429}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+        assert!(err.retryable);
+        // Google permission boundary stays terminal.
+        let err = provider_error_for_http_with_scrubber(
+            403,
+            r#"{"error":{"status":"PERMISSION_DENIED"}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        assert!(!err.retryable);
+        // No structured hint: the status taxonomy decides.
+        let err = provider_error_for_http_with_scrubber(
+            400,
+            r#"{"error":{"message":"nope"}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::Malformed);
+        assert!(!err.retryable);
+        let err = provider_error_for_http_with_scrubber(
+            503,
+            r#"{"error":{"message":"down"}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::Server);
+        assert!(err.retryable);
+    }
+
+    #[test]
+    fn hint_envelope_for_stream_events() {
+        assert_eq!(
+            provider_error_for_hint(Some("invalid_api_key")),
+            Some(ProviderErrorKind::Auth)
+        );
+        assert_eq!(
+            provider_error_for_hint(Some("RESOURCE_EXHAUSTED")),
+            Some(ProviderErrorKind::RateLimited)
+        );
+        assert_eq!(
+            provider_error_for_hint(Some("server_error")),
+            None,
+            "unknown codes keep the caller's generic terminal kind"
+        );
+        assert_eq!(provider_error_for_hint(None), None);
     }
 
     #[test]
@@ -481,31 +644,21 @@ mod tests {
             let code = status.to_string();
             assert_eq!(err.code.as_deref(), Some(code.as_str()));
         }
-        // Kinds surface typed through the envelope.
-        let err = provider_error_for(ErrorKind::Auth, "401", "k");
+        // Kinds surface typed through the envelope: core `Permission` is the
+        // frozen `Auth` envelope; unrepresentable terminal kinds fold to the
+        // non-retryable `BadRequest` envelope.
+        let err = provider_error_for(ErrorKind::Permission, "401", "k");
         assert_eq!(err.kind, ProviderErrorKind::Auth);
         let err = provider_error_for(ErrorKind::Permission, "403", "k");
-        assert_eq!(err.kind, ProviderErrorKind::Permission);
-        let err = provider_error_for(ErrorKind::Unsupported, "422", "k");
-        assert_eq!(err.kind, ProviderErrorKind::Unsupported);
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        let err = provider_error_for(ErrorKind::Internal, "422", "k");
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
         let err = provider_error_for(ErrorKind::NotFound, "404", "k");
-        assert_eq!(err.kind, ProviderErrorKind::NotFound);
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
         let err = provider_error_for(ErrorKind::Conflict, "409", "k");
-        assert_eq!(err.kind, ProviderErrorKind::Conflict);
+        assert_eq!(err.kind, ProviderErrorKind::BadRequest);
         let err = provider_error_for(ErrorKind::RateLimited, "429", "k");
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
-    }
-
-    #[test]
-    fn core_error_carries_classified_kind_and_code() {
-        let kind = classify_http(401, None);
-        let err = core_error_for(kind, "invalid api key");
-        assert_eq!(err.kind, ErrorKind::Auth);
-        assert_eq!(err.code(), "auth_required");
-        assert!(!err.retryable);
-        let err = core_error_for(classify_http(422, None), "unsupported");
-        assert_eq!(err.code(), "unsupported");
-        assert!(!err.retryable);
     }
 
     #[test]
@@ -513,6 +666,11 @@ mod tests {
         assert_eq!(hint_kind("authentication_error"), Some(ErrorHint::Auth));
         assert_eq!(hint_kind("Invalid_API_Key"), Some(ErrorHint::Auth));
         assert_eq!(hint_kind("unauthorized"), Some(ErrorHint::Auth));
+        // The conservative family match keeps every auth-shaped spelling the
+        // replaced in-stream classifier caught (it used `contains("auth")`).
+        assert_eq!(hint_kind("authorization_error"), Some(ErrorHint::Auth));
+        assert_eq!(hint_kind("authentication_failure"), Some(ErrorHint::Auth));
+        assert_eq!(hint_kind("oauth_error"), Some(ErrorHint::Auth));
         assert_eq!(hint_kind("PERMISSION_DENIED"), Some(ErrorHint::Permission));
         assert_eq!(hint_kind("forbidden"), Some(ErrorHint::Permission));
         assert_eq!(hint_kind("rate_limit"), Some(ErrorHint::RateLimited));
@@ -532,10 +690,46 @@ mod tests {
     }
 
     #[test]
+    fn http_message_shape_follows_the_classified_auth_disposition() {
+        let scrubber = ErrorScrubber::new();
+        // 403 quota is rate-limit class: retryable, and its scrubbed body is
+        // kept (the status-only rule would have claimed an auth failure).
+        let err = provider_error_for_http_with_scrubber(
+            403,
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+        assert!(err.retryable);
+        assert!(err.message.contains("HTTP 403"), "{}", err.message);
+        assert!(
+            !err.message.contains("authentication failure"),
+            "{}",
+            err.message
+        );
+        // 400 bad key is auth class: terminal and withheld.
+        let err = provider_error_for_http_with_scrubber(
+            400,
+            r#"{"error":{"code":"invalid_api_key","message":"bad key"}}"#,
+            &scrubber,
+        );
+        assert_eq!(err.kind, ProviderErrorKind::Auth);
+        assert!(!err.retryable);
+        assert!(err.message.contains("withheld"), "{}", err.message);
+        assert!(!err.message.contains("bad key"), "{}", err.message);
+        // 401/403 without a hint stay auth and withheld.
+        for status in [401u16, 403] {
+            let err = provider_error_for_http_with_scrubber(status, "denied", &scrubber);
+            assert_eq!(err.kind, ProviderErrorKind::Auth, "status {status}");
+            assert!(err.message.contains("withheld"), "status {status}");
+        }
+    }
+
+    #[test]
     fn hint_only_classification_for_sse_error_events() {
         assert_eq!(
             classify_hint_only(Some("invalid_api_key")),
-            Some(ErrorKind::Auth)
+            Some(ErrorKind::Permission)
         );
         assert_eq!(
             classify_hint_only(Some("PERMISSION_DENIED")),

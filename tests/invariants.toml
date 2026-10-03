@@ -9,8 +9,13 @@
 #   production_wiring Rust test fn proving the production path is wired to it
 #   fault             optional #[ignore]-gated [fault] campaign fn ("" = none)
 #   mutation_witness  Rust test fn that plants a deliberate violation and
-#                     proves the oracle fires; "" only with a mutation_debt
-#   mutation_debt     one-line reason no witness fn exists ("" when set)
+#                     proves the oracle fires; "" for script-level witnesses
+#   mutation_command  command that plants a real mutation through
+#                     scripts/mutation-run.mjs (spec under scripts/mutations/)
+#                     and exits 0 only when the gate detected it; "" only
+#                     with a mutation_debt
+#   mutation_debt     one-line reason no planted-mutation run exists
+#                     ("" when mutation_command is set)
 #   platforms         platforms where the invariant must hold
 #   script_check      literal non-Rust gate: a VS Code selftest step label
 #                     (apps/vscode/scripts/selftest.mjs) or a command line
@@ -19,8 +24,8 @@
 #
 # scripts/check-invariants.mjs is the gate: every named Rust fn must exist
 # exactly once across crates/**+tests/**, every script_check must resolve to
-# a selftest step or a wired CI command, and every invariant must either name
-# a mutation_witness or document the mutation_debt.
+# a selftest step or a wired CI command, and every invariant must either ship
+# a mutation_command or document the mutation_debt.
 
 [[invariant]]
 id = "INV-COMPACTION-SUMMARY-CAP"
@@ -31,7 +36,8 @@ unit_test = "compaction_summary_one_over_the_cap_is_refused"
 production_wiring = "try_compact_consumes_durable_projection_not_the_transcript"
 fault = ""
 mutation_witness = "compaction_cap_guard_is_pinned_against_mutation"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-COMPACTION-SUMMARY-CAP"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -43,7 +49,8 @@ unit_test = "maximum_quality_prefers_higher_measured_quality_over_equal_descript
 production_wiring = "maximum_quality_path_consumes_only_qualified_candidates"
 fault = ""
 mutation_witness = "measured_outcomes_supersede_declared_quality_in_both_directions"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-MAX-QUALITY-ONE-AUTHORITY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -55,7 +62,8 @@ unit_test = "attachment_references_are_keyed_by_full_metadata_and_survive_reopen
 production_wiring = "upload_resolve_and_reference_identity_roundtrip_over_the_wire"
 fault = ""
 mutation_witness = "migration_v25_rebuilds_attachment_references_and_preserves_rows"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-ATTACHMENT-REFERENCE-IDENTITY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -67,7 +75,8 @@ unit_test = "seed_task_attachments_txn_create_lands_references_and_the_row_toget
 production_wiring = "seed_task_attachments_writer_closure_is_sql_only"
 fault = ""
 mutation_witness = "seed_task_attachments_txn_hostile_task_update_rolls_back_references"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-ATTACHMENT-SEED-ATOMIC"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -79,7 +88,8 @@ unit_test = "shutdown_reports_typed_error_when_maintenance_does_not_drain"
 production_wiring = "shutdown_drains_queued_mutations_deterministically"
 fault = ""
 mutation_witness = "register_after_shutdown_begins_is_refused"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -91,7 +101,8 @@ unit_test = "prepared_writer_jobs_never_do_fs_serialization_hashing_sleeps_or_cl
 production_wiring = "writer_job_allowlist_is_empty"
 fault = ""
 mutation_witness = "writer_job_scan_fires_on_planted_unprepared_work"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-PREPARED-WRITER-JOBS"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -103,7 +114,8 @@ unit_test = "journal_session_problems_flag_each_open_invariant"
 production_wiring = "journal_verify_open_maps_a_torn_journal_to_the_typed_corruption_surface"
 fault = "full_store_journal_boundaries"
 mutation_witness = "journal_consistency_flags_later_event_masquerading_as_seq_one"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-JOURNAL-INTEGRITY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -115,7 +127,8 @@ unit_test = "create_session_seams_never_leave_a_row_without_its_seed_event"
 production_wiring = "reopen_replays_state_from_journal"
 fault = "full_session_command_boundaries"
 mutation_witness = "crash_at_each_seam_reopens_exactly_old_or_exactly_new"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-CREATE-SESSION-SEED-ATOMIC"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -127,7 +140,8 @@ unit_test = "event_page_cursors_and_limits_never_wrap_the_signed_domain"
 production_wiring = "ledger_page_limits_refuse_above_the_signed_range"
 fault = ""
 mutation_witness = "persistence_limits_and_sequences_are_never_cast_unchecked"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-PERSISTENCE-SIGNED-DOMAIN"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -139,7 +153,8 @@ unit_test = "claim_fresh_then_complete_replays_the_exact_receipt_bytes"
 production_wiring = "submission_key_replay_returns_the_byte_identical_receipt_without_a_second_run"
 fault = ""
 mutation_witness = "same_key_with_a_different_digest_is_key_reused_even_before_completion"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-TASK-START-IDEMPOTENT"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -149,7 +164,8 @@ owner = "apps/vscode webview transcript"
 authority = "apps/vscode/media/chat.js renderTranscript/transcriptScrollPlan"
 script_check = "background refresh with no transcript delta mutates zero scroll and keeps evidence"
 mutation_witness = "an unpinned reader keeps the first visible entry and pixel offset"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-TRANSCRIPT-SCROLL-OWNERSHIP"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -159,7 +175,8 @@ owner = "apps/vscode verification cache"
 authority = "apps/vscode/src/taskStart.ts EvidenceAuthorityCache/verificationAuthorityKey; apps/vscode/src/extension.ts taskVerificationFor/taskProofFor"
 script_check = "architectural: no proof-like cache returns data after its authority key changed"
 mutation_witness = "a failed fetch after an authority change never returns the previous view"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-VERIFICATION-CACHE-FRESHNESS"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -171,7 +188,8 @@ unit_test = "huge_sparse_manifest_is_refused_from_literal_metadata_bounded"
 production_wiring = "verification_manifest_reads_are_bounded_and_rooted"
 fault = ""
 mutation_witness = "manifest_read_scan_fires_on_planted_raw_reads"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-MANIFEST-READ-BOUNDED"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -183,7 +201,8 @@ unit_test = "a_binary_swapped_between_verification_and_exec_never_executes"
 production_wiring = "launch_refuses_a_group_or_other_writable_install_ancestor"
 fault = ""
 mutation_witness = "a_binary_swapped_between_verification_and_exec_never_executes"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-UPDATER-EXEC-IDENTITY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -195,7 +214,8 @@ unit_test = "memo_outcome_store_is_a_read_only_view_scoped_to_one_route"
 production_wiring = "store_backed_outcomes_serve_routing_after_reopen_and_failures_flip_cheap_to_strong"
 fault = ""
 mutation_witness = "memo_read_only_view_is_pinned_against_mutation"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-MEMO-READ-ONLY-VIEW"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -207,7 +227,8 @@ unit_test = "missing_corrupt_and_failed_durable_reads_are_distinct"
 production_wiring = "corrupt_journals_refuse_open_list_and_recovery_typed"
 fault = ""
 mutation_witness = "corrupt_injected_rows_are_loud_never_guessed"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-DURABLE-CORRUPTION-LOUD"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -219,7 +240,8 @@ unit_test = "queue_admission_files_column_accepts_only_json_string_arrays"
 production_wiring = "second_prompt_while_active_is_queued_and_delivered_after"
 fault = ""
 mutation_witness = "queue_file_array_predicate_is_pinned_against_mutation"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-QUEUE-ADMISSION-FILES"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -229,7 +251,7 @@ owner = "scripts/protocol-codegen"
 authority = "scripts/protocol-codegen.mjs --check-clients (wired in .woodpecker/trusted/trusted.yaml vscode lane)"
 script_check = "node scripts/protocol-codegen.mjs --check-clients"
 mutation_witness = "node scripts/protocol-codegen.mjs --check-clients"
-mutation_command = "node scripts/check-dto-parity-mutation.mjs"
+mutation_command = "node scripts/mutation-run.mjs INV-GENERATED-DTO-PARITY"
 mutation_debt = ""
 platforms = ["linux"]
 
@@ -240,7 +262,8 @@ owner = "apps/vscode event stream"
 authority = "apps/vscode/src/eventStream.ts cumulative frame budget"
 script_check = "one hundred thousand tiny data lines are refused early with bounded retention"
 mutation_witness = "frame budget: exactly max cumulative bytes is accepted, one line above is refused"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-IDE-SSE-FRAME-BOUNDED"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -250,7 +273,8 @@ owner = "apps/vscode event stream"
 authority = "apps/vscode/src/eventStream.ts ProtocolBlocked"
 script_check = "an oversized durable frame blocks and a following valid frame is never delivered"
 mutation_witness = "an oversized durable frame blocks and a following valid frame is never delivered"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-IDE-SSE-BLOCKED-DURABLE"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -260,7 +284,8 @@ owner = "apps/jetbrains event stream"
 authority = "apps/jetbrains/backend NativeEventStream.kt ProtocolBlocked"
 script_check = "assertSseBlockedShape"
 mutation_witness = "assertSseBlockedRecovery"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-IDE-SSE-BLOCKED-DURABLE-JB"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -270,7 +295,8 @@ owner = "apps/jetbrains process manager"
 authority = "apps/jetbrains/backend BackendProcessManager.kt BoundedDrainer/runCommand"
 script_check = "assertCommandDrain"
 mutation_witness = "assertCommandDrain"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -280,7 +306,8 @@ owner = "apps/vscode composer"
 authority = "apps/vscode/src/webview.ts + media/chat.js + src/extension.ts attachment envelope"
 script_check = "DOM -> sendGoal -> validator -> upload -> durable ids -> task start (mutation witness)"
 mutation_witness = "DOM -> sendGoal -> validator -> upload -> durable ids -> task start (mutation witness)"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-ATTACHMENT-UI-REACHABILITY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -290,7 +317,8 @@ owner = "apps/vscode event stream"
 authority = "apps/vscode/src/eventStream.ts abortableDelay/stop"
 script_check = "stop() during the maximum backoff is prompt with no later fetch"
 mutation_witness = "stop() during the maximum backoff is prompt with no later fetch"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -300,7 +328,8 @@ owner = "apps/vscode webview"
 authority = "apps/vscode/src/webview.ts label/role=log"
 script_check = "the real composer markup ships the attachment surface, the a11y log and recovery affordances"
 mutation_witness = "the transcript live region appends only new entries"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-ACCESSIBILITY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -310,7 +339,8 @@ owner = "apps/vscode webview"
 authority = "apps/vscode/media/chat.js key handling"
 script_check = "Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns"
 mutation_witness = "Enter is a newline, Ctrl/Cmd+Enter starts, Escape dismisses, focus returns"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-VSCODE-KEYBOARD-SUBMISSION"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -321,7 +351,8 @@ authority = "prompt_admission_claim and native_prompt"
 unit_test = "prompt_claim_fresh_then_complete_replays_the_exact_receipt_bytes"
 production_wiring = "prompt_replay_returns_the_stored_receipt_byte_for_byte_with_one_prompt_row"
 mutation_witness = "prompt_same_key_with_a_different_digest_is_key_reused_after_completion"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-PROMPT-START-IDEMPOTENT"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -332,7 +363,8 @@ authority = "ChunkSink::try_send dropped_bytes"
 unit_test = "chunk_sink_closed_receiver_counts_current_event"
 production_wiring = "chunk_sink_drop_accounting_equals_produced_minus_delivered_minus_buffered"
 mutation_witness = "chunk_sink_closed_receiver_counts_pending_plus_current"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-CHUNK-DROP-ACCOUNTING"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -342,7 +374,8 @@ owner = "apps/jetbrains frontend"
 authority = "FaktorChatPanel.sendPrompt + selectPromptSubmission"
 script_check = "prompt submission identity: identical retry reuses the id, edits mint new"
 mutation_witness = "prompt submission identity: identical retry reuses the id, edits mint new"
-mutation_debt = "witness is the selection rule's oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
@@ -353,7 +386,8 @@ authority = "crates/terminal sandbox/linux.rs"
 unit_test = "deny_all_spawn_isolates_the_child_or_refuses_typed"
 production_wiring = "deny_all_is_refused_before_spawn_without_a_backend"
 mutation_witness = "deny_all_spawn_isolates_the_child_or_refuses_typed"
-mutation_debt = "privilege-gated: positive capability assertions run only on a root lane; no planted-mutation run yet"
+mutation_command = "node scripts/mutation-run.mjs INV-SANDBOX-PRIVILEGE-DROP"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 
@@ -365,7 +399,8 @@ authority = "crates/fs entry_state/lib writers"
 unit_test = "merge_apply_content_refuses_a_parent_swapped_to_an_outside_symlink"
 production_wiring = "entry_state_transitions_refuse_a_parent_swapped_to_an_outside_symlink"
 mutation_witness = "cas_write_content_refuses_a_parent_swapped_to_an_outside_symlink"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-FS-MUTATION-PARENT-REVERIFY"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 
@@ -377,7 +412,8 @@ authority = "crates/pty guardian/mod.rs"
 unit_test = "control_pipe_is_cloexec_at_creation"
 production_wiring = "child_spawned_during_creation_cannot_hold_the_control_pipe"
 mutation_witness = "control_pipe_is_cloexec_at_creation"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-PTY-CONTROL-PIPE-CLOEXEC"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 
@@ -389,7 +425,8 @@ authority = "crates/security + provider sanitize + commerce-connectors"
 unit_test = "decoy_hits_before_the_real_secret_never_expose_it"
 production_wiring = "property_no_pattern_secret_survives_any_decoy_count"
 mutation_witness = "at_most_32_occurrences_are_redacted"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-REDACTION-CAP-FAIL-CLOSED"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 
@@ -401,7 +438,8 @@ authority = "crates/server native/terminal.rs"
 unit_test = "interleaved_foreign_refresh_cannot_cross_into_a_terminal_event_page"
 production_wiring = "concurrent_terminal_event_reads_never_cross_session_frames"
 mutation_witness = "interleaved_foreign_refresh_cannot_cross_into_a_terminal_event_page"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-TERMINAL-EVENTS-SESSION-ISOLATED"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 
@@ -413,7 +451,8 @@ authority = "crates/store attachments.rs + session artifacts.rs"
 unit_test = "artifact_read_refuses_hostile_columns_never_absent"
 production_wiring = "artifact_identity_is_per_session_and_never_silently_discarded"
 mutation_witness = "migration_v28_rebuilds_artifact_identity_per_session_and_preserves_rows"
-mutation_debt = "witness is a hostile/refusal oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-ARTIFACT-READ-LOUD-SCOPED"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]
 
 
@@ -424,5 +463,6 @@ owner = "apps/vscode nativeClient/eventStream"
 authority = "apps/vscode/src/nativeClient.ts + eventStream.ts"
 script_check = "client routes match the daemon router (no /session/* fallback)"
 mutation_witness = "client routes match the daemon router (no /session/* fallback)"
-mutation_debt = "source-parsed drift test is the oracle; no planted-mutation run wired yet"
+mutation_command = "node scripts/mutation-run.mjs INV-CLIENT-ROUTE-CONTRACT"
+mutation_debt = ""
 platforms = ["linux", "macos", "windows"]

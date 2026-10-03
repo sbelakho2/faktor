@@ -1,0 +1,9 @@
+{
+  "id": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE",
+  "file": "apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt",
+  "find": "    retained?.takeIf { it.sessionId == sessionId && it.text == text }",
+  "replace": "    retained?.takeIf { it.sessionId != sessionId || it.text != text }",
+  "gate": "apps/jetbrains/gradlew -p apps/jetbrains --offline --console=plain --no-daemon :frontend:smokeJetBrainsParity -PfaktorCliBin=\"$PWD/target/debug/faktor-cli\"",
+  "timeout_ms": 1800000,
+  "note": "The selection rule is inverted: an identical retry mints a NEW submission id while edits reuse the retained one."
+}

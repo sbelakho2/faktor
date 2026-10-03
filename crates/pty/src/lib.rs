@@ -156,3 +156,6 @@ impl Default for PtyConfig {
         }
     }
 }
+#[cfg(all(test, unix))]
+#[path = "pty_hostile_output.rs"]
+mod pty_hostile_output;

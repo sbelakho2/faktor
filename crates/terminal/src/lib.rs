@@ -316,6 +316,15 @@ static DENY_ALL_PROVEN: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 static BROKER_ONLY_PROVEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only read of the DenyAll proof flag: lets an honesty check assert
+/// that `OsLevel` seen mid-suite was earned by a real spawn in this process
+/// (another DenyAll test may have run first), never claimed from capability
+/// existence.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn deny_all_proven_for_tests() -> bool {
+    DENY_ALL_PROVEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// True when this BUILD has a BrokerOnly backend at all (Linux). This is a
 /// compile-time platform fact only, never an enforcement claim: the
 /// runtime can still refuse a BrokerOnly spawn typed (e.g. no
@@ -3922,3 +3931,12 @@ mod containment_policy_tests {
         assert!(production.contains("#[cfg(all(test, unix))]\nasync fn kill_group_async("));
     }
 }
+#[cfg(test)]
+#[path = "budget_hostile.rs"]
+mod budget_hostile;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "sandbox_hostile.rs"]
+mod sandbox_hostile;
+#[cfg(all(test, unix))]
+#[path = "supervisor_hostile.rs"]
+mod supervisor_hostile;

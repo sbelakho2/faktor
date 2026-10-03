@@ -1,0 +1,8 @@
+{
+  "id": "INV-MEMO-READ-ONLY-VIEW",
+  "file": "crates/router/src/outcomes.rs",
+  "find": "impl OutcomeView for MemoOutcomeStore<'_> {",
+  "replace": "impl OutcomeStore for MemoOutcomeStore<'_> {\n    fn append_sample(&self, _key: &OutcomeKey, _sample: OutcomeSample) {}\n}\n\nimpl OutcomeView for MemoOutcomeStore<'_> {",
+  "gate": "cargo test -p faktor-router --lib memo_read_only_view_is_pinned_against_mutation",
+  "note": "Reintroduces a mutable append path on the per-route memo; the pinned source oracle refuses it."
+}

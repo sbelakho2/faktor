@@ -1,0 +1,8 @@
+{
+  "id": "INV-JOURNAL-INTEGRITY",
+  "file": "crates/store/src/ledger.rs",
+  "find": "                if kind != \"session_created\" {",
+  "replace": "                if false {",
+  "gate": "cargo test -p faktor-store --lib journal_session_problems_flag_each_open_invariant",
+  "note": "Drops the seq-1 SessionCreated kind check: a later event renumbered into slot 1 is no longer flagged."
+}

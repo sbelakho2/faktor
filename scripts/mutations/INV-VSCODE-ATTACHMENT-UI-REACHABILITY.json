@@ -1,0 +1,9 @@
+{
+  "id": "INV-VSCODE-ATTACHMENT-UI-REACHABILITY",
+  "file": "apps/vscode/media/chat.js",
+  "find": "      message.attachmentIds = ids;",
+  "replace": "      // planted: attachment ids are dropped from the sendGoal payload",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "The webview composer no longer ships attachment ids with sendGoal: the DOM->payload->upload->task-start path is broken."
+}

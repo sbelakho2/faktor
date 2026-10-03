@@ -1,0 +1,8 @@
+{
+  "id": "INV-ARTIFACT-READ-LOUD-SCOPED",
+  "file": "crates/store/src/attachments.rs",
+  "find": "                let summary = r.get::<_, String>(1).map_err(|e| {\n                    StoreError::Corrupt(vec![format!(\n                        \"artifact row {id} (session {session_id}, hash {cas_hash:?}): \\\n                         summary column is undecodable: {e}\"\n                    )])\n                })?;",
+  "replace": "                let summary = r.get::<_, String>(1).unwrap_or_default();",
+  "gate": "cargo test -p faktor-store --lib artifact_read_refuses_hostile_columns_never_absent",
+  "note": "A hostile BLOB summary silently defaults instead of refusing Corrupt, so a corrupt row reads as present-but-empty."
+}

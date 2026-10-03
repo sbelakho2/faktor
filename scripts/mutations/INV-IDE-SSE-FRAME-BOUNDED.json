@@ -1,0 +1,9 @@
+{
+  "id": "INV-IDE-SSE-FRAME-BOUNDED",
+  "file": "apps/vscode/src/eventStream.ts",
+  "find": "        buffer += decoded;\n        bufferBytes += Buffer.byteLength(decoded, 'utf8');\n        let newline: number;\n        while ((newline = buffer.indexOf('\\n')) >= 0) {\n          const rawLine = buffer.slice(0, newline);\n          buffer = buffer.slice(newline + 1);\n          const lineBytes = Buffer.byteLength(rawLine, 'utf8') + 1;",
+  "replace": "        buffer += decoded;\n        bufferBytes += decoded.length;\n        let newline: number;\n        while ((newline = buffer.indexOf('\\n')) >= 0) {\n          const rawLine = buffer.slice(0, newline);\n          buffer = buffer.slice(newline + 1);\n          const lineBytes = rawLine.length + 1;",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "The frame budget counts UTF-16 code units instead of UTF-8 bytes: a multibyte frame above the byte cap is accepted, breaking byte-accurate bounding."
+}
