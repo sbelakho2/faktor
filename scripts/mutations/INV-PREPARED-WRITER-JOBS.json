@@ -1,0 +1,8 @@
+{
+  "id": "INV-PREPARED-WRITER-JOBS",
+  "file": "crates/store/src/ledger.rs",
+  "find": "        self.writer.execute(\"mark_queue_status\", move |conn| {\n            conn.execute(",
+  "replace": "        self.writer.execute(\"mark_queue_status\", move |conn| {\n            let _ = serde_json::json!({});\n            conn.execute(",
+  "gate": "cargo test -p faktor-tests-static-authority --lib prepared_writer_jobs_never_do_fs_serialization_hashing_sleeps_or_clocks",
+  "note": "Plants a serialization marker inside a production writer-job closure; the SQL-only scan must fire."
+}

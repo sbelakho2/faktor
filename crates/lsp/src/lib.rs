@@ -2052,3 +2052,6 @@ log("mock exiting")
         assert!(mgr.active().is_empty());
     }
 }
+#[cfg(test)]
+#[path = "lsp_hostile_internals.rs"]
+mod lsp_hostile_internals;

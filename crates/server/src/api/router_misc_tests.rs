@@ -76,7 +76,7 @@ async fn poisoned_terminal_event_cache_recovers_on_next_read() {
         axum::extract::State(state.clone()),
         headers,
         axum::extract::Path(sid.clone()),
-        axum::extract::Query(query),
+        Ok(axum::extract::Query(query)),
     )
     .await;
     assert_eq!(

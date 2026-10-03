@@ -1,0 +1,8 @@
+{
+  "id": "INV-UPDATER-EXEC-IDENTITY",
+  "file": "crates/updater/src/release.rs",
+  "find": "        crate::fd_exec::exec_verified_fd(&file, &argv, &env, &target.binary)",
+  "replace": "        crate::fd_exec::exec_verified_fd(&fs::File::open(&target.binary).unwrap(), &argv, &env, &target.binary)",
+  "gate": "cargo test -p faktor-updater --lib a_binary_swapped_between_verification_and_exec_never_executes",
+  "note": "Reopens the release by PATH after the digest check: the verified inode is no longer what executes."
+}

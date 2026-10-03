@@ -665,6 +665,10 @@ fn resolve_within(root: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[path = "adversarial_sandbox_tests.rs"]
+mod adversarial_sandbox_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;

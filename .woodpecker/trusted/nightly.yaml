@@ -85,20 +85,30 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
+      # Long-run mode: scripts/soak.sh repeats the lane's ignored [soak] set
+      # FAKTOR_SOAK_SCALE=4 rounds (bounded by FAKTOR_SOAK_MAX_ROUNDS and the
+      # wall budget) and records target/certification/soak.json. The trusted
+      # push gate runs the same driver in bounded smoke mode.
+      FAKTOR_SOAK_MODE: long
+      FAKTOR_SOAK_SCALE: "4"
+      FAKTOR_SOAK_MAX_WALL_SECONDS: "14400"
+      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "3600"
     volumes:
       - faktor-nightly-cargo-registry:/usr/local/cargo/registry
       - faktor-nightly-cargo-git:/usr/local/cargo/git
       - faktor-nightly-target-soak:/woodpecker-cache/target
     commands:
-      # The soak nightly lane: the bounded keyless [soak] tests assigned to
-      # it in scripts/certification/ignored-tests.json. The 12h/24h/10 GiB
+      # The soak nightly lane: the bounded keyless [soak] tests assigned to it
+      # in scripts/certification/ignored-tests.json, driven through
+      # scripts/soak.sh in long mode (the first argument must forward the
+      # registry's recorded cargo invocation verbatim). The 12h/24h/10 GiB
       # wall-clock soaks stay manual by design (documented there).
-      - cargo test -p faktor-tests-accounting-modelcheck --release -- --ignored
+      - bash scripts/soak.sh -p faktor-tests-accounting-modelcheck --release -- --ignored
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        cargo test -p faktor-tests-accounting-modelcheck --release -- --ignored
+        bash scripts/soak.sh -p faktor-tests-accounting-modelcheck --release -- --ignored
         CMDS
         )"
         cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"

@@ -23,6 +23,7 @@ use faktor_core::model::{ModelCapabilities, ReasoningMode};
 use faktor_provider::catalog::{
     ModelCatalogEntry, PricingState, Provenance, QualityPrior, CATALOG_FIRST_EPOCH,
 };
+use faktor_provider::classify::provider_error_for_http_with_scrubber;
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
 use faktor_provider::egress::{
@@ -1353,15 +1354,7 @@ fn status_to_provider_error(
     text: String,
     scrubber: &ErrorScrubber,
 ) -> ProviderError {
-    let kind = match status.as_u16() {
-        401 | 403 => ProviderErrorKind::Auth,
-        429 => ProviderErrorKind::RateLimited,
-        408 | 504 => ProviderErrorKind::Timeout,
-        500..=599 => ProviderErrorKind::Server,
-        _ => ProviderErrorKind::BadRequest,
-    };
-    let code = status.as_u16();
-    ProviderError::with_code(kind, code.to_string(), scrubber.diagnostic(code, &text))
+    provider_error_for_http_with_scrubber(status.as_u16(), &text, scrubber)
 }
 
 /// Re-apply the provider's embedding batch bounds to a directly-constructed
@@ -3512,7 +3505,9 @@ mod tests {
             (401, ProviderErrorKind::Auth, false),
             (429, ProviderErrorKind::RateLimited, true),
             (500, ProviderErrorKind::Server, true),
-            (400, ProviderErrorKind::BadRequest, false),
+            // A bare 400 is the classifier's Malformed class (the shared
+            // taxonomy maps it there; no structure = no stronger hint).
+            (400, ProviderErrorKind::Malformed, false),
         ];
         for (status, kind, retryable) in cases {
             let mock = Arc::new(MockHttpTransport::new(status, "denied"));

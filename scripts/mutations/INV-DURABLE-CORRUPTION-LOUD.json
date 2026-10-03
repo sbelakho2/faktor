@@ -1,0 +1,8 @@
+{
+  "id": "INV-DURABLE-CORRUPTION-LOUD",
+  "file": "crates/session/src/task/mod.rs",
+  "find": "            DurableRead::PresentMalformed(detail) => {\n                return Err(TaskError::CorruptDurableState {\n                    what: format!(\"completion contract of task {task_id}\"),\n                    detail,\n                })\n            }\n            DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),\n        };\n        let revision =",
+  "replace": "            DurableRead::PresentMalformed(_detail) => return Ok(None),\n            DurableRead::StoreFailure(detail) => return Err(TaskError::Store(detail)),\n        };\n        let revision =",
+  "gate": "cargo test -p faktor-session --lib missing_corrupt_and_failed_durable_reads_are_distinct",
+  "note": "A present-but-corrupt completion-contract row reads as genuinely absent: corruption is silently downgraded to the not-found policy."
+}

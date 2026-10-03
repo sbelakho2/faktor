@@ -1,0 +1,8 @@
+{
+  "id": "INV-TASK-START-IDEMPOTENT",
+  "file": "crates/store/src/task_admission.rs",
+  "find": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(TaskAdmissionClaim::InFlight)\n                }",
+  "replace": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(TaskAdmissionClaim::Fresh)\n                }",
+  "gate": "cargo test -p faktor-store --lib claim_fresh_then_complete_replays_the_exact_receipt_bytes",
+  "note": "A pending submission key is admitted as Fresh again: the concurrent duplicate is no longer refused as in-flight."
+}

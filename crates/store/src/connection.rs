@@ -845,6 +845,49 @@ mod writer_service_tests {
         (dir, store, ws, sid)
     }
 
+    /// Deterministically drain the writer receipts: commands run FIFO on the
+    /// single writer owner, so observing the receipt of a barrier job proves
+    /// every job enqueued before the barrier (e.g. `create_session`) has
+    /// executed. A bare `take_writer_receipts()` drains only what has already
+    /// run, letting an earlier job's receipt land afterwards and breaking
+    /// tests that assume an empty ring.
+    fn drain_writer_receipts(store: &Store) {
+        store
+            .writer_debug_job("receipt_drain_barrier", |_conn| ())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let receipts = store.take_writer_receipts();
+            if receipts.iter().any(|r| r.label == "receipt_drain_barrier") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writer receipt drain barrier was never observed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Wait (bounded) until at least one receipt exists, then drain. The
+    /// writer records a job's receipt AFTER handing the caller its result, so
+    /// a completed command's receipt can lag its return by a scheduling
+    /// window; this is the honest barrier for tests that need it.
+    fn drain_after_completion(store: &Store) -> Vec<WriterJobReceipt> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let receipts = store.take_writer_receipts();
+            if !receipts.is_empty() {
+                return receipts;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no writer receipt became visible within the bound"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !cond() {
@@ -1231,12 +1274,13 @@ mod writer_service_tests {
     #[test]
     fn writer_receipts_account_each_job_and_drain_once() {
         let (_d, store, _ws, sid) = store_with_session();
-        store.take_writer_receipts(); // discard open-time receipts
+        drain_writer_receipts(&store);
         let before = store.writer_telemetry();
+        let dropped_before = before.receipts_dropped;
         store
             .append_ledger_entry(sid, "receipt_probe", 1, serde_json::json!({"i": 1}))
             .unwrap();
-        let receipts = store.take_writer_receipts();
+        let receipts = drain_after_completion(&store);
         assert_eq!(receipts.len(), 1, "{receipts:?}");
         let receipt = &receipts[0];
         assert_eq!(receipt.label, "append_ledger_entry");
@@ -1249,7 +1293,10 @@ mod writer_service_tests {
         assert!(store.take_writer_receipts().is_empty());
         let after = store.writer_telemetry();
         assert_eq!(after.jobs, before.jobs + 1);
-        assert_eq!(after.receipts_dropped, 0, "one job never evicts");
+        assert_eq!(
+            after.receipts_dropped, dropped_before,
+            "one job never evicts"
+        );
     }
 
     /// The receipt ring is a BOUNDED diagnostic: a consumer that never drains
@@ -1258,19 +1305,29 @@ mod writer_service_tests {
     #[test]
     fn writer_receipt_ring_is_bounded_and_counts_evictions() {
         let (_d, store, _ws, _sid) = store_with_session();
-        store.take_writer_receipts();
+        drain_writer_receipts(&store);
+        let telemetry_before = store.writer_telemetry();
+        let dropped_before = telemetry_before.receipts_dropped;
+        let jobs_before = telemetry_before.jobs;
         let overflow = WRITER_RECEIPT_CAPACITY + 8;
         for _ in 0..overflow {
             store
                 .writer_debug_job("receipt_ring_probe", |_conn| ())
                 .unwrap();
         }
+        // A job's telemetry is recorded after its caller is unblocked (the
+        // receipt ordering documented on `drain_after_completion`): wait for
+        // all `overflow` completions before draining the ring.
+        wait_until(
+            || store.writer_telemetry().jobs >= jobs_before + overflow as u64,
+            "writer jobs to be recorded",
+        );
         let receipts = store.take_writer_receipts();
         assert_eq!(receipts.len(), WRITER_RECEIPT_CAPACITY);
         assert!(receipts.iter().all(|r| r.label == "receipt_ring_probe"));
         let telemetry = store.writer_telemetry();
         assert_eq!(
-            telemetry.receipts_dropped as usize,
+            (telemetry.receipts_dropped - dropped_before) as usize,
             overflow - WRITER_RECEIPT_CAPACITY
         );
         assert!(store.take_writer_receipts().is_empty());

@@ -337,11 +337,15 @@ pub(crate) async fn native_enterprise_status(
 pub(crate) async fn native_enterprise_audit(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CursorQuery>,
+    query: Result<Query<CursorQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -452,11 +456,15 @@ pub(crate) async fn native_enterprise_settings_put(
 pub(crate) async fn native_enterprise_artifacts_list(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CursorQuery>,
+    query: Result<Query<CursorQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -604,11 +612,15 @@ pub(crate) async fn native_enterprise_gc(
 pub(crate) async fn native_enterprise_deletion_jobs_list(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CursorQuery>,
+    query: Result<Query<CursorQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),

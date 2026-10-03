@@ -582,11 +582,15 @@ fn store_page_bound(limit: i64) -> Result<u64, ApiError> {
 pub(crate) async fn native_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NativeMessagesQuery>,
+    query: Result<Query<NativeMessagesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     if let Some(before) = q.before {
         if before < 1 {
             return wire_status(malformed_body("before must be >= 1"));
@@ -670,11 +674,15 @@ pub(crate) struct NativeEventsQuery {
 pub(crate) async fn native_events(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NativeEventsQuery>,
+    query: Result<Query<NativeEventsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let limit = match page_limit(q.limit, MAX_NATIVE_EVENT_PAGE) {
         Ok(l) => l,
         Err(e) => return wire_status(e),
@@ -744,11 +752,15 @@ pub(crate) async fn native_session_events(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<NativeSessionEventsQuery>,
+    query: Result<Query<NativeSessionEventsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let handle = match native_resolve_session(&state, &id) {
         Ok(h) => h,
         Err(r) => return *r,
@@ -872,11 +884,15 @@ pub(crate) struct NativePermissionsQuery {
 pub(crate) async fn native_permissions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NativePermissionsQuery>,
+    query: Result<Query<NativePermissionsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let filter = match q.session.as_deref() {
         Some(raw) => match parse_session_id(raw) {
             Ok(id) => Some(id),
@@ -1448,11 +1464,11 @@ mod tests {
         let response = native_events(
             State(state.clone()),
             authed_headers(state),
-            Query(NativeEventsQuery {
+            Ok(Query(NativeEventsQuery {
                 session: sid.to_string(),
                 after,
                 limit,
-            }),
+            })),
         )
         .await;
         json_body(response).await
@@ -1467,11 +1483,11 @@ mod tests {
         let response = native_messages(
             State(state.clone()),
             authed_headers(state),
-            Query(NativeMessagesQuery {
+            Ok(Query(NativeMessagesQuery {
                 session: sid.to_string(),
                 before,
                 limit,
-            }),
+            })),
         )
         .await;
         json_body(response).await
@@ -1653,7 +1669,7 @@ mod tests {
             State(state.clone()),
             authed_headers(&state),
             Path(sid.to_string()),
-            Query(NativeSessionEventsQuery { after: Some(1) }),
+            Ok(Query(NativeSessionEventsQuery { after: Some(1) })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1697,7 +1713,7 @@ mod tests {
             State(state.clone()),
             authed_headers(&state),
             Path(sid.to_string()),
-            Query(NativeSessionEventsQuery { after: None }),
+            Ok(Query(NativeSessionEventsQuery { after: None })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);

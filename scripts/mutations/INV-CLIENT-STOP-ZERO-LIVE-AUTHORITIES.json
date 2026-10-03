@@ -1,0 +1,9 @@
+{
+  "id": "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES",
+  "file": "apps/vscode/src/eventStream.ts",
+  "find": "    this.sleep = options.sleep ?? abortableDelay;",
+  "replace": "    this.sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "The default backoff sleep is no longer abort-aware: stop() during the maximum backoff waits out the timer and a later fetch follows."
+}

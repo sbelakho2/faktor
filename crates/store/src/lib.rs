@@ -207,3 +207,7 @@ mod index;
 pub use index::*;
 mod billing;
 pub use billing::*;
+
+#[cfg(test)]
+#[path = "hostile_corpus_tests.rs"]
+mod hostile_corpus_tests;

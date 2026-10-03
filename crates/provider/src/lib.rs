@@ -33,6 +33,7 @@ use crate::catalog::{ModelCatalogEntry, PricingState, Provenance, QualityPrior};
 
 pub mod catalog;
 
+pub mod classify;
 /// Provider configuration hardening: wrapped credentials
 /// ([`config::SecretValue`]), validated extra headers
 /// ([`config::ExtraHeaders`]) and redacted configuration errors
@@ -2485,6 +2486,14 @@ impl Provider for FakeProvider {
         Box::pin(stream)
     }
 }
+
+#[cfg(test)]
+#[path = "adversarial_transport_tests.rs"]
+mod adversarial_transport_tests;
+
+#[cfg(test)]
+#[path = "adversarial_egress_tests.rs"]
+mod adversarial_egress_tests;
 
 #[cfg(test)]
 mod tests {

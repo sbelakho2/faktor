@@ -2771,3 +2771,12 @@ mod tests {
         }
     }
 }
+#[cfg(all(test, unix))]
+#[path = "fs_hostile_paths.rs"]
+mod fs_hostile_paths;
+#[cfg(test)]
+#[path = "fs_property_hostile.rs"]
+mod fs_property_hostile;
+#[cfg(test)]
+#[path = "fs_walk_hostile.rs"]
+mod fs_walk_hostile;

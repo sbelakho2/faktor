@@ -1,0 +1,8 @@
+{
+  "id": "INV-CHUNK-DROP-ACCOUNTING",
+  "file": "crates/agent/src/runtime/provider_loop.rs",
+  "find": "                Err(TrySendError::Closed(p)) => {\n                    // The receiver closed on this event: it never reached a\n                    // consumer and must be counted, not discarded silently.\n                    st.dropped_bytes = st.dropped_bytes.saturating_add(p.text.len() as u64);\n                    st.tx = None;\n                    return;\n                }",
+  "replace": "                Err(TrySendError::Closed(p)) => {\n                    // The receiver closed on this event: it never reached a\n                    // consumer and must be counted, not discarded silently.\n                    st.tx = None;\n                    return;\n                }",
+  "gate": "cargo test -p faktor-agent --lib chunk_sink_closed_receiver_counts_current_event",
+  "note": "Removes the closed-receiver accounting for the current event: bytes that never reached a consumer vanish from the drop ledger, violating produced == delivered + buffered + dropped."
+}

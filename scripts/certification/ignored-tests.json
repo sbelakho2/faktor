@@ -28,7 +28,7 @@
     "soak": {
       "workflow": "nightly",
       "step": "soak",
-      "command": "cargo test -p faktor-tests-accounting-modelcheck --release -- --ignored"
+      "command": "bash scripts/soak.sh -p faktor-tests-accounting-modelcheck --release -- --ignored"
     },
     "perf": {
       "workflow": "trusted",

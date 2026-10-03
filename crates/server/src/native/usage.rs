@@ -51,13 +51,17 @@ pub(crate) struct NativeUsageQuery {
 pub(crate) async fn native_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<NativeUsageQuery>,
+    query: Result<Query<NativeUsageQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Some(org) = query.org {
-        return billing_usage(state, headers, org, query.since, query.limit);
-    }
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
+    if let Some(org) = query.org {
+        return billing_usage(state, headers, org, query.since, query.limit);
     }
     const MAX_SESSIONS: usize = 10_000;
     let mut budget_total: i64 = 0;

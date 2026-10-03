@@ -1,0 +1,8 @@
+{
+  "id": "INV-MANIFEST-READ-BOUNDED",
+  "file": "crates/verify/src/manifest.rs",
+  "find": "        Ok(Some(meta)) if meta.size > max => {",
+  "replace": "        Ok(Some(meta)) if false && meta.size > max => {",
+  "gate": "cargo test -p faktor-verify --lib huge_sparse_manifest_is_refused_from_literal_metadata_bounded",
+  "note": "Drops the literal-size refusal: a 200 MiB sparse manifest is no longer refused from metadata with the true observed size."
+}

@@ -414,3 +414,88 @@ fn sessions_and_approval_decisions_are_exactly_once_across_a_restart() {
         ControlPlaneError::Conflict(_)
     ));
 }
+
+#[test]
+fn scoped_idempotency_keys_isolate_tenants_without_blocking() {
+    let (cp, store) = memory_plane();
+    let (owner_a, org_a, _) = owner(&cp, "Alpha", "owner@alpha.test", "a");
+    let (owner_b, org_b, _) = owner(&cp, "Beta", "owner@beta.test", "b");
+
+    // The SAME raw key from two tenants is two logical requests: each tenant
+    // gets its own record, and neither is blocked or replayed into the other
+    // (the scoped key namespaces the tenant; the raw key is only a
+    // best-effort compatibility alias).
+    let inv_a = cp
+        .invite(
+            &owner_a,
+            &org_a,
+            "new@alpha.test",
+            Role::Member,
+            "shared-inv",
+        )
+        .unwrap();
+    let inv_b = cp
+        .invite(
+            &owner_b,
+            &org_b,
+            "new@beta.test",
+            Role::Member,
+            "shared-inv",
+        )
+        .unwrap();
+    assert_ne!(inv_a.invitation.id, inv_b.invitation.id);
+    assert_eq!(inv_a.invitation.organization, org_a);
+    assert_eq!(inv_b.invitation.organization, org_b);
+
+    let apr_a = cp
+        .request_approval(
+            &owner_a,
+            &org_a,
+            Action::SecretWrite,
+            "s:1",
+            "r",
+            "shared-apr",
+        )
+        .unwrap();
+    let apr_b = cp
+        .request_approval(
+            &owner_b,
+            &org_b,
+            Action::SecretWrite,
+            "s:1",
+            "r",
+            "shared-apr",
+        )
+        .unwrap();
+    assert_ne!(apr_a.id, apr_b.id);
+    assert_eq!(apr_a.organization, org_a);
+    assert_eq!(apr_b.organization, org_b);
+
+    // Same-tenant retries still replay their own record exactly.
+    let replay_a = cp
+        .invite(
+            &owner_a,
+            &org_a,
+            "new@alpha.test",
+            Role::Member,
+            "shared-inv",
+        )
+        .unwrap();
+    assert_eq!(replay_a.invitation.id, inv_a.invitation.id);
+    let replay_apr_a = cp
+        .request_approval(
+            &owner_a,
+            &org_a,
+            Action::SecretWrite,
+            "s:1",
+            "r",
+            "shared-apr",
+        )
+        .unwrap();
+    assert_eq!(replay_apr_a.id, apr_a.id);
+
+    // The raw keys survive as compatibility aliases, so a pre-scoping client
+    // retry can still find a record instead of re-executing.
+    assert!(store.idempotent("shared-inv").unwrap().is_some());
+    assert!(store.idempotent("shared-apr").unwrap().is_some());
+}

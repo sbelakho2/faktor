@@ -964,3 +964,6 @@ mod tests {
         assert_eq!(refused.code(), "manifest_tampered");
     }
 }
+#[cfg(test)]
+#[path = "updater_hostile.rs"]
+mod updater_hostile;

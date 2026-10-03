@@ -1,0 +1,9 @@
+{
+  "id": "INV-CLIENT-ROUTE-CONTRACT",
+  "file": "apps/vscode/src/nativeClient.ts",
+  "find": "    return this.request('POST', '/native/session', {",
+  "replace": "    return this.request('POST', '/session/create', {",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "The client create route drifts back to the retired /session/create path; the daemon-router drift scan must fail."
+}

@@ -1,0 +1,9 @@
+{
+  "id": "INV-VERIFICATION-CACHE-FRESHNESS",
+  "file": "apps/vscode/src/taskStart.ts",
+  "find": "    if (this.key === null || this.key !== key) {",
+  "replace": "    if (this.key === null) {",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "EvidenceAuthorityCache.read ignores the authority key: a changed key still returns the previous view."
+}

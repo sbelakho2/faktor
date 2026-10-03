@@ -89,7 +89,10 @@ pub(crate) struct NativeIndexCoverageQuery {
 pub(crate) async fn native_index_coverage(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<NativeIndexCoverageQuery>,
+    query: Result<
+        axum::extract::Query<NativeIndexCoverageQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     if let Err(e) = authed(&headers, &state) {
@@ -99,6 +102,10 @@ pub(crate) async fn native_index_coverage(
         )
             .into_response();
     }
+    let axum::extract::Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let handle = match native_resolve_session(&state, &query.session) {
         Ok(handle) => handle,
         Err(response) => return *response,

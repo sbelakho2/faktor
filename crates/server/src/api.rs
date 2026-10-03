@@ -49,6 +49,22 @@ mod enterprise_tests;
 #[path = "updater_tests.rs"]
 mod updater_tests;
 
+#[cfg(test)]
+#[path = "adversarial_auth_tests.rs"]
+mod adversarial_auth_tests;
+
+#[cfg(test)]
+#[path = "adversarial_dto_tests.rs"]
+mod adversarial_dto_tests;
+
+#[cfg(test)]
+#[path = "adversarial_sse_bounds_tests.rs"]
+mod adversarial_sse_bounds_tests;
+
+#[cfg(test)]
+#[path = "adversarial_control_plane_tests.rs"]
+mod adversarial_control_plane_tests;
+
 mod deps;
 pub use deps::*;
 mod lifecycle;

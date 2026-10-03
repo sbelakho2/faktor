@@ -38,6 +38,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Tenant-scope one idempotency key. The control-plane store keys its
+/// idempotency table by the string alone, so without scoping two principals
+/// using the same raw key share one record: a foreign tenant can block a
+/// request, and — with a compatibility alias — could be handed a replayed
+/// response. The scoped key is `{organization}:{sha256(org NUL key)[..32]}`:
+/// stable per organization, fixed-width for any accepted raw key, and
+/// collision-resistant (the previous FNV-1a fold was cheaply collidable for
+/// a client-chosen identifier). The raw key still travels as a compatibility
+/// alias so records written by a pre-scoping release replay.
+fn scoped_idempotency_key(organization: &OrganizationId, key: &str) -> String {
+    let mut material = Vec::with_capacity(organization.as_str().len() + key.len() + 1);
+    material.extend_from_slice(organization.as_str().as_bytes());
+    material.push(0);
+    material.extend_from_slice(key.as_bytes());
+    let hash = sha256_hex(&material);
+    format!("{}:{}", organization.as_str(), &hash[..32])
+}
+
 /// The clock seam (deterministic tests; production uses the wall clock).
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -817,7 +835,8 @@ impl ControlPlane {
             Action::MemberWrite,
         )?;
         let email = normalize_email(email)?;
-        let key = Self::validate_idempotency_key(idempotency_key)?;
+        let raw_key = Self::validate_idempotency_key(idempotency_key)?;
+        let key = scoped_idempotency_key(organization, &raw_key);
         let request = serde_json::json!({
             "organization": organization.as_str(),
             "email": email,
@@ -834,9 +853,13 @@ impl ControlPlane {
         };
         let now = self.now_ms();
         let mut issued: Option<SecretToken> = None;
-        let outcome = self
-            .store
-            .execute_idempotent(&key, "invite", &digest, now, &mut |tx| {
+        let outcome = self.store.execute_idempotent_aliased(
+            &key,
+            &[raw_key.as_str()],
+            "invite",
+            &digest,
+            now,
+            &mut |tx| {
                 // The same authorization is re-run INSIDE the transaction:
                 // the role/tenant state that guarded the precheck must still
                 // hold at commit time.
@@ -871,8 +894,17 @@ impl ControlPlane {
                 tx.put_invitation(&invitation)?;
                 issued = Some(token);
                 Ok(serde_json::json!({ "invitation": invitation }))
-            })?;
+            },
+        )?;
         let record: InvitationRecord = Self::decode_idempotent(outcome.into_response())?;
+        // A legacy-alias replay is not tenant-verified by the key itself (the
+        // store cannot know the tenant); the decoded record's organization
+        // must match before anything is returned.
+        if record.invitation.organization != *organization {
+            return Err(ControlPlaneError::Conflict(
+                "idempotency key resolved to a different organization".into(),
+            ));
+        }
         Ok(InvitationIssued {
             invitation: record.invitation,
             token: issued,
@@ -1174,7 +1206,8 @@ impl ControlPlane {
                 ));
             }
         };
-        let key = Self::validate_idempotency_key(idempotency_key)?;
+        let raw_key = Self::validate_idempotency_key(idempotency_key)?;
+        let key = scoped_idempotency_key(organization, &raw_key);
         let request = serde_json::json!({
             "organization": organization.as_str(),
             "action": action.as_str(),
@@ -1183,32 +1216,44 @@ impl ControlPlane {
         });
         let digest = Self::request_hash(&request)?;
         let now = self.now_ms();
-        let outcome =
-            self.store
-                .execute_idempotent(&key, "request_approval", &digest, now, &mut |tx| {
-                    authorize(
-                        principal,
-                        organization,
-                        Resource::Approval,
-                        Action::ApprovalRequest,
-                    )?;
-                    let approval = ApprovalRequest {
-                        id: ApprovalId::try_new(Self::new_id("apr"))?,
-                        organization: organization.clone(),
-                        action,
-                        resource: resource.to_string(),
-                        requested_by: requested_by.clone(),
-                        reason: reason.to_string(),
-                        status: ApprovalStatus::Open,
-                        decided_by: None,
-                        note: None,
-                        created_ms: now,
-                        decided_ms: None,
-                    };
-                    tx.put_approval(&approval)?;
-                    Ok(serde_json::json!({ "approval": approval }))
-                })?;
+        let outcome = self.store.execute_idempotent_aliased(
+            &key,
+            &[raw_key.as_str()],
+            "request_approval",
+            &digest,
+            now,
+            &mut |tx| {
+                authorize(
+                    principal,
+                    organization,
+                    Resource::Approval,
+                    Action::ApprovalRequest,
+                )?;
+                let approval = ApprovalRequest {
+                    id: ApprovalId::try_new(Self::new_id("apr"))?,
+                    organization: organization.clone(),
+                    action,
+                    resource: resource.to_string(),
+                    requested_by: requested_by.clone(),
+                    reason: reason.to_string(),
+                    status: ApprovalStatus::Open,
+                    decided_by: None,
+                    note: None,
+                    created_ms: now,
+                    decided_ms: None,
+                };
+                tx.put_approval(&approval)?;
+                Ok(serde_json::json!({ "approval": approval }))
+            },
+        )?;
         let record: ApprovalRecord = Self::decode_idempotent(outcome.into_response())?;
+        // A legacy-alias replay is not tenant-verified by the key itself; the
+        // decoded record's organization must match before it is returned.
+        if record.approval.organization != *organization {
+            return Err(ControlPlaneError::Conflict(
+                "idempotency key resolved to a different organization".into(),
+            ));
+        }
         Ok(record.approval)
     }
 
@@ -1230,7 +1275,8 @@ impl ControlPlane {
                 "decision note is oversized".into(),
             ));
         }
-        let key = Self::validate_idempotency_key(idempotency_key)?;
+        let raw_key = Self::validate_idempotency_key(idempotency_key)?;
+        let key = scoped_idempotency_key(&principal.organization, &raw_key);
         let request = serde_json::json!({
             "approval": approval_id.as_str(),
             "approved": approved,
@@ -1246,47 +1292,59 @@ impl ControlPlane {
             }
         };
         let now = self.now_ms();
-        let outcome =
-            self.store
-                .execute_idempotent(&key, "decide_approval", &digest, now, &mut |tx| {
-                    let approval = tx
-                        .approval(approval_id)?
-                        .ok_or_else(|| ControlPlaneError::NotFound("approval not found".into()))?;
-                    // The tenant check runs INSIDE the transaction, before any
-                    // state is read back or written: a foreign organization's
-                    // approval stays indistinguishable from a missing one.
-                    entity_authorize(
-                        authorize(
-                            principal,
-                            &approval.organization,
-                            Resource::Approval,
-                            Action::ApprovalDecide,
-                        ),
-                        "approval",
-                    )?;
-                    if approval.status != ApprovalStatus::Open {
-                        return Err(ControlPlaneError::Conflict(format!(
-                            "approval is already {}",
-                            approval.status.as_str()
-                        )));
-                    }
-                    let mut decided = approval;
-                    decided.status = if approved {
-                        ApprovalStatus::Approved
-                    } else {
-                        ApprovalStatus::Rejected
-                    };
-                    decided.decided_by = Some(decided_by.clone());
-                    decided.note = if note.is_empty() {
-                        None
-                    } else {
-                        Some(note.to_string())
-                    };
-                    decided.decided_ms = Some(now);
-                    tx.put_approval(&decided)?;
-                    Ok(serde_json::json!({ "approval": decided }))
-                })?;
+        let outcome = self.store.execute_idempotent_aliased(
+            &key,
+            &[raw_key.as_str()],
+            "decide_approval",
+            &digest,
+            now,
+            &mut |tx| {
+                let approval = tx
+                    .approval(approval_id)?
+                    .ok_or_else(|| ControlPlaneError::NotFound("approval not found".into()))?;
+                // The tenant check runs INSIDE the transaction, before any
+                // state is read back or written: a foreign organization's
+                // approval stays indistinguishable from a missing one.
+                entity_authorize(
+                    authorize(
+                        principal,
+                        &approval.organization,
+                        Resource::Approval,
+                        Action::ApprovalDecide,
+                    ),
+                    "approval",
+                )?;
+                if approval.status != ApprovalStatus::Open {
+                    return Err(ControlPlaneError::Conflict(format!(
+                        "approval is already {}",
+                        approval.status.as_str()
+                    )));
+                }
+                let mut decided = approval;
+                decided.status = if approved {
+                    ApprovalStatus::Approved
+                } else {
+                    ApprovalStatus::Rejected
+                };
+                decided.decided_by = Some(decided_by.clone());
+                decided.note = if note.is_empty() {
+                    None
+                } else {
+                    Some(note.to_string())
+                };
+                decided.decided_ms = Some(now);
+                tx.put_approval(&decided)?;
+                Ok(serde_json::json!({ "approval": decided }))
+            },
+        )?;
         let record: ApprovalRecord = Self::decode_idempotent(outcome.into_response())?;
+        // The scoped key plus the (globally unique) approval id in the digest
+        // already preclude a foreign replay; verify the decoded tenant anyway.
+        if record.approval.organization != principal.organization {
+            return Err(ControlPlaneError::Conflict(
+                "idempotency key resolved to a different organization".into(),
+            ));
+        }
         Ok(record.approval)
     }
 
@@ -2010,7 +2068,7 @@ mod crash_and_race_tests {
         let base = tempfile::tempdir().unwrap();
         let clock = Arc::new(ManualClock::new(T0));
         let mut reached_full_path = false;
-        for k in 1..=12usize {
+        for k in 1..=16usize {
             let path = base.path().join(format!("invite-{k}.db"));
             let store = open(&path);
             let cp = ControlPlane::new(store.clone(), clock.clone());
@@ -2032,7 +2090,8 @@ mod crash_and_race_tests {
                 assert_eq!(replay.invitation.id, issued.invitation.id);
                 assert!(replay.token.is_none());
                 assert_eq!(rows(&store, "cp_invitation"), 1);
-                assert_eq!(rows(&store, "cp_idempotency"), 2);
+                // boot + scoped claim + compatibility alias.
+                assert_eq!(rows(&store, "cp_idempotency"), 3);
                 break;
             }
             let attempt = attempt.unwrap_err();
@@ -2062,7 +2121,7 @@ mod crash_and_race_tests {
             assert_eq!(replay.invitation.id, issued.invitation.id);
             assert!(replay.token.is_none(), "k={k}: no token on replay");
             assert_eq!(rows(&store, "cp_invitation"), 1, "k={k}");
-            assert_eq!(rows(&store, "cp_idempotency"), 2, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 3, "k={k}");
         }
         assert!(reached_full_path, "the matrix never reached the full path");
     }
@@ -2112,8 +2171,8 @@ mod crash_and_race_tests {
                     .unwrap();
                 assert_eq!(accepted.status, InvitationStatus::Accepted);
                 assert_eq!(rows(&store, "cp_membership"), 2);
-                // boot + invite + create_user + accept.
-                assert_eq!(rows(&store, "cp_idempotency"), 4);
+                // boot + invite (scoped + alias) + create_user + accept.
+                assert_eq!(rows(&store, "cp_idempotency"), 5);
                 break;
             }
             let attempt = attempt.unwrap_err();
@@ -2155,8 +2214,8 @@ mod crash_and_race_tests {
                 .unwrap();
             assert_eq!(replay.id, membership.id, "k={k}");
             assert_eq!(rows(&store, "cp_membership"), 2, "k={k}");
-            // boot + invite + create_user + accept.
-            assert_eq!(rows(&store, "cp_idempotency"), 4, "k={k}");
+            // boot + invite (scoped + alias) + create_user + accept.
+            assert_eq!(rows(&store, "cp_idempotency"), 5, "k={k}");
         }
         assert!(reached_full_path, "the matrix never reached the full path");
     }
@@ -2169,7 +2228,7 @@ mod crash_and_race_tests {
         let base = tempfile::tempdir().unwrap();
         let clock = Arc::new(ManualClock::new(T0));
         let mut reached_full_path = false;
-        for k in 1..=12usize {
+        for k in 1..=16usize {
             let path = base.path().join(format!("decide-{k}.db"));
             let store = open(&path);
             let cp = ControlPlane::new(store.clone(), clock.clone());
@@ -2200,7 +2259,8 @@ mod crash_and_race_tests {
                     .unwrap();
                 assert_eq!(replay.decided_ms, decided.decided_ms);
                 assert_eq!(rows(&store, "cp_approval"), 1);
-                assert_eq!(rows(&store, "cp_idempotency"), 3);
+                // boot + request (scoped + alias) + decide (scoped + alias).
+                assert_eq!(rows(&store, "cp_idempotency"), 5);
                 break;
             }
             let attempt = attempt.unwrap_err();
@@ -2224,7 +2284,8 @@ mod crash_and_race_tests {
                 .unwrap();
             assert_eq!(replay.decided_ms, decided.decided_ms, "k={k}");
             assert_eq!(rows(&store, "cp_approval"), 1, "k={k}");
-            assert_eq!(rows(&store, "cp_idempotency"), 3, "k={k}");
+            // boot + request (scoped + alias) + decide (scoped + alias).
+            assert_eq!(rows(&store, "cp_idempotency"), 5, "k={k}");
         }
         assert!(reached_full_path, "the matrix never reached the full path");
     }
@@ -2236,7 +2297,7 @@ mod crash_and_race_tests {
         let base = tempfile::tempdir().unwrap();
         let clock = Arc::new(ManualClock::new(T0));
         let mut reached_full_path = false;
-        for k in 1..=12usize {
+        for k in 1..=16usize {
             let path = base.path().join(format!("request-{k}.db"));
             let store = open(&path);
             let cp = ControlPlane::new(store.clone(), clock.clone());
@@ -2271,7 +2332,8 @@ mod crash_and_race_tests {
                     .unwrap();
                 assert_eq!(replay.id, approval.id);
                 assert_eq!(rows(&store, "cp_approval"), 1);
-                assert_eq!(rows(&store, "cp_idempotency"), 2);
+                // boot + scoped claim + compatibility alias.
+                assert_eq!(rows(&store, "cp_idempotency"), 3);
                 break;
             }
             let attempt = attempt.unwrap_err();
@@ -2309,7 +2371,7 @@ mod crash_and_race_tests {
                 .unwrap();
             assert_eq!(replay.id, approval.id, "k={k}");
             assert_eq!(rows(&store, "cp_approval"), 1, "k={k}");
-            assert_eq!(rows(&store, "cp_idempotency"), 2, "k={k}");
+            assert_eq!(rows(&store, "cp_idempotency"), 3, "k={k}");
         }
         assert!(reached_full_path, "the matrix never reached the full path");
     }

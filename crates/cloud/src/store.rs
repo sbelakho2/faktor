@@ -252,7 +252,8 @@ pub trait ControlPlaneStore: Send + Sync {
     /// Called on the open/backup tick; exposed for explicit maintenance.
     fn prune_idempotency(&self, now_ms: i64) -> Result<usize, CloudStoreError>;
 
-    /// Execute `apply` exactly once per `(key, operation, request_digest)`.
+    /// Execute `apply` exactly once per `(key, operation, request_digest)`,
+    /// consulting legacy alias keys for rollout compatibility.
     ///
     /// The idempotency claim (`INSERT OR IGNORE` with a response
     /// placeholder), every domain mutation `apply` performs through
@@ -263,6 +264,28 @@ pub trait ControlPlaneStore: Send + Sync {
     /// A closure refusal (or any store failure) rolls the whole transaction
     /// back, so no partial domain write survives and the key stays free for
     /// a retry.
+    ///
+    /// `aliases` are pre-scoping keys the same logical operation may have
+    /// been recorded under (a release before tenant-scoped keys). An alias
+    /// with the SAME operation and request digest replays the recorded
+    /// response and is promoted under `key`; an alias with a different
+    /// operation or digest is IGNORED — never a conflict — so a foreign
+    /// tenant's coincidental key can neither block nor be replayed. Every
+    /// successful execution also writes best-effort alias rows
+    /// (`INSERT OR IGNORE`), so a retry under either spelling converges.
+    fn execute_idempotent_aliased(
+        &self,
+        key: &str,
+        aliases: &[&str],
+        operation: &str,
+        request_digest: &str,
+        now_ms: i64,
+        apply: &mut dyn FnMut(
+            &mut dyn ControlPlaneTx,
+        ) -> Result<serde_json::Value, ControlPlaneError>,
+    ) -> Result<IdempotentOutcome, ControlPlaneError>;
+
+    /// [`Self::execute_idempotent_aliased`] with no legacy aliases.
     fn execute_idempotent(
         &self,
         key: &str,
@@ -272,7 +295,9 @@ pub trait ControlPlaneStore: Send + Sync {
         apply: &mut dyn FnMut(
             &mut dyn ControlPlaneTx,
         ) -> Result<serde_json::Value, ControlPlaneError>,
-    ) -> Result<IdempotentOutcome, ControlPlaneError>;
+    ) -> Result<IdempotentOutcome, ControlPlaneError> {
+        self.execute_idempotent_aliased(key, &[], operation, request_digest, now_ms, apply)
+    }
 }
 
 // ------------------------------------------------------------- in-memory
@@ -969,9 +994,10 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
         Ok(before - inner.idempotency.len())
     }
 
-    fn execute_idempotent(
+    fn execute_idempotent_aliased(
         &self,
         key: &str,
+        aliases: &[&str],
         operation: &str,
         request_digest: &str,
         now_ms: i64,
@@ -985,6 +1011,22 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
         // replays); it can never interleave with a half-written operation.
         let mut inner = self.lock()?;
         if let Some(existing) = inner.idempotency.get(key).cloned() {
+            return replay_record(key, operation, request_digest, &existing);
+        }
+        // Rollout compatibility: a legacy alias with the SAME operation and
+        // digest replays and is promoted under the primary key. A mismatch is
+        // ignored, never a conflict, so a foreign tenant's coincidental key
+        // can neither block nor leak.
+        for alias in aliases {
+            let Some(existing) = inner.idempotency.get(*alias).cloned() else {
+                continue;
+            };
+            if existing.operation != operation || existing.request_hash != request_digest {
+                continue;
+            }
+            let mut promoted = existing.clone();
+            promoted.key = key.to_string();
+            inner.idempotency.insert(key.to_string(), promoted);
             return replay_record(key, operation, request_digest, &existing);
         }
         let (response, response_json) = {
@@ -1018,10 +1060,24 @@ impl ControlPlaneStore for MemoryControlPlaneStore {
                 key: key.to_string(),
                 operation: operation.to_string(),
                 request_hash: request_digest.to_string(),
-                response_json,
+                response_json: response_json.clone(),
                 created_ms: now_ms,
             },
         );
+        // Best-effort alias rows (`INSERT OR IGNORE` twin): a pre-scoping
+        // client retry finds the record under the raw key.
+        for alias in aliases {
+            inner
+                .idempotency
+                .entry((*alias).to_string())
+                .or_insert_with(|| IdempotencyRecord {
+                    key: (*alias).to_string(),
+                    operation: operation.to_string(),
+                    request_hash: request_digest.to_string(),
+                    response_json: response_json.clone(),
+                    created_ms: now_ms,
+                });
+        }
         Ok(IdempotentOutcome::Executed(response))
     }
 }
@@ -2307,9 +2363,10 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         prune_idempotency_sql(&conn, now_ms)
     }
 
-    fn execute_idempotent(
+    fn execute_idempotent_aliased(
         &self,
         key: &str,
+        aliases: &[&str],
         operation: &str,
         request_digest: &str,
         now_ms: i64,
@@ -2344,6 +2401,46 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             },
         };
 
+        // Rollout compatibility: a legacy alias with the SAME operation and
+        // digest replays, and is promoted under the primary key so later
+        // retries converge. A mismatch is IGNORED, never a conflict, so a
+        // foreign tenant's coincidental key can neither block nor leak.
+        for alias in aliases {
+            wrapper.tick()?;
+            let legacy: Option<(String, String, String)> = wrapper
+                .tx
+                .query_row(
+                    "SELECT operation, request_hash, response FROM cp_idempotency WHERE key = ?1",
+                    params![alias],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(backend)?;
+            let Some((legacy_operation, legacy_digest, response_json)) = legacy else {
+                continue;
+            };
+            if legacy_operation != operation || legacy_digest != request_digest {
+                continue;
+            }
+            wrapper.tick()?;
+            wrapper
+                .tx
+                .execute(
+                    "INSERT INTO cp_idempotency (key, operation, request_hash, response, created_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(key) DO NOTHING",
+                    params![key, operation, request_digest, &response_json, now_ms],
+                )
+                .map_err(backend)?;
+            wrapper.tx.commit().map_err(backend)?;
+            let replayed = serde_json::from_str(&response_json).map_err(|e| {
+                ControlPlaneError::Backend(format!(
+                    "recorded idempotent response is unreadable: {e}"
+                ))
+            })?;
+            return Ok(IdempotentOutcome::Replayed(replayed));
+        }
+
         wrapper.tick()?;
         let claimed = wrapper
             .tx
@@ -2369,6 +2466,21 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
                     params![encoded, key],
                 )
                 .map_err(backend)?;
+            // Best-effort alias rows: a pre-scoping client retry finds the
+            // record under the raw key (an existing alias row wins; it can
+            // only ever be the same request's).
+            for alias in aliases {
+                wrapper.tick()?;
+                wrapper
+                    .tx
+                    .execute(
+                        "INSERT INTO cp_idempotency (key, operation, request_hash, response, created_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(key) DO NOTHING",
+                        params![alias, operation, request_digest, &encoded, now_ms],
+                    )
+                    .map_err(backend)?;
+            }
             wrapper.tx.commit().map_err(backend)?;
             return Ok(IdempotentOutcome::Executed(response));
         }
@@ -2719,6 +2831,80 @@ mod tests {
     #[test]
     fn sqlite_store_idempotent_transaction_contract() {
         idempotent_transaction_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn memory_store_legacy_alias_compatibility_contract() {
+        legacy_alias_compatibility_contract(&MemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn sqlite_store_legacy_alias_compatibility_contract() {
+        legacy_alias_compatibility_contract(&SqliteControlPlaneStore::open_in_memory().unwrap());
+    }
+
+    /// Rollout compatibility: a record written under a pre-scoping raw key
+    /// replays when the scoped key misses, is promoted under the scoped key,
+    /// and a mismatched alias is IGNORED (never a cross-tenant block).
+    fn legacy_alias_compatibility_contract(store: &dyn ControlPlaneStore) {
+        let mut runs = 0usize;
+        // Simulate the pre-scoping release: the operation is recorded under
+        // the raw key only.
+        let legacy = store
+            .execute_idempotent("legacy-key", "op", "digest-1", 7, &mut |_tx| {
+                runs += 1;
+                Ok(serde_json::json!({"ok": true}))
+            })
+            .unwrap();
+        assert!(matches!(legacy, IdempotentOutcome::Executed(_)));
+
+        // The scoped key has no record yet: the matching alias replays and
+        // the closure never runs.
+        let replayed = store
+            .execute_idempotent_aliased(
+                "scoped-key",
+                &["legacy-key"],
+                "op",
+                "digest-1",
+                8,
+                &mut |_tx| {
+                    runs += 1;
+                    Ok(serde_json::json!({"ok": false}))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            replayed,
+            IdempotentOutcome::Replayed(serde_json::json!({"ok": true}))
+        );
+        assert_eq!(runs, 1, "an alias replay never runs the closure");
+        // Promoted: the scoped key now has its own row.
+        assert!(store.idempotent("scoped-key").unwrap().is_some());
+
+        // A mismatched alias (different digest) is IGNORED, not a conflict:
+        // a foreign tenant's coincidental key must not block this tenant.
+        let executed = store
+            .execute_idempotent_aliased(
+                "other-scoped",
+                &["legacy-key"],
+                "op",
+                "digest-2",
+                9,
+                &mut |_tx| {
+                    runs += 1;
+                    Ok(serde_json::json!({"ok": true, "run": runs}))
+                },
+            )
+            .unwrap();
+        assert!(matches!(executed, IdempotentOutcome::Executed(_)));
+        assert_eq!(runs, 2);
+
+        // A successful execution writes the alias alongside the primary, so
+        // a legacy client retry under either spelling converges.
+        assert!(store.idempotent("other-scoped").unwrap().is_some());
+        let raw_alias = store.idempotent("legacy-key").unwrap().unwrap();
+        assert_eq!(raw_alias.operation, "op");
+        assert_eq!(raw_alias.request_hash, "digest-1");
     }
 
     /// F12: a recorded response beyond the hard bound cannot be persisted; the

@@ -145,7 +145,9 @@ fn no_new_privs_now() -> bool {
 pub(crate) fn probe_privilege_drop_for_tests() -> DropProbe {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a live two-element array; failure is refused.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    // O_CLOEXEC is atomic at creation: a concurrent fork/exec in another
+    // test thread can never inherit the probe's pipe descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return DropProbe::Refused(libc::EMFILE);
     }
     // SAFETY: fork in a test; the child branch below only calls the raw
@@ -214,8 +216,9 @@ pub(crate) fn netns_unshare_available_for_tests() -> bool {
     *AVAILABLE.get_or_init(|| {
         let mut fds = [0i32; 2];
         // SAFETY: `fds` is a live two-element array; failure means "unknown",
-        // reported as unavailable.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        // reported as unavailable. O_CLOEXEC is atomic at creation, so a
+        // concurrent spawn can never inherit the probe pipe.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return false;
         }
         // SAFETY: fork in a test; the child branch only calls unshare, write

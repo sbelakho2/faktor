@@ -142,11 +142,15 @@ pub(crate) fn orchestrator_graph_row_error(
 pub(crate) async fn native_orchestrator_graph(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NativeOrchestratorGraphQuery>,
+    query: Result<Query<NativeOrchestratorGraphQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let graph_404 = |m: String| {
         let e = ApiError {
             code: "not_found",
@@ -1069,11 +1073,15 @@ pub(crate) fn model_known(state: &AppState, model: &str) -> bool {
 pub(crate) async fn native_agents(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NativeAgentsQuery>,
+    query: Result<Query<NativeAgentsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
+    };
     let Ok(raw) = q.session.parse::<u64>() else {
         return wire_status(not_found(&format!("invalid session id {:?}", q.session)));
     };

@@ -1289,6 +1289,18 @@ pub fn can_escalate(from: Cap, to: Cap) -> bool {
 }
 
 #[cfg(test)]
+#[path = "adversarial_secret_tests.rs"]
+mod adversarial_secret_tests;
+
+#[cfg(test)]
+#[path = "adversarial_destination_tests.rs"]
+mod adversarial_destination_tests;
+
+#[cfg(test)]
+#[path = "adversarial_property_tests.rs"]
+mod adversarial_property_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -27,6 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use faktor_core::model::ModelCapabilities;
+use faktor_provider::classify;
 use faktor_provider::config::{bearer_auth_header, ExtraHeaders, ProviderConfigError};
 #[cfg(test)]
 use faktor_provider::egress::PolicyCheckedHttpTransport;
@@ -157,27 +158,21 @@ pub fn authorization_headers(
     Ok(h)
 }
 
-/// Shared HTTP-status classifier for BOTH wire families. Retryability comes
-/// from the provider crate's [`ProviderErrorKind::retryable`] (429 and 5xx
-/// retry with backoff; auth failures and every other 4xx are terminal), so
-/// the chat and responses paths can never drift apart. The error message is
-/// the scrubbed, bounded diagnostic ([`ErrorScrubber::diagnostic`]): raw
-/// upstream bodies (which can echo request credentials) never reach the
-/// error.
+/// Shared HTTP-status classifier for BOTH wire families, delegated to the
+/// provider crate's single classifier ([`provider_error_for_http`]): the
+/// status taxonomy plus the structured body hint (`error.code` /
+/// `error.status` / `error.type`, never message text) decide the kind, and
+/// retryability comes from the provider crate's
+/// [`ProviderErrorKind::retryable`], so the chat and responses paths can
+/// never drift apart. The error message is the scrubbed, bounded diagnostic
+/// ([`ErrorScrubber::diagnostic`]): raw upstream bodies (which can echo
+/// request credentials) never reach the error.
 fn classify_http_status(
     status: reqwest::StatusCode,
     body: String,
     scrubber: &ErrorScrubber,
 ) -> ProviderError {
-    let kind = match status.as_u16() {
-        401 | 403 => ProviderErrorKind::Auth,
-        429 => ProviderErrorKind::RateLimited,
-        408 | 504 => ProviderErrorKind::Timeout,
-        500..=599 => ProviderErrorKind::Server,
-        _ => ProviderErrorKind::BadRequest,
-    };
-    let code = status.as_u16();
-    ProviderError::with_code(kind, code.to_string(), scrubber.diagnostic(code, &body))
+    classify::provider_error_for_http_with_scrubber(status.as_u16(), &body, scrubber)
 }
 
 /// Hard bound on the provider-native error `code` echoed into a
@@ -1118,23 +1113,14 @@ fn responses_event_error(ev: &serde_json::Value, scrubber: &ErrorScrubber) -> Pr
         .and_then(|c| c.as_str())
         .or_else(|| ev.get("code").and_then(|c| c.as_str()))
         .unwrap_or_default();
-    let folded: String = code
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    let kind = if folded.starts_with("ratelimit")
-        || folded.starts_with("toomany")
-        || folded.starts_with("quota")
-        || folded.starts_with("resourceexhausted")
-        || folded.starts_with("throttl")
-    {
-        ProviderErrorKind::RateLimited
-    } else if folded.contains("auth") || folded.contains("apikey") || folded == "invalidkey" {
-        ProviderErrorKind::Auth
-    } else {
-        ProviderErrorKind::BadRequest
-    };
+    // Shared structured classification (the same token table HTTP bodies
+    // use): the nested `error` object when present, else the event's
+    // top-level fields. Unknown codes keep the terminal BadRequest kind.
+    let hint = err
+        .and_then(classify::value_error_hint)
+        .or_else(|| classify::value_error_hint(ev));
+    let kind =
+        classify::provider_error_for_hint(hint.as_deref()).unwrap_or(ProviderErrorKind::BadRequest);
     let message = scrubber.event_diagnostic(
         "responses stream error",
         raw_message,
@@ -2931,17 +2917,26 @@ mod tests {
     #[tokio::test]
     async fn http_status_retry_classification_is_shared_by_both_families() {
         // ONE status classifier serves both wire families: 429/5xx are
-        // retryable, auth and every other 4xx are terminal, and the
-        // envelope's retryability is the provider crate's shared
+        // retryable, auth and every other 4xx are terminal, structured body
+        // hints override the bare 400/403 statuses, and the envelope's
+        // retryability is the provider crate's shared
         // `ProviderErrorKind::retryable()`.
-        for (status, expect_kind, expect_retryable) in [
-            (429u16, ProviderErrorKind::RateLimited, true),
-            (500, ProviderErrorKind::Server, true),
-            (503, ProviderErrorKind::Server, true),
-            (400, ProviderErrorKind::BadRequest, false),
-            (401, ProviderErrorKind::Auth, false),
-            (403, ProviderErrorKind::Auth, false),
-            (404, ProviderErrorKind::BadRequest, false),
+        let bare = r#"{"error":{"message":"nope"}}"#;
+        let bad_key = r#"{"error":{"code":"invalid_api_key","message":"bad"}}"#;
+        let quota = r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"quota"}}"#;
+        let denied = r#"{"error":{"status":"PERMISSION_DENIED","message":"nope"}}"#;
+        for (status, body, expect_kind, expect_retryable) in [
+            (429u16, bare, ProviderErrorKind::RateLimited, true),
+            (500, bare, ProviderErrorKind::Server, true),
+            (503, bare, ProviderErrorKind::Server, true),
+            (400, bare, ProviderErrorKind::Malformed, false),
+            (401, bare, ProviderErrorKind::Auth, false),
+            (403, bare, ProviderErrorKind::Auth, false),
+            (404, bare, ProviderErrorKind::BadRequest, false),
+            // Structured body hints override the bare status.
+            (400, bad_key, ProviderErrorKind::Auth, false),
+            (403, quota, ProviderErrorKind::RateLimited, true),
+            (403, denied, ProviderErrorKind::Auth, false),
         ] {
             for responses in [false, true] {
                 let server = MockServer::new();
@@ -2955,7 +2950,7 @@ mod tests {
                     path,
                     MockAction::Respond {
                         status,
-                        body: r#"{"error":{"message":"nope"}}"#.into(),
+                        body: body.into(),
                     },
                 );
                 let base = server.base_url().await;

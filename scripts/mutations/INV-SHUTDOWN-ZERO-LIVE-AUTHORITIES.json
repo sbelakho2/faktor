@@ -1,0 +1,8 @@
+{
+  "id": "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES",
+  "file": "crates/store/src/connection.rs",
+  "find": "        if !maintenance_drained {",
+  "replace": "        if false && !maintenance_drained {",
+  "gate": "cargo test -p faktor-store --lib shutdown_reports_typed_error_when_maintenance_does_not_drain",
+  "note": "A live maintenance authority is no longer reported: shutdown claims success while a store-owned thread survives."
+}

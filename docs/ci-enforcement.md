@@ -13,6 +13,8 @@ it needs credentials or a server this checkout does not have.
 | Dependency license/bans/sources policy (`deny.toml`) enforced in the trusted static lane via `scripts/check-licenses.sh` (locked `cargo metadata` + optional cargo-deny) | Applied | `deny.toml`, `scripts/check-licenses.sh`, `.woodpecker/trusted/trusted.yaml` |
 | Committed-artifact hygiene scan (bytecode / build artifacts / opaque extensionless binaries ≥ 64 KiB) with justified load-bearing allowlist and planted-fixture proof | Applied | `tests/static-authority/src/lib.rs` (scan 13), `.gitignore`, `docs/repo-hygiene.md` |
 | Container images pinned by multi-arch index digest (non-Rust) | Applied | `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml`, `.woodpecker/trusted/nightly.yaml`, `scripts/woodpecker/docker-compose.yml` |
+| VS Code E2E toolchain pinned by release version + commit + sha256 in the lane script (verified before extraction; `code --version` must print both) | Applied | `scripts/vscode-e2e.sh`, `.woodpecker/trusted/trusted.yaml` |
+| Bounded release-soak driver (configurable `FAKTOR_SOAK_SCALE`, wall/test budgets, zero/zero-test refusal) | Applied | `scripts/soak.sh`, `.woodpecker/trusted/trusted.yaml` (`soak-smoke`), `.woodpecker/trusted/nightly.yaml` (`soak` long mode) |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
 | Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict) and the PR path | Applied | GitHub API |
 | Woodpecker publishes `ci/woodpecker/pr/pr` for this repo | **Operator** | Woodpecker server |
@@ -147,6 +149,7 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   | `faktor-ci` (local build, linux/amd64) | `sha256:c720f6fd634eb7557fc8852652777000629642b12c0e2564b5a692b52f3fef0b` (`docker/faktor-ci/image-digest.txt`) |
   | `ubuntu:24.04` | `sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3` |
   | `alpine:3.20` | `sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc` |
+  | `mcr.microsoft.com/playwright:v1.55.0-noble` (VS Code Extension Host E2E; Chromium runtime libs, no apt step) | `sha256:b27e719ecbfef153e13fd24e8341736733bf2658b229677eb21ff57ff5d7fb29` |
   | `bash:latest` | `sha256:61962062d969cb46dfc2bad061d36342406fa485f64f246aa7e95693ca07df1f` |
   | `woodpeckerci/woodpecker-server:v3` | `sha256:58dafbe56bb3529d78b48ee8d56a1f4b0886748763fd04ac23c01cc06c3dd24e` |
   | `woodpeckerci/woodpecker-agent:v3` | `sha256:73ee7cc63161b40bfefa4a26eae45c518a09124ab34f7e3c5e781df85e1ba4ac` |
@@ -172,6 +175,22 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   CI and `scripts/package-artifacts.sh` run `npx --no-install vsce package`
   (never `npx --yes @vscode/vsce`, which could fetch a mutable latest).
   Verify locally: `cd apps/vscode && npm ci && npx --no-install vsce --version`.
+- VS Code E2E toolchain: `scripts/vscode-e2e.sh` records the release
+  version (`1.140.0`), commit (`07f806f9…`), build id and SHA-256
+  (`d32031e9…`) of the linux-x64 tarball; the SHA is verified before
+  extraction and `code --version` must print the pinned version and commit,
+  so a retagged/mutated download cannot run. The cached tarball lives on the
+  `faktor-trusted-vscode-e2e-cache` volume. Re-pin deliberately with
+  `curl https://update.code.visualstudio.com/api/update/linux-x64/stable/<version>`
+  and update the constants (see §2.15 of `docs/certification.md`).
+- Release soak driver: `scripts/soak.sh` is the only soak campaign entry
+  point. `FAKTOR_SOAK_SCALE` is a positive multiplier capped by
+  `FAKTOR_SOAK_MAX_SCALE`/`FAKTOR_SOAK_MAX_ROUNDS`; `FAKTOR_SOAK_MAX_WALL_SECONDS`
+  and `FAKTOR_SOAK_TEST_TIMEOUT_SECONDS` bound the run; a zero/negative/
+  unparseable scale and a run that executes zero tests are both refusals
+  (`target/certification/soak.json` records scale/rounds/status). The trusted
+  `soak-smoke` step runs the bounded smoke and the nightly `soak` lane runs
+  the long mode (see §2.15 of `docs/certification.md`).
 
 Workflow YAML is validated with `woodpecker-cli lint .woodpecker/` (or the
 container fallback in `scripts/woodpecker/setup.md` §13) plus the

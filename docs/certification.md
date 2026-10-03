@@ -110,12 +110,14 @@ when CI migrated (historical note only, no workflow files remain under
 | `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run); `doctor` smoke |
 | `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; license/bans/sources policy gate (`scripts/check-licenses.sh`); supply-chain SBOM/checksums/advisories with recorded skips |
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
+| `soak-smoke` | linux/amd64 | bounded accelerated release soak (`scripts/soak.sh`, smoke mode, scale 1): one representative ignored `[soak]`/`[fault]`/`[perf]` test per group with wall/test budgets; records `target/certification/soak.json`; a zero-test run fails |
 | `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; lockfile-pinned `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
+| `vscode-e2e` | linux/amd64 | pinned VS Code tarball (version+commit+sha256 in `scripts/vscode-e2e.sh`) + real Extension Host smoke after `vscode`: extension activates, commands registered, compiled webview provider HTML carries the strict CSP and composer/attachment surface (no pixel comparison) |
 | `jetbrains-build` | linux/amd64 | `./gradlew :frontend:buildPlugin --no-daemon --stacktrace` |
 | `jetbrains-smoke` | linux/amd64 | kotlinc split-mode compile + wire/native smokes against a real daemon |
 | `perf` | linux/amd64 | release `[perf]` gates; serialized after the other Rust lanes so budgets do not race a loaded agent |
 | `darwin-check` / `darwin-test` / `darwin-doctor` | self-hosted macOS (`local` backend) | `check`/`test --workspace` + `doctor`; `push` to `main` only |
-| `windows-check` / `windows-test` | self-hosted Windows (`local` backend) | `cargo check --workspace`; `cargo test -p faktor-fs --all-targets`, then the explicit rooted/atomic groups (`cargo test -p faktor-fs rooted`, `cargo test -p faktor-fs atomic`) and the `cfg(windows)` anchored-IO seam suite (`cargo test -p faktor-fs platform::windows`), then workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts; `push` to `main` only |
+| `windows-check` / `windows-test` / `windows-visual-baseline` | self-hosted Windows (`local` backend) | `cargo check --workspace`; `cargo test -p faktor-fs --all-targets`, then the explicit rooted/atomic groups (`cargo test -p faktor-fs rooted`, `cargo test -p faktor-fs atomic`) and the `cfg(windows)` anchored-IO seam suite (`cargo test -p faktor-fs platform::windows`), then workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts; plus the Windows-owned JetBrains visual baseline gate (`scripts/windows-visual-baseline.ps1`), which fails when the pinned baseline has no DISTINCT `windows` record and renders/compares that platform's panels (re-pin with `-WriteBaselines`); `push` to `main` only |
 | `certificate` | linux/amd64 | aggregate gate over every linux lane: verifies each lane's marker and the workflow status, writes `target/certification/ci-certification.json` |
 | `certificate-darwin` / `certificate-windows` | self-hosted platform agent | per-platform aggregate marker/status gate |
 
@@ -153,9 +155,13 @@ certificate; branch protection requires the resulting
 too long for push/PR: the ignored `[fault]` campaign at scale, the longrun
 suite, efficiency, economy, the coding-benchmark smoke, the provider-key
 real-model run (an explicit recorded skip unless keys are supplied
-out-of-band) and supply-chain evidence. It writes lane markers and its own
-certificate. §2.11 describes the two-project trust boundary that keeps the PR
-workflow from ever obtaining a volume mount.
+out-of-band) and supply-chain evidence. Its `soak` lane drives
+`scripts/soak.sh` in long mode (`FAKTOR_SOAK_MODE=long`,
+`FAKTOR_SOAK_SCALE=4`, bounded by the driver's max-rounds/wall budget), which
+records `target/certification/soak.json`; the trusted push workflow runs the
+same driver as the bounded `soak-smoke` gate (§2.15). The nightly workflow
+writes lane markers and its own certificate. §2.11 describes the two-project
+trust boundary that keeps the PR workflow from ever obtaining a volume mount.
 
 100% requires the linux certificate green at the exact commit, plus the
 platform certificates when self-hosted darwin/windows agents exist. The
@@ -164,7 +170,9 @@ release criterion, no CI workflow or release gate consumes it, and the
 `[soak]`-ignored longrun tests remain in-tree and runnable manually. `bash
 scripts/certify-local.sh full` keeps the long release lanes ([perf], [fault]
 at scale, coding benchmark, efficiency, ACP interop, packaging, installation
-matrix) runnable offline.
+matrix) runnable offline. A bounded accelerated soak campaign (`scripts/soak.sh`
+with an explicit `FAKTOR_SOAK_SCALE`) is in scope and runs in CI: the trusted
+push gate in smoke mode and the nightly `soak` lane in long mode (§2.15).
 
 ### 2.2 UI builds and parity
 
@@ -177,8 +185,21 @@ matrix) runnable offline.
   verification (`apps/vscode/scripts/verify-vsix.mjs`) asserts the panel
   surface exactly (an extra `media/`/`out/` artifact is a failure), and
   `node scripts/selftest.mjs --packaged` asserts the extracted layout.
-  A real-IDE screenshot comparison against a launched VS Code remains a
-  host/CI capability not claimed by the offline certificate.
+  On top of that offline surface, the trusted `vscode-e2e` lane launches a
+  REAL pinned VS Code (linux-x64 tarball pinned by version + commit +
+  sha256 in `scripts/vscode-e2e.sh`; the SHA is verified before extraction
+  and `code --version` must print both the pinned version and commit) with
+  `--extensionDevelopmentPath=apps/vscode` and executes
+  `scripts/vscode-e2e/extension-host-smoke.cjs` INSIDE the real extension
+  host: the `faktor.faktor` extension is present and activates, the
+  contributed `faktor.*` commands are registered (`faktor.openChat`
+  executes), and the compiled webview provider renders HTML carrying the
+  strict CSP plus the composer and attachment surface. That proves host
+  activation and the compiled webview surface, NOT rendered pixels: no
+  screenshot comparison exists and the workbench UI/WebviewView is not
+  displayed; a real-IDE screenshot comparison remains a host capability not
+  claimed by the offline certificate. The lane records its exact coverage in
+  `target/certification/vscode-e2e.json` (§2.15).
 - **JetBrains** (`apps/jetbrains`): `bash apps/jetbrains/compile-and-smoke.sh`
   green (`:shared` + `:backend` + `:frontend` Swing panel, real kotlinc,
   real daemon: daemon-lifecycle smoke plus native-protocol fake-server unit
@@ -796,7 +817,11 @@ scripts/check-ignored-tests.mjs` against
 
 Nightly lanes: `fault-scale` runs `faktor-tests-fault` + `faktor-updater`
 ignored tests, `soak` runs the bounded keyless `[soak]` set
-(`faktor-tests-accounting-modelcheck`), and `longrun` is the release lane;
+(`faktor-tests-accounting-modelcheck`) through `scripts/soak.sh` in long mode
+(the registry records the exact `bash scripts/soak.sh -p
+faktor-tests-accounting-modelcheck --release -- --ignored` command that the
+step runs; the trusted push gate runs the same driver in smoke mode), and
+`longrun` is the release lane;
 the key-gated `coding-benchmark-real-model` step is the live-paid lane. The
 12h/24h/10 GiB wall-clock soaks stay manual by design and are recorded as
 such in the registry. The certificate jobs run the inventory check first,
@@ -866,6 +891,76 @@ fails with `unassigned`; an unconventional tag fails with
   Regenerate deliberately with `./gradlew --write-locks
   --write-verification-metadata sha256 :frontend:buildPlugin`.
 
+### 2.15 Accelerated release soak, VS Code Extension Host E2E, Windows visual baseline
+
+- **Accelerated release soak (`scripts/soak.sh`).** One bounded driver for
+  the existing ignored `[soak]`/`[fault]`/`[perf]` campaigns. `FAKTOR_SOAK_SCALE`
+  is a positive multiplier (`rounds = ceil(min(scale, FAKTOR_SOAK_MAX_SCALE))`,
+  further capped by `FAKTOR_SOAK_MAX_ROUNDS`); `FAKTOR_SOAK_MODE=smoke` pins
+  one round and runs one representative ignored test per group with `--exact`,
+  while `FAKTOR_SOAK_MODE=long` runs the whole ignored set per round. The run
+  is bounded by `FAKTOR_SOAK_MAX_WALL_SECONDS` (checked between rounds, plus a
+  per-invocation `timeout` of `FAKTOR_SOAK_TEST_TIMEOUT_SECONDS`). Refusals
+  are hard failures: a zero/negative/unparseable scale, a non-positive budget,
+  or a campaign that executes zero tests. Every run records
+  `target/certification/soak.json` with commit/tree/scale/rounds/status and
+  per-group executed/passed/failed counts; `scripts/soak.sh --selftest`
+  proves the scale-clamp and zero/zero-test refusals with a fake cargo.
+  Wiring: the trusted `soak-smoke` step (smoke, scale 1, one representative
+  per group) and the nightly `soak` lane (long, scale 4, forwarding the
+  registry's recorded `-p faktor-tests-accounting-modelcheck …` command
+  verbatim). Operator long campaign:
+  `FAKTOR_SOAK_MODE=long FAKTOR_SOAK_SCALE=4 bash scripts/soak.sh --groups soak,fault,perf`.
+- **VS Code Extension Host E2E (`scripts/vscode-e2e.sh`).** Downloads the
+  PINNED linux-x64 VS Code build (version `1.140.0`, commit
+  `07f806f999227108933c2e30515b26eecc1fda74`, sha256 `d32031e9…`, recorded in
+  the script and re-checked before extraction), then runs the CLI pin checks
+  (`code --version`, isolated `--install-extension`/`--list-extensions` of the
+  built VSIX) and the real Extension Host smoke
+  (`scripts/vscode-e2e/extension-host-smoke.cjs`): extension present +
+  activated, `faktor.*` commands registered, `faktor.openChat` executed, and
+  the compiled webview provider HTML carries the strict CSP
+  (`default-src 'none'`, nonce, `connect-src 'none'`) plus the composer and
+  attachment surface (`#composer`, `#goal`, `#attachment-list`,
+  `#attachment-hint`, `#btn-attach`). On a headless runner it launches
+  Electron with `--ozone-platform=headless --disable-gpu` (and `--no-sandbox`
+  as root). Exact coverage is recorded in `target/certification/vscode-e2e.json`:
+  it does NOT prove rendered pixels/screenshots, a displayed workbench
+  UI/WebviewView, or live daemon connectivity — the record carries that
+  `does_not_prove` list verbatim. The lane runs on the digest-pinned
+  Playwright image (Chromium runtime libraries), NOT on `node:24` (which
+  lacks them and cannot start the Electron host). `bash scripts/vscode-e2e.sh
+  --selftest` proves the pin-tamper, missing-evidence, failed-check, wrong-
+  version and CLI-only cases without network or a real Electron.
+- **Windows visual baseline (`scripts/windows-visual-baseline.ps1`).** The
+  `windows-visual-baseline` step runs on the self-hosted Windows agent and is
+  part of `certificate-windows`. It FAILS when the pinned baseline has no
+  `windows` record (a platform is never certified by inheriting linux/macos
+  digests; an identical windows<->linux/macos digest for the same panel is an
+  explicit `inherited-digest` failure), validates every digest as 64-hex, and
+  then renders/compares this platform's panels with
+  `bash apps/jetbrains/compile-and-smoke.sh`. `-WriteBaselines` first re-pins
+  the record with `--write-baselines`, copies the produced file to
+  `target/certification/visual-baselines-windows.json` for retrieval, and
+  still re-runs the comparison; the operator commits that file into
+  `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`.
+  A missing Git Bash/JetBrains toolchain is a hard `windows-jetbrains-toolchain-missing`
+  failure, never a skip. `powershell -File scripts/windows-visual-baseline.ps1
+  -SelfTest` proves the missing/inherited/malformed/v2 refusals offline.
+  The checked-in baseline does not yet carry a `windows` record, so this gate
+  is red until the Windows agent records it — that is the intended fail-closed
+  state, not a silent pass.
+- **Mutation registry gate.** `node scripts/check-invariants.mjs` runs in the
+  trusted and PR certificate steps. The executable campaign
+  (`node scripts/check-invariants.mjs --mutations`) runs in the trusted
+  `jetbrains-smoke` lane, the only lane carrying cargo, JDK/gradle and a
+  pinned Node together. Each spec first runs its gate on the pristine source
+  and requires it to pass; environment failures (missing toolchain, exit
+  126/127, harness timeout) and a mutation that does not compile are never
+  counted as detections, and a spec may declare an `expect` signature that the
+  mutated gate failure must match. The lanes above add gates but never bypass the mutation witness
+  gate (§2.12).
+
 ---
 
 ## 3. Honest current status
@@ -881,6 +976,7 @@ profile).
 | Local host lane (darwin) | fast profile: fmt, check, clippy, tests, static authority, fault smoke, doctor deep, branding, release CLI | `scripts/certify-local.sh fast` → `target/certification/manifest.json` | CERTIFIED per run (see §3.1) |
 | Perf distributions | release `[perf]` gates | `full` profile / Woodpecker `perf` job | CI-LANE |
 | Fault at scale | `[fault] --ignored` campaigns | `full` profile / nightly `fault` job | CI-LANE |
+| Accelerated release soak | bounded `scripts/soak.sh` campaign (`FAKTOR_SOAK_SCALE`, wall/test budgets, zero/zero-test refusal) | trusted `soak-smoke` (scale 1 smoke) + nightly `soak` (long mode scale 4); `target/certification/soak.json` | CI-LANE (bounded accelerated; the 12–24h wall-clock soak below stays out of scope) |
 | Coding benchmark (harness) | `smoke` suite, offline | `full` profile | CERTIFIED in `full` only |
 | Coding benchmark (real model) | `real --ignored`, provider keys | manual, keyed | NOT RUN HERE (recorded skip) |
 | Efficiency | KPI harness | `full` profile | CERTIFIED in `full` only |
@@ -888,15 +984,16 @@ profile).
 | Installable artifacts (host) | daemon tar.gz + VSIX + JetBrains zip + `artifacts.json` | `full` profile (`scripts/package-artifacts.sh`, §2.9) | CERTIFIED per full run (recorded skips with exact errors when a tool/registry is absent) |
 | Installation matrix (host) | clean-prefix extract + `doctor`; VSIX/zip structure + entry points | `full` profile (`node scripts/install-matrix.mjs` → `install-matrix.json`, §2.9) | CERTIFIED per full run |
 | IDE-launched install | `code --install-extension` / JetBrains sandbox install | requires an IDE host; the Woodpecker `vscode` job owns it | NOT RUN HERE (residual, recorded in `install-matrix.json`) |
-| Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot | Woodpecker `windows-*` jobs | CI-LANE |
+| Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot; JetBrains visual baseline gate | Woodpecker `windows-*` jobs | CI-LANE (visual gate fails until a DISTINCT windows baseline is recorded on the agent — never inherited) |
 | Linux lane | fmt/check/test/clippy/doctor | Woodpecker `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code Faktor panel | hand-written panel (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`) + provider (`apps/vscode/src/webview.ts`) | `node scripts/selftest.mjs` + `node scripts/verify-vsix.mjs` + Woodpecker `vscode` job; §2.10 | CI-LANE (Faktor-owned, no vendored closure; a real-IDE screenshot comparison stays a host capability not claimed offline) |
+| VS Code Extension Host E2E | pinned VS Code `1.140.0`/commit `07f806f9…`/sha256 `d32031e9…` + `scripts/vscode-e2e/extension-host-smoke.cjs` inside the real host | trusted `vscode-e2e` lane; `target/certification/vscode-e2e.json` (exact `does_not_prove` list) | CI-LANE (real host activation + registered commands + compiled webview HTML surface; NOT rendered pixels or a displayed workbench) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (lifecycle + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
 | JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) (generated) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
-| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here) |
+| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`; the Windows platform record is gated by `scripts/windows-visual-baseline.ps1` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here; windows is NOT certified until the Windows agent records its own record) |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
-| Real-time soak (12–24h) | excluded by owner decision | no release gate and no CI workflow consumes a wall-clock soak; the `[soak]`-ignored longrun suites remain runnable manually | OUT OF SCOPE (by decision) |
+| Real-time soak (12–24h) | excluded by owner decision | no release gate and no CI workflow consumes a wall-clock soak; the `[soak]`-ignored longrun suites remain runnable manually; the bounded accelerated campaign above is a different, in-scope gate | OUT OF SCOPE (by decision) |
 | PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task/`, `crates/session/src/ledger/`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime/settlement.rs`); adversarial gate/step tests in-tree (`crates/agent/src/runtime/verification_attribution_tests.rs`); Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
 | Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools, native `GET/POST /native/session/{id}/board`, both IDE board panels | `crates/session/src/board.rs` + `crates/session/src/ledger/`; `crates/server/src/native/board.rs`; `apps/vscode/src/nativeClient.ts`; JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt` | IMPLEMENTED (fast tests green; native GET/POST round-trip in both IDE smokes; unavailable state recorded truthfully) |
 | Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup, cross-IDE controls | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints; VS Code cockpit + JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt` (decide gated on every candidate settled) | IMPLEMENTED (fast tests green + both IDE smokes; integration stays the explicit approved-merge path) |

@@ -1,0 +1,8 @@
+{
+  "id": "INV-PROMPT-START-IDEMPOTENT",
+  "file": "crates/store/src/prompt_admission.rs",
+  "find": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(PromptAdmissionClaim::InFlight)\n                }",
+  "replace": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(PromptAdmissionClaim::Fresh)\n                }",
+  "gate": "cargo test -p faktor-store --lib prompt_claim_fresh_then_complete_replays_the_exact_receipt_bytes",
+  "note": "A pending prompt key is admitted as Fresh again: the duplicate prompt can execute while the first is in flight."
+}

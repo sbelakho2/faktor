@@ -1,0 +1,9 @@
+{
+  "id": "INV-VSCODE-ACCESSIBILITY",
+  "file": "apps/vscode/src/webview.ts",
+  "find": "<div id=\"entries\" role=\"log\" aria-live=\"polite\" aria-relevant=\"additions\" aria-label=\"Conversation transcript\"></div>",
+  "replace": "<div id=\"entries\" role=\"presentation\" aria-live=\"off\" aria-relevant=\"additions\" aria-label=\"Conversation transcript\"></div>",
+  "gate": "node --no-warnings --experimental-loader ./scripts/mutations/vscode-ts-loader.mjs apps/vscode/scripts/selftest.mjs",
+  "timeout_ms": 180000,
+  "note": "The transcript is no longer a polite log live region in the shipped composer markup."
+}
