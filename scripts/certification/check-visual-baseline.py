@@ -86,9 +86,9 @@ def selftest():
 
     good = {
         "platforms": {
-            "linux": {"environment": "linux-x86_64-jvm17-f0a1b2c3", "digests": {"a": "a" * 64}},
-            "macos": {"environment": "mac-os-x-aarch64-jvm17-f0a1b2c3", "digests": {"a": "b" * 64}},
-            "windows": {"environment": "windows-amd64-jvm17-f0a1b2c3", "digests": {"a": "c" * 64}},
+            "linux": {"environment": "linux-x86_64-jvm17-f0a1b2c3d4e5", "digests": {"a": "a" * 64}},
+            "macos": {"environment": "mac-os-x-aarch64-jvm17-f0a1b2c3d4e5", "digests": {"a": "b" * 64}},
+            "windows": {"environment": "windows-amd64-jvm17-f0a1b2c3d4e5", "digests": {"a": "c" * 64}},
         }
     }
     check_case("a fingerprinted record passes", check(good, "macos") == [])
