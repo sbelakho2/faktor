@@ -4,8 +4,9 @@
 //
 //  - every frame carries `event:` (projection type), `id:` (the journal
 //    sequence — the resume cursor) and one JSON `data:` line;
-//  - heartbeats (`event: heartbeat` / comment keep-alives) are ignored but
-//    still advance the cursor when they carry an id;
+//  - heartbeats (`event: heartbeat` / comment keep-alives) are ignored and
+//    NEVER advance the cursor, even when a nonconforming server attaches an
+//    id (advancing would silently skip durable events below it);
 //  - on a TRANSIENT disconnect the loop reconnects with bounded exponential
 //    backoff and resumes from the last delivered frame id, so a reconnect
 //    can neither duplicate nor skip events;
@@ -72,7 +73,14 @@ class ProtocolBlocked(
         OVERSIZED_FRAME,
 
         /** The daemon's terminal error frame: the journal cannot be read. */
-        JOURNAL_UNREADABLE
+        JOURNAL_UNREADABLE,
+
+        /**
+         * The serving daemon rejected the stream with a NON-retryable HTTP
+         * status (400/401/403/404/409/422...): reconnect never converges, so
+         * the stream reports a stable typed block instead of retrying forever.
+         */
+        STREAM_REJECTED
     }
 
     companion object {
@@ -273,10 +281,21 @@ class NativeEventStream(
             .build()
         val response = http.send(request, HttpResponse.BodyHandlers.ofInputStream())
         if (response.statusCode() !in 200..299) {
+            val status = response.statusCode()
             val detail = response.body().use { readErrorBody(it) }
+            if (!isRetryableStatus(status)) {
+                // A persistent 401/403/404/... is terminal: retrying every
+                // backoff interval would leave the UI "retrying" forever and
+                // hammer the daemon. Land in the stable typed blocked state.
+                throw ProtocolBlocked(
+                    ProtocolBlocked.Kind.STREAM_REJECTED,
+                    cursorValue,
+                    "stream rejected with HTTP $status$detail; this status is not retryable"
+                )
+            }
             throw NativeProtocolException(
                 "GET /native/session/{id}/events",
-                "stream rejected with HTTP ${response.statusCode()}$detail"
+                "stream rejected with HTTP $status$detail"
             )
         }
         val body = response.body()
@@ -297,22 +316,42 @@ class NativeEventStream(
     private fun pump(body: InputStream) {
         val reader = InputStreamReader(body, Charsets.UTF_8)
         val line = StringBuilder()
+        var lineBytes = 0L
         var lineOverlong = false
         var eventName: String? = null
         var frameId: Long? = null
         var idSeen = false
         var idUnreadable = false
         val data = StringBuilder()
+        var dataBytes = 0L
         var frameOverlong = false
         while (!stopped) {
             val c = reader.read()
             if (c < 0) return
             if (c == '\r'.toInt()) continue
             if (c != '\n'.toInt()) {
-                if (line.length < maxFrameBytes) {
-                    line.append(c.toChar())
-                } else {
-                    lineOverlong = true
+                // Incremental UTF-8 BYTES, not UTF-16 units (a CJK frame of
+                // maxFrameBytes chars is ~3x the advertised byte budget).
+                // The counter is exact: a low surrogate completing a pair
+                // already charged 3 bytes contributes 1 more, everything else
+                // is charged its UTF-8 width. O(1) per char, and once the
+                // line is overlong the accumulator stops mutating entirely.
+                if (!lineOverlong) {
+                    val ch = c.toChar()
+                    val extra = when {
+                        ch.isLowSurrogate() &&
+                            line.isNotEmpty() &&
+                            line[line.length - 1].isHighSurrogate() -> 1
+                        ch.code < 0x80 -> 1
+                        ch.code < 0x800 -> 2
+                        else -> 3
+                    }
+                    if (lineBytes + extra <= maxFrameBytes) {
+                        line.append(ch)
+                        lineBytes += extra
+                    } else {
+                        lineOverlong = true
+                    }
                 }
                 continue
             }
@@ -320,6 +359,7 @@ class NativeEventStream(
             val text = if (overlong) "" else line.toString()
             val prefix = if (overlong) line.toString() else ""
             line.setLength(0)
+            lineBytes = 0L
             lineOverlong = false
             if (text.isEmpty() && !overlong) {
                 dispatch(eventName, frameId, idSeen, idUnreadable, data.toString(), frameOverlong)
@@ -328,6 +368,7 @@ class NativeEventStream(
                 idSeen = false
                 idUnreadable = false
                 data.setLength(0)
+                dataBytes = 0L
                 frameOverlong = false
                 continue
             }
@@ -364,11 +405,15 @@ class NativeEventStream(
                         .let { if (it.startsWith(" ")) it.substring(1) else it }
                     // Strictly bounded: never let a hostile frame grow RAM.
                     val separator = if (data.isEmpty()) 0 else 1
-                    if (data.length + separator + chunk.length > maxFrameBytes) {
+                    // Exact bytes: at most maxFrameBytes is accepted, only
+                    // MORE is overlong (the line guard uses the same rule).
+                    val chunkBytes = utf8Length(chunk)
+                    if (dataBytes + separator + chunkBytes > maxFrameBytes) {
                         frameOverlong = true
                     } else {
                         if (separator == 1) data.append('\n')
                         data.append(chunk)
+                        dataBytes += separator + chunkBytes
                     }
                 }
             }
@@ -455,7 +500,10 @@ class NativeEventStream(
                 "frame carries no event discriminator"
             )
         if (tagged == "heartbeat") {
-            if (frameId != null) cursorValue = maxOf(cursorValue, frameId)
+            // The contract says keep-alives carry NO id. A hostile/buggy
+            // heartbeat id must never advance the resume cursor: doing so
+            // would silently skip every durable event below it and the
+            // reconnect `after=` could never replay them.
             return
         }
         if (idUnreadable || (idSeen && frameId == null)) {
@@ -483,6 +531,30 @@ class NativeEventStream(
         cursorValue = frameId
         onEvent(NativeSseEvent(frameId, tagged, parsed))
     }
+
+    /** UTF-8 byte length of a char sequence (surrogate pairs count once). */
+    private fun utf8Length(text: CharSequence): Long {
+        var bytes = 0L
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            bytes += when {
+                c.code < 0x80 -> 1
+                c.code < 0x800 -> 2
+                c.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate() -> {
+                    i += 1
+                    4
+                }
+                else -> 3
+            }
+            i += 1
+        }
+        return bytes
+    }
+
+    /** 5xx, 408 and 429 are transient; every other non-2xx is terminal. */
+    private fun isRetryableStatus(status: Int): Boolean =
+        status == 408 || status == 425 || status == 429 || status in 500..599
 
     private fun readErrorBody(stream: InputStream): String {
         val out = StringBuilder()

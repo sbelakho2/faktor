@@ -197,7 +197,10 @@ class TerminalPanel : JPanel(BorderLayout()) {
     fun submitSpawn() {
         if (!available) return
         val command = commandField.text.trim()
-        if (command.isEmpty()) return
+        if (command.isEmpty()) {
+            eventsArea.text = "spawn refused: no command entered"
+            return
+        }
         val args = argsField.text.split(' ')
             .map { it.trim() }
             .filter { it.isNotEmpty() }

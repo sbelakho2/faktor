@@ -362,6 +362,11 @@ struct Inner {
     supervisor: Arc<ProcessSupervisor>,
     cfg: Mutex<ServiceConfig>,
     live: Mutex<HashMap<WorkspaceId, LiveWs>>,
+    /// Last generation whose publication was LOGGED per workspace raw id:
+    /// the ~30s reconciliation re-publishes and re-runs the publish path,
+    /// and an unchanged generation must not re-log (the old line repeated
+    /// every tick forever).
+    published_logged: Mutex<HashMap<u64, i64>>,
     /// OPTIONAL build-time embedding source plus the operator-pinned model
     /// identity. `None` = the build carries persisted vectors forward but
     /// never calls out; search can still use them.
@@ -586,6 +591,7 @@ impl IndexService {
                 supervisor,
                 cfg: Mutex::new(ServiceConfig::default()),
                 live: Mutex::new(HashMap::new()),
+                published_logged: Mutex::new(HashMap::new()),
                 embedding: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 worker_started: AtomicBool::new(false),
@@ -2347,11 +2353,30 @@ impl IndexService {
             }
         }
         prune_generations(&self.inner.data_root, workspace, target);
-        tracing::info!(
-            workspace = ws_raw,
-            generation = target,
-            "index generation published"
-        );
+        let first_publication = {
+            let mut logged = self
+                .inner
+                .published_logged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let target_marker = target as i64;
+            if logged.get(&ws_raw).copied() == Some(target_marker) {
+                false
+            } else {
+                if logged.len() > 1024 {
+                    logged.clear();
+                }
+                logged.insert(ws_raw, target_marker);
+                true
+            }
+        };
+        if first_publication {
+            tracing::info!(
+                workspace = ws_raw,
+                generation = target,
+                "index generation published"
+            );
+        }
         Ok(BuildOutcome::Ran)
     }
 

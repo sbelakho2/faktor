@@ -122,7 +122,12 @@ import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 import java.time.Duration
+import java.util.Timer
+import java.util.TimerTask
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val REQUEST_ERROR_SNIPPET = 400
 
@@ -171,6 +176,15 @@ class NativeClient(
          * an over-bound body is closed and refused typed.
          */
         const val ATTACHMENT_RESPONSE_MAX_BYTES = 7L * 1024 * 1024
+
+        /**
+         * One shared daemon watchdog for bounded BODY reads.
+         * `HttpRequest.timeout` stops at response HEADERS; a body that
+         * dribbles under the byte cap would otherwise never settle. The
+         * watchdog closes the body stream at the request deadline so the
+         * blocked read fails into the typed timeout refusal.
+         */
+        private val bodyDeadlineTimer = Timer("faktor-native-body-deadline", true)
 
         fun forConnection(
             connection: BackendConnection,
@@ -861,8 +875,14 @@ class NativeClient(
         } else {
             builder.method(method, HttpRequest.BodyPublishers.noBody())
         }
+        // The deadline covers the WHOLE request: headers AND the bounded body
+        // read. `HttpRequest.timeout` alone only bounds headers with an
+        // InputStream body handler.
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         val response = try {
             http.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        } catch (e: HttpTimeoutException) {
+            throw timeoutError("$method $path")
         } catch (e: IOException) {
             throw NativeApiException(
                 0, "transport",
@@ -873,7 +893,7 @@ class NativeClient(
             throw NativeApiException(0, "transport", "$method $path interrupted", true)
         }
         val status = response.statusCode()
-        val text = response.body().use { readBounded(it, maxBytes, "$method $path") }
+        val text = response.body().use { readBounded(it, maxBytes, "$method $path", deadlineNanos) }
         if (status !in 200..299) {
             throw apiError(status, text, "$method $path")
         }
@@ -912,8 +932,13 @@ class NativeClient(
             builder.header("x-faktor-control-token", controlToken)
         }
         builder.method(method, HttpRequest.BodyPublishers.noBody())
+        // Same whole-request deadline as `request`: the bounded byte read is
+        // covered, not just header arrival.
+        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         val response = try {
             http.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        } catch (e: HttpTimeoutException) {
+            throw timeoutError("$method $path")
         } catch (e: IOException) {
             throw NativeApiException(
                 0, "transport",
@@ -924,7 +949,9 @@ class NativeClient(
             throw NativeApiException(0, "transport", "$method $path interrupted", true)
         }
         val status = response.statusCode()
-        val bytes = response.body().use { readBoundedBytes(it, maxBytes, "$method $path") }
+        val bytes = response.body().use {
+            readBoundedBytes(it, maxBytes, "$method $path", deadlineNanos)
+        }
         if (status !in 200..299) {
             throw apiError(status, String(bytes, Charsets.UTF_8), "$method $path")
         }
@@ -932,39 +959,104 @@ class NativeClient(
         return AttachmentBytes(mime, bytes)
     }
 
-    /** Reads at most [maxBytes]; an oversized body is closed and rejected. */
-    private fun readBounded(stream: InputStream, maxBytes: Long, path: String): String {
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        var total = 0L
-        while (true) {
-            val read = stream.read(buffer)
-            if (read < 0) break
-            total += read
-            if (total > maxBytes) {
-                throw NativeProtocolException(path, "response body exceeded bound $maxBytes bytes")
-            }
-            out.write(buffer, 0, read)
-        }
-        return String(out.toByteArray(), Charsets.UTF_8)
-    }
+    /** The typed client-side deadline refusal: header or body, one shape. */
+    private fun timeoutError(path: String): NativeApiException =
+        NativeApiException(0, "timeout", "$path timed out after ${timeoutMs}ms", true)
+
+    /** Reads at most [maxBytes]; an oversized body is closed and rejected.
+     *  [deadlineNanos] is the SAME deadline that bounds header arrival and it
+     *  stays live through the body: the stream is closed at the deadline, so
+     *  a body that dribbles under the byte cap is refused typed instead of
+     *  read forever. */
+    private fun readBounded(
+        stream: InputStream,
+        maxBytes: Long,
+        path: String,
+        deadlineNanos: Long
+    ): String = String(readBoundedRaw(stream, maxBytes, path, deadlineNanos), Charsets.UTF_8)
 
     /** Reads at most [maxBytes] byte-exact; an oversized body is closed and
-     *  rejected (never truncated, never decoded). */
-    private fun readBoundedBytes(stream: InputStream, maxBytes: Long, path: String): ByteArray {
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        var total = 0L
-        while (true) {
-            val read = stream.read(buffer)
-            if (read < 0) break
-            total += read
-            if (total > maxBytes) {
-                throw NativeProtocolException(path, "response body exceeded bound $maxBytes bytes")
+     *  rejected (never truncated, never decoded), and the same whole-request
+     *  [deadlineNanos] applies. */
+    private fun readBoundedBytes(
+        stream: InputStream,
+        maxBytes: Long,
+        path: String,
+        deadlineNanos: Long
+    ): ByteArray = readBoundedRaw(stream, maxBytes, path, deadlineNanos)
+
+    /** The one bounded body-read core: byte cap plus request deadline. */
+    private fun readBoundedRaw(
+        stream: InputStream,
+        maxBytes: Long,
+        path: String,
+        deadlineNanos: Long
+    ): ByteArray {
+        val timedOut = AtomicBoolean(false)
+        val watchdog = scheduleDeadlineClose(stream, deadlineNanos, timedOut)
+        try {
+            val out = ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            var total = 0L
+            while (true) {
+                if (timedOut.get()) throw timeoutError(path)
+                val read = try {
+                    stream.read(buffer)
+                } catch (e: IOException) {
+                    if (timedOut.get()) throw timeoutError(path)
+                    throw e
+                }
+                if (read < 0) break
+                total += read
+                if (total > maxBytes) {
+                    throw NativeProtocolException(path, "response body exceeded bound $maxBytes bytes")
+                }
+                out.write(buffer, 0, read)
             }
-            out.write(buffer, 0, read)
+            return out.toByteArray()
+        } finally {
+            watchdog?.cancel()
         }
-        return out.toByteArray()
+    }
+
+    /**
+     * Schedules the stream close at [deadlineNanos] on the shared daemon
+     * watchdog. When the deadline has already elapsed the stream is closed
+     * immediately and the following read (or the [timedOut] check) refuses
+     * typed.
+     */
+    private fun scheduleDeadlineClose(
+        stream: InputStream,
+        deadlineNanos: Long,
+        timedOut: AtomicBoolean
+    ): TimerTask? {
+        val remainingNanos = deadlineNanos - System.nanoTime()
+        if (remainingNanos <= 0L) {
+            timedOut.set(true)
+            closeQuietly(stream)
+            return null
+        }
+        val task = object : TimerTask() {
+            override fun run() {
+                // The watchdog must never kill the shared timer thread.
+                try {
+                    timedOut.set(true)
+                    closeQuietly(stream)
+                } catch (e: Exception) {
+                    // Best-effort close; the typed refusal is the point.
+                }
+            }
+        }
+        bodyDeadlineTimer.schedule(task, TimeUnit.NANOSECONDS.toMillis(remainingNanos) + 1L)
+        return task
+    }
+
+    private fun closeQuietly(stream: InputStream) {
+        try {
+            stream.close()
+        } catch (e: IOException) {
+            // The typed deadline refusal is the point; close is best-effort.
+        }
     }
 
     /** Maps a non-2xx body onto the daemon's typed error envelope. The

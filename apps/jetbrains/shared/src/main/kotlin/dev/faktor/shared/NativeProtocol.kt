@@ -40,6 +40,9 @@ sealed class JsonValue {
 }
 
 /** Serializes a JSON value tree; rejects non-finite numbers loudly. */
+/** Maximum JSON nesting the parser accepts (byte bounds do not bound depth). */
+private const val MAX_JSON_DEPTH = 128
+
 object JsonCodec {
     fun parse(text: String): JsonValue {
         val parser = Parser(text)
@@ -112,6 +115,7 @@ object JsonCodec {
 
     private class Parser(private val s: String) {
         private var i = 0
+        private var depth = 0
 
         fun atEnd(): Boolean = i >= s.length
 
@@ -124,9 +128,29 @@ object JsonCodec {
         fun parseValue(): JsonValue {
             skipWs()
             if (i >= s.length) throw NativeProtocolException("json", "unexpected end of JSON")
+            if (depth >= MAX_JSON_DEPTH) {
+                // Byte bounds alone are not a nesting bound: a ~1 MiB body of
+                // '[' bytes would recurse ~1M frames and kill the thread with
+                // a StackOverflowError that no typed handler catches.
+                throw NativeProtocolException("json", "nesting exceeds $MAX_JSON_DEPTH levels")
+            }
             return when (s[i]) {
-                '{' -> parseObject()
-                '[' -> parseArray()
+                '{' -> {
+                    depth += 1
+                    try {
+                        parseObject()
+                    } finally {
+                        depth -= 1
+                    }
+                }
+                '[' -> {
+                    depth += 1
+                    try {
+                        parseArray()
+                    } finally {
+                        depth -= 1
+                    }
+                }
                 '"' -> JsonValue.Str(parseString())
                 't' -> {
                     expect("true")

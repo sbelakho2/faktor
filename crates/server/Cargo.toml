@@ -45,6 +45,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 faktor-provider = { workspace = true, features = ["test-utils"] }
+# Lifecycle-hook registries for the session-start wiring tests.
+faktor-hooks.workspace = true
 # The updater route tests sign manifests with a real ed25519 key and
 # implement the async artifact-fetcher seam.
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }

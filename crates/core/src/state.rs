@@ -1976,12 +1976,16 @@ pub enum ReasonCode {
     /// The loop detector stopped the turn because ≥3 consecutive DIFFERENT
     /// search commands returned the identical evidence set (P0-78).
     RepeatedEvidenceSet,
+    /// A generic shell mutation was left unattributed (the pre/post workspace
+    /// manifest reconciliation could not bind every change): certification is
+    /// refused instead of assuming "no changes" (P0-2 remainder).
+    UnattributedChange,
 }
 
 impl ReasonCode {
     /// The complete, ordered code table. The uniqueness test iterates this
     /// array: adding a variant without extending it (or vice versa) fails.
-    pub const ALL: [ReasonCode; 13] = [
+    pub const ALL: [ReasonCode; 14] = [
         ReasonCode::CheckFailed,
         ReasonCode::CheckUnavailable,
         ReasonCode::ReviewBlocked,
@@ -1995,6 +1999,7 @@ impl ReasonCode {
         ReasonCode::CriteriaInconsistent,
         ReasonCode::PatchRevertPatch,
         ReasonCode::RepeatedEvidenceSet,
+        ReasonCode::UnattributedChange,
     ];
 
     /// The stable machine code (snake_case; equals the serde spelling).
@@ -2013,6 +2018,7 @@ impl ReasonCode {
             ReasonCode::CriteriaInconsistent => "criteria_inconsistent",
             ReasonCode::PatchRevertPatch => "patch_revert_patch",
             ReasonCode::RepeatedEvidenceSet => "repeated_evidence_set",
+            ReasonCode::UnattributedChange => "unattributed_change",
         }
     }
 
@@ -2035,6 +2041,9 @@ impl ReasonCode {
             }
             ReasonCode::RepeatedEvidenceSet => {
                 "different searches returned the identical evidence set repeatedly"
+            }
+            ReasonCode::UnattributedChange => {
+                "a shell mutation could not be attributed to the change set"
             }
         }
     }
@@ -2485,7 +2494,7 @@ mod tests {
         // without a table row breaks ALL (serde deserializes it but no
         // machine code exists). Exhaustive via a manual listing — adding a
         // variant here without a row above fails the next match arm.
-        assert_eq!(ReasonCode::ALL.len(), 13);
+        assert_eq!(ReasonCode::ALL.len(), 14);
     }
 
     #[test]

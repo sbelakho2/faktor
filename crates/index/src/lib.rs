@@ -9,6 +9,7 @@
 //! worker, and restart-safe generation files — see
 //! [`service`](crate::service) and [`state`](crate::state).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -34,7 +35,9 @@ pub use service::{
 };
 pub use state::WorkspaceIndexState;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
     Function,
@@ -50,7 +53,7 @@ pub enum SymbolKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -99,6 +102,14 @@ fn flush(current: &mut String, out: &mut Vec<String>) {
     }
 }
 
+/// Total, locale-independent order of one symbol hit: path (UTF-8
+/// codepoints), then the symbol's declaration identity (name, kind, line,
+/// doc). Used wherever hits feed a bounded (`truncate`) result, so the
+/// cutoff never depends on insertion or HashMap iteration order.
+fn symbol_hit_cmp(a: &(String, Symbol), b: &(String, Symbol)) -> Ordering {
+    a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+}
+
 #[derive(Debug, Default)]
 struct FileEntry {
     symbols: Vec<Symbol>,
@@ -130,6 +141,20 @@ pub struct TokenHit {
     pub freq: u32,
 }
 
+/// Immutable identity of one indexed file. A caller that must release the
+/// index lock for a slow provider call (semantic search) snapshots a
+/// candidate's revision under the lock and re-checks it before returning a
+/// hit: a path that was removed/replaced in the meantime compares unequal
+/// and can never be served from the stale snapshot. Every field is cloned
+/// from the same `FileEntry`, so the comparison is exact (no hashing or
+/// fingerprint collisions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRevision {
+    pub modified_ms: i64,
+    pub chunks: Vec<String>,
+    pub symbols: Vec<Symbol>,
+}
+
 impl WorkspaceIndex {
     pub fn new() -> Self {
         Self::default()
@@ -143,12 +168,55 @@ impl WorkspaceIndex {
         bytes: &[u8],
         modified_ms: i64,
     ) -> Result<(), String> {
+        self.index_file_capped(workspace, rel, bytes, modified_ms, MAX_FILES_PER_WORKSPACE)
+    }
+
+    /// [`Self::index_file`] against an explicit file cap: the cap policy is
+    /// a pure function of `(modified_ms, path)`, so tests exercise the
+    /// admission/eviction path at a small cap without materializing 100k
+    /// files.
+    fn index_file_capped(
+        &mut self,
+        workspace: WorkspaceId,
+        rel: &Path,
+        bytes: &[u8],
+        modified_ms: i64,
+        file_cap: usize,
+    ) -> Result<(), String> {
+        debug_assert!(file_cap > 0);
         let rel_str = rel.to_string_lossy().to_string();
-        let files = self.files.entry(workspace).or_default();
-        // Enforce the file cap (drop oldest unknown: keep the newest file).
-        if !files.contains_key(&rel_str) && files.len() >= MAX_FILES_PER_WORKSPACE {
-            // Evict the first (arbitrary deterministic) entry.
-            let victim = files.keys().next().cloned().ok_or("empty")?;
+        // Enforce the file cap by CANONICAL admission: the surviving corpus
+        // is the top `file_cap` files by `(modified_ms ASC, path ASC)` — a
+        // pure function of the admitted file set, never of insertion order
+        // or HashMap iteration order (randomized per hash seed). The victim
+        // is the resident with the smallest `(modified_ms, path)`; an
+        // incoming file that does not outrank it is refused, so an older
+        // straggler can never displace a newer resident. `path` compares as
+        // UTF-8 bytes (codepoints), never a locale collation.
+        let mut evict: Option<String> = None;
+        {
+            let files = self.files.entry(workspace).or_default();
+            if !files.contains_key(&rel_str) && files.len() >= file_cap {
+                if let Some((victim, victim_entry)) = files.iter().min_by(|(pa, ea), (pb, eb)| {
+                    ea.modified_ms
+                        .cmp(&eb.modified_ms)
+                        .then_with(|| pa.as_str().cmp(pb.as_str()))
+                }) {
+                    let outranks = modified_ms
+                        .cmp(&victim_entry.modified_ms)
+                        .then_with(|| rel_str.as_str().cmp(victim.as_str()))
+                        == Ordering::Greater;
+                    if outranks {
+                        evict = Some(victim.clone());
+                    } else {
+                        // Not newer than every resident: refused (the cap
+                        // already holds the canonical survivors).
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Some(victim) = evict {
             self.remove_file(workspace, Path::new(&victim));
         }
         let text = String::from_utf8_lossy(bytes);
@@ -240,7 +308,10 @@ impl WorkspaceIndex {
                     freq: *freq,
                 });
             }
-            out.sort_by_key(|h| std::cmp::Reverse(h.freq));
+            // Deterministic ranking: frequency DESC, then path ASC on the
+            // raw UTF-8 bytes (codepoints), so equal-frequency ties and the
+            // `limit` cutoff never depend on HashMap iteration order.
+            out.sort_by(|a, b| b.freq.cmp(&a.freq).then_with(|| a.path.cmp(&b.path)));
             out.truncate(limit);
         }
         out
@@ -264,11 +335,14 @@ impl WorkspaceIndex {
         let needle = name.to_lowercase();
         let mut out = Vec::new();
         if let Some(symbols) = self.symbols.get(&workspace) {
-            // Exact match first, then prefix matches (bounded).
+            // Exact match first, then prefix matches (bounded). Every hit
+            // list is ordered by `(path, symbol)` — a total, codepoint
+            // order — so the bounded output never depends on insertion or
+            // HashMap iteration order.
             if let Some(list) = symbols.get(&needle) {
-                for (path, s) in list {
-                    out.push((path.clone(), s.clone()));
-                }
+                let mut exact: Vec<(String, Symbol)> = list.clone();
+                exact.sort_by(symbol_hit_cmp);
+                out.extend(exact);
             }
             if out.len() < limit && !needle.is_empty() {
                 let mut keys: Vec<&String> = symbols
@@ -277,11 +351,13 @@ impl WorkspaceIndex {
                     .collect();
                 keys.sort_by_key(|k| k.as_str());
                 for key in keys {
-                    for (path, s) in &symbols[key] {
+                    let mut hits: Vec<(String, Symbol)> = symbols[key].clone();
+                    hits.sort_by(symbol_hit_cmp);
+                    for (path, s) in hits {
                         if out.len() >= limit {
                             break;
                         }
-                        out.push((path.clone(), s.clone()));
+                        out.push((path, s));
                     }
                 }
             }
@@ -296,6 +372,20 @@ impl WorkspaceIndex {
 
     pub fn file_count(&self, workspace: WorkspaceId) -> usize {
         self.files.get(&workspace).map(|f| f.len()).unwrap_or(0)
+    }
+
+    /// Snapshot one indexed file's immutable identity, or `None` when the
+    /// path is not currently indexed (removed/tombstoned). See
+    /// [`FileRevision`]: semantic search re-checks this after provider calls
+    /// ran outside the lock and drops candidates that no longer compare
+    /// equal.
+    pub fn file_revision(&self, workspace: WorkspaceId, rel: &str) -> Option<FileRevision> {
+        let entry = self.files.get(&workspace)?.get(rel)?;
+        Some(FileRevision {
+            modified_ms: entry.modified_ms,
+            chunks: entry.chunks.clone(),
+            symbols: entry.symbols.clone(),
+        })
     }
 
     /// All indexed paths for a workspace (sorted, bounded by the file cap).
@@ -1532,6 +1622,267 @@ module.exports = Cart;
         assert_eq!(rust_symbols("fn x() {}").len(), 1);
         assert_eq!(python_symbols("def y():\n    pass").len(), 1);
         let _ = tempdir();
+    }
+
+    // ------------------------------------------------- audit P2 determinism
+
+    /// Canonical byte view of one workspace index: the corpus (sorted files
+    /// with per-file symbols/chunks and the sorted snapshot), the persisted
+    /// generation envelope (wall-clock stamp normalized), and the retrieval
+    /// results of every bounded probe at several limits (so truncation
+    /// cutoffs are compared too). Two equivalent indexes are byte-identical
+    /// iff this view is.
+    fn canonical_test_view(index: &WorkspaceIndex, workspace: WorkspaceId) -> Vec<u8> {
+        const PROBES: &[&str] = &["common", "helper", "shared", "shared_helper", "f00"];
+        const LIMITS: &[usize] = &[1, 3, 8, 64];
+        let files: Vec<serde_json::Value> = index
+            .file_paths(workspace)
+            .into_iter()
+            .map(|path| {
+                serde_json::json!({
+                    "path": path,
+                    "symbols": index.symbols_in(workspace, Path::new(&path)),
+                    "chunks": index.chunk_hashes(workspace, &path),
+                })
+            })
+            .collect();
+        let postings: Vec<serde_json::Value> = PROBES
+            .iter()
+            .map(|probe| {
+                let by_limit: Vec<serde_json::Value> = LIMITS
+                    .iter()
+                    .map(|&limit| {
+                        let hits: Vec<serde_json::Value> = index
+                            .files_for_token(workspace, probe, limit)
+                            .into_iter()
+                            .map(|h| serde_json::json!({ "path": h.path, "freq": h.freq }))
+                            .collect();
+                        serde_json::json!({ "limit": limit, "hits": hits })
+                    })
+                    .collect();
+                serde_json::json!({ "probe": probe, "by_limit": by_limit })
+            })
+            .collect();
+        let symbols: Vec<serde_json::Value> = PROBES
+            .iter()
+            .map(|probe| {
+                let by_limit: Vec<serde_json::Value> = LIMITS
+                    .iter()
+                    .map(|&limit| {
+                        let hits: Vec<serde_json::Value> = index
+                            .symbol_lookup(workspace, probe, limit)
+                            .into_iter()
+                            .map(|(path, symbol)| {
+                                serde_json::json!({ "path": path, "symbol": symbol })
+                            })
+                            .collect();
+                        serde_json::json!({ "limit": limit, "hits": hits })
+                    })
+                    .collect();
+                serde_json::json!({ "probe": probe, "by_limit": by_limit })
+            })
+            .collect();
+        let mut generation =
+            crate::generation::GenerationFile::capture(workspace.raw(), 1, index, Vec::new());
+        generation.built_ms = 0;
+        serde_json::to_vec(&serde_json::json!({
+            "files": files,
+            "snapshot": index.snapshot(workspace),
+            "postings": postings,
+            "symbols": symbols,
+            "generation": generation.to_bytes().unwrap(),
+        }))
+        .unwrap()
+    }
+
+    /// Deterministic xorshift64 permutation (no RNG dependency): 100 seeded
+    /// permutations are reproducible across runs and hash seeds.
+    fn seeded_permutation(len: usize, seed: u64) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..len).collect();
+        let mut state = seed | 1;
+        for i in (1..len).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        order
+    }
+
+    #[test]
+    fn eviction_is_canonical_across_100_permutations_and_hash_seeds() {
+        const CAP: usize = 8;
+        const PERMUTATIONS: usize = 100;
+        const THREADS: usize = 4;
+        let ws = WorkspaceId::new(1);
+        // 14 files with a 2-level mtime distribution and a wide tie group:
+        // the 4 newest (ms=200) always survive, and among the 10 tied at
+        // ms=100 only the greatest four paths survive — ties are broken by
+        // `path ASC` eviction (smallest paths evicted first).
+        let files: Vec<(String, i64)> = (0..14)
+            .map(|i| (format!("src/f{i:02}.rs"), if i < 4 { 200 } else { 100 }))
+            .collect();
+        let content = b"pub fn shared_helper() { let common = 1; }\n";
+        let expected: Vec<String> = {
+            let mut order = files.clone();
+            order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+            order.truncate(CAP);
+            let mut paths: Vec<String> = order.into_iter().map(|(p, _)| p).collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(expected, {
+            let mut want = vec![
+                "src/f00.rs",
+                "src/f01.rs",
+                "src/f02.rs",
+                "src/f03.rs",
+                "src/f10.rs",
+                "src/f11.rs",
+                "src/f12.rs",
+                "src/f13.rs",
+            ];
+            want.sort();
+            want
+        });
+
+        let files_ref = &files;
+        let expected_ref = &expected;
+        let views: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            // Fresh threads => fresh thread-local hash seeds; a fresh
+            // WorkspaceIndex per permutation => fresh HashMap seeds.
+            let handles: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    scope.spawn(move || {
+                        let mut views = Vec::new();
+                        for p in 0..PERMUTATIONS / THREADS {
+                            let seed = (thread as u64) * 1_000_003
+                                + (p as u64) * 7919
+                                + 0x9e37_79b9_7f4a_7c15;
+                            let order = seeded_permutation(files_ref.len(), seed);
+                            let mut index = WorkspaceIndex::new();
+                            for &i in &order {
+                                index
+                                    .index_file_capped(
+                                        ws,
+                                        Path::new(&files_ref[i].0),
+                                        content,
+                                        files_ref[i].1,
+                                        CAP,
+                                    )
+                                    .unwrap();
+                            }
+                            assert_eq!(index.file_count(ws), CAP);
+                            assert_eq!(
+                                index.file_paths(ws),
+                                *expected_ref,
+                                "survivors must be the canonical top-{CAP} for any insertion order"
+                            );
+                            views.push(canonical_test_view(&index, ws));
+                        }
+                        views
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert_eq!(views.len(), PERMUTATIONS);
+        for view in &views[1..] {
+            assert_eq!(
+                view, &views[0],
+                "canonical corpus+retrieval view differs across permutations/hash seeds"
+            );
+        }
+
+        // Truncation is total: equal-frequency postings order by path ASC,
+        // exact symbol hits by path then declaration identity.
+        let mut index = WorkspaceIndex::new();
+        for (path, modified_ms) in &files {
+            index
+                .index_file_capped(ws, Path::new(path), content, *modified_ms, CAP)
+                .unwrap();
+        }
+        assert_eq!(
+            index
+                .files_for_token(ws, "common", 3)
+                .iter()
+                .map(|h| h.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/f00.rs", "src/f01.rs", "src/f02.rs"]
+        );
+        assert_eq!(
+            index
+                .symbol_lookup(ws, "shared_helper", 3)
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/f00.rs", "src/f01.rs", "src/f02.rs"]
+        );
+    }
+
+    #[test]
+    fn eviction_corpus_survives_generation_store_reopen() {
+        const CAP: usize = 6;
+        let ws = WorkspaceId::new(3);
+        let content = b"pub fn shared_helper() { let common = 1; }\n";
+        let files: Vec<(String, i64)> = (0..10)
+            .map(|i| (format!("src/f{i:02}.rs"), i as i64 * 10))
+            .collect();
+        let mut index = WorkspaceIndex::new();
+        for (path, modified_ms) in &files {
+            index
+                .index_file_capped(ws, Path::new(path), content, *modified_ms, CAP)
+                .unwrap();
+        }
+        let before = canonical_test_view(&index, ws);
+
+        // Persist exactly as the service publishes, then DROP the in-memory
+        // index and reopen from the durable bytes ("daemon restart").
+        let dir = tempdir().unwrap();
+        let gen_path = dir.path().join("gen-1.json");
+        let bytes = crate::generation::GenerationFile::capture(ws.raw(), 1, &index, Vec::new())
+            .to_bytes()
+            .unwrap();
+        std::fs::write(&gen_path, &bytes).unwrap();
+        drop(index);
+        let reopened =
+            crate::generation::GenerationFile::from_bytes(&std::fs::read(&gen_path).unwrap())
+                .unwrap()
+                .materialize()
+                .unwrap();
+
+        // The corpus AND every retrieval result are byte-identical.
+        assert_eq!(before, canonical_test_view(&reopened, ws));
+        // `(modified_ms, path)` priority survived the round trip: the
+        // restored index still identifies the oldest resident as victim.
+        let before_paths = reopened.file_paths(ws);
+        assert_eq!(before_paths.len(), CAP);
+        assert_eq!(
+            before_paths,
+            vec![
+                "src/f04.rs",
+                "src/f05.rs",
+                "src/f06.rs",
+                "src/f07.rs",
+                "src/f08.rs",
+                "src/f09.rs",
+            ]
+        );
+        let mut continued = reopened;
+        continued
+            .index_file_capped(ws, Path::new("src/zz_new.rs"), content, 10_000, CAP)
+            .unwrap();
+        let paths = continued.file_paths(ws);
+        assert!(paths.iter().any(|p| p == "src/zz_new.rs"));
+        assert!(
+            !paths.iter().any(|p| p == "src/f04.rs"),
+            "the oldest restored resident is the eviction victim: {paths:?}"
+        );
+        assert_eq!(paths.len(), CAP);
     }
 }
 

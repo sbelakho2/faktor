@@ -78,6 +78,7 @@ pub mod recovery;
 pub mod retention;
 pub mod task;
 pub mod verification_job;
+pub mod wedge;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
 pub use billing_read::{
@@ -167,6 +168,7 @@ pub use verification_job::{
     MAX_VERIFICATION_JOB_RESULT_JSON_BYTES, MAX_VERIFICATION_JOB_ROOT_BYTES,
     MAX_VERIFICATION_JOB_SPEC_JSON_BYTES,
 };
+pub use wedge::{SessionWedgeIssue, SessionWedgeScan, MAX_WEDGE_DETAILS};
 
 /// Errors of the session runtime. The public API surface returns
 /// [`faktor_core::Error`] (via `From`), so protocol/HTTP mapping stays single-sourced

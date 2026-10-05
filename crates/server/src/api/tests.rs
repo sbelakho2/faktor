@@ -70,11 +70,14 @@ pub(crate) fn wire_snapshot_deps(
 }
 
 /// The minimal real agent every test `ServerDeps` carries: text-only
-/// turns, passthrough routing over the caller's registry.
+/// turns, passthrough routing over the caller's registry. `hooks` is wired
+/// straight into the runtime's agent deps (the production daemon wires the
+/// `FAKTOR_HOOKS` registry there too).
 pub(crate) fn test_agent_over(
     session: Arc<SessionManager>,
     permissions: Arc<ChannelPermissionRequester>,
     registry: faktor_provider::ProviderRegistry,
+    hooks: Option<Arc<faktor_hooks::HookRegistry>>,
 ) -> Arc<AgentRuntime> {
     AgentRuntime::new(faktor_agent::AgentDeps {
         session,
@@ -94,7 +97,7 @@ pub(crate) fn test_agent_over(
         compaction_model: None,
         compact_at_usage: 0.65,
         instructions: "You are a test server agent.".into(),
-        hooks: None,
+        hooks,
         instructions_resolver: faktor_instructions::no_roots_resolver(),
         routing: faktor_agent::FixedRoutingPolicy::passthrough(),
         budgets: Arc::new(faktor_session::NoopBudget),
@@ -104,6 +107,7 @@ pub(crate) fn test_agent_over(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap()
@@ -130,6 +134,17 @@ pub(crate) fn test_deps_with(
     root: &std::path::Path,
     extra_providers: Vec<Arc<dyn faktor_provider::Provider>>,
 ) -> ServerDeps {
+    test_deps_with_hooks(root, extra_providers, None)
+}
+
+/// [`test_deps_with`] with an explicit lifecycle-hook registry on the
+/// agent runtime (the SAME field the production daemon's `FAKTOR_HOOKS`
+/// registry occupies).
+pub(crate) fn test_deps_with_hooks(
+    root: &std::path::Path,
+    extra_providers: Vec<Arc<dyn faktor_provider::Provider>>,
+    hooks: Option<Arc<faktor_hooks::HookRegistry>>,
+) -> ServerDeps {
     let mut registry = faktor_provider::ProviderRegistry::new();
     registry
         .try_register(Arc::new(FakeProvider::with_script(
@@ -149,7 +164,7 @@ pub(crate) fn test_deps_with(
     }
     let session = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
     let permissions = ChannelPermissionRequester::new(Duration::from_secs(5));
-    let agent = test_agent_over(session.clone(), permissions.clone(), registry);
+    let agent = test_agent_over(session.clone(), permissions.clone(), registry, hooks);
     let (orchestrator, tasks) = orch_pair(session.clone(), agent.clone());
     ServerDeps {
         budgets: faktor_session::DurableBudgetLedger::new(session.clone()),
@@ -515,6 +530,7 @@ pub(crate) fn paced_test_deps(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap();
@@ -838,6 +854,7 @@ pub(crate) fn test_deps_full(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap();
@@ -1109,6 +1126,7 @@ pub(crate) fn native_task_rig_with_provider_and_verification(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap();

@@ -47,6 +47,21 @@ pub struct SandboxCfg {
     pub shell: Option<faktor_sandbox::ShellExecutionMode>,
 }
 
+/// Omitted scalar keys inherit `Config::default()` (a partial file must mean
+/// "the documented defaults plus my overrides", never an empty model that
+/// fails after durable state was created).
+fn default_model() -> String {
+    crate::config::Config::default().model
+}
+
+fn default_compact_at_usage() -> f64 {
+    crate::config::Config::default().compact_at_usage
+}
+
+fn default_instructions() -> String {
+    crate::config::Config::default().instructions
+}
+
 /// The config FILE shape: `Config` plus `config_version` (default 1 when
 /// the key is absent). Deserialization is STRICT: unknown fields anywhere
 /// are rejected (a typo'd key fails startup instead of silently changing
@@ -62,13 +77,13 @@ impl<'de> serde::Deserialize<'de> for Config {
         struct File {
             #[serde(default = "default_config_version")]
             config_version: u32,
-            #[serde(default)]
+            #[serde(default = "default_model")]
             model: String,
             #[serde(default)]
             compaction_model: Option<String>,
-            #[serde(default)]
+            #[serde(default = "default_compact_at_usage")]
             compact_at_usage: f64,
-            #[serde(default)]
+            #[serde(default = "default_instructions")]
             instructions: String,
             #[serde(default)]
             providers: Vec<ProviderCfg>,
@@ -90,6 +105,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             completion: CompletionCfg,
             #[serde(default = "production_efficiency")]
             efficiency: EfficiencyCfg,
+            #[serde(default)]
+            retry: RetryCfg,
             #[serde(default)]
             embeddings: Option<EmbeddingCfg>,
             #[serde(default)]
@@ -129,6 +146,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             tasks: file.tasks,
             completion: file.completion,
             efficiency: file.efficiency,
+            retry: file.retry,
             embeddings: file.embeddings,
             cloud: file.cloud,
             billing: file.billing,

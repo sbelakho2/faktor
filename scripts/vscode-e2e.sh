@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
-# Faktor VS Code Extension Host / webview E2E smoke lane.
+# Faktor VS Code Extension Host / webview E2E matrix lane.
 #
 # Downloads a PINNED linux-x64 VS Code build, verifies the recorded SHA-256,
-# and runs a REAL Extension Host against `--extensionDevelopmentPath=apps/vscode`
-# with an isolated `--user-data-dir` / `--extensions-dir`. The host-side test
-# module (`scripts/vscode-e2e/extension-host-smoke.cjs`) executes inside the
-# pinned VS Code extension host and asserts:
+# and runs REAL Extension Host cells against a real `--extensionDevelopmentPath`
+# tree (the dev tree, or the VSIX-extracted tree in `--vsix` mode) with
+# isolated `--user-data-dir` / `--extensions-dir`. The host-side test module
+# (`scripts/vscode-e2e/extension-host-smoke.cjs`) executes inside the pinned
+# VS Code extension host and asserts:
 #   * the `faktor.faktor` extension is present and activates,
 #   * the contributed `faktor.*` commands are registered (incl. openChat),
 #   * the compiled Faktor webview provider renders HTML carrying the strict
 #     CSP plus the composer and attachment surface elements,
-# and writes `target/certification/vscode-e2e.json` with the exact coverage.
+#   * a REAL WebviewPanel matrix driven over the Chrome DevTools Protocol:
+#     live light/dark/high-contrast/high-contrast-light theme switches with
+#     the acceptance-verdict chip contrast re-measured in the renderer,
+#     real webview viewports at 240/320/480/800 CSS px, real keyboard-only
+#     Tab traversal + Ctrl+Enter submission (trusted Input events), paste and
+#     drop attachment bytes, dispose+reopen snapshot/attachment restoration,
+#     and dedicated `--force-device-scale-factor=1.25|2` cells for the
+#     100/125/200% zoom factors (devicePixelRatio asserted in the webview).
+# The exact method per capability and the capabilities that cannot be
+# emulated headlessly are recorded verbatim in the JSON record and evidence.
 #
 # COVERAGE / WHAT THIS DOES NOT PROVE (recorded verbatim in the JSON record):
 #   * It does NOT take screenshots or compare rendered pixels; there is no
 #     image/visual-baseline coverage.
-#   * It does NOT display or drive a visible workbench UI/WebviewView; the
-#     webview HTML is produced by the extension's own compiled provider
-#     running in the real extension host.
 #   * It does NOT talk to a live daemon; daemon behavior is covered by the
 #     Faktor Node panel selftest and the protocol test suites.
+#   * OS-level clipboard/drag payload injection and physical panel resizing
+#     are unavailable headlessly; the record names the strongest substitute
+#     that ran for each.
 #
 # Headless mechanics: the desktop VS Code workbench needs a display; on a
 # headless runner the script launches Electron with `--ozone-platform=headless
@@ -64,6 +74,13 @@ EXTENSION_DIR="${FAKTOR_VSCODE_E2E_EXTENSION:-$ROOT/apps/vscode}"
 VSIX_PATH="${FAKTOR_VSCODE_E2E_VSIX:-}"
 HOST_TIMEOUT="${FAKTOR_VSCODE_E2E_TIMEOUT:-600}"
 EXTENSION_HOST_SMOKE="$SCRIPT_DIR/vscode-e2e/extension-host-smoke.cjs"
+# Matrix cells: "<label>:<device-scale-factor>:<mode>". The full cell runs the
+# capability battery (themes, widths, keyboard, paste/drop, disposal); the
+# extra cells prove the exact 125%/200% real device scale factors.
+MATRIX_CELLS=("full:1:full" "zoom125:1.25:zoom" "zoom200:2:zoom")
+HOST_EXTENSION_DIR=""
+HOST_PACKAGE_MODE="dev"
+VSIX_EXPLICIT=0
 CLI_ONLY=0
 KEEP=0
 SELFTEST=0
@@ -98,7 +115,7 @@ while [ "$#" -gt 0 ]; do
     --work-dir) WORK_DIR="$2" ;;
     --out) OUT_FILE="$2" ;;
     --extension-dir) EXTENSION_DIR="$2" ;;
-    --vsix) VSIX_PATH="$2" ;;
+    --vsix) VSIX_PATH="$2"; VSIX_EXPLICIT=1 ;;
     --timeout) HOST_TIMEOUT="$2" ;;
     esac
     shift 2
@@ -127,6 +144,7 @@ STATE_CODE_VERSION=""
 STATE_HOST_EVIDENCE_SHA=""
 STATE_CHECKS_JSON="[]"
 STATE_HOST_CHECKS_JSON="[]"
+STATE_MATRIX_JSON="[]"
 STARTED=""
 
 write_record() { # status
@@ -150,19 +168,22 @@ write_record() { # status
   [ -n "$commit" ] || commit="unknown"
   [ -n "$tree" ] || tree="unknown"
   local coverage does_not_prove
-  if [ "$STATE_MODE" = "extension-host" ]; then
-    coverage="real pinned VS Code Extension Host: extension present+activated, faktor.* commands registered, compiled webview provider HTML carries strict CSP + composer/attachment surface"
-    does_not_prove='["rendered pixels or screenshots","visible workbench UI/WebviewView display","live daemon connectivity (the provider HTML is exercised in-process)"]'
+  if [ "$STATE_MODE" = "extension-host" ] || [ "$STATE_MODE" = "extension-host-vsix" ]; then
+    coverage="real pinned VS Code Extension Host matrix: extension present+activated, faktor.* commands registered, compiled webview provider HTML carries strict CSP + composer/attachment surface; a real WebviewPanel is driven over CDP through light/dark/high-contrast themes, 240/320/480/800 px viewports, trusted keyboard-only submission, paste/drop bytes, dispose+reopen restoration, and dedicated --force-device-scale-factor 1.25/2 cells (per-capability methods in the matrix field)"
+    if [ "$STATE_MODE" = "extension-host-vsix" ]; then
+      coverage="$coverage; the host extension tree is extracted from the supplied VSIX"
+    fi
+    does_not_prove='["rendered pixels or screenshots","trusted OS clipboard/drag file payload injection (synthetic DataTransfer events at the real handlers)","physical workbench panel resize (top-level CDP device metrics calibrated to the requested webview width)","live daemon connectivity (the provider HTML is exercised in-process)"]'
   else
     coverage="pinned VS Code CLI only: --version pin check and isolated --install-extension/--list-extensions of the built VSIX"
     does_not_prove='["real Extension Host launch","activation","webview HTML generation","rendered pixels"]'
   fi
   mkdir -p "$(dirname "$OUT_FILE")"
-  printf '{"schema":"faktor-vscode-e2e/v1","status":"%s","reason":"%s","mode":"%s","coverage":"%s","does_not_prove":%s,"pin":{"version":"%s","commit":"%s","url":"%s","sha256":"%s","sha256_verified":%s},"code_version":"%s","host_evidence_sha256":"%s","cli_checks":%s,"host_checks":%s,"commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s"},"started_at":"%s","finished_at":"%s","duration_seconds":%s}\n' \
+  printf '{"schema":"faktor-vscode-e2e/v1","status":"%s","reason":"%s","mode":"%s","coverage":"%s","does_not_prove":%s,"pin":{"version":"%s","commit":"%s","url":"%s","sha256":"%s","sha256_verified":%s},"code_version":"%s","host_evidence_sha256":"%s","cli_checks":%s,"host_checks":%s,"matrix":%s,"commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s"},"started_at":"%s","finished_at":"%s","duration_seconds":%s}\n' \
     "$(json_escape "$status")" "$(json_escape "$STATE_REASON")" "$(json_escape "${STATE_MODE:-cli-only}")" \
     "$(json_escape "$coverage")" "$does_not_prove" \
     "$VSCODE_VERSION" "$VSCODE_COMMIT" "$(json_escape "$DOWNLOAD_URL")" "$EXPECTED_SHA" "$([ "$STATE_SHA" = verified ] && echo true || echo false)" \
-    "$(json_escape "$STATE_CODE_VERSION")" "$STATE_HOST_EVIDENCE_SHA" "$STATE_CHECKS_JSON" "$STATE_HOST_CHECKS_JSON" \
+    "$(json_escape "$STATE_CODE_VERSION")" "$STATE_HOST_EVIDENCE_SHA" "$STATE_CHECKS_JSON" "$STATE_HOST_CHECKS_JSON" "$STATE_MATRIX_JSON" \
     "$(json_escape "$commit")" "$(json_escape "$tree")" \
     "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" \
     "$STARTED" "$finished" "$duration" >"$OUT_FILE.tmp.$$"
@@ -321,47 +342,162 @@ host_launch_args() {
   printf '%s' "$args"
 }
 
+pick_free_port() {
+  node -e 'const net=require("node:net");const s=net.createServer();s.on("error",()=>process.exit(1));s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close();});' 2>/dev/null
+}
+
+reap_cell() { # workdir
+  local marker="$1" pid
+  for pid in $(pgrep -f -- "$marker" 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
+}
+
 run_extension_host() {
-  mkdir -p "$WORK_DIR/host-user-data" "$WORK_DIR/host-extensions"
-  local evidence="$WORK_DIR/host-evidence.json"
-  rm -f "$evidence"
-  [ -f "$EXTENSION_HOST_SMOKE" ] || fail "host-test-missing: $EXTENSION_HOST_SMOKE"
-  [ -f "$EXTENSION_DIR/out/extension.js" ] || fail "extension-not-built: $EXTENSION_DIR/out/extension.js is missing (run npm run build first)"
-
-  local -a args
-  # shellcheck disable=SC2206 # args are a fixed internal word list
-  args=($(host_launch_args))
-  echo "vscode-e2e: launching pinned Extension Host ($VSCODE_VERSION) ${args[*]}" >&2
-
-  local rc
-  FAKTOR_VSCODE_E2E_EVIDENCE="$evidence" \
-    FAKTOR_VSCODE_E2E_PIN_VERSION="$VSCODE_VERSION" \
-    FAKTOR_VSCODE_E2E_PIN_COMMIT="$VSCODE_COMMIT" \
-    timeout "$HOST_TIMEOUT" "$CODE_BIN" "${args[@]}" \
-    --user-data-dir "$WORK_DIR/host-user-data" \
-    --extensions-dir "$WORK_DIR/host-extensions" \
-    --extensionDevelopmentPath="$EXTENSION_DIR" \
-    --extensionTestsPath="$EXTENSION_HOST_SMOKE" >/dev/null 2>&1
-  rc=$?
-
-  if [ ! -s "$evidence" ]; then
-    fail "extension-host-no-evidence: host rc=$rc and no evidence at $evidence (no silent pass)"
+  local host_dir="$HOST_EXTENSION_DIR"
+  if [ -z "$host_dir" ]; then
+    host_dir="$EXTENSION_DIR"
   fi
-  STATE_HOST_EVIDENCE_SHA="$(sha_of "$evidence")"
-  local ok_checks
-  ok_checks="$(node -e '
-    const fs = require("node:fs");
-    const e = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const bad = (e.checks || []).filter((c) => !c.ok).map((c) => c.name);
-    if (e.status !== "passed" || bad.length > 0) {
-      console.error("status=" + e.status + " failed=" + bad.join(","));
-      process.exit(1);
+  [ -f "$host_dir/package.json" ] || fail "extension-dir-invalid: $host_dir/package.json is missing"
+  [ -f "$EXTENSION_HOST_SMOKE" ] || fail "host-test-missing: $EXTENSION_HOST_SMOKE"
+  # Source mode used to run whatever stale out/ existed: a src change (a new
+  # contributed command) then produced a misleading host failure. Rebuild
+  # whenever any src file is newer than out/extension.js. A VSIX-extracted
+  # tree has no src/ and is used exactly as packaged.
+  if [ -f "$host_dir/package.json" ] && [ -d "$host_dir/src" ] && command -v npm >/dev/null 2>&1; then
+    if [ ! -f "$host_dir/out/extension.js" ] || find "$host_dir/src" -type f -newer "$host_dir/out/extension.js" | grep -q .; then
+      echo "vscode-e2e: rebuilding the extension (src is newer than out)" >&2
+      (cd "$host_dir" && npm run build >/dev/null 2>&1) || fail "extension-build-failed: npm run build"
+    fi
+  fi
+  [ -f "$host_dir/out/extension.js" ] || fail "extension-not-built: $host_dir/out/extension.js is missing (run npm run build first)"
+
+  local aggregate="$WORK_DIR/host-aggregate.json"
+  local -a evidence_files=()
+  local spec cell dpr mode
+  for spec in "${MATRIX_CELLS[@]}"; do
+    IFS=: read -r cell dpr mode <<<"$spec"
+    local cell_dir="$WORK_DIR/host-$cell"
+    mkdir -p "$cell_dir/user-data" "$cell_dir/extensions"
+    local evidence="$cell_dir/evidence.json"
+    rm -f "$evidence"
+    local cdp_port
+    cdp_port="$(pick_free_port)" || fail "cdp-port-unavailable: no free loopback port for cell $cell"
+    [ -n "$cdp_port" ] || fail "cdp-port-unavailable: no free loopback port for cell $cell"
+
+    local -a args
+    # shellcheck disable=SC2206 # args are a fixed internal word list
+    args=($(host_launch_args))
+    args+=(--remote-debugging-port="$cdp_port" --remote-allow-origins='*')
+    if [ "$dpr" != "1" ]; then
+      args+=(--force-device-scale-factor="$dpr")
+    fi
+    echo "vscode-e2e: cell $cell (mode=$mode dpr=$dpr cdp=$cdp_port) launching pinned Extension Host ($VSCODE_VERSION)" >&2
+
+    local rc
+    FAKTOR_VSCODE_E2E_EVIDENCE="$evidence" \
+      FAKTOR_VSCODE_E2E_PIN_VERSION="$VSCODE_VERSION" \
+      FAKTOR_VSCODE_E2E_PIN_COMMIT="$VSCODE_COMMIT" \
+      FAKTOR_VSCODE_E2E_CDP_PORT="$cdp_port" \
+      FAKTOR_VSCODE_E2E_MATRIX="$mode" \
+      FAKTOR_VSCODE_E2E_CELL="$cell" \
+      FAKTOR_VSCODE_E2E_EXPECT_DPR="$dpr" \
+      FAKTOR_VSCODE_E2E_PACKAGE_MODE="$HOST_PACKAGE_MODE" \
+      timeout -k 15 "$HOST_TIMEOUT" "$CODE_BIN" "${args[@]}" \
+      --user-data-dir "$cell_dir/user-data" \
+      --extensions-dir "$cell_dir/extensions" \
+      --extensionDevelopmentPath="$host_dir" \
+      --extensionTestsPath="$EXTENSION_HOST_SMOKE" >"$cell_dir/stdout.log" 2>&1
+    rc=$?
+
+    if [ ! -s "$evidence" ]; then
+      reap_cell "$cell_dir/user-data"
+      fail "extension-host-no-evidence: cell=$cell host rc=$rc and no evidence at $evidence (no silent pass)"
+    fi
+    local cell_status
+    cell_status="$(node -e '
+      const fs = require("node:fs");
+      const e = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const bad = (e.checks || []).filter((c) => !c.ok).map((c) => c.name);
+      if (e.status !== "passed" || bad.length > 0) {
+        console.error("cell " + process.argv[2] + ": status=" + e.status + " failed=" + bad.join(","));
+        process.exit(1);
+      }
+      process.stdout.write("ok");
+    ' "$evidence" "$cell" 2>&1)" || {
+      reap_cell "$cell_dir/user-data"
+      fail "extension-host-checks-failed: $cell_status"
     }
-    process.stdout.write("ok");
-  ' "$evidence" 2>&1)" || fail "extension-host-checks-failed: $ok_checks"
-  STATE_HOST_CHECKS_JSON="$(node -e 'process.stdout.write(JSON.stringify(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).checks || []))' "$evidence")"
+    evidence_files+=("$evidence")
+    echo "vscode-e2e: cell $cell checks passed" >&2
+  done
+
+  node -e '
+    const fs = require("node:fs");
+    const crypto = require("node:crypto");
+    const files = process.argv.slice(1);
+    const checks = [];
+    const cells = [];
+    const hashes = [];
+    for (const file of files) {
+      const cell = file.split("/").slice(-2)[0].replace(/^host-/, "");
+      const e = JSON.parse(fs.readFileSync(file, "utf8"));
+      for (const entry of e.checks || []) {
+        checks.push({ name: cell + ":" + entry.name, ok: entry.ok === true, detail: entry.detail || "" });
+      }
+      cells.push({
+        cell,
+        mode: e.matrix && e.matrix.cell ? e.matrix.cell.mode : null,
+        expected_dpr: e.matrix && e.matrix.cell ? e.matrix.cell.expected_dpr : null,
+        package_mode: e.matrix && e.matrix.cell ? e.matrix.cell.package_mode : null,
+        cdp: e.matrix ? e.matrix.cdp : null,
+        capabilities: e.matrix ? e.matrix.capabilities : null,
+        not_emulatable: e.matrix ? e.matrix.not_emulatable : [],
+      });
+      hashes.push(crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex"));
+    }
+    const evidenceSha = crypto.createHash("sha256").update(hashes.join("\n")).digest("hex");
+    process.stdout.write(JSON.stringify({ checks, cells, evidence_sha256: evidenceSha }));
+  ' "${evidence_files[@]}" >"$aggregate" 2>"$WORK_DIR/host-aggregate.err" || fail "host-aggregate-failed: $(cat "$WORK_DIR/host-aggregate.err")"
+  rm -f "$WORK_DIR/host-aggregate.err"
+
+  STATE_HOST_EVIDENCE_SHA="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).evidence_sha256)' "$aggregate")"
+  STATE_HOST_CHECKS_JSON="$(node -e 'process.stdout.write(JSON.stringify(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).checks))' "$aggregate")"
+  STATE_MATRIX_JSON="$(node -e '
+    const fs = require("node:fs");
+    const aggregate = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const matrix = {
+      cells: aggregate.cells.map((cell) => ({
+        cell: cell.cell,
+        mode: cell.mode,
+        expected_dpr: cell.expected_dpr,
+        package_mode: cell.package_mode,
+        cdp: cell.cdp,
+        capabilities: cell.capabilities,
+        not_emulatable: cell.not_emulatable,
+      })),
+    };
+    process.stdout.write(JSON.stringify(matrix));
+  ' "$aggregate")"
   STATE_MODE="extension-host"
-  echo "vscode-e2e: extension host checks passed (evidence sha256 $STATE_HOST_EVIDENCE_SHA)" >&2
+  if [ "$HOST_PACKAGE_MODE" = "vsix" ]; then
+    STATE_MODE="extension-host-vsix"
+  fi
+  echo "vscode-e2e: ${#evidence_files[@]} host cell(s) passed (aggregate evidence sha256 $STATE_HOST_EVIDENCE_SHA)" >&2
+}
+
+# ------------------------------------------------- packaged (VSIX) host mode
+prepare_packaged_extension() {
+  [ "$VSIX_EXPLICIT" -eq 1 ] || return 0
+  command -v unzip >/dev/null 2>&1 || fail "vsix-extract-tool-missing: unzip is required for --vsix packaged host mode"
+  rm -rf "$WORK_DIR/vsix-extracted"
+  mkdir -p "$WORK_DIR/vsix-extracted"
+  unzip -q "$VSIX_PATH" -d "$WORK_DIR/vsix-extracted" || fail "vsix-extract-failed: $VSIX_PATH"
+  HOST_EXTENSION_DIR="$WORK_DIR/vsix-extracted/extension"
+  [ -f "$HOST_EXTENSION_DIR/package.json" ] || fail "vsix-extension-missing: $HOST_EXTENSION_DIR/package.json"
+  HOST_PACKAGE_MODE="vsix"
+  echo "vscode-e2e: packaged host mode uses the extracted VSIX tree $HOST_EXTENSION_DIR" >&2
 }
 
 # ------------------------------------------------------------------ selftest
@@ -373,11 +509,20 @@ args="$*"
 case "$args" in
 *--extensionTestsPath*)
   if [ "${FAKE_CODE_NO_EVIDENCE:-0}" = 1 ]; then exit 0; fi
+  ext_dir=""
+  prev=""
+  for a in "$@"; do
+    case "$a" in --extensionDevelopmentPath=*) ext_dir="${a#--extensionDevelopmentPath=}" ;; esac
+    [ "$prev" = "--extensionDevelopmentPath" ] && ext_dir="$a"
+    prev="$a"
+  done
   if [ "${FAKE_CODE_FAIL_CHECK:-0}" = 1 ]; then
-    printf '{"status":"failed","checks":[{"name":"webview-html-has:id=\\"composer\\"","ok":false,"detail":"planted"}]}\n' >"${FAKTOR_VSCODE_E2E_EVIDENCE:?}"
+    printf '{"status":"failed","matrix":{"cell":{"label":"%s","mode":"%s","expected_dpr":%s,"package_mode":"%s"}},"checks":[{"name":"webview-html-has:id=\\"composer\\"","ok":false,"detail":"planted"}]}\n' \
+      "${FAKTOR_VSCODE_E2E_CELL:-fake}" "${FAKTOR_VSCODE_E2E_MATRIX:-full}" "${FAKTOR_VSCODE_E2E_EXPECT_DPR:-1}" "${FAKTOR_VSCODE_E2E_PACKAGE_MODE:-dev}" >"${FAKTOR_VSCODE_E2E_EVIDENCE:?}"
     exit 0
   fi
-  printf '{"status":"passed","checks":[{"name":"extension-present","ok":true},{"name":"webview-html-has:id=\\"composer\\"","ok":true}]}\n' >"${FAKTOR_VSCODE_E2E_EVIDENCE:?}"
+  printf '{"status":"passed","matrix":{"cell":{"label":"%s","mode":"%s","expected_dpr":%s,"package_mode":"%s"},"cdp":{"connected":true},"capabilities":{"renderer":{"emulated":true,"method":"fake-host"}},"not_emulatable":[]},"extension_path":"%s","checks":[{"name":"extension-present","ok":true},{"name":"webview-html-has:id=\\"composer\\"","ok":true},{"name":"matrix:webview-booted","ok":true}]}\n' \
+    "${FAKTOR_VSCODE_E2E_CELL:-fake}" "${FAKTOR_VSCODE_E2E_MATRIX:-full}" "${FAKTOR_VSCODE_E2E_EXPECT_DPR:-1}" "${FAKTOR_VSCODE_E2E_PACKAGE_MODE:-dev}" "$ext_dir" >"${FAKTOR_VSCODE_E2E_EVIDENCE:?}"
   exit 0
   ;;
 esac
@@ -398,6 +543,7 @@ selftest() {
   trap 'rm -rf "${tmp:-}"' EXIT
   make_fake_code "$tmp/extracted"
   mkdir -p "$tmp/extension/out"
+  printf '{"name":"faktor","publisher":"faktor"}\n' >"$tmp/extension/package.json"
   printf 'module.exports = {};\n' >"$tmp/extension/out/extension.js"
   export FAKTOR_VSCODE_E2E_EXTENSION="$tmp/extension"
   mkdir -p "$tmp/pack/VSCode-linux-x64/bin"
@@ -431,6 +577,8 @@ selftest() {
   check "happy status passed" "$([ "$(status_of "$out")" = passed ] && echo 0 || echo 1)"
   check "happy mode extension-host" "$(node -e 'process.exit(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).mode==="extension-host"?0:1)' "$out" 2>/dev/null && echo 0 || echo 1)"
   check "happy records does_not_prove" "$(grep -q 'does_not_prove' "$out" && echo 0 || echo 1)"
+  check "happy aggregates all matrix cells" "$(node -e 'process.exit(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).matrix.cells.length===3?0:1)' "$out" 2>/dev/null && echo 0 || echo 1)"
+  check "happy records per-capability methods" "$(node -e 'const m=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).matrix.cells;process.exit(m[0].capabilities&&m[0].capabilities.renderer?0:1)' "$out" 2>/dev/null && echo 0 || echo 1)"
 
   # 2. tampered tarball is refused before extraction
   out="$tmp/tampered.json"
@@ -482,11 +630,35 @@ selftest() {
   node --check "$EXTENSION_HOST_SMOKE" >/dev/null 2>&1
   check "extension-host-smoke.cjs parses" "$?"
 
+  # 8. --vsix packaged mode extracts the archive and runs the host matrix from
+  #    that tree (never silently from the dev checkout).
+  if command -v zip >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+    mkdir -p "$tmp/vsix-src/extension/out" "$tmp/vsix-src/extension/media"
+    printf '{"name":"faktor","publisher":"faktor"}\n' >"$tmp/vsix-src/extension/package.json"
+    printf 'module.exports = {};\n' >"$tmp/vsix-src/extension/out/extension.js"
+    printf '' >"$tmp/vsix-src/extension/media/chat.css"
+    if command -v zip >/dev/null 2>&1; then
+      (cd "$tmp/vsix-src" && zip -qr "$tmp/fake.vsix" extension)
+    else
+      (cd "$tmp/vsix-src" && python3 -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); [z.write(p) for p in ["extension/package.json","extension/out/extension.js","extension/media/chat.css"]]; z.close()' "$tmp/fake.vsix")
+    fi
+    out="$tmp/vsix.json"
+    FAKTOR_VSCODE_TARBALL="$tmp/code.tar.gz" FAKTOR_VSCODE_SHA256="$sha" \
+      bash "$SELF" --vsix "$tmp/fake.vsix" --keep --out "$out" --cache-dir "$tmp/cache" --work-dir "$tmp/work-vsix" \
+      >"$tmp/vsix.stdout" 2>"$tmp/vsix.stderr"
+    rc=$?
+    check "packaged vsix mode passes" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+    check "packaged vsix mode recorded" "$(node -e 'process.exit(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).mode==="extension-host-vsix"?0:1)' "$out" 2>/dev/null && echo 0 || echo 1)"
+    check "packaged vsix host used extracted tree" "$(grep -q 'vsix-extracted' "$tmp/work-vsix/host-full/evidence.json" && echo 0 || echo 1)"
+  else
+    echo "vscode-e2e selftest skip: packaged-vsix case needs zip or python3 to build a test archive"
+  fi
+
   if [ "$failures" -gt 0 ]; then
     echo "vscode-e2e selftest: FAIL ($failures case(s))" >&2
     return 1
   fi
-  echo "vscode-e2e selftest: PASS (pin tamper, no-evidence, failed-check, version and cli-only cases exercised)"
+  echo "vscode-e2e selftest: PASS (pin tamper, no-evidence, failed-check, version, cli-only and packaged-VSIX cases exercised)"
   return 0
 }
 
@@ -531,6 +703,7 @@ STATE_CHECKS_JSON="$CLI_CHECKS"
 if [ "$CLI_ONLY" -eq 1 ]; then
   STATE_MODE="cli-only"
 else
+  prepare_packaged_extension
   run_extension_host
 fi
 write_record passed

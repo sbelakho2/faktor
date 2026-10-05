@@ -99,7 +99,6 @@ import {
   MAX_PENDING_ATTACHMENT_BYTES,
   PendingSubmission,
   PendingSubmissionRetainer,
-  StartFailure,
   StartSubmissionSnapshot,
   StartTaskSettings,
   TaskStartGate,
@@ -108,6 +107,7 @@ import {
   boundedWebviewFiles,
   composerAttachmentRefusal,
   composerMimeForFilename,
+  completionContractFromPicks,
   hasCompletionSteps,
   parseCompletionContract,
   parsePendingSubmission,
@@ -986,6 +986,27 @@ function scheduleRefresh(delayMs = 250): void {
   }, delayMs);
 }
 
+/**
+ * The user-gesture refresh path. Scheduled and internal refreshes stay
+ * silent, but a palette command or the panel button must never be a silent
+ * no-op: an unavailable daemon/session or an in-flight refresh answers with
+ * a visible typed notice.
+ */
+async function refreshFromUserGesture(): Promise<void> {
+  if (!active.client || !active.sessionId) {
+    chatProvider?.postNotice(
+      'error',
+      'the Faktor daemon is not running; start it before refreshing',
+    );
+    return;
+  }
+  if (active.refreshing) {
+    chatProvider?.postNotice('info', 'a refresh is already in flight');
+    return;
+  }
+  await refresh();
+}
+
 async function refresh(): Promise<void> {
   const client = active.client;
   const sessionId = active.sessionId;
@@ -1369,16 +1390,20 @@ async function readBoard(since: number | null, limit: number | null): Promise<vo
 async function postBoard(message: ChatMessage): Promise<void> {
   const client = active.client;
   const sessionId = active.sessionId;
+  const token =
+    typeof message.token === 'string' && message.token.length <= 128 ? message.token : null;
   const parsed = parseBoardPostRequest({
     subject: message.subject,
     body: message.body,
     refs: message.refs,
   });
   if ('reason' in parsed) {
+    chatProvider?.postBoardRefused(token, parsed.reason);
     chatProvider?.postNotice('error', parsed.reason);
     return;
   }
   if (!client || !sessionId) {
+    chatProvider?.postBoardRefused(token, 'daemon-not-running');
     chatProvider?.postNotice('info', 'start the daemon before posting to the board');
     return;
   }
@@ -1386,9 +1411,16 @@ async function postBoard(message: ChatMessage): Promise<void> {
     const post = await client.boardPost(sessionId, parsed);
     // The operator authored this post: it is read by definition.
     active.boardSeenRevision = Math.max(active.boardSeenRevision, post.revision);
+    chatProvider?.postBoardPosted(post.revision, token);
     chatProvider?.postNotice('info', `board post #${post.revision} recorded`);
     scheduleRefresh(0);
   } catch (error) {
+    // EVERY outcome answers the panel: a refusal must release its in-flight
+    // lock without waiting for an unrelated snapshot.
+    chatProvider?.postBoardRefused(
+      token,
+      error instanceof Error ? error.message : 'board post failed',
+    );
     reportError(error);
   }
 }
@@ -1560,6 +1592,21 @@ function postComposerAttachments(policy: AttachmentAdmissionPolicy): void {
       refusal: composerAttachmentRefusal(entry, policy),
     })),
   );
+}
+
+/**
+ * Re-post host-owned view state after a (re)resolution: the bounded
+ * attachment metadata (with refusals) and the current stream-block reason.
+ * Neither travels in the durable snapshot, so without this a closed and
+ * reopened Faktor view shows an empty attachment list and a generic stream
+ * reason while the host still holds the bytes and the typed refusal.
+ */
+async function postHostOwnedViewState(): Promise<void> {
+  postComposerAttachments(await composerAttachmentPolicy());
+  const blocked = active.stream?.blocked ?? null;
+  if (blocked !== null) {
+    chatProvider?.postStreamBlocked(blocked.reason);
+  }
 }
 
 /**
@@ -1793,7 +1840,7 @@ async function startTask(
         active.completionContract = contract;
         store.patch({ activeRunId: started.run_id, busy: true, lastError: null });
         const attached = files.length + pending.attachments.length;
-        const attachments = attached > 0 ? ` with ${attached} attachment(s)` : '';
+        const attachments = attached > 0 ? ` with ${attached} attachment${attached === 1 ? '' : 's'}` : '';
         const steps = contract !== null ? ' + completion contract' : '';
         chatProvider?.postNotice(
           'info',
@@ -1801,8 +1848,10 @@ async function startTask(
         );
         scheduleRefresh(0);
       },
-      onFailure: (failure: StartFailure | AdmitFailure) => {
-        reportError(new Error(failure.message));
+      onFailure: () => {
+        // `restore` is the single terminal callback and owns the visible
+        // report (it posts the error and retains the retryable envelope);
+        // reporting here too produced two toasts/notices per failure.
       },
       restore,
     });
@@ -1831,10 +1880,13 @@ async function startTask(
 /**
  * Task-mode completion controls for the command path (the chat composer
  * carries the same three checkboxes): a multi-select list of the three
- * conditional steps. An empty selection = today's default path (no
- * contract, no work item).
+ * conditional steps. An explicit empty selection = today's default path (no
+ * contract, no work item); a DISMISSED picker aborts the flow (the caller
+ * must not start the run the operator just cancelled).
  */
-async function promptCompletionContract(): Promise<NativeCompletionContract | null> {
+async function promptCompletionContract(): Promise<
+  NativeCompletionContract | null | undefined
+> {
   const picks = await vscode.window.showQuickPick(
     [
       { label: 'Commit when verified', key: 'include_commit' as const, picked: false },
@@ -1848,14 +1900,7 @@ async function promptCompletionContract(): Promise<NativeCompletionContract | nu
       ignoreFocusOut: true,
     },
   );
-  if (picks === undefined || picks.length === 0) {
-    return null;
-  }
-  return {
-    include_commit: picks.some((pick) => pick.key === 'include_commit'),
-    include_push: picks.some((pick) => pick.key === 'include_push'),
-    include_pr: picks.some((pick) => pick.key === 'include_pr'),
-  };
+  return completionContractFromPicks(picks);
 }
 
 async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<void> {
@@ -1868,6 +1913,11 @@ async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<voi
     return;
   }
   const contract = await promptCompletionContract();
+  if (contract === undefined) {
+    // The operator dismissed the completion-contract step: abort the start
+    // instead of silently running with the default path.
+    return;
+  }
   const pending = pendingEnvelope(goal.trim());
   const decision = taskStartGate.admit({
     pending,
@@ -2293,9 +2343,15 @@ function updateStatusBar(): void {
   const indexTooltip = snapshot.indexCoverage
     ? ` · ${indexCoverageLabel(snapshot.indexCoverage)}`
     : '';
+  const stoppedTooltip =
+    snapshot.daemon === 'starting'
+      ? 'Faktor daemon starting'
+      : snapshot.daemon === 'error'
+        ? 'Faktor daemon failed to start'
+        : 'Faktor daemon stopped';
   statusBar.tooltip = snapshot.baseUrl
     ? `Faktor daemon ${snapshot.daemon} at ${snapshot.baseUrl}${snapshot.session ? ` · session ${snapshot.session.title}` : ''}${indexTooltip}`
-    : 'Faktor daemon stopped';
+    : stoppedTooltip;
   statusBar.show();
 }
 
@@ -2320,7 +2376,7 @@ async function handleWebviewMessage(
       stopServer();
       return;
     case 'refresh':
-      await refresh();
+      await refreshFromUserGesture();
       return;
     case 'attachPick':
       await pickComposerAttachments();
@@ -2365,7 +2421,7 @@ async function handleWebviewMessage(
           .join('; ');
         chatProvider?.postNotice(
           'error',
-          `${refused.length} attachment(s) refused: ${reasons}`,
+          `${refused.length} attachment${refused.length === 1 ? '' : 's'} refused: ${reasons}`,
         );
       }
       const contract = parseCompletionContract(message.completionContract);
@@ -2514,6 +2570,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   chatProvider = new ChatViewProvider(context.extensionUri, {
     handle: (message) => handleWebviewMessage(message, context),
+    onViewResolved: () => postHostOwnedViewState(),
   });
 
   // EXTERNAL SecretStorage changes (another window, the OS keychain UI, an
@@ -2559,7 +2616,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('faktor.cancelTask', () => cancelActiveRun()),
     vscode.commands.registerCommand('faktor.replyPermission', () => replyPermissionFromCommand()),
-    vscode.commands.registerCommand('faktor.refresh', () => refresh()),
+    vscode.commands.registerCommand('faktor.refresh', () => refreshFromUserGesture()),
+    // The palette entry for the same recovery the webview gesture triggers:
+    // a blocked stream is recoverable without finding the panel button.
     vscode.commands.registerCommand('faktor.reconnectStream', () => recoverEventStream()),
     vscode.commands.registerCommand('faktor.controlPlaneSignIn', async () => {
       await controlPlaneSignIn(context);

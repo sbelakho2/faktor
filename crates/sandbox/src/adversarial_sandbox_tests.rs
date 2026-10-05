@@ -165,6 +165,177 @@ fn spawn_requirement_mapping_is_exact() {
     );
 }
 
+// ------------- P1 filesystem-confinement authority (policy -> spawn) -----
+
+/// The filesystem projection is enforcement-honest: it never says
+/// `workspace` on a build without an OS confinement backend, it qualifies
+/// BestEffort as non-guaranteed, and it names the external rules whenever
+/// the jail is not claimed.
+#[test]
+fn filesystem_projection_is_enforcement_honest() {
+    let locked = |guarantee| SandboxPolicy {
+        read_external: Rule::Deny,
+        write_external: Rule::Deny,
+        filesystem_guarantee: guarantee,
+        ..SandboxPolicy::default()
+    };
+    let backend = filesystem_backend_available();
+    assert_eq!(
+        backend,
+        cfg!(target_os = "linux"),
+        "backend is the build fact"
+    );
+    // Required: a guaranteed jail where the backend exists, an honest
+    // application-policy-only tag (and a typed spawn refusal) elsewhere.
+    assert_eq!(
+        locked(FilesystemGuarantee::Required)
+            .spawn_profile()
+            .filesystem,
+        if backend {
+            "workspace"
+        } else {
+            "application-policy-only"
+        },
+        "Required must project the jail only where it can be enforced"
+    );
+    // BestEffort never claims a guaranteed jail.
+    assert_eq!(
+        locked(FilesystemGuarantee::BestEffort)
+            .spawn_profile()
+            .filesystem,
+        if backend {
+            "workspace_best_effort"
+        } else {
+            "application-policy-only"
+        },
+        "BestEffort must stay honest about the fallback"
+    );
+    // None claims no OS confinement at all.
+    assert_eq!(
+        locked(FilesystemGuarantee::None).spawn_profile().filesystem,
+        "application-policy-only",
+        "None must never claim a workspace jail"
+    );
+    // A non-jail policy names its external rules and claims nothing else.
+    for (read, write, tag) in [
+        (Rule::Ask, Rule::Ask, "workspace+external:ask-ask"),
+        (Rule::Allow, Rule::Deny, "workspace+external:allow-deny"),
+        (Rule::Deny, Rule::Allow, "workspace+external:deny-allow"),
+    ] {
+        let policy = SandboxPolicy {
+            read_external: read,
+            write_external: write,
+            filesystem_guarantee: FilesystemGuarantee::Required,
+            ..SandboxPolicy::default()
+        };
+        assert_eq!(policy.spawn_profile().filesystem, tag, "{read:?}/{write:?}");
+    }
+    // Determinism and serde round-trip of the projection (it is evidence).
+    let policy = locked(FilesystemGuarantee::Required);
+    assert_eq!(policy.spawn_profile(), policy.spawn_profile());
+    let back: SpawnProfile =
+        serde_json::from_value(serde_json::to_value(policy.spawn_profile()).unwrap()).unwrap();
+    assert_eq!(back, policy.spawn_profile());
+}
+
+/// The guarantee -> spawn-requirement mapping is exact, and the demand is
+/// workspace-shaped only where the policy claims the jail.
+#[test]
+fn filesystem_requirement_mapping_is_exact() {
+    assert_eq!(
+        FilesystemGuarantee::Required.filesystem_requirement(),
+        FilesystemIsolationRequirement::Workspace { best_effort: false },
+        "Required maps to a fail-closed workspace demand"
+    );
+    assert_eq!(
+        FilesystemIsolationRequirement::from(FilesystemGuarantee::BestEffort),
+        FilesystemIsolationRequirement::Workspace { best_effort: true },
+        "BestEffort maps to an install-if-available workspace demand"
+    );
+    assert_eq!(
+        FilesystemGuarantee::None.filesystem_requirement(),
+        FilesystemIsolationRequirement::Inherit,
+        "None maps to Inherit"
+    );
+    let locked = |guarantee| {
+        PermissionEngine::new(
+            SandboxPolicy {
+                read_external: Rule::Deny,
+                write_external: Rule::Deny,
+                filesystem_guarantee: guarantee,
+                ..SandboxPolicy::default()
+            },
+            None,
+        )
+        .spawn_filesystem_requirement()
+    };
+    assert_eq!(
+        locked(FilesystemGuarantee::Required),
+        FilesystemIsolationRequirement::Workspace { best_effort: false }
+    );
+    assert_eq!(
+        locked(FilesystemGuarantee::BestEffort),
+        FilesystemIsolationRequirement::Workspace { best_effort: true }
+    );
+    assert_eq!(
+        locked(FilesystemGuarantee::None),
+        FilesystemIsolationRequirement::Inherit,
+        "None never demands confinement"
+    );
+    // Non-jail policies demand nothing even under a Required guarantee:
+    // the profile names the external rules instead.
+    for (read, write) in [(Rule::Ask, Rule::Ask), (Rule::Allow, Rule::Deny)] {
+        let engine = PermissionEngine::new(
+            SandboxPolicy {
+                read_external: read,
+                write_external: write,
+                filesystem_guarantee: FilesystemGuarantee::Required,
+                ..SandboxPolicy::default()
+            },
+            None,
+        );
+        assert_eq!(
+            engine.spawn_filesystem_requirement(),
+            FilesystemIsolationRequirement::Inherit,
+            "{read:?}/{write:?}: no jail claim, no confinement demand"
+        );
+    }
+}
+
+/// The new guarantee field is additive on the config surface: absent means
+/// Required (secure default) and the policy still round-trips.
+#[test]
+fn filesystem_guarantee_serde_defaults_to_required() {
+    let policy = SandboxPolicy::default();
+    assert_eq!(
+        policy.filesystem_guarantee,
+        FilesystemGuarantee::Required,
+        "the secure default is Required"
+    );
+    let mut value = serde_json::to_value(policy).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("filesystem_guarantee");
+    let back: SandboxPolicy = serde_json::from_value(value).unwrap();
+    assert_eq!(back.filesystem_guarantee, FilesystemGuarantee::Required);
+    assert_eq!(
+        serde_json::to_value(FilesystemGuarantee::BestEffort).unwrap(),
+        serde_json::json!("best_effort")
+    );
+    assert_eq!(
+        serde_json::to_value(FilesystemGuarantee::None).unwrap(),
+        serde_json::json!("none")
+    );
+    let round = SandboxPolicy {
+        filesystem_guarantee: FilesystemGuarantee::BestEffort,
+        ..SandboxPolicy::default()
+    };
+    let back: SandboxPolicy =
+        serde_json::from_value(serde_json::to_value(&round).unwrap()).unwrap();
+    assert_eq!(back, round);
+}
+
 #[test]
 fn default_gate_allows_only_the_frozen_provider_endpoints() {
     let engine = PermissionEngine::new(SandboxPolicy::default(), None);

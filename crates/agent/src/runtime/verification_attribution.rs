@@ -2232,10 +2232,15 @@ impl AgentRuntime {
         let row = handle
             .row()
             .map_err(|e| format!("session row unresolvable: {e}"))?;
+        // The integrated root is a daemon-owned CANDIDATE directory
+        // (`run_exec_dir/candidate`), NOT the session's durable workspace.
+        // Opening it under the session's workspace id always conflicted with
+        // the live handle ("workspace N already open at ...") and left every
+        // orchestrated run unverified.
         let ws = self
             .deps
             .workspaces
-            .open(row.workspace_id, root.to_path_buf())
+            .open_ephemeral(root.to_path_buf())
             .map_err(|e| format!("integration root could not be opened: {e}"))?;
         let candidate_snapshot = root_snapshot_best_effort(&ws);
         let goal = handle

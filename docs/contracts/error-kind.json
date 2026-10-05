@@ -1,0 +1,78 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "error_kind",
+  "type": "faktor_core::error::ErrorKind",
+  "representation": "external",
+  "variants": [
+    {
+      "name": "NotFound",
+      "wire": "not_found",
+      "retryable": false
+    },
+    {
+      "name": "Conflict",
+      "wire": "conflict",
+      "retryable": false
+    },
+    {
+      "name": "InvalidState",
+      "wire": "invalid_state",
+      "retryable": false
+    },
+    {
+      "name": "Permission",
+      "wire": "permission",
+      "retryable": false
+    },
+    {
+      "name": "Timeout",
+      "wire": "timeout",
+      "retryable": true
+    },
+    {
+      "name": "Cancelled",
+      "wire": "cancelled",
+      "retryable": false
+    },
+    {
+      "name": "Store",
+      "wire": "store",
+      "retryable": true
+    },
+    {
+      "name": "Network",
+      "wire": "network",
+      "retryable": true
+    },
+    {
+      "name": "Provider",
+      "wire": "provider",
+      "retryable": true
+    },
+    {
+      "name": "Malformed",
+      "wire": "malformed",
+      "retryable": false
+    },
+    {
+      "name": "Oversized",
+      "wire": "oversized",
+      "retryable": false
+    },
+    {
+      "name": "RateLimited",
+      "wire": "rate_limited",
+      "retryable": true
+    },
+    {
+      "name": "Deadlock",
+      "wire": "deadlock",
+      "retryable": true
+    },
+    {
+      "name": "Internal",
+      "wire": "internal",
+      "retryable": false
+    }
+  ]
+}

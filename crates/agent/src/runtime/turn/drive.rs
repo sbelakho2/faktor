@@ -83,6 +83,21 @@ impl AgentRuntime {
         prompt: &str,
         files: &[String],
     ) -> faktor_core::Result<faktor_session::PromptReceipt> {
+        self.submit_with_op_id(session, prompt, files, None)
+    }
+
+    /// [`Self::submit`] under a PREALLOCATED operation id (audit P1): the
+    /// durable admission claim reserved the id BEFORE the prompt was
+    /// accepted, so the claim's `reservation` names exactly the turn this
+    /// submit journals and recovery can rebuild the receipt from the
+    /// durable turn/queue facts. `None` mints a fresh id as before.
+    pub fn submit_with_op_id(
+        self: &Arc<Self>,
+        session: SessionId,
+        prompt: &str,
+        files: &[String],
+        reserved_op_id: Option<OpId>,
+    ) -> faktor_core::Result<faktor_session::PromptReceipt> {
         let handle = self
             .deps
             .session
@@ -90,7 +105,7 @@ impl AgentRuntime {
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
         // Crash recovery first (never blindly re-run).
         self.recover_session(&handle)?;
-        handle.submit_prompt(prompt, files)
+        handle.submit_prompt_with_op_id(prompt, files, reserved_op_id)
     }
 
     /// Persist a child drive's coarse execution phase at a safe boundary
@@ -327,10 +342,21 @@ impl AgentRuntime {
         if let Err(e) = &outcome {
             // Cleanup path: the ORIGINAL turn error must reach the caller, so
             // a failed Failed-journal is recorded (marker + audit) instead.
+            // A failure while parked at WaitingForPermission (a permission
+            // timeout) has NO legal edge to FailedRecoverable: forcing it
+            // wrote a false crash marker. Blocked is the legal "no live
+            // owner" landing; every other failure keeps FailedRecoverable.
+            let target = match handle.state() {
+                // `WaitingForPermission` has no edge to FailedRecoverable;
+                // its legal honest landing is ReadyForNextTurn (the timeout
+                // is reported by the event, and the session stays usable).
+                Ok(AgentState::WaitingForPermission) => AgentState::ReadyForNextTurn,
+                _ => AgentState::FailedRecoverable,
+            };
             self.dw_note_journal_failed(
                 handle,
                 op_id,
-                AgentState::FailedRecoverable,
+                target,
                 serde_json::json!({ "message": e.message }),
                 DW_SITE_RECEIPT_JOURNAL,
             )
@@ -1238,7 +1264,22 @@ impl AgentRuntime {
                         // decision still resolved the execution provider.
                         model
                     } else {
-                        decision.model.clone()
+                        let routed_model = decision.model.clone();
+                        if routed_model != model {
+                            // Economy may choose among SERVED candidates, but
+                            // never silently: the session surface names both
+                            // sides. UNSERVED models are refused typed at
+                            // session creation (native_create_session), so
+                            // this substitution is a priced equivalence, not
+                            // a lost model.
+                            tracing::warn!(
+                                session = %handle.id(),
+                                requested = %model,
+                                chosen = %routed_model,
+                                "economy routing chose a different served model"
+                            );
+                        }
+                        routed_model
                     };
                     tracing::info!(session = %handle.id(), "routing: {reasoning}", reasoning = decision.reasoning);
                     // Typed ledger: the routing DECISION is durable history.
@@ -1630,6 +1671,23 @@ impl AgentRuntime {
                                 // left the process and the provider may have
                                 // billed (settlement/reconciliation later).
                                 debits.close_uncertain();
+                                // Flush the partial stream: the buffered text
+                                // and reasoning were emitted live but never
+                                // journaled, so a cancel used to leave an
+                                // empty assistant message.
+                                if !text_buf.is_empty() || !reasoning_buf.is_empty() {
+                                    let mid = self
+                                        .ensure_assistant_message(handle, &mut assistant_message)
+                                        .await?;
+                                    if !text_buf.is_empty() {
+                                        handle.append_text_part(mid, &text_buf).await?;
+                                        text_buf.clear();
+                                    }
+                                    if !reasoning_buf.is_empty() {
+                                        handle.append_reasoning_part(mid, &reasoning_buf).await?;
+                                        reasoning_buf.clear();
+                                    }
+                                }
                                 // Cancel cleanup: recorded (marker + audit),
                                 // never a different error for the Cancelled end.
                                 self.dw_note_abort(handle, Some(op_id), DW_SITE_DRIVE_ABORT_DISPATCH);
@@ -1782,7 +1840,18 @@ impl AgentRuntime {
                                     // tool runs pending) and the failure is retryable.
                                     let safe = assistant_message.is_none()
                                         && handle.pending_tool_runs()?.is_empty();
-                                    if safe && attempt + 1 < max_attempts && e.retryable {
+                                    // Class-aware: the same predicate the policy exposes
+                                    // (Network never retries rate limits; RateLimited/
+                                    // ServerError/Always do), instead of consulting only
+                                    // `retryable`.
+                                    let rate_limited = matches!(
+                                        e.kind,
+                                        faktor_provider::ProviderErrorKind::RateLimited
+                                    );
+                                    if safe
+                                        && retry_policy
+                                            .should_retry(attempt, e.retryable, rate_limited)
+                                    {
                                         tracing::warn!(
                                         "provider failure on attempt {} of {max_attempts}: {e}; retrying",
                                         attempt + 1
@@ -2325,6 +2394,21 @@ impl AgentRuntime {
         settled_calls: &mut Vec<(SettledCallOutcome, u8)>,
         cancel: &CancellationToken,
     ) -> faktor_core::Result<()> {
+        // P0-2 remainder: generic-shell changes are attributed through the
+        // durable `shell_change` facts, so a crash-resumed turn (or a live
+        // settlement that could not open a workspace) still feeds its ACTUAL
+        // changed paths into the SAME consumers `write_file` feeds. An
+        // unresolved attribution (captured/discovered/unattributed) refuses
+        // the completion gate below — the unknown tree is never read as
+        // "unchanged".
+        let (durable_shell_paths, unresolved_shell) = shell_change_facts(handle, op_id);
+        let mut merged_summary = turn_summary.clone();
+        for path in durable_shell_paths {
+            if !merged_summary.files_changed.contains(&path) {
+                merged_summary.files_changed.push(path);
+            }
+        }
+        let turn_summary = &merged_summary;
         ledger.record_turn(turn_summary);
         handle.put_task_ledger(serde_json::to_value(&*ledger)?)?;
         self.record_memory(handle, op_id, ledger, turn_summary)?;
@@ -2500,6 +2584,20 @@ impl AgentRuntime {
         // between the record's certification and the completion transaction)
         // downgrades the gate — never fails the turn — and the fact is
         // rewritten to the refused gate below.
+        if unresolved_shell {
+            // P0-2 remainder: a shell mutation whose actual tree was never
+            // certified blocks a completion claim with the typed
+            // `unattributed_change` reason. The discovered/merged paths still
+            // ran through verification above (evidence is never discarded);
+            // only the CLAIM is refused until a re-verified turn succeeds.
+            let detail = format!(
+                "{} change(s) are attributed to this turn but at least one generic-shell \
+                 mutation was never certified by the bounded pre/post manifest reconciliation; \
+                 the completion claim is refused and the changes stay unattributed",
+                turn_summary.files_changed.len()
+            );
+            gate = refuse_unattributed_gate(gate, &detail);
+        }
         let gate_landed =
             self.apply_gate_to_task_row(handle, gate.clone(), verdict.proof.as_ref())?;
         if gate_landed.is_none() && matches!(gate, Some(CompletionGate::VerifiedComplete)) {

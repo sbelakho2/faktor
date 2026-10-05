@@ -1,0 +1,9 @@
+{
+  "id": "INV-ADMISSION-LEASE-FENCING",
+  "file": "crates/store/src/task_admission.rs",
+  "find": "        self.owner_generation == generation && self.lease_deadline_ms > now",
+  "replace": "        self.owner_generation == generation && self.lease_deadline_ms >= now",
+  "gate": "cargo test -p faktor-store --lib an_expired_lease_is_stale_even_within_one_generation",
+  "expect": "panicked|InFlight|Stale",
+  "note": "The lease comparison accepts the exact deadline as live: an expired claim of this boot keeps answering InFlight forever instead of becoming stale for recovery."
+}

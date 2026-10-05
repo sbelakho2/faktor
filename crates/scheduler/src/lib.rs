@@ -49,6 +49,13 @@ impl OwnershipSet {
         self.0.is_empty()
     }
 
+    /// Full-workspace ownership (generic shell): overlaps EVERY path, so
+    /// every writer serializes against it and the ChangeBudget gate sees the
+    /// whole workspace as its declared write set (P0-2).
+    pub fn workspace_root() -> Self {
+        Self(vec![WORKSPACE_ROOT_SENTINEL.to_string()])
+    }
+
     /// The canonical sorted path list (for ledger/journal bookkeeping).
     pub fn entries(&self) -> &[String] {
         &self.0
@@ -69,7 +76,13 @@ impl OwnershipSet {
 /// Normalize an ownership path for comparison: strip Windows verbatim/UNC
 /// prefixes, fold separators to `/`, and case-fold on Windows (NTFS is
 /// case-insensitive; two differently-cased spellings of one path are the
-/// same file). Unix behavior is unchanged (no folding, identity).
+/// same file) and on macOS (the default APFS/HFS+ volume is case-insensitive
+/// and case-preserving). Unix behavior is unchanged (no folding, identity).
+///
+/// The macOS fold carries the same documented ambiguity the Windows policy
+/// does: a case-sensitive APFS volume cannot be detected here, so a
+/// case-only collision conservatively serializes two names that volume
+/// treats as distinct — safety over throughput, never the reverse.
 fn normalize_owned_path(s: &str) -> String {
     let mut t = s.to_string();
     if cfg!(windows) {
@@ -80,11 +93,18 @@ fn normalize_owned_path(s: &str) -> String {
         }
         t = t.replace('\\', "/");
         t = t.to_ascii_lowercase();
+    } else if cfg!(target_os = "macos") {
+        t = t.to_ascii_lowercase();
     }
     t
 }
 
+/// Full-workspace ownership token (see [`OwnershipSet::workspace_root`]).
+const WORKSPACE_ROOT_SENTINEL: &str = "**";
 fn path_overlaps(a: &str, b: &str) -> bool {
+    if a == WORKSPACE_ROOT_SENTINEL || b == WORKSPACE_ROOT_SENTINEL {
+        return true;
+    }
     let (a, b) = (normalize_owned_path(a), normalize_owned_path(b));
     if a == b {
         return true;

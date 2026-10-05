@@ -514,11 +514,10 @@ export class EventStream {
       return;
     }
     if (tagged === HEARTBEAT_EVENT_NAME) {
-      // A heartbeat may carry an id (advances the resume cursor) or not
-      // (pure keep-alive). It is never delivered to the UI.
-      if (frameId !== null) {
-        this.cursorValue = Math.max(this.cursorValue, frameId);
-      }
+      // The contract says keep-alives carry NO id. A hostile/buggy heartbeat
+      // id must never move the resume cursor: doing so silently skips every
+      // durable event below it and `recover()` can never replay them. The
+      // JetBrains twin enforces the same rule (NativeEventStreamTest).
       return;
     }
     if (frameId === null) {

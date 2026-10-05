@@ -1074,9 +1074,34 @@ object FrontendSmoke {
             // never moves the watermark.
             panel.setBoard(parseNativeBoardPage(BOARD_PAGE_JSON), acknowledge = true)
             assertTrue(panel.headerText().contains("unread=0"), panel.headerText())
+            // Byte-bound parity with the daemon and the VS Code panel: 512
+            // emoji is 2048 UTF-8 bytes and must be refused LOCALLY (never
+            // accepted and silently truncated), while 340 bytes is inside.
+            panel.setComposerFields("\uD83D\uDE00".repeat(512), "body")
+            assertEquals(false, panel.postEnabled())
+            assertTrue(
+                panel.draftRefusal()?.contains("512") == true,
+                panel.draftRefusal()
+            )
+            panel.setComposerFields("s\u00e9".repeat(170), "body")
+            assertEquals(true, panel.postEnabled(), "340 bytes is inside the 512-byte bound")
+
             panel.reset()
             assertEquals(false, panel.available())
             assertEquals(false, panel.postEnabled())
+        }
+
+        step("display bounds strip invisible controls and never split surrogate pairs") {
+            // A cut between a high and a low surrogate backs off one unit
+            // instead of rendering U+FFFD: "a" + emoji + "b" bounded to 2.
+            assertEquals("a...", bound("a\uD83D\uDE00b", 2))
+            // At the exact boundary the pair is kept whole.
+            assertEquals("a\uD83D\uDE00", bound("a\uD83D\uDE00", 3))
+            // C0 controls and bidi overrides never reach a visible label.
+            assertEquals("abc", bound("a\u0000b\u200Ec", 10))
+            assertEquals("abc", bound("a\u2066b\u2069c", 10))
+            // Newlines and tabs are legitimate line structure and survive.
+            assertEquals("a\nb\tc", bound("a\nb\tc", 10))
         }
 
         step("evidence ref parsing mirrors the cockpit vocabulary") {
@@ -1394,14 +1419,27 @@ object FrontendSmoke {
                 byKey["check criterion"]?.snapshot?.contains("src 3") == true,
                 byKey["check criterion"]?.snapshot
             )
+            // Timestamps render as ISO-8601 UTC (seconds precision, matching
+            // the VS Code cockpit), never as raw epoch milliseconds.
             assertTrue(
-                byKey["check criterion"]?.verificationTimestamp?.contains("started 11ms") == true,
+                byKey["check criterion"]?.verificationTimestamp
+                    ?.contains("started 1970-01-01T00:00:00Z") == true,
                 byKey["check criterion"]?.verificationTimestamp
             )
             assertTrue(
-                byKey["check criterion"]?.verificationTimestamp?.contains("completed 22ms") == true,
+                byKey["check criterion"]?.verificationTimestamp
+                    ?.contains("completed 1970-01-01T00:00:00Z") == true,
                 byKey["check criterion"]?.verificationTimestamp
             )
+            assertTrue(
+                byKey["check criterion"]?.verificationTimestamp?.contains("11ms") != true,
+                "raw epoch milliseconds must never reach the panel"
+            )
+            // Whole-second instants carry EXACTLY one Z (Instant.toString()
+            // omits the fraction and used to get another Z appended).
+            assertEquals("1970-01-01T00:00:00Z", TaskTree.utcSecondsForTest(0L))
+            assertEquals("1970-01-01T00:00:01Z", TaskTree.utcSecondsForTest(1000L))
+            assertEquals(-1, TaskTree.utcSecondsForTest(1000L).indexOf("ZZ"))
             // Panel rendering: every served field survives into the label and
             // the verdict tones are distinct (unavailable is never
             // pass-styled).
@@ -2440,6 +2478,14 @@ object FrontendSmoke {
     private fun runAgainstRealDaemon(binaryPath: String) {
         val binary = Paths.get(binaryPath)
         val dataDir = Files.createTempDirectory("faktor-frontend-smoke-")
+        // The daemon's provider preflight requires a registered provider: seed
+        // the discovered config so the smoke's `default` id is served (an
+        // ollama entry is local-only and needs no key).
+        Files.write(
+            dataDir.resolve("faktor-plus.json"),
+            """{"config_version":1,"model":"default","providers":[{"kind":"ollama","id":"default","base_url":"http://127.0.0.1:9","allow_loopback":true}]}"""
+                .toByteArray()
+        )
         // The shadow mutation default copies the session's WORKSPACE on a
         // task start; a tiny dedicated workspace keeps the smoke hermetic
         // and fast instead of duplicating the whole checkout.

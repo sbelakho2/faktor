@@ -7,9 +7,12 @@ Crate: crates/sandbox (faktor-core, serde, serde_json, tracing; tempfile dev).
 ```rust
 pub struct SandboxPolicy { pub read_workspace: Rule, pub write_workspace: Rule,
     pub read_external: Rule, pub write_external: Rule, pub execute_shell: Rule,
-    pub network: NetworkPolicy, pub mcp: Rule, pub git: Rule }
+    pub network: NetworkPolicy, pub mcp: Rule, pub git: Rule,
+    pub network_guarantee: SandboxGuarantee, pub shell_execution: ShellExecutionMode,
+    pub filesystem_guarantee: FilesystemGuarantee }
 pub enum Rule { Allow, Deny, Ask }
-impl Default for SandboxPolicy { /* workspace rw Allow, external Ask, shell Ask, network AllowProviders, mcp Allow, git Allow */ }
+pub enum FilesystemGuarantee { Required, BestEffort, None }
+impl Default for SandboxPolicy { /* workspace rw Allow, external Ask, shell Ask, network AllowProviders, mcp Allow, git Allow, Required/OsIsolated/Required guarantees */ }
 pub struct PermissionEngine { policy: SandboxPolicy, workspace_root: Option<PathBuf> }
 impl PermissionEngine {
     pub fn new(policy: SandboxPolicy, workspace_root: Option<PathBuf>) -> Self;
@@ -20,7 +23,14 @@ impl PermissionEngine {
     pub fn policy(&self) -> &SandboxPolicy;
 }
 ```
-Rules: `is_within_workspace` canonicalizes the parent dir + joins the file name, rejects symlink escapes and `..`. External reads/writes evaluate against policy with the real path. Network destinations use NetworkPolicy::allows.
+Rules: `is_within_workspace` canonicalizes the parent dir + joins the file name,
+rejects symlink escapes and `..`. External reads/writes evaluate against policy with
+the real path. Network destinations use NetworkPolicy::allows. The spawn projection
+(`SandboxPolicy::spawn_profile`) is enforcement-honest: `filesystem: "workspace"`
+appears only where both external rules are `Deny`, the guarantee is `Required`, and
+the build has an OS filesystem backend (Linux Landlock); `BestEffort` projects
+`workspace_best_effort`, backend-less builds project `application-policy-only`, and
+a Required demand on such a build is a typed spawn refusal (audit P1).
 Adversarial tests: traversal matrix (.., abs, symlink, symlinked dir, unicode tricks), policy matrix (Allow/Deny/Ask per capability), network matrix (DenyAll/AllowProviders/AllowConfigured incl. subdomain escape), evaluate_never_panics_on_any_path, symlink_loop (a→b→a) terminates.
 
 ## Part B — faktor-mcp: JSON-RPC MCP client

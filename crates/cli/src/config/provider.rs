@@ -67,6 +67,12 @@ pub enum ProviderCfg {
         /// into; no other special class is ever allowed.
         #[serde(default)]
         allow_loopback: bool,
+        /// Extra served model ids for a custom OpenAI-compatible endpoint.
+        /// Declared ids carry the endpoint's generic capabilities, are
+        /// visible to session/model validation and routing, and are the
+        /// supported way to run non-official model ids locally.
+        #[serde(default)]
+        models: Vec<String>,
         #[serde(default)]
         pricing: Option<ProviderPricingCfg>,
         /// The additive per-instance quality declaration (quality-authority
@@ -719,11 +725,14 @@ impl ProviderCfg {
                 let cfg = faktor_ollama::OllamaConfig::new(base_url.clone());
                 faktor_ollama::OllamaProvider::new(cfg, transport.clone())
             }
-            ProviderCfg::OpenAi { base_url, .. } => {
+            ProviderCfg::OpenAi {
+                base_url, models, ..
+            } => {
                 let mut cfg = faktor_openai::OpenAiConfig::chat(base_url, self.key());
                 cfg.family = self
                     .openai_family()
                     .expect("open_ai entries always select an OpenAI family");
+                cfg = cfg.with_models(models.clone());
                 faktor_openai::OpenAiProvider::build(cfg, transport.clone())
             }
             ProviderCfg::Anthropic { .. } => {

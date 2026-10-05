@@ -1,0 +1,9 @@
+{
+  "id": "INV-CI-THREE-PLATFORM-AGGREGATE",
+  "file": "scripts/certification/publish-status.mjs",
+  "find": "export const AGGREGATE_CONTEXTS = {\n  linux: 'ci/faktor/trusted-certified-linux',\n  darwin: 'ci/faktor/trusted-certified-darwin',\n  windows: 'ci/faktor/trusted-certified-windows',\n};",
+  "replace": "export const AGGREGATE_CONTEXTS = {\n  linux: 'ci/faktor/trusted-certified-linux',\n  darwin: 'ci/faktor/trusted-certified-darwin',\n};",
+  "gate": "node scripts/certification/publish-status.mjs selftest",
+  "expect": "selftest FAIL",
+  "note": "Removes the windows lookup entirely: linux+darwin alone would aggregate the release status green (and a duplicate linux status could masquerade as windows), defeating the three-platform proof. The selftest's missing/failing-windows and windows-required rows must fail."
+}

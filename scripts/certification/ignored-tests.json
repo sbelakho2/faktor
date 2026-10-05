@@ -28,7 +28,7 @@
     "soak": {
       "workflow": "nightly",
       "step": "soak",
-      "command": "bash scripts/soak.sh -p faktor-tests-accounting-modelcheck --release -- --ignored"
+      "command": "bash scripts/soak.sh --mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck --release -- --ignored --skip soak_12h_scale"
     },
     "perf": {
       "workflow": "trusted",
@@ -101,6 +101,11 @@
       "file": "crates/updater/tests/release_flip.rs",
       "fn": "the_running_binary_changes_with_the_activated_release",
       "lane": "fault"
+    },
+    {
+      "file": "tests/soak/src/lib.rs",
+      "fn": "soak_convergence_churn",
+      "lane": "soak"
     },
     {
       "file": "tests/accounting-modelcheck/src/lib.rs",
@@ -212,19 +217,19 @@
       "file": "tests/longrun/src/lib.rs",
       "fn": "soak_24h_zero_drift_certification",
       "tag": "soak",
-      "reason": "24h wall-clock soak exceeds the nightly pipeline timeout; run explicitly"
+      "reason": "standalone 24h ledger zero-drift variant; the nightly soak lane owns the real-time 24h convergence acceptance (scripts/soak.sh --mode realtime); run explicitly for this ledger variant"
     },
     {
       "file": "tests/quality/src/lib.rs",
       "fn": "quality_10000_turn_no_quality_regression",
       "tag": "soak",
-      "reason": "10k-turn no-quality-regression certification; run explicitly"
+      "reason": "very long quality campaign; the nightly real-time convergence lane owns the promoted 24h acceptance; run explicitly for the 10k-turn quality ledger"
     },
     {
       "file": "tests/soak/src/lib.rs",
       "fn": "soak_12h_scale",
       "tag": "soak",
-      "reason": "12-hour wall-clock scale soak; run explicitly"
+      "reason": "legacy accelerated 10k-op scale shape; the nightly real-time convergence lane (scripts/soak.sh --mode realtime, exact-SHA) is the promoted acceptance run and skips this test; run explicitly only for the legacy synthetic shape"
     },
     {
       "file": "tests/visual/tests/gen_fixtures.rs",

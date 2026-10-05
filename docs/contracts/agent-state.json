@@ -1,0 +1,76 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "agent_state",
+  "type": "faktor_core::state::AgentState",
+  "representation": "external",
+  "variants": [
+    {
+      "name": "Idle",
+      "wire": "idle"
+    },
+    {
+      "name": "Preparing",
+      "wire": "preparing"
+    },
+    {
+      "name": "BuildingContext",
+      "wire": "building_context"
+    },
+    {
+      "name": "WaitingForModel",
+      "wire": "waiting_for_model"
+    },
+    {
+      "name": "Streaming",
+      "wire": "streaming"
+    },
+    {
+      "name": "ToolRequested",
+      "wire": "tool_requested"
+    },
+    {
+      "name": "WaitingForPermission",
+      "wire": "waiting_for_permission"
+    },
+    {
+      "name": "ExecutingTool",
+      "wire": "executing_tool"
+    },
+    {
+      "name": "Validating",
+      "wire": "validating"
+    },
+    {
+      "name": "UpdatingMemory",
+      "wire": "updating_memory"
+    },
+    {
+      "name": "ReadyForNextTurn",
+      "wire": "ready_for_next_turn"
+    },
+    {
+      "name": "Completed",
+      "wire": "completed"
+    },
+    {
+      "name": "Cancelled",
+      "wire": "cancelled"
+    },
+    {
+      "name": "FailedRecoverable",
+      "wire": "failed_recoverable"
+    },
+    {
+      "name": "FailedPermanent",
+      "wire": "failed_permanent"
+    },
+    {
+      "name": "NeedsUserInput",
+      "wire": "needs_user_input"
+    },
+    {
+      "name": "Suspended",
+      "wire": "suspended"
+    }
+  ]
+}

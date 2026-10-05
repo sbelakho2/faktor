@@ -24,7 +24,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use faktor_cloud::rbac::{Action, Resource, Role};
+use faktor_cloud::rbac::{Action, PrincipalSubject, Resource, Role};
 use faktor_cloud::{ApprovalStatus, ControlPlaneError, OrganizationId, Page};
 use faktor_protocol::error::ApiError;
 
@@ -178,6 +178,19 @@ pub(crate) struct InviteMemberBody {
     role: String,
 }
 
+/// Strict native accept-invitation DTO (`POST /native/invitations/accept`).
+/// The idempotency key rides the BODY here (unlike the header-keyed org
+/// routes) so a client holding only the invitation token can replay the
+/// acceptance without first resolving an organization; the SAME
+/// [`faktor_cloud::ControlPlane::validate_idempotency_key`] contract and
+/// same-key replay/different-request-conflict semantics apply.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptInvitationBody {
+    token: String,
+    idempotency_key: String,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateApprovalBody {
@@ -232,7 +245,19 @@ pub(crate) async fn native_identity(State(state): State<AppState>, headers: Head
 pub(crate) async fn native_orgs_list(
     State(state): State<AppState>,
     headers: HeaderMap,
+    query: Result<Query<PageQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    // Strict DTOs everywhere: unknown/out-of-band pagination is a typed 400
+    // (this route used to ignore `?limit=0`, `?limit=abc` and `?bogus=1`).
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return wire_status(malformed_body("invalid query parameters (strict DTO)"));
+        }
+    };
+    if let Err(e) = page_limit(query.limit) {
+        return wire_status(e);
+    }
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
@@ -285,7 +310,7 @@ pub(crate) async fn native_orgs_create(
         Err(_) => {
             return wire_status(malformed_body(
                 "invalid organization bootstrap body (strict DTO)",
-            ))
+            ));
         }
     };
     let idempotency_key = match require_idempotency_key(&headers) {
@@ -434,6 +459,67 @@ pub(crate) async fn native_org_members_invite(
     }
 }
 
+/// `POST /native/invitations/accept` — accept ONE invitation as the
+/// authenticated control-plane user (idempotency-keyed by the body's
+/// `idempotency_key`).
+///
+/// The accepting user is the principal's subject: the invitation must have
+/// been issued to that user's email (a foreign principal — a different
+/// tenant's user or a service account — is refused typed and creates no
+/// membership). The service commits the membership insert and the
+/// invitation-accepted update in ONE transaction with the idempotency
+/// claim: a same-key replay returns the recorded membership, a NEW key
+/// against an already-decided invitation is a typed 409 conflict, and an
+/// expired/revoked/unknown token is a typed 409/401 — never a second
+/// membership.
+///
+/// The route rides the daemon password PLUS the control-plane principal,
+/// exactly like the other mutating control-plane routes.
+pub(crate) async fn native_invitation_accept(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<AcceptInvitationBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return wire_status(malformed_body(
+                "invalid invitation accept body (strict DTO)",
+            ));
+        }
+    };
+    let principal = match require_principal(&state, &headers) {
+        Ok(p) => p,
+        Err(e) => return wire_status(e),
+    };
+    let user =
+        match &principal.subject {
+            PrincipalSubject::User(id) => id.clone(),
+            PrincipalSubject::ServiceAccount(_) => return wire_status(ApiError {
+                code: "permission_denied",
+                message:
+                    "a service account cannot accept an invitation; invitations bind to user emails"
+                        .into(),
+                http_status: 403,
+                retryable: false,
+            }),
+        };
+    let Some(control_plane) = state.deps.control_plane.as_ref() else {
+        return wire_status(cloud_disabled());
+    };
+    match control_plane.accept_invitation(&body.token, &user, &body.idempotency_key) {
+        Ok(membership) => Json(serde_json::json!({
+            "ok": true,
+            "membership": membership,
+        }))
+        .into_response(),
+        Err(e) => wire_status(control_plane_err(e)),
+    }
+}
+
 /// `GET /native/repositories` — one cursor page of the caller's
 /// organization's synced repositories.
 pub(crate) async fn native_repositories(
@@ -545,7 +631,7 @@ pub(crate) async fn native_approvals_list(
             None => {
                 return wire_status(malformed_body(
                     "status must be one of open|approved|rejected",
-                ))
+                ));
             }
         },
     };
@@ -630,7 +716,7 @@ pub(crate) async fn native_approvals_decide(
         Err(_) => {
             return wire_status(malformed_body(
                 "invalid approval decision body (strict DTO)",
-            ))
+            ));
         }
     };
     let principal = match require_principal(&state, &headers) {

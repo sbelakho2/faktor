@@ -125,11 +125,37 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     fun available(): Boolean = available
 
-    fun label(index: Int): String {
-        val session = model.getElementAt(index)
+    fun label(index: Int): String = sessionLabel(model.getElementAt(index))
+
+    /** One bounded session row (the renderer and the test helper share it). */
+    private fun sessionLabel(session: NativeSessionSummary): String {
         val current = if (session.id == currentSessionId) " (current)" else ""
         return "${session.id} [${session.state}] ${session.provider}/${session.model} " +
-            "price ${bound(session.title, 80)}$current"
+            "${bound(session.title, 80)}$current"
+    }
+
+    /**
+     * The REAL list path must use the same bounded label as [label]: without
+     * a renderer, DefaultListCellRenderer shows NativeSessionSummary
+     * .toString() raw (unbounded upstream title).
+     */
+    private inner class SessionCellRenderer : javax.swing.DefaultListCellRenderer() {
+        override fun getListCellRendererComponent(
+            list: JList<*>?,
+            value: Any?,
+            index: Int,
+            selected: Boolean,
+            focus: Boolean
+        ): java.awt.Component {
+            super.getListCellRendererComponent(list, value, index, selected, focus)
+            val session = value as? NativeSessionSummary ?: return this
+            text = sessionLabel(session)
+            return this
+        }
+    }
+
+    init {
+        list.cellRenderer = SessionCellRenderer()
     }
 
     fun select(index: Int) {
@@ -161,7 +187,7 @@ class HistoryPanel : JPanel(BorderLayout()) {
         status.text = if (!available) {
             "history: unavailable ($reason)"
         } else {
-            "history: ${model.size} session(s), current=${currentSessionId ?: "-"}"
+            "history: ${plural(model.size, "session")}, current=${currentSessionId ?: "-"}"
         }
     }
 }

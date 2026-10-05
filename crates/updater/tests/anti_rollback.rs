@@ -43,6 +43,12 @@ impl FakeFetcher {
             .insert(url.to_string(), payload.to_vec());
     }
 
+    /// Deny one URL: the next fetch for it is a typed transport refusal (the
+    /// egress-denied shape).
+    fn deny(&self, url: &str) {
+        self.payloads.lock().unwrap().remove(url);
+    }
+
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
@@ -282,8 +288,8 @@ async fn admission_raises_the_durable_floor_and_a_reopen_cannot_lower_it() {
         b"gen5",
     );
 
-    // Admit generation 5 and "crash" before activation completes: the floor
-    // is already durable (record-first).
+    // Admit generation 5 and complete a verified stage: the floor is durable
+    // because the artifact was actually published (commit-after-publish).
     {
         let store = Arc::new(SqliteUpdaterStore::open(&db).unwrap());
         let updater = Updater::with_default_probe(
@@ -832,5 +838,293 @@ async fn recovery_of_an_interrupted_downgrade_completes_the_floor_reset() {
             .unwrap()
             .digest,
         v3
+    );
+}
+
+// ------------------------------------------- commit-after-verified-publish
+
+/// Adversarial: a stage whose downloaded bytes fail the signed digest is a
+/// TYPED refusal and must NOT raise the durable floor — the running stage row
+/// is only a pending admission and a bad digest voids it. A LOWER signed
+/// generation stays admissible afterwards (check and stage both).
+#[tokio::test]
+async fn a_failed_bad_digest_stage_does_not_raise_the_floor() {
+    let fixture = memory_fixture(false, []);
+    let (signed, digest) =
+        signed_manifest(&fixture.fetcher, &fixture.key, "5.0.0", Some(5), b"gen5");
+    // The manifest is signed over `gen5`; the transport serves different
+    // bytes (a mirror compromise / truncation).
+    assert_eq!(digest, manifest::sha256_hex(b"gen5"));
+    fixture.fetcher.serve(
+        "https://mirror.test/5.0.0/faktor-cli-5.0.0-darwin-arm64.tar.gz",
+        b"tampered payload",
+    );
+    let err = fixture
+        .updater
+        .stage(&signed, &components(), None, NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "digest_mismatch");
+    assert!(matches!(err, UpdateError::DigestMismatch { .. }));
+    assert_eq!(
+        floor(&fixture.updater, "stable"),
+        None,
+        "a bad-digest stage never raises the floor"
+    );
+    assert!(!fixture
+        .updater
+        .layout()
+        .artifact_path("faktor-cli-5.0.0-darwin-arm64.tar.gz", &digest)
+        .exists());
+    let stages: Vec<UpdateOperation> = fixture
+        .store
+        .list(64)
+        .unwrap()
+        .into_iter()
+        .filter(|op| op.kind == UpdateOpKind::Stage)
+        .collect();
+    assert_eq!(stages.len(), 1);
+    assert_eq!(stages[0].status, UpdateOpStatus::Failed);
+    assert!(
+        stages[0].detail.as_deref().unwrap().contains("voided"),
+        "the failed row records the voided admission: {:?}",
+        stages[0].detail
+    );
+
+    // A LOWER generation is still admitted and staged: the failed download
+    // left no floor behind.
+    let (lower, lower_digest) =
+        signed_manifest(&fixture.fetcher, &fixture.key, "1.0.0", Some(1), b"gen1");
+    assert!(fixture
+        .updater
+        .check(&lower, &components(), NOW + 1)
+        .is_ok());
+    let staged = fixture
+        .updater
+        .stage(&lower, &components(), None, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(staged.release_generation, 1);
+    assert_eq!(floor(&fixture.updater, "stable"), Some(1));
+    assert_eq!(lower_digest, manifest::sha256_hex(b"gen1"));
+}
+
+/// Adversarial: an egress-denied (transport-refused) download is a typed,
+/// retryable failure that must NOT raise the durable floor. A lower signed
+/// generation stages normally afterwards.
+#[tokio::test]
+async fn an_egress_denied_stage_does_not_raise_the_floor() {
+    let fixture = memory_fixture(false, []);
+    let (signed, _) = signed_manifest(&fixture.fetcher, &fixture.key, "7.0.0", Some(7), b"gen7");
+    // The URL the signed manifest names is denied by the transport.
+    fixture
+        .fetcher
+        .deny("https://mirror.test/7.0.0/faktor-cli-7.0.0-darwin-arm64.tar.gz");
+    let err = fixture
+        .updater
+        .stage(&signed, &components(), None, NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "transport");
+    assert!(err.retryable(), "a transport refusal stays retryable");
+    assert_eq!(
+        floor(&fixture.updater, "stable"),
+        None,
+        "a denied download never raises the floor"
+    );
+
+    // A lower generation is still admitted and staged after the denial.
+    let (lower, _) = signed_manifest(&fixture.fetcher, &fixture.key, "1.0.0", Some(1), b"gen1");
+    assert!(fixture
+        .updater
+        .check(&lower, &components(), NOW + 1)
+        .is_ok());
+    let staged = fixture
+        .updater
+        .stage(&lower, &components(), None, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(staged.release_generation, 1);
+    assert_eq!(floor(&fixture.updater, "stable"), Some(1));
+}
+
+/// Adversarial crash windows of the pending admission:
+///
+/// - a crash between the admission (running `stage` row) and the publish
+///   leaves NO published artifact: recovery VOIDS the admission and the
+///   floor is exactly what it was before (never raised, never lowered);
+/// - a crash after the VERIFIED publish but before the commit: recovery
+///   finds the content-addressed bytes and COMMITS the admission, raising
+///   the floor to the published generation.
+#[tokio::test]
+async fn recovery_voids_an_unpublished_admission_and_commits_a_published_one() {
+    let fixture = memory_fixture(false, []);
+    // Establish a floor of 3 with a completed verified stage.
+    let (v3, v3_digest) = signed_manifest(&fixture.fetcher, &fixture.key, "3.0.0", Some(3), b"v3");
+    fixture
+        .updater
+        .stage(&v3, &components(), None, NOW)
+        .await
+        .unwrap();
+    assert_eq!(floor(&fixture.updater, "stable"), Some(3));
+
+    // Crash window A: the admission row is durable (Running) but the
+    // download never published anything.
+    let mut unpublished = UpdateOperation::new(UpdateOpKind::Stage, NOW + 1, None);
+    unpublished.channel = Some("stable".into());
+    unpublished.after_version = Some("7.0.0".into());
+    unpublished.after_digest = Some("7".repeat(64));
+    unpublished.artifact = Some("faktor-cli-7.0.0-darwin-arm64.tar.gz".into());
+    unpublished.release_generation = Some(7);
+    fixture.store.insert(&unpublished.clone()).unwrap();
+    let outcomes = fixture.updater.recover(NOW + 2).unwrap();
+    assert!(
+        matches!(outcomes[0], RecoveryOutcome::Abandoned { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        floor(&fixture.updater, "stable"),
+        Some(3),
+        "an unpublished admission is voided: the floor is neither raised nor lowered"
+    );
+    let recovered = fixture.store.get(unpublished.id.as_str()).unwrap().unwrap();
+    assert_eq!(recovered.status, UpdateOpStatus::Failed);
+    assert!(
+        recovered.detail.as_deref().unwrap().contains("voided"),
+        "{:?}",
+        recovered.detail
+    );
+
+    // The lower generation is still refused (floor 3) and the equal one is
+    // still admitted: the voided admission changed nothing.
+    let (v1, _) = signed_manifest(&fixture.fetcher, &fixture.key, "1.0.0", Some(1), b"v1");
+    assert_eq!(
+        fixture
+            .updater
+            .check(&v1, &components(), NOW + 3)
+            .unwrap_err()
+            .code(),
+        "rollback_refused"
+    );
+    assert!(fixture.updater.check(&v3, &components(), NOW + 4).is_ok());
+
+    // Crash window B: the verified bytes WERE published (content-addressed)
+    // but the commit never ran.
+    let payload = b"gen9-published";
+    let digest = manifest::sha256_hex(payload);
+    let name = format!("faktor-cli-9.0.0-{OS}-{ARCH}.tar.gz");
+    let mut published = UpdateOperation::new(UpdateOpKind::Stage, NOW + 5, None);
+    published.channel = Some("stable".into());
+    published.after_version = Some("9.0.0".into());
+    published.after_digest = Some(digest.clone());
+    published.artifact = Some(name.clone());
+    published.release_generation = Some(9);
+    let staged_file = fixture
+        .updater
+        .layout()
+        .staging_file(published.id.as_str(), &name);
+    std::fs::create_dir_all(staged_file.parent().unwrap()).unwrap();
+    std::fs::write(&staged_file, payload).unwrap();
+    fixture
+        .updater
+        .layout()
+        .publish_staged(&staged_file, &name, &digest)
+        .unwrap();
+    fixture.store.insert(&published.clone()).unwrap();
+    let outcomes = fixture.updater.recover(NOW + 6).unwrap();
+    assert!(
+        matches!(outcomes[0], RecoveryOutcome::Abandoned { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        floor(&fixture.updater, "stable"),
+        Some(9),
+        "a published admission is committed by recovery"
+    );
+    let recovered = fixture.store.get(published.id.as_str()).unwrap().unwrap();
+    assert_eq!(recovered.status, UpdateOpStatus::Failed);
+    assert!(
+        recovered.detail.as_deref().unwrap().contains("committed"),
+        "{:?}",
+        recovered.detail
+    );
+    // The committed floor now refuses the older release.
+    let err = fixture
+        .updater
+        .check(&v1, &components(), NOW + 7)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            UpdateError::RollbackRefused {
+                high_water: 9,
+                offered: 1,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(v3_digest, manifest::sha256_hex(b"v3"));
+}
+
+/// Adversarial: a FAILED legacy-manifest stage must not consume the one-time
+/// allowance. Exactly one legacy manifest can ever be admitted; a
+/// bad-digest failure leaves the allowance intact, so a subsequent good
+/// legacy stage is still the one admissible migration.
+#[tokio::test]
+async fn a_failed_legacy_stage_does_not_consume_the_one_time_allowance() {
+    let fixture = memory_fixture(true, []);
+    let (bad, _) = signed_manifest(&fixture.fetcher, &fixture.key, "0.2.0", None, b"legacy-bad");
+    fixture.fetcher.serve(
+        "https://mirror.test/0.2.0/faktor-cli-0.2.0-darwin-arm64.tar.gz",
+        b"tampered",
+    );
+    let err = fixture
+        .updater
+        .stage(&bad, &components(), None, NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "digest_mismatch");
+    assert_eq!(
+        floor(&fixture.updater, "stable"),
+        None,
+        "a failed legacy stage does not create a floor"
+    );
+    assert!(
+        fixture.store.high_water("stable").unwrap().is_none(),
+        "a failed legacy stage does not consume the allowance"
+    );
+
+    // The good legacy manifest is still admitted exactly once and consumes
+    // the allowance durably.
+    let (good, _) = signed_manifest(
+        &fixture.fetcher,
+        &fixture.key,
+        "0.2.0",
+        None,
+        b"legacy-good",
+    );
+    let staged = fixture
+        .updater
+        .stage(&good, &components(), None, NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(staged.release_generation, 0);
+    let mark = fixture
+        .store
+        .high_water("stable")
+        .unwrap()
+        .expect("the successful legacy stage commits the floor");
+    assert_eq!(mark.generation, 0);
+    assert!(mark.legacy_consumed);
+    // The second legacy manifest is refused.
+    let (second, _) = signed_manifest(&fixture.fetcher, &fixture.key, "0.3.0", None, b"legacy-2");
+    assert_eq!(
+        fixture
+            .updater
+            .check(&second, &components(), NOW + 2)
+            .unwrap_err()
+            .code(),
+        "legacy_manifest_refused"
     );
 }

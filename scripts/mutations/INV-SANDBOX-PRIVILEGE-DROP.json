@@ -1,8 +1,8 @@
 {
   "id": "INV-SANDBOX-PRIVILEGE-DROP",
   "file": "crates/terminal/src/lib.rs",
-  "find": "        NetworkIsolation::DenyAll => Error::permission(format!(\n            \"{DENY_ALL_REFUSAL_PREFIX} of `{}`: the isolated child could not be created \\\n             ({e}); never running it unenforced\",\n            cfg.cmd\n        )),",
-  "replace": "        NetworkIsolation::DenyAll => Error::internal(format!(\n            \"{DENY_ALL_REFUSAL_PREFIX} of `{}`: the isolated child could not be created \\\n             ({e}); never running it unenforced\",\n            cfg.cmd\n        )),",
+  "find": "    Error::permission(format!(\n        \"sandbox unavailable: refusing spawn under {} of `{}`: the confined child could not be \\\n         created ({e}); never running it unenforced\",",
+  "replace": "    Error::internal(format!(\n        \"sandbox unavailable: refusing spawn under {} of `{}`: the confined child could not be \\\n         created ({e}); never running it unenforced\",",
   "gate": "cargo test -p faktor-terminal --lib deny_all_spawn_isolates_the_child_or_refuses_typed",
-  "note": "Planted at the typed-refusal authority: a failed isolation/drop now refuses UNTYPED (internal), so the oracle's Permission+message contract fails. HONEST LIMIT: the literal 'skip the capset' variant is unobservable on hosts where unshare(CLONE_NEWNET) is refused before the drop runs (this host), because the oracle then only exercises the refusal path; this mutation attacks that same fail-closed contract on every host."
+  "note": "Planted at the typed-refusal authority: a failed confinement/drop now refuses UNTYPED (internal), so the oracle's Permission+message contract fails. HONEST LIMIT: the literal 'skip the capset' variant is unobservable on hosts where the isolation backend is refused before the drop runs (this host), because the oracle then only exercises the refusal path; this mutation attacks that same fail-closed contract on every host."
 }

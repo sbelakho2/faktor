@@ -48,6 +48,8 @@ import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.view
 import java.awt.Component
 import java.awt.Container
+import java.awt.Font
+import java.awt.font.FontRenderContext
 import java.awt.image.BufferedImage
 import java.io.File
 import java.security.MessageDigest
@@ -393,6 +395,49 @@ internal object ParityMatrix {
         assertTrue(
             visualCoverageOf(complete).values.all { it == "certified" },
             "self-test: complete coverage must be certified"
+        )
+        // Font/environment attribution: a record whose environment carries a
+        // fingerprint that does not match this host reports not_certified for
+        // mismatching rows (never a false code drift), while a matching
+        // digest under that environment still passes.
+        val foreignEnvironment = baselineText(windows = true)
+            .replace("linux-amd64-jvm17", "linux-amd64-jvm17-fdeadbeef1234")
+        val fingerprinted = parseVisualBaseline(JsonCodec.parse(foreignEnvironment))
+            ?: fail("self-test: fingerprinted v3 baseline must parse")
+        val environmentMismatch = applyVisualEnvironmentPolicy(
+            "linux",
+            fingerprinted,
+            visualResultsFor(
+                "linux",
+                fingerprinted,
+                mapOf("task-tree" to "aa", "settings" to "zz")
+            )
+        )
+        assertTrue(
+            environmentMismatch.single { it.panel == "settings" }.notCertified,
+            "self-test: a mismatch on a foreign font environment must be not_certified"
+        )
+        assertTrue(
+            environmentMismatch.single { it.panel == "task-tree" }.passed,
+            "self-test: a matching digest stays passed even on a foreign environment"
+        )
+        // A legacy record without a fingerprint keeps the drift comparison.
+        val legacyMismatch = applyVisualEnvironmentPolicy(
+            "linux",
+            complete,
+            visualResultsFor(
+                "linux",
+                complete,
+                mapOf("task-tree" to "aa", "settings" to "zz")
+            )
+        )
+        assertTrue(
+            legacyMismatch.single { it.panel == "settings" }.drifted,
+            "self-test: a legacy record without a fingerprint keeps drift semantics"
+        )
+        assertTrue(
+            fontFingerprint().length == 64,
+            "self-test: the font fingerprint must be a full sha256 hex string"
         )
     }
 
@@ -776,7 +821,56 @@ internal object ParityMatrix {
         }
         val baseline = readVisualBaseline(baselineFile)
         visualCoverage = visualCoverageOf(baseline)
-        return visualResultsFor(platform, baseline, digests)
+        return applyVisualEnvironmentPolicy(
+            platform,
+            baseline,
+            visualResultsFor(platform, baseline, digests)
+        )
+    }
+
+    /**
+     * A digest mismatch is attributable to code ONLY when the render ran in
+     * the certified environment. When the record carries a font fingerprint
+     * and this host's environment differs, mismatching rows are reported
+     * `not_certified` with the typed environment reason rather than a false
+     * `drifted` regression. A matching digest stays `passed` (a match under
+     * another environment is stronger evidence), and a record without a
+     * fingerprint (legacy) keeps the digest-only comparison.
+     */
+    internal fun applyVisualEnvironmentPolicy(
+        platform: String,
+        baseline: VisualBaseline?,
+        results: List<ParityVisualResult>
+    ): List<ParityVisualResult> {
+        val record = baseline?.platforms?.get(platform) ?: return results
+        val current = visualEnvironment()
+        if (!hasFontFingerprint(record.environment) || record.environment == current) {
+            return results
+        }
+        return results.map { result ->
+            if (result.drifted) {
+                ParityVisualResult(
+                    result.panel,
+                    "not_certified",
+                    result.digest,
+                    result.baseline,
+                    platform,
+                    "rendering environment differs from the certified record " +
+                        "(record: ${record.environment}; this host: $current); " +
+                        "the digest comparison is not attributable to code drift"
+                )
+            } else {
+                result
+            }
+        }
+    }
+
+    /** True when an environment string carries a resolved-font fingerprint. */
+    private fun hasFontFingerprint(environment: String): Boolean {
+        val marker = environment.lastIndexOf("-f")
+        if (marker < 0) return false
+        val token = environment.substring(marker + 2)
+        return token.length >= 8 && token.all { it in '0'..'9' || it in 'a'..'f' }
     }
 
     /**
@@ -814,7 +908,14 @@ internal object ParityMatrix {
         }
     }
 
-    /** The stable fingerprint of the rendering host (OS + arch + JVM major). */
+    /**
+     * The stable fingerprint of the rendering host: OS + arch + JVM major +
+     * resolved logical-font metrics (the component/state digest's bounds
+     * derive from font metrics, so a record is only valid for the font
+     * environment it was pinned in). A record's fingerprint lets a host with
+     * different fonts report `not_certified` with a typed environment reason
+     * instead of a false `drifted` code regression.
+     */
     private fun visualEnvironment(): String {
         fun slug(raw: String): String =
             asciiLowerCase(raw).replace(Regex("[^a-z0-9]+"), "-").trim('-')
@@ -826,7 +927,34 @@ internal object ParityMatrix {
             ?.filter { it in '0'..'9' }
             .orEmpty()
             .ifEmpty { "unknown" }
-        return "$os-$arch-jvm$jvm"
+        return "$os-$arch-jvm$jvm-f${fontFingerprint().take(12)}"
+    }
+
+    /**
+     * Deterministic hash of the RESOLVED logical-font metrics (family, style,
+     * a fixed string's advance width, line ascent/descent). Physical font
+     * files are not readable through the AWT API, and names are not stable
+     * identities, so the metrics are the portable identity: identical font
+     * environments hash identically, a font-set or font-version change does
+     * not.
+     */
+    internal fun fontFingerprint(): String {
+        val sb = StringBuilder()
+        val context = FontRenderContext(null, true, true)
+        for (family in listOf(Font.DIALOG, Font.SANS_SERIF, Font.SERIF, Font.MONOSPACED)) {
+            for (style in listOf(Font.PLAIN, Font.BOLD, Font.ITALIC, Font.BOLD or Font.ITALIC)) {
+                val font = Font(family, style, 12)
+                val sample = "Faktor parity 0123"
+                val bounds = font.getStringBounds(sample, context)
+                val metrics = font.getLineMetrics(sample, context)
+                sb.append(family).append('|').append(style).append('|')
+                    .append(font.family).append('|')
+                    .append(bounds.width).append('|')
+                    .append(metrics.ascent).append('|')
+                    .append(metrics.descent).append('\n')
+            }
+        }
+        return ParityPath.sha256Hex(sb.toString().toByteArray(Charsets.UTF_8))
     }
 
     /**
@@ -871,6 +999,19 @@ internal object ParityMatrix {
         out.append("  \"method\": ")
         JsonCodec.writeString(out, VISUAL_METHOD)
         out.append(",\n")
+        // One-time re-pin provenance, preserved verbatim across re-pins: the
+        // Windows record must be produced by a Windows render (its own
+        // `windows-...-f<hex>` environment fingerprint) via the owned lane.
+        out.append("  \"rePin\": {\n")
+        out.append("    \"windows\": ")
+        JsonCodec.writeString(out, VISUAL_WINDOWS_RE_PIN)
+        out.append(",\n")
+        out.append("    \"linux\": ")
+        JsonCodec.writeString(out, VISUAL_LINUX_RE_PIN)
+        out.append(",\n")
+        out.append("    \"fonts\": ")
+        JsonCodec.writeString(out, VISUAL_FONT_ENVIRONMENT)
+        out.append("\n  },\n")
         out.append("  \"requiredPlatforms\": [")
         for ((index, required) in REQUIRED_VISUAL_PLATFORMS.withIndex()) {
             JsonCodec.writeString(out, required)
@@ -1233,6 +1374,16 @@ internal data class RenderStats(
 
 internal const val VISUAL_METHOD =
     "offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline"
+
+/** One-time per-platform re-pin provenance written into the baseline file
+ * (and preserved across re-pins). The Windows record may ONLY come from the
+ * Windows-owned lane; a platform is never pinned from another host. */
+internal const val VISUAL_WINDOWS_RE_PIN =
+    "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1 -WriteBaselines (on the Windows agent); commit target/certification/visual-baselines-windows.json into this file's windows record"
+internal const val VISUAL_LINUX_RE_PIN =
+    "bash apps/jetbrains/compile-and-smoke.sh --write-baselines (or ./gradlew :frontend:smoke -PwriteBaselines=true) on the Linux host, under the pinned core-fonts fontconfig"
+internal const val VISUAL_FONT_ENVIRONMENT =
+    "apps/jetbrains/frontend/src/test/resources/parity/fonts/core-fonts.conf (FONTCONFIG_FILE); digest bounds derive from resolved font metrics"
 
 /** Baseline schema v3: distinct per-platform records, no inherited pin. */
 internal const val VISUAL_BASELINE_SCHEMA = "faktor-parity-visual-baselines/v3"

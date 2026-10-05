@@ -1207,7 +1207,10 @@ fn enterprise_layers_are_policy_vs_preference_and_loosening_is_refused() {
         }"#,
     )
     .unwrap();
-    cfg.validate().unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "a preference outside policy must refuse AT LOAD (no enterprise DB created)"
+    );
     let layers = cfg.enterprise.layers().unwrap();
     let error = faktor_cloud::resolve_layers(&layers).unwrap_err();
     assert!(

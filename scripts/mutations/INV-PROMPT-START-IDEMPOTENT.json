@@ -1,8 +1,9 @@
 {
   "id": "INV-PROMPT-START-IDEMPOTENT",
   "file": "crates/store/src/prompt_admission.rs",
-  "find": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(PromptAdmissionClaim::InFlight)\n                }",
-  "replace": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(PromptAdmissionClaim::Fresh)\n                }",
-  "gate": "cargo test -p faktor-store --lib prompt_claim_fresh_then_complete_replays_the_exact_receipt_bytes",
-  "note": "A pending prompt key is admitted as Fresh again: the duplicate prompt can execute while the first is in flight."
+  "find": "                    if stored_digest != request_digest {\n                        PromptAdmissionClaim::KeyReused { stored_digest }\n                    } else {",
+  "replace": "                    if false {\n                        PromptAdmissionClaim::KeyReused { stored_digest }\n                    } else {",
+  "gate": "cargo test -p faktor-store --lib prompt_same_key_with_a_different_digest_is_key_reused_after_completion",
+  "expect": "assertion.*failed|left.*right",
+  "note": "A completed prompt key with a DIFFERENT body digest is replayed as Complete instead of the typed KeyReused: a changed prompt is silently answered with the previous receipt."
 }

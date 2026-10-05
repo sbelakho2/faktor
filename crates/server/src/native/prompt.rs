@@ -43,6 +43,16 @@ pub struct PromptRequest {
     /// original receipt on a repeated key. `None` (ACP and the plain prompt
     /// route) keeps the unkeyed legacy prompt path.
     pub submission_id: Option<String>,
+    /// A reservation the CALLER already claimed durably (audit P1): the
+    /// ordinary-prompt route reserves the turn's op id with its
+    /// `prompt_admission` claim and threads it here, so the admitted turn
+    /// journals exactly the op id the claim names. `None` leaves the
+    /// executor's own allocation untouched.
+    pub reserved_op_id: Option<OpId>,
+    /// The request digest of the caller's admission claim (audit P1),
+    /// recorded on the run row so admission recovery can detect a tampered
+    /// linkage row. `None` for unkeyed prompts.
+    pub admission_digest: Option<String>,
     /// Attached file paths (the SDK prompt vocabulary).
     pub files: Vec<String>,
     /// Durable typed binary/image attachments (`AttachmentId` rows),
@@ -190,6 +200,8 @@ impl PromptExecutionService {
             goal: request.prompt,
             work_items: vec![item],
             submission_id: request.submission_id,
+            reserved_op_id: request.reserved_op_id,
+            admission_digest: request.admission_digest,
             model: request.model,
             criteria: request.criteria,
             files: request.files,

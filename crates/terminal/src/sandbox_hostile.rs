@@ -16,8 +16,8 @@ use std::time::Duration;
 use faktor_core::command::EnvSpec;
 
 use crate::{
-    NetworkEnforcement, NetworkIsolation, NetworkIsolationRequirement, ProcessOwner,
-    ProcessSupervisor, SpawnConfig,
+    FilesystemIsolation, NetworkEnforcement, NetworkIsolation, NetworkIsolationRequirement,
+    ProcessOwner, ProcessSupervisor, SpawnConfig,
 };
 
 /// Serializes the tests that toggle process-global seams, through the SAME
@@ -42,6 +42,7 @@ fn cfg_run(command: &str, script: &str, cwd: PathBuf, isolation: NetworkIsolatio
         capture: true,
         artifact_max: 64 * 1024,
         network_isolation: isolation,
+        filesystem_isolation: FilesystemIsolation::Inherit,
     }
 }
 

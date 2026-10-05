@@ -20,7 +20,22 @@
 //        lane-name-mismatch, other-commit, tree-mismatch, stale-run,
 //        failed-lane, skipped-required, silent-skip,
 //        command-digest-mismatch, command-set-drift, artifact-mismatch,
-//        artifact-missing, timestamp-order, failed pipeline status.
+//        artifact-missing, artifact-required, timestamp-order,
+//        auth-malformed, auth-mismatch, auth-missing when a lane token is
+//        configured for verification, failed pipeline status.
+//      A lane whose auth cannot be checked (no lane token in the verifier's
+//      environment) is reported as `unattested`, not `passed`, but is not by
+//      itself a hard failure: PR/untrusted and unconfigured deployments keep
+//      working while a configured lane token always requires a valid MAC.
+//
+//      The `windows` workflow is the canonical Windows-platform lane spec
+//      (executed natively by `certificate-windows` on the self-hosted
+//      Windows agent, where Node is not available): it requires the
+//      `windows-visual-baseline` lane, which in turn MUST have recorded
+//      `target/certification/ci-certification-windows-visual.json` as a
+//      hashed artifact. A Windows certificate that lacks the lane or that
+//      record cannot pass; the selftest proves both refusals plus the
+//      drifted-record rejection.
 //
 //   3. Self-tests (`selftest`) that construct a temp git repository and
 //      prove every rejection above, the signature allowlist behavior, and
@@ -50,10 +65,12 @@
 
 import {
   createHash,
+  createHmac,
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
   sign as cryptoSign,
+  timingSafeEqual,
   verify as cryptoVerify,
 } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -63,6 +80,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -208,6 +226,89 @@ function hashFile(path) {
   return `sha256:${createHash('sha256').update(data).digest('hex')}`;
 }
 
+// Per-lane marker auth. Each trusted/nightly lane writes its marker through
+// scripts/certification/lane-marker.sh, which MACs the canonical unsigned
+// marker JSON with the lane's OWN CI secret env:
+//
+//   key     = $faktor_lane_token_<lane> (lane lowercased, non-alnum -> '_';
+//             the uppercase FAKTOR_LANE_TOKEN_<LANE> form is accepted)
+//   message = canonicalJson(marker without `auth`)
+//   auth    = "hmac-sha256:<hex>"
+//
+// A lane only ever receives its own token, so it cannot produce a valid MAC
+// for another lane. The certificate step receives every lane token (when the
+// operator configured them) and enforces this; when a lane token is absent
+// from the verifier's environment the lane can only be recorded as
+// `unattested`, never silently `passed`, and the certificate does not fail
+// (PR/untrusted and unconfigured deployments keep working).
+function normalizeLaneName(lane) {
+  return String(lane)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function laneTokenEnvNames(lane) {
+  const normalized = normalizeLaneName(lane);
+  return [`faktor_lane_token_${normalized}`, `FAKTOR_LANE_TOKEN_${normalized.toUpperCase()}`];
+}
+
+function laneTokenFromEnv(lane) {
+  for (const name of laneTokenEnvNames(lane)) {
+    const value = process.env[name];
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  }
+  return '';
+}
+
+function markerAuthPayload(record) {
+  const { auth, ...rest } = record;
+  void auth;
+  return canonicalJson(rest);
+}
+
+function computeMarkerAuth(record, token) {
+  const mac = createHmac('sha256', String(token)).update(markerAuthPayload(record), 'utf8').digest('hex');
+  return `hmac-sha256:${mac}`;
+}
+
+function validAuthShape(auth) {
+  return typeof auth === 'string' && /^hmac-sha256:[0-9a-f]{64}$/.test(auth);
+}
+
+// Returns { problems, auth } where auth is 'verified' | 'unverifiable' |
+// 'none'. `unverifiable`/`none` do not fail on their own; the caller reports
+// the lane as `unattested`. A present-but-malformed auth always fails.
+function markerAuthVerdict(record, token, label) {
+  const problems = [];
+  const hasAuth = record.auth !== undefined && record.auth !== null;
+  if (!hasAuth) {
+    if (token) {
+      problems.push(
+        `auth-missing: ${label} has no auth but a lane token is configured for verification`,
+      );
+    }
+    return { problems, auth: 'none' };
+  }
+  if (!validAuthShape(record.auth)) {
+    problems.push(`auth-malformed: ${label} auth is not hmac-sha256:<64 hex>`);
+    return { problems, auth: 'unverifiable' };
+  }
+  if (!token) {
+    return { problems, auth: 'unverifiable' };
+  }
+  const expected = computeMarkerAuth(record, token);
+  const actual = Buffer.from(record.auth, 'utf8');
+  const want = Buffer.from(expected, 'utf8');
+  if (actual.length !== want.length || !timingSafeEqual(actual, want)) {
+    problems.push(`auth-mismatch: ${label} auth does not verify with the lane token`);
+    return { problems, auth: 'unverifiable' };
+  }
+  return { problems, auth: 'verified' };
+}
+
 function runnerDefaults() {
   const os =
     process.platform === 'darwin'
@@ -242,6 +343,16 @@ function argValue(args, name, fallback = '') {
   return value;
 }
 
+function argValues(args, name) {
+  const values = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === name && i + 1 < args.length && !args[i + 1].startsWith('--')) {
+      values.push(args[i + 1]);
+    }
+  }
+  return values;
+}
+
 // ------------------------------------------------- evidence object handling
 
 const EVIDENCE_REQUIRED = [
@@ -257,6 +368,57 @@ const EVIDENCE_REQUIRED = [
   'artifact_digest',
   'runner',
 ];
+
+// Extra evidence fields (`--field NAME=VALUE`) may only ADD named bindings;
+// they can never shadow the schema the verifier inspects.
+const EVIDENCE_RESERVED_FIELDS = new Set([
+  ...EVIDENCE_REQUIRED,
+  'commands',
+  'artifacts',
+  'signature',
+  'repository_tree_verified',
+]);
+
+const EXTRA_FIELD_NAME_RE = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * Parse repeated `--field NAME=VALUE` arguments. The names become literal
+ * fields of the evidence object (and therefore part of the signed canonical
+ * payload), so reserved/malformed/duplicate names are usage errors.
+ */
+function extraFieldsFromArgs(args) {
+  const fields = [];
+  const seen = new Set();
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] !== '--field') continue;
+    const spec = args[i + 1];
+    if (spec === undefined || spec.startsWith('--')) {
+      throw new Error('--field requires NAME=VALUE');
+    }
+    i += 1;
+    const eq = spec.indexOf('=');
+    if (eq <= 0) {
+      throw new Error(`--field ${JSON.stringify(spec)} is not NAME=VALUE`);
+    }
+    const name = spec.slice(0, eq);
+    const value = spec.slice(eq + 1);
+    if (!EXTRA_FIELD_NAME_RE.test(name)) {
+      throw new Error(`--field name '${name}' is not a lowercase identifier`);
+    }
+    if (EVIDENCE_RESERVED_FIELDS.has(name)) {
+      throw new Error(`--field name '${name}' is reserved by the evidence schema`);
+    }
+    if (value.length === 0 || value.length > 256) {
+      throw new Error(`--field ${name} value must be 1..256 characters`);
+    }
+    if (seen.has(name)) {
+      throw new Error(`--field name '${name}' is repeated`);
+    }
+    seen.add(name);
+    fields.push([name, value]);
+  }
+  return fields;
+}
 
 function evidencePayload(evidence) {
   const { signature, ...rest } = evidence;
@@ -521,13 +683,16 @@ function verifyEvidenceObject(evidence, options = {}) {
 
 // Expected marker sets per workflow. `skippable` lanes may be `skipped`, but
 // only with a recorded reason; every other lane must be `passed`.
+// `requiredArtifacts` lists outputs a lane MUST report in its marker (the
+// file is additionally re-hashed by `checkArtifacts`): an empty `artifacts`
+// list can no longer stand in for a lane that produced a real artifact.
 const WORKFLOWS = {
   pr: {
     expected: [
       'linux',
       'static',
       'docs',
-      'vscode',
+      { lane: 'vscode', requiredArtifacts: ['apps/vscode/faktor-ci.vsix'] },
       'jetbrains-build',
       'jetbrains-smoke',
     ],
@@ -537,25 +702,48 @@ const WORKFLOWS = {
       'linux',
       'static',
       'docs',
-      'soak-smoke',
-      'vscode',
-      'vscode-e2e',
+      { lane: 'soak-smoke', requiredArtifacts: ['target/certification/soak.json'] },
+      { lane: 'vscode', requiredArtifacts: ['apps/vscode/faktor-ci.vsix'] },
+      { lane: 'vscode-e2e', requiredArtifacts: ['target/certification/vscode-e2e.json'] },
       'jetbrains-build',
-      'jetbrains-smoke',
+      {
+        lane: 'jetbrains-smoke',
+        requiredArtifacts: ['target/certification/jetbrains-host-matrix.json'],
+      },
       'perf',
-      'release-artifacts',
+      { lane: 'release-artifacts', requiredArtifacts: ['target/release/faktor-cli'] },
     ],
   },
   nightly: {
     expected: [
       'fault-scale',
-      'soak',
+      { lane: 'soak', requiredArtifacts: ['target/certification/soak.json'] },
+      'contention',
       'longrun',
       'efficiency',
       'economy',
       'coding-benchmark',
       { lane: 'coding-benchmark-real-model', skippable: true },
       'supply-chain',
+    ],
+  },
+  // The Windows certificate lane (`.woodpecker/trusted/trusted.yaml`,
+  // `certificate-windows`) runs natively in PowerShell, so it mirrors this
+  // spec instead of executing Node. The expected-lane/artifact spec here is
+  // still the canonical source of truth: a `windows` certificate may not
+  // pass without the Windows visual baseline lane, and that lane MUST have
+  // recorded `target/certification/ci-certification-windows-visual.json`
+  // (the lane's own `faktor-windows-visual-baseline/v1` record). Lanes run
+  // on the self-hosted Windows agent, so no YAML command-drift comparison is
+  // performed for this workflow (pass no `--yaml-dir`).
+  windows: {
+    expected: [
+      'windows-check',
+      'windows-test',
+      {
+        lane: 'windows-visual-baseline',
+        requiredArtifacts: ['target/certification/ci-certification-windows-visual.json'],
+      },
     ],
   },
 };
@@ -633,7 +821,7 @@ function extractLaneCommands(yamlText, lane) {
   }
   const actual = [];
   for (const item of items) {
-    if (item.some((raw) => /target\/certification\/lanes|faktor-woodpecker-lane/.test(raw))) {
+    if (item.some((raw) => /target\/certification\/lanes|faktor-woodpecker-lane|lane-marker\.(sh|mjs|py)/.test(raw))) {
       continue;
     }
     actual.push(...item.map((raw) => raw.trim()).filter((raw) => raw !== ''));
@@ -674,6 +862,104 @@ function extractDeclaredCommands(yamlText, lane) {
   return declared ? declared.filter((line) => line !== '') : null;
 }
 
+// The convergence metrics every soak artifact must certify. Missing samples
+// are a typed FAILURE in `scripts/certification/soak-convergence.py`, so a
+// passing artifact must record all of them as passed; the certificate
+// re-checks that contract instead of trusting a hashed file.
+export const SOAK_CONVERGENCE_METRICS = [
+  'rss_bounded',
+  'fds_bounded',
+  'child_processes_zero',
+  'background_tasks_settled',
+  'writer_queue_zero',
+  'reader_queue_zero',
+  'wal_converged',
+  'temp_files_removed',
+  'cas_unreachable_stable',
+  'journal_latency_no_upward_trend',
+  'index_latency_no_upward_trend',
+  'reconnect_correct',
+  'duration_target_met',
+];
+
+const SOAK_ARTIFACT_PATH = 'target/certification/soak.json';
+
+// Lane mode contract: the trusted per-release gate is the accelerated churn;
+// the nightly lane is the real-time 12-24h run.
+const SOAK_LANE_MODE = { 'soak-smoke': 'churn', soak: 'realtime' };
+
+// A soak artifact is more than a hashed file: the certificate parses it and
+// requires the exact-SHA binding, a passing lane status and an
+// all-metrics-passed convergence record.
+function soakArtifactProblems(record, label, cwd) {
+  const problems = [];
+  const artifacts = Array.isArray(record.artifacts) ? record.artifacts : [];
+  const entry = artifacts.find((artifact) => artifact && artifact.path === SOAK_ARTIFACT_PATH);
+  if (!entry) {
+    return problems;
+  }
+  const full = resolve(cwd || ROOT, SOAK_ARTIFACT_PATH);
+  if (!existsSync(full) || !statSync(full).isFile()) {
+    problems.push(`soak-unreadable: ${label} ${SOAK_ARTIFACT_PATH} is missing`);
+    return problems;
+  }
+  let payload;
+  try {
+    payload = readJsonStrict(full);
+  } catch (error) {
+    problems.push(`soak-unreadable: ${label} ${SOAK_ARTIFACT_PATH} is not strict JSON: ${error.message}`);
+    return problems;
+  }
+  if (payload.schema !== 'faktor-soak/v1') {
+    problems.push(`soak-schema: ${label} soak schema '${payload.schema}' != 'faktor-soak/v1'`);
+  }
+  if (payload.lane !== record.lane) {
+    problems.push(`soak-lane-mismatch: ${label} soak lane '${payload.lane}' != marker lane '${record.lane}'`);
+  }
+  if (payload.commit !== record.commit) {
+    problems.push(`soak-commit-mismatch: ${label} soak commit '${payload.commit}' != marker commit '${record.commit}'`);
+  }
+  if (payload.tree !== record.tree) {
+    problems.push(`soak-tree-mismatch: ${label} soak tree '${payload.tree}' != marker tree '${record.tree}'`);
+  }
+  if (payload.status !== 'passed') {
+    problems.push(`soak-status: ${label} soak status '${payload.status}' != 'passed'`);
+  }
+  const expectedMode = SOAK_LANE_MODE[record.lane];
+  if (expectedMode && payload.mode !== expectedMode) {
+    problems.push(
+      `soak-mode-mismatch: ${label} lane ${record.lane} requires mode '${expectedMode}', soak ran '${payload.mode}'`,
+    );
+  }
+  const convergence = payload.convergence;
+  if (!convergence || typeof convergence !== 'object') {
+    problems.push(`soak-convergence-missing: ${label} soak artifact carries no convergence object`);
+    return problems;
+  }
+  if (payload.convergence_required !== true || convergence.required !== true) {
+    problems.push(`soak-convergence-missing: ${label} convergence was not required (required=${convergence.required})`);
+  }
+  if (convergence.mode !== payload.mode) {
+    problems.push(
+      `soak-mode-mismatch: ${label} convergence mode '${convergence.mode}' != soak mode '${payload.mode}'`,
+    );
+  }
+  if (convergence.status !== 'passed' || convergence.ok !== true) {
+    const failed = Array.isArray(convergence.failed_metrics) ? convergence.failed_metrics.join(', ') : 'unknown';
+    problems.push(`soak-convergence-failed: ${label} convergence status '${convergence.status}' (failed: ${failed})`);
+  }
+  const metrics = Array.isArray(convergence.metrics) ? convergence.metrics : [];
+  for (const name of SOAK_CONVERGENCE_METRICS) {
+    const metric = metrics.find((candidate) => candidate && candidate.name === name);
+    if (!metric) {
+      problems.push(`soak-metric-missing: ${label} convergence did not record '${name}'`);
+    } else if (metric.status !== 'passed') {
+      problems.push(`soak-metric-failed: ${label} convergence metric '${name}' status='${metric.status}'`);
+    }
+  }
+  return problems;
+}
+
 function markerProblems(record, options) {
   const problems = [];
   const {
@@ -685,15 +971,18 @@ function markerProblems(record, options) {
     yamlText,
     checkArtifacts,
     cwd,
+    token = '',
   } = options;
   const label = `lane ${lane}`;
   if (record.schema !== MARKER_SCHEMA) {
     problems.push(`wrong-schema: ${label} schema=${record.schema}`);
-    return problems;
+    return { problems, auth: 'unverifiable' };
   }
   if (record.lane !== lane) {
     problems.push(`lane-name-mismatch: ${label} file says lane=${record.lane}`);
   }
+  const authVerdict = markerAuthVerdict(record, token, label);
+  problems.push(...authVerdict.problems);
   const status = String(record.status);
   if (status === 'skipped') {
     if (!expected.skippable) {
@@ -779,8 +1068,15 @@ function markerProblems(record, options) {
         }
       }
     }
+    for (const required of expected.requiredArtifacts || []) {
+      const entry = artifacts.find((artifact) => artifact && artifact.path === required);
+      if (!entry) {
+        problems.push(`artifact-required: ${label} did not record required artifact ${required}`);
+      }
+    }
   }
-  return problems;
+  problems.push(...soakArtifactProblems(record, label, cwd));
+  return { problems, auth: authVerdict.auth };
 }
 
 function verifyMarkers(options) {
@@ -796,11 +1092,16 @@ function verifyMarkers(options) {
     checkArtifacts = true,
     cwd = ROOT,
   } = options;
+  // `laneTokens` (selftest/demos) overrides env lookup entirely: an explicit
+  // token set means a lane with no entry is verified as unattested even when
+  // the surrounding process happens to carry that lane token in its env.
+  const explicitTokens = options.laneTokens;
   const expected = expectedLanes(workflow);
   const expectedNames = expected.map((entry) => entry.lane);
   const problems = [];
   const lanes = {};
   const markers = {};
+  const attested = {};
   const dir = resolve(cwd, lanesDir);
   let files = [];
   if (existsSync(dir)) {
@@ -830,7 +1131,8 @@ function verifyMarkers(options) {
       continue;
     }
     const spec = expected.find((entry) => entry.lane === stem);
-    const laneProblems = markerProblems(record, {
+    const token = explicitTokens !== undefined ? explicitTokens[stem] || '' : laneTokenFromEnv(stem);
+    const verdict = markerProblems(record, {
       lane: stem,
       expected: spec,
       commit,
@@ -839,6 +1141,7 @@ function verifyMarkers(options) {
       yamlText,
       checkArtifacts,
       cwd,
+      token,
     });
     markers[stem] = {
       commit: record.commit,
@@ -848,12 +1151,19 @@ function verifyMarkers(options) {
       commands_digest: record.commands_digest,
       artifact_digest: record.artifact_digest,
       runner: record.runner,
+      auth: typeof record.auth === 'string' ? record.auth : null,
+      auth_verified: verdict.auth === 'verified',
     };
-    if (laneProblems.length > 0) {
-      lanes[stem] = laneProblems[0].split(':')[0];
-      problems.push(...laneProblems);
+    attested[stem] = verdict.auth === 'verified';
+    if (verdict.problems.length > 0) {
+      lanes[stem] = verdict.problems[0].split(':')[0];
+      problems.push(...verdict.problems);
+    } else if (record.status === 'skipped') {
+      lanes[stem] = 'skipped';
+    } else if (verdict.auth === 'verified') {
+      lanes[stem] = 'passed';
     } else {
-      lanes[stem] = record.status === 'skipped' ? 'skipped' : 'passed';
+      lanes[stem] = 'unattested';
     }
   }
   for (const spec of expected) {
@@ -865,6 +1175,14 @@ function verifyMarkers(options) {
   if (pipelineStatus !== undefined && pipelineStatus !== 'success') {
     problems.push(`pipeline-status: workflow status before the certificate is ${pipelineStatus}`);
   }
+  const authSummary = { verified: [], unattested: [] };
+  for (const spec of expected) {
+    if (attested[spec.lane]) {
+      authSummary.verified.push(spec.lane);
+    } else {
+      authSummary.unattested.push(spec.lane);
+    }
+  }
   const status = problems.length === 0 ? 'pass' : 'fail';
   const manifest = {
     schema: CI_CERT_SCHEMA,
@@ -875,6 +1193,7 @@ function verifyMarkers(options) {
     run_id: runId,
     pipeline_url: process.env.CI_PIPELINE_URL || '',
     status,
+    auth: authSummary,
     lanes,
     markers,
     problems,
@@ -884,7 +1203,13 @@ function verifyMarkers(options) {
     writeFileSync(resolve(cwd, out), `${JSON.stringify(manifest, null, 2)}\n`);
   }
   for (const spec of expected) {
-    console.log(`${lanes[spec.lane] === 'passed' ? 'passed' : `FAILED ${lanes[spec.lane]}`} ${spec.lane}`);
+    if (lanes[spec.lane] === 'passed') {
+      console.log(`passed ${spec.lane}`);
+    } else if (lanes[spec.lane] === 'unattested') {
+      console.log(`unattested ${spec.lane} (no lane token configured; marker auth not verified)`);
+    } else {
+      console.log(`FAILED ${lanes[spec.lane]} ${spec.lane}`);
+    }
   }
   if (problems.length > 0) {
     for (const problem of problems) {
@@ -892,7 +1217,11 @@ function verifyMarkers(options) {
     }
     return { ok: false, manifest };
   }
-  console.log('certification: PASS (every required lane produced verifiable evidence for this commit/tree)');
+  const unattested = authSummary.unattested.length;
+  console.log(
+    `certification: PASS (every required lane produced verifiable evidence for this commit/tree;` +
+      ` ${authSummary.verified.length} lane(s) auth-verified, ${unattested} unattested)`,
+  );
   return { ok: true, manifest };
 }
 
@@ -911,6 +1240,7 @@ function writeEvidence(options) {
     fromMarkers,
     onlyLane,
     commandsText,
+    fields = [],
   } = options;
   const commit = headCommit(cwd);
   const tree = headTree(cwd);
@@ -958,6 +1288,9 @@ function writeEvidence(options) {
     artifacts,
     signature: null,
   };
+  for (const [name, value] of fields) {
+    evidence[name] = value;
+  }
   if (kind === 'cross_platform_lanes') {
     // The writer DERIVES the verdict from the child certificates; callers can
     // never hand a passing status around arbitrary artifact files.
@@ -1063,6 +1396,8 @@ function runSelftest() {
     };
     const lanesDir = join(repo, 'target/certification/lanes');
     const valid = () => ({ 'lane-a': marker('lane-a'), 'lane-b': marker('lane-b') });
+    const withAuth = (record, token) => ({ ...record, auth: computeMarkerAuth(record, token) });
+    const laneTokens = { 'lane-a': 'token-a', 'lane-b': 'token-b' };
     const verify = (records, extra = {}) => {
       rmSync(lanesDir, { recursive: true, force: true });
       writeMarkers(lanesDir, records);
@@ -1076,6 +1411,7 @@ function runSelftest() {
         yamlText,
         checkArtifacts: false,
         cwd: repo,
+        laneTokens: {},
         ...extra,
       });
     };
@@ -1085,6 +1421,80 @@ function runSelftest() {
     run('valid markers verify', () => {
       const result = verify(valid());
       assert(result.ok, `expected pass, problems=${JSON.stringify(result.manifest.problems)}`);
+      assert(
+        result.manifest.lanes['lane-a'] === 'unattested' && result.manifest.lanes['lane-b'] === 'unattested',
+        `no lane token is configured, so lanes must be visibly unattested, got ${JSON.stringify(result.manifest.lanes)}`,
+      );
+      assert(
+        result.manifest.auth.verified.length === 0 && result.manifest.auth.unattested.length === 2,
+        `auth summary must report both lanes unattested, got ${JSON.stringify(result.manifest.auth)}`,
+      );
+    });
+    run('lane-token signed markers verify as passed', () => {
+      const records = {
+        'lane-a': withAuth(marker('lane-a'), laneTokens['lane-a']),
+        'lane-b': withAuth(marker('lane-b'), laneTokens['lane-b']),
+      };
+      const result = verify(records, { laneTokens });
+      assert(result.ok, `expected pass, problems=${JSON.stringify(result.manifest.problems)}`);
+      assert(
+        result.manifest.lanes['lane-a'] === 'passed' && result.manifest.lanes['lane-b'] === 'passed',
+        `verified lanes must be passed, got ${JSON.stringify(result.manifest.lanes)}`,
+      );
+      assert(result.manifest.markers['lane-a'].auth_verified === true, 'auth_verified must be recorded');
+    });
+    run('forged marker signed with another lane token rejected', () => {
+      const records = {
+        'lane-a': withAuth(marker('lane-a'), laneTokens['lane-b']),
+        'lane-b': withAuth(marker('lane-b'), laneTokens['lane-b']),
+      };
+      expectFailCode(verify(records, { laneTokens }), 'auth-mismatch', 'cross-lane forgery');
+    });
+    run('missing auth rejected when lane token is configured', () => {
+      const records = {
+        'lane-a': marker('lane-a'),
+        'lane-b': withAuth(marker('lane-b'), laneTokens['lane-b']),
+      };
+      expectFailCode(verify(records, { laneTokens }), 'auth-missing', 'missing auth');
+    });
+    run('tampered field invalidates auth', () => {
+      const record = withAuth(marker('lane-a'), laneTokens['lane-a']);
+      record.started_at = '2026-01-01T00:00:30Z';
+      const records = { 'lane-a': record, 'lane-b': withAuth(marker('lane-b'), laneTokens['lane-b']) };
+      expectFailCode(verify(records, { laneTokens }), 'auth-mismatch', 'tampered field');
+    });
+    run('malformed auth rejected even without a lane token', () => {
+      const records = valid();
+      records['lane-a'].auth = 'hmac-sha256:not-hex';
+      expectFailCode(verify(records, { laneTokens: {} }), 'auth-malformed', 'malformed auth');
+    });
+    run('auth present but unverifiable is unattested, not passed', () => {
+      const records = {
+        'lane-a': withAuth(marker('lane-a'), 'some-unknown-token'),
+        'lane-b': marker('lane-b'),
+      };
+      const result = verify(records, { laneTokens: {} });
+      assert(result.ok, `expected pass, problems=${JSON.stringify(result.manifest.problems)}`);
+      assert(
+        result.manifest.lanes['lane-a'] === 'unattested',
+        `unverifiable auth must be unattested, got ${result.manifest.lanes['lane-a']}`,
+      );
+    });
+    run('required artifact omission rejected', () => {
+      WORKFLOWS['selftest-required'] = {
+        expected: [
+          { lane: 'lane-a', requiredArtifacts: ['artifact.bin'] },
+          { lane: 'lane-b', skippable: true },
+        ],
+      };
+      const records = valid();
+      let result;
+      try {
+        result = verify(records, { workflow: 'selftest-required' });
+      } finally {
+        delete WORKFLOWS['selftest-required'];
+      }
+      expectFailCode(result, 'artifact-required', 'required artifact');
     });
     run('other commit rejected', () => {
       const records = valid();
@@ -1118,6 +1528,7 @@ function runSelftest() {
         runId,
         pipelineStatus: 'success',
         yamlText,
+        laneTokens: {},
         checkArtifacts: false,
         cwd: repo,
       });
@@ -1135,6 +1546,7 @@ function runSelftest() {
         runId,
         pipelineStatus: 'success',
         yamlText,
+        laneTokens: {},
         checkArtifacts: false,
         cwd: repo,
       });
@@ -1215,6 +1627,7 @@ function runSelftest() {
         runId,
         pipelineStatus: 'success',
         yamlText,
+        laneTokens: {},
         checkArtifacts: true,
         cwd: repo,
       });
@@ -1231,6 +1644,7 @@ function runSelftest() {
         runId,
         pipelineStatus: 'success',
         yamlText,
+        laneTokens: {},
         checkArtifacts: true,
         cwd: repo,
       });
@@ -1250,10 +1664,185 @@ function runSelftest() {
         runId,
         pipelineStatus: 'success',
         yamlText,
+        laneTokens: {},
         checkArtifacts: true,
         cwd: repo,
       });
       expectFailCode(result, 'artifact-missing', 'artifact missing');
+    });
+
+    // ------------------------------------------- soak convergence artifact
+    run('soak artifact is semantically enforced for the lane contract', () => {
+      try {
+      WORKFLOWS['selftest-soak'] = {
+        expected: [{ lane: 'soak-smoke', requiredArtifacts: [SOAK_ARTIFACT_PATH] }],
+      };
+      const soakPath = join(repo, SOAK_ARTIFACT_PATH);
+      mkdirSync(dirname(soakPath), { recursive: true });
+      const soakPayload = (overrides = {}, convergenceOverrides = {}) => ({
+        schema: 'faktor-soak/v1',
+        lane: 'soak-smoke',
+        status: 'passed',
+        mode: 'churn',
+        commit,
+        tree,
+        target_seconds: 1800,
+        convergence_required: true,
+        convergence: {
+          schema: 'faktor-soak-convergence/v1',
+          status: 'passed',
+          ok: true,
+          required: true,
+          lane: 'soak-smoke',
+          mode: 'churn',
+          failed_metrics: [],
+          metrics: SOAK_CONVERGENCE_METRICS.map((name) => ({ name, status: 'passed' })),
+          ...convergenceOverrides,
+        },
+        ...overrides,
+      });
+      const verifySoak = (payload) => {
+        writeFileSync(soakPath, JSON.stringify(payload));
+        const artifacts = [
+          { path: SOAK_ARTIFACT_PATH, sha256: hashFile(soakPath) },
+        ];
+        const record = {
+          ...marker('soak-smoke', { commands: ['echo soak-smoke'], lane: 'soak-smoke' }),
+          artifacts,
+          artifact_digest: artifactDigest(artifacts),
+        };
+        rmSync(lanesDir, { recursive: true, force: true });
+        writeMarkers(lanesDir, { 'soak-smoke': record });
+        return verifyMarkers({
+          workflow: 'selftest-soak',
+          lanesDir,
+          commit,
+          tree,
+          runId,
+          pipelineStatus: 'success',
+          yamlText: null,
+          laneTokens: {},
+          checkArtifacts: true,
+          cwd: repo,
+        });
+      };
+      const good = verifySoak(soakPayload());
+      assert(good.ok, `valid soak artifact must verify, problems=${JSON.stringify(good.manifest.problems)}`);
+      expectFailCode(
+        verifySoak(soakPayload({}, { status: 'failed', ok: false, failed_metrics: ['rss_bounded'] })),
+        'soak-convergence-failed',
+        'failed convergence',
+      );
+      expectFailCode(
+        verifySoak(
+          soakPayload({}, {
+            metrics: SOAK_CONVERGENCE_METRICS.filter((name) => name !== 'wal_converged').map((name) => ({
+              name,
+              status: 'passed',
+            })),
+          }),
+        ),
+        'soak-metric-missing',
+        'missing convergence metric',
+      );
+      expectFailCode(verifySoak(soakPayload({ commit: '0'.repeat(40) })), 'soak-commit-mismatch', 'soak commit');
+      expectFailCode(verifySoak(soakPayload({ mode: 'smoke' }, { mode: 'smoke' })), 'soak-mode-mismatch', 'soak mode');
+      } finally {
+        delete WORKFLOWS['selftest-soak'];
+      }
+    });
+
+    // ------------------------------------------------- lane-marker helper
+    run('lane-marker generators (node/python/launcher) agree byte-for-byte and bind auth', () => {
+      const genDir = join(repo, 'target/certification/lanes-gen');
+      mkdirSync(genDir, { recursive: true });
+      const commands = 'echo lane-a\nsleep 0';
+      const commonArgs = [
+        'write',
+        '--lane',
+        'lane-a',
+        '--status',
+        'passed',
+        '--commands',
+        commands,
+        '--cwd',
+        repo,
+        '--commit',
+        commit,
+        '--tree',
+        tree,
+        '--run-id',
+        '4242',
+        '--started-at',
+        '2026-01-01T00:00:00Z',
+        '--finished-at',
+        '2026-01-01T00:01:00Z',
+        '--runner-os',
+        'linux',
+        '--runner-arch',
+        'amd64',
+        '--runner-ci',
+        'woodpecker',
+      ];
+      const tokenEnv = { ...process.env, faktor_lane_token_lane_a: 'token-a' };
+      const runHelper = (interpreter, script, out) => {
+        execFileSync(interpreter, [script, ...commonArgs, '--out', out], {
+          cwd: repo,
+          env: tokenEnv,
+        });
+        return readJsonStrict(join(repo, out));
+      };
+      const nodeRecord = runHelper(process.execPath, join(ROOT, 'scripts/certification/lane-marker.mjs'), 'target/certification/lanes-gen/node.json');
+      const launcherRecord = runHelper('sh', join(ROOT, 'scripts/certification/lane-marker.sh'), 'target/certification/lanes-gen/launcher.json');
+      assert(nodeRecord.auth === computeMarkerAuth(nodeRecord, 'token-a'), 'node helper auth must verify');
+      assert(
+        JSON.stringify(nodeRecord) === JSON.stringify(launcherRecord),
+        'lane-marker.sh must produce the same record as lane-marker.mjs',
+      );
+      let pythonAvailable = true;
+      try {
+        execFileSync('python3', ['--version'], { stdio: 'ignore' });
+      } catch {
+        pythonAvailable = false;
+      }
+      if (pythonAvailable) {
+        const pyRecord = runHelper('python3', join(ROOT, 'scripts/certification/lane-marker.py'), 'target/certification/lanes-gen/python.json');
+        assert(
+          JSON.stringify(pyRecord) === JSON.stringify(nodeRecord),
+          'python and node generators must produce identical marker JSON',
+        );
+      }
+      const noToken = {
+        ...process.env,
+        faktor_lane_token_lane_a: '',
+        FAKTOR_LANE_TOKEN_LANE_A: '',
+      };
+      execFileSync(
+        process.execPath,
+        [join(ROOT, 'scripts/certification/lane-marker.mjs'), ...commonArgs, '--out', 'target/certification/lanes-gen/none.json'],
+        { cwd: repo, env: noToken },
+      );
+      const unsignedRecord = readJsonStrict(join(repo, 'target/certification/lanes-gen/none.json'));
+      assert(!('auth' in unsignedRecord), 'absent lane token must omit auth');
+      // stdin from a pipe that is still empty when the helper starts: the
+      // helper must wait for the writer (EAGAIN/EINTR retry), not read an
+      // empty command set. A delayed writer makes that deterministic.
+      const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+      const pipeline = [
+        'sleep 0.2',
+        `; printf '%s' ${quote(commands)}`,
+        `| ${quote(process.execPath)} ${quote(join(ROOT, 'scripts/certification/lane-marker.mjs'))} write --lane lane-a --status passed`,
+        `--cwd ${quote(repo)} --commit ${quote(commit)} --tree ${quote(tree)} --run-id 4242`,
+        '--started-at 2026-01-01T00:00:00Z --finished-at 2026-01-01T00:01:00Z',
+        '--runner-os linux --runner-arch amd64 --runner-ci woodpecker',
+        '--out target/certification/lanes-gen/stdin.json',
+      ].join(' ');
+      execFileSync('sh', ['-c', pipeline], { cwd: repo, env: tokenEnv });
+      const stdinRecord = readJsonStrict(join(repo, 'target/certification/lanes-gen/stdin.json'));
+      assert(
+        JSON.stringify(stdinRecord) === JSON.stringify(nodeRecord),
+        'stdin pipeline marker must match the --commands form',
+      );
     });
 
     // ------------------------------------------------- evidence signatures
@@ -1491,11 +2080,156 @@ function runSelftest() {
       assert(verdict.ok, `written evidence must verify: ${JSON.stringify(verdict.problems)}`);
     });
 
+    run('extra evidence fields are bound, verified and reserved names refused', () => {
+      const digest = `sha256:${'a'.repeat(64)}`;
+      const fields = extraFieldsFromArgs(['--field', `contracts_digest=${digest}`]);
+      assert(
+        fields.length === 1 && fields[0][0] === 'contracts_digest' && fields[0][1] === digest,
+        `--field must parse one NAME=VALUE pair, got ${JSON.stringify(fields)}`,
+      );
+      const outDir = join(repo, 'target/certification/evidence');
+      const path = writeEvidence({
+        kind: 'real_provider',
+        status: 'passed',
+        outDir,
+        cwd: repo,
+        artifactsExplicit: [],
+        commandsText: 'selftest provider commands',
+        fields,
+        runner: { os: 'linux', arch: 'amd64', ci: 'selftest', run_id: '1' },
+      });
+      const record = readJsonStrict(path);
+      assert(record.contracts_digest === digest, 'the extra field must be a literal evidence field');
+      const verdict = verifyEvidenceObject(record, {
+        kind: 'real_provider',
+        expectedCommit: commit,
+        expectedTree: tree,
+        keys: {},
+        requireSigned: false,
+      });
+      assert(verdict.ok, `extra-field evidence must verify: ${JSON.stringify(verdict.problems)}`);
+      for (const spec of ['commands=hidden', 'signature=x', 'Bad=1', 'empty=', 'missing']) {
+        let refused = false;
+        try {
+          extraFieldsFromArgs(['--field', spec]);
+        } catch {
+          refused = true;
+        }
+        assert(refused, `--field ${JSON.stringify(spec)} must be refused`);
+      }
+      let repeated = false;
+      try {
+        extraFieldsFromArgs(['--field', 'a=1', '--field', 'a=2']);
+      } catch {
+        repeated = true;
+      }
+      assert(repeated, 'a repeated --field name must be refused');
+    });
+
+    // ------------------------------------------- windows visual evidence
+    // The `windows` workflow spec: a Windows certificate that lacks the
+    // windows-visual-baseline lane, or whose visual lane recorded no (or a
+    // drifted) `ci-certification-windows-visual.json`, is refused.
+    const windowsLanesDir = join(repo, 'target/certification/lanes-windows');
+    const windowsRecordRel = 'target/certification/ci-certification-windows-visual.json';
+    const windowsRecordAbs = join(repo, windowsRecordRel);
+    const writeWindowsRecord = () => {
+      mkdirSync(dirname(windowsRecordAbs), { recursive: true });
+      writeFileSync(
+        windowsRecordAbs,
+        JSON.stringify({
+          schema: 'faktor-windows-visual-baseline/v1',
+          status: 'passed',
+          mode: 'compare',
+          coverage: 'linux=certified,macos=certified,windows=certified',
+        }),
+      );
+      return hashFile(windowsRecordAbs);
+    };
+    const windowsMarker = (lane, artifact) => {
+      const commands =
+        'powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1 -SelfTest\n' +
+        'powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1';
+      const artifacts = artifact ? [{ path: windowsRecordRel, sha256: artifact }] : [];
+      return {
+        schema: MARKER_SCHEMA,
+        lane,
+        status: 'passed',
+        commit,
+        tree,
+        runner: { os: 'windows', arch: 'amd64', ci: 'woodpecker', run_id: runId },
+        started_at: '2026-01-01T00:00:00Z',
+        finished_at: '2026-01-01T00:01:00Z',
+        commands_b64: Buffer.from(commands, 'utf8').toString('base64'),
+        commands_digest: `sha256:${sha256Hex(commands)}`,
+        artifacts,
+        artifact_digest: artifactDigest(artifacts),
+      };
+    };
+    const verifyWindows = (records) => {
+      rmSync(windowsLanesDir, { recursive: true, force: true });
+      writeMarkers(windowsLanesDir, records);
+      return verifyMarkers({
+        workflow: 'windows',
+        lanesDir: windowsLanesDir,
+        commit,
+        tree,
+        runId,
+        pipelineStatus: 'success',
+        laneTokens: {},
+        checkArtifacts: true,
+        cwd: repo,
+      });
+    };
+    run('windows certificate requires the windows-visual-baseline lane', () => {
+      const records = {
+        'windows-check': windowsMarker('windows-check'),
+        'windows-test': windowsMarker('windows-test'),
+      };
+      expectFailCode(verifyWindows(records), 'missing', 'missing windows visual lane');
+    });
+    run('windows certificate refuses a visual lane without the record artifact', () => {
+      const records = {
+        'windows-check': windowsMarker('windows-check'),
+        'windows-test': windowsMarker('windows-test'),
+        'windows-visual-baseline': windowsMarker('windows-visual-baseline'),
+      };
+      expectFailCode(verifyWindows(records), 'artifact-required', 'missing windows visual record');
+    });
+    run('windows certificate refuses a drifted visual record digest', () => {
+      const digest = writeWindowsRecord();
+      const records = {
+        'windows-check': windowsMarker('windows-check'),
+        'windows-test': windowsMarker('windows-test'),
+        'windows-visual-baseline': windowsMarker('windows-visual-baseline', digest),
+      };
+      const passing = verifyWindows(records);
+      assert(
+        passing.ok,
+        `the fresh windows record must verify, problems=${JSON.stringify(passing.manifest.problems)}`,
+      );
+      writeFileSync(
+        windowsRecordAbs,
+        JSON.stringify({ schema: 'faktor-windows-visual-baseline/v1', status: 'passed', coverage: 'tampered' }),
+      );
+      expectFailCode(verifyWindows(records), 'artifact-mismatch', 'drifted windows record digest');
+      writeWindowsRecord();
+    });
+
     // ------------------------------------------- repository drift self-test
     run('woodpecker marker heredocs match lane commands', () => {
       const yamlDir = resolve(ROOT, '.woodpecker');
       const problems = [];
       const yamlFiles = { pr: 'pr.yaml', trusted: 'trusted.yaml', nightly: 'nightly.yaml' };
+      const laneSection = (text, lane) => {
+        const start = text.indexOf(`  - name: ${lane}\n`);
+        if (start === -1) {
+          return '';
+        }
+        const rest = text.slice(start + 1);
+        const next = rest.indexOf('\n  - name: ');
+        return next === -1 ? rest : rest.slice(0, next);
+      };
       for (const [workflow, file] of Object.entries(yamlFiles)) {
         if (!existsSync(join(yamlDir, file))) {
           continue;
@@ -1514,6 +2248,18 @@ function runSelftest() {
               `${file}: lane ${spec.lane} marker commands drift at line ${firstDiff + 1}` +
                 ` (declared ${declared.length} lines, actual ${actual.length})`,
             );
+          }
+          // Trusted/nightly markers MUST be produced by the shared helper so
+          // the JSON and the per-lane HMAC always come from one contract.
+          if (workflow !== 'pr') {
+            const section = laneSection(text, spec.lane);
+            if (
+              !/lane-marker\.(sh|mjs)/.test(section) ||
+              !/lane-marker\.(sh|mjs)\s+write/.test(section) ||
+              !section.includes(`--lane ${spec.lane}`)
+            ) {
+              problems.push(`${file}: lane ${spec.lane} marker is not emitted through the shared lane-marker helper`);
+            }
           }
         }
       }
@@ -1539,15 +2285,24 @@ commands:
   write          write target/certification/evidence/<kind>.json
                  --kind K --status passed|failed|skipped [--out-dir DIR]
                  [--commands TEXT] [--from-markers DIR [--only-lane L]]
-                 [--artifacts a,b] [--sign-key PEM --key-id ID]
+                 [--artifacts a,b] [--field NAME=VALUE ...]
+                 [--sign-key PEM --key-id ID]
                  [--runner-os OS --runner-arch ARCH --runner-ci CI --runner-run-id ID]
   sign           add an ed25519 signature: --file E.json --key PEM --key-id ID
   verify         verify one evidence object (--kind K [--evidence-dir DIR]
                  [--require-signed] [--keys FILE] [--json]); exit 1 on problems
   verify-markers verify a workflow's lane markers and write the CI certificate
-                 --workflow pr|trusted|nightly [--lanes-dir DIR] [--out FILE]
+                 --workflow pr|trusted|nightly|windows [--lanes-dir DIR] [--out FILE]
                  [--yaml-dir DIR] [--pipeline-status STATUS] [--run-id ID]
-  selftest       prove the rejection matrix + signature allowlist + repo drift`);
+                 [--cwd DIR] (artifact resolution root; defaults to the repo)
+                 lane auth is verified from each lane's secret env
+                 (faktor_lane_token_<lane>; uppercase accepted). Lanes without
+                 a token are recorded 'unattested'; a configured token makes
+                 auth mandatory. [--lane-token lane=token] overrides env.
+  selftest       prove the rejection matrix + auth forgery matrix + signature
+                 allowlist + marker-helper parity + repo drift
+
+lane markers are written by scripts/certification/lane-marker.sh write --lane L ...`);
 }
 
 function main(argv) {
@@ -1564,6 +2319,13 @@ function main(argv) {
     const status = argValue(args, '--status', 'passed');
     if (!kind) {
       console.error('write: --kind is required');
+      return 2;
+    }
+    let fields;
+    try {
+      fields = extraFieldsFromArgs(args);
+    } catch (error) {
+      console.error(`write: ${error.message}`);
       return 2;
     }
     writeEvidence({
@@ -1590,6 +2352,7 @@ function main(argv) {
       startedAt: argValue(args, '--started-at') || undefined,
       finishedAt: argValue(args, '--finished-at') || undefined,
       repository: argValue(args, '--repository') || undefined,
+      fields,
     });
     return 0;
   }
@@ -1669,6 +2432,19 @@ function main(argv) {
     const yamlDir = resolve(argValue(args, '--yaml-dir', '.woodpecker'));
     const yamlFile = join(yamlDir, `${workflow}.yaml`);
     const yamlText = existsSync(yamlFile) ? readFileSync(yamlFile, 'utf8') : null;
+    const laneTokenArgs = argValues(args, '--lane-token');
+    let laneTokens;
+    if (laneTokenArgs.length > 0) {
+      laneTokens = {};
+      for (const entry of laneTokenArgs) {
+        const eq = entry.indexOf('=');
+        if (eq <= 0) {
+          console.error(`verify-markers: --lane-token '${entry}' is not lane=token`);
+          return 2;
+        }
+        laneTokens[entry.slice(0, eq)] = entry.slice(eq + 1);
+      }
+    }
     const result = verifyMarkers({
       workflow,
       lanesDir: argValue(args, '--lanes-dir', 'target/certification/lanes'),
@@ -1679,7 +2455,8 @@ function main(argv) {
       runId: argValue(args, '--run-id', process.env.CI_PIPELINE_NUMBER || ''),
       pipelineStatus: argValue(args, '--pipeline-status', process.env.CI_PIPELINE_STATUS || ''),
       checkArtifacts: true,
-      cwd: ROOT,
+      cwd: resolve(argValue(args, '--cwd', ROOT)),
+      laneTokens,
     });
     return result.ok ? 0 : 1;
   }
@@ -1688,4 +2465,34 @@ function main(argv) {
   return 2;
 }
 
-process.exit(main(process.argv.slice(2)));
+const invokedDirectly = (() => {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedDirectly) {
+  process.exit(main(process.argv.slice(2)));
+}
+
+export {
+  WORKFLOWS,
+  artifactDigest,
+  canonicalJson,
+  computeMarkerAuth,
+  expectedLanes,
+  extractDeclaredCommands,
+  extractLaneCommands,
+  hashFile,
+  laneTokenEnvNames,
+  laneTokenFromEnv,
+  markerAuthPayload,
+  markerProblems,
+  sha256Hex,
+  verifyMarkers,
+};

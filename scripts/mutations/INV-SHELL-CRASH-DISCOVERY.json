@@ -1,0 +1,9 @@
+{
+  "id": "INV-SHELL-CRASH-DISCOVERY",
+  "file": "crates/agent/src/runtime/shell_changes.rs",
+  "find": "    let envelope = row.pre_manifest.as_ref()?;\n    if envelope.get(\"state\").and_then(|v| v.as_str()) != Some(\"captured\") {\n        return None;\n    }",
+  "replace": "    let envelope = row.pre_manifest.as_ref()?;\n    if envelope.get(\"state\").and_then(|v| v.as_str()) != Some(\"settled\") {\n        return None;\n    }",
+  "gate": "cargo test -p faktor-agent --lib crash_after_shell_mutation_is_discovered_on_restart",
+  "expect": "assertion|left.*right",
+  "note": "Crash reconciliation no longer recognizes a captured (never settled) pre-manifest row: a shell that crashed mid-run is not diffed against the durable pre-manifest and the actual changed tree stays undiscovered."
+}

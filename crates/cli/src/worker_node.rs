@@ -471,6 +471,10 @@ impl JobExecutor for LocalPipelineExecutor {
             .session
             .create_session(workspace, "worker-node", &self.provider, &self.model)
             .map_err(|e| format!("worker session: {e}"))?;
+        // SessionStart lifecycle hook (audit): the worker node is a session
+        // creator too, so it fires the SAME agent-registry seam right after
+        // the durable row exists and before the first turn. Best-effort.
+        self.agent.run_session_start_hook(row.id());
         self.runtime.block_on(async {
             let cancelled = async {
                 loop {

@@ -68,7 +68,9 @@ docker compose up -d
 The compose file starts `woodpecker-server` (port 8000 for UI/API, port 9000
 for the agent gRPC channel, data in the `woodpecker-data` volume) and one
 linux docker agent. It also raises `WOODPECKER_MAX_PIPELINE_TIMEOUT` (default
-1560 minutes / 26h) so the nightly longrun campaign can be admitted; see §6.
+1560 minutes / 26h) so the nightly longrun campaign AND the 24h real-time
+soak lane (`scripts/soak.sh --mode realtime`, <= 25h wall) can be admitted;
+see §6.
 Port 9000 must be reachable from the macOS/Windows agent hosts and should be
 firewalled otherwise (only the shared agent secret crosses it). Server state
 survives
@@ -207,6 +209,36 @@ environment (self-hosted) or register project secrets with
 `activate.sh --secret NAME=VALUE` and add explicit
 `environment: {FAKTOR_BENCH_API_KEY: {from_secret: ...}}` entries to the lane
 in `.woodpecker/trusted/nightly.yaml`.
+
+Lane-marker auth tokens (optional, recommended). The trusted linux and
+nightly campaign lanes emit their `faktor-woodpecker-lane/v2` markers through
+`scripts/certification/lane-marker.sh`, which binds each marker to the lane
+that ran it with `auth = hmac-sha256(<lane token>, canonical unsigned marker
+JSON)`. Register one token per lane on the trusted project and map it into
+BOTH that lane's step environment and the aggregate certificate step:
+
+```
+for lane in linux static docs soak_smoke vscode vscode_e2e jetbrains_build \
+            jetbrains_smoke perf release_artifacts; do
+  bash scripts/woodpecker/activate.sh <owner/repo> \
+    --secret "faktor_lane_token_${lane}=$(openssl rand -hex 32)"
+done
+```
+
+then uncomment/add the matching `environment:` lines from the comment blocks
+in `.woodpecker/trusted/trusted.yaml` (the ten linux lanes + `certificate`)
+and `.woodpecker/trusted/nightly.yaml` (the nine campaign lanes +
+`certificate-nightly`). The environment key is the same as the secret name
+(`faktor_lane_token_<lane>`, with `-` -> `_`; the uppercase
+`FAKTOR_LANE_TOKEN_<LANE>` form is also accepted). Secrets stay on the
+trusted project: without a mapping a lane marker carries no `auth` and
+`verify-markers` records that lane as `unattested` (visible, no failure), so
+PR/untrusted keeps working; with a mapping, missing or wrong auth fails the
+certificate. Because a `from_secret` to a missing secret is a config compile
+error, the mappings ship commented and binding is opt-in per configured
+secret. This is what makes a marker attributable to the lane that produced
+it, instead of self-asserted evidence any lane sharing the workspace could
+fabricate.
 
 The release attestation (`trusted.yaml`, step `attestation`) is signed or it
 does not exist: `scripts/certification/attestation.mjs create` exits 3 with

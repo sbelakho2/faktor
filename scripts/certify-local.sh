@@ -103,9 +103,10 @@
 #
 # A release is certified only for its exact commit with dirty=false AND every
 # evidence gate verified; see docs/certification.md for what 100% means in
-# this repository. The 12-24h real-time soak is out of scope by owner
-# decision: it is not a release criterion, no CI workflow or release gate
-# consumes it, and the [soak]-ignored longrun suites stay runnable manually.
+# this repository. The wall-clock soak gates are owned by CI and are never
+# fabricated locally: the trusted soak-smoke lane runs the 30-60 min
+# accelerated churn and the nightly soak lane owns the real 12-24h
+# convergence run (scripts/soak.sh --mode churn|realtime).
 #
 # Self-test:
 #   CERTIFY_SELFTEST=force_fail bash scripts/certify-local.sh fast
@@ -317,8 +318,9 @@ local_offline_certified_rule() {
 
 # `release_certified`: the local offline certificate PLUS the external
 # evidence gates at the same SHA. The local harness can never fabricate a
-# cross-platform lane or a real-provider run. The 12-24h real-time soak is
-# out of scope by owner decision and is deliberately NOT a gate.
+# cross-platform lane or a real-provider run. The wall-clock soak gates
+# (trusted churn, nightly real-time convergence) are CI-owned and are
+# deliberately NOT simulated by this local harness.
 release_certified_rule() {
     # local_offline cross_platform real_provider
     if [ "$1" = "true" ] && [ "$2" = "true" ] && [ "$3" = "true" ]; then
@@ -794,8 +796,8 @@ emit_manifest() {
     # Certification levels: local_offline is this host's clean full pass;
     # release additionally requires EVERY verified external evidence gate
     # for this exact commit and tree. The harness never fabricates a gate
-    # from a flag, and the 12-24h real-time soak is out of scope by owner
-    # decision (never a gate).
+    # from a flag; the wall-clock soak acceptance (trusted churn + nightly
+    # real-time convergence) is CI-owned and never simulated locally.
     local_offline="$(local_offline_certified_rule "$status" "$PROFILE" "$dirty" "$FAST_TESTS_SKIPPED")"
     # Write this host's own evidence object when it certifies (unsigned unless
     # CERTIFY_EVIDENCE_SIGN_KEY is configured; never a release gate).

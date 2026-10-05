@@ -66,7 +66,7 @@ the reason instead of running it. Such a manifest can never be
 1. `cargo fmt --check`
 2. `cargo check --workspace`
 3. capability manifest + docs drift (`node scripts/capabilities-manifest.mjs`, skipped when node is absent)
-4. certification-evidence verifier selftest (`node scripts/certification/evidence.mjs selftest`: marker rejection matrix, commit/tree binding, signature allowlist, `.woodpecker` marker/command drift; skipped when node is absent)
+4. certification-evidence verifier selftest (`node scripts/certification/evidence.mjs selftest`: marker rejection matrix, lane-token auth/forgery matrix + helper parity, commit/tree binding, signature allowlist, `.woodpecker` marker/command drift; skipped when node is absent)
 5. `cargo clippy --workspace --all-targets -- -D warnings`
 6. `cargo test --workspace` (wrapped in `caffeinate -i` on macOS)
 7. static-authority scans (`faktor-tests-static-authority`)
@@ -108,17 +108,17 @@ when CI migrated (historical note only, no workflow files remain under
 | Job | Agent | Content |
 | --- | --- | --- |
 | `linux` | linux/amd64 | fmt; clippy `--workspace --all-targets --all-features -D warnings`; `check` + tests `--workspace --all-features` (protocol/stream codecs ride this run); `doctor` smoke |
-| `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; license/bans/sources policy gate (`scripts/check-licenses.sh`); supply-chain SBOM/checksums/advisories with recorded skips |
+| `static` | linux/amd64 | static-authority scans; security suite; seeded fuzz; frozen-contract drift gate (`cargo run -p faktor-contracts -- check` regenerates every vocabulary from the compiled serde implementation and fails on any rename/reorder in `docs/contracts/`); license/bans/sources policy gate (`scripts/check-licenses.sh`); supply-chain SBOM/checksums/advisories with recorded skips |
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
-| `soak-smoke` | linux/amd64 | bounded accelerated release soak (`scripts/soak.sh`, smoke mode, scale 1): one representative ignored `[soak]`/`[fault]`/`[perf]` test per group with wall/test budgets; records `target/certification/soak.json`; a zero-test run fails |
+| `soak-smoke` | linux/amd64 | per-release accelerated churn: `scripts/soak.sh --mode churn` runs the convergence churn workload for 1800 s (30–60 min band) with the mandatory quiescent-convergence checker; records `target/certification/soak.json`; a zero-test run, a missing metric sample or ANY failed convergence metric fails the lane |
 | `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; lockfile-pinned `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
 | `vscode-e2e` | linux/amd64 | pinned VS Code tarball (version+commit+sha256 in `scripts/vscode-e2e.sh`) + real Extension Host smoke after `vscode`: extension activates, commands registered, compiled webview provider HTML carries the strict CSP and composer/attachment surface (no pixel comparison) |
 | `jetbrains-build` | linux/amd64 | `./gradlew :frontend:buildPlugin --no-daemon --stacktrace` |
 | `jetbrains-smoke` | linux/amd64 | kotlinc split-mode compile + wire/native smokes against a real daemon |
 | `perf` | linux/amd64 | release `[perf]` gates; serialized after the other Rust lanes so budgets do not race a loaded agent |
 | `darwin-check` / `darwin-test` / `darwin-doctor` | self-hosted macOS (`local` backend) | `check`/`test --workspace` + `doctor`; `push` to `main` only |
-| `windows-check` / `windows-test` / `windows-visual-baseline` | self-hosted Windows (`local` backend) | `cargo check --workspace`; `cargo test -p faktor-fs --all-targets`, then the explicit rooted/atomic groups (`cargo test -p faktor-fs rooted`, `cargo test -p faktor-fs atomic`) and the `cfg(windows)` anchored-IO seam suite (`cargo test -p faktor-fs platform::windows`), then workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts; plus the Windows-owned JetBrains visual baseline gate (`scripts/windows-visual-baseline.ps1`), which fails when the pinned baseline has no DISTINCT `windows` record and renders/compares that platform's panels (re-pin with `-WriteBaselines`); `push` to `main` only |
-| `certificate` | linux/amd64 | aggregate gate over every linux lane: verifies each lane's marker and the workflow status, writes `target/certification/ci-certification.json` |
+| `windows-check` / `windows-test` / `windows-visual-baseline` | self-hosted Windows (`local` backend) | `cargo check --workspace`; `cargo test -p faktor-fs --all-targets`, then the explicit rooted/atomic groups (`cargo test -p faktor-fs rooted`, `cargo test -p faktor-fs atomic`) and the `cfg(windows)` anchored-IO seam suite (`cargo test -p faktor-fs platform::windows`), then workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts; plus the Windows-owned JetBrains visual baseline gate (`scripts/windows-visual-baseline.ps1`), which fails when the pinned baseline has no DISTINCT `windows` record (or its environment is not a Windows font fingerprint) and renders/compares that platform's panels (re-pin with `-WriteBaselines`); the lane must record `target/certification/ci-certification-windows-visual.json`, which `certificate-windows` re-hashes and REQUIRES before it can pass; `push` to `main` only |
+| `certificate` | linux/amd64 | aggregate gate over every linux lane: verifies each lane's marker and the workflow status, writes `target/certification/ci-certification.json`; re-hashes the frozen `docs/contracts/` files (node-only) and binds the contract digest as the `contracts_digest` evidence field |
 | `certificate-darwin` / `certificate-windows` | self-hosted platform agent | per-platform aggregate marker/status gate |
 
 Aggregation is marker-based because Woodpecker workflows are
@@ -139,10 +139,41 @@ lane-name-mismatch, marker-from-another-commit, tree-mismatch, stale-run
 (a marker from a different pipeline), failed lane, skipped-required lane,
 silent skip (a skippable lane without a reason), `commands_digest`
 mismatch, command-set drift against the lane's actual `.woodpecker/`
-commands, artifact hash/missing mismatch, timestamp order, and a
-non-success `CI_PIPELINE_STATUS`. `scripts/woodpecker/setup.md` documents
-the agent labels, self-hosted macOS/Windows agents, trusted-volume caching
-and the free cloud tier (linux runners only).
+commands, artifact hash/missing mismatch, a lane that omits a required
+artifact (`artifact-required`, e.g. the soak JSON, the VSIX or the release
+CLI), `auth` malformed/mismatch/missing, timestamp order, and a non-success
+`CI_PIPELINE_STATUS`. `scripts/woodpecker/setup.md` documents the agent
+labels, self-hosted macOS/Windows agents, trusted-volume caching and the
+free cloud tier (linux runners only).
+
+**Lane-bound marker auth (attribution).** Marker fields are all derivable
+from the YAML and `CI_*` environment, so on their own they prove a lane's
+claims only to the extent that the workspace is trustworthy; any lane
+sharing the workspace could fabricate another lane's marker. The trusted
+linux marker set and the nightly campaign set therefore emit through ONE
+helper,
+`scripts/certification/lane-marker.sh write --lane <id> --status ...
+--artifact ...` (Node implementation `lane-marker.mjs`, byte-for-byte
+parity fallback `lane-marker.py` for the python-only rust/Faktor-CI lane
+images), which computes `"auth":"hmac-sha256:<hex>"` =
+HMAC-SHA256(key = the lane's own `faktor_lane_token_<lane>` CI secret env,
+message = the canonical JSON of the marker with `auth` removed). The helper
+also derives `commands_b64`/`commands_digest` and the artifact digests from
+the same inputs, so the JSON and the MAC can never disagree. A lane step is
+mapped only to its own token, so it cannot mint a valid MAC for a lane it
+did not run; `verify-markers` runs in the certificate step, which receives
+every lane token (when the operator configured them) and recomputes each
+MAC over the canonical unsigned marker JSON. A configured lane token turns
+missing or wrong `auth` into a hard failure (`auth-missing` /
+`auth-mismatch`); a key that merely looks like an HMAC is always rejected
+(`auth-malformed`). When a lane has no token (PR/untrusted project or an
+unconfigured operator) the marker carries no `auth` and the certificate
+records that lane as **`unattested`** — visible in the manifest and output,
+never silently `passed` — while still passing so PR/untrusted behavior is
+unchanged. Secret registration and the exact step `environment:` mappings
+are in `scripts/woodpecker/setup.md` §4; the rejection and forgery matrix
+(including a lane-A marker signed with lane-B's token) is proven by
+`node scripts/certification/evidence.mjs selftest`.
 
 The table above is the **trusted** lane set (`.woodpecker/trusted/trusted.yaml`:
 `push`/`tag`, with the named-volume caches and the release `[perf]` budgets).
@@ -156,23 +187,28 @@ too long for push/PR: the ignored `[fault]` campaign at scale, the longrun
 suite, efficiency, economy, the coding-benchmark smoke, the provider-key
 real-model run (an explicit recorded skip unless keys are supplied
 out-of-band) and supply-chain evidence. Its `soak` lane drives
-`scripts/soak.sh` in long mode (`FAKTOR_SOAK_MODE=long`,
-`FAKTOR_SOAK_SCALE=4`, bounded by the driver's max-rounds/wall budget), which
-records `target/certification/soak.json`; the trusted push workflow runs the
-same driver as the bounded `soak-smoke` gate (§2.15). The nightly workflow
-writes lane markers and its own certificate. §2.11 describes the two-project
-trust boundary that keeps the PR workflow from ever obtaining a volume mount.
+`scripts/soak.sh` in **realtime** mode (`FAKTOR_SOAK_MODE=realtime`,
+`FAKTOR_SOAK_REALTIME_SECONDS=86400`): the convergence churn workload runs
+for a real 24 h of wall clock (never shortened) together with the keyless
+accounting modelcheck test, the mandatory quiescent-convergence checker
+evaluates every typed metric, and the lane records `target/certification/soak.json`
+plus its marker; the trusted push workflow runs the same driver as the
+bounded `soak-smoke` churn gate (§2.15). The nightly workflow writes lane
+markers and its own certificate. §2.11 describes the two-project trust
+boundary that keeps the PR workflow from ever obtaining a volume mount.
 
 100% requires the linux certificate green at the exact commit, plus the
 platform certificates when self-hosted darwin/windows agents exist. The
-12–24h real-time soak is **out of scope by owner decision**: it is not a
-release criterion, no CI workflow or release gate consumes it, and the
-`[soak]`-ignored longrun tests remain in-tree and runnable manually. `bash
-scripts/certify-local.sh full` keeps the long release lanes ([perf], [fault]
-at scale, coding benchmark, efficiency, ACP interop, packaging, installation
-matrix) runnable offline. A bounded accelerated soak campaign (`scripts/soak.sh`
-with an explicit `FAKTOR_SOAK_SCALE`) is in scope and runs in CI: the trusted
-push gate in smoke mode and the nightly `soak` lane in long mode (§2.15).
+REAL-TIME 12–24 h soak **is** a release criterion now: the nightly `soak`
+lane runs the real 24 h convergence churn (exact-SHA bound; a 12 h operator
+variant is `FAKTOR_SOAK_REALTIME_SECONDS=43200`) and its marker and
+`target/certification/soak.json` are required by the nightly certificate,
+while the trusted `soak-smoke` lane requires the same all-metrics-passed
+convergence record for a 30–60 min accelerated churn. `bash
+scripts/certify-local.sh full` keeps the other long release lanes ([perf],
+[fault] at scale, coding benchmark, efficiency, ACP interop, packaging,
+installation matrix) runnable offline; the wall-clock lanes are owned by CI
+and are never fabricated locally.
 
 ### 2.2 UI builds and parity
 
@@ -223,13 +259,51 @@ push gate in smoke mode and the nightly `soak` lane in long mode (§2.15).
   daemon, and driven as an executable matrix
   (`apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt`)
   that writes `target/certification/jetbrains-parity.json`: 11 behavioral
-  rows (each run against canned frames AND the fake daemon) and 8 rendered
-  Swing panels compared against pinned baselines. The derived capability
+   rows (each run against canned frames AND the fake daemon) and 8 rendered
+   Swing panels compared against pinned baselines. Each platform record's
+   `environment` fingerprint binds the render to OS + arch + JVM major +
+   resolved logical-font metrics: the component-tree/state digest's bounds
+   derive from font metrics, so the recorded baselines are only valid for
+   the pinned font environment. The Linux smoke pins that environment
+   in-tree with
+   `apps/jetbrains/frontend/src/test/resources/parity/fonts/core-fonts.conf`
+   (`FONTCONFIG_FILE`, DejaVu-only — the font set the CI image's
+   `libharfbuzz0b`/`fontconfig`/`fonts-dejavu-core` package pins produce)
+   and runs the smoke JVM with a checkout-local `user.home`, so the JVM
+   font cache can never keep a stale host mapping. A host whose fingerprint
+   differs reports the visual
+   rows `not_certified` with the typed environment reason — never a false
+   `drifted` regression and never a silent pass. A legacy record without a
+   fingerprint (the pre-fingerprint macOS entry) keeps the digest-only
+   comparison until that platform's lane re-pins it with its own font
+   fingerprint; the Windows re-pin records one for its platform, and the
+   Windows lane refuses a record whose environment is not its own distinct
+   `windows-...-f<hex>` fingerprint. Re-pin a platform with
+   `-PwriteBaselines=true` from that platform's pinned render (the
+   baseline's `rePin` block records the exact per-platform commands). The derived capability
   labels carry `jetbrains_frontend` **IMPLEMENTED** (the Faktor-owned
   frontend operates) and `jetbrains_behavioral_parity`/`jetbrains_visual_parity`
   derived from that HEAD-bound artifact only (§2.10, §3). Only the 2024.1.7
   distribution was verified; `until-build` stays unbounded, so
   newer-platform compatibility is not claimed.
+- **JetBrains packaged-plugin host matrix.** `JetBrainsHostMatrixSmoke`
+  proves the SHIPPED plugin ZIP, not the source classpath: it extracts
+  `frontend/build/distributions/faktor-*.zip`, requires
+  `faktor/lib/{frontend,shared,backend}-0.1.0.jar`, puts the extracted jars
+  first on the classpath, and asserts the loaded panel class comes from the
+  packaged jar (never `build/classes`). It then runs every panel through
+  width 240/320/480/800 px, font zoom 100/125/200 %, UIManager themes
+  light/dark/high-contrast (with a high-contrast black background +
+  light-text assertion), keyboard-only Tab-cycle + SPACE-binding traversal
+  (no `MouseEvent` is ever constructed) and the
+  empty/loading/error/blocked/reconnect states, recording
+  `target/certification/jetbrains-host-matrix.json`
+  (`faktor-jetbrains-host-matrix/v1`: per-check status, axes, ZIP sha256,
+  class-location provenance, `does_not_prove`). The trusted `jetbrains-smoke`
+  lane depends on `jetbrains-build` and runs
+  `FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 bash apps/jetbrains/compile-and-smoke.sh`
+  (typed failure on a missing ZIP); the Gradle equivalents are
+  `./gradlew :frontend:smokeHostMatrixZip` / `./gradlew smokeHostMatrixZip`.
 
 100% requires the builds and smokes green **and the derived capability
 manifest labels honest**. It does not require byte-for-byte parity where
@@ -816,15 +890,18 @@ scripts/check-ignored-tests.mjs` against
   `stale-registry`.
 
 Nightly lanes: `fault-scale` runs `faktor-tests-fault` + `faktor-updater`
-ignored tests, `soak` runs the bounded keyless `[soak]` set
-(`faktor-tests-accounting-modelcheck`) through `scripts/soak.sh` in long mode
-(the registry records the exact `bash scripts/soak.sh -p
-faktor-tests-accounting-modelcheck --release -- --ignored` command that the
-step runs; the trusted push gate runs the same driver in smoke mode), and
+ignored tests, `soak` runs the keyless `[soak]` set through `scripts/soak.sh`
+in **realtime** mode (the registry records the exact `bash scripts/soak.sh
+--mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck
+--release -- --ignored --skip soak_12h_scale` command that the step runs; the
+trusted push gate runs the same driver as the 30–60 min churn), and
 `longrun` is the release lane;
 the key-gated `coding-benchmark-real-model` step is the live-paid lane. The
-12h/24h/10 GiB wall-clock soaks stay manual by design and are recorded as
-such in the registry. The certificate jobs run the inventory check first,
+real-time soak test `soak_convergence_churn` is assigned to the `soak` lane
+and runs for a real 24 h there; the standalone accelerated `soak_12h_scale`,
+the `soak_24h_zero_drift_certification` ledger variant and the 10 GiB
+payload soaks stay operator-runnable (recorded as such in the registry) and
+are superseded as acceptance by the real-time convergence lane. The certificate jobs run the inventory check first,
 and `--selftest` proves the planted-violation fixtures under
 `scripts/certification/fixtures/ignored-tests/` (an unassigned ignored test
 fails with `unassigned`; an unconventional tag fails with
@@ -893,24 +970,63 @@ fails with `unassigned`; an unconventional tag fails with
 
 ### 2.15 Accelerated release soak, VS Code Extension Host E2E, Windows visual baseline
 
-- **Accelerated release soak (`scripts/soak.sh`).** One bounded driver for
-  the existing ignored `[soak]`/`[fault]`/`[perf]` campaigns. `FAKTOR_SOAK_SCALE`
-  is a positive multiplier (`rounds = ceil(min(scale, FAKTOR_SOAK_MAX_SCALE))`,
-  further capped by `FAKTOR_SOAK_MAX_ROUNDS`); `FAKTOR_SOAK_MODE=smoke` pins
-  one round and runs one representative ignored test per group with `--exact`,
-  while `FAKTOR_SOAK_MODE=long` runs the whole ignored set per round. The run
-  is bounded by `FAKTOR_SOAK_MAX_WALL_SECONDS` (checked between rounds, plus a
-  per-invocation `timeout` of `FAKTOR_SOAK_TEST_TIMEOUT_SECONDS`). Refusals
-  are hard failures: a zero/negative/unparseable scale, a non-positive budget,
-  or a campaign that executes zero tests. Every run records
-  `target/certification/soak.json` with commit/tree/scale/rounds/status and
-  per-group executed/passed/failed counts; `scripts/soak.sh --selftest`
-  proves the scale-clamp and zero/zero-test refusals with a fake cargo.
-  Wiring: the trusted `soak-smoke` step (smoke, scale 1, one representative
-  per group) and the nightly `soak` lane (long, scale 4, forwarding the
-  registry's recorded `-p faktor-tests-accounting-modelcheck …` command
-  verbatim). Operator long campaign:
-  `FAKTOR_SOAK_MODE=long FAKTOR_SOAK_SCALE=4 bash scripts/soak.sh --groups soak,fault,perf`.
+- **Accelerated churn + real-time soak (`scripts/soak.sh`).** One bounded
+  driver for the ignored `[soak]`/`[fault]`/`[perf]` campaigns and the
+  convergence churn workload (`tests/soak/src/lib.rs::soak_convergence_churn`,
+  a real runtime/store churn with real daemon restarts/reconnects).
+  `FAKTOR_SOAK_SCALE` is a positive multiplier for the legacy
+  `smoke`/`long` modes; `--mode churn` repeats rounds until
+  `FAKTOR_SOAK_CHURN_SECONDS` (default 1800; the trusted lane's 30–60 min
+  band) and `--mode realtime` repeats until `FAKTOR_SOAK_REALTIME_SECONDS`
+  (default/nightly-lane 86400; a 12 h operator variant is 43200) of REAL wall
+  clock has elapsed — a fast workload can never shorten either target, and
+  `FAKTOR_SOAK_MAX_WALL_SECONDS`/`FAKTOR_SOAK_TEST_TIMEOUT_SECONDS` bound the
+  run. Imported budget/scale refusals remain hard failures: zero/negative/
+  unparseable scale, non-positive budget, zero-test campaign. Every run
+  records `target/certification/soak.json` with lane/mode/commit/tree/
+  target/rounds/status, per-group counts and the embedded convergence report
+  (`faktor-soak-convergence/v1`).
+  - **Quiescent convergence is the acceptance rule,** not "no crash". After
+    the workload quiesces, bounded samplers
+    (`scripts/certification/soak-convergence.py sample`) sample the dominant
+    subject-pid process tree (Linux `/proc`, `ps` fallback; the workload
+    publishes its own pid through `FAKTOR_SOAK_SUBJECT_PIDFILE` so build
+    tooling is never mistaken for workload state) and the soak data dir
+    (WAL bytes, temp files, CAS blob count and the CAS unreachable population
+    computed read-only against the store's artifact/checkpoint/attachment
+    references). The checker (`... check`) evaluates and records typed
+    pass/fail for every metric; ANY failed metric fails the lane, and a
+    missing sample set is itself a typed FAILURE (never a skip):
+    `rss_bounded` (steady baseline = median of per-quintile maxima; last
+    window ≤ max(1.5× baseline, baseline + 128 MiB) and ≤ 2 GiB),
+    `fds_bounded` (≤ baseline + max(16, 10 %) and ≤ 4096),
+    `child_processes_zero` (0 descendants; 0 pgid orphans),
+    `background_tasks_settled` / `writer_queue_zero` / `reader_queue_zero`
+    (last window = 0), `wal_converged` (last-window growth ≤ 4 MiB and size
+    ≤ 64 MiB), `temp_files_removed` (= 0),
+    `cas_unreachable_stable` (≤ first window + 8 blobs and not monotonically
+    increasing), `journal_latency_no_upward_trend` /
+    `index_latency_no_upward_trend` (last-window p95 ≤ 2× first-window p95
+    and ≤ 500 ms), `reconnect_correct` (≥ 1 reconnect event and 0 failures),
+    `duration_target_met` (real elapsed ≥ the mode target and ≤ the wall
+    budget). The full band table is embedded in every soak.json.
+  - Wiring: the trusted per-release `soak-smoke` lane runs
+    `--mode churn -p faktor-tests-soak --release -- --ignored --exact
+    soak_convergence_churn` with `FAKTOR_SOAK_CONVERGENCE=required`; the
+    nightly `soak` lane runs `--mode realtime` with the same required
+    convergence plus the keyless accounting modelcheck set. Both lane
+    markers require `target/certification/soak.json`, and
+    `node scripts/certification/evidence.mjs verify-markers` additionally
+    parses the artifact and refuses (typed `soak-*` problems) a missing/
+    failed convergence record, any of the 13 metrics missing or not passed,
+    a lane, commit or tree mismatch, a wrong mode for the lane
+    (`soak-smoke`=churn, `soak`=realtime), or a non-passing soak status.
+    `scripts/soak.sh --selftest` proves the metric algebra (converged world,
+    leaky world, missing samples, duration band) and the churn integration
+    against fake metrics; `node scripts/certification/evidence.mjs selftest`
+    proves the certificate's soak rejection matrix.
+    Operator real-time campaign:
+    `FAKTOR_SOAK_MODE=realtime bash scripts/soak.sh --mode realtime -p faktor-tests-soak --release -- --ignored`.
 - **VS Code Extension Host E2E (`scripts/vscode-e2e.sh`).** Downloads the
   PINNED linux-x64 VS Code build (version `1.140.0`, commit
   `07f806f999227108933c2e30515b26eecc1fda74`, sha256 `d32031e9…`, recorded in
@@ -938,18 +1054,36 @@ fails with `unassigned`; an unconventional tag fails with
   `windows` record (a platform is never certified by inheriting linux/macos
   digests; an identical windows<->linux/macos digest for the same panel is an
   explicit `inherited-digest` failure), validates every digest as 64-hex, and
-  then renders/compares this platform's panels with
-  `bash apps/jetbrains/compile-and-smoke.sh`. `-WriteBaselines` first re-pins
-  the record with `--write-baselines`, copies the produced file to
-  `target/certification/visual-baselines-windows.json` for retrieval, and
-  still re-runs the comparison; the operator commits that file into
+  requires the windows record's `environment` to be its OWN distinct
+  `windows-...-f<hex>` fingerprint (a fingerprint-less placeholder or a
+  linux/macos environment is refused), and then renders/compares this
+  platform's panels with `bash apps/jetbrains/compile-and-smoke.sh`.
+  `-WriteBaselines` first re-pins the record with `--write-baselines`, copies
+  the produced file to `target/certification/visual-baselines-windows.json`
+  for retrieval, and still re-runs the comparison; the operator commits that
+  file into
   `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`.
-  A missing Git Bash/JetBrains toolchain is a hard `windows-jetbrains-toolchain-missing`
-  failure, never a skip. `powershell -File scripts/windows-visual-baseline.ps1
-  -SelfTest` proves the missing/inherited/malformed/v2 refusals offline.
-  The checked-in baseline does not yet carry a `windows` record, so this gate
-  is red until the Windows agent records it — that is the intended fail-closed
-  state, not a silent pass.
+  On success the lane writes
+  `target/certification/ci-certification-windows-visual.json`
+  (`faktor-windows-visual-baseline/v1`, with `windows_environment`,
+  `baseline_sha256`, coverage and the exact commit/tree) and REQUIRES it as a
+  lane-marker artifact. `certificate-windows` re-hashes that artifact and
+  refuses to write a passing `ci-certification-windows.json` when the lane,
+  the artifact, its digest, the record's pass status/commit/tree or the
+  `windows=certified` coverage is missing — the same rule is the canonical
+  `windows` workflow spec in `scripts/certification/evidence.mjs`
+  (`windows-check`, `windows-test`,
+  `windows-visual-baseline` with required artifact
+  `target/certification/ci-certification-windows-visual.json`), whose
+  selftest proves the missing-lane / missing-record / drifted-record
+  refusals. A missing Git Bash/JetBrains toolchain is a hard
+  `windows-jetbrains-toolchain-missing` failure, never a skip.
+  `powershell -File scripts/windows-visual-baseline.ps1 -SelfTest` proves the
+  missing/inherited/malformed/wrong-digest/foreign-fingerprint/v2 refusals
+  offline. The checked-in baseline does not yet carry a `windows` record
+  (the file records the one-time `-WriteBaselines` command in its `rePin`
+  block), so this gate is red until the Windows agent records it — that is
+  the intended fail-closed state, not a silent pass.
 - **Mutation registry gate.** `node scripts/check-invariants.mjs` runs in the
   trusted and PR certificate steps. The executable campaign
   (`node scripts/check-invariants.mjs --mutations`) runs in the trusted
@@ -960,6 +1094,18 @@ fails with `unassigned`; an unconventional tag fails with
   counted as detections, and a spec may declare an `expect` signature that the
   mutated gate failure must match. The lanes above add gates but never bypass the mutation witness
   gate (§2.12).
+- **Criticality policy.** Every `[[invariant]]` in `tests/invariants.toml`
+  names a production authority, so every entry is release-critical by default
+  (`release_critical` defaults to `true`). A release-critical invariant MUST
+  ship an executable `mutation_command`: a non-empty `mutation_debt` on one is
+  a hard `release-critical-mutation-debt` failure in BOTH checker modes (the
+  normal drift check and `--mutations`), so a documented hole can never
+  substitute for a planted-mutation proof. An entry may be explicitly
+  downgraded with `release_critical = false`, which requires a non-empty
+  `criticality_reason`; only then may `mutation_debt` remain, and the checker
+  prints it as a warning instead of treating it as proof. A behavioral
+  witness alone (a hostile/refusal oracle) is evidence, not a release proof:
+  the planted mutation must make the named gate fail with the violation live.
 
 ---
 
@@ -976,7 +1122,7 @@ profile).
 | Local host lane (darwin) | fast profile: fmt, check, clippy, tests, static authority, fault smoke, doctor deep, branding, release CLI | `scripts/certify-local.sh fast` → `target/certification/manifest.json` | CERTIFIED per run (see §3.1) |
 | Perf distributions | release `[perf]` gates | `full` profile / Woodpecker `perf` job | CI-LANE |
 | Fault at scale | `[fault] --ignored` campaigns | `full` profile / nightly `fault` job | CI-LANE |
-| Accelerated release soak | bounded `scripts/soak.sh` campaign (`FAKTOR_SOAK_SCALE`, wall/test budgets, zero/zero-test refusal) | trusted `soak-smoke` (scale 1 smoke) + nightly `soak` (long mode scale 4); `target/certification/soak.json` | CI-LANE (bounded accelerated; the 12–24h wall-clock soak below stays out of scope) |
+| Accelerated release soak | 30–60 min `scripts/soak.sh --mode churn` with required quiescent convergence (13 typed metrics, wall/test budgets, zero/zero-test refusal) | trusted `soak-smoke`; `target/certification/soak.json` + convergence report enforced by `verify-markers` | CI-LANE (per-release churn; a failed or missing metric fails the lane) |
 | Coding benchmark (harness) | `smoke` suite, offline | `full` profile | CERTIFIED in `full` only |
 | Coding benchmark (real model) | `real --ignored`, provider keys | manual, keyed | NOT RUN HERE (recorded skip) |
 | Efficiency | KPI harness | `full` profile | CERTIFIED in `full` only |
@@ -984,18 +1130,19 @@ profile).
 | Installable artifacts (host) | daemon tar.gz + VSIX + JetBrains zip + `artifacts.json` | `full` profile (`scripts/package-artifacts.sh`, §2.9) | CERTIFIED per full run (recorded skips with exact errors when a tool/registry is absent) |
 | Installation matrix (host) | clean-prefix extract + `doctor`; VSIX/zip structure + entry points | `full` profile (`node scripts/install-matrix.mjs` → `install-matrix.json`, §2.9) | CERTIFIED per full run |
 | IDE-launched install | `code --install-extension` / JetBrains sandbox install | requires an IDE host; the Woodpecker `vscode` job owns it | NOT RUN HERE (residual, recorded in `install-matrix.json`) |
-| Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot; JetBrains visual baseline gate | Woodpecker `windows-*` jobs | CI-LANE (visual gate fails until a DISTINCT windows baseline is recorded on the agent — never inherited) |
+| Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot; JetBrains visual baseline gate | Woodpecker `windows-*` jobs + `target/certification/ci-certification-windows-visual.json` (required artifact of the `windows-visual-baseline` lane marker) | CI-LANE (visual gate and `certificate-windows` fail until a DISTINCT windows baseline + record are produced on the agent — never inherited) |
 | Linux lane | fmt/check/test/clippy/doctor | Woodpecker `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code Faktor panel | hand-written panel (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`) + provider (`apps/vscode/src/webview.ts`) | `node scripts/selftest.mjs` + `node scripts/verify-vsix.mjs` + Woodpecker `vscode` job; §2.10 | CI-LANE (Faktor-owned, no vendored closure; a real-IDE screenshot comparison stays a host capability not claimed offline) |
 | VS Code Extension Host E2E | pinned VS Code `1.140.0`/commit `07f806f9…`/sha256 `d32031e9…` + `scripts/vscode-e2e/extension-host-smoke.cjs` inside the real host | trusted `vscode-e2e` lane; `target/certification/vscode-e2e.json` (exact `does_not_prove` list) | CI-LANE (real host activation + registered commands + compiled webview HTML surface; NOT rendered pixels or a displayed workbench) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (lifecycle + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
 | JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) (generated) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
-| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`; the Windows platform record is gated by `scripts/windows-visual-baseline.ps1` | IMPLEMENTED (offline component-tree/state comparison; a real-IDE screenshot comparison stays a host capability not claimed here; windows is NOT certified until the Windows agent records its own record) |
+| JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; pinned font env (`parity/fonts/core-fonts.conf` via `FONTCONFIG_FILE`); regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`; the Windows platform record is gated by `scripts/windows-visual-baseline.ps1` | IMPLEMENTED (offline component-tree/state comparison on linux/macos; a real-IDE screenshot comparison stays a host capability not claimed here; windows is NOT certified until the Windows agent records its own record) |
+| JetBrains packaged-plugin host matrix | `JetBrainsHostMatrixSmoke` (`target/certification/jetbrains-host-matrix.json`) | BUILT plugin ZIP extracted with `faktor/lib/*.jar` first on the classpath + class-provenance assertion; width 240/320/480/800, zoom 100/125/200 %, light/dark/high-contrast UIManager themes, keyboard-only Tab/SPACE traversal, empty/loading/error/blocked/reconnect states; `FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1` in the trusted `jetbrains-smoke` lane | IMPLEMENTED |
 | Fuzz harnesses | seeded pseudo-fuzz | Woodpecker `static` job / manual | CI-LANE |
-| Real-time soak (12–24h) | excluded by owner decision | no release gate and no CI workflow consumes a wall-clock soak; the `[soak]`-ignored longrun suites remain runnable manually; the bounded accelerated campaign above is a different, in-scope gate | OUT OF SCOPE (by decision) |
+| Real-time soak (12–24h) | `scripts/soak.sh --mode realtime` runs the convergence churn for 86400 s of real wall clock (43200 s operator variant) with required quiescent convergence | nightly `soak` lane + nightly certificate (`target/certification/soak.json` parsed by `verify-markers`); runnable manually | CI-LANE (release criterion; exact-SHA bound) |
 | PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task/`, `crates/session/src/ledger/`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime/settlement.rs`); adversarial gate/step tests in-tree (`crates/agent/src/runtime/verification_attribution_tests.rs`); Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
-| Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools, native `GET/POST /native/session/{id}/board`, both IDE board panels | `crates/session/src/board.rs` + `crates/session/src/ledger/`; `crates/server/src/native/board.rs`; `apps/vscode/src/nativeClient.ts`; JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt` | IMPLEMENTED (fast tests green; native GET/POST round-trip in both IDE smokes; unavailable state recorded truthfully) |
+| Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools, native `GET/POST /native/session/{id}/board`, both IDE board panels | `crates/session/src/board.rs` + `crates/session/src/ledger/`; `crates/server/src/native/board.rs`; `apps/vscode/src/nativeClient.ts` + `apps/vscode/media/board-state.js` (bounds parity-pinned by the selftest) + `media/chat.js` panel; JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt` | IMPLEMENTED (fast tests green; native GET/POST round-trip in both IDE smokes; unavailable state recorded truthfully; both composers gate on the same byte bounds) |
 | Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup, cross-IDE controls | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints; VS Code cockpit + JetBrains `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt` (decide gated on every candidate settled) | IMPLEMENTED (fast tests green + both IDE smokes; integration stays the explicit approved-merge path) |
 | Pixel agents | deterministic per-ChildId avatars (VS Code + JetBrains, identical FNV-1a hashes) | `apps/vscode/src/pixelAgents.ts`, `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt` | IMPLEMENTED (UI layers; daemon exposes the durable child ids/state they render) |
 | Canonical child lifecycle + typed blockers | typed core `ChildBlocker` (kind/dependency/resolution/last-progress) with `blocked <=> blocker` decode invariants; corrupt rows fail loudly; canonical child-state projection | `crates/core/src/blocker.rs`, `crates/session/src/child.rs` (`child_runtime` v23 row) + native agent projection (`state`/`blocker` fields) | IMPLEMENTED (fast tests green) |
@@ -1284,8 +1431,11 @@ configured).
 > **A release is certified only for its exact commit with `dirty_count = 0`,
 > `local_offline_certified = true`, and every external evidence object
 > (`cross_platform_lanes`, `real_provider`) verified at the same
-> commit and tree.** Booleans never certify. The 12–24h real-time soak is
-> out of scope by owner decision and is not a release gate.
+> commit and tree.** Booleans never certify. The per-release trusted
+> `soak-smoke` lane must additionally carry the 30–60 min churn's
+> all-metrics-passed quiescent-convergence record (`target/certification/soak.json`,
+> parsed and enforced by `verify-markers`), and the nightly `soak` lane owns
+> the real 24 h (12–24 h) real-time convergence run for the same exact SHA.
 
 Concretely, to ship:
 
@@ -1397,6 +1547,13 @@ Exact binding rules:
   comes from `--keys <file>` or `CERTIFY_EVIDENCE_KEYS`
   (`{"identities":{"<identity>":{"ed25519_public_key":"<base64>"}}}`).
   Unsigned or foreign-key evidence fails `--require-signed` (release-grade).
+- **Lane markers:** `faktor-woodpecker-lane/v2` markers written by the
+  shared helper additionally carry `auth`, an
+  `hmac-sha256:<hex>` MAC over the canonical JSON of the marker without
+  `auth`, keyed by the lane's own `faktor_lane_token_<lane>` secret. The
+  verifier recomputes it whenever the token is available to the certificate
+  step (missing/wrong auth then fails) and records token-less lanes as
+  `unattested` (§2.1).
 
 Usage:
 
@@ -1411,14 +1568,22 @@ node scripts/certification/evidence.mjs verify --kind real_provider \
   --evidence-dir target/certification/evidence --require-signed
 
 # verify a workflow's markers and write ci-certification.json
+# (lane tokens come from faktor_lane_token_<lane> env; --lane-token can pin
+#  them explicitly, and lanes without a token are recorded `unattested`)
 node scripts/certification/evidence.mjs verify-markers --workflow pr \
   --lanes-dir target/certification/lanes --out target/certification/ci-certification.json \
   --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
+
+# emit a lane marker + its auth through the shared helper (used by every
+# trusted/nightly lane block; pipe the lane's CMDS heredoc on stdin)
+printf '%s' "$CMDS" | scripts/certification/lane-marker.sh write \
+  --lane linux --status passed --out target/certification/lanes/linux.json
 
 # add a signature with an offline key
 node scripts/certification/evidence.mjs sign --file target/certification/evidence/real_provider.json \
   --key /secure/ci-ed25519.pem --key-id ci-provider
 
-# prove the whole rejection matrix + signature allowlist + repo drift
+# prove the whole rejection matrix + lane-token forgery matrix + signature
+# allowlist + helper parity + repo drift
 node scripts/certification/evidence.mjs selftest
 ```

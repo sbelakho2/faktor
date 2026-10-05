@@ -653,6 +653,20 @@ pub fn build_router_service_with_outcomes(
 /// [`build_router_service_with_outcomes`] for the admission policy).
 type RouterCandidates = Vec<faktor_router::RouteCandidate>;
 
+/// The daemon's boot-time admissibility check of the configured routing
+/// mode over the registered providers: builds the SAME candidate set
+/// [`build_router_service_with_outcomes`] consumes (via the shared
+/// [`router_candidates`] authority) and discards it. A pinned mode naming an
+/// unregistered provider/model or a balanced mode with no admitted candidate
+/// refuses HERE — used by the pure boot preflight so the refusal precedes
+/// any store write.
+pub(crate) fn validate_router_candidates(
+    providers: &ProviderRegistry,
+    mode: &RoutingMode,
+) -> Result<(), String> {
+    router_candidates(providers, mode).map(|_| ())
+}
+
 /// Candidate build shared by both service constructors (see
 /// [`build_router_service_with_outcomes`] for the admission policy).
 fn router_candidates(
@@ -1121,6 +1135,7 @@ mod tests {
             base_url: "https://corp.example.com/v1".into(),
             api_key_env: None,
             api: None,
+            models: Vec::new(),
             pricing: Some(crate::config::ProviderPricingCfg {
                 pricing_ceiling_micro_usd_per_million_tokens: Some(42_000_000),
                 ..Default::default()
@@ -1454,6 +1469,7 @@ mod tests {
                 base_url: format!("https://{id}.example.com/v1"),
                 api_key_env: None,
                 api: None,
+                models: Vec::new(),
                 pricing: Some(pricing),
                 quality: None,
                 allow_loopback: true,
@@ -2342,8 +2358,11 @@ mod tests {
     /// ordering list the test asserts against the builder text.
     const CORE_STEP_TOKENS: &[(&str, &str)] = &[
         ("transport", "daemon_egress_transport("),
-        ("providers", "ProviderRegistry::new"),
-        ("catalog", "p.build_ollama("),
+        // Steps 5-6 are delegated to the ONE shared configured-provider
+        // builder (also used by the pure boot preflight): the tokens are the
+        // in-core call and the catalog-authority/ollama-concrete destructure.
+        ("providers", "build_configured_providers("),
+        ("catalog", "ConfiguredProviders {"),
         ("router", "economic_routing_policy_with_outcomes("),
         ("budgets", "DurableBudgetLedger::new"),
         ("index", "IndexService::open_with_supervisor("),

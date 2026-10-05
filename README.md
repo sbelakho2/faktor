@@ -133,9 +133,12 @@ precedence over a root `.woodpecker.yml`, and this repository has none):
   Registration is in `scripts/woodpecker/setup.md`;
   `scripts/woodpecker/activate.sh` does it via the Woodpecker API.
 
-The 12–24h real-time soak is out of scope by owner decision: it is not a
-release criterion, no CI workflow or release gate consumes it, and the
-`[soak]`-ignored longrun suites remain runnable manually.
+The trusted `soak-smoke` lane runs the per-release 30–60 min accelerated
+churn with the mandatory quiescent-convergence checker, and the nightly
+`soak` lane owns the real 12–24 h real-time convergence run
+(`scripts/soak.sh --mode churn|realtime`): a missing metric sample or any
+failed metric fails the lane, and both lanes' certificates parse
+`target/certification/soak.json` for the exact commit.
 
 The `certificate` job is the aggregate gate in every workflow: every lane
 emits a `faktor-woodpecker-lane/v2` marker with the exact commit and tree,

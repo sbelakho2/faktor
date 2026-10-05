@@ -471,19 +471,26 @@ details summary {
   letter-spacing: 0.04em;
 }
 
+/* Verdict chips are DESIGNED PAIRS (deep tinted background + light tinted
+   text), never "theme accent + white": white on the stock
+   `--vscode-testing-iconPassed`/`-Failed` accents measured 2.00-3.35:1
+   (below WCAG AA 4.5:1 for this normal-size text) in the real renderer, and
+   the accents vary by theme while the chip text did not. Each pair below
+   measures >= 7:1 in every theme (the selftest contrast check parses these
+   exact declarations and fails if white-on-accent returns). */
 .criterion-verdict-pass {
-  background: var(--vscode-testing-iconPassed, #3fb950);
-  color: #fff;
+  background: #033a16;
+  color: #7ee787;
 }
 
 .criterion-verdict-fail {
-  background: var(--vscode-testing-iconFailed, #f85149);
-  color: #fff;
+  background: #4c1114;
+  color: #ffa198;
 }
 
 .criterion-verdict-unavailable {
-  background: transparent;
-  color: var(--vscode-editorWarning-foreground, #d29922);
+  background: #3a2d05;
+  color: #f2cc60;
   border: 1px dashed currentColor;
 }
 
@@ -520,6 +527,61 @@ details summary {
 /* Accessibility: with prefers-reduced-motion every .pixel-* animation and
    transform is removed, while each state keeps a STATIC cue (opacity) so
    presence is still legible without motion. */
+.board-posts {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.board-post {
+  border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  padding-left: 6px;
+}
+
+.board-post-head {
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.board-post-subject {
+  font-weight: 600;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.board-post-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.board-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* Every element that can render daemon-provided text must break long
+   unbroken tokens (paths, digests, JSON, CJK) instead of widening the
+   panel; min-width:0 lets flex children actually shrink. */
+#app,
+.muted,
+.warn,
+.error,
+.notice,
+.agent-head,
+.criterion-key,
+.usage-alert {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pixel,
   .pixel-running,

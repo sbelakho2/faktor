@@ -8,10 +8,19 @@
 #      parity families + the executable behavioral/visual parity matrix
 #      artifact + real daemon restart/reconnect) against the real daemon;
 #      exit 0/1
+#   4. run JetBrainsHostMatrixSmoke against the BUILT plugin ZIP when one is
+#      present (extract + extracted jars first on the classpath), else in
+#      source-bundle mode; the trusted lane requires the ZIP
+#      (FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1)
+#
+# The offscreen render runs under the pinned core-fonts fontconfig
+# (frontend/src/test/resources/parity/fonts/core-fonts.conf) on Linux and a
+# checkout-local user.home, so the pinned visual digest is comparable.
 #
 # When kotlinc is absent (dev hosts), the same smokes run on the
 # Gradle-managed Kotlin/IntelliJ classpath instead:
 #   ./gradlew :backend:smoke :frontend:smoke -PfaktorCliBin=<bin>
+#   ./gradlew :frontend:smokeHostMatrixZip          # ZIP-hosted proof
 # CI images that ship kotlinc keep the self-contained, network-free path.
 #
 # Flags:
@@ -24,6 +33,17 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JETBRAINS="$ROOT/apps/jetbrains"
+
+# Pinned core-fonts environment for the offscreen Swing render: the visual
+# digest derives component bounds from resolved font metrics, so the pinned
+# linux baseline is only comparable under this environment (the CI image
+# installs exactly fontconfig + fonts-dejavu-core). macOS/Windows render and
+# record their own environment fingerprints.
+CORE_FONTS_CONF="$JETBRAINS/frontend/src/test/resources/parity/fonts/core-fonts.conf"
+if [ -f "$CORE_FONTS_CONF" ] && [ "$(uname -s)" = "Linux" ]; then
+  export FONTCONFIG_FILE="$CORE_FONTS_CONF"
+  echo "[compile-and-smoke] pinned core-fonts fontconfig: $CORE_FONTS_CONF"
+fi
 
 EXTRA_JVM_ARGS=""
 for arg in "$@"; do
@@ -51,6 +71,7 @@ $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendTestSupport.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/ControlPlaneCredentialSmoke.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsHostMatrixSmoke.kt
 $JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ControlPlaneCredentials.kt
@@ -111,7 +132,10 @@ if [ -z "$KOTLINC" ]; then
   if [ -n "$EXTRA_JVM_ARGS" ]; then
     GRADLE_SMOKE_ARGS+=(-PwriteBaselines=true)
   fi
-  (cd "$JETBRAINS" && ./gradlew "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke)
+  (cd "$JETBRAINS" && ./gradlew "${GRADLE_SMOKE_ARGS[@]}" :backend:smoke :frontend:smoke) || exit $?
+  # The packaged-plugin host proof on the same Gradle-managed classpath set:
+  # buildPlugin + extract + run the host matrix with the ZIP jars first.
+  (cd "$JETBRAINS" && ./gradlew --console=plain --no-daemon :frontend:smokeHostMatrixZip)
   exit $?
 fi
 
@@ -238,7 +262,8 @@ compile_kotlin || {
 run_smoke() {
   local name="$1"
   local err="$WORK/${name}.stderr"
-  java -Dfaktor.repo.root="$ROOT" $EXTRA_JVM_ARGS -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
+  mkdir -p "$WORK/home"
+  java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $EXTRA_JVM_ARGS -cp "$SMOKE_JAR" "$2" "$BIN" 2>"$err"
   local rc=$?
   if [ $rc -ne 0 ]; then
     echo "[compile-and-smoke] $name FAILED (rc=$rc); daemon stderr tail ($err):" >&2
@@ -254,11 +279,54 @@ echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against
 run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke || exit $?
 
 echo "[compile-and-smoke] running FrontendSmoke (panels + canned native JSON + real daemon) against $BIN"
-run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke
+run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke || exit $?
 
 echo "[compile-and-smoke] running ControlPlaneCredentialSmoke (fake PasswordSafe rows) against $BIN"
 run_smoke ControlPlaneCredentialSmoke dev.faktor.frontend.ControlPlaneCredentialSmoke || exit $?
 
 echo "[compile-and-smoke] running JetBrainsParitySmoke (pin hashes + fake daemon + real daemon parity) against $BIN"
-run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke
-exit $?
+run_smoke JetBrainsParitySmoke dev.faktor.frontend.JetBrainsParitySmoke || exit $?
+
+# ---- 7. host matrix: the BUILT plugin ZIP ----------------------------------
+# Extracts the built plugin ZIP and runs the host matrix with the ZIP's
+# `faktor/lib/*.jar` FIRST on the classpath, so the panel classes under test
+# are the shipped ones (the smoke asserts the class provenance). The trusted
+# `jetbrains-smoke` lane sets FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1, which
+# makes a missing ZIP a typed failure instead of a silent source-only run.
+PLUGIN_ZIP="${FAKTOR_JETBRAINS_PLUGIN_ZIP:-}"
+if [ -z "$PLUGIN_ZIP" ]; then
+  PLUGIN_ZIP="$(ls -t "$JETBRAINS"/frontend/build/distributions/*.zip 2>/dev/null | head -n 1 || true)"
+fi
+HOST_MATRIX_CP="$SMOKE_JAR"
+HOST_MATRIX_ARGS=""
+if [ -n "$PLUGIN_ZIP" ]; then
+  echo "[compile-and-smoke] host matrix: extracting the built plugin ZIP $PLUGIN_ZIP"
+  mkdir -p "$WORK/plugin-zip"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$PLUGIN_ZIP" -d "$WORK/plugin-zip"
+  else
+    JAR_BIN="$(dirname "$(command -v java)")/jar"
+    (cd "$WORK/plugin-zip" && "$JAR_BIN" xf "$PLUGIN_ZIP") || {
+      echo "FAIL: cannot extract $PLUGIN_ZIP (unzip absent and jar extraction failed)" >&2
+      exit 1
+    }
+  fi
+  HOST_MATRIX_CP="$WORK/plugin-zip/faktor/lib/*:$SMOKE_JAR"
+  HOST_MATRIX_ARGS="-Dfaktor.hostMatrix.zip=$PLUGIN_ZIP -Dfaktor.hostMatrix.requireZip=true"
+else
+  if [ "${FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP:-0}" = "1" ]; then
+    echo "FAIL: jetbrains-plugin-zip-missing: FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 but no built plugin ZIP was found (run ./gradlew :frontend:buildPlugin first); the host matrix must run against the shipped artifact" >&2
+    exit 1
+  fi
+  echo "[compile-and-smoke] host matrix: no built plugin ZIP; running source-bundle mode (build :frontend:buildPlugin for the shipped-artifact proof)"
+fi
+mkdir -p "$WORK/home"
+echo "[compile-and-smoke] running JetBrainsHostMatrixSmoke (width/zoom/theme/keyboard-only/states)"
+java -Dfaktor.repo.root="$ROOT" -Duser.home="$WORK/home" $HOST_MATRIX_ARGS -cp "$HOST_MATRIX_CP" dev.faktor.frontend.JetBrainsHostMatrixSmoke 2>"$WORK/HostMatrix.stderr"
+HOST_RC=$?
+if [ $HOST_RC -ne 0 ]; then
+  echo "[compile-and-smoke] JetBrainsHostMatrixSmoke FAILED (rc=$HOST_RC); stderr tail:" >&2
+  tail -n 40 "$WORK/HostMatrix.stderr" >&2 || true
+  exit $HOST_RC
+fi
+exit 0

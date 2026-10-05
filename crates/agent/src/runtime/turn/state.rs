@@ -470,14 +470,22 @@ pub struct AgentDeps {
     /// [`AgentDeps::context_prior`] seam; the remaining flags are carried
     /// for their efficiency components.
     pub efficiency: EfficiencyFlags,
+    /// The daemon's configured-secret registry: the SAME `Arc` the outbound
+    /// egress scan uses (built once in the daemon builder). Tool outcomes,
+    /// durable message-part excerpts and every CAS artifact put are exact-
+    /// redacted through it, so a configured provider key echoed by a tool
+    /// can neither reach durable storage nor block the next provider request
+    /// at the egress scan. `None` in test graphs (pattern-only behavior).
+    pub secret_registry: Option<Arc<faktor_security::registry::SecretRegistry>>,
 }
 
 impl AgentDeps {
     pub fn artifact_sink(&self, session: SessionId) -> ToolArtifactSink {
         match &self.cas {
-            Some(cas) => {
-                ToolArtifactSink::Real(Arc::new(ArtifactWriter::new(cas.clone(), session)))
-            }
+            Some(cas) => ToolArtifactSink::Real {
+                writer: Arc::new(ArtifactWriter::new(cas.clone(), session)),
+                secrets: self.secret_registry.clone(),
+            },
             None => ToolArtifactSink::Null,
         }
     }
@@ -2008,9 +2016,11 @@ impl AgentRuntime {
     /// it NEVER fails the session transition or rolls the session back.
     ///
     /// Sessions are CREATED by the session manager (server side), not by the
-    /// runtime, so SessionStart is not fired inside this file: session
-    /// creators (the CLI/acp daemon entry in `faktor-cli` main.rs) call this
-    /// helper right after `create_session` succeeds. SessionEnd fires from
+    /// runtime, so SessionStart is not fired inside this file: every session
+    /// creator (the ACP daemon entry, `faktor run`, the native
+    /// `POST /native/session` handler and the worker node) calls this helper
+    /// right after `create_session` succeeds, before the session is first
+    /// used. SessionEnd fires from
     /// [`AgentRuntime::end_session`]. SessionResume fires from
     /// [`AgentRuntime::continue_record`] — the ONLY recovery-resume
     /// boundary; `drive_receipt` also runs after `recover_session` for
@@ -2033,6 +2043,17 @@ impl AgentRuntime {
             None,
             serde_json::json!({ "session_id": session.to_string() }),
         );
+    }
+
+    /// SessionStart lifecycle hook for one newly created durable session:
+    /// the ONE seam every session creator calls immediately after
+    /// `create_session` succeeds and before the session is first used (the
+    /// same ordering the ACP daemon entry established). Best-effort and
+    /// audit-only — a failing/hanging hook is bounded by its registry
+    /// deadline and can NEVER fail or roll back the session creation, and a
+    /// registry-less runtime is a no-op.
+    pub fn run_session_start_hook(&self, session: SessionId) {
+        self.run_lifecycle_hook(faktor_hooks::HookEvent::SessionStart, session);
     }
 
     /// Best-effort post-hoc hook dispatch: run every registry hook

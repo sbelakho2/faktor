@@ -2246,6 +2246,7 @@ pub(crate) fn open_real_tool_env_inner_with_resolver(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap();

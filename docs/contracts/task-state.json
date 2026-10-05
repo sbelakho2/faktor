@@ -1,0 +1,48 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "task_state",
+  "type": "faktor_core::state::TaskState",
+  "representation": "external",
+  "variants": [
+    {
+      "name": "Pending",
+      "wire": "pending"
+    },
+    {
+      "name": "Planning",
+      "wire": "planning"
+    },
+    {
+      "name": "Running",
+      "wire": "running"
+    },
+    {
+      "name": "Waiting",
+      "wire": "waiting"
+    },
+    {
+      "name": "Blocked",
+      "wire": "blocked"
+    },
+    {
+      "name": "NeedsVerification",
+      "wire": "needs_verification"
+    },
+    {
+      "name": "Verifying",
+      "wire": "verifying"
+    },
+    {
+      "name": "VerifiedComplete",
+      "wire": "verified_complete"
+    },
+    {
+      "name": "Failed",
+      "wire": "failed"
+    },
+    {
+      "name": "Cancelled",
+      "wire": "cancelled"
+    }
+  ]
+}

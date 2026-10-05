@@ -271,14 +271,49 @@ mod tests {
 mod vocabulary_tests {
     use super::*;
 
-    /// The vocabulary is the authority: every variant compiles through the
-    /// exhaustive guard and appears in the documented contract.
+    #[derive(serde::Deserialize)]
+    struct FrozenContract {
+        schema: String,
+        #[serde(rename = "type")]
+        type_path: String,
+        variants: Vec<FrozenVariant>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FrozenVariant {
+        name: String,
+        wire: String,
+    }
+
+    /// The vocabulary authority is the mechanically generated frozen contract
+    /// (`cargo run -p faktor-contracts -- check`, derived from the compiled
+    /// serde implementation): `EventKind::ALL` must match it in declaration
+    /// order, and the documented contract must still spell every variant.
     #[test]
     fn event_kind_vocabulary_is_complete_and_documented() {
-        assert_eq!(EventKind::ALL.len(), 28);
+        let contract: FrozenContract =
+            serde_json::from_str(include_str!("../../../docs/contracts/event-kind.json"))
+                .expect("the generated event-kind contract must parse");
+        assert_eq!(contract.schema, "faktor-frozen-contract/v1");
+        assert_eq!(contract.type_path, "faktor_core::event::EventKind");
+        assert_eq!(
+            contract.variants.len(),
+            EventKind::ALL.len(),
+            "EventKind::ALL must cover the compiled vocabulary"
+        );
         let doc = include_str!("../../../docs/api-contracts.md");
-        for kind in EventKind::ALL {
+        for (index, kind) in EventKind::ALL.iter().enumerate() {
             kind.exhaustive();
+            let variant = &contract.variants[index];
+            assert_eq!(
+                variant.name,
+                format!("{kind:?}"),
+                "EventKind::ALL[{index}] must match the compiled declaration order"
+            );
+            assert!(
+                !variant.wire.is_empty(),
+                "EventKind::{kind:?} has an empty serde wire name"
+            );
             assert!(
                 doc.contains(&format!("{kind:?}")),
                 "api-contracts.md omits EventKind::{kind:?}"

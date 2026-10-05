@@ -17,12 +17,24 @@
 //! when no embedder is configured — a `Disabled` mode that is explicit in the
 //! API ([`SearchService::semantic_enabled`] returns `false`), never encoded
 //! as zero semantic hits.
+//!
+//! Locking/embedding contract (audit P1): the index mutex is never held
+//! across a provider call. `semantic` embeds the query before snapshotting,
+//! scores persisted vectors under a read-consistent lock without calling
+//! out, and the fallback path snapshots at most
+//! [`MAX_FALLBACK_SEMANTIC_CANDIDATES`] reduced candidates (lexical/symbol
+//! first, then a deterministic path prefix), embeds them OUTSIDE the lock in
+//! requests of at most [`Embedder::max_batch_size`] clamped to
+//! [`MAX_SEMANTIC_EMBED_BATCH`], and re-checks each candidate's
+//! [`faktor_index::FileRevision`] under the lock before returning a page. A
+//! slow, dead or hostile provider can therefore never stall lexical/symbol
+//! search or index updates.
 
 use std::sync::{Arc, Mutex};
 
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::id::WorkspaceId;
-use faktor_index::{Symbol, SymbolKind, WorkspaceIndex};
+use faktor_index::{FileRevision, Symbol, SymbolKind, WorkspaceIndex};
 
 /// Classified lock recovery for DERIVED state (caches, registries, rings,
 /// process/ownership projections): a poisoned guard is recovered with the
@@ -43,6 +55,28 @@ const MAX_SNIPPET_CHARS: usize = 400;
 /// order). The persisted store is itself bounded per workspace; this is the
 /// per-query work bound.
 const MAX_PERSISTED_VECTORS_PER_QUERY: usize = 8_192;
+/// Local candidate reduction bound for FALLBACK semantic retrieval (a
+/// workspace with no persisted vectors): the union of the query's
+/// lexical/symbol candidates ranks first and the remaining budget is filled
+/// with the deterministic sorted-path prefix, so ONE fallback query embeds
+/// at most this many documents no matter how large the workspace is. The
+/// window is deliberately in the documented 256..=4096 range: large enough
+/// to preserve whole-corpus recall on normal repositories, hard-bounded for
+/// hostile ones.
+pub const MAX_FALLBACK_SEMANTIC_CANDIDATES: usize = 512;
+/// Hard cap on the number of texts of ONE embedding request the search
+/// service issues. Mirrors `faktor_provider::MAX_EMBEDDING_INPUTS`, which
+/// bounds one provider embedding request the same way. An [`Embedder`] may
+/// declare a SMALLER cap via [`Embedder::max_batch_size`]; it can never
+/// raise this one.
+pub const MAX_SEMANTIC_EMBED_BATCH: usize = faktor_provider::MAX_EMBEDDING_INPUTS;
+
+// Compile-time validation of the bounds above.
+const _: () = {
+    assert!(MAX_SEMANTIC_EMBED_BATCH >= 1);
+    assert!(MAX_FALLBACK_SEMANTIC_CANDIDATES >= 256);
+    assert!(MAX_FALLBACK_SEMANTIC_CANDIDATES <= 4096);
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -78,6 +112,15 @@ pub trait Embedder: Send + Sync {
     /// keep working unchanged.
     fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
         Ok(self.embed(texts))
+    }
+
+    /// Maximum number of texts this embedder accepts in ONE `try_embed`
+    /// call. Providers with a smaller request cap override this; the search
+    /// service validates the declaration by clamping it to
+    /// `1..=MAX_SEMANTIC_EMBED_BATCH`, so an embedder can lower the batch
+    /// size but can never raise the service's hard cap.
+    fn max_batch_size(&self) -> usize {
+        MAX_SEMANTIC_EMBED_BATCH
     }
 }
 
@@ -206,6 +249,16 @@ impl SearchService {
     /// `Disabled` refusal (`NotFound`); with one configured, every provider
     /// failure propagates unchanged — never an empty or lexical-only
     /// substitute.
+    ///
+    /// Locking contract (audit P1): the index mutex is NEVER held across a
+    /// provider call. It is taken only to (a) probe which retrieval path
+    /// applies, (b) snapshot fallback candidates plus their [`FileRevision`]
+    /// under the lock, and (c) score a read-consistent page. The query is
+    /// embedded before any snapshot, document batches are embedded after the
+    /// lock was released, and the final page re-acquires the lock only to
+    /// reject candidates that were removed/replaced in the meantime. A slow
+    /// or dead provider therefore cannot stall lexical/symbol search or
+    /// index updates.
     pub fn semantic(&self, ws: WorkspaceId, query: &str, limit: usize) -> Result<Vec<Hit>, Error> {
         self.check_query(query)?;
         let Some(embedder) = &self.embedder else {
@@ -214,87 +267,100 @@ impl SearchService {
                 "no embedding provider configured",
             ));
         };
-        let index = recover_lock(&self.index);
-        // Persisted-vector retrieval (index builds with a configured
-        // embedding source persist chunk vectors keyed by content hash): the
-        // QUERY is embedded, the corpus is served from the durable vectors —
-        // no document is re-embedded per search, and chunk embeddings
-        // survive generation swaps/reopens.
-        if index.has_embedding_index(ws) {
-            return semantic_from_persisted(&index, ws, query, limit, embedder.as_ref());
-        }
-        // Embed the query and candidate chunks (paths + symbols); cosine
-        // similarity ranks the corpus.
-        let mut candidates: Vec<String> = Vec::new();
-        let mut paths: Vec<String> = Vec::new();
-        if let Some(files) = index_files(&index, ws) {
-            for (path, syms) in files {
-                candidates.push(format!(
-                    "{path} {}",
-                    syms.iter()
-                        .map(|s| s.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ));
-                paths.push(path);
+        // Path probe under the lock, released before the query embed.
+        let persisted = {
+            let index = recover_lock(&self.index);
+            if index.has_embedding_index(ws) {
+                true
+            } else if index.file_count(ws) == 0 {
+                return Ok(vec![]);
+            } else {
+                false
+            }
+        };
+        // Provider call OUTSIDE the lock: persisted-vector retrieval only
+        // embeds the QUERY (the corpus comes from the durable vectors); the
+        // fallback embeds the query first and the reduced candidate set
+        // later, also outside the lock.
+        let query_emb = embedder.try_embed(&[query.to_string()])?;
+        let q = validated_query_vector(&query_emb)?;
+        if persisted {
+            // Read-consistent scoring under the lock: no provider call here.
+            let index = recover_lock(&self.index);
+            if index.has_embedding_index(ws) {
+                return semantic_from_persisted(&index, ws, q, limit);
+            }
+            if index.file_count(ws) == 0 {
+                return Ok(vec![]);
             }
         }
+        self.semantic_fallback(ws, query, q, limit, embedder.as_ref())
+    }
+
+    /// The no-persisted-vectors fallback: snapshot bounded candidates under
+    /// the lock, embed their texts OUTSIDE the lock in provider-aware
+    /// batches, then re-acquire the lock for the read-consistent page and
+    /// drop candidates whose file was removed or replaced while the provider
+    /// ran.
+    fn semantic_fallback(
+        &self,
+        ws: WorkspaceId,
+        query: &str,
+        query_vector: &[f32],
+        limit: usize,
+        embedder: &dyn Embedder,
+    ) -> Result<Vec<Hit>, Error> {
+        let candidates = {
+            let index = recover_lock(&self.index);
+            snapshot_fallback_candidates(&index, ws, query)
+        };
         if candidates.is_empty() {
             return Ok(vec![]);
         }
-        let query_emb = embedder.try_embed(&[query.to_string()])?;
-        let doc_embs = embedder.try_embed(&candidates)?;
-        // A configured embedder is untrusted INPUT: an empty or ragged
-        // response is a typed refusal, never an index panic or a silent
-        // truncation that would score the wrong files.
-        let Some(q) = query_emb.first() else {
-            return Err(Error::malformed(
-                "embedding provider returned no vector for the query",
-            ));
-        };
-        if q.is_empty() || q.iter().any(|v| !v.is_finite()) {
-            return Err(Error::malformed(
-                "embedding provider returned a malformed query vector",
-            ));
-        }
-        if doc_embs.len() != paths.len() {
-            return Err(Error::malformed(format!(
-                "embedding provider returned {} vectors for {} documents",
-                doc_embs.len(),
-                paths.len()
-            )));
-        }
+        let doc_embs = embed_documents_batched(embedder, &candidates)?;
         if doc_embs
             .iter()
-            .any(|d| d.len() != q.len() || d.iter().any(|v| !v.is_finite()))
+            .any(|d| d.len() != query_vector.len() || d.iter().any(|v| !v.is_finite()))
         {
             return Err(Error::malformed(
                 "embedding provider returned a document vector with a different dimension or non-finite component",
             ));
         }
-        let mut scored: Vec<(String, f64)> = paths
+        let mut scored: Vec<(String, FileRevision, f64)> = candidates
             .iter()
             .zip(doc_embs.iter())
-            .map(|(p, d)| (p.clone(), cosine(q, d)))
+            .map(|(candidate, vector)| {
+                (
+                    candidate.path.clone(),
+                    candidate.revision.clone(),
+                    cosine(query_vector, vector),
+                )
+            })
             .collect();
         scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
+            b.2.partial_cmp(&a.2)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
-        scored.truncate(limit);
-        Ok(scored
-            .into_iter()
-            .map(|(path, score)| {
-                let snippet = snippet_for(&path);
-                Hit {
+        // Read-consistent page: a candidate whose revision no longer matches
+        // (deleted, tombstoned, re-indexed) is dropped rather than returned
+        // from the stale snapshot.
+        let index = recover_lock(&self.index);
+        let mut out = Vec::new();
+        for (path, revision, score) in scored {
+            if out.len() >= limit {
+                break;
+            }
+            if index.file_revision(ws, &path).as_ref() == Some(&revision) {
+                out.push(Hit {
+                    snippet: snippet_for(&path),
                     path,
                     score,
-                    snippet,
                     symbol: None,
-                }
-            })
-            .collect())
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Reciprocal-rank fusion over exact/lexical/symbol (+ semantic when a
@@ -390,24 +456,116 @@ fn index_files(
     )
 }
 
-fn snippet_for(path: &str) -> String {
-    truncate(path, MAX_SNIPPET_CHARS)
+/// One snapshot candidate of the fallback semantic path: the text embedded
+/// for it, and the [`FileRevision`] it was snapshotted from. The revision is
+/// re-checked under the lock before the candidate may appear in a page.
+struct FallbackCandidate {
+    path: String,
+    text: String,
+    revision: FileRevision,
 }
 
-/// Semantic retrieval over the PERSISTED chunk vectors of one workspace
-/// generation: embed the query, exact-cosine score every stored vector
-/// (bounded, deterministic order), keep each path's best chunk, rank by
-/// (score desc, path asc). A query vector whose dimension does not match
-/// the active model dimension is a typed `Malformed` refusal — never a
-/// silent zero-score ranking.
-fn semantic_from_persisted(
+/// Local candidate reduction for the fallback path (audit P1). The union of
+/// the query's lexical postings and symbol hits ranks first (bounded per
+/// token by [`MAX_FALLBACK_SEMANTIC_CANDIDATES`]); the remaining budget is
+/// filled with the deterministic sorted-path prefix, so normal-size
+/// repositories keep whole-corpus recall while a huge workspace can never
+/// turn into an unbounded embedding request. Ties are broken by path, so
+/// the candidate set is deterministic. Must be called with the index lock
+/// held; it clones everything the later provider calls need and never calls
+/// out.
+fn snapshot_fallback_candidates(
     index: &WorkspaceIndex,
     ws: WorkspaceId,
     query: &str,
-    limit: usize,
+) -> Vec<FallbackCandidate> {
+    let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for token in faktor_index::tokenize(query) {
+        for hit in index.files_for_token(ws, &token, MAX_FALLBACK_SEMANTIC_CANDIDATES) {
+            *scores.entry(hit.path).or_insert(0.0) += hit.freq as f64;
+        }
+    }
+    for (path, _symbol) in index.symbol_lookup(ws, query, MAX_FALLBACK_SEMANTIC_CANDIDATES) {
+        *scores.entry(path).or_insert(0.0) += 2.0;
+    }
+    let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    let mut selected: Vec<String> = ranked
+        .into_iter()
+        .take(MAX_FALLBACK_SEMANTIC_CANDIDATES)
+        .map(|(path, _)| path)
+        .collect();
+    if selected.len() < MAX_FALLBACK_SEMANTIC_CANDIDATES {
+        let mut seen: std::collections::HashSet<String> = selected.iter().cloned().collect();
+        for path in index.file_paths(ws) {
+            if selected.len() >= MAX_FALLBACK_SEMANTIC_CANDIDATES {
+                break;
+            }
+            if seen.insert(path.clone()) {
+                selected.push(path);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(selected.len());
+    for path in selected {
+        let Some(revision) = index.file_revision(ws, &path) else {
+            continue;
+        };
+        let symbols = revision
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("{path} {symbols}");
+        out.push(FallbackCandidate {
+            path,
+            text,
+            revision,
+        });
+    }
+    out
+}
+
+/// Embed the candidate texts in provider-aware batches. The effective batch
+/// size is the embedder's declared [`Embedder::max_batch_size`] clamped to
+/// `1..=MAX_SEMANTIC_EMBED_BATCH`, so an embedder can lower the batch size
+/// but never raise the service's hard cap. The FIRST typed provider error is
+/// returned unchanged (a mid-batch failure is bounded: at most
+/// `ceil(candidates / batch)` calls) and every batch's vector count is
+/// validated before scoring. The caller holds no index lock here.
+fn embed_documents_batched(
     embedder: &dyn Embedder,
-) -> Result<Vec<Hit>, Error> {
-    let query_emb = embedder.try_embed(&[query.to_string()])?;
+    candidates: &[FallbackCandidate],
+) -> Result<Vec<Vec<f32>>, Error> {
+    let batch_size = embedder.max_batch_size().clamp(1, MAX_SEMANTIC_EMBED_BATCH);
+    let mut out = Vec::with_capacity(candidates.len());
+    for batch in candidates.chunks(batch_size) {
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|candidate| candidate.text.clone())
+            .collect();
+        let vectors = embedder.try_embed(&texts)?;
+        if vectors.len() != batch.len() {
+            return Err(Error::malformed(format!(
+                "embedding provider returned {} vectors for {} documents",
+                vectors.len(),
+                batch.len()
+            )));
+        }
+        out.extend(vectors);
+    }
+    Ok(out)
+}
+
+/// Validate the query embedding response: exactly one finite, non-empty
+/// vector, else a typed `Malformed` refusal (a configured embedder is
+/// untrusted input).
+fn validated_query_vector(query_emb: &[Vec<f32>]) -> Result<&[f32], Error> {
     let Some(q) = query_emb.first() else {
         return Err(Error::malformed(
             "embedding provider returned no vector for the query",
@@ -418,16 +576,36 @@ fn semantic_from_persisted(
             "embedding provider returned a malformed query vector",
         ));
     }
+    Ok(q)
+}
+
+fn snippet_for(path: &str) -> String {
+    truncate(path, MAX_SNIPPET_CHARS)
+}
+
+/// Semantic retrieval over the PERSISTED chunk vectors of one workspace
+/// generation: exact-cosine score every stored vector (bounded,
+/// deterministic order), keep each path's best chunk, rank by (score desc,
+/// path asc). The QUERY VECTOR was already embedded by the caller OUTSIDE
+/// the index lock; this function performs no provider call at all. A query
+/// vector whose dimension does not match the active model dimension is a
+/// typed `Malformed` refusal — never a silent zero-score ranking.
+fn semantic_from_persisted(
+    index: &WorkspaceIndex,
+    ws: WorkspaceId,
+    query_vector: &[f32],
+    limit: usize,
+) -> Result<Vec<Hit>, Error> {
     let active_dimension = index.embedding_dimension(ws) as usize;
-    if q.len() != active_dimension {
+    if query_vector.len() != active_dimension {
         return Err(Error::malformed(format!(
             "query embedding dimension {} does not match the indexed model dimension {active_dimension}",
-            q.len()
+            query_vector.len()
         )));
     }
     let mut best: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for (path, vector) in index.chunk_vectors(ws, MAX_PERSISTED_VECTORS_PER_QUERY) {
-        let score = cosine(q, vector);
+        let score = cosine(query_vector, vector);
         best.entry(path)
             .and_modify(|current| {
                 if score > *current {
@@ -1167,5 +1345,456 @@ mod tests {
             .all(|e| !e.snippet.is_empty() && e.path.ends_with(".rs")));
         let cjk_only = svc.evidence_package(ws, &["解析".into()], 5).unwrap();
         assert!(cjk_only.len() <= 5, "a pure-CJK concept stays bounded");
+    }
+
+    // ------------------------------------------- audit P1: lock discipline
+
+    /// Audit P1 killer concurrency test: a provider call blocks; while it is
+    /// blocked, lexical search, symbol search and an index update must each
+    /// complete well under the bound (the semantic path must not hold the
+    /// index mutex across the embedder call).
+    #[test]
+    fn slow_provider_never_stalls_lexical_symbol_or_index_updates() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        struct GatedEmbedder {
+            entered: mpsc::Sender<()>,
+            release: Mutex<bool>,
+            ready: std::sync::Condvar,
+            first_call: std::sync::atomic::AtomicBool,
+        }
+        impl GatedEmbedder {
+            fn release(&self) {
+                *self.release.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                self.ready.notify_all();
+            }
+        }
+        impl Embedder for GatedEmbedder {
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                self.try_embed(texts).unwrap_or_default()
+            }
+            fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+                if !self
+                    .first_call
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = self.entered.send(());
+                    // Safety valve: a regression takes the assertion path
+                    // instead of hanging the suite forever.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut released = self.release.lock().unwrap_or_else(|p| p.into_inner());
+                    while !*released && Instant::now() < deadline {
+                        let (guard, _) = self
+                            .ready
+                            .wait_timeout(released, Duration::from_millis(25))
+                            .unwrap_or_else(|p| p.into_inner());
+                        released = guard;
+                    }
+                }
+                Ok(texts.iter().map(|_| vec![1.0f32]).collect())
+            }
+        }
+
+        let (idx, ws) = corpus();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gated = Arc::new(GatedEmbedder {
+            entered: entered_tx,
+            release: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            first_call: std::sync::atomic::AtomicBool::new(false),
+        });
+        let svc = Arc::new(SearchService::new(idx.clone(), Some(gated.clone())));
+        let worker = {
+            let svc = svc.clone();
+            std::thread::spawn(move || svc.semantic(ws, "lexer token", 5))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the gated embedder must be entered");
+
+        let bound = Duration::from_millis(250);
+        let started = Instant::now();
+        let lexical = svc.lexical(ws, "parse", 5).unwrap();
+        let lexical_elapsed = started.elapsed();
+        assert!(
+            lexical_elapsed < bound,
+            "lexical search stalled behind the blocked provider: {lexical_elapsed:?}"
+        );
+        let started = Instant::now();
+        let symbols = svc.symbol(ws, "Parser", 5).unwrap();
+        let symbol_elapsed = started.elapsed();
+        assert!(
+            symbol_elapsed < bound,
+            "symbol search stalled behind the blocked provider: {symbol_elapsed:?}"
+        );
+        let started = Instant::now();
+        idx.lock()
+            .unwrap()
+            .index_file(
+                ws,
+                std::path::Path::new("src/added_while_blocked.rs"),
+                b"fn added_while_blocked() {}\n",
+                1,
+            )
+            .unwrap();
+        let update_elapsed = started.elapsed();
+        assert!(
+            update_elapsed < bound,
+            "index update stalled behind the blocked provider: {update_elapsed:?}"
+        );
+        eprintln!(
+            "P1 measured while provider blocked: lexical={lexical_elapsed:?} symbol={symbol_elapsed:?} update={update_elapsed:?} (bound {bound:?})"
+        );
+        assert!(!lexical.is_empty());
+        assert!(!symbols.is_empty());
+
+        gated.release();
+        let hits = worker.join().unwrap().unwrap();
+        assert!(!hits.is_empty(), "{hits:?}");
+    }
+
+    /// The fallback reduction keeps whole-corpus recall on small
+    /// repositories in deterministic sorted-path order: the two-file
+    /// semantic-only corpus used by the CLI/agent E2Es is embedded in ONE
+    /// two-text request with ledger before parser, and the semantic-only
+    /// nearest neighbor still ranks first.
+    #[test]
+    fn fallback_small_corpus_is_filled_in_deterministic_path_order() {
+        struct RecordingEmbedder {
+            batches: Mutex<Vec<Vec<String>>>,
+        }
+        impl Embedder for RecordingEmbedder {
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                self.batches.lock().unwrap().push(texts.to_vec());
+                texts
+                    .iter()
+                    .map(|t| {
+                        let l = t.to_lowercase();
+                        vec![
+                            if l.contains("quantum") || l.contains("ledger") {
+                                1.0f32
+                            } else {
+                                0.0
+                            },
+                            if l.contains("zebra") || l.contains("parser") {
+                                1.0f32
+                            } else {
+                                0.0
+                            },
+                        ]
+                    })
+                    .collect()
+            }
+        }
+
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(21);
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/ledger.rs"),
+            b"pub fn reconcile_accounts() -> u32 { 7 }\n",
+            1,
+        )
+        .unwrap();
+        idx.index_file(
+            ws,
+            std::path::Path::new("src/parser.rs"),
+            b"pub fn parse_expr() -> u32 { 1 }\n",
+            2,
+        )
+        .unwrap();
+        let recording = Arc::new(RecordingEmbedder {
+            batches: Mutex::new(Vec::new()),
+        });
+        let svc = SearchService::new(Arc::new(Mutex::new(idx)), Some(recording.clone()));
+        let hits = svc.semantic(ws, "quantum zebra", 5).unwrap();
+        assert_eq!(
+            hits[0].path, "src/ledger.rs",
+            "the semantic-only nearest neighbor must win: {hits:?}"
+        );
+        let batches = recording.batches.lock().unwrap().clone();
+        assert_eq!(batches.len(), 2, "query + one candidate batch: {batches:?}");
+        assert_eq!(batches[0], vec!["quantum zebra".to_string()]);
+        assert_eq!(batches[1].len(), 2);
+        assert!(batches[1][0].starts_with("src/ledger.rs"), "{batches:?}");
+        assert!(batches[1][1].starts_with("src/parser.rs"), "{batches:?}");
+    }
+
+    /// Fallback candidate reduction under the file cap: a fallback query
+    /// over 100k files embeds at most [`MAX_FALLBACK_SEMANTIC_CANDIDATES`]
+    /// documents, and every provider request stays within
+    /// [`MAX_SEMANTIC_EMBED_BATCH`].
+    #[test]
+    fn fallback_with_100k_files_embeds_at_most_the_candidate_cap() {
+        struct CountingEmbedder {
+            calls: Mutex<Vec<usize>>,
+        }
+        impl Embedder for CountingEmbedder {
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                self.calls.lock().unwrap().push(texts.len());
+                texts.iter().map(|_| vec![1.0f32]).collect()
+            }
+        }
+
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(11);
+        for i in 0..100_000usize {
+            let rel = format!("f{i:06}.txt");
+            idx.index_file(
+                ws,
+                std::path::Path::new(&rel),
+                b"alpha shared token payload",
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(idx.file_count(ws), 100_000);
+        let counting = Arc::new(CountingEmbedder {
+            calls: Mutex::new(Vec::new()),
+        });
+        let svc = SearchService::new(Arc::new(Mutex::new(idx)), Some(counting.clone()));
+        let hits = svc.semantic(ws, "shared", 16).unwrap();
+        assert_eq!(hits.len(), 16);
+        let calls = counting.calls.lock().unwrap().clone();
+        assert_eq!(calls[0], 1, "the query is its own one-text request");
+        assert!(
+            calls.iter().all(|&n| n <= MAX_SEMANTIC_EMBED_BATCH),
+            "every request is within the hard batch cap: {calls:?}"
+        );
+        let documents: usize = calls[1..].iter().sum();
+        assert!(
+            documents <= MAX_FALLBACK_SEMANTIC_CANDIDATES,
+            "fallback embedded {documents} documents (cap {MAX_FALLBACK_SEMANTIC_CANDIDATES}): {calls:?}"
+        );
+        assert!(
+            calls.len() <= 1 + MAX_FALLBACK_SEMANTIC_CANDIDATES,
+            "the number of provider calls is bounded: {calls:?}"
+        );
+    }
+
+    /// A fallback snapshot taken before the document embed can never serve a
+    /// candidate that was deleted/tombstoned while the provider ran.
+    #[test]
+    fn stale_snapshot_never_returns_a_deleted_candidate() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct ParserAxisEmbedder;
+        impl Embedder for ParserAxisEmbedder {
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                texts
+                    .iter()
+                    .map(|t| vec![if t.contains("pars") { 1.0f32 } else { 0.0 }])
+                    .collect()
+            }
+        }
+        struct DocGateEmbedder {
+            entered: mpsc::Sender<()>,
+            release: Mutex<bool>,
+            ready: std::sync::Condvar,
+            blocked: std::sync::atomic::AtomicBool,
+        }
+        impl DocGateEmbedder {
+            fn release(&self) {
+                *self.release.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                self.ready.notify_all();
+            }
+        }
+        impl Embedder for DocGateEmbedder {
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                ParserAxisEmbedder.embed(texts)
+            }
+            fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+                // The query is its own one-text call; block the DOCUMENT
+                // batch so the deletion lands strictly between the snapshot
+                // and the page assembly.
+                if texts.len() > 1 && !self.blocked.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = self.entered.send(());
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let mut released = self.release.lock().unwrap_or_else(|p| p.into_inner());
+                    while !*released && std::time::Instant::now() < deadline {
+                        let (guard, _) = self
+                            .ready
+                            .wait_timeout(released, Duration::from_millis(25))
+                            .unwrap_or_else(|p| p.into_inner());
+                        released = guard;
+                    }
+                }
+                Ok(ParserAxisEmbedder.embed(texts))
+            }
+        }
+
+        // Control: without the deletion, the file is the top semantic hit.
+        let (idx_control, ws_control) = corpus();
+        let control = SearchService::new(idx_control, Some(Arc::new(ParserAxisEmbedder)));
+        let before = control
+            .semantic(ws_control, "parse lexer token", 5)
+            .unwrap();
+        assert_eq!(before[0].path, "src/parser.rs", "{before:?}");
+
+        let (idx, ws) = corpus();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gated = Arc::new(DocGateEmbedder {
+            entered: entered_tx,
+            release: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            blocked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let svc = Arc::new(SearchService::new(idx.clone(), Some(gated.clone())));
+        let worker = {
+            let svc = svc.clone();
+            std::thread::spawn(move || svc.semantic(ws, "parse lexer token", 5))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the document batch must be entered");
+        idx.lock()
+            .unwrap()
+            .remove_file(ws, std::path::Path::new("src/parser.rs"));
+        gated.release();
+        let after = worker.join().unwrap().unwrap();
+        assert!(
+            after.iter().all(|hit| hit.path != "src/parser.rs"),
+            "a deleted candidate must not be served from the stale snapshot: {after:?}"
+        );
+        assert!(
+            !after.is_empty(),
+            "live candidates must still serve after the deletion: {after:?}"
+        );
+    }
+
+    /// A provider failure in the MIDDLE of the fallback document batches is
+    /// typed (kind, code and retryability survive) and bounded (the service
+    /// stops at the first failure and never exceeds the declared batch cap).
+    #[test]
+    fn provider_error_mid_batch_is_typed_and_bounded() {
+        struct MidBatchFail {
+            requests: Mutex<Vec<usize>>,
+            doc_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl Embedder for MidBatchFail {
+            fn max_batch_size(&self) -> usize {
+                4
+            }
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                texts.iter().map(|_| vec![1.0f32]).collect()
+            }
+            fn try_embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
+                self.requests.lock().unwrap().push(texts.len());
+                if texts.len() == 1 {
+                    return Ok(vec![vec![1.0]]);
+                }
+                if self
+                    .doc_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    >= 1
+                {
+                    return Err(Error::new(
+                        ErrorKind::Provider {
+                            code: "embed_batch_rejected".into(),
+                            retryable: true,
+                        },
+                        "provider rejected document batch 2",
+                    ));
+                }
+                Ok(self.embed(texts))
+            }
+        }
+
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(12);
+        for i in 0..10 {
+            let rel = format!("src/f{i}.txt");
+            idx.index_file(ws, std::path::Path::new(&rel), b"shared token payload", 0)
+                .unwrap();
+        }
+        let failing = Arc::new(MidBatchFail {
+            requests: Mutex::new(Vec::new()),
+            doc_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let svc = SearchService::new(Arc::new(Mutex::new(idx)), Some(failing.clone()));
+        let err = svc.semantic(ws, "shared", 5).unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Provider {
+                code: "embed_batch_rejected".into(),
+                retryable: true,
+            },
+            "{err}"
+        );
+        assert!(err.retryable, "retryability must survive: {err}");
+        let requests = failing.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests,
+            vec![1, 4, 4],
+            "the first failing batch ends the walk at the declared cap: {requests:?}"
+        );
+        assert!(
+            requests.iter().all(|&n| n <= 4),
+            "no request may exceed the declared batch size: {requests:?}"
+        );
+    }
+
+    /// The declared provider cap is validated: a smaller declaration is
+    /// respected, an overclaim is clamped to [`MAX_SEMANTIC_EMBED_BATCH`],
+    /// and a zero declaration is clamped to one text per request.
+    #[test]
+    fn provider_batch_cap_is_validated_and_clamped() {
+        struct Declared {
+            cap: usize,
+            requests: Mutex<Vec<usize>>,
+        }
+        impl Embedder for Declared {
+            fn max_batch_size(&self) -> usize {
+                self.cap
+            }
+            fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+                self.requests.lock().unwrap().push(texts.len());
+                texts.iter().map(|_| vec![1.0f32]).collect()
+            }
+        }
+
+        let mut idx = WI::new();
+        let ws = WorkspaceId::new(13);
+        for i in 0..130 {
+            let rel = format!("src/g{i:03}.txt");
+            idx.index_file(ws, std::path::Path::new(&rel), b"shared token payload", 0)
+                .unwrap();
+        }
+        let idx = Arc::new(Mutex::new(idx));
+
+        // An overclaiming provider can never raise the hard cap.
+        let over = Arc::new(Declared {
+            cap: usize::MAX,
+            requests: Mutex::new(Vec::new()),
+        });
+        SearchService::new(idx.clone(), Some(over.clone()))
+            .semantic(ws, "shared", 5)
+            .unwrap();
+        let requests = over.requests.lock().unwrap().clone();
+        assert_eq!(requests[0], 1);
+        assert!(
+            requests[1..].iter().all(|&n| n <= MAX_SEMANTIC_EMBED_BATCH),
+            "{requests:?}"
+        );
+        assert_eq!(
+            requests[1..].iter().sum::<usize>(),
+            130,
+            "all candidates still embed: {requests:?}"
+        );
+
+        // A declared zero clamps to one text per request.
+        let zero = Arc::new(Declared {
+            cap: 0,
+            requests: Mutex::new(Vec::new()),
+        });
+        SearchService::new(idx, Some(zero.clone()))
+            .semantic(ws, "shared", 5)
+            .unwrap();
+        let requests = zero.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 131, "query + 130 singleton batches");
+        assert!(requests.iter().all(|&n| n == 1), "{requests:?}");
     }
 }

@@ -137,5 +137,7 @@ export function microBalance(
  * suffix decides only how the value is rendered.
  */
 export function isMicroLimitName(name: string): boolean {
-  return name.endsWith('_micro');
+  // A micro segment anywhere counts: `max_managed_spend_micro_per_period`
+  // does not END in `_micro` and previously rendered both sides bare.
+  return /(^|_)micro(_|$)/.test(name);
 }

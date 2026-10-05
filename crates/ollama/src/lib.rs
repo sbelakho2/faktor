@@ -464,7 +464,7 @@ impl OllamaProvider {
             .await
             .map_err(egress_to_host_error)?;
             if !resp.status().is_success() {
-                return Err(Error::new(
+                return Err(faktor_provider::classify::core_error_for(
                     ErrorKind::Provider {
                         code: resp.status().as_u16().to_string(),
                         retryable: false,
@@ -526,7 +526,7 @@ impl OllamaProvider {
             .await
             .map_err(egress_to_host_error)?;
             if !resp.status().is_success() {
-                return Err(Error::new(
+                return Err(faktor_provider::classify::core_error_for(
                     ErrorKind::Provider {
                         code: resp.status().as_u16().to_string(),
                         retryable: false,
@@ -554,7 +554,7 @@ impl OllamaProvider {
             .await
             .map_err(egress_to_host_error)?;
             if !resp.status().is_success() {
-                return Err(Error::new(
+                return Err(faktor_provider::classify::core_error_for(
                     ErrorKind::NotFound,
                     format!("ollama cannot see model {model}"),
                 ));

@@ -3590,10 +3590,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(
-            v, 29,
-            "schema target 29 after the v28 per-session artifact rebuild"
-        );
+        assert_eq!(v, 31, "schema target 31 after the v29/v30 migrations");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -3656,6 +3653,8 @@ mod typed_ledger_tests {
             let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
             let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
             let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+            // The v30 shell-attribution column is post-this-version too.
+            let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
             conn.execute("PRAGMA user_version = 18", []).unwrap();
         }
         let store = Store::open(dir.path().join("store"), true).unwrap();

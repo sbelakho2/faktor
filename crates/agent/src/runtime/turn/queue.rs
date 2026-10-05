@@ -140,7 +140,23 @@ impl AgentRuntime {
             .session
             .get_session(session)?
             .ok_or_else(|| Error::not_found(format!("session {session}")))?;
-        Ok(handle.abort(op_id)?.op_ids)
+        let aborted = handle.abort(op_id)?.op_ids;
+        // Abort must close the turn RECORD too: a killed drive leaves the
+        // record active, which then 409s every new prompt forever.
+        if let Some(record) = self
+            .deps
+            .session
+            .store()
+            .active_turn_record(session)
+            .map_err(|e| Error::internal(format!("active turn record: {e}")))?
+        {
+            self.deps
+                .session
+                .store()
+                .finish_turn_record(session, record.turn_op_id, "cancelled")
+                .map_err(|e| Error::internal(format!("finish aborted turn record: {e}")))?;
+        }
+        Ok(aborted)
     }
 
     /// Explicitly close a session (the only normal route to terminal
@@ -661,6 +677,13 @@ impl AgentRuntime {
                 return Ok(report);
             }
         }
+        // P0-2 remainder (crash safety): a captured generic-shell pre-manifest
+        // means the shell may have mutated the tree without settlement. Diff
+        // the durable pre-manifest against the CURRENT tree BEFORE anything
+        // else observes the session; the discovered set is recorded durably
+        // and the turn's completion gate refuses certification (never
+        // "unchanged").
+        report.applied |= self.reconcile_captured_shell_runs(handle);
         // Crash-resume transcript integrity (see
         // [`AgentRuntime::answer_dangling_tool_calls`]): with NO open run
         // rows nothing will replay (a replay answers its own call), so any

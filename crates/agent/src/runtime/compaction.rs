@@ -417,6 +417,19 @@ impl AgentRuntime {
         if before == 0 {
             return Ok(None);
         }
+        // A tiny history cannot need compaction: the wire plan is dominated
+        // by the system prompt/tool bundle, which compaction does not touch,
+        // and a fresh session's first turn used to be failed by a summary
+        // that could only GROW the 3-token history. Below this floor the
+        // honest behavior is "no compaction" (an oversized call still fails
+        // with a typed context error from the provider).
+        // The deterministic/summary floors are ~65 tokens; a history below
+        // this can never be reduced by any summary, so compaction is skipped
+        // instead of being attempted (and rejected as a grow).
+        const MIN_COMPACTABLE_HISTORY_TOKENS: usize = 128;
+        if before < MIN_COMPACTABLE_HISTORY_TOKENS {
+            return Ok(None);
+        }
         let target = budget.context_max();
         // Compaction-model selection (P0-2 phase mapping): an EXPLICIT
         // compaction_model config ("model" or "provider/model") is honored
@@ -782,6 +795,19 @@ impl AgentRuntime {
             }
         }
         let accepted = plan.accepted;
+        if plan.after_tokens > plan.before_tokens {
+            // A grow is NOT a recordable compaction (`record_compaction`
+            // rightly refuses it as malformed); the plan is already rejected,
+            // so skip the record and the turn instead of turning a no-op
+            // compaction into a failed turn.
+            tracing::warn!(
+                session = %handle.id(),
+                before = plan.before_tokens,
+                after = plan.after_tokens,
+                "compaction summary would grow the context; skipping compaction"
+            );
+            return Ok(None);
+        }
         handle.record_compaction_defaults(
             plan.before_tokens as i64,
             plan.after_tokens as i64,

@@ -103,6 +103,28 @@ class FaktorFrontendService(
     /** Single-flight gate of the task-start surface (see [startTaskRun]). */
     private val taskStartInFlight = AtomicBoolean(false)
 
+    /**
+     * Serializes daemon acquisition ([start]/[attachConnection]): concurrent
+     * callers must never spawn/attach two daemons, because the last writer
+     * would win the fields and the earlier daemon would become an untracked
+     * orphan (Zero orphans).
+     */
+    private val startLock = Any()
+
+    /** Set by [stop] while a start is in flight: the freshly spawned daemon
+     * is reaped before any state is published. */
+    @Volatile
+    private var stopRequested = false
+
+    /** Bumped by every stop; an attach that began before it is aborted. */
+    private var stopGeneration = 0L
+
+    /** Bumped on every stream swap/stop so a late [watchSession] start cannot
+     * resurrect a superseded stream under a new session/authority. */
+    private var streamEpoch = 0L
+
+    private class StartAborted : Exception("stop requested while the daemon was starting")
+
     @Volatile
     private var listener: Listener? = null
 
@@ -185,6 +207,8 @@ class FaktorFrontendService(
 
     /** Starts the daemon, authenticates, and waits until it reports ready. */
     fun start(): NativeHealth {
+      synchronized(startLock) {
+        stopRequested = false
         synchronized(lifecycleLock) {
             if (client != null) return client!!.health()
             // A tracked connection that still answers health is a LIVE daemon:
@@ -213,29 +237,53 @@ class FaktorFrontendService(
             if (!ready.ready) {
                 throw BackendException("daemon never reported ready")
             }
+            // Publish and the stop recheck share ONE critical section: a
+            // stop() that runs while the daemon was starting must never be
+            // lost to a check-then-publish window.
+            var aborted = false
             synchronized(lifecycleLock) {
-                manager = mgr
-                connection = backendConnection
-                client = cl
+                if (stopRequested) {
+                    aborted = true
+                } else {
+                    manager = mgr
+                    connection = backendConnection
+                    client = cl
+                }
+            }
+            if (aborted) {
+                mgr.stop(backendConnection)
+                listener?.onDaemonStatus("stopped", null)
+                throw StartAborted()
             }
             listener?.onDaemonStatus(
                 "running",
                 "pid ${backendConnection.pid()} port ${backendConnection.port} version ${health.version}"
             )
             return health
-        } catch (e: Exception) {
+        } catch (e: StartAborted) {
+            throw e
+        } catch (e: Throwable) {
+            // Throwable, not Exception: a hostile/deep body can raise an
+            // Error (e.g. StackOverflowError) during health/readiness parsing,
+            // and the freshly spawned daemon must still be reaped and the
+            // failure reported instead of leaking an orphan in "starting".
             mgr.stop(backendConnection)
-            listener?.onDaemonStatus("failed", e.message)
+            listener?.onDaemonStatus("failed", e.message ?: e.javaClass.simpleName)
             throw e
         }
+      }
     }
 
     /** Stops the SSE stream and the daemon; idempotent. */
     fun stop() {
         var toStop: Pair<BackendProcessManager, BackendConnection>? = null
         var adoptedStop: (() -> Unit)? = null
+        var streamToStop: NativeEventStream? = null
         synchronized(lifecycleLock) {
-            stream?.stop()
+            stopRequested = true
+            stopGeneration += 1
+            streamEpoch += 1
+            streamToStop = stream
             stream = null
             sessionId = null
             val mgr = manager
@@ -250,6 +298,9 @@ class FaktorFrontendService(
                 externalStop = null
             }
         }
+        // The stream join is bounded but can still take up to 1 s: never hold
+        // the lifecycle lock (the EDT reads it via isRunning/daemonDescription).
+        streamToStop?.stop()
         val stopPair = toStop
         val external = adoptedStop
         if (stopPair != null) {
@@ -272,6 +323,8 @@ class FaktorFrontendService(
         backendConnection: BackendConnection,
         stopAction: (() -> Unit)? = null
     ): NativeHealth {
+      synchronized(startLock) {
+        val generation = synchronized(lifecycleLock) { stopGeneration }
         synchronized(lifecycleLock) {
             if (client != null) throw BackendException("a daemon connection is already attached")
         }
@@ -281,17 +334,27 @@ class FaktorFrontendService(
         if (!ready.ready) {
             throw BackendException("adopted daemon never reported ready")
         }
+        var aborted = false
         synchronized(lifecycleLock) {
-            connection = backendConnection
-            client = cl
-            manager = null
-            externalStop = stopAction
+            if (stopRequested || stopGeneration != generation) {
+                aborted = true
+            } else {
+                connection = backendConnection
+                client = cl
+                manager = null
+                externalStop = stopAction
+            }
+        }
+        if (aborted) {
+            stopAction?.invoke()
+            throw StartAborted()
         }
         listener?.onDaemonStatus(
             "running",
             "attached port ${backendConnection.port} version ${health.version}"
         )
         return health
+      }
     }
 
     /**
@@ -620,27 +683,46 @@ class FaktorFrontendService(
      * replay from the beginning). Events are delivered to the listener.
      */
     fun watchSession(id: String, cursor: Long = 0) {
-        val backendConnection = synchronized(lifecycleLock) {
+        val epoch: Long
+        val previous: NativeEventStream?
+        val s: NativeEventStream
+        synchronized(lifecycleLock) {
+            val backendConnection = connection
+                ?: throw BackendException("daemon is not running")
             sessionId = id
-            connection
-        } ?: throw BackendException("daemon is not running")
-        stream?.stop()
-        val s = NativeEventStream.forConnection(
-            backendConnection, id, cursor,
-            onEvent = { listener?.onEvent(it) },
-            onStatus = { status, detail -> listener?.onStreamStatus(status, detail) },
-            onError = { e -> listener?.onError(e.message ?: e.javaClass.simpleName) },
-            onBlocked = { block -> listener?.onStreamBlocked(block) }
-        )
-        synchronized(lifecycleLock) { stream = s }
-        s.start()
+            streamEpoch += 1
+            epoch = streamEpoch
+            previous = stream
+            s = NativeEventStream.forConnection(
+                backendConnection, id, cursor,
+                onEvent = { listener?.onEvent(it) },
+                onStatus = { status, detail -> listener?.onStreamStatus(status, detail) },
+                onError = { e -> listener?.onError(e.message ?: e.javaClass.simpleName) },
+                onBlocked = { block -> listener?.onStreamBlocked(block) }
+            )
+            stream = s
+        }
+        // Outside the lock: a bounded join must never block the EDT.
+        previous?.stop()
+        // The epoch check and the start share one critical section: stop()/
+        // stopStream()/a newer watchSession bump the epoch under this lock,
+        // so a stream can never be resurrected after they returned. start()
+        // only spawns a daemon thread, so it cannot block the EDT here.
+        synchronized(lifecycleLock) {
+            if (streamEpoch == epoch && stream === s) {
+                s.start()
+            }
+        }
     }
 
     fun stopStream() {
-        synchronized(lifecycleLock) {
-            stream?.stop()
+        val s = synchronized(lifecycleLock) {
+            streamEpoch += 1
+            val current = stream
             stream = null
+            current
         }
+        s?.stop()
     }
 
     fun streamCursor(): Long = synchronized(lifecycleLock) { stream?.cursor ?: 0L }

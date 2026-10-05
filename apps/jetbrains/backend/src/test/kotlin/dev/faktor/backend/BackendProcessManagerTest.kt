@@ -66,6 +66,14 @@ object BackendSmoke {
         }
         val binary = Paths.get(args[0])
         val dataDir = Files.createTempDirectory("faktor-smoke-")
+        // The daemon's provider preflight requires a registered provider: seed
+        // the discovered config so the smoke's `default` id is served (an
+        // ollama entry is local-only and needs no key).
+        Files.write(
+            dataDir.resolve("faktor-plus.json"),
+            """{"config_version":1,"model":"default","providers":[{"kind":"ollama","id":"default","base_url":"http://127.0.0.1:9","allow_loopback":true}]}"""
+                .toByteArray()
+        )
 
         step("unit assertions") { BackendProcessManagerTest.runAll() }
 
@@ -613,6 +621,23 @@ private fun assertFixtureStartupLine() {
     )
     assertEquals(null, StartupLine.parse(""), "empty line must not parse")
     assertEquals(null, StartupLine.parse("faktor server listening on http://127.0.0.1"), "no port")
+    // Digit overflow and non-TCP ports are malformed, not a thrown
+    // NumberFormatException that kills the stdout drain thread.
+    assertEquals(
+        null,
+        StartupLine.parse("faktor server listening on http://127.0.0.1:99999999999"),
+        "an Int-overflowing port must be malformed"
+    )
+    assertEquals(
+        null,
+        StartupLine.parse("faktor server listening on http://127.0.0.1:0"),
+        "port 0 is not a listening port"
+    )
+    assertEquals(
+        null,
+        StartupLine.parse("faktor server listening on http://127.0.0.1:70000"),
+        "ports above 65535 are malformed"
+    )
     assertEquals(
         null,
         StartupLine.parse("faktor server listening on http://127.0.0.1:0x10"),

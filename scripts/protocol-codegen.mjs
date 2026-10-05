@@ -1006,6 +1006,7 @@ const HANDWRITTEN_FROZEN = new Set([
   '/native/health',
   '/native/identity',
   '/native/index/coverage',
+  '/native/invitations/accept',
   '/native/jobs/{id}',
   '/native/jobs/{id}/result',
   '/native/jobs/claim',

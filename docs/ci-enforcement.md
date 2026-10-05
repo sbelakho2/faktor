@@ -15,6 +15,8 @@ it needs credentials or a server this checkout does not have.
 | Container images pinned by multi-arch index digest (non-Rust) | Applied | `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml`, `.woodpecker/trusted/nightly.yaml`, `scripts/woodpecker/docker-compose.yml` |
 | VS Code E2E toolchain pinned by release version + commit + sha256 in the lane script (verified before extraction; `code --version` must print both) | Applied | `scripts/vscode-e2e.sh`, `.woodpecker/trusted/trusted.yaml` |
 | Bounded release-soak driver (configurable `FAKTOR_SOAK_SCALE`, wall/test budgets, zero/zero-test refusal) | Applied | `scripts/soak.sh`, `.woodpecker/trusted/trusted.yaml` (`soak-smoke`), `.woodpecker/trusted/nightly.yaml` (`soak` long mode) |
+| Lane-bound marker auth: per-lane HMAC `auth` over the canonical unsigned marker, one shared generator, `unattested` (not silent pass) without a token | Applied | `scripts/certification/lane-marker.{sh,mjs,py}`, `scripts/certification/evidence.mjs`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/trusted/nightly.yaml` |
+| Invariant criticality + planted-mutation proof: every entry is release-critical by default (its `authority` names the production gate) and must ship a planted `mutation_command`; non-empty `mutation_debt` fails both checker modes, downgrades require `criticality_reason` | Applied | `tests/invariants.toml`, `scripts/check-invariants.mjs`, `scripts/mutation-run.mjs`, `scripts/mutations/*.json`, `.woodpecker/trusted/trusted.yaml`, `.woodpecker/untrusted/pr.yaml` |
 | `@vscode/vsce` pinned exactly in the VS Code lockfile and run as the locked binary | Applied | `apps/vscode/package.json`, `apps/vscode/package-lock.json`, `.woodpecker/**`, `scripts/package-artifacts.sh` |
 | Branch protection on `main` requires `ci/woodpecker/pr/pr` (strict) and the PR path | Applied | GitHub API |
 | Woodpecker publishes `ci/woodpecker/pr/pr` for this repo | **Operator** | Woodpecker server |
@@ -184,13 +186,48 @@ gh api repos/sbelakho2/faktor/commits/$(git rev-parse HEAD) --jq '.commit.verifi
   `curl https://update.code.visualstudio.com/api/update/linux-x64/stable/<version>`
   and update the constants (see §2.15 of `docs/certification.md`).
 - Release soak driver: `scripts/soak.sh` is the only soak campaign entry
-  point. `FAKTOR_SOAK_SCALE` is a positive multiplier capped by
-  `FAKTOR_SOAK_MAX_SCALE`/`FAKTOR_SOAK_MAX_ROUNDS`; `FAKTOR_SOAK_MAX_WALL_SECONDS`
+  point. `FAKTOR_SOAK_CHURN_SECONDS`/`FAKTOR_SOAK_REALTIME_SECONDS` are the
+  real wall-clock targets of the `churn`/`realtime` modes (the legacy
+  `FAKTOR_SOAK_SCALE` remains for `smoke`/`long`); `FAKTOR_SOAK_MAX_WALL_SECONDS`
   and `FAKTOR_SOAK_TEST_TIMEOUT_SECONDS` bound the run; a zero/negative/
-  unparseable scale and a run that executes zero tests are both refusals
-  (`target/certification/soak.json` records scale/rounds/status). The trusted
-  `soak-smoke` step runs the bounded smoke and the nightly `soak` lane runs
-  the long mode (see §2.15 of `docs/certification.md`).
+  unparseable scale and a run that executes zero tests are both refusals.
+  `target/certification/soak.json` records lane/mode/target/status and the
+  embedded all-metrics convergence report, and ANY failed (or missing)
+  convergence metric fails the lane. The trusted `soak-smoke` step runs the
+  30–60 min accelerated churn and the nightly `soak` lane runs the real
+  12–24 h real-time mode (see §2.15 of `docs/certification.md`).
+- Invariant criticality and planted-mutation proof: every `[[invariant]]` in
+  `tests/invariants.toml` is release-critical by default because its
+  `authority` names the production gate, and it must ship an executable
+  `mutation_command` through `scripts/mutation-run.mjs` (the runner first
+  requires the gate to pass on the pristine source, then requires the planted
+  violation to make it fail, optionally matching a declared `expect`
+  signature). A non-empty `mutation_debt` on a release-critical entry fails
+  both `node scripts/check-invariants.mjs` (trusted/PR certificate steps) and
+  `node scripts/check-invariants.mjs --mutations` (trusted `jetbrains-smoke`
+  lane); only an explicit `release_critical = false` with a non-empty
+  `criticality_reason` may keep debt, and it is reported as a warning. This
+  closes the audit gap where a release-critical invariant could stay green
+  while its production authority was no longer exercised.
+- Lane-bound marker auth: the trusted linux and nightly campaign lanes emit
+  their `faktor-woodpecker-lane/v2` markers through ONE helper
+  (`scripts/certification/lane-marker.sh write --lane ...`, Node
+  `lane-marker.mjs`, python parity fallback `lane-marker.py` for the
+  python-only lane images), which adds `auth = hmac-sha256:<hex>` over the
+  canonical unsigned marker JSON keyed by the lane's own
+  `faktor_lane_token_<lane>` CI secret (`-` -> `_`; uppercase accepted). The
+  `certificate`/`certificate-nightly` step maps every lane token in its
+  `environment:` and `evidence.mjs verify-markers` recomputes each MAC:
+  wrong/missing auth for a configured token fails (`auth-mismatch` /
+  `auth-missing`), malformed auth always fails, and a lane whose token is
+  not configured is recorded `unattested` (visible, not silently passed)
+  with no hard failure for PR/untrusted. A lane step only holds its own
+  token, so one lane cannot mint another lane's marker; the selftest proves
+  the forgery case. Register the tokens and uncomment the exact step
+  `environment:` blocks per `scripts/woodpecker/setup.md` §4. Since a
+  `from_secret` to a missing secret is a Woodpecker config error, the
+  mappings ship commented: binding is opt-in per configured secret, and
+  until enabled the certificate output shows which lanes are `unattested`.
 
 Workflow YAML is validated with `woodpecker-cli lint .woodpecker/` (or the
 container fallback in `scripts/woodpecker/setup.md` §13) plus the

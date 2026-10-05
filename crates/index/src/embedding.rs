@@ -519,8 +519,10 @@ impl EmbeddingIndex {
         Ok(())
     }
 
-    /// Deterministic disk bound: drop lexicographically-first keys until
-    /// both the record count and the summed component budget are met.
+    /// Deterministic disk bound: `records` is a `BTreeMap`, so its keys
+    /// iterate in lexicographic (UTF-8 codepoint) order — identical on every
+    /// process and hash seed. Drop the smallest keys until both the record
+    /// count and the summed component budget are met.
     fn prune(&mut self) {
         while self.records.len() > MAX_EMBEDDING_RECORDS {
             let Some(key) = self.records.keys().next().cloned() else {

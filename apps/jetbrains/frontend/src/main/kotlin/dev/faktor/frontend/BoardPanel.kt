@@ -18,8 +18,11 @@ import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
 
-private const val MAX_BOARD_SUBJECT_CHARS = 512
-private const val MAX_BOARD_BODY_CHARS = 16 * 1024
+// Wire bounds are UTF-8 BYTES (the daemon refuses on bytes, and the VS Code
+// panel gates on bytes): counting UTF-16 chars accepted a 512-emoji subject
+// that the daemon then refused.
+private const val MAX_BOARD_SUBJECT_BYTES = 512
+private const val MAX_BOARD_BODY_BYTES = 16 * 1024
 private const val MAX_BOARD_LINE_CHARS = 240
 
 class BoardPanel : JPanel(BorderLayout()) {
@@ -32,7 +35,7 @@ class BoardPanel : JPanel(BorderLayout()) {
         fun onPost(subject: String, body: String)
     }
 
-    private val header = JLabel("board: unavailable (not read yet)")
+    private val header = JLabel("board: not read yet")
 
     private val postsArea = compactArea(10)
 
@@ -42,7 +45,7 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     private val postButton = JButton("Post")
 
-    private val readButton = JButton("Refresh")
+    private val readButton = JButton("Read board")
 
     private val composer = JPanel(GridLayout(0, 1, 2, 2))
 
@@ -60,6 +63,13 @@ class BoardPanel : JPanel(BorderLayout()) {
         readButton.isEnabled = false
         postButton.addActionListener { submitComposer() }
         readButton.addActionListener { if (readButton.isEnabled) listener?.onRead() }
+        val draftListener = object : javax.swing.event.DocumentListener {
+            override fun insertUpdate(e: javax.swing.event.DocumentEvent?) = updateComposer()
+            override fun removeUpdate(e: javax.swing.event.DocumentEvent?) = updateComposer()
+            override fun changedUpdate(e: javax.swing.event.DocumentEvent?) = updateComposer()
+        }
+        subjectField.document.addDocumentListener(draftListener)
+        bodyArea.document.addDocumentListener(draftListener)
 
         val row1 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
         row1.add(JLabel("subject"))
@@ -130,7 +140,9 @@ class BoardPanel : JPanel(BorderLayout()) {
     /** Clears to the pre-read state (daemon stopped / session switched). */
     fun reset() {
         seenRevision = 0L
-        setUnavailable("not read yet")
+        setAvailable(false)
+        header.text = "board: not read yet"
+        postsArea.text = ""
     }
 
     fun clearComposer() {
@@ -158,20 +170,43 @@ class BoardPanel : JPanel(BorderLayout()) {
     fun setComposerFields(subject: String, body: String) {
         subjectField.text = subject
         bodyArea.text = body
+        updateComposer()
     }
 
-    /** The Post action exactly as the button runs it (gated on availability). */
+    /** The local draft refusal (the same byte bounds the daemon enforces). */
+    fun draftRefusal(): String? {
+        val subject = subjectField.text.trim()
+        val body = bodyArea.text
+        if (subject.isEmpty()) return "subject is required"
+        if (utf8Bytes(subject) > MAX_BOARD_SUBJECT_BYTES) {
+            return "subject exceeds $MAX_BOARD_SUBJECT_BYTES bytes"
+        }
+        if (body.trim().isEmpty()) return "body is required"
+        if (utf8Bytes(body) > MAX_BOARD_BODY_BYTES) {
+            return "body exceeds $MAX_BOARD_BODY_BYTES bytes"
+        }
+        return null
+    }
+
+    private fun utf8Bytes(text: String): Int = text.toByteArray(Charsets.UTF_8).size
+
+    /**
+     * The Post action exactly as the button runs it. Posting is possible only
+     * when the local byte-bounded draft is valid; the submitted text is NOT
+     * silently truncated (a truncated post would alter the operator's words).
+     */
     fun submitComposer() {
         if (!postButton.isEnabled) return
-        listener?.onPost(
-            subjectField.text.trim().take(MAX_BOARD_SUBJECT_CHARS),
-            bodyArea.text.take(MAX_BOARD_BODY_CHARS)
-        )
+        listener?.onPost(subjectField.text.trim(), bodyArea.text)
+    }
+
+    private fun updateComposer() {
+        postButton.isEnabled = available && draftRefusal() == null
     }
 
     private fun setAvailable(value: Boolean) {
         available = value
-        postButton.isEnabled = value
         readButton.isEnabled = value
+        updateComposer()
     }
 }

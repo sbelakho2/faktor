@@ -136,15 +136,38 @@ This builds `faktor-cli` if missing and then:
 5. runs `JetBrainsParitySmoke <binary>` — first the Faktor-owned tree
    check (`FAKTOR-OWNED TREE PASS`: root resolves, no vendored upstream UI
    corpus exists, the panel sources are present, all offline), then the
-   ten parity families over canned frames (`task mode`, `agent tree with
-   blockers/presentation/pixel identity`, `permissions`, `terminal`,
-   `review/tournament`, `evidence navigation`, `settings`, `provider
-   selection`, `history`, `restart/reconnect`), then a raw-socket fake
+   eleven parity families over canned frames (`task mode`, `agent tree with
+   blockers/presentation/pixel identity`, `criterion proofs`, `permissions`,
+   `terminal`, `review/tournament`, `evidence navigation`, `settings`,
+   `provider selection`, `history`, `restart/reconnect`), then a raw-socket fake
    daemon driving the REAL `FaktorFrontendService` + `FaktorChatPanel`
    end to end (permission reply, terminal spawn, task-run body,
    session-from-selection, history open, SSE cursor resume), then the
    real daemon (history, task-run with mutation mode, terminal
-   spawn/list/events/output, restart with the durable session, reconnect).
+   spawn/list/events/output, restart with the durable session, reconnect);
+6. runs `JetBrainsHostMatrixSmoke` against the BUILT plugin ZIP when one is
+   present (`FAKTOR_JETBRAINS_PLUGIN_ZIP` or
+   `frontend/build/distributions/faktor-*.zip`): it extracts the ZIP, puts
+   its `faktor/lib/*.jar` first on the classpath, asserts the production
+   class provenance, and runs every panel through width 240/320/480/800,
+   font zoom 100/125/200 %, theme light/dark/high-contrast, keyboard-only
+   Tab/SPACE traversal and the empty/loading/error/blocked/reconnect states.
+   With `FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1` (the trusted
+   `jetbrains-smoke` lane) a missing ZIP is a typed failure. The result is
+   `target/certification/jetbrains-host-matrix.json`
+   (`faktor-jetbrains-host-matrix/v1`, records the ZIP sha256 and class
+   location). Equivalent Gradle task: `./gradlew :frontend:smokeHostMatrixZip`
+   (or `./gradlew smokeHostMatrixZip`).
+
+The offscreen visual render runs on Linux under the pinned core-fonts
+fontconfig
+(`frontend/src/test/resources/parity/fonts/core-fonts.conf` set as
+`FONTCONFIG_FILE`) with a checkout-local `user.home`; that is the
+environment the committed Linux visual record is pinned in. Re-pin with
+`./gradlew :frontend:smokeJetBrainsParity -PwriteBaselines=true
+-PfaktorCliBin=<bin>` (or the script's `--write-baselines`). A Windows
+record is only valid when produced by the Windows-owned
+`scripts/windows-visual-baseline.ps1 -WriteBaselines` lane.
 
 Every step prints PASS/FAIL; the script exits nonzero on any failure. The
 script compiles only the non-IntelliJ sources, so it stays runnable

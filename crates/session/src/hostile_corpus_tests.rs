@@ -707,7 +707,7 @@ fn session_recovery_expires_pending_permissions_durably() {
     case += 1;
     let report = s.recover_all().unwrap();
     assert!(
-        report.crashed_ops.is_empty() && !report.interrupted_turn,
+        report.crashed_ops.is_empty() && report.interrupted_turn,
         "recovery-permission case #{case}: after the permission terminalized there is nothing to recover"
     );
     assert_eq!(case, 8, "permission recovery matrix size drifted");

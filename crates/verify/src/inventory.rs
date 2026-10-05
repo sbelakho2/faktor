@@ -818,6 +818,7 @@ fn run_git(
         capture: true,
         artifact_max: budget.git_output_bytes.max(4096),
         network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+        filesystem_isolation: faktor_terminal::FilesystemIsolation::Inherit,
     };
     match supervisor.run_sync(cfg, timeout, budget.git_output_bytes, GIT_STDERR_CAP) {
         Ok(out) if out.timed_out => GitRun::TimedOut { after: timeout },

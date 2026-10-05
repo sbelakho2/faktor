@@ -918,7 +918,7 @@ pub(crate) async fn serve_impl(
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), String> {
-    let (config, semantic) = match serve_config_and_semantic(config_path) {
+    let (config, semantic) = match crate::load_entry_config(&data_dir, config_path) {
         Ok(loaded) => loaded,
         Err(e) => return Err(format!("config error: {e}")),
     };
@@ -1053,6 +1053,29 @@ pub(crate) async fn serve_impl(
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
+    // Durable admission recovery (audit P1): every pending admission claim of
+    // a previous daemon generation is classified against its durable facts
+    // and landed as a replay, a safe reclaim or a typed conflict BEFORE the
+    // first request — a retry of the same submission key can never observe a
+    // perpetual in-flight row.
+    {
+        let summary = faktor_server::native::recover_pending_admissions(&session);
+        if summary.replayed > 0
+            || summary.reclaimed > 0
+            || summary.conflicts > 0
+            || summary.failed > 0
+            || summary.truncated
+        {
+            tracing::info!(
+                replayed = summary.replayed,
+                reclaimed = summary.reclaimed,
+                conflicts = summary.conflicts,
+                failed = summary.failed,
+                truncated = summary.truncated,
+                "pending admission claims recovered"
+            );
+        }
+    }
     // Durable verification-job recovery: stale Running rows of a previous
     // daemon are requeued BEFORE the executor can claim anything, so a
     // crashed check is retried rather than lost.
@@ -1182,8 +1205,12 @@ pub(crate) async fn serve_impl(
                     .map_err(|e| format!("billing store {}: {e}", path.display()))?,
             ) as Arc<dyn faktor_cloud::BillingStore>
         };
-        let service = faktor_cloud::EntitlementService::with_system_clock(store, service_config)
-            .map_err(|e| format!("billing service: {e}"))?;
+        let service = faktor_cloud::EntitlementService::with_system_clock_for_organization(
+            store,
+            service_config,
+            organization.clone(),
+        )
+        .map_err(|e| format!("billing service: {e}"))?;
         // The report schedule (additive; disabled by default): strict vendor
         // config, the durable billing store and the daemon's checked
         // transport. A missing vendor credential env var refuses startup —
@@ -1603,6 +1630,9 @@ pub(crate) async fn acp(data_dir: PathBuf) {
     if let Err(e) = agent.recover() {
         tracing::error!("recovery failed: {e}");
     }
+    // Durable admission recovery (audit P1), exactly like serve: land every
+    // pending claim from a previous generation before the first prompt.
+    faktor_server::native::recover_pending_admissions(&session);
     // Durable queue-head recovery, exactly like serve: the same order (after
     // `agent.recover()`, before the first prompt is accepted) over the same
     // executor, so a killed process's pending durable head is driven without
@@ -1639,12 +1669,10 @@ pub(crate) async fn acp(data_dir: PathBuf) {
 /// exists; a broken file is a loud warning that falls back to defaults (the
 /// daemon still serves — same policy as `serve`).
 pub(crate) fn load_acp_config(data_dir: &std::path::Path) -> config::Config {
-    let path = data_dir.join("faktor-plus.json");
-    if !path.exists() {
-        return config::Config::default();
-    }
-    match config::Config::load(&path) {
-        Ok(c) => c,
+    // Same discovery + semantic-stripping policy as every other entry point:
+    // a serve-valid file must never be rejected (or silently swallowed) here.
+    match crate::load_optional_config(data_dir, None) {
+        Ok(config) => config,
         Err(e) => {
             tracing::error!("config error: {e}; using defaults");
             config::Config::default()
@@ -1892,10 +1920,10 @@ impl AcpBackend for DaemonAcpBackend {
             .map_err(|e| e.message)?;
         // Session lifecycle hook (audit): sessions are created here (the
         // session manager), not in the runtime — the daemon entry fires
-        // SessionStart best-effort right after creation. Native server-side
-        // session creation lives in crates/server, outside the CLI.
-        self.agent
-            .run_lifecycle_hook(faktor_hooks::HookEvent::SessionStart, row.id());
+        // SessionStart best-effort right after creation, before first use.
+        // The native `POST /native/session` handler and `faktor run` fire
+        // the SAME agent-registry seam on their session-creation paths.
+        self.agent.run_session_start_hook(row.id());
         Ok(row.id().to_string())
     }
 

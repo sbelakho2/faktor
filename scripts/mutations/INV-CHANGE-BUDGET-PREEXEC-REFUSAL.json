@@ -1,0 +1,9 @@
+{
+  "id": "INV-CHANGE-BUDGET-PREEXEC-REFUSAL",
+  "file": "crates/session/src/budget.rs",
+  "find": "        if !budget.allows_path(path) {",
+  "replace": "        if false && !budget.allows_path(path) {",
+  "gate": "cargo test -p faktor-agent --lib change_budget_refusal_is_answered_with_typed_result",
+  "expect": "assertion|change_budget",
+  "note": "The path-outside-allowed check of the change budget is disabled: an out-of-scope write is no longer a violation, so the pre-execution gate lets the edit execute and the typed change_budget_refused denial never happens."
+}

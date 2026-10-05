@@ -786,6 +786,13 @@ pub trait RoutingPolicy: Send + Sync {
     /// policy itself applies it inside [`RoutingPolicy::route`]).
     fn mode(&self) -> RoutingMode;
 
+    /// The (provider, model) pairs this policy can serve, when it is backed
+    /// by a priced candidate set. Empty = unknown (passthrough/fixed test
+    /// policies) and session-model validation stays permissive.
+    fn served_models(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Cache-economics consult (P0-82): `route` plus the session's stored
     /// prefix-stability history. The production policy prices a churning
     /// session WITHOUT provider-side cache-read discounts and charges the
@@ -1315,6 +1322,14 @@ impl RoutingPolicy for EconomicRoutingPolicy {
 
     fn mode(&self) -> RoutingMode {
         self.mode.clone()
+    }
+
+    fn served_models(&self) -> Vec<(String, String)> {
+        self.service
+            .priced
+            .iter()
+            .map(|c| (c.descriptor.provider.clone(), c.descriptor.model.clone()))
+            .collect()
     }
 
     /// Cache economics in production routing (P0-82/15): the session's

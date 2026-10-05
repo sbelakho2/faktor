@@ -9,15 +9,20 @@
 //!    streams the artifact through the checked transport into the same
 //!    filesystem's staging area under the configured byte bound, verifies
 //!    the sha256, publishes it content-addressed, and records a durable
-//!    `stage` row. The install is untouched;
+//!    `stage` row. The install is untouched. The running `stage` row is the
+//!    durable PENDING anti-rollback admission: the per-channel high-water
+//!    mark is raised only AFTER the verified publish, so a failed/refused
+//!    download can never raise the floor;
 //! 3. `apply` re-hashes the staged artifact, records the apply BEFORE the
 //!    swap, atomically replaces the `current` pointer, and runs the health
 //!    probe. A probe failure automatically restores the previous pointer
 //!    (exact previous artifact + digest) and records a `rollback` row;
 //! 4. `recover` resolves `running` rows left by a crash: an interrupted
-//!    stage is abandoned with the install intact; an interrupted apply is
-//!    either resumed (pointer already swapped → probe → applied) or rolled
-//!    back (probe failure), never guessed.
+//!    stage is resolved against the published bytes — COMMITTED when the
+//!    verified artifact was published, VOIDED otherwise — and the install
+//!    is left intact; an interrupted apply is either resumed (pointer
+//!    already swapped → probe → applied) or rolled back (probe failure),
+//!    never guessed.
 //!
 //! Every step is role-gated at the server layer (`apply` requires the admin
 //! role in the control plane) and every transition carries before/after
@@ -478,8 +483,11 @@ impl Updater {
     /// - anything below the mark is a typed
     ///   [`UpdateError::RollbackRefused`] naming both generations.
     ///
-    /// This function only DECIDES; [`Updater::record_admission`] persists the
-    /// decision (record-first) before any activation step.
+    /// This function only DECIDES; the decision becomes durable with the
+    /// `stage` operation row and is COMMITTED to the high-water mark only
+    /// after a verified publish ([`Updater::commit_admission`]). A crash
+    /// between the pending row and the publish is resolved by recovery
+    /// against the published bytes (commit or void, never guessed).
     fn admit(&self, manifest: &UpdateManifest) -> Result<Admission, UpdateError> {
         let channel = manifest.channel.to_string();
         let floor = self.store.high_water(&channel)?;
@@ -526,22 +534,47 @@ impl Updater {
         })
     }
 
-    /// Persist one admission BEFORE the release is activated: the mark
-    /// becomes `max(high_water, generation)` (and the legacy allowance is
-    /// consumed), so a crash at any later point cannot lower it.
-    fn record_admission(
+    /// COMMIT one admission after its VERIFIED publish: the mark becomes
+    /// `max(high_water, generation)` (and the legacy allowance is consumed).
+    /// This is the ONLY place an ordinary update raises the floor; it runs
+    /// after the artifact bytes verified against the signed digest and were
+    /// published content-addressed, so a failed/refused download can never
+    /// raise it. A crash before this call leaves the running `stage` row
+    /// (the durable pending admission) for recovery to commit (published) or
+    /// void (never published).
+    fn commit_admission(
         &self,
-        manifest: &UpdateManifest,
+        channel: &str,
         admission: Admission,
         now_ms: i64,
     ) -> Result<(), UpdateError> {
-        self.store.raise_high_water(
-            &manifest.channel.to_string(),
-            admission.generation,
-            admission.legacy,
-            now_ms,
-        )?;
+        self.store
+            .raise_high_water(channel, admission.generation, admission.legacy, now_ms)?;
         Ok(())
+    }
+
+    /// Whether the verified artifact of one pending `stage` operation is
+    /// actually published: the content-addressed destination exists and
+    /// re-hashes to the signed digest. The RUNNING stage row is only a
+    /// pending admission; this filesystem proof is what recovery uses to
+    /// COMMIT it (published) or VOID it (never published). A hostile
+    /// artifact name or digest in a rewritten row is never trusted (it can
+    /// not name a path outside the layout).
+    fn stage_artifact_published(&self, op: &UpdateOperation) -> bool {
+        let (Some(name), Some(digest)) = (op.artifact.as_deref(), op.after_digest.as_deref())
+        else {
+            return false;
+        };
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return false;
+        }
+        if !crate::manifest::is_lower_hex(digest, 64) {
+            return false;
+        }
+        matches!(
+            self.layout.artifact_digest(name, digest),
+            Ok(actual) if actual == digest
+        )
     }
 
     /// `GET status` data: pointer, staged op, recent operations.
@@ -765,12 +798,13 @@ impl Updater {
             }
         }
 
-        // Anti-rollback admission, RECORD-FIRST: the durable high-water mark
-        // is raised to `max(mark, generation)` (and a legacy allowance, if
-        // this is one, is consumed) BEFORE the download starts, so a crash at
-        // any later point cannot lower the floor.
+        // Anti-rollback admission: the running stage row below is the
+        // durable PENDING admission. The high-water mark is NOT raised here:
+        // it is committed by `commit_admission` ONLY after the artifact
+        // verified and was published. A failed/refused download therefore
+        // leaves the floor unchanged, and a crash before the publish leaves
+        // the pending row for recovery to void.
         let admission = self.admit(manifest)?;
-        self.record_admission(manifest, admission, now_ms)?;
 
         let current = self.layout.read_pointer()?;
         let mut op = UpdateOperation::new(
@@ -790,6 +824,7 @@ impl Updater {
         op.after_digest = Some(artifact.sha256.clone());
         op.artifact = Some(artifact.name.clone());
         op.release_generation = Some(admission.generation);
+        op.legacy_admission = admission.legacy;
         op.identity = Some(verified.identity().to_string());
         op.certification_level = manifest.certification.as_ref().map(|c| c.level.clone());
         op.idempotency_key = idempotency_key.map(str::to_string);
@@ -800,6 +835,23 @@ impl Updater {
             .await
         {
             Ok(bytes) => {
+                // VERIFIED publish success: NOW the admission becomes durable.
+                // A commit failure leaves the running stage row as the
+                // pending admission (recovery re-commits it against the
+                // published bytes) and fails the request typed — never a
+                // silently swallowed raise and never a lowered floor.
+                if let Err(e) =
+                    self.commit_admission(&manifest.channel.to_string(), admission, now_ms)
+                {
+                    op.updated_ms = now_ms;
+                    op.detail = Some(format!(
+                        "the artifact was verified and published, but the anti-rollback \
+                         high-water commit failed: {e}; the pending admission stays durable \
+                         and recovery will commit it"
+                    ));
+                    self.store.update(&op)?;
+                    return Err(e);
+                }
                 op.status = UpdateOpStatus::Staged;
                 op.updated_ms = now_ms;
                 op.detail = Some(format!(
@@ -826,11 +878,15 @@ impl Updater {
                         .await;
                 // The download failure stays the returned typed error; the
                 // cleanup failure is durable evidence in the row (never a
-                // silently discarded `let _ =`).
+                // silently discarded `let _ =`). The pending admission is
+                // VOIDED with the failure: the floor is untouched.
                 let cleanup_note = staging_cleanup_note(&cleanup);
                 op.status = UpdateOpStatus::Failed;
                 op.updated_ms = now_ms;
-                op.detail = Some(format!("{e}{cleanup_note}"));
+                op.detail = Some(format!(
+                    "{e}{cleanup_note}; no verified artifact was published, so the \
+                     anti-rollback admission was voided and the floor is unchanged"
+                ));
                 self.store.update(&op)?;
                 Err(e)
             }
@@ -1924,15 +1980,54 @@ impl Updater {
                     });
                 }
                 UpdateOpKind::Stage => {
+                    // The running stage row IS the durable PENDING admission.
+                    // Recovery resolves it against the filesystem, the only
+                    // authority that can prove the publish: verified published
+                    // bytes COMMIT the admission (floor raised, legacy
+                    // allowance consumed); anything else VOIDS it (floor
+                    // untouched). It never re-runs the download and it never
+                    // touches the install.
                     self.layout.clear_staging(op.id.as_str())?;
-                    op.status = UpdateOpStatus::Failed;
-                    op.updated_ms = now_ms;
-                    op.detail = Some("crashed during stage; the install was never touched".into());
-                    self.store.update(&op)?;
-                    outcomes.push(RecoveryOutcome::Abandoned {
-                        op_id: op.id.to_string(),
-                        detail: "crashed during stage; the install was never touched".into(),
-                    });
+                    if self.stage_artifact_published(&op) {
+                        let channel = op
+                            .channel
+                            .clone()
+                            .unwrap_or_else(|| self.config.channel.to_string());
+                        let generation = op.release_generation.unwrap_or(0);
+                        // A failed commit leaves the row RUNNING (the pending
+                        // admission stays durable) and aborts recovery typed,
+                        // so a later pass retries it; the floor can only ever
+                        // be raised here, never lowered.
+                        self.store.raise_high_water(
+                            &channel,
+                            generation,
+                            op.legacy_admission,
+                            now_ms,
+                        )?;
+                        let detail = "crashed during stage after the verified artifact was \
+                                      published; the anti-rollback admission was committed; the \
+                                      install was never touched";
+                        op.status = UpdateOpStatus::Failed;
+                        op.updated_ms = now_ms;
+                        op.detail = Some(detail.into());
+                        self.store.update(&op)?;
+                        outcomes.push(RecoveryOutcome::Abandoned {
+                            op_id: op.id.to_string(),
+                            detail: detail.into(),
+                        });
+                    } else {
+                        let detail = "crashed during stage; no verified artifact was published, \
+                                      so the anti-rollback admission was voided; the install \
+                                      was never touched";
+                        op.status = UpdateOpStatus::Failed;
+                        op.updated_ms = now_ms;
+                        op.detail = Some(detail.into());
+                        self.store.update(&op)?;
+                        outcomes.push(RecoveryOutcome::Abandoned {
+                            op_id: op.id.to_string(),
+                            detail: detail.into(),
+                        });
+                    }
                 }
                 UpdateOpKind::Apply => {
                     outcomes.push(self.recover_apply(&mut op, now_ms, running_digest)?);

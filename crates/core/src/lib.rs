@@ -55,7 +55,10 @@ pub use cancellation::CancellationToken;
 pub use capability::{
     Capability, CapabilityKind, CapabilitySet, NetworkPolicy, PermissionDecision,
 };
-pub use command::{CommandSpec, EnvSpec, NetworkIsolationRequirement, ResolvedCommand, ShellKind};
+pub use command::{
+    CommandSpec, EnvSpec, FilesystemIsolationRequirement, NetworkIsolationRequirement,
+    ResolvedCommand, ShellKind,
+};
 pub use completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};

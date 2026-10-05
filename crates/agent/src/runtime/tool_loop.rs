@@ -8,10 +8,17 @@ use super::*;
 /// excerpt.
 pub(crate) const TOOL_OUTPUT_EVIDENCE_MIN_BYTES: usize = 8 * 1024;
 
-/// Artifact storage handed to tools (bounded writes to the CAS).
+/// Artifact storage handed to tools (bounded writes to the CAS). The REAL
+/// sink carries the daemon's configured-secret registry (the SAME instance
+/// the egress scan uses), and every stored byte buffer is exact-redacted
+/// through it BEFORE the CAS put / inline materialization — a tool that
+/// echoes a configured credential can never land it in durable storage raw.
 #[derive(Clone)]
 pub enum ToolArtifactSink {
-    Real(Arc<ArtifactWriter>),
+    Real {
+        writer: Arc<ArtifactWriter>,
+        secrets: Option<Arc<faktor_security::registry::SecretRegistry>>,
+    },
     Null,
 }
 
@@ -23,7 +30,17 @@ impl ToolArtifactSink {
         max_inline: usize,
     ) -> faktor_core::Result<faktor_context::ArtifactRef> {
         match self {
-            ToolArtifactSink::Real(w) => w.store(kind, bytes, max_inline),
+            ToolArtifactSink::Real { writer, secrets } => {
+                let scrubbed;
+                let payload = match secrets {
+                    Some(registry) if !registry.scan_exact(bytes).is_empty() => {
+                        scrubbed = registry.redact_bytes(bytes);
+                        scrubbed.as_slice()
+                    }
+                    _ => bytes,
+                };
+                writer.store(kind, payload, max_inline)
+            }
             ToolArtifactSink::Null => Ok(faktor_context::ArtifactRef {
                 inline: Some(String::from_utf8_lossy(bytes).to_string()),
                 artifact: None,
@@ -38,15 +55,165 @@ impl ToolArtifactSink {
 /// tool's declared path args (read_file/search ⇒ reads; write_file ⇒ writes).
 /// This is the ONLY source for `ScheduledOp::reads/writes` — tools never
 /// hand the scheduler raw paths from any other channel.
+///
+/// The declared spellings are canonicalized against the SESSION workspace
+/// root (the same root the tool executes against) through
+/// [`OwnershipSet::canonicalized`] — the ONE path-identity authority — before
+/// they become scheduler resources, so `src/a`, `./src/a`, `src/x/../a` and
+/// `src//a` are one resource exactly as the rooted filesystem treats them as
+/// one object. A session with no resolvable workspace passes `None`: nothing
+/// executes against a root there, so the declared spelling is kept (today's
+/// behavior).
 pub(crate) fn ownership_sets(
+    tool: &Arc<Tool>,
+    input: &serde_json::Value,
+    workspace_root: Option<&std::path::Path>,
+) -> (OwnershipSet, OwnershipSet) {
+    let ownership = tool.ownership(input);
+    ownership_sets_for(tool.capability.as_ref(), ownership, workspace_root)
+}
+
+/// The tool's DECLARED sets in the policy path vocabulary (the
+/// repository-relative spellings the model supplied), with the P0-2 shell
+/// rule applied but WITHOUT workspace-root canonicalization. The
+/// ChangeBudget gate observes exactly these: its `allowed_paths` are
+/// repository-relative, so it must never see the canonical absolute identity
+/// the scheduler uses.
+pub(crate) fn declared_ownership_sets(
     tool: &Arc<Tool>,
     input: &serde_json::Value,
 ) -> (OwnershipSet, OwnershipSet) {
     let ownership = tool.ownership(input);
-    (
-        OwnershipSet::new(ownership.reads),
-        OwnershipSet::new(ownership.writes),
-    )
+    ownership_sets_for(tool.capability.as_ref(), ownership, None)
+}
+
+/// The P0-2 ownership rule, factored for direct testing: a generic shell
+/// capability owns the whole workspace (both directions); every other tool
+/// keeps its declared ownership, canonicalized against `workspace_root` when
+/// one is resolvable. The shell sentinel is returned BEFORE the normalizer:
+/// `**` is a policy token, not a path, and canonicalization must never turn
+/// it into one (the scheduler's [`OwnershipSet::canonicalized`] also
+/// preserves it defensively).
+pub(crate) fn ownership_sets_for(
+    capability: Option<&faktor_core::capability::Capability>,
+    ownership: crate::tool::Ownership,
+    workspace_root: Option<&std::path::Path>,
+) -> (OwnershipSet, OwnershipSet) {
+    if matches!(
+        capability,
+        Some(faktor_core::capability::Capability::ExecuteShell { .. })
+    ) {
+        return (
+            OwnershipSet::workspace_root(),
+            OwnershipSet::workspace_root(),
+        );
+    }
+    let normalized = |paths: Vec<String>| match workspace_root {
+        Some(root) => OwnershipSet::new(paths).canonicalized(root),
+        None => OwnershipSet::new(paths),
+    };
+    (normalized(ownership.reads), normalized(ownership.writes))
+}
+
+#[cfg(test)]
+mod shell_ownership_tests {
+    use super::*;
+    use faktor_core::capability::Capability;
+
+    #[test]
+    fn a_generic_shell_owns_the_whole_workspace_for_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let (_reads, writes) = ownership_sets_for(
+            Some(&Capability::ExecuteShell {
+                command: String::new(),
+            }),
+            crate::tool::Ownership {
+                reads: vec!["src/a.rs".into()],
+                writes: Vec::new(),
+            },
+            Some(root.path()),
+        );
+        assert_eq!(
+            writes.entries(),
+            &["**".to_string()],
+            "canonicalization must not turn the shell sentinel into a path"
+        );
+        assert!(
+            writes.overlaps(&OwnershipSet::new(["src/a.rs".to_string()])),
+            "a shell write must serialize with any workspace writer"
+        );
+        assert!(
+            writes.overlaps(&OwnershipSet::new(["docs/readme.md".to_string()])),
+            "a shell write must serialize with EVERY workspace path"
+        );
+    }
+
+    #[test]
+    fn a_full_workspace_shell_write_is_refused_by_a_path_constrained_budget() {
+        use faktor_core::state::ChangeBudget;
+        let budget = ChangeBudget {
+            allowed_paths: vec!["docs".into()],
+            ..Default::default()
+        };
+        let observations = faktor_session::budget::ChangeObservations {
+            changed_paths: vec!["**".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            faktor_session::budget::check_change_budget(&budget, &observations).is_err(),
+            "a docs-only task must refuse the generic shell BEFORE execution"
+        );
+    }
+
+    #[test]
+    fn non_shell_tools_keep_their_declared_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let (reads, writes) = ownership_sets_for(
+            None,
+            crate::tool::Ownership {
+                reads: vec!["src/a.rs".into()],
+                writes: vec!["src/b.rs".into()],
+            },
+            Some(root.path()),
+        );
+        assert!(
+            reads.overlaps(&OwnershipSet::new(["src/a.rs".to_string()]).canonicalized(root.path()))
+        );
+        assert!(!writes
+            .overlaps(&OwnershipSet::new(["src/a.rs".to_string()]).canonicalized(root.path())));
+    }
+
+    #[test]
+    fn declared_ownership_stays_relative_for_policy_gates_but_scheduler_identity_is_canonical() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = Arc::new(Tool {
+            name: "write_file".into(),
+            description: "w".into(),
+            input_schema: serde_json::json!({}),
+            resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+            capability: None,
+            recovery_hint: RecoveryHint::WorkspaceWrite,
+            path_args: vec!["path".into()],
+            execute: Arc::new(|_ctx, _args| Box::pin(async move { Ok(ToolOutcome::default()) })),
+        });
+        let args = serde_json::json!({"path": "./src/x/../a.rs"});
+        let (_, declared) = declared_ownership_sets(&tool, &args);
+        assert_eq!(
+            declared.entries(),
+            &["./src/x/../a.rs".to_string()],
+            "the ChangeBudget vocabulary stays repository-relative and declared"
+        );
+        let (_, scheduled) = ownership_sets(&tool, &args, Some(root.path()));
+        let (_, same_target) = ownership_sets(
+            &tool,
+            &serde_json::json!({"path": "src/a.rs"}),
+            Some(root.path()),
+        );
+        assert!(
+            scheduled.overlaps(&same_target),
+            "scheduler identity canonicalizes alias spellings to one resource"
+        );
+    }
 }
 
 /// The typed kind of one refused tool call. A refusal is durable turn
@@ -511,7 +678,7 @@ impl AgentRuntime {
             .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
             .await?;
         let body = ToolResultBody {
-            excerpt: truncate(&outcome.text, 2000),
+            excerpt: self.redact_configured_secrets(&truncate(&outcome.text, 2000)),
             exit_code: outcome.exit_code,
             artifact: outcome.artifact,
             slice_hint: outcome.slice_hint,
@@ -691,6 +858,11 @@ impl AgentRuntime {
         let scheduler = Scheduler::new(handle.id(), self.deps.clock.clone())
             .with_limits(risk_adjusted_resource_limits(semantic.map(|s| s.level)));
         let outcomes: Arc<std::sync::Mutex<HashMap<OpId, ToolOutcome>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // P0-2 remainder: the actual change set of every generic-shell
+        // invocation, filled by the pre/post manifest diff around execution
+        // and consumed by the SAME settlement path write_file feeds.
+        let shell_changes: Arc<std::sync::Mutex<HashMap<OpId, ShellChangeSet>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let mut submitted: Vec<(OpId, String, String, serde_json::Value)> = Vec::new();
         // Refused calls, with their durable call identity and typed kind:
@@ -920,9 +1092,15 @@ impl AgentRuntime {
             // constrains them therefore takes the documented stronger-
             // verification refusal path. This is the edit/steer gate: a
             // steered run's edits pass through the same tool batch.
-            if tool.resource_class == faktor_core::resource::ResourceClass::DiskWrite {
+            let shell_capability = matches!(
+                tool.capability,
+                Some(faktor_core::capability::Capability::ExecuteShell { .. })
+            );
+            if tool.resource_class == faktor_core::resource::ResourceClass::DiskWrite
+                || shell_capability
+            {
                 if let Some(budget) = &change_budget {
-                    let (_reads, writes) = ownership_sets(&tool, &input);
+                    let (_reads, writes) = declared_ownership_sets(&tool, &input);
                     let observations = faktor_session::budget::ChangeObservations {
                         changed_paths: writes.entries().to_vec(),
                         ..Default::default()
@@ -1034,8 +1212,15 @@ impl AgentRuntime {
             };
             let tool_arc = tool.clone();
             let outcomes = outcomes.clone();
+            let shell_changes_for_run = shell_changes.clone();
+            let handle_for_run = handle.clone();
+            let runtime_for_run = self.clone();
             let args = input.clone();
-            let (reads, writes) = ownership_sets(&tool, &input);
+            let shell_run = matches!(
+                tool.capability,
+                Some(faktor_core::capability::Capability::ExecuteShell { .. })
+            );
+            let (reads, writes) = ownership_sets(&tool, &input, root.as_deref());
             let spec = ScheduledOp {
                 meta: op_meta.clone(),
                 resources: ResourceRequest {
@@ -1053,8 +1238,28 @@ impl AgentRuntime {
                     let ctx = ctx.clone();
                     let args = args.clone();
                     let outcomes = outcomes.clone();
+                    let shell_changes = shell_changes_for_run.clone();
+                    let handle = handle_for_run.clone();
+                    let runtime = runtime_for_run.clone();
                     Box::pin(async move {
-                        let outcome = (tool.execute)(ctx, args).await?;
+                        // P0-2 remainder: a generic shell executes under the
+                        // bounded pre/post workspace-manifest accounting; the
+                        // actual change set rides the SAME settlement path
+                        // write_file feeds.
+                        let outcome = if shell_run {
+                            runtime
+                                .execute_shell_with_manifest(
+                                    &handle,
+                                    tool.clone(),
+                                    ctx,
+                                    args,
+                                    turn_op,
+                                    &shell_changes,
+                                )
+                                .await?
+                        } else {
+                            (tool.execute)(ctx, args).await?
+                        };
                         outcomes.lock().unwrap().insert(op_id, outcome);
                         Ok(())
                     })
@@ -1096,12 +1301,32 @@ impl AgentRuntime {
         // transition when a batch contains more than one tool).
         for (op_id, name, _call_id, _input) in submitted.iter() {
             if done.contains(op_id) {
+                // P0-2 remainder: a generic shell's ACTUAL change set (from
+                // the bounded pre/post manifest diff) rides the durable
+                // FileChanged payload — the real paths, never an input-arg
+                // inference. Non-shell tools keep the byte-identical payload.
+                let mut payload = serde_json::json!({ "tool": name, "effect": "applied" });
+                if let Some(set) = shell_changes.lock().unwrap().get(op_id).cloned() {
+                    let (rows, list_truncated) = set.durable_changes();
+                    let truncated = set.truncated.clone().or_else(|| {
+                        list_truncated.then(|| {
+                            format!(
+                                "change list truncated at {SHELL_CHANGE_DURABLE_MAX} durable rows"
+                            )
+                        })
+                    });
+                    payload["changes"] = serde_json::json!(rows);
+                    payload["changed"] = serde_json::json!(set.changes.len());
+                    payload["changes_truncated"] = serde_json::json!(truncated);
+                    payload["before_digest"] = serde_json::json!(set.before_digest);
+                    payload["after_digest"] = serde_json::json!(set.after_digest);
+                }
                 handle
                     .append_journal_event(
                         faktor_core::event::EventKind::FileChanged,
                         AgentState::ExecutingTool,
                         Some(*op_id),
-                        Some(serde_json::json!({ "tool": name, "effect": "applied" })),
+                        Some(payload),
                     )
                     .await?;
             }
@@ -1154,6 +1379,27 @@ impl AgentRuntime {
                     serde_json::json!({ "tool": name, "exit_code": outcome.exit_code }),
                 );
                 collect_tool_summary(turn_summary, &name, &input, &outcome);
+                // P0-2 remainder: the generic shell's actual change set feeds
+                // the SAME accounting path write_file uses — checkpoint rows
+                // through the session's CheckpointStore, the turn summary's
+                // changed files (verification/review inputs), the durable
+                // settled envelope and the per-path progress digests. Runs
+                // AFTER the run row is finished so the reconciled envelope
+                // (which may update a terminal row) is durable.
+                if let Some(set) = shell_changes.lock().unwrap().remove(&op_id) {
+                    if let Some(ws) = &workspace {
+                        self.settle_shell_changes(handle, op_id, turn_op, &set, turn_summary, ws);
+                    } else {
+                        // No resolvable workspace at settlement: the captured
+                        // fact stays unresolved, so the completion gate
+                        // refuses certification (never "unchanged").
+                        tracing::error!(
+                            session = %handle.id(),
+                            op = %op_id,
+                            "shell change set could not be settled (no workspace); the turn's gate will refuse certification"
+                        );
+                    }
+                }
                 let seq = handle.proposed_message_seq()?;
                 let mid = handle
                     .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
@@ -1174,6 +1420,11 @@ impl AgentRuntime {
                     }
                     None => truncate(&outcome.text, 2000),
                 };
+                // Durable message-part boundary: the configured-secret
+                // registry redaction is applied to the EXACT bytes that
+                // enter the transcript (belt-and-braces on top of
+                // `sanitize_outcome_text`, so no future path can bypass it).
+                let excerpt = self.redact_configured_secrets(&excerpt);
                 let body = ToolResultBody {
                     excerpt,
                     exit_code: outcome.exit_code,
@@ -1263,7 +1514,9 @@ impl AgentRuntime {
             // repeated across turns is the same "stop and re-plan" signal as
             // a failing command.
             if !turn_summary.failures.iter().any(|f| f == &tool_error) {
-                turn_summary.failures.push(truncate(&tool_error, 400));
+                turn_summary
+                    .failures
+                    .push(self.redact_configured_secrets(&truncate(&tool_error, 400)));
             }
             // When the turn continues (or ends at FailedRecoverable) the
             // model must SEE the failure: every tool call of the assistant
@@ -1278,7 +1531,7 @@ impl AgentRuntime {
                     .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
                     .await?;
                 let body = ToolResultBody {
-                    excerpt: truncate(&tool_error, 2000),
+                    excerpt: self.redact_configured_secrets(&truncate(&tool_error, 2000)),
                     exit_code: Some(1),
                     artifact: None,
                     slice_hint: None,
@@ -1323,7 +1576,7 @@ impl AgentRuntime {
                     return Err(err);
                 }
             }
-            let line = denial.ledger_line();
+            let line = self.redact_configured_secrets(&denial.ledger_line());
             if !turn_summary.failures.iter().any(|f| f == &line) {
                 turn_summary.failures.push(line);
             }
@@ -1365,7 +1618,7 @@ impl AgentRuntime {
             .append_message(seq, "assistant", serde_json::json!({ "parts": [] }))
             .await?;
         let body = ToolResultBody {
-            excerpt: denial.excerpt(),
+            excerpt: self.redact_configured_secrets(&denial.excerpt()),
             exit_code: Some(1),
             artifact: None,
             slice_hint: None,
@@ -1407,16 +1660,54 @@ impl AgentRuntime {
 
     /// Tool-outcome sanitization (audit round 16): a tool's output may echo
     /// a credential (a command that printed a key). Before ANY part of the
-    /// outcome text is journaled — the durable tool-result message, the
-    /// turn summary/ledger — it is scanned under the default SecretPolicy
-    /// and, on a hit, redacted in place. Benign output is byte-identical
+    /// outcome is journaled — the durable tool-result message (text AND the
+    /// inline artifact/slice carriers), the turn summary/ledger — it is
+    /// scanned under the default SecretPolicy AND the daemon's
+    /// configured-secret registry (the SAME instance the egress scan uses),
+    /// and on a hit redacted in place. Benign output is byte-identical
     /// (redaction runs only when a hit exists); scanning covers the whole
-    /// payload (streaming overlap window, P0-37) and never panics on
-    /// hostile output.
+    /// payload (streaming overlap window, P0-37) and never panics on hostile
+    /// output. The registry pass closes the fault where a command
+    /// `cat`-ing a configured provider key left the raw value in the journal
+    /// and the next provider request was egress-blocked.
     pub(crate) fn sanitize_outcome_text(&self, outcome: &mut ToolOutcome) {
+        outcome.text = self.sanitize_tool_outcome_text(&outcome.text);
+        if let Some(artifact) = outcome.artifact.as_mut() {
+            *artifact = self.sanitize_tool_outcome_text(artifact);
+        }
+        if let Some(slice_hint) = outcome.slice_hint.as_mut() {
+            *slice_hint = self.sanitize_tool_outcome_text(slice_hint);
+        }
+    }
+
+    /// The pattern + configured-registry redaction of one tool-outcome text
+    /// carrier. Benign text is returned byte-identical.
+    fn sanitize_tool_outcome_text(&self, text: &str) -> String {
         let policy = faktor_security::SecretPolicy::default();
-        if !faktor_security::scan_secrets(&outcome.text, &policy).is_empty() {
-            outcome.text = faktor_security::redact(&outcome.text, &policy);
+        let mut out = if faktor_security::scan_secrets(text, &policy).is_empty() {
+            text.to_string()
+        } else {
+            faktor_security::redact(text, &policy)
+        };
+        if let Some(registry) = &self.deps.secret_registry {
+            if !registry.scan_exact(out.as_bytes()).is_empty() {
+                out = registry.redact_text(&out);
+            }
+        }
+        out
+    }
+
+    /// The configured-secret half of tool-output sanitization, exposed so
+    /// every durable surface carrying tool text (message-part excerpts,
+    /// ledger lines) can apply the identical exact redaction even when the
+    /// text did not originate from `ToolOutcome::text`. Benign text is
+    /// byte-identical; with no registry wired this is a pass-through.
+    pub(crate) fn redact_configured_secrets(&self, text: &str) -> String {
+        match &self.deps.secret_registry {
+            Some(registry) if !registry.scan_exact(text.as_bytes()).is_empty() => {
+                registry.redact_text(text)
+            }
+            _ => text.to_string(),
         }
     }
 

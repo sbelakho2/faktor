@@ -1,0 +1,9 @@
+{
+  "id": "INV-RUNTIME-PATH-CANONICALIZATION",
+  "file": "crates/core/src/path.rs",
+  "find": "            if component == \".\" {\n                return refuse(PathViolationKind::CurrentComponent);\n            }",
+  "replace": "            if false && component == \".\" {\n                return refuse(PathViolationKind::CurrentComponent);\n            }",
+  "gate": "cargo test -p faktor-orchestrator --lib canonicalized_overlapping_spellings_are_refused_before_spawn",
+  "expect": "assertion|InvalidPlan|overlapping write ownership",
+  "note": "A `.` path component is accepted instead of being a typed plan violation: `./src` normalizes silently, no longer refuses before spawn, and can dodge the canonical overlap analysis."
+}

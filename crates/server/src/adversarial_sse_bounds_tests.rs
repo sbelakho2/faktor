@@ -735,3 +735,97 @@ async fn body_bounds_content_type_truncation_and_utf8_splits() {
     server.request_shutdown();
     wait_until_server_dead(&server).await;
 }
+
+/// Unknown methods and unknown paths must be the frozen typed JSON envelope,
+/// never a bare empty 405/404 (the UI cannot render an empty body).
+#[tokio::test]
+async fn unknown_methods_and_paths_answer_the_typed_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let deps = Arc::new(test_deps(dir.path()));
+    let token = deps.auth_token.as_str().to_string();
+    let server = serve_arc(deps, 0).await.unwrap();
+    let addr = server.addr;
+
+    // POST on a GET-only route -> typed 405.
+    let response = raw_post(
+        addr,
+        &token,
+        "/native/health",
+        "application/json",
+        Some(0),
+        &[],
+        false,
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 405"),
+        "{}",
+        &response[..response.len().min(160)]
+    );
+    assert!(response.contains("\"method_not_allowed\""), "{response}");
+
+    // Unknown path -> typed 404.
+    let response = raw_post(
+        addr,
+        &token,
+        "/native/definitely-not-a-route",
+        "application/json",
+        Some(0),
+        &[],
+        false,
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "{}",
+        &response[..response.len().min(160)]
+    );
+    assert!(response.contains("\"not_found\""), "{response}");
+
+    server.request_shutdown();
+    wait_until_server_dead(&server).await;
+}
+
+/// 2 MiB..10 MiB bodies are inside the daemon's advertised bound: axum's
+/// 2 MiB Json-extractor default must not turn them into a misleading
+/// `400 malformed` before the handler's own typed decision runs.
+#[tokio::test]
+async fn bodies_above_the_axum_default_are_not_mislabeled_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let deps = Arc::new(test_deps(dir.path()));
+    let token = deps.auth_token.as_str().to_string();
+    let server = serve_arc(deps, 0).await.unwrap();
+    let addr = server.addr;
+
+    let title = "x".repeat(3 * 1024 * 1024);
+    let body = serde_json::json!({
+        "provider": "ghost",
+        "model": "m",
+        "workspace": "/tmp",
+        "title": title,
+    })
+    .to_string()
+    .into_bytes();
+    let response = raw_post(
+        addr,
+        &token,
+        "/native/session",
+        "application/json",
+        Some(body.len()),
+        &body,
+        false,
+    )
+    .await;
+    assert!(
+        !response.contains("\"malformed\""),
+        "a 3 MiB body inside MAX_BODY_BYTES must reach the handler: {}",
+        &response[..response.len().min(200)]
+    );
+    // The handler's own typed decision (unregistered provider) proves the
+    // body was parsed rather than rejected by an extractor default.
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    assert!(response.contains("is not registered"), "{response}");
+
+    server.request_shutdown();
+    wait_until_server_dead(&server).await;
+}

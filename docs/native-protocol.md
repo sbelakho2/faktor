@@ -168,6 +168,8 @@ generated into both IDE clients (`ProtocolAttachmentId`,
 - `GET /native/health` / `GET /native/ready` — see "Liveness and
   readiness" above.
 - `POST /native/session` — create one durable session:
+
+The create-session contract validates BOTH the provider and the model against the daemon's registered, priced catalog: an id the router cannot serve is a typed `not_found` refusal BEFORE any workspace/session row exists. A served session model may still be replaced by Economy routing (a priced equivalence among served candidates); the substitution is durable and loud, never silent.
   `{provider, model, workspace?, title?}` (strict DTO; `workspace`
   defaults to the daemon's own directory) → `{id, title, created_ms}`.
 - `GET /native/sessions` — the durable session listing (newest first,
@@ -355,6 +357,49 @@ serves these daemon-level forms only — there are no exact
   parallelTools, reasoning, thinking, vision, structuredOutput,
   embeddings, streaming, source}], runtimeContextLimitSupported, health}]`.
   Auth/endpoint metadata stays in the provider layer and is never emitted.
+
+### Control-plane surface (disabled by default)
+
+With no `[cloud]` section every route below answers a typed 409
+`cloud_disabled` and nothing else in the daemon changes. Every route rides
+the daemon password AND, except the bootstrap, an
+`x-faktor-control-token` control-plane principal; a principal is fixed to
+one organization, and a path `{id}` naming a foreign organization is the
+same 404 a nonexistent one answers (no existence leak). Mutating
+control-plane routes require a bounded printable-ASCII idempotency key:
+the same key + same request replays the recorded response; the same key +
+a different request is a typed 409.
+
+- `GET /native/identity`, `GET /native/orgs`, `POST /native/orgs` — the
+  caller's identity/organization and the daemon-owner-only bootstrap that
+  mints the first owner session token (header `Idempotency-Key`).
+- `GET /native/orgs/{id}/members`, `POST /native/orgs/{id}/members` — the
+  member page and the invite (header `Idempotency-Key`); the invite
+  response presents the single-use invitation token exactly once.
+- `POST /native/invitations/accept` — redeem ONE invitation as the
+  authenticated control-plane user. Strict body:
+  `{token, idempotency_key}` (unknown fields refused). The idempotency key
+  rides the BODY because the client holding only the invitation token may
+  not know an organization to key against; the SAME
+  `validate_idempotency_key` contract (bounded printable ASCII) and
+  same-key replay semantics as the header-keyed routes apply. The
+  accepting user is the principal's subject and must match the invited
+  email — a foreign organization's principal (or a service account) is a
+  typed `permission_denied` (403) and creates no membership. The
+  membership insert and the invitation-accepted update commit in ONE
+  transaction with the idempotency claim:
+  - a same-key retry replays the recorded membership byte-for-byte and
+    never inserts a second membership;
+  - the same token under a NEW key is a typed `conflict` (409;
+    `already accepted` / `has expired` / `was revoked`), and an unknown or
+    empty token is a typed `unauthorized` (401);
+  - success: `{ok: true, membership: {id, organization, user, role,
+    created_ms}}`.
+- `GET /native/repositories` — one cursor page of the organization's
+  synced repositories.
+- `GET,POST /native/approvals` and `POST /native/approvals/{id}/decide` —
+  the approval queue (request is header-`Idempotency-Key`-keyed; a
+  decision is idempotency-keyed and replays its recorded outcome).
 
 ## UI-adaptation principle
 

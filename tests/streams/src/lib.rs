@@ -277,9 +277,11 @@ mod streams_tests {
     }
 
     #[tokio::test]
-    async fn chat_missing_done_emits_done_at_eof() {
-        // (b) The server never sends finish_reason or [DONE]: the adapter
-        // emits Done exactly once at EOF — the stream is still well-formed.
+    async fn chat_missing_done_is_a_typed_failure_at_eof() {
+        // (b) The server never sends finish_reason or [DONE]: a dropped
+        // upstream connection mid-response is a TYPED failure, never a
+        // completed turn with truncated text (the already-delivered text
+        // chunks stay delivered).
         let norms = chat_sse_norms(vec![
             sse_frame(&chat_text("hi")),
             sse_frame(&chat_text(" there")),
@@ -290,9 +292,13 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Text(" there".into()),
-                Norm::Done
+                Norm::Err {
+                    kind: ProviderErrorKind::Malformed,
+                    retryable: false,
+                    code: None,
+                },
             ],
-            "Done is synthesized once at EOF"
+            "EOF before [DONE] is a typed Malformed failure"
         );
     }
 
@@ -479,10 +485,13 @@ mod streams_tests {
         // NEVER surfaced (the frame yields its first chunk — the text — and
         // the rest of the frame is not re-scanned). Documented actual
         // behavior: usage reaches the agent only on dedicated frames.
-        let norms = chat_sse_norms(vec![sse_frame(&json!({
-            "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
-        }))])
+        let norms = chat_sse_norms(vec![
+            sse_frame(&json!({
+                "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+            })),
+            sse_done(),
+        ])
         .await;
         assert_eq!(
             norms,
@@ -655,9 +664,10 @@ mod streams_tests {
     }
 
     #[tokio::test]
-    async fn responses_missing_completed_emits_done_at_eof() {
-        // (b) Neither response.completed nor [DONE] arrives: the stream end
-        // synthesizes Done exactly once.
+    async fn responses_missing_completed_is_a_typed_failure_at_eof() {
+        // (b) Neither response.completed nor [DONE] arrives: the body ended
+        // before any terminal response event, so the truncated stream is a
+        // TYPED failure (never a completed turn).
         let norms = responses_norms(vec![
             sse_frame(&responses_text_delta("hi")),
             sse_frame(&responses_text_delta(" there")),
@@ -668,9 +678,13 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Text(" there".into()),
-                Norm::Done
+                Norm::Err {
+                    kind: ProviderErrorKind::Malformed,
+                    retryable: false,
+                    code: None,
+                },
             ],
-            "EOF emits Done exactly once for the responses codec too"
+            "EOF before a terminal response event is a typed Malformed failure"
         );
     }
 
@@ -1826,8 +1840,10 @@ mod streams_tests {
     }
 
     #[tokio::test]
-    async fn gateway_missing_done_emits_done_at_eof() {
-        // (b) No finish_reason, no [DONE]: Done is synthesized at EOF once.
+    async fn gateway_missing_done_is_a_typed_failure_at_eof() {
+        // (b) No finish_reason, no [DONE]: the dropped connection is a
+        // TYPED failure through the gateway adapter too (delivered text
+        // chunks stay delivered).
         let norms = gateway_norms(MockAction::Sse {
             status: 200,
             events: vec![sse_frame(&chat_text("hi")), sse_frame(&chat_text(" there"))],
@@ -1838,9 +1854,13 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Text(" there".into()),
-                Norm::Done
+                Norm::Err {
+                    kind: ProviderErrorKind::Malformed,
+                    retryable: false,
+                    code: None,
+                },
             ],
-            "EOF emits Done exactly once through the gateway"
+            "EOF before [DONE] is a typed Malformed failure through the gateway"
         );
     }
 
@@ -2046,8 +2066,9 @@ mod streams_tests {
     }
 
     #[tokio::test]
-    async fn deepseek_missing_done_emits_done_at_eof() {
-        // (b) No finish_reason, no [DONE]: Done is synthesized at EOF once.
+    async fn deepseek_missing_done_is_a_typed_failure_at_eof() {
+        // (b) No finish_reason, no [DONE]: the dropped connection is a
+        // TYPED failure on the deepseek wire too.
         let norms = deepseek_norms(MockAction::Sse {
             status: 200,
             events: vec![sse_frame(&chat_text("hi")), sse_frame(&chat_text(" there"))],
@@ -2058,9 +2079,13 @@ mod streams_tests {
             vec![
                 Norm::Text("hi".into()),
                 Norm::Text(" there".into()),
-                Norm::Done
+                Norm::Err {
+                    kind: ProviderErrorKind::Malformed,
+                    retryable: false,
+                    code: None,
+                },
             ],
-            "EOF emits Done exactly once on the deepseek wire"
+            "EOF before [DONE] is a typed Malformed failure on the deepseek wire"
         );
     }
 

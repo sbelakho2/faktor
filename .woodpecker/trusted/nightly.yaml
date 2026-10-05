@@ -24,7 +24,8 @@
 # inside target/certification/supply-chain-status.json).
 #
 # Timeout: Woodpecker has no per-step timeout; the project pipeline timeout
-# applies (default 60 min, max settable 120 min). Raise it (setup.md §6):
+# applies. The 24h REAL-TIME soak lane needs a >= 25h budget, so raise it
+# (setup.md §6):
 #   server:  WOODPECKER_MAX_PIPELINE_TIMEOUT=1560
 #   project: PATCH /api/repos/{trusted_repo_id} {"timeout":1560}
 # Toolchain authority: `rust-toolchain.toml` pins channel 1.98.0 with
@@ -43,6 +44,31 @@
 # `scripts/certification/ignored-tests.json`.
 #
 # Commit-status context (default format): ci/woodpecker/cron/nightly
+#
+# Lane-bound marker auth (attribution, per-lane marker HMAC): every nightly
+# lane emits its marker through scripts/certification/lane-marker.sh, which
+# adds `"auth":"hmac-sha256:<hex>"` over the canonical unsigned marker JSON
+# using the lane's OWN CI secret. To enable verification, register one secret
+# per lane on the TRUSTED project and map it BOTH in the lane step's
+# `environment:` and in `certificate-nightly`'s `environment:` (see
+# scripts/woodpecker/setup.md §4):
+#
+#   fault-scale                          faktor_lane_token_fault_scale
+#   soak                                 faktor_lane_token_soak
+#   longrun                              faktor_lane_token_longrun
+#   efficiency                           faktor_lane_token_efficiency
+#   contention                           faktor_lane_token_contention
+#   economy                              faktor_lane_token_economy
+#   coding-benchmark                     faktor_lane_token_coding_benchmark
+#   coding-benchmark-real-model          faktor_lane_token_coding_benchmark_real_model
+#   supply-chain                         faktor_lane_token_supply_chain
+#
+# env var name = `faktor_lane_token_<lane>` with '-' -> '_' (the uppercase
+# FAKTOR_LANE_TOKEN_<LANE> form is also accepted). A lane step only receives
+# its own token, so it cannot mint another lane's MAC; the certificate step
+# receives all of them and rejects wrong or missing auth. While a mapping is
+# absent the marker carries no auth and verify-markers records that lane as
+# `unattested` — visible, never silently passed — with no hard failure.
 
 labels:
   platform: linux/amd64
@@ -70,57 +96,53 @@ steps:
         cargo test -p faktor-tests-fault -p faktor-updater --release -- --ignored
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"fault-scale","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/fault-scale.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane fault-scale --status passed \
+          --out target/certification/lanes/fault-scale.json
   - name: soak
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
-      # Long-run mode: scripts/soak.sh repeats the lane's ignored [soak] set
-      # FAKTOR_SOAK_SCALE=4 rounds (bounded by FAKTOR_SOAK_MAX_ROUNDS and the
-      # wall budget) and records target/certification/soak.json. The trusted
-      # push gate runs the same driver in bounded smoke mode.
-      FAKTOR_SOAK_MODE: long
-      FAKTOR_SOAK_SCALE: "4"
-      FAKTOR_SOAK_MAX_WALL_SECONDS: "14400"
-      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "3600"
+      # REAL-TIME durability run: scripts/soak.sh --mode realtime keeps the
+      # convergence churn workload running until FAKTOR_SOAK_REALTIME_SECONDS
+      # of real wall clock has elapsed (never shortened by a fast workload),
+      # plus the keyless accounting modelcheck lane test. The mandatory
+      # quiescent-convergence checker then evaluates every typed metric and
+      # ANY failed metric fails the lane. The per-release trusted push gate
+      # runs the same driver as the 30-60 min churn. The project must raise
+      # the pipeline timeout to >= 25h (WOODPECKER_MAX_PIPELINE_TIMEOUT).
+      FAKTOR_SOAK_MODE: realtime
+      FAKTOR_SOAK_REALTIME_SECONDS: "86400"
+      FAKTOR_SOAK_CONVERGENCE: required
+      FAKTOR_SOAK_LANE: soak
+      # Sparse sampling over 24h: 5760 bounded samples is far more than the
+      # checker's percentile windows need and keeps the sampler light.
+      FAKTOR_SOAK_SAMPLE_INTERVAL: "15"
+      FAKTOR_SOAK_MAX_WALL_SECONDS: "90000"
+      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "88200"
     volumes:
       - faktor-nightly-cargo-registry:/usr/local/cargo/registry
       - faktor-nightly-cargo-git:/usr/local/cargo/git
       - faktor-nightly-target-soak:/woodpecker-cache/target
     commands:
-      # The soak nightly lane: the bounded keyless [soak] tests assigned to it
-      # in scripts/certification/ignored-tests.json, driven through
-      # scripts/soak.sh in long mode (the first argument must forward the
-      # registry's recorded cargo invocation verbatim). The 12h/24h/10 GiB
-      # wall-clock soaks stay manual by design (documented there).
-      - bash scripts/soak.sh -p faktor-tests-accounting-modelcheck --release -- --ignored
+      # Exact-SHA real-time soak: the keyless ignored [soak] tests assigned to
+      # this lane in scripts/certification/ignored-tests.json. The convergence
+      # test honors the real target; soak_12h_scale stays a manual operator
+      # test (its 10k-turn synthetic scale is superseded here by real wall
+      # time). The registry command must match this step verbatim.
+      - bash scripts/soak.sh --mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck --release -- --ignored --skip soak_12h_scale
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        bash scripts/soak.sh -p faktor-tests-accounting-modelcheck --release -- --ignored
+        bash scripts/soak.sh --mode realtime -p faktor-tests-soak -p faktor-tests-accounting-modelcheck --release -- --ignored --skip soak_12h_scale
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"soak","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/soak.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane soak --status passed \
+          --artifact target/certification/soak.json \
+          --out target/certification/lanes/soak.json
   - name: longrun
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -139,16 +161,9 @@ steps:
         cargo test -p faktor-tests-longrun --release
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"longrun","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/longrun.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane longrun --status passed \
+          --out target/certification/lanes/longrun.json
   - name: efficiency
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -167,16 +182,9 @@ steps:
         cargo test -p faktor-tests-efficiency
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"efficiency","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/efficiency.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane efficiency --status passed \
+          --out target/certification/lanes/efficiency.json
   # Audit 27: the reproducible multi-agent contention benchmark. 32 concurrent
   # sessions with child agents, direct + SSE journal readers, index rebuilds,
   # tool records and budget writes; records p50/p95/p99 turn bookkeeping,
@@ -201,16 +209,9 @@ steps:
         cargo test -p faktor-tests-performance --release --test contention -- --ignored
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"contention","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/contention.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane contention --status passed \
+          --out target/certification/lanes/contention.json
   - name: economy
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -229,16 +230,9 @@ steps:
         cargo test -p faktor-tests-economy
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"economy","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/economy.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane economy --status passed \
+          --out target/certification/lanes/economy.json
   - name: coding-benchmark
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -257,16 +251,9 @@ steps:
         cargo test -p faktor-tests-coding-benchmark --test smoke
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"coding-benchmark","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/coding-benchmark.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane coding-benchmark --status passed \
+          --out target/certification/lanes/coding-benchmark.json
   - name: coding-benchmark-real-model
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     environment:
@@ -278,7 +265,7 @@ steps:
       - faktor-nightly-target-real:/woodpecker-cache/target
     commands:
       - |
-        set -u
+        set -eu
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
           cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
           status="passed"; reason=""
@@ -290,7 +277,7 @@ steps:
         set -u
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        set -u
+        set -eu
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
         cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
         status="passed"; reason=""
@@ -300,20 +287,15 @@ steps:
         fi
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
           status="passed"; reason=""
         else
           status="skipped"
           reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
         fi
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"coding-benchmark-real-model","status":"%s","reason":"%s","commit":"%s","tree":"%s","runner":{"os":"linux","arch":"amd64","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":[],"artifact_digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}\n' \
-          "$status" "$reason" "$CI_COMMIT_SHA" "$tree" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" > target/certification/lanes/coding-benchmark-real-model.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane coding-benchmark-real-model --status "$status" --reason "$reason" \
+          --out target/certification/lanes/coding-benchmark-real-model.json
         echo "coding-benchmark-real-model: $status ${reason:+(recorded skip)}"
   - name: supply-chain
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -333,16 +315,9 @@ steps:
         SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"supply-chain","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"sha256:%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/supply-chain.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane supply-chain --status passed \
+          --out target/certification/lanes/supply-chain.json
   - name: certificate-nightly
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -357,6 +332,20 @@ steps:
       - supply-chain
     when:
       status: [success, failure]
+    # Lane-bound auth verification (opt-in): map every registered lane token
+    # here so verify-markers can check each marker's `auth` HMAC. Unmapped
+    # lanes are still checked but recorded `unattested`. All lines are
+    # comments today so the pipeline compiles without the secrets:
+    # environment:
+    #   faktor_lane_token_fault_scale: { from_secret: faktor_lane_token_fault_scale }
+    #   faktor_lane_token_soak: { from_secret: faktor_lane_token_soak }
+    #   faktor_lane_token_longrun: { from_secret: faktor_lane_token_longrun }
+    #   faktor_lane_token_efficiency: { from_secret: faktor_lane_token_efficiency }
+    #   faktor_lane_token_contention: { from_secret: faktor_lane_token_contention }
+    #   faktor_lane_token_economy: { from_secret: faktor_lane_token_economy }
+    #   faktor_lane_token_coding_benchmark: { from_secret: faktor_lane_token_coding_benchmark }
+    #   faktor_lane_token_coding_benchmark_real_model: { from_secret: faktor_lane_token_coding_benchmark_real_model }
+    #   faktor_lane_token_supply_chain: { from_secret: faktor_lane_token_supply_chain }
     commands:
       # Enforce the ignored-test inventory first: every #[ignore] site must be
       # conventionally tagged and assigned to a lane wired in this workflow

@@ -105,7 +105,7 @@ pub const MAX_TREE_MANIFEST_LINK_BYTES: usize = 1024 * 1024;
 
 /// The entry kind of the canonical manifest. Dirs are implicit; special
 /// files are excluded and surface as a typed refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TreeEntryKind {
     Regular,
     Symlink,
@@ -113,7 +113,7 @@ pub enum TreeEntryKind {
 
 /// The canonical (git-style) mode of one manifest entry: `100644` regular,
 /// `100755` executable regular, `120000` symlink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CanonicalMode {
     RegularFile,
     ExecutableFile,
@@ -132,7 +132,7 @@ impl CanonicalMode {
 }
 
 /// One entry of the canonical tree manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TreeEntry {
     /// Relative path, `/`-separated, exact UTF-8 (no unicode normalization).
     pub normalized_path: String,
@@ -145,7 +145,7 @@ pub struct TreeEntry {
 
 /// A canonical manifest: the sorted entries plus the completeness notes of
 /// every special file the walk refused to fold away.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TreeManifest {
     entries: Vec<TreeEntry>,
     special_files: Vec<String>,
@@ -249,6 +249,22 @@ pub fn tree_manifest_budgeted(
     root: &Path,
     budget: &mut WalkBudget,
 ) -> Result<TreeManifest, TreeManifestError> {
+    tree_manifest_with_skip_budgeted(root, budget, TREE_MANIFEST_SKIP_DIRS)
+}
+
+/// [`tree_manifest_budgeted`] with caller-supplied skip directories (the
+/// exact-name skip list is validated by [`RootedDir::walk_bounded`]). The
+/// VCS names of [`TREE_MANIFEST_SKIP_DIRS`] are ALWAYS honored in addition:
+/// a caller can only ever make MORE paths invisible to a change-accounting
+/// walk (build outputs, dependency trees), never resurrect VCS bookkeeping.
+/// The shell-attribution walk uses this to honor the runtime's existing
+/// build/dependency ignore rules while remaining byte-identical to the
+/// canonical manifest for the paths it does see.
+pub fn tree_manifest_with_skip_budgeted(
+    root: &Path,
+    budget: &mut WalkBudget,
+    extra_skip_dirs: &[&str],
+) -> Result<TreeManifest, TreeManifestError> {
     let canonical = root
         .canonicalize()
         .map_err(|e| TreeManifestError::RootUnavailable(format!("{}: {e}", root.display())))?;
@@ -260,6 +276,12 @@ pub fn tree_manifest_budgeted(
     }
     let dir = RootedDir::open(&canonical)
         .map_err(|e| TreeManifestError::RootUnavailable(format!("{}: {e}", root.display())))?;
+    let mut skip_dirs: Vec<&str> = TREE_MANIFEST_SKIP_DIRS.to_vec();
+    for name in extra_skip_dirs {
+        if !skip_dirs.contains(name) {
+            skip_dirs.push(name);
+        }
+    }
     let mut manifest = TreeManifest::default();
     let mut failure: Option<TreeManifestError> = None;
     {
@@ -278,8 +300,7 @@ pub fn tree_manifest_budgeted(
                 }
             }
         };
-        if let Err(e) = dir.walk_bounded(Path::new(""), budget, TREE_MANIFEST_SKIP_DIRS, &mut visit)
-        {
+        if let Err(e) = dir.walk_bounded(Path::new(""), budget, &skip_dirs, &mut visit) {
             return Err(manifest_walk_error(e));
         }
     }

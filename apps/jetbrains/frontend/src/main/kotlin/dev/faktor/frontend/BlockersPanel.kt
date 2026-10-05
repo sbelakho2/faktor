@@ -155,9 +155,11 @@ class BlockersPanel : JPanel(BorderLayout()) {
         text.append("child: ").append(row.childId)
         text.append("\nstate: ").append(row.presence.state.tag)
         text.append("\nblocker kind: ").append(row.kind)
-        text.append("\nreason: ").append(row.reason)
-        if (row.dependency != null) text.append("\ndependency: ").append(row.dependency)
-        if (row.resolution != null) text.append("\nsuggested resolution: ").append(row.resolution)
+        text.append("\nreason: ").append(bound(row.reason, 240))
+        if (row.dependency != null) text.append("\ndependency: ").append(bound(row.dependency, 240))
+        if (row.resolution != null) {
+            text.append("\nsuggested resolution: ").append(bound(row.resolution, 240))
+        }
         if (row.lastProgressMs != null) text.append("\nlast progress ms: ").append(row.lastProgressMs)
         detail.text = text.toString()
     }

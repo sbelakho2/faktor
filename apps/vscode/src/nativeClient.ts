@@ -3747,38 +3747,45 @@ export class NativeClient {
     const controller = new AbortController();
     const timeout = this.timeoutMs;
     const timer = setTimeout(() => controller.abort(), timeout);
-    let response: ResponseLike;
+    // The deadline stays armed through the bounded body read: response
+    // HEADERS are not completion, so a body that dribbles under the byte cap
+    // is still cancelled and refused typed once the deadline elapses. The
+    // timer is cleared exactly once, on every path.
+    const deadline: BodyReadDeadline = { signal: controller.signal, timeoutMs: timeout };
     try {
-      response = await this.fetchImpl(url.toString(), {
-        method,
-        headers,
-        body,
-        signal: controller.signal,
-      });
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new NativeProtocolError(`${method} ${path}`, `request timed out after ${timeout}ms`);
+      let response: ResponseLike;
+      try {
+        response = await this.fetchImpl(url.toString(), {
+          method,
+          headers,
+          body,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw timeoutError(`${method} ${path}`, timeout);
+        }
+        throw new NativeProtocolError(
+          `${method} ${path}`,
+          `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-      throw new NativeProtocolError(
-        `${method} ${path}`,
-        `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const label = `${method} ${path}`;
+      if (!response.ok) {
+        const text = await readBounded(response, ERROR_BODY_BYTES, label, deadline);
+        throw apiError(response.status, text, label);
+      }
+      const text = await readBounded(response, options.maxBytes ?? this.maxBodyBytes, label, deadline);
+      let parsed: Json;
+      try {
+        parsed = JSON.parse(text) as Json;
+      } catch {
+        throw new NativeProtocolError(label, `response was not valid JSON (${text.length} bytes)`);
+      }
+      return options.validate(parsed, label);
     } finally {
       clearTimeout(timer);
     }
-    const label = `${method} ${path}`;
-    if (!response.ok) {
-      const text = await readBounded(response, ERROR_BODY_BYTES, label);
-      throw apiError(response.status, text, label);
-    }
-    const text = await readBounded(response, options.maxBytes ?? this.maxBodyBytes, label);
-    let parsed: Json;
-    try {
-      parsed = JSON.parse(text) as Json;
-    } catch {
-      throw new NativeProtocolError(label, `response was not valid JSON (${text.length} bytes)`);
-    }
-    return options.validate(parsed, label);
   }
 
   /**
@@ -3804,27 +3811,32 @@ export class NativeClient {
     const controller = new AbortController();
     const timeout = this.timeoutMs;
     const timer = setTimeout(() => controller.abort(), timeout);
-    let response: ResponseLike;
+    // Same whole-request deadline as `request`: headers arriving does not end
+    // the request; the bounded byte read is covered too.
+    const deadline: BodyReadDeadline = { signal: controller.signal, timeoutMs: timeout };
     try {
-      response = await this.fetchImpl(url.toString(), { method, headers, signal: controller.signal });
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new NativeProtocolError(`${method} ${path}`, `request timed out after ${timeout}ms`);
+      let response: ResponseLike;
+      try {
+        response = await this.fetchImpl(url.toString(), { method, headers, signal: controller.signal });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw timeoutError(`${method} ${path}`, timeout);
+        }
+        throw new NativeProtocolError(
+          `${method} ${path}`,
+          `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-      throw new NativeProtocolError(
-        `${method} ${path}`,
-        `fetch failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const label = `${method} ${path}`;
+      if (!response.ok) {
+        const text = await readBounded(response, ERROR_BODY_BYTES, label, deadline);
+        throw apiError(response.status, text, label);
+      }
+      const mime = response.headers?.get?.('content-type') ?? null;
+      return { mime, bytes: await readBoundedBytes(response, maxBytes, label, deadline) };
     } finally {
       clearTimeout(timer);
     }
-    const label = `${method} ${path}`;
-    if (!response.ok) {
-      const text = await readBounded(response, ERROR_BODY_BYTES, label);
-      throw apiError(response.status, text, label);
-    }
-    const mime = response.headers?.get?.('content-type') ?? null;
-    return { mime, bytes: await readBoundedBytes(response, maxBytes, label) };
   }
 
   health(): Promise<NativeHealth> {
@@ -4460,10 +4472,64 @@ function apiError(status: number, body: string, label: string): NativeApiError {
   throw new NativeProtocolError(label, `non-JSON error body with HTTP ${status}`);
 }
 
+/**
+ * The live deadline of ONE request, armed from before fetch until the bounded
+ * body read has completed. The abort signal is what cancels an in-flight
+ * body; `timeoutMs` is only used to render the typed refusal.
+ */
+interface BodyReadDeadline {
+  readonly signal: AbortSignal;
+  readonly timeoutMs: number;
+}
+
+function timeoutError(label: string, timeoutMs: number): NativeProtocolError {
+  return new NativeProtocolError(label, `request timed out after ${timeoutMs}ms`);
+}
+
+/**
+ * Races one pending body operation against the live request deadline. On
+ * abort the pending promise is abandoned; the caller cancels the underlying
+ * reader so no socket or timer outlives the refusal.
+ */
+function readWithinDeadline<T>(
+  pending: Promise<T>,
+  deadline: BodyReadDeadline,
+  label: string,
+): Promise<T> {
+  if (deadline.signal.aborted) {
+    return Promise.reject(timeoutError(label, deadline.timeoutMs));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(timeoutError(label, deadline.timeoutMs));
+    };
+    deadline.signal.addEventListener('abort', onAbort, { once: true });
+    pending.then(
+      (value) => {
+        deadline.signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        deadline.signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function cancelReader(reader: StreamReaderLike): Promise<void> {
+  try {
+    await reader.cancel();
+  } catch {
+    // Cancellation is best-effort; the typed rejection is the point.
+  }
+}
+
 async function readBounded(
   response: ResponseLike,
   maxBytes: number,
   label: string,
+  deadline: BodyReadDeadline,
 ): Promise<string> {
   const declared = Number(response.headers?.get?.('content-length') ?? Number.NaN);
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -4474,7 +4540,18 @@ async function readBounded(
     const chunks: Uint8Array[] = [];
     let size = 0;
     for (;;) {
-      const { done, value } = await reader.read();
+      let result: { done: boolean; value?: Uint8Array };
+      try {
+        result = await readWithinDeadline(reader.read(), deadline, label);
+      } catch (error) {
+        if (deadline.signal.aborted) {
+          // Initiate cancellation without awaiting a hostile reader.cancel:
+          // the typed deadline refusal must never be delayed by cleanup.
+          void cancelReader(reader);
+        }
+        throw error;
+      }
+      const { done, value } = result;
       if (done) {
         break;
       }
@@ -4483,18 +4560,14 @@ async function readBounded(
       }
       size += value.byteLength;
       if (size > maxBytes) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Cancellation is best-effort; the rejection below is the point.
-        }
+        await cancelReader(reader);
         throw new NativeProtocolError(label, `streamed body exceeded bound ${maxBytes} bytes`);
       }
       chunks.push(value);
     }
     return decodeUtf8(chunks, size);
   }
-  const buffer = await response.arrayBuffer();
+  const buffer = await readWithinDeadline(response.arrayBuffer(), deadline, label);
   if (buffer.byteLength > maxBytes) {
     throw new NativeProtocolError(label, `body ${buffer.byteLength} bytes exceeds bound ${maxBytes}`);
   }
@@ -4505,6 +4578,7 @@ async function readBoundedBytes(
   response: ResponseLike,
   maxBytes: number,
   label: string,
+  deadline: BodyReadDeadline,
 ): Promise<Uint8Array> {
   const declared = Number(response.headers?.get?.('content-length') ?? Number.NaN);
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -4515,7 +4589,18 @@ async function readBoundedBytes(
     const chunks: Uint8Array[] = [];
     let size = 0;
     for (;;) {
-      const { done, value } = await reader.read();
+      let result: { done: boolean; value?: Uint8Array };
+      try {
+        result = await readWithinDeadline(reader.read(), deadline, label);
+      } catch (error) {
+        if (deadline.signal.aborted) {
+          // Initiate cancellation without awaiting a hostile reader.cancel:
+          // the typed deadline refusal must never be delayed by cleanup.
+          void cancelReader(reader);
+        }
+        throw error;
+      }
+      const { done, value } = result;
       if (done) {
         break;
       }
@@ -4524,11 +4609,7 @@ async function readBoundedBytes(
       }
       size += value.byteLength;
       if (size > maxBytes) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Cancellation is best-effort; the rejection below is the point.
-        }
+        await cancelReader(reader);
         throw new NativeProtocolError(label, `streamed body exceeded bound ${maxBytes} bytes`);
       }
       chunks.push(value);
@@ -4541,7 +4622,7 @@ async function readBoundedBytes(
     }
     return joined;
   }
-  const buffer = await response.arrayBuffer();
+  const buffer = await readWithinDeadline(response.arrayBuffer(), deadline, label);
   if (buffer.byteLength > maxBytes) {
     throw new NativeProtocolError(label, `body ${buffer.byteLength} bytes exceeds bound ${maxBytes}`);
   }

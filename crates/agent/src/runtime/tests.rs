@@ -106,6 +106,7 @@ pub(crate) fn deps_with(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: crate::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     (deps, dir)
@@ -161,6 +162,7 @@ pub(crate) fn deps_sharing_session(
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: crate::fallback_semantic_registry(),
             context_prior: None,
+            secret_registry: None,
             efficiency: Default::default(),
         },
         dir,
@@ -887,6 +889,7 @@ pub(crate) fn verified_rust_env(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: crate::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     (deps, dir, root)
@@ -1250,6 +1253,7 @@ pub(crate) fn review_env(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: crate::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     (deps, dir, root)

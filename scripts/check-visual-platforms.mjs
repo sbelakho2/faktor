@@ -32,6 +32,22 @@ const SCHEMA = 'faktor-parity-visual-baselines/v3';
 const REQUIRED_PLATFORMS = ['linux', 'macos', 'windows'];
 const DIGEST = /^[0-9a-f]{64}$/;
 
+/** True when an environment string carries a resolved-font fingerprint
+ * (`-f` + at least 8 hex chars) — the shape the Kotlin `visualEnvironment()`
+ * writes. The Windows record must have its own; a fingerprint-less
+ * placeholder is never a certified render. */
+export function hasFontFingerprint(environment) {
+  if (typeof environment !== 'string') {
+    return false;
+  }
+  const marker = environment.lastIndexOf('-f');
+  if (marker < 0) {
+    return false;
+  }
+  const token = environment.slice(marker + 2);
+  return token.length >= 8 && /^[0-9a-f]+$/.test(token);
+}
+
 function fail(message) {
   console.error(`check-visual-platforms: ${message}`);
   process.exit(1);
@@ -67,6 +83,7 @@ export function evaluateBaseline(text, requiredPlatforms = REQUIRED_PLATFORMS) {
     }
   }
   const coverage = {};
+  const environments = {};
   for (const platform of requiredPlatforms) {
     const record = platforms[platform];
     if (record === undefined) {
@@ -80,6 +97,8 @@ export function evaluateBaseline(text, requiredPlatforms = REQUIRED_PLATFORMS) {
     }
     if (typeof record.environment !== 'string' || record.environment.length === 0) {
       problems.push(`platform ${platform} has no environment fingerprint`);
+    } else {
+      environments[platform] = record.environment;
     }
     const digests = record.digests;
     if (typeof digests !== 'object' || digests === null || Object.keys(digests).length === 0) {
@@ -95,6 +114,38 @@ export function evaluateBaseline(text, requiredPlatforms = REQUIRED_PLATFORMS) {
       }
     }
     coverage[platform] = ok && problems.length === 0 ? 'certified' : 'not_certified';
+  }
+  // The Windows record must be produced by a Windows render: a distinct
+  // `windows-...` environment WITH its own resolved-font fingerprint. A
+  // record reusing another platform's environment (or a fingerprint-less
+  // placeholder) is refused, so a linux/macos pin can never be copied in.
+  if (platforms.windows !== undefined && typeof platforms.windows === 'object' && platforms.windows !== null) {
+    const environment = platforms.windows.environment;
+    if (typeof environment === 'string' && environment.length > 0) {
+      if (!environment.startsWith('windows-')) {
+        problems.push(
+          `windows environment ${JSON.stringify(environment)} is not a distinct windows-* fingerprint`,
+        );
+        coverage.windows = 'not_certified';
+      }
+      if (!hasFontFingerprint(environment)) {
+        problems.push(
+          `windows environment ${JSON.stringify(environment)} carries no resolved-font fingerprint`,
+        );
+        coverage.windows = 'not_certified';
+      }
+    }
+  }
+  const seenEnvironments = new Map();
+  for (const [platform, environment] of Object.entries(environments)) {
+    if (seenEnvironments.has(environment)) {
+      problems.push(
+        `platforms ${seenEnvironments.get(environment)} and ${platform} share environment ` +
+          `${JSON.stringify(environment)}; each platform record must be its own render`,
+      );
+    } else {
+      seenEnvironments.set(environment, platform);
+    }
   }
   return { coverage, problems };
 }
@@ -139,7 +190,7 @@ function run(path, release) {
 
 function fixture(overrides = {}) {
   const record = {
-    environment: 'linux-amd64-jvm17',
+    environment: 'linux-amd64-jvm17-f2927b2734270',
     digests: { 'task-tree': 'a'.repeat(64), settings: 'b'.repeat(64) },
   };
   const base = {
@@ -148,11 +199,11 @@ function fixture(overrides = {}) {
     platforms: {
       linux: JSON.parse(JSON.stringify(record)),
       macos: {
-        environment: 'mac-os-x-aarch64-jvm17',
+        environment: 'mac-os-x-aarch64-jvm17-f0123456789ab',
         digests: { 'task-tree': 'c'.repeat(64), settings: 'd'.repeat(64) },
       },
       windows: {
-        environment: 'windows-amd64-jvm17',
+        environment: 'windows-amd64-jvm17-fcafef00d123',
         digests: { 'task-tree': 'e'.repeat(64), settings: 'f'.repeat(64) },
       },
     },
@@ -209,6 +260,35 @@ function selftest() {
   const emptyDigests = JSON.parse(fixture());
   emptyDigests.platforms.macos.digests = {};
   expectProblems('empty digest record', JSON.stringify(emptyDigests), true);
+  // The windows record must be its own windows render with a font
+  // fingerprint; a placeholder or a copied linux environment certifies
+  // nothing.
+  const noFingerprint = JSON.parse(fixture());
+  noFingerprint.platforms.windows.environment = 'windows-amd64-jvm17';
+  const noFingerprintResult = evaluateBaseline(JSON.stringify(noFingerprint));
+  if (!noFingerprintResult.problems.some((p) => p.includes('no resolved-font fingerprint'))) {
+    console.error(
+      `check-visual-platforms selftest: FAIL windows without fingerprint: ${noFingerprintResult.problems.join('; ')}`,
+    );
+    failed += 1;
+  }
+  if (noFingerprintResult.coverage.windows !== 'not_certified') {
+    console.error('check-visual-platforms selftest: FAIL fingerprint-less windows must be not_certified');
+    failed += 1;
+  }
+  const reused = JSON.parse(fixture());
+  reused.platforms.windows.environment = reused.platforms.linux.environment;
+  const reusedResult = evaluateBaseline(JSON.stringify(reused));
+  if (!reusedResult.problems.some((p) => p.includes('not a distinct windows-* fingerprint'))) {
+    console.error(
+      `check-visual-platforms selftest: FAIL windows reusing linux env: ${reusedResult.problems.join('; ')}`,
+    );
+    failed += 1;
+  }
+  if (!reusedResult.problems.some((p) => p.includes('share environment'))) {
+    console.error('check-visual-platforms selftest: FAIL duplicate environment must be refused');
+    failed += 1;
+  }
   if (failed > 0) process.exit(1);
   console.log('check-visual-platforms selftest: PASS');
 }

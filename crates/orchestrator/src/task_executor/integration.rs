@@ -647,6 +647,31 @@ impl TaskExecutor {
                         row.shadow_id
                     )));
                 }
+                // Applied-but-unintegrated writes are NOT garbage: the
+                // durable tool ledger still says `applied`, so discarding the
+                // shadow silently destroyed them (a later doctor showed a
+                // clean tree). Retain and surface a typed obligation.
+                let unintegrated = handle
+                    .memory_facts()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(kind, key, _)| kind == "verification" && key.contains("root:"))
+                    .any(|(_, _, value)| {
+                        serde_json::from_str::<serde_json::Value>(value.as_str())
+                            .ok()
+                            .and_then(|v| {
+                                v.get("changed")
+                                    .and_then(|c| c.as_array())
+                                    .map(|a| !a.is_empty())
+                            })
+                            .unwrap_or(false)
+                    });
+                if unintegrated {
+                    return Err(ExecError::Conflict(format!(
+                        "session {parent} carries applied-but-unintegrated changes in shadow {}; re-run settlement or explicitly discard the shadow before a new run",
+                        row.shadow_id
+                    )));
+                }
                 shadows.discard(parent)?;
             }
             None => {
@@ -847,8 +872,13 @@ impl TaskExecutor {
             .drives
             .spawn(format!("tx-session-{}", parent.raw()), async move {
                 let deadline = Instant::now() + Self::SHADOW_WATCH_DEADLINE;
+                // Backoff: the watcher re-settles a parked run, and an
+                // unchanged refusal must not be re-driven at the base tick
+                // for the whole 120s deadline (480 no-op reviewer attempts).
+                let mut wait = Self::SHADOW_WATCH_INTERVAL;
                 loop {
-                    tokio::time::sleep(Self::SHADOW_WATCH_INTERVAL).await;
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(4));
                     if Instant::now() >= deadline {
                         return;
                     }

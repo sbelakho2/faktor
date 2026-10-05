@@ -292,6 +292,7 @@ fn validate_rejects_duplicate_provider_ids() {
                 base_url: "http://x".into(),
                 api_key_env: None,
                 api: None,
+                models: Vec::new(),
                 pricing: None,
                 allow_loopback: true,
                 quality: None,
@@ -312,6 +313,7 @@ fn validate_rejects_duplicate_provider_ids() {
                 base_url: "http://y".into(),
                 api_key_env: None,
                 api: None,
+                models: Vec::new(),
                 pricing: None,
                 allow_loopback: true,
                 quality: None,
@@ -333,6 +335,7 @@ fn endpoint_address_class_requires_explicit_naming_of_non_global_literals() {
             api_key_env: None,
             api: None,
             allow_loopback,
+            models: Vec::new(),
             pricing: None,
             quality: None,
         }],
@@ -554,6 +557,7 @@ async fn built_openai_provider_targets_the_selected_family_endpoint() {
         base_url: base_url.into(),
         api_key_env: None,
         api,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -914,6 +918,7 @@ fn keys_read_from_env_not_file() {
         base_url: "http://x".into(),
         api_key_env: Some("FAKTOR_TEST_KEY".into()),
         api: None,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -955,6 +960,7 @@ fn built_providers_register_under_configured_instance_ids() {
             base_url: format!("https://{id}.example.com/v1"),
             api_key_env: None,
             api: None,
+            models: Vec::new(),
             pricing: None,
             allow_loopback: true,
             quality: None,
@@ -1046,6 +1052,7 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
         base_url: OPENAI_OFFICIAL_BASE_URL.into(),
         api_key_env: None,
         api: None,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -1055,6 +1062,7 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
         base_url: format!("{OPENAI_OFFICIAL_BASE_URL}/"),
         api_key_env: None,
         api: None,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -1064,6 +1072,7 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
         base_url: "https://corp.example.com/v1".into(),
         api_key_env: None,
         api: None,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -1162,6 +1171,7 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
         base_url: "https://corp.example.com/v1".into(),
         api_key_env: None,
         api: None,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -1187,6 +1197,7 @@ fn billing_origin_matrix_is_strict_and_instance_scoped() {
         base_url: OPENAI_OFFICIAL_BASE_URL.into(),
         api_key_env: None,
         api: None,
+        models: Vec::new(),
         pricing: None,
         allow_loopback: true,
         quality: None,
@@ -1716,4 +1727,42 @@ fn failure_learning_flag_gates_the_planner_prior_hook() {
         baseline, boosted,
         "the parsed flag must decide planner construction"
     );
+}
+
+#[test]
+fn retry_section_defaults_to_bounded_rate_limit_retries_and_validates() {
+    let cfg: Config = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        cfg.retry.max_attempts, 3,
+        "the daemon retries transients by default"
+    );
+    assert!(matches!(
+        cfg.retry.class,
+        faktor_core::retry::RetryClass::RateLimited
+    ));
+    assert_eq!(cfg.retry.to_policy().max_attempts, 3);
+
+    let cfg: Config =
+        serde_json::from_str(r#"{"retry":{"max_attempts":5,"class":"server_error"}}"#).unwrap();
+    let policy = cfg.retry.to_policy();
+    assert_eq!(policy.max_attempts, 5);
+    assert!(matches!(
+        policy.class,
+        faktor_core::retry::RetryClass::ServerError
+    ));
+    assert!(cfg.validate().is_ok());
+
+    for bad in [
+        r#"{"retry":{"max_attempts":0}}"#,
+        r#"{"retry":{"max_attempts":9}}"#,
+        r#"{"retry":{"jitter":2.0}}"#,
+        r#"{"retry":{"base_delay_ms":0}}"#,
+        r#"{"retry":{"base_delay_ms":100,"max_delay_ms":10}}"#,
+        r#"{"retry":{"nonsense":1}}"#,
+    ] {
+        let parsed: Result<Config, _> = serde_json::from_str(bad);
+        if let Ok(cfg) = parsed {
+            assert!(cfg.validate().is_err(), "must refuse: {bad}");
+        }
+    }
 }

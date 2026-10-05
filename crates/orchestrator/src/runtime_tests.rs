@@ -1,11 +1,9 @@
 #![allow(clippy::await_holding_lock)]
-//! (suite-level HEAVY_SUITE guard is held across awaits BY DESIGN: it
-//! serializes whole heavy integration tests; clippy's lint is test-only noise.)
-
+//! (suite-level HEAVY_SUITE guard held across awaits BY DESIGN: it serializes
+//! whole heavy integration tests; clippy's lint is test-only noise.)
 //! Adversarial tests for the orchestrator runtime wiring (audits 20-24).
-//!
-//! Children are driven by a REAL `AgentRuntime` over a REAL `SessionManager`
-//! with a scripted, chunk-paced provider (no network). Every test attempts
+//! Children are driven by a REAL `AgentRuntime` over a REAL `SessionManager` with
+//! a scripted, chunk-paced provider (no network). Every test attempts
 //! to break the invariants: crashes at seams, mid-drive kills, paused
 //! drives, duplicate steer application, ceiling pressure, ownership
 //! overlap and zero-orphan registry checks after every crash.
@@ -354,6 +352,7 @@ fn open_env_with_routing(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     let agent = AgentRuntime::new(deps).unwrap();
@@ -2055,6 +2054,7 @@ async fn registry_and_identity_rows_survive_a_full_manager_reopen() {
             retry_policy: faktor_core::retry::RetryPolicy::default(),
             semantic: faktor_agent::fallback_semantic_registry(),
             context_prior: None,
+            secret_registry: None,
             efficiency: Default::default(),
         };
         let agent = AgentRuntime::new(deps).unwrap();

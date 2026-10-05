@@ -1022,11 +1022,69 @@ pub(crate) async fn native_create_session(
     if req.provider.trim().is_empty() || req.model.trim().is_empty() {
         return wire_status(malformed_body("provider and model must not be empty"));
     }
+    // The registry is the authority: an unregistered provider refuses HERE,
+    // before any workspace/session effect (the CLI's `run` preflight mirrors
+    // this rule). Without it an unknown id created a durable workspace and a
+    // permanently failed session.
+    let registered = state.deps.agent.deps().providers.ids();
+    if !registered.iter().any(|id| id == &req.provider) {
+        return api_err(&faktor_core::Error::new(
+            faktor_core::error::ErrorKind::NotFound,
+            format!(
+                "provider '{}' is not registered; registered: {:?}",
+                req.provider, registered
+            ),
+        ));
+    }
+    // The session model must be SERVED. The router's priced candidate set is
+    // the authority: Economy may substitute among served models, but an
+    // unserved model must refuse typed instead of being silently replaced
+    // (docs: "A session whose model the router cannot serve is refused with
+    // a typed failure — never silently replaced").
+    let served: Vec<String> = state
+        .deps
+        .agent
+        .deps()
+        .routing
+        .served_models()
+        .into_iter()
+        .filter(|(provider, _)| provider == &req.provider)
+        .map(|(_, model)| model)
+        .collect();
+    // Permissive when the policy exposes no candidate set (fixed/passthrough
+    // test policies); production Economy validates against its priced set.
+    if !served.is_empty() && !served.iter().any(|m| m == &req.model) {
+        let mut listed = served.clone();
+        listed.sort();
+        listed.dedup();
+        return api_err(&faktor_core::Error::new(
+            faktor_core::error::ErrorKind::NotFound,
+            format!(
+                "session model '{}' is not served by provider '{}'; served: {:?}",
+                req.model, req.provider, listed
+            ),
+        ));
+    }
     let root = req
         .workspace
         .clone()
         .or_else(|| state.deps.directory.clone())
         .unwrap_or_else(|| ".".to_string());
+    // The handler contract is "a workspace that cannot be registered is a
+    // typed error, never a half-created session": a 256 KiB single-component
+    // path used to create a durable session for a root that can never exist
+    // (NAME_MAX), and a missing root registered silently.
+    const MAX_WORKSPACE_ROOT_BYTES: usize = 4096;
+    if root.len() > MAX_WORKSPACE_ROOT_BYTES {
+        return wire_status(malformed_body(&format!(
+            "workspace root exceeds {MAX_WORKSPACE_ROOT_BYTES} bytes"
+        )));
+    }
+    if !std::path::Path::new(&root).is_dir() {
+        return wire_status(malformed_body(&format!(
+            "workspace root {root} does not exist or is not a directory"
+        )));
+    }
     let ws = match state.deps.session.create_workspace(&root) {
         Ok(ws) => ws,
         Err(e) => return api_err(&e),
@@ -1038,6 +1096,13 @@ pub(crate) async fn native_create_session(
         .create_session(ws, &title, &req.provider, &req.model)
     {
         Ok(handle) => {
+            // SessionStart lifecycle hook (audit): the durable row exists
+            // now, and the session has not been used yet — the SAME
+            // ordering as the ACP daemon entry. Best-effort: the registry
+            // bounds the hook (deadline/caps) and a fail-closed verdict is
+            // audit-only, so session creation can never fail or hang
+            // unboundedly on a hook.
+            state.deps.agent.run_session_start_hook(handle.id());
             let row = handle.row().ok();
             Json(serde_json::json!({
                 "id": handle.id().to_string(),
@@ -1147,7 +1212,9 @@ fn prompt_admission_digest(
 
 /// Serialize one accepted prompt receipt into the exact response bytes the
 /// admission row stores, so a replay is byte-for-byte the first success.
-fn prompt_receipt_json(receipt: &PromptReceipt) -> String {
+/// `pub(crate)`: the admission-recovery module rebuilds the same bytes from
+/// the durable turn facts.
+pub(crate) fn prompt_receipt_json(receipt: &PromptReceipt) -> String {
     serde_json::json!({
         "op_id": receipt.op_id.to_string(),
         "run_id": receipt.run_id,
@@ -1230,14 +1297,49 @@ pub(crate) async fn native_prompt(
     };
     // The admission claim is the FIRST durable act of the prompt: it
     // precedes the `PromptReceived` append and every queue/message write.
+    //
+    // Audit P1: reserve the turn's op id durably BEFORE the claim so the
+    // claim's `reservation` (`tx-<op>`) names exactly the turn a fresh
+    // execution journals; startup recovery then rebuilds the receipt from
+    // the durable turn/queue facts instead of guessing.
     let files = req.files.unwrap_or_default();
     let store = state.deps.session.store();
     let digest = prompt_admission_digest(sid, &req.prompt, &files);
-    let claim =
-        match store.prompt_admission_claim(sid, &req.submission_id, &digest, handle.now_ms()) {
+    let reserved_op = match state.deps.session.try_next_op_id() {
+        Ok(op) => op,
+        Err(e) => return api_err(&faktor_core::Error::from(e)),
+    };
+    let reservation = format!("tx-{:016x}", reserved_op.raw());
+    let mut claim = match store.prompt_admission_claim(
+        sid,
+        &req.submission_id,
+        &digest,
+        &reservation,
+        handle.now_ms(),
+    ) {
+        Ok(claim) => claim,
+        Err(e) => return api_err(&store_err_to_core(e)),
+    };
+    if let PromptAdmissionClaim::Stale(row) = &claim {
+        // A stale row (a previous boot's owner or an expired lease) is never
+        // answered in flight: classify it against the durable facts, land it
+        // exactly once, then retry the claim.
+        if let Err(e) =
+            super::admission_recovery::land_stale_prompt_admission(&state.deps.session, row)
+        {
+            return exec_error_response(&e);
+        }
+        claim = match store.prompt_admission_claim(
+            sid,
+            &req.submission_id,
+            &digest,
+            &reservation,
+            handle.now_ms(),
+        ) {
             Ok(claim) => claim,
             Err(e) => return api_err(&store_err_to_core(e)),
         };
+    }
     match claim {
         PromptAdmissionClaim::Complete(receipt_json) => {
             // The stored receipt is served byte-for-byte with ZERO journal,
@@ -1264,6 +1366,19 @@ pub(crate) async fn native_prompt(
                 retryable: false,
             });
         }
+        PromptAdmissionClaim::Stale(_) => {
+            // A second stale landing raced this claim (rare, bounded): the
+            // retryable refusal is honest, never a perpetual in-flight.
+            return wire_status(ApiError {
+                code: "conflict",
+                message: format!(
+                    "prompt submission id {:?} has a stale claim being resolved; retry",
+                    req.submission_id
+                ),
+                http_status: 409,
+                retryable: true,
+            });
+        }
         PromptAdmissionClaim::KeyReused { stored_digest } => {
             return wire_status(ApiError {
                 code: "conflict",
@@ -1283,20 +1398,28 @@ pub(crate) async fn native_prompt(
         files,
         // The server-level admission IS this path's durable key: the
         // executor is called unkeyed so a prompt key can never alias a
-        // task-start key (separate tables, separate semantics).
+        // task-start key (separate tables, separate semantics). The
+        // reserved op id is threaded so the executor's turn journals exactly
+        // the reservation this claim recorded.
         submission_id: None,
+        reserved_op_id: Some(reserved_op),
+        admission_digest: Some(digest),
         ..Default::default()
     };
     match service.prompt(sid, request).await {
         Ok(receipt) => {
             let receipt_json = prompt_receipt_json(&receipt);
-            if let Err(e) = store.prompt_admission_complete(sid, &req.submission_id, &receipt_json)
-            {
+            if let Err(e) = store.prompt_admission_complete(
+                sid,
+                &req.submission_id,
+                &reservation,
+                &receipt_json,
+            ) {
                 tracing::error!(
                     session_id = %sid,
                     submission_id = %req.submission_id,
                     error = %e,
-                    "prompt admission completion failed after the prompt was accepted; the key stays pending so a retry answers in flight instead of duplicating"
+                    "prompt admission completion failed after the prompt was accepted; the key stays pending and startup recovery completes it from the durable turn facts"
                 );
                 return api_err(&store_err_to_core(e));
             }
@@ -1305,15 +1428,17 @@ pub(crate) async fn native_prompt(
         Err(e) => {
             // A provably pre-admission refusal releases the key so the SAME
             // submission may be retried; an ambiguous failure keeps it
-            // pending (a retry then answers 409 in-flight, never a
-            // duplicate).
+            // pending (startup recovery then replays the accepted turn or
+            // reclaims it — never a perpetual in-flight).
             if prompt_refusal_is_pre_admission(&e) {
-                if let Err(release_err) = store.prompt_admission_release(sid, &req.submission_id) {
+                if let Err(release_err) =
+                    store.prompt_admission_release(sid, &req.submission_id, &reservation)
+                {
                     tracing::error!(
                         session_id = %sid,
                         submission_id = %req.submission_id,
                         error = %release_err,
-                        "prompt admission release failed after a pre-admission refusal; a retry may answer in flight"
+                        "prompt admission release failed after a pre-admission refusal; startup recovery resolves the key"
                     );
                 }
             }
@@ -1344,6 +1469,69 @@ mod tests {
 
     fn abort_state(root: &std::path::Path) -> (AppState, faktor_core::id::SessionId) {
         test_state(root, "abort")
+    }
+
+    #[tokio::test]
+    async fn create_session_refuses_an_unregistered_provider_before_any_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = test_state(dir.path(), "seed");
+        let before = state.deps.session.list_sessions(None).unwrap().len();
+        let mut headers = authed_headers(&state);
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let response = super::native_create_session(
+            State(state.clone()),
+            headers,
+            Ok(Json(NativeCreateSessionRequest {
+                provider: "ghost".into(),
+                model: "m".into(),
+                workspace: Some("/tmp".into()),
+                title: None,
+            })),
+        )
+        .await;
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not registered"),
+            "{body}"
+        );
+        assert_eq!(
+            state.deps.session.list_sessions(None).unwrap().len(),
+            before,
+            "an unregistered provider must leave no session behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_accepts_a_registered_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = test_state(dir.path(), "seed");
+        let mut headers = authed_headers(&state);
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let response = super::native_create_session(
+            State(state.clone()),
+            headers,
+            Ok(Json(NativeCreateSessionRequest {
+                provider: "fake".into(),
+                model: "m".into(),
+                workspace: Some("/tmp".into()),
+                title: Some("accepted".into()),
+            })),
+        )
+        .await;
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body["id"].as_str().unwrap_or_default().is_empty());
     }
 
     fn authed_headers(state: &AppState) -> HeaderMap {
@@ -1885,7 +2073,7 @@ mod tests {
         let digest = prompt_admission_digest(sid, "hi", &[]);
         assert_eq!(
             store
-                .prompt_admission_claim(sid, PROMPT_KEY, &digest, 0)
+                .prompt_admission_claim(sid, PROMPT_KEY, &digest, "tx-replay-probe", 0)
                 .unwrap(),
             PromptAdmissionClaim::Complete(first_text.clone()),
             "exactly one completed admission storing the response bytes"
@@ -1934,7 +2122,13 @@ mod tests {
         let store = state.deps.session.store();
         assert_eq!(
             store
-                .prompt_admission_claim(sid, PROMPT_KEY, "digest-from-another-writer", 1)
+                .prompt_admission_claim(
+                    sid,
+                    PROMPT_KEY,
+                    "digest-from-another-writer",
+                    "tx-00000000000000bb",
+                    handle.now_ms()
+                )
                 .unwrap(),
             PromptAdmissionClaim::Fresh,
             "the test plants the pending claim an in-flight winner would hold"
@@ -1995,5 +2189,422 @@ mod tests {
         // refuses typed: accepting the retry did not drop the receipt.
         let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "other")).await;
         assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    }
+
+    // --------------------------------------- admission crash matrix (P1)
+
+    /// Reopen the SAME data root as a new daemon boot generation without
+    /// creating a second workspace/session (the crash matrix retries the
+    /// original session id).
+    fn reopen_state(root: &std::path::Path) -> AppState {
+        let deps = crate::api::tests::test_deps(root);
+        AppState {
+            deps: Arc::new(deps),
+            auth: Arc::new(std::sync::RwLock::new(None)),
+            terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    fn user_message_count(handle: &faktor_session::SessionHandle) -> usize {
+        handle
+            .messages_page(None, 100)
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .count()
+    }
+
+    /// Audit P1 crash matrix, shared harness: arm ONE admission boundary,
+    /// drive the native prompt handler into the injected crash (the store
+    /// writer dies and the handler answers typed), drop the "daemon",
+    /// reopen the SAME data root as a NEW boot generation, run boot
+    /// admission recovery and assert the pending table is EMPTY.
+    async fn prompt_crash_and_reopen(
+        dir: &tempfile::TempDir,
+        point: &'static str,
+        ordinal: u64,
+    ) -> (AppState, faktor_core::id::SessionId, serde_json::Value) {
+        let (state, sid) = test_state(dir.path(), "prompt-crash");
+        let body = prompt_body(sid, PROMPT_KEY, "crash matrix prompt");
+        state
+            .deps
+            .session
+            .store()
+            .crash_arm(faktor_store::CrashArm { point, ordinal });
+        let (status, text) = prompt_call(&state, sid, body.clone()).await;
+        assert!(
+            status.is_server_error(),
+            "seam {point}#{ordinal} must interrupt the prompt: {status} {text}"
+        );
+        assert!(
+            !state.deps.session.store().writer_available(),
+            "seam {point}#{ordinal} must kill the durable writer"
+        );
+        drop(state);
+        let state = reopen_state(dir.path());
+        let summary = crate::native::recover_pending_admissions(&state.deps.session);
+        assert_eq!(summary.failed, 0, "{summary:?}");
+        let pending = state
+            .deps
+            .session
+            .store()
+            .prompt_admission_pending_page(None, 100)
+            .unwrap();
+        assert!(
+            pending.rows.is_empty(),
+            "boot recovery never leaves a pending claim: {summary:?}"
+        );
+        (state, sid, body)
+    }
+
+    /// Boundary 1: the claim never committed. No row exists; the retry
+    /// admits exactly one prompt.
+    #[tokio::test]
+    async fn prompt_crash_before_claim_retries_as_one_fresh_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid, body) =
+            prompt_crash_and_reopen(&dir, "prompt_admission_claim_precommit", 0).await;
+        let (status, text) = prompt_call(&state, sid, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(prompt_received_count(&handle), 1);
+        assert_eq!(user_message_count(&handle), 1);
+    }
+
+    /// Boundary 2: the claim committed, no mutation followed. Boot recovery
+    /// reclaims it; the retry admits exactly one prompt.
+    #[tokio::test]
+    async fn prompt_crash_after_claim_before_mutation_reclaims_and_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid, body) =
+            prompt_crash_and_reopen(&dir, "prompt_admission_claim_committed", 0).await;
+        let (status, text) = prompt_call(&state, sid, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(prompt_received_count(&handle), 1);
+        assert_eq!(user_message_count(&handle), 1);
+    }
+
+    /// Boundary 3: the first durable mutation (the `PromptReceived` append)
+    /// committed before the crash. A bare journal entry is not an accepted
+    /// prompt (no message, no turn record): recovery reclaims it, repairs
+    /// the phantom active state and the retry admits exactly one prompt.
+    #[tokio::test]
+    async fn prompt_crash_after_first_durable_mutation_reclaims_and_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid, body) = prompt_crash_and_reopen(&dir, "ev_committed", 0).await;
+        let (status, text) = prompt_call(&state, sid, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            user_message_count(&handle),
+            1,
+            "exactly one user prompt was materialized"
+        );
+    }
+
+    /// Boundary 4: the accepted prompt exists (turn record durable) but the
+    /// run linkage and the receipt are not. Recovery rebuilds the receipt
+    /// from the facts and the retry replays it byte-for-byte.
+    #[tokio::test]
+    async fn prompt_crash_after_accepted_prompt_before_receipt_replays_from_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-crash-accepted");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let prompt = "crash matrix prompt";
+        let digest = prompt_admission_digest(sid, prompt, &[]);
+        let op = state.deps.session.try_next_op_id().unwrap();
+        let reservation = format!("tx-{:016x}", op.raw());
+        assert!(state
+            .deps
+            .session
+            .store()
+            .prompt_admission_claim(sid, PROMPT_KEY, &digest, &reservation, handle.now_ms())
+            .unwrap()
+            .is_fresh());
+        let submitted = handle
+            .submit_prompt_with_op_id(prompt, &[], Some(op))
+            .unwrap();
+        let expected = prompt_receipt_json(&PromptReceipt {
+            run_id: reservation,
+            op_id: op,
+            queued: submitted.queued,
+            accepted: true,
+        });
+        drop(state);
+
+        let state = reopen_state(dir.path());
+        let summary = crate::native::recover_pending_admissions(&state.deps.session);
+        assert_eq!(summary.replayed, 1, "{summary:?}");
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, prompt)).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(
+            text, expected,
+            "the receipt is rebuilt byte-for-byte from the durable turn facts"
+        );
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(user_message_count(&handle), 1, "no second prompt row");
+        assert_eq!(prompt_received_count(&handle), 1);
+    }
+
+    /// Boundary 5: full durable acceptance (prompt, turn, run linkage) before
+    /// the receipt completion transaction. Boot recovery completes the receipt
+    /// from the facts; the retry replays it and admits no second prompt.
+    #[tokio::test]
+    async fn prompt_crash_after_full_acceptance_before_receipt_completes_from_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid, body) =
+            prompt_crash_and_reopen(&dir, "prompt_admission_complete_precommit", 0).await;
+        let (status, text) = prompt_call(&state, sid, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(prompt_received_count(&handle), 1);
+        assert_eq!(user_message_count(&handle), 1);
+        let receipt: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(receipt["accepted"], serde_json::json!(true), "{text}");
+        let run_id = receipt["run_id"].as_str().expect("run id").to_string();
+        assert_eq!(
+            run_id,
+            format!(
+                "tx-{:016x}",
+                receipt["op_id"]
+                    .as_str()
+                    .expect("op id")
+                    .parse::<u64>()
+                    .unwrap()
+            ),
+            "the recovered run id names the reserved turn: {text}"
+        );
+    }
+
+    /// Boundary 6: the receipt completed but the owner died before the HTTP
+    /// response. The retry replays the EXACT stored bytes with zero writes.
+    #[tokio::test]
+    async fn prompt_crash_after_receipt_completion_replays_stored_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid, body) =
+            prompt_crash_and_reopen(&dir, "prompt_admission_complete_committed", 0).await;
+        // The durable receipt is the answer the retry must return exactly.
+        let digest = prompt_admission_digest(sid, "crash matrix prompt", &[]);
+        let stored = match state
+            .deps
+            .session
+            .store()
+            .prompt_admission_claim(sid, PROMPT_KEY, &digest, "tx-probe", 0)
+        {
+            Ok(PromptAdmissionClaim::Complete(receipt)) => receipt,
+            other => panic!("the completed row must replay: {other:?}"),
+        };
+        let (status, text) = prompt_call(&state, sid, body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(
+            text, stored,
+            "the replay is the stored receipt byte-for-byte"
+        );
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(prompt_received_count(&handle), 1);
+        assert_eq!(user_message_count(&handle), 1);
+    }
+
+    /// An unlinkable pending prompt row (no recognizable reservation) is
+    /// never guessed at: recovery lands the typed conflict and the retry
+    /// never executes.
+    #[tokio::test]
+    async fn prompt_unlinkable_pending_row_lands_typed_conflict_and_never_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-legacy");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let digest = prompt_admission_digest(sid, "crash matrix prompt", &[]);
+        assert!(state
+            .deps
+            .session
+            .store()
+            .prompt_admission_claim(
+                sid,
+                PROMPT_KEY,
+                &digest,
+                "not-a-reservation",
+                handle.now_ms()
+            )
+            .unwrap()
+            .is_fresh());
+        drop(state);
+        let state = reopen_state(dir.path());
+        let summary = crate::native::recover_pending_admissions(&state.deps.session);
+        assert_eq!(summary.conflicts, 1, "{summary:?}");
+        let (status, text) = prompt_call(
+            &state,
+            sid,
+            prompt_body(sid, PROMPT_KEY, "crash matrix prompt"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        assert!(!text.contains("in flight"), "{text}");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        assert_eq!(prompt_received_count(&handle), 0);
+        assert_eq!(user_message_count(&handle), 0);
+    }
+
+    // ------------------------------------------- SessionStart lifecycle hook
+
+    /// One test AppState over deps whose agent carries an explicit hook
+    /// registry (the SAME `AgentDeps.hooks` field the production daemon's
+    /// `FAKTOR_HOOKS` registry occupies).
+    #[cfg(unix)]
+    fn hooked_state(
+        root: &std::path::Path,
+        specs: Vec<faktor_hooks::HookSpec>,
+    ) -> (AppState, Arc<faktor_hooks::HookRegistry>) {
+        let hooks = Arc::new(
+            faktor_hooks::HookRegistry::try_new().expect("standalone hook registry for tests"),
+        );
+        for spec in specs {
+            hooks.register(spec).unwrap();
+        }
+        let deps = crate::api::tests::test_deps_with_hooks(root, vec![], Some(hooks.clone()));
+        let state = AppState {
+            deps: Arc::new(deps),
+            auth: Arc::new(std::sync::RwLock::new(None)),
+            terminal_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            next_terminal_event_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (state, hooks)
+    }
+
+    /// The exact spec shape `FAKTOR_HOOKS=session_start:<script>` produces.
+    #[cfg(unix)]
+    fn session_start_spec(
+        id: &str,
+        script: String,
+        deadline_ms: u64,
+        failure_policy: faktor_hooks::FailurePolicy,
+    ) -> faktor_hooks::HookSpec {
+        faktor_hooks::HookSpec {
+            id: id.into(),
+            events: vec![faktor_hooks::HookEvent::SessionStart],
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env_allowlist: true,
+            deadline_ms,
+            failure_policy,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    async fn create_session_call(state: &AppState, title: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = authed_headers(state);
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let response = super::native_create_session(
+            State(state.clone()),
+            headers,
+            Ok(Json(NativeCreateSessionRequest {
+                provider: "fake".into(),
+                model: "m".into(),
+                workspace: Some("/tmp".into()),
+                title: Some(title.into()),
+            })),
+        )
+        .await;
+        json_body(response).await
+    }
+
+    /// The native `POST /native/session` path fires SessionStart through the
+    /// agent's hook registry exactly once, after the durable session exists,
+    /// with the created session id — the SAME ordering as the ACP daemon
+    /// entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_create_session_fires_session_start_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("native-session-start.log");
+        let script = format!("echo \"$FAKTOR_HOOK_INPUT\" >> '{}'", marker.display());
+        let (state, hooks) = hooked_state(
+            dir.path(),
+            vec![session_start_spec(
+                "env-0",
+                script,
+                5000,
+                faktor_hooks::FailurePolicy::FailClosed,
+            )],
+        );
+        let (status, body) = create_session_call(&state, "hooked").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sid = body["id"].as_str().expect("session id").to_string();
+        assert!(
+            state
+                .deps
+                .session
+                .get_session(faktor_core::id::SessionId::new(sid.parse().unwrap()))
+                .unwrap()
+                .is_some(),
+            "the hook fired after the durable row existed"
+        );
+        let log = std::fs::read_to_string(&marker).unwrap();
+        let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "the hook runs exactly once: {log}");
+        assert!(
+            lines[0].contains(&format!("\"session_id\":\"{sid}\"")),
+            "the payload names the created session: {log}"
+        );
+        assert!(lines[0].contains("\"event\":\"session_start\""), "{log}");
+        let audit = hooks.audit();
+        assert_eq!(audit.len(), 1, "exactly one audit record");
+        assert_eq!(audit[0].hook_id, "env-0");
+        assert_eq!(audit[0].event, faktor_hooks::HookEvent::SessionStart);
+        assert_eq!(audit[0].exit_code, Some(0));
+    }
+
+    /// A failing or hanging SessionStart hook is bounded by its registry
+    /// deadline and can NEVER fail (or unboundedly stall) session creation:
+    /// the route answers 200 and the durable row exists in both cases.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_create_session_survives_a_failing_or_hanging_hook() {
+        for (id, script, deadline_ms) in [
+            ("fail", "exit 3".to_string(), 2000u64),
+            ("hang", "sleep 30".to_string(), 250u64),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, hooks) = hooked_state(
+                dir.path(),
+                vec![session_start_spec(
+                    id,
+                    script,
+                    deadline_ms,
+                    faktor_hooks::FailurePolicy::FailClosed,
+                )],
+            );
+            let t0 = std::time::Instant::now();
+            let (status, body) = create_session_call(&state, id).await;
+            assert_eq!(status, StatusCode::OK, "{id}: {body}");
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(8),
+                "{id}: the hook deadline must bound session creation"
+            );
+            let sid = body["id"].as_str().expect("session id").parse().unwrap();
+            assert!(
+                state
+                    .deps
+                    .session
+                    .get_session(faktor_core::id::SessionId::new(sid))
+                    .unwrap()
+                    .is_some(),
+                "{id}: the durable session exists"
+            );
+            let audit = hooks.audit();
+            assert_eq!(audit.len(), 1, "{id}: exactly one audit record");
+            assert_eq!(
+                audit[0].verdict, "deny",
+                "{id}: a fail-closed hook outcome is audit-only"
+            );
+        }
     }
 }

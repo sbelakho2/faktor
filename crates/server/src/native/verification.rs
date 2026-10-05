@@ -26,10 +26,25 @@ pub(crate) fn native_verification_facts(
         .filter(|(kind, _, _)| kind == "verification")
         .take(MAX_NATIVE_LIST)
         .map(|(_, key, value)| {
+            // Project the FACT's own status instead of a constant: a
+            // completed no-op turn used to be reported as `failed` while its
+            // detail said `pending`/`unavailable`.
+            // Facts are stored as JSON text: project the embedded status.
+            let status = serde_json::from_str::<serde_json::Value>(value.as_str())
+                .ok()
+                .and_then(|parsed| {
+                    parsed
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                })
+                // A non-JSON fact is the historical `failed:<check>` record:
+                // it IS a failure, never `unknown`.
+                .unwrap_or_else(|| "failed".into());
             serde_json::json!({
                 "id": key,
                 "detail": value,
-                "status": "failed",
+                "status": status,
             })
         })
         .collect()

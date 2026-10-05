@@ -253,6 +253,7 @@ impl SupervisorColdCommandRunner {
             capture: true,
             artifact_max: COLD_MAX_TRACKED_BYTES as usize,
             network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+            filesystem_isolation: faktor_terminal::FilesystemIsolation::Inherit,
         };
         let out = self
             .supervisor

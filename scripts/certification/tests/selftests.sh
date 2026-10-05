@@ -19,6 +19,9 @@
 #   scripts/check-gradle-integrity.sh       planted tampering + temp-name migration
 #   scripts/check-ci-image-pins.sh          image pins + apt-snapshot/apt-pinned audit
 #   scripts/build-ci-image.sh --selftest    Faktor CI image pin hygiene
+#   scripts/certification/soak-convergence.py selftest
+#                                           soak convergence metric algebra
+#                                           (converged/leaky/missing/duration)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -46,6 +49,7 @@ run "cross-target-check.sh classify selftest" env CROSS_TARGET_SELFTEST=classify
 run "check-gradle-integrity.sh --selftest" bash scripts/check-gradle-integrity.sh --selftest
 run "check-ci-image-pins.sh --selftest" sh scripts/check-ci-image-pins.sh --selftest
 run "build-ci-image.sh --selftest" bash scripts/build-ci-image.sh --selftest
+run "soak-convergence.py selftest" python3 scripts/certification/soak-convergence.py selftest
 
 printf '\n=====================\n'
 if [ "$failures" -eq 0 ]; then

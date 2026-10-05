@@ -134,6 +134,11 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
     }
 
     /** Selects one ref and immediately retrieves it (one-click from the tree). */
+    /**
+     * Swing-only selection: mutates the list/output and NEVER performs a
+     * request. The caller retrieves on its worker (selecting used to invoke
+     * retrieve() from off the EDT on the tree-evidence path).
+     */
     fun selectEvidence(ref: EvidenceRef) {
         for (i in 0 until evidenceModel.size()) {
             if (evidenceModel.getElementAt(i) == ref) {
@@ -146,7 +151,6 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
             return
         }
         modeBox.selectedItem = "all"
-        retrieve()
     }
 
     fun showRetrieval(evidenceId: Long, text: String, byteLen: Long, truncated: Boolean) {
@@ -156,6 +160,17 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
 
     fun showError(evidenceId: Long, message: String) {
         output.text = "evidence $evidenceId: $message"
+    }
+
+    /**
+     * Clears every per-session content pane on a session switch: a stale
+     * evidence list, retrieval output or child transcript must never remain
+     * visible (or be applied by a late worker) under a new session.
+     */
+    fun resetSessionView() {
+        evidenceModel.clear()
+        output.text = ""
+        transcriptArea.text = ""
     }
 
     fun showTranscriptSlice(title: String, text: String) {

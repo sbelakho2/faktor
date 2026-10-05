@@ -35,6 +35,8 @@ pub struct Config {
     /// The additive `[efficiency]` section (audit 86 + the efficiency-variant
     /// production flags): five boolean feature switches, ALL default `false`.
     pub efficiency: EfficiencyCfg,
+    /// The additive `[retry]` section: daemon provider-call retries.
+    pub retry: RetryCfg,
     /// The additive `[embeddings]` section: the semantic embedding provider
     /// selection (model + provider + policy) wired into the search seam.
     /// Absent = no embedder: retrieval stays lexical/symbol-only and
@@ -92,6 +94,67 @@ pub struct Config {
 
 pub(crate) fn default_config_version() -> u32 {
     1
+}
+
+/// The additive `[retry]` section: bounded, class-aware retries for provider
+/// calls. The CORE default (`max_attempts: 1`) stays untouched for library
+/// uses; the DAEMON defaults to three attempts with rate-limit-class
+/// retries so a transient 429/5xx does not fail an entire turn on the first
+/// try (the retry site is still state-aware: a request that journaled
+/// anything durable is never replayed).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetryCfg {
+    /// Total attempts (1 = no retry). Bounded to 1..=8.
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    /// Jitter fraction in [0.0, 1.0].
+    pub jitter: f64,
+    pub class: faktor_core::retry::RetryClass,
+}
+
+impl Default for RetryCfg {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 250,
+            max_delay_ms: 5_000,
+            jitter: 0.2,
+            class: faktor_core::retry::RetryClass::RateLimited,
+        }
+    }
+}
+
+impl RetryCfg {
+    pub fn to_policy(&self) -> faktor_core::retry::RetryPolicy {
+        faktor_core::retry::RetryPolicy {
+            max_attempts: self.max_attempts.clamp(1, 8),
+            base_delay_ms: self.base_delay_ms,
+            max_delay_ms: self.max_delay_ms.max(self.base_delay_ms).max(1),
+            jitter: self.jitter.clamp(0.0, 1.0),
+            class: self.class,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_attempts == 0 || self.max_attempts > 8 {
+            return Err(format!(
+                "retry.max_attempts must be 1..=8 (got {})",
+                self.max_attempts
+            ));
+        }
+        if self.base_delay_ms == 0 || self.base_delay_ms > 60_000 {
+            return Err("retry.base_delay_ms must be 1..=60000".into());
+        }
+        if self.max_delay_ms < self.base_delay_ms || self.max_delay_ms > 120_000 {
+            return Err("retry.max_delay_ms must be >= base_delay_ms and <= 120000".into());
+        }
+        if !(0.0..=1.0).contains(&self.jitter) {
+            return Err("retry.jitter must be within 0.0..=1.0".into());
+        }
+        Ok(())
+    }
 }
 
 impl Config {
@@ -189,6 +252,10 @@ impl Config {
     /// override tables on local runtimes).
     pub fn validate(&self) -> Result<(), String> {
         self.mcp_servers()?;
+        if self.model.trim().is_empty() {
+            return Err("model must not be empty".into());
+        }
+        self.retry.validate()?;
         let sandbox = self
             .sandbox_policy()
             .map_err(|e| format!("sandbox config: {e}"))?;

@@ -2360,6 +2360,13 @@ impl AgentRuntime {
             return;
         }
         if let Err(err) = handle.abort(op_id) {
+            if matches!(err.kind, faktor_core::ErrorKind::NotFound) {
+                // The op was already settled (an abort racing its own
+                // completion): nothing durable is missing, so this is NOT a
+                // crash marker.
+                tracing::debug!(site, "abort target already settled");
+                return;
+            }
             self.record_durable_write_failure(handle, site, &intent, &err);
         }
     }

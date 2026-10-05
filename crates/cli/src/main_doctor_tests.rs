@@ -1330,6 +1330,101 @@ fn doctor_deep_flags_active_turn_without_recoverable_owner() {
     );
 }
 
+/// Three durable wedges that used to be reported as "all checks passed":
+/// (1) an op-active session with an active turn record and no drive at all,
+/// (2) a pending permission whose waiter lived only in a dead process, and
+/// (3) an applied workspace write with no verification/integration record.
+/// Each must appear as a typed issue line and make `doctor --deep` fail.
+#[test]
+fn doctor_deep_flags_wedged_sessions_and_fails_nonzero() {
+    use faktor_core::capability::Capability;
+    use faktor_core::event::EventKind;
+    use faktor_core::state::AgentState;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let m =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        // (1) admitted into Preparing, then never driven: active record, no
+        // queue row, no permission, no running tool run.
+        let ws1 = m.create_workspace("/wedge-ws-1").unwrap();
+        let s1 = m.create_session(ws1, "no-drive", "p", "m").unwrap();
+        s1.submit_prompt("never driven", &[]).unwrap();
+
+        // (2) parked on a permission request: pending row, no live waiter.
+        let ws2 = m.create_workspace("/wedge-ws-2").unwrap();
+        let s2 = m
+            .create_session(ws2, "orphan-permission", "p", "m")
+            .unwrap();
+        let receipt = s2.submit_prompt("park", &[]).unwrap();
+        for (kind, state) in [
+            (EventKind::ContextPrepared, AgentState::BuildingContext),
+            (EventKind::ModelStarted, AgentState::WaitingForModel),
+            (EventKind::ModelChunkReceived, AgentState::Streaming),
+        ] {
+            s2.append_event(kind, state, None, None).unwrap();
+        }
+        s2.request_permission(
+            receipt.op_id,
+            &Capability::ReadWorkspace {
+                path: "/wedge-ws-2/a".into(),
+            },
+        )
+        .unwrap();
+
+        // (3) an applied workspace write (durable postcondition) on a
+        // session with no task verification and no integration record.
+        let ws3 = m.create_workspace("/wedge-ws-3").unwrap();
+        let s3 = m.create_session(ws3, "applied", "p", "m").unwrap();
+        let op = m.try_next_op_id().unwrap();
+        m.store()
+            .start_tool_run(
+                s3.id(),
+                op,
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "x"}),
+                serde_json::json!({"strategy": "mark_unknown"}),
+                None,
+                None,
+            )
+            .unwrap();
+        m.store()
+            .record_tool_postcondition(
+                s3.id(),
+                op,
+                &serde_json::json!({
+                    "workspace_id": 1,
+                    "worktree_id": 1,
+                    "relative_path": "a.txt",
+                    "expected_hash": "ab".repeat(32),
+                }),
+            )
+            .unwrap();
+        m.store()
+            .finish_tool_run(s3.id(), op, "completed", "applied")
+            .unwrap();
+    }
+
+    let report = doctor_run(dir.path(), true);
+    let text = report.lines.join("\n");
+    for kind in [
+        "active_turn_without_drive",
+        "ownerless_pending_permission",
+        "applied_run_without_verification",
+    ] {
+        assert!(
+            text.contains(&format!("session wedge [{kind}]")),
+            "missing typed issue {kind} in:\n{text}"
+        );
+    }
+    assert!(text.contains("session wedges:"), "{text}");
+    assert!(
+        report.issues >= 3,
+        "wedged sessions must fail doctor --deep: issues={} lines:\n{text}",
+        report.issues
+    );
+}
+
 #[test]
 fn doctor_deep_flags_orphan_child_rows_and_a_missing_worktree_dir() {
     // Three orphan-child corruptions: an unparseable registry row, a

@@ -158,7 +158,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
             detail.text = if (model.size() == 0) "no pending permission requests" else "select a request"
         } else {
             detail.text = "#${permission.id}\nsession: ${permission.sessionId}" +
-                "\ncapability: ${permission.capability}\ndetail: ${permission.detail}"
+                "\ncapability: ${permission.capability}\ndetail: ${bound(permission.detail, 240)}"
         }
         updateButtons()
     }

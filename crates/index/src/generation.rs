@@ -183,7 +183,7 @@ impl GenerationFile {
                         symbol: symbol.clone(),
                     })
                     .collect();
-                list.sort_by(|a, b| a.path.cmp(&b.path).then(a.symbol.line.cmp(&b.symbol.line)));
+                list.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.symbol.cmp(&b.symbol)));
                 symbols.insert(name.clone(), list);
             }
         }
