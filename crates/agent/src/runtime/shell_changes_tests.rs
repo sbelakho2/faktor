@@ -17,6 +17,7 @@ use faktor_core::id::OpId;
 use faktor_core::resource::ResourceClass;
 use faktor_core::time::{Deadline, SystemClock};
 use faktor_core::WorkspaceIdentity;
+use faktor_fs::WorkspaceHandle;
 use faktor_session::SessionManager;
 use faktor_terminal::{EnvSpec, NetworkIsolation, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
@@ -621,4 +622,115 @@ fn shell_change_facts_distinguish_settled_from_unresolved() {
     let (paths, unresolved) = shell_change_facts(&handle, turn);
     assert!(!unresolved);
     assert_eq!(paths, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+}
+
+/// P1-SHELL: VCS metadata and Faktor tool state live in trees the canonical
+/// manifest skips, but their AUTHORITY subset must still be attributed: a
+/// shell that rewrites .git/HEAD (branch), the index, refs or .faktor state
+/// produces real change rows even though no manifest entry moved.
+#[test]
+fn authority_state_mutations_are_attributed_even_in_ignored_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+    std::fs::create_dir_all(root.join(".faktor")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(root.join(".git/index"), b"index-v1").unwrap();
+    std::fs::write(
+        root.join(".git/refs/heads/main"),
+        "1111111111111111111111111111111111111111\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".faktor/state.json"), b"{\"phase\":1}").unwrap();
+    let ws =
+        WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(1), root.clone()).unwrap();
+    let before = capture_authority_state(&ws);
+    assert!(before.contains_key(".git/HEAD"));
+    assert!(before.contains_key(".git/index"));
+    assert!(before.contains_key(".git/refs/heads/main"));
+    assert!(before.contains_key(".faktor/state.json"));
+
+    // A shell rewrites the branch, stages something (index changed), adds a
+    // ref, and mutates Faktor state; also creates an ignored-tree file that
+    // is NOT authority-relevant and must not appear.
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/evil\n").unwrap();
+    std::fs::write(root.join(".git/index"), b"index-v2-longer").unwrap();
+    std::fs::write(
+        root.join(".git/refs/heads/evil"),
+        "2222222222222222222222222222222222222222\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".faktor/state.json"), b"{\"phase\":2}").unwrap();
+    std::fs::write(root.join(".git/COMMIT_EDITMSG"), b"staged\n").unwrap();
+
+    let after = capture_authority_state(&ws);
+    let changes = diff_authority(&before, &after);
+    let find = |path: &str| changes.iter().find(|change| change.path == path);
+    assert_eq!(
+        find(".git/HEAD").expect("HEAD changed").status,
+        ShellChangeStatus::Modified
+    );
+    assert_eq!(
+        find(".git/index").expect("index changed").status,
+        ShellChangeStatus::Modified
+    );
+    assert_eq!(
+        find(".git/refs/heads/evil").expect("new ref").status,
+        ShellChangeStatus::Added
+    );
+    assert_eq!(
+        find(".faktor/state.json").expect("state changed").status,
+        ShellChangeStatus::Modified
+    );
+    assert_eq!(
+        find(".git/COMMIT_EDITMSG").expect("appeared").status,
+        ShellChangeStatus::Added
+    );
+
+    // Deletion is attributed too.
+    std::fs::remove_file(root.join(".git/refs/heads/evil")).unwrap();
+    let after_delete = capture_authority_state(&ws);
+    let changes = diff_authority(&after, &after_delete);
+    assert_eq!(
+        changes
+            .iter()
+            .find(|change| change.path == ".git/refs/heads/evil")
+            .expect("ref deleted")
+            .status,
+        ShellChangeStatus::Deleted
+    );
+}
+
+/// The authority map skips build/dependency trees by the documented contract
+/// (derived, regenerable state), and a symlinked authority file is recorded
+/// as `symlink`, never followed.
+#[test]
+fn authority_probe_skips_derived_trees_and_never_follows_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    std::fs::create_dir_all(root.join("target/debug")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(root.join("node_modules/pkg/x.js"), b"ignored").unwrap();
+    std::fs::write(root.join("target/debug/x"), b"ignored").unwrap();
+    std::os::unix::fs::symlink(root.join(".git/HEAD"), root.join(".faktor-link")).ok();
+    let ws =
+        WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(2), root.clone()).unwrap();
+    let state = capture_authority_state(&ws);
+    assert!(state.contains_key(".git/HEAD"));
+    assert!(!state.keys().any(|key| key.starts_with("node_modules/")));
+    assert!(!state.keys().any(|key| key.starts_with("target/")));
+    // A .faktor directory entry that is a symlink is recorded as a marker,
+    // never dereferenced.
+    std::fs::create_dir_all(root.join(".faktor")).unwrap();
+    std::fs::write(root.join(".faktor/real.json"), b"x").unwrap();
+    std::fs::remove_file(root.join(".faktor-link")).ok();
+    std::os::unix::fs::symlink(root.join(".git/HEAD"), root.join(".faktor/link")).unwrap();
+    let state = capture_authority_state(&ws);
+    assert_eq!(
+        state.get(".faktor/link").map(String::as_str),
+        Some("symlink")
+    );
+    assert!(state.contains_key(".faktor/real.json"));
 }

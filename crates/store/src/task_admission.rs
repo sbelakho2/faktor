@@ -306,19 +306,27 @@ impl Store {
             }
             let outcome = match state.as_str() {
                 "pending" => {
-                    let stale = PendingAdmission {
-                        key: key.clone(),
-                        session_id,
-                        request_digest: stored_digest,
-                        reservation: stored_reservation,
-                        owner_generation,
-                        lease_deadline_ms: lease_deadline,
-                        created_ms,
-                    };
-                    if stale.is_live_for(&generation, now) {
-                        TaskAdmissionClaim::InFlight
+                    // DIGEST FIRST (idempotency contract): a key reused with
+                    // different bytes is the typed KeyReused regardless of
+                    // lease state; only a byte-identical claim may answer
+                    // InFlight (live) or Stale (recovery-reclaimable).
+                    if stored_digest != request_digest {
+                        TaskAdmissionClaim::KeyReused { stored_digest }
                     } else {
-                        TaskAdmissionClaim::Stale(stale)
+                        let stale = PendingAdmission {
+                            key: key.clone(),
+                            session_id,
+                            request_digest: stored_digest,
+                            reservation: stored_reservation,
+                            owner_generation,
+                            lease_deadline_ms: lease_deadline,
+                            created_ms,
+                        };
+                        if stale.is_live_for(&generation, now) {
+                            TaskAdmissionClaim::InFlight
+                        } else {
+                            TaskAdmissionClaim::Stale(stale)
+                        }
                     }
                 }
                 "complete" => {
@@ -412,6 +420,10 @@ impl Store {
         }
         match state.as_str() {
             "pending" => {
+                // Same digest-first contract as `task_admission_claim`.
+                if stored_digest != request_digest {
+                    return Ok(Some(TaskAdmissionClaim::KeyReused { stored_digest }));
+                }
                 let stale = PendingAdmission {
                     key: key.to_owned(),
                     session_id,
@@ -732,23 +744,45 @@ mod task_admission_tests {
     }
 
     #[test]
-    fn same_key_with_a_different_digest_is_in_flight_while_live_then_key_reused() {
+    fn same_key_with_a_different_digest_is_key_reused_in_every_pending_state() {
         let dir = tempfile::tempdir().unwrap();
         let (store, sid) = store_with_session(&dir);
         store
             .task_admission_claim(sid, KEY, DIGEST, RES, 1)
             .unwrap();
-        // Pending live: a different digest is still the SAME in-flight
-        // logical start (the pending winner owns the key).
+        let reused = TaskAdmissionClaim::KeyReused {
+            stored_digest: DIGEST.to_string(),
+        };
+        // Pending (live) + different bytes: KeyReused, never InFlight.
         assert_eq!(
             store
                 .task_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000002", 2)
+                .unwrap(),
+            reused
+        );
+        // Pending (expired lease) + different bytes: still KeyReused.
+        assert_eq!(
+            store
+                .task_admission_claim(
+                    sid,
+                    KEY,
+                    OTHER_DIGEST,
+                    "tx-0000000000000003",
+                    ADMISSION_LEASE_MS
+                )
+                .unwrap(),
+            reused
+        );
+        // Identical bytes remain InFlight while live.
+        assert_eq!(
+            store
+                .task_admission_claim(sid, KEY, DIGEST, "tx-0000000000000004", 2)
                 .unwrap(),
             TaskAdmissionClaim::InFlight
         );
         store.task_admission_complete(sid, KEY, RES, "{}").unwrap();
         let claim = store
-            .task_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000003", 3)
+            .task_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000005", 3)
             .unwrap();
         assert_eq!(
             claim,
@@ -1011,6 +1045,85 @@ mod task_admission_tests {
             Some(TaskAdmissionClaim::KeyReused {
                 stored_digest: DIGEST.to_string()
             })
+        );
+    }
+
+    #[test]
+    fn pending_key_digest_mismatch_is_key_reused_not_in_flight_or_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, sid) = store_with_session(&dir);
+        store
+            .task_admission_claim(sid, KEY, DIGEST, RES, 0)
+            .unwrap();
+        let reused = TaskAdmissionClaim::KeyReused {
+            stored_digest: DIGEST.to_string(),
+        };
+        // Live + different bytes: KeyReused on BOTH entry points.
+        assert_eq!(
+            store
+                .task_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000009", 1)
+                .unwrap(),
+            reused
+        );
+        assert_eq!(
+            store
+                .task_admission_peek(sid, KEY, OTHER_DIGEST, 1)
+                .unwrap(),
+            Some(reused.clone())
+        );
+        // Live + identical: InFlight on both.
+        assert_eq!(
+            store
+                .task_admission_claim(sid, KEY, DIGEST, "tx-000000000000000a", 1)
+                .unwrap(),
+            TaskAdmissionClaim::InFlight
+        );
+        assert_eq!(
+            store.task_admission_peek(sid, KEY, DIGEST, 1).unwrap(),
+            Some(TaskAdmissionClaim::InFlight)
+        );
+        // Stale (lease deadline reached) + identical: Stale on both.
+        let expired = ADMISSION_LEASE_MS;
+        assert!(matches!(
+            store
+                .task_admission_claim(sid, KEY, DIGEST, "tx-000000000000000b", expired)
+                .unwrap(),
+            TaskAdmissionClaim::Stale(_)
+        ));
+        assert!(matches!(
+            store
+                .task_admission_peek(sid, KEY, DIGEST, expired)
+                .unwrap(),
+            Some(TaskAdmissionClaim::Stale(_))
+        ));
+        // Stale + different bytes: still KeyReused, never Stale.
+        assert_eq!(
+            store
+                .task_admission_claim(sid, KEY, OTHER_DIGEST, "tx-000000000000000c", expired)
+                .unwrap(),
+            reused
+        );
+        assert_eq!(
+            store
+                .task_admission_peek(sid, KEY, OTHER_DIGEST, expired)
+                .unwrap(),
+            Some(reused.clone())
+        );
+        // Complete + same: byte-exact replay; + different: KeyReused.
+        store
+            .task_admission_complete(sid, KEY, RES, "receipt")
+            .unwrap();
+        assert_eq!(
+            store
+                .task_admission_claim(sid, KEY, DIGEST, "tx-000000000000000d", expired + 1)
+                .unwrap(),
+            TaskAdmissionClaim::Complete("receipt".to_string())
+        );
+        assert_eq!(
+            store
+                .task_admission_claim(sid, KEY, OTHER_DIGEST, "tx-000000000000000e", expired + 1)
+                .unwrap(),
+            reused
         );
     }
 

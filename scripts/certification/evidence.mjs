@@ -983,6 +983,14 @@ function markerProblems(record, options) {
   }
   const authVerdict = markerAuthVerdict(record, token, label);
   problems.push(...authVerdict.problems);
+  // P0-CERT: the lane must have executed the COMMITTED bytes. A dirty tracked
+  // working tree (or a marker predating the clean-field contract) means the
+  // recorded commit/tree is not what ran, so the marker cannot certify.
+  if (record.clean !== true) {
+    problems.push(
+      `dirty-checkout: ${label} ran with tracked working-tree modifications (or lacks the clean-field contract); ensure the lane starts from the committed checkout`,
+    );
+  }
   const status = String(record.status);
   if (status === 'skipped') {
     if (!expected.skippable) {

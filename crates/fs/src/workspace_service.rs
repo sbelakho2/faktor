@@ -9,6 +9,114 @@ use super::*;
 /// base), so a candidate id can never collide with a real workspace row.
 pub(crate) const EPHEMERAL_WORKSPACE_ID_BASE: u64 = 1 << 63;
 
+/// How many registrations may wait behind the singleton worker. Once full,
+/// further registrations degrade immediately instead of allocating anything.
+const WATCH_REGISTRATION_QUEUE_DEPTH: usize = 2;
+
+/// Outcome of one bounded watcher registration (P2-FS).
+enum WatchRegistrationOutcome {
+    /// Watcher attached; the handle owns it.
+    Registered(RecommendedWatcher),
+    /// The backend refused registration (fatal, as before).
+    Failed(String),
+    /// Deadline elapsed / queue full / worker gone: open WITHOUT a watcher
+    /// (fingerprint reconciliation only). The singleton worker may still be
+    /// wedged on a pathological root, but no per-root thread can accumulate.
+    Degraded,
+}
+
+struct WatchRegistrationRequest {
+    watcher: RecommendedWatcher,
+    root: PathBuf,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    reply: std::sync::mpsc::SyncSender<(RecommendedWatcher, notify::Result<()>)>,
+}
+
+/// The ONE watcher-registration worker (P2-FS). `notify`'s recursive watch
+/// walks the tree inside the calling thread and offers no cancellation, so a
+/// per-registration helper thread would accumulate one permanently blocked
+/// thread per timed-out pathological root. Registrations are therefore
+/// serialized through this bounded-queue singleton: the number of live
+/// registration threads is at most one no matter how many roots time out.
+static WATCH_REGISTRATION_QUEUE: std::sync::OnceLock<
+    std::sync::mpsc::SyncSender<WatchRegistrationRequest>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static WATCH_REGISTRATION_WORKER_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn watch_registration_worker_spawns() -> usize {
+    WATCH_REGISTRATION_WORKER_SPAWNS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn watcher_registration_queue() -> &'static std::sync::mpsc::SyncSender<WatchRegistrationRequest> {
+    WATCH_REGISTRATION_QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WatchRegistrationRequest>(
+            WATCH_REGISTRATION_QUEUE_DEPTH,
+        );
+        #[cfg(test)]
+        WATCH_REGISTRATION_WORKER_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::thread::Builder::new()
+            .name("faktor-watch-registration".into())
+            .spawn(move || {
+                while let Ok(request) = rx.recv() {
+                    if request.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        // The caller already degraded: drop its watcher now.
+                        continue;
+                    }
+                    let mut watcher = request.watcher;
+                    let result = watcher.watch(&request.root, RecursiveMode::Recursive);
+                    // A timed-out caller is gone: the send fails and the
+                    // watcher is dropped with the message.
+                    let _ = request.reply.send((watcher, result));
+                }
+            });
+        tx
+    })
+}
+
+/// Register one recursive watcher under a wall deadline through the bounded
+/// singleton worker. Never blocks on a full queue and never spawns a thread
+/// per call.
+fn register_watch_bounded(
+    watcher: RecommendedWatcher,
+    root: PathBuf,
+    deadline: std::time::Duration,
+) -> WatchRegistrationOutcome {
+    use std::sync::atomic::Ordering;
+    let (reply, response) = std::sync::mpsc::sync_channel(1);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let request = WatchRegistrationRequest {
+        watcher,
+        root,
+        cancel: cancel.clone(),
+        reply,
+    };
+    match watcher_registration_queue().try_send(request) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_))
+        | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            cancel.store(true, Ordering::SeqCst);
+            return WatchRegistrationOutcome::Degraded;
+        }
+    }
+    match response.recv_timeout(deadline) {
+        Ok((watcher, Ok(()))) => WatchRegistrationOutcome::Registered(watcher),
+        Ok((_watcher, Err(e))) => {
+            WatchRegistrationOutcome::Failed(format!("watch registration failed: {e}"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // Cooperative cancellation: if the worker has not started the
+            // registration yet, it drops the watcher without walking.
+            cancel.store(true, Ordering::SeqCst);
+            WatchRegistrationOutcome::Degraded
+        }
+    }
+}
+
 /// Registry of open workspace ROOTS. A durable workspace id may be open at
 /// several roots at once: its real root and the live shadow root of an
 /// active shadow-mutation drive (the drive reads the world it mutates).
@@ -142,22 +250,19 @@ impl WorkspaceFileService {
             );
             None
         } else {
-            let watch_root = root.clone();
-            let registration = bounded_join(
-                "faktor-fs-watch-reg",
-                self.watch_registration_deadline,
-                move || {
-                    let mut watcher = watcher;
-                    let res = watcher.watch(&watch_root, RecursiveMode::Recursive);
-                    (watcher, res)
-                },
-            );
+            // P2-FS: registration runs through the bounded singleton worker
+            // (never a thread per timed-out root).
+            let registration =
+                register_watch_bounded(watcher, root.clone(), self.watch_registration_deadline);
             match registration {
-                Some((watcher, Ok(()))) => Some(watcher),
-                Some((_watcher, Err(e))) => {
-                    return Err(Error::internal(format!("watch {}: {e}", root.display())));
+                WatchRegistrationOutcome::Registered(watcher) => Some(watcher),
+                WatchRegistrationOutcome::Failed(reason) => {
+                    return Err(Error::internal(format!(
+                        "watch {}: {reason}",
+                        root.display()
+                    )));
                 }
-                None => {
+                WatchRegistrationOutcome::Degraded => {
                     tracing::warn!(
                         workspace = workspace_id.raw(),
                         root = %root.display(),

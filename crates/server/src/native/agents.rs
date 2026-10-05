@@ -866,7 +866,7 @@ pub(crate) fn native_agents_body(
         // State: the durable typed task row wins when terminal (wave-24) —
         // a cancelled/verified/failed run reads as such even though the
         // session itself is parked.
-        let run_state = in_session_run_state_tag(handle, &session_row);
+        let run_state = in_session_run_state_tag(handle, &session_row)?;
         push(serde_json::json!({
             "agent_id": key,
             "kind": "self",

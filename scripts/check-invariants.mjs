@@ -32,12 +32,15 @@
 // `mutation_command` and requires the planted violation to be detected; a
 // release-critical entry without one already fails before this mode runs.
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { dirname, join, relative, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execSync, spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const ISOLATION_EXCLUDES = new Set(['target', '.git', 'node_modules', '.idea']);
 const PLATFORMS = new Set(['linux', 'macos', 'windows']);
 const ID_RE = /^INV-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const FN_RE =
@@ -54,6 +57,104 @@ function argValue(args, name, fallback = '') {
   const value = args[idx + 1];
   if (value === undefined || value.startsWith('--')) return '';
   return value;
+}
+
+// ---------------------------------------------- campaign isolation + barrier
+//
+// P0-CERT: the mutation campaign must never edit the trusted source tree,
+// even transiently. Every planted edit and gate runs in an isolated copy
+// (FAKTOR_MUTATION_ROOT) with a dedicated CARGO_TARGET_DIR, while this
+// process continuously hashes the REAL checkout and fails if a single byte
+// changes during the campaign.
+
+function excludedUnder(root, path) {
+  const rel = relative(root, path);
+  if (rel === '') return false;
+  return rel.split(/[\\/]/).some((part) => ISOLATION_EXCLUDES.has(part));
+}
+
+function listTreeFiles(root) {
+  const files = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(dir).sort()) {
+      const path = join(dir, name);
+      const rel = relative(root, path);
+      if (rel.split(sep).some((part) => ISOLATION_EXCLUDES.has(part))) continue;
+      const stat = lstatSync(path);
+      if (stat.isDirectory()) walk(path);
+      else if (stat.isFile()) files.push(path);
+    }
+  };
+  walk(root);
+  files.sort();
+  return files;
+}
+
+/** Content digest of every source file (build/VCS/dependency trees excluded). */
+function treeContentDigest(root) {
+  const hash = createHash('sha256');
+  for (const file of listTreeFiles(root)) {
+    hash.update(relative(root, file).split(sep).join('/'));
+    hash.update('\0');
+    hash.update(readFileSync(file));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+/** Cheap continuous digest: path + size + mtime, no file contents. */
+function treeMetaDigest(root) {
+  const hash = createHash('sha256');
+  for (const file of listTreeFiles(root)) {
+    const stat = statSync(file);
+    hash.update(relative(root, file).split(sep).join('/'));
+    hash.update(`:${stat.size}:${stat.mtimeMs}`);
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+/** Null when the tracked tree is clean; else the failing git command. */
+function gitCleanProblem(root) {
+  for (const command of ['git diff --exit-code --quiet', 'git diff --cached --exit-code --quiet']) {
+    try {
+      execSync(command, { cwd: root, stdio: 'pipe' });
+    } catch {
+      return command;
+    }
+  }
+  return null;
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Continuous barrier child: appends a violation count file on exit. */
+function treeBarrier(args) {
+  const root = resolve(args[1]);
+  const baseline = args[2];
+  const out = args[3];
+  let violations = 0;
+  const timer = setInterval(() => {
+    try {
+      if (treeMetaDigest(root) !== baseline) violations += 1;
+    } catch {
+      violations += 1;
+    }
+  }, 200);
+  const finish = () => {
+    clearInterval(timer);
+    try {
+      writeFileSync(out, String(violations));
+    } catch {
+      // best effort: the parent fails closed when the file is absent
+    }
+    process.exit(0);
+  };
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    process.on(signal, finish);
+  }
 }
 
 // ------------------------------------------------------------------ parsing
@@ -550,25 +651,88 @@ function main() {
     // that plants the violation (and must exit non-zero), or carries an
     // explicit mutation_debt. This closes the audit's
     // "a normal drift check is not a mutation witness" gap.
+    //
+    // P0-CERT: the campaign may only run from a CLEAN committed checkout
+    // (git diff + diff --cached both empty), it runs every planted edit in an
+    // isolated copy, and a continuous barrier hashes the real checkout while
+    // it runs — any transient edit to the trusted tree fails the campaign.
+    const dirtyBefore = gitCleanProblem(root);
+    if (dirtyBefore !== null) {
+      console.error(
+        `check-invariants --mutations: FAIL — the trusted tree is dirty (\`${dirtyBefore}\`); the campaign may only run from the committed checkout`,
+      );
+      return 1;
+    }
+    const baselineMeta = treeMetaDigest(root);
+    const baselineContent = treeContentDigest(root);
+    const barrierDir = mkdtempSync(join(tmpdir(), 'faktor-tree-barrier-'));
+    const barrierOut = join(barrierDir, 'violations');
+    const hasher = spawn(
+      process.execPath,
+      [fileURLToPath(import.meta.url), '--tree-barrier', root, baselineMeta, barrierOut],
+      { stdio: 'ignore' },
+    );
+    const scratch = mkdtempSync(join(tmpdir(), 'faktor-mutation-campaign-'));
+    cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
+    const mutationEnv = {
+      ...process.env,
+      FAKTOR_MUTATION_ROOT: scratch,
+      CARGO_TARGET_DIR: join(root, 'target', 'mutation-campaign'),
+    };
     const missing = [];
     const undetected = [];
     let proven = 0;
-    for (const entry of entries) {
-      const command = typeof entry.mutation_command === 'string' ? entry.mutation_command.trim() : '';
-      if (command === '') {
-        if (typeof entry.mutation_debt !== 'string' || entry.mutation_debt.trim() === '') {
-          missing.push(entry.id);
+    try {
+      for (const entry of entries) {
+        const command = typeof entry.mutation_command === 'string' ? entry.mutation_command.trim() : '';
+        if (command === '') {
+          if (typeof entry.mutation_debt !== 'string' || entry.mutation_debt.trim() === '') {
+            missing.push(entry.id);
+          }
+          continue;
         }
-        continue;
+        // A mutation command exits 0 when its gate DETECTED the planted
+        // violation, and non-zero when the mutation slipped through. The
+        // command sees the isolated copy through FAKTOR_MUTATION_ROOT.
+        try {
+          execSync(command, { cwd: root, stdio: 'pipe', env: mutationEnv });
+          proven += 1;
+        } catch {
+          undetected.push(`${entry.id} (${command})`);
+        }
       }
-      // A mutation command exits 0 when its gate DETECTED the planted
-      // violation, and non-zero when the mutation slipped through.
-      try {
-        execSync(command, { cwd: root, stdio: 'pipe' });
-        proven += 1;
-      } catch {
-        undetected.push(`${entry.id} (${command})`);
+    } finally {
+      hasher.kill('SIGTERM');
+      const deadline = Date.now() + 5000;
+      while (!existsSync(barrierOut) && Date.now() < deadline) {
+        sleepSync(25);
       }
+      rmSync(scratch, { recursive: true, force: true });
+    }
+    let barrierViolations = null;
+    if (existsSync(barrierOut)) {
+      barrierViolations = Number(readFileSync(barrierOut, 'utf8'));
+      rmSync(barrierDir, { recursive: true, force: true });
+    }
+    const contentAfter = treeContentDigest(root);
+    const dirtyAfter = gitCleanProblem(root);
+    if (barrierViolations === null || Number.isNaN(barrierViolations) || barrierViolations > 0) {
+      console.error(
+        `check-invariants --mutations: FAIL — the tree barrier observed the trusted checkout change during the campaign (${barrierViolations} violation sample(s)); mutations must never touch the certifying tree`,
+      );
+      return 1;
+    }
+    if (contentAfter !== baselineContent) {
+      console.error(
+        'check-invariants --mutations: FAIL — the trusted checkout content changed during the campaign',
+      );
+      return 1;
+    }
+    if (dirtyAfter !== null) {
+      console.error(
+        `check-invariants --mutations: FAIL — the trusted tree is dirty after the campaign (\`${dirtyAfter}\`)`,
+      );
+      return 1;
     }
     if (missing.length > 0 || undetected.length > 0) {
       for (const id of missing) {
@@ -598,4 +762,11 @@ function main() {
   return 0;
 }
 
-process.exit(main());
+const entryArgs = process.argv.slice(2);
+if (entryArgs[0] === '--tree-barrier') {
+  // Internal mode: continuous checkout hasher for the mutation campaign. The
+  // parent terminates this process and reads its violation count.
+  treeBarrier(entryArgs);
+} else {
+  process.exit(main());
+}

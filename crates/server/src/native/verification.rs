@@ -16,12 +16,14 @@ pub(crate) const MAX_NATIVE_VERIFICATION: usize = 32;
 
 /// The durable verification facts of one session: memory facts of kind
 /// `verification` (the runtime records one per failed REQUIRED check with
-/// key = check id, value = "failed:<command>"). Bounded.
+/// key = check id, value = "failed:<command>"). Bounded. A durable read
+/// failure is LOUD (`Err`), never projected as an empty fact set — a
+/// corrupted ledger must not read as "nothing failed" on the proof surface.
 pub(crate) fn native_verification_facts(
     handle: &faktor_session::SessionHandle,
-) -> Vec<serde_json::Value> {
-    let facts = handle.memory_facts().unwrap_or_default();
-    facts
+) -> faktor_core::Result<Vec<serde_json::Value>> {
+    let facts = handle.memory_facts()?;
+    Ok(facts
         .iter()
         .filter(|(kind, _, _)| kind == "verification")
         .take(MAX_NATIVE_LIST)
@@ -47,7 +49,7 @@ pub(crate) fn native_verification_facts(
                 "status": status,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// `GET /native/session/{id}/verification` — everything the session owes
@@ -86,9 +88,13 @@ pub(crate) async fn native_session_verification(
             })
         })
         .collect();
+    let failed_checks = match native_verification_facts(&handle) {
+        Ok(f) => f,
+        Err(e) => return api_err(&e),
+    };
     Json(serde_json::json!({
         "owed": owed,
-        "failedChecks": native_verification_facts(&handle),
+        "failedChecks": failed_checks,
     }))
     .into_response()
 }

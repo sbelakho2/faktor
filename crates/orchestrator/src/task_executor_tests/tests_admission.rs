@@ -369,10 +369,16 @@ pub(crate) async fn a_pending_row_blocks_a_duplicate_start_without_touching_anyt
     let _heavy = heavy_guard();
     let dir = tempfile::tempdir().unwrap();
     let env = open_env(&dir.path().join("e"), done_script());
-    // A concurrent attempt already claimed the key (its digest does not
-    // matter: a pending row refuses EVERY duplicate). The claim is LIVE
-    // (current boot, unexpired lease) exactly as a concurrent attempt's
-    // would be.
+    let mut req = request(
+        "blocked duplicate",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    req.submission_id = Some(KEY_A.to_string());
+    // A concurrent attempt already claimed the key with the EXACT digest this
+    // request computes, and the claim is LIVE (current boot, unexpired
+    // lease). A byte-identical duplicate is the in-flight refusal.
+    let digest = crate::runtime::task_executor::task_start_digest(&req).expect("request digest");
     let now = env
         .manager
         .get_session(env.parent)
@@ -382,21 +388,9 @@ pub(crate) async fn a_pending_row_blocks_a_duplicate_start_without_touching_anyt
     assert!(env
         .manager
         .store()
-        .task_admission_claim(
-            env.parent,
-            KEY_A,
-            "in-flight-digest",
-            "tx-00000000000000aa",
-            now
-        )
+        .task_admission_claim(env.parent, KEY_A, &digest, "tx-00000000000000aa", now)
         .unwrap()
         .is_fresh());
-    let mut req = request(
-        "blocked duplicate",
-        vec![wi("a1", WorkKind::Analysis, &[])],
-        &env,
-    );
-    req.submission_id = Some(KEY_A.to_string());
     let err = env
         .executor
         .start_task(env.parent, req.clone())
@@ -421,6 +415,51 @@ pub(crate) async fn a_pending_row_blocks_a_duplicate_start_without_touching_anyt
         .expect("retry after the pending row released");
     wait_turn_settled(&env, receipt.op_id.expect("in-session op id")).await;
     assert_eq!(receipt.mode, TaskRunMode::InSession);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+pub(crate) async fn a_pending_row_with_different_bytes_is_key_reused_without_touching_anything() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("e"), done_script());
+    let mut req = request(
+        "different bytes under a live key",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    req.submission_id = Some(KEY_A.to_string());
+    // A live pending claim whose stored digest is NOT this request's digest:
+    // the contract is the typed key-reuse conflict, never a lease-long
+    // in-flight answer.
+    let now = env
+        .manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .now_ms();
+    assert!(env
+        .manager
+        .store()
+        .task_admission_claim(
+            env.parent,
+            KEY_A,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "tx-00000000000000ab",
+            now
+        )
+        .unwrap()
+        .is_fresh());
+    let err = env
+        .executor
+        .start_task(env.parent, req)
+        .expect_err("a pending key with different bytes is KeyReused");
+    assert!(matches!(err, ExecError::Conflict(_)), "{err}");
+    assert!(err.to_string().contains("different task start"), "{err}");
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    assert!(h.get_task(TaskId::new(1)).unwrap().is_none());
+    assert_eq!(message_count(&env), 0);
+    assert_eq!(env.provider.count(), 0);
+    assert_eq!(linkage_row_count(&env), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -339,7 +339,18 @@ def store_references(db_path):
     return refs
 
 
-def data_dir_metrics(data_dir, refs_cache):
+def data_dir_metrics(data_dir):
+    """One sample's data-dir metrics.
+
+    The CAS reference set is re-read from the store EVERY sample (P2-SOAK):
+    a cached set goes stale under churn, so newly referenced blobs would look
+    unreachable and newly unreferenced blobs would stay classified reachable,
+    corrupting the convergence verdict. Blobs are scanned first and the
+    authoritative references read immediately after, so the unreachable
+    population is the same-sample truth (a blob created between the two
+    passes counts as unreferenced for this sample at worst, never silently
+    reachable).
+    """
     metrics = {
         "wal_bytes": 0,
         "temp_files": 0,
@@ -364,9 +375,7 @@ def data_dir_metrics(data_dir, refs_cache):
             if BLOB.match(name) and SHARD.match(parent):
                 blobs.append(name)
         metrics["cas_blobs"] = len(blobs)
-        if "refs" not in refs_cache:
-            refs_cache["refs"] = store_references(store_db)
-        refs = refs_cache["refs"]
+        refs = store_references(store_db)
         if refs is None:
             metrics["cas_unreachable"] = None
             metrics["sample_error"] = "store-reference-scan-unavailable"
@@ -392,7 +401,6 @@ class Sampler:
         self.args = args
         self.stop = False
         self.samples = 0
-        self.refs_cache = {}
         self.last_pgid = None
         self.final_scan = None
 
@@ -440,7 +448,7 @@ class Sampler:
             sample["orphans"] = pgid_members(self.last_pgid) or 0
         else:
             sample["orphans"] = 0 if sample.get("root_alive") else None
-        sample.update(data_dir_metrics(self.args.data_dir, self.refs_cache))
+        sample.update(data_dir_metrics(self.args.data_dir))
         probe = reconnect_probe(self.args.probe_url)
         if probe is not None:
             sample["probe_ok"] = probe
@@ -993,6 +1001,57 @@ def run_selftest():
             else:
                 print(f"selftest FAIL: missing {metric_name} must fail typed", file=sys.stderr)
                 failures += 1
+
+        # P2-SOAK: the CAS reference set is re-read EVERY sample. A blob that
+        # becomes unreferenced between samples must flip from reachable to
+        # unreachable in the very next sample (a cached set would miss it).
+        import sqlite3 as _sqlite3
+
+        data_dir = os.path.join(tmp, "data")
+        os.makedirs(os.path.join(data_dir, "cas", "ab"))
+        os.makedirs(os.path.join(data_dir, "store"))
+        blob = "ab" + "c" * 62
+        with open(os.path.join(data_dir, "cas", "ab", blob), "wb") as handle:
+            handle.write(b"x")
+        db_path = os.path.join(data_dir, "store", "faktor-plus.db")
+        conn = _sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE artifact (cas_hash TEXT)")
+        conn.execute("INSERT INTO artifact VALUES (?)", (blob,))
+        conn.commit()
+        conn.close()
+        first = data_dir_metrics(data_dir)
+        conn = _sqlite3.connect(db_path)
+        conn.execute("DELETE FROM artifact")
+        conn.commit()
+        conn.close()
+        second = data_dir_metrics(data_dir)
+        if (
+            first["cas_unreachable"] == 0
+            and second["cas_unreachable"] == 1
+            and first["cas_blobs"] == 1
+            and second["cas_blobs"] == 1
+        ):
+            print("selftest ok: the CAS reference set is refreshed every sample")
+        else:
+            print(
+                "selftest FAIL: stale CAS reference set "
+                f"(first={first['cas_unreachable']} second={second['cas_unreachable']})",
+                file=sys.stderr,
+            )
+            failures += 1
+        # A blob created while the reference scan runs is counted unreachable
+        # for THAT sample (fail-visible, never silently reachable).
+        with open(os.path.join(data_dir, "cas", "ab", "d" * 64), "wb") as handle:
+            handle.write(b"y")
+        third = data_dir_metrics(data_dir)
+        if third["cas_unreachable"] == 2:
+            print("selftest ok: a newer unreferenced blob is visible immediately")
+        else:
+            print(
+                f"selftest FAIL: newer unreferenced blob not counted ({third['cas_unreachable']})",
+                file=sys.stderr,
+            )
+            failures += 1
 
         args.samples, args.workload = samples_good, work_good
         args.target_seconds = 30

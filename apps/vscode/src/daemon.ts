@@ -173,6 +173,13 @@ export interface DaemonHandle {
 
 let activeChild: ChildProcess | null = null;
 let activeHandle: DaemonHandle | null = null;
+/**
+ * The in-flight start (single-flight). Published BEFORE any await so every
+ * concurrent caller — autostart, palette/webview commands, task submission —
+ * awaits the SAME attempt and at most one daemon process is ever spawned.
+ * Cleared in `finally`, so a failed start can be retried.
+ */
+let starting: Promise<DaemonHandle> | null = null;
 
 export function findBinary(options: DaemonOptions): string {
   const env = options.binaryPath ?? process.env.FAKTOR_BIN;
@@ -247,10 +254,25 @@ export function currentDaemon(): DaemonHandle | null {
 }
 
 /**
- * Start (or return the already running) daemon. The returned handle owns
- * every child process it created; `stop()` is the only shutdown path.
+ * Start (or return the already running) daemon. SINGLE-FLIGHT: concurrent
+ * callers share one attempt; the promise is published before spawn.
  */
 export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle> {
+  if (starting !== null) {
+    return starting;
+  }
+  const attempt = startDaemonOnce(options);
+  starting = attempt;
+  try {
+    return await attempt;
+  } finally {
+    if (starting === attempt) {
+      starting = null;
+    }
+  }
+}
+
+async function startDaemonOnce(options: DaemonOptions): Promise<DaemonHandle> {
   if (activeHandle) {
     if (await activeHandle.alive()) {
       return activeHandle;
@@ -545,15 +567,25 @@ async function verifyAnnouncementDigest(
 }
 
 /** SIGTERM, escalating to SIGKILL only when the child ignores it. */
-export function stopDaemon(handle?: DaemonHandle | null): Promise<void> {
+export async function stopDaemon(handle?: DaemonHandle | null): Promise<void> {
   const target = handle ?? activeHandle;
   if (target) {
     return target.stop();
   }
+  if (starting !== null) {
+    // A start is in flight and no handle is published yet: wait for that
+    // exact attempt (bounded by its own startup timeout) and stop whatever
+    // it produced, so a concurrent stop cannot leak a daemon.
+    try {
+      const started = await starting;
+      return started.stop();
+    } catch {
+      return;
+    }
+  }
   if (activeChild) {
     stopChild(activeChild);
   }
-  return Promise.resolve();
 }
 
 function stopChild(child: ChildProcess): void {

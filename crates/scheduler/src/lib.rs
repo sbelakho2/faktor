@@ -92,9 +92,9 @@ fn normalize_owned_path(s: &str) -> String {
             t = rest.to_string();
         }
         t = t.replace('\\', "/");
-        t = t.to_ascii_lowercase();
+        t = crate::path_identity::fold_volume_identity(&t);
     } else if cfg!(target_os = "macos") {
-        t = t.to_ascii_lowercase();
+        t = crate::path_identity::fold_volume_identity(&t);
     }
     t
 }

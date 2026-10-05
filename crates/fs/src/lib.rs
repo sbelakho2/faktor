@@ -96,7 +96,10 @@ const DEFAULT_WATCH_REGISTRATION_DEADLINE: std::time::Duration = std::time::Dura
 /// Run `f` on a named helper thread and wait at most `deadline` for its
 /// result. `None` means the deadline elapsed: the helper keeps running and its
 /// result is discarded when it returns (callers must treat that as an
-/// explicit degraded outcome, never as success).
+/// explicit degraded outcome, never as success). Kept for the deadline
+/// semantics test; production watcher registration uses the bounded
+/// singleton worker in `workspace_service`.
+#[cfg(test)]
 fn bounded_join<T: Send + 'static>(
     name: &str,
     deadline: std::time::Duration,
@@ -170,32 +173,36 @@ fn err_not_found(rel: &Path, e: std::io::Error) -> Error {
 }
 
 /// The shared bounded read over an ALREADY-OPEN file (the fd walk already
-/// ran): the size that decides `Full` vs `Slice` is the file's size at open
-/// time (fstat), so no path string is re-resolved here. Either the whole
-/// file is read (`Full` digest) or exactly `max_bytes` (`Slice` digest).
+/// ran). The cap is ENFORCED by the read itself: at most `max_bytes + 1`
+/// bytes are ever pulled into memory, so a concurrently growing file can
+/// never outgrow the advertised bound. `fstat` only sizes the allocation;
+/// the digest is `Full` only when the whole file was actually read within
+/// the cap, `Slice` otherwise (exactly `max_bytes`, offset 0).
 pub(crate) fn read_open_bounded(
     f: &mut fs::File,
     rel: &Path,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, ContentDigest), Error> {
     use std::io::Read;
-    let size = f
+    let cap = max_bytes.saturating_add(1);
+    let hint = f
         .metadata()
         .map_err(|e| Error::internal(format!("stat {rel:?}: {e}")))?
-        .len();
-    let mut bytes = Vec::new();
-    let digest = if size > max_bytes as u64 {
-        bytes.resize(max_bytes, 0);
-        f.read_exact(&mut bytes)
-            .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+        .len()
+        .min(cap as u64);
+    let mut bytes = Vec::with_capacity(hint as usize);
+    f.by_ref()
+        .take(cap as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
+    let digest = if bytes.len() > max_bytes {
+        bytes.truncate(max_bytes);
         ContentDigest::Slice {
             hash: FileHash::from(blake3::hash(&bytes).into()),
             offset: 0,
             len: bytes.len() as u64,
         }
     } else {
-        f.read_to_end(&mut bytes)
-            .map_err(|e| Error::internal(format!("read {rel:?}: {e}")))?;
         ContentDigest::Full(FileHash::from(blake3::hash(&bytes).into()))
     };
     Ok((bytes, digest))
@@ -629,8 +636,10 @@ pub fn merge_apply_content(
         }
         _ => {}
     }
-    // Read the source ONCE into the wave-10 CAS payload (bounded: files
-    // beyond the cap fail loudly, never truncated).
+    // Read the source ONCE into the wave-10 CAS payload. The metadata length
+    // is only an early refusal/allocation hint: the read itself is capped at
+    // MAX_MERGE_FILE_BYTES + 1, so a file that grows after the stat can
+    // never be materialized unbounded (it becomes a loud Oversized refusal).
     let meta = fs::metadata(&src).map_err(|e| err_not_found(src_rel, e))?;
     if meta.len() > MAX_MERGE_FILE_BYTES {
         return Err(Error::oversized(format!(
@@ -645,9 +654,16 @@ pub fn merge_apply_content(
         )));
     }
     use std::io::Read;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
+    let mut bytes = Vec::with_capacity(meta.len().min(MAX_MERGE_FILE_BYTES + 1) as usize);
+    f.by_ref()
+        .take(MAX_MERGE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| Error::internal(format!("read {src_rel:?}: {e}")))?;
+    if bytes.len() as u64 > MAX_MERGE_FILE_BYTES {
+        return Err(Error::oversized(format!(
+            "merge file {src_rel:?} grew past the {MAX_MERGE_FILE_BYTES}-byte cap while being read; refusing to merge it whole"
+        )));
+    }
     let hash = FileHash::from(blake3::hash(&bytes).into());
     if hash != expected_src_hash {
         return Err(Error::conflict(format!(
@@ -1399,6 +1415,35 @@ mod tests {
     }
 
     #[test]
+    fn watcher_registration_uses_exactly_one_worker_thread() {
+        // P2-FS: every registration (including deadline-degraded ones) funnels
+        // through one bounded singleton worker, so live registration threads
+        // cannot grow per root.
+        let (_d, _service, handle) = fixture();
+        assert!(handle.watcher_attached());
+        let mut handles = Vec::new();
+        let mut roots = Vec::new();
+        for index in 0..4u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let service = WorkspaceFileService::new();
+            handles.push(
+                service
+                    .open(WorkspaceId::new(100 + index), dir.path().to_path_buf())
+                    .unwrap(),
+            );
+            roots.push(dir);
+        }
+        assert!(handles.iter().all(|handle| handle.watcher_attached()));
+        assert_eq!(
+            crate::workspace_service::watch_registration_worker_spawns(),
+            1,
+            "watch registration must use exactly one process-wide worker"
+        );
+        drop(handles);
+        drop(roots);
+    }
+
+    #[test]
     fn bounded_join_degrades_once_the_deadline_elapses() {
         let started = std::time::Instant::now();
         let slow = bounded_join(
@@ -1578,6 +1623,64 @@ mod tests {
             "whole read must carry the whole-file hash"
         );
         assert_eq!(data.bytes.len(), 10_000);
+    }
+
+    #[test]
+    fn bounded_read_never_exceeds_the_cap_under_concurrent_growth() {
+        use std::io::Write as _;
+        let (_d, _s, h) = fixture();
+        let path = h.root().join("grow.bin");
+        fs::write(&path, vec![1u8; 16]).unwrap();
+        let cap = 512usize;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_stop = stop.clone();
+        let writer_start = start.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_path)
+                .unwrap();
+            writer_start.wait();
+            let chunk = vec![2u8; 4096];
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if f.write_all(&chunk).is_err() {
+                    break;
+                }
+                let _ = f.flush();
+                std::thread::yield_now();
+            }
+        });
+        start.wait();
+        let mut saw_slice = false;
+        for i in 0..500 {
+            let data = h.read(Path::new("grow.bin"), cap).unwrap();
+            assert!(
+                data.bytes.len() <= cap,
+                "read {i} returned {} bytes (cap {cap}) while the file grew",
+                data.bytes.len()
+            );
+            match &data.digest {
+                ContentDigest::Slice { len, .. } => {
+                    assert_eq!(*len as usize, data.bytes.len());
+                    saw_slice = true;
+                }
+                ContentDigest::Full(hash) => {
+                    assert_eq!(
+                        *hash,
+                        FileHash::from(blake3::hash(&data.bytes).into()),
+                        "a Full digest must hash exactly the bytes returned"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_slice,
+            "the concurrent grower must have produced at least one capped read"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
     }
 
     #[test]

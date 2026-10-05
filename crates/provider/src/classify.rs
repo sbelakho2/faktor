@@ -11,6 +11,7 @@
 //! | 403 | `rate_limit`-family (`RESOURCE_EXHAUSTED`, quota) | `RateLimited` |
 //! | 403 | auth-family or none | `Permission` |
 //! | 400 | auth/permission-family (OpenAI `code: invalid_api_key`) | `Permission` |
+//! | 400 | rate-limit-family (`RESOURCE_EXHAUSTED`, quota) | `RateLimited` |
 //! | 400 | none | `Malformed` |
 //! | 404 | — | `NotFound` |
 //! | 409 | — | `Conflict` |
@@ -31,7 +32,9 @@
 //! with backoff. Hints only override where providers genuinely differ:
 //! 400 and 403 (OpenAI 400s bad keys with `code: invalid_api_key`; Google
 //! 403s permission boundaries with `PERMISSION_DENIED` — permission is NOT
-//! auth, and quota 403s with `RESOURCE_EXHAUSTED` are rate-limit class).
+//! auth, and quota 403s with `RESOURCE_EXHAUSTED` are rate-limit class; a
+//! 400 carrying `RESOURCE_EXHAUSTED`/quota is equally rate-limit class, since
+//! gateways surface upstream quota exhaustion with status 400).
 //!
 //! Hint scanning is STRUCTURED ONLY: JSON fields `error.type`,
 //! `error.code` and `error.status` (OpenAI/Anthropic/Google shapes), key
@@ -236,7 +239,13 @@ fn find_ci<'v>(value: &'v Value, key: &str) -> Option<&'v Value> {
 /// 400/403 hint overrides. Every adapter transport error path must call
 /// this — no locally duplicated status chains anywhere.
 pub fn classify_http(status: u16, body_hint: Option<&str>) -> ErrorKind {
-    let hint = body_hint.and_then(hint_kind);
+    classify_http_hint(status, body_hint.and_then(hint_kind))
+}
+
+/// The classifier over the ALREADY-PARSED structured hint family. Hints have
+/// no wire shape here — this is the exhaustive status × hint authority the
+/// truth table and every adapter expectation derive from.
+pub fn classify_http_hint(status: u16, hint: Option<ErrorHint>) -> ErrorKind {
     match status {
         // Credentials were rejected: NEVER retryable. Permission wins over
         // any body hint — see the module docs.
@@ -251,11 +260,14 @@ pub fn classify_http(status: u16, body_hint: Option<&str>) -> ErrorKind {
             _ => ErrorKind::Permission,
         },
         // 400 with an auth/permission token: some providers 400 instead of
-        // 401 on bad keys (OpenAI-style `code: invalid_api_key`); the hint
-        // overrides the status. No hint: malformed request.
+        // 401 on bad keys (OpenAI-style `code: invalid_api_key`); a
+        // rate-limit token on a 400 (proxies and gateways surface provider
+        // quota exhaustion with status 400) is rate-limit class and stays
+        // retryable with backoff. No hint: malformed request.
         400 => match hint {
             Some(ErrorHint::Auth) | Some(ErrorHint::Permission) => ErrorKind::Permission,
-            _ => ErrorKind::Malformed,
+            Some(ErrorHint::RateLimited) => ErrorKind::RateLimited,
+            None => ErrorKind::Malformed,
         },
         404 => ErrorKind::NotFound,
         409 => ErrorKind::Conflict,
@@ -281,6 +293,41 @@ pub fn classify_http(status: u16, body_hint: Option<&str>) -> ErrorKind {
             code: status.to_string(),
             retryable: false,
         },
+    }
+}
+
+/// The exhaustive status × hint truth table this module implements, one row
+/// per representative status class × every [`ErrorHint`] family (and the
+/// no-hint cell). Tests and generated adapter expectations iterate THIS
+/// table, so a classifier cell can never silently drift from its documented
+/// contract.
+pub fn classification_table() -> Vec<(u16, Option<ErrorHint>, ErrorKind)> {
+    const STATUSES: [u16; 18] = [
+        400, 401, 403, 404, 405, 408, 409, 418, 422, 425, 429, 500, 501, 502, 503, 504, 529, 599,
+    ];
+    const HINTS: [Option<ErrorHint>; 4] = [
+        None,
+        Some(ErrorHint::Auth),
+        Some(ErrorHint::Permission),
+        Some(ErrorHint::RateLimited),
+    ];
+    let mut rows = Vec::with_capacity(STATUSES.len() * HINTS.len());
+    for status in STATUSES {
+        for hint in HINTS {
+            rows.push((status, hint, classify_http_hint(status, hint)));
+        }
+    }
+    rows
+}
+
+/// The wire token that reaches each hint family, used by table-driven tests
+/// to prove the token scanner and the hint-family table agree.
+pub fn classification_table_token(hint: Option<ErrorHint>) -> Option<&'static str> {
+    match hint {
+        None => None,
+        Some(ErrorHint::Auth) => Some("invalid_api_key"),
+        Some(ErrorHint::Permission) => Some("PERMISSION_DENIED"),
+        Some(ErrorHint::RateLimited) => Some("RESOURCE_EXHAUSTED"),
     }
 }
 
@@ -426,7 +473,12 @@ mod tests {
         assert_eq!(kind_for(400, Some("authentication_error")), K::Permission);
         assert_eq!(kind_for(400, Some("unauthorized")), K::Permission);
         assert_eq!(kind_for(400, Some("permission")), K::Permission);
-        assert_eq!(kind_for(400, Some("rate_limit")), K::Malformed);
+        // A 400 carrying a structured rate-limit/quota code is rate-limit
+        // class and STAYS RETRYABLE (proxies/gateways surface provider quota
+        // exhaustion with status 400).
+        assert_eq!(kind_for(400, Some("rate_limit")), K::RateLimited);
+        assert_eq!(kind_for(400, Some("RESOURCE_EXHAUSTED")), K::RateLimited);
+        assert_eq!(kind_for(400, Some("quota_exceeded")), K::RateLimited);
         // Typed 4xx.
         assert_eq!(kind_for(404, None), K::NotFound);
         assert_eq!(kind_for(409, None), K::Conflict);
@@ -470,6 +522,36 @@ mod tests {
         assert!(!K::NotFound.is_retryable());
         assert!(!K::Conflict.is_retryable());
         assert!(!K::Malformed.is_retryable());
+    }
+
+    #[test]
+    fn exhaustive_status_hint_table_is_the_single_authority() {
+        use ErrorKind as K;
+        let table = classification_table();
+        assert_eq!(table.len(), 18 * 4, "every status class × hint family");
+        for (status, hint, expected) in &table {
+            assert_eq!(
+                classify_http_hint(*status, *hint),
+                *expected,
+                "hint-family cell {status} {hint:?}"
+            );
+            assert_eq!(
+                classify_http(*status, classification_table_token(*hint)),
+                *expected,
+                "wire-token path must agree with the hint-family cell for {status} {hint:?}"
+            );
+            // The transport envelope retryability mirrors the kind exactly
+            // for every cell, so no adapter can diverge on retry behavior.
+            let env = provider_error_for(expected.clone(), status.to_string(), "boom");
+            assert_eq!(
+                env.retryable,
+                expected.is_retryable(),
+                "envelope retryability for {status} {hint:?}"
+            );
+        }
+        // The formerly-missing cell is pinned by name as well.
+        assert_eq!(kind_for(400, Some("RESOURCE_EXHAUSTED")), K::RateLimited);
+        assert!(K::RateLimited.is_retryable());
     }
 
     #[test]

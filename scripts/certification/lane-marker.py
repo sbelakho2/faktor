@@ -152,6 +152,26 @@ def git(args, cwd):
     return subprocess.check_output(["git", "-C", cwd, *args], text=True).strip()
 
 
+def worktree_clean(cwd):
+    """True when the tracked working tree is clean (git diff --exit-code and
+    git diff --cached --exit-code both succeed). Any git failure is NOT clean:
+    the verifier fails closed instead of certifying unproven bytes."""
+    for args in (
+        ["diff", "--exit-code", "--quiet"],
+        ["diff", "--cached", "--exit-code", "--quiet"],
+    ):
+        try:
+            subprocess.run(
+                ["git", "-C", cwd, *args],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:  # noqa: BLE001 - any git failure means not proven clean
+            return False
+    return True
+
+
 def flag_value(args, name, fallback=""):
     if name not in args:
         return fallback
@@ -205,6 +225,7 @@ def generate_marker(options):
             "commands_digest": "sha256:" + sha256_hex(commands_text),
             "artifacts": options.get("artifacts", []),
             "artifact_digest": artifact_digest(options.get("artifacts", [])),
+            "clean": bool(options.get("clean", True)),
         }
     )
     token = options.get("token", "")
@@ -272,6 +293,7 @@ def write_command(args):
             "tree": tree,
             "startedAt": flag_value(args, "--started-at") or default_started_at(),
             "finishedAt": flag_value(args, "--finished-at") or iso_now(),
+            "clean": worktree_clean(cwd),
             "runner": {
                 "os": flag_value(args, "--runner-os") or default_runner_os(),
                 "arch": flag_value(args, "--runner-arch") or default_runner_arch(),

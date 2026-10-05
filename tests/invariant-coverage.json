@@ -1,0 +1,414 @@
+{
+ "schema": "faktor-invariant-coverage/v1",
+ "entries": [
+  {
+   "crate": "faktor-acp",
+   "class": "gap",
+   "reason": "ACP conformance is exercised by tests/acp-official but no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-acquire",
+   "class": "gap",
+   "reason": "commerce acquisition surface has dedicated adversarial suites but no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-agent",
+   "class": "release-critical",
+   "owners": [
+    "INV-COMPACTION-SUMMARY-CAP",
+    "INV-MAX-QUALITY-ONE-AUTHORITY",
+    "INV-QUEUE-ADMISSION-FILES",
+    "INV-CHUNK-DROP-ACCOUNTING",
+    "INV-SHELL-FULL-WORKSPACE-OWNERSHIP",
+    "INV-CHANGE-BUDGET-PREEXEC-REFUSAL",
+    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+    "INV-SHELL-CRASH-DISCOVERY"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-anthropic",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-browser",
+   "class": "gap",
+   "reason": "browser confinement has a large adversarial suite and the sandbox projection invariant, but no crate-owned mutation-killed invariant yet"
+  },
+  {
+   "crate": "faktor-cas",
+   "class": "covered",
+   "via": [
+    "INV-FS-MUTATION-PARENT-REVERIFY",
+    "INV-DURABLE-CORRUPTION-LOUD"
+   ],
+   "reason": "CAS writes/reads are the durable store transaction substrate"
+  },
+  {
+   "crate": "faktor-cli",
+   "class": "covered",
+   "via": [
+    "INV-FROZEN-CONTRACTS",
+    "INV-DURABLE-CORRUPTION-LOUD"
+   ],
+   "reason": "CLI surface consumes frozen protocol/contracts and durable store reads"
+  },
+  {
+   "crate": "faktor-cloud",
+   "class": "gap",
+   "reason": "cloud/RBAC/billing surfaces have no new concrete blocker but no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-commerce",
+   "class": "gap",
+   "reason": "commerce policy surface has dedicated adversarial suites but no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-commerce-connectors",
+   "class": "release-critical",
+   "owners": [
+    "INV-REDACTION-CAP-FAIL-CLOSED"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-context",
+   "class": "covered",
+   "via": [
+    "INV-COMPACTION-SUMMARY-CAP",
+    "INV-QUEUE-ADMISSION-FILES",
+    "INV-CHUNK-DROP-ACCOUNTING"
+   ],
+   "reason": "turn ledger/compaction authority lives in the agent runtime"
+  },
+  {
+   "crate": "faktor-contracts",
+   "class": "release-critical",
+   "owners": [
+    "INV-FROZEN-CONTRACTS"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-core",
+   "class": "release-critical",
+   "owners": [
+    "INV-RUNTIME-PATH-CANONICALIZATION",
+    "INV-FROZEN-CONTRACTS"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-deepseek",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-edit",
+   "class": "covered",
+   "via": [
+    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+    "INV-FS-MUTATION-PARENT-REVERIFY"
+   ],
+   "reason": "edit writes go through the rooted fs authority and shell change attribution"
+  },
+  {
+   "crate": "faktor-evidence",
+   "class": "covered",
+   "via": [
+    "INV-CI-THREE-PLATFORM-AGGREGATE",
+    "INV-FROZEN-CONTRACTS"
+   ],
+   "reason": "evidence schemas are bound into the certification chain"
+  },
+  {
+   "crate": "faktor-fs",
+   "class": "release-critical",
+   "owners": [
+    "INV-FS-MUTATION-PARENT-REVERIFY"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-gateway",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-git",
+   "class": "covered",
+   "via": [
+    "INV-FS-MUTATION-PARENT-REVERIFY",
+    "INV-PREPARED-WRITER-JOBS"
+   ],
+   "reason": "git writes go through the rooted fs authority and snapshot checkpointing"
+  },
+  {
+   "crate": "faktor-google",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-hooks",
+   "class": "covered",
+   "via": [
+    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+    "INV-PREPARED-WRITER-JOBS"
+   ],
+   "reason": "hook execution rides the tool lifecycle accounting"
+  },
+  {
+   "crate": "faktor-index",
+   "class": "release-critical",
+   "owners": [
+    "INV-INDEX-EVICTION-DETERMINISTIC"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-instructions",
+   "class": "covered",
+   "via": [
+    "INV-DURABLE-CORRUPTION-LOUD",
+    "INV-COMPACTION-SUMMARY-CAP"
+   ],
+   "reason": "instruction/memory vocabulary is durable store fact state"
+  },
+  {
+   "crate": "faktor-learning",
+   "class": "covered",
+   "via": [
+    "INV-DURABLE-CORRUPTION-LOUD",
+    "INV-MEMO-READ-ONLY-VIEW"
+   ],
+   "reason": "learning outcomes are durable store fact state"
+  },
+  {
+   "crate": "faktor-lsp",
+   "class": "gap",
+   "reason": "LSP process/session surface has no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-mcp",
+   "class": "gap",
+   "reason": "MCP bounded writer queue/delivery-unknown surface has no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-memory",
+   "class": "covered",
+   "via": [
+    "INV-DURABLE-CORRUPTION-LOUD",
+    "INV-COMPACTION-SUMMARY-CAP"
+   ],
+   "reason": "memory facts are durable store fact state"
+  },
+  {
+   "crate": "faktor-ollama",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-openai",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-orchestrator",
+   "class": "release-critical",
+   "owners": [
+    "INV-TASK-START-IDEMPOTENT",
+    "INV-ADMISSION-RECOVERY-LANDING",
+    "INV-RUNTIME-PATH-CANONICALIZATION"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-protocol",
+   "class": "release-critical",
+   "owners": [
+    "INV-FROZEN-CONTRACTS"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-provider",
+   "class": "release-critical",
+   "owners": [
+    "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-pty",
+   "class": "release-critical",
+   "owners": [
+    "INV-PTY-CONTROL-PIPE-CLOEXEC"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-router",
+   "class": "release-critical",
+   "owners": [
+    "INV-MAX-QUALITY-ONE-AUTHORITY",
+    "INV-MEMO-READ-ONLY-VIEW"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-sandbox",
+   "class": "release-critical",
+   "owners": [
+    "INV-SANDBOX-PRIVILEGE-DROP"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-scheduler",
+   "class": "release-critical",
+   "owners": [
+    "INV-RUNTIME-PATH-CANONICALIZATION"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-scm",
+   "class": "gap",
+   "reason": "SCM daemon authority has dedicated adversarial suites but no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-search",
+   "class": "release-critical",
+   "owners": [
+    "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE",
+    "INV-SEMANTIC-EMBED-BATCH-BOUNDS"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-security",
+   "class": "release-critical",
+   "owners": [
+    "INV-REDACTION-CAP-FAIL-CLOSED"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-semantic",
+   "class": "gap",
+   "reason": "semantic provider layer has no mutation-killed registry invariant yet"
+  },
+  {
+   "crate": "faktor-server",
+   "class": "release-critical",
+   "owners": [
+    "INV-ATTACHMENT-REFERENCE-IDENTITY",
+    "INV-PROMPT-START-IDEMPOTENT",
+    "INV-TERMINAL-EVENTS-SESSION-ISOLATED"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-session",
+   "class": "release-critical",
+   "owners": [
+    "INV-JOURNAL-INTEGRITY",
+    "INV-DURABLE-CORRUPTION-LOUD",
+    "INV-CHANGE-BUDGET-PREEXEC-REFUSAL"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-snapshot",
+   "class": "covered",
+   "via": [
+    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+    "INV-FS-MUTATION-PARENT-REVERIFY"
+   ],
+   "reason": "snapshot checkpoints feed the shell attribution settlement path"
+  },
+  {
+   "crate": "faktor-store",
+   "class": "release-critical",
+   "owners": [
+    "INV-ATTACHMENT-REFERENCE-IDENTITY",
+    "INV-ATTACHMENT-SEED-ATOMIC",
+    "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES",
+    "INV-PREPARED-WRITER-JOBS",
+    "INV-JOURNAL-INTEGRITY",
+    "INV-CREATE-SESSION-SEED-ATOMIC",
+    "INV-PERSISTENCE-SIGNED-DOMAIN",
+    "INV-TASK-START-IDEMPOTENT",
+    "INV-DURABLE-CORRUPTION-LOUD",
+    "INV-QUEUE-ADMISSION-FILES",
+    "INV-PROMPT-START-IDEMPOTENT",
+    "INV-ARTIFACT-READ-LOUD-SCOPED",
+    "INV-ADMISSION-LEASE-FENCING",
+    "INV-ADMISSION-RECOVERY-LANDING"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-terminal",
+   "class": "release-critical",
+   "owners": [
+    "INV-SANDBOX-PRIVILEGE-DROP",
+    "INV-FS-CONFINEMENT-LANDLOCK-DEMAND"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-updater",
+   "class": "release-critical",
+   "owners": [
+    "INV-UPDATER-EXEC-IDENTITY"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-verify",
+   "class": "release-critical",
+   "owners": [
+    "INV-MANIFEST-READ-BOUNDED"
+   ],
+   "authority": "authority text of the named invariants"
+  },
+  {
+   "crate": "faktor-winjob",
+   "class": "covered",
+   "via": [
+    "INV-SANDBOX-PRIVILEGE-DROP",
+    "INV-PTY-CONTROL-PIPE-CLOEXEC"
+   ],
+   "reason": "windows job confinement is the spawn/PTY authority"
+  },
+  {
+   "crate": "faktor-worker",
+   "class": "covered",
+   "via": [
+    "INV-ADMISSION-RECOVERY-LANDING",
+    "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES"
+   ],
+   "reason": "worker plane recovery is the admission/landing authority"
+  }
+ ]
+}

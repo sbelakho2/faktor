@@ -25,6 +25,7 @@ function hostMessageId(raw: unknown): string {
   return randomUUID();
 }
 import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
+import { LifecycleFence } from './lifecycleFence';
 import {
   FetchLike,
   NativeApiError,
@@ -211,6 +212,19 @@ const active: ActiveSession = {
 const store = new FaktorStore();
 let chatProvider: ChatViewProvider | null = null;
 let statusBar: vscode.StatusBarItem | null = null;
+/**
+ * Lifecycle generation fence (audit P1-VSCODE): bumped whenever the daemon
+ * authority changes (start/stop) or the active session id changes. `refresh()`
+ * captures it once and refuses to patch ANY host state after a transition, so
+ * a slow read for a dead daemon/session can never overwrite a newer snapshot.
+ * Bumping also disarms the in-flight refresh flag: the transition itself owns
+ * the state, and the next `refresh()` re-arms it.
+ */
+const lifecycle = new LifecycleFence();
+function bumpLifecycle(): void {
+  lifecycle.bump();
+  active.refreshing = false;
+}
 // Bounded local pending state for submission retries (audit 29): uploaded
 // attachment ids survive a failed start and a retry resolves them first,
 // uploading only the attachments still absent.
@@ -748,6 +762,8 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     const health = await client.health();
     active.daemon = daemon;
     active.client = client;
+    // A new daemon authority invalidates every read started under the old one.
+    bumpLifecycle();
     store.patch({
       daemon: 'running',
       // The health version already carries the bootstrap-verified release
@@ -771,6 +787,9 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
 }
 
 function stopServer(): void {
+  // Any in-flight refresh captured the previous generation: fence it out and
+  // disarm the flag before the state reset below.
+  bumpLifecycle();
   if (active.refreshTimer !== null) {
     clearTimeout(active.refreshTimer);
     active.refreshTimer = null;
@@ -852,11 +871,13 @@ async function ensureSession(
   const boundSummary = boundId !== null ? sessions.find((entry) => entry.id === boundId) : undefined;
   if (boundId !== null && boundSummary !== undefined) {
     active.sessionId = boundId;
+    bumpLifecycle();
     store.patch({ session: boundSummary });
   } else if (boundId === null && !listed && workspace.key !== null && bindings[workspace.key]) {
     // The listing failed; trust the durable binding for this exact
     // workspace rather than minting a duplicate session.
     active.sessionId = bindings[workspace.key] as string;
+    bumpLifecycle();
   } else {
     let provider = config('defaultProvider', '');
     let model = config('defaultModel', '');
@@ -878,6 +899,7 @@ async function ensureSession(
       title: workspaceTitle(),
     });
     active.sessionId = created.id;
+    bumpLifecycle();
     bindings = withBinding(bindings, workspace.key, created.id);
     await writeBindings(context, bindings);
     store.patch({
@@ -1013,6 +1035,14 @@ async function refresh(): Promise<void> {
   if (!client || !sessionId || active.refreshing) {
     return;
   }
+  // Fence every await against lifecycle transitions: this refresh may only
+  // publish if the exact daemon + session generation it captured is still
+  // current when it finishes.
+  const generation = lifecycle.current();
+  const current = (): boolean =>
+    lifecycle.isCurrent(generation) &&
+    active.client === client &&
+    active.sessionId === sessionId;
   active.refreshing = true;
   try {
     // The board read is OPTIONAL and never rejects: an older daemon records
@@ -1033,6 +1063,9 @@ async function refresh(): Promise<void> {
         client.modelCatalog().catch(() => [] as NativeModelInfo[]),
       ]);
     const board = await boardPromise;
+    if (!current()) {
+      return;
+    }
     // Durable index coverage (audits 5/6): optional like the board read — an
     // older daemon or a never-hosted index service yields null, never a
     // snapshot failure.
@@ -1087,6 +1120,11 @@ async function refresh(): Promise<void> {
       proof: proofRead.proof,
       proofUnavailable: proofRead.unavailable,
     });
+    // The authority may have changed while the reads ran: never patch a
+    // newer snapshot with this stale generation's data.
+    if (!current()) {
+      return;
+    }
     store.patch({
       sessions,
       machineState: projection.state.machine,
@@ -1116,9 +1154,15 @@ async function refresh(): Promise<void> {
       store.patch({ transcript });
     }
   } catch (error) {
-    store.patch({ lastError: messageOf(error) });
+    if (current()) {
+      store.patch({ lastError: messageOf(error) });
+    }
   } finally {
-    active.refreshing = false;
+    // Only the generation that armed the flag may clear it; a transition
+    // already disarmed it (bumpLifecycle) and may have armed a newer refresh.
+    if (lifecycle.isCurrent(generation)) {
+      active.refreshing = false;
+    }
     updateStatusBar();
   }
 }
@@ -1857,12 +1901,20 @@ async function startTask(
     });
     if (outcome.ok) {
       // Durable acceptance: ONLY now may the pending envelope (and its
-      // retained uploads) be dropped, together with the host-side composer
-      // bytes the panel still shows.
+      // retained uploads) be dropped. Clear EXACTLY the host-side entries
+      // this snapshot selected — an attachment added for the next task while
+      // the request was in flight keeps its id and survives (audit P1-VSCODE).
       pendingSubmissionRetainer.release(outcome.pending);
       taskStartGate.settle(submissionId, 'started');
-      if (snapshot.pending.attachments.length > 0) {
-        composerAttachments.clear();
+      if (snapshot.attachmentIds.length > 0) {
+        const removed = composerAttachments.removeMany(snapshot.attachmentIds);
+        if (removed > 0) {
+          postComposerAttachments(await composerAttachmentPolicy());
+        }
+      } else if (snapshot.pending.attachments.length > 0) {
+        // Legacy raw envelope: the submitted bytes were never host-store
+        // entries, so the store is untouched; only the submitted display is
+        // cleared.
         chatProvider?.postAttachmentsCleared();
       }
       chatProvider?.postStartResult(goal, true);
@@ -2444,6 +2496,7 @@ async function handleWebviewMessage(
       const binaryAttachments = message.attachments;
       const hostSessionId = active.sessionId ?? message.sessionId;
       let pending: PendingSubmission;
+      let selectedAttachmentIds: readonly string[] = [];
       if (attachmentIds !== undefined && attachmentIds !== null) {
         const selected = composerAttachments.select(attachmentIds);
         if (selected.reason !== null) {
@@ -2454,6 +2507,7 @@ async function handleWebviewMessage(
           chatProvider?.postStartResult(goal, false);
           return;
         }
+        selectedAttachmentIds = selected.ids;
         const parsed = parsePendingSubmission({
           text: goal,
           sessionId: hostSessionId,
@@ -2496,6 +2550,7 @@ async function handleWebviewMessage(
         pending,
         files,
         contract: contract.contract,
+        attachmentIds: selectedAttachmentIds,
         newId: randomUUID,
       });
       if (decision.action !== 'start') {

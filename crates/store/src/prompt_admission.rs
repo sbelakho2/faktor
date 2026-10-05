@@ -239,19 +239,26 @@ impl Store {
             }
             let outcome = match state.as_str() {
                 "pending" => {
-                    let stale = PendingAdmission {
-                        key: key.clone(),
-                        session_id,
-                        request_digest: stored_digest,
-                        reservation: stored_reservation,
-                        owner_generation,
-                        lease_deadline_ms: lease_deadline,
-                        created_ms,
-                    };
-                    if stale.is_live_for(&generation, now) {
-                        PromptAdmissionClaim::InFlight
+                    // DIGEST FIRST (idempotency contract): different bytes on
+                    // a reused key are KeyReused even while the row is live
+                    // or stale; only an identical claim is InFlight/Stale.
+                    if stored_digest != request_digest {
+                        PromptAdmissionClaim::KeyReused { stored_digest }
                     } else {
-                        PromptAdmissionClaim::Stale(stale)
+                        let stale = PendingAdmission {
+                            key: key.clone(),
+                            session_id,
+                            request_digest: stored_digest,
+                            reservation: stored_reservation,
+                            owner_generation,
+                            lease_deadline_ms: lease_deadline,
+                            created_ms,
+                        };
+                        if stale.is_live_for(&generation, now) {
+                            PromptAdmissionClaim::InFlight
+                        } else {
+                            PromptAdmissionClaim::Stale(stale)
+                        }
                     }
                 }
                 "complete" => {
@@ -514,32 +521,61 @@ mod prompt_admission_tests {
     }
 
     #[test]
-    fn prompt_same_key_with_a_different_digest_is_key_reused_after_completion() {
+    fn prompt_same_key_with_a_different_digest_is_key_reused_at_every_state() {
         let dir = tempfile::tempdir().unwrap();
         let (store, sid) = store_with_session(&dir);
         store
             .prompt_admission_claim(sid, KEY, DIGEST, RES, 1)
             .unwrap();
-        // Pending: a different digest is still the SAME in-flight logical
-        // prompt (the pending winner owns the key).
+        let reused = PromptAdmissionClaim::KeyReused {
+            stored_digest: DIGEST.to_string(),
+        };
+        // Pending (live) + different bytes: KeyReused, never InFlight.
         assert_eq!(
             store
                 .prompt_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000002", 2)
                 .unwrap(),
+            reused
+        );
+        // Pending (expired lease) + different bytes: still KeyReused, never
+        // Stale. The claim landed at now=1, so the deadline is LEASE+1.
+        let expired = super::super::ADMISSION_LEASE_MS + 1;
+        assert_eq!(
+            store
+                .prompt_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000003", expired)
+                .unwrap(),
+            reused
+        );
+        // Identical bytes are InFlight while live...
+        assert_eq!(
+            store
+                .prompt_admission_claim(sid, KEY, DIGEST, "tx-0000000000000004", 2)
+                .unwrap(),
             PromptAdmissionClaim::InFlight
         );
+        // ...and Stale once the lease expired.
+        assert!(matches!(
+            store
+                .prompt_admission_claim(sid, KEY, DIGEST, "tx-0000000000000005", expired)
+                .unwrap(),
+            PromptAdmissionClaim::Stale(_)
+        ));
         store
             .prompt_admission_complete(sid, KEY, RES, "{}")
             .unwrap();
-        let claim = store
-            .prompt_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000003", 3)
-            .unwrap();
+        // Complete + different bytes: KeyReused naming the stored digest.
         assert_eq!(
-            claim,
-            PromptAdmissionClaim::KeyReused {
-                stored_digest: DIGEST.to_string()
-            },
-            "a completed key with a different digest names the stored digest"
+            store
+                .prompt_admission_claim(sid, KEY, OTHER_DIGEST, "tx-0000000000000006", expired + 1)
+                .unwrap(),
+            reused
+        );
+        // Complete + identical: byte-exact replay.
+        assert_eq!(
+            store
+                .prompt_admission_claim(sid, KEY, DIGEST, "tx-0000000000000007", expired + 1)
+                .unwrap(),
+            PromptAdmissionClaim::Complete("{}".to_string())
         );
     }
 

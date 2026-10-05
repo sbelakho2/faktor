@@ -764,6 +764,33 @@ object FrontendSmoke {
             )
         }
 
+        // P1-JETBRAINS: lexical containment is not object identity. An
+        // in-workspace symlink that resolves outside must be refused by the
+        // authoritative (real-path revalidated) attachment read, while a real
+        // in-workspace file still reads.
+        step("attachment reads are canonicalized and symlink escapes refuse") {
+            val dir = Files.createTempDirectory("faktor-jb-attach-")
+            val root = Files.createDirectories(dir.resolve("ws"))
+            val outside = Files.createDirectories(dir.resolve("outside"))
+            val secret = Files.write(outside.resolve("secret.txt"), "top-secret".toByteArray())
+            Files.write(root.resolve("inside.txt"), "ok".toByteArray())
+            Files.createSymbolicLink(root.resolve("escape.txt"), secret)
+            val refusal = refusalOf {
+                readAttachmentBounded("escape.txt", root, 1024)
+            }
+            assertEquals("outside_workspace", refusal.code)
+            val inside = readAttachmentBounded("inside.txt", root, 1024)
+            assertEquals("ok", String(inside!!, Charsets.UTF_8))
+            // An absolute path outside the root is refused at the lexical
+            // stage, and a symlinked parent directory cannot smuggle it in.
+            val linkedDir = Files.createSymbolicLink(dir.resolve("linked-outside"), outside)
+            val viaDir = linkedDir.resolve("secret.txt").toString()
+            val viaRefusal = refusalOf {
+                readAttachmentBounded(viaDir, root, 1024)
+            }
+            assertEquals("outside_workspace", viaRefusal.code)
+        }
+
         // Audit findings 2/4: the attachment byte RESPONSE bound mirrors the
         // daemon's HTTP upload/retrieval contract (7 MiB), never the generic
         // 4 MiB body cap; and the blob metadata route is surfaced with its

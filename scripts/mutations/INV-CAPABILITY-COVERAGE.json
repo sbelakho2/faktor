@@ -1,0 +1,9 @@
+{
+  "id": "INV-CAPABILITY-COVERAGE",
+  "file": "tests/invariant-coverage.json",
+  "find": "   \"crate\": \"faktor-acquire\",\n   \"class\": \"gap\",",
+  "replace": "   \"crate\": \"faktor-acquire\",\n   \"class\": \"release-critical\",",
+  "gate": "node scripts/check-invariant-coverage.mjs --check",
+  "expect": "FAIL",
+  "note": "Silently promotes a documented gap to release-critical with no owner invariant: the mechanical coverage check must fail on the ownerless classification."
+}

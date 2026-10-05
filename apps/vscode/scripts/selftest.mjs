@@ -20,6 +20,7 @@ import * as nc from '../src/nativeClient.ts';
 import * as es from '../src/eventStream.ts';
 import * as st from '../src/state.ts';
 import * as dm from '../src/daemon.ts';
+import * as lf from '../src/lifecycleFence.ts';
 import * as ts from '../src/taskStart.ts';
 import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
@@ -2939,6 +2940,34 @@ async function daemonTests() {
       dm.findBinary({ workspaceRoot: '/nonexistent', binaryPath: '/tmp/fake-faktor-cli' }),
       '/tmp/fake-faktor-cli',
     );
+  });
+
+  await test('100 concurrent startDaemon callers spawn exactly one process (single-flight)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-daemon-single-flight-'));
+    const release = join(root, 'fake-release.cjs');
+    const counter = join(root, 'spawns.txt');
+    const pidfile = join(root, 'release.pid');
+    const bin = join(root, 'counting-bin.sh');
+    writeExecutable(release, FAKE_RELEASE_SOURCE);
+    // Every spawn appends one line BEFORE exec, so the count is the number of
+    // processes actually started, not the number of handles returned.
+    writeExecutable(
+      bin,
+      `#!/bin/sh\necho spawn >> '${counter}'\nFAKE_RELEASE_PIDFILE='${pidfile}' exec node '${release}' "$@"\n`,
+    );
+    try {
+      const handles = await Promise.all(
+        Array.from({ length: 100 }, () =>
+          dm.startDaemon({ workspaceRoot: '/nonexistent', binaryPath: bin }),
+        ),
+      );
+      assertEqual(new Set(handles).size, 1, 'every concurrent caller receives the same handle');
+      const spawns = readFileSync(counter, 'utf8').trim().split('\n').length;
+      assertEqual(spawns, 1, 'exactly one daemon process may ever be spawned');
+      await dm.stopDaemon(handles[0]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   await test('daemon refuses to start without a binary', async () => {
@@ -7135,6 +7164,81 @@ function realComposerHost(sessionId = '7') {
 }
 
 async function composerAttachmentTests() {
+  await test('durable acceptance clears ONLY the accepted attachment ids (next-task attachment survives)', () => {
+    let counter = 0;
+    const store = new ts.ComposerAttachmentStore(() => `att-${++counter}`);
+    const png = (byte) => ({
+      mime: 'image/png',
+      filename: `f${byte}.png`,
+      bytes: 1,
+      dataBase64: Buffer.from([byte]).toString('base64'),
+      isImage: true,
+    });
+    const first = store.add(png(1));
+    const second = store.add(png(2));
+    assertEqual(first.reason, null);
+    assertEqual(second.reason, null);
+    // The submitted snapshot selected the FIRST attachment only.
+    const selected = store.select([first.view.id]);
+    assertEqual(selected.reason, null);
+    assertEqual(selected.ids.join(','), first.view.id);
+    // The second attachment was added for the NEXT task while the request
+    // was in flight; acceptance must not clear it.
+    assertEqual(store.removeMany(selected.ids), 1);
+    assertEqual(
+      store.list().map((entry) => entry.id).join(','),
+      second.view.id,
+      'only the accepted ids may be removed',
+    );
+    // A select of the now-removed id is a loud refusal, never a silent skip.
+    assert(
+      store.select([first.view.id]).reason !== null,
+      'a removed id must refuse the whole selection',
+    );
+    // removeMany of unknown ids removes nothing (idempotent cleanup).
+    assertEqual(store.removeMany([first.view.id, 'never-existed']), 0);
+    assertEqual(store.list().length, 1);
+  });
+
+  await test('task-start snapshots retain the accepted ids across a transport retry', () => {
+    const gate = new ts.TaskStartGate();
+    const pending = ts.parsePendingSubmission({
+      text: 'goal',
+      sessionId: '7',
+      draftId: null,
+      messageId: 'm1',
+      files: [],
+      attachments: [],
+    });
+    assert(pending !== null, 'the pending envelope must parse');
+    const first = gate.admit({
+      pending,
+      files: [],
+      contract: null,
+      attachmentIds: ['att-1', 'att-2'],
+      newId: () => 'sub-1',
+    });
+    assertEqual(first.action, 'start');
+    assertEqual(first.snapshot.attachmentIds.join(','), 'att-1,att-2');
+    gate.settle('sub-1', 'transport');
+    const retry = gate.admit({
+      pending,
+      files: [],
+      contract: null,
+      attachmentIds: ['att-1', 'att-2'],
+      newId: () => 'sub-2',
+    });
+    assertEqual(retry.action, 'start');
+    assertEqual(retry.retry, true);
+    assertEqual(retry.snapshot.submissionId, 'sub-1', 'retry reuses the original id');
+    assertEqual(
+      retry.snapshot.attachmentIds.join(','),
+      'att-1,att-2',
+      'the accepted ids survive into the retry snapshot',
+    );
+    gate.settle('sub-1', 'started');
+  });
+
   await test('the real composer markup ships the attachment surface, the a11y log and recovery affordances', () => {
     const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
     // Mutation witness (markup half): removing any required control fails
@@ -7934,6 +8038,59 @@ function fakeStartHost() {
 }
 
 async function submissionSingleFlightTests() {
+  await test('lifecycle fence: a bump invalidates every captured generation', () => {
+    const fence = new lf.LifecycleFence();
+    const captured = fence.current();
+    assertEqual(fence.isCurrent(captured), true, 'a fresh generation is current');
+    fence.bump();
+    assertEqual(fence.isCurrent(captured), false, 'a bump must stale every capture');
+    const next = fence.current();
+    assert(next > captured, 'generations only move forward');
+    assertEqual(fence.isCurrent(next), true);
+  });
+
+  await test('lifecycle fence: 2,000 randomized interleavings never apply a stale generation', () => {
+    let seed = 0x12345678;
+    const rand = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 0x100000000;
+    };
+    const fence = new lf.LifecycleFence();
+    const pendingOps = [];
+    const applied = [];
+    let lastApplied = -1;
+    for (let step = 0; step < 2000; step += 1) {
+      const roll = rand();
+      if (roll < 0.4) {
+        pendingOps.push({ generation: fence.current(), id: step });
+      } else if (roll < 0.7) {
+        fence.bump();
+      } else if (pendingOps.length > 0) {
+        const op = pendingOps.splice(Math.floor(rand() * pendingOps.length), 1)[0];
+        if (fence.isCurrent(op.generation)) {
+          assert(
+            op.generation >= lastApplied,
+            'an applied generation can only move forward',
+          );
+          lastApplied = op.generation;
+          applied.push(op.id);
+        }
+      }
+    }
+    for (const op of pendingOps) {
+      if (fence.isCurrent(op.generation)) {
+        assert(op.generation >= lastApplied, 'drained applies move forward too');
+        lastApplied = op.generation;
+        applied.push(op.id);
+      }
+    }
+    assert(applied.length > 0, 'the fuzz must exercise at least one apply');
+    // After a final bump nothing captured before it may apply.
+    const before = fence.current();
+    fence.bump();
+    assertEqual(fence.isCurrent(before), false);
+  });
+
   await test('double click / Enter+click / triple submit admit exactly ONE start', async () => {
     for (const label of ['double click', 'Enter+click race', 'three rapid submits']) {
       const host = fakeStartHost();

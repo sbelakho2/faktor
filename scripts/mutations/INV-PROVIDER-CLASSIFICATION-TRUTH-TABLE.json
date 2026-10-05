@@ -1,0 +1,9 @@
+{
+  "id": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+  "file": "crates/provider/src/classify.rs",
+  "find": "        400 => match hint {\n            Some(ErrorHint::Auth) | Some(ErrorHint::Permission) => ErrorKind::Permission,\n            Some(ErrorHint::RateLimited) => ErrorKind::RateLimited,\n            None => ErrorKind::Malformed,\n        },",
+  "replace": "        400 => match hint {\n            Some(ErrorHint::Auth) | Some(ErrorHint::Permission) => ErrorKind::Permission,\n            Some(ErrorHint::RateLimited) => ErrorKind::Malformed,\n            None => ErrorKind::Malformed,\n        },",
+  "gate": "cargo test -p faktor-provider --lib classify",
+  "expect": "FAILED",
+  "note": "Drops the 400+rate-limit truth-table cell back to Malformed: the exhaustive status x hint test (and every adapter expectation generated from the table) must fail."
+}
