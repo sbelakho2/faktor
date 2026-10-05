@@ -169,6 +169,26 @@ function git(args, cwd) {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 }
 
+/**
+ * TRUE when the tracked working tree is clean: `git diff --exit-code` and
+ * `git diff --cached --exit-code` both succeed. Any git failure (not a
+ * worktree, missing git) is recorded as NOT clean, so the verifier fails
+ * closed rather than certifying bytes nobody proved.
+ */
+function workingTreeClean(cwd) {
+  for (const args of [
+    ['diff', '--exit-code', '--quiet'],
+    ['diff', '--cached', '--exit-code', '--quiet'],
+  ]) {
+    try {
+      execFileSync('git', ['-C', cwd, ...args], { stdio: 'ignore' });
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 function flagValue(args, name, fallback = '') {
   const idx = args.indexOf(name);
   if (idx === -1) {
@@ -269,6 +289,11 @@ export function generateMarker(options) {
     commands_digest: `sha256:${sha256Hex(commandsText)}`,
     artifacts,
     artifact_digest: artifactDigest(artifacts),
+    // P0-CERT: certifying lanes must have executed the COMMITTED bytes. The
+    // verifier rejects a lane whose marker records a dirty working tree
+    // (tracked modifications or staged changes), because HEAD^{tree} is not
+    // what ran. Untracked build outputs do not count as dirty.
+    clean: options.clean === undefined ? true : options.clean === true,
   };
   if (token) {
     record.auth = computeMarkerAuth(record, token);
@@ -335,6 +360,7 @@ function writeCommand(args) {
       ci: flagValue(args, '--runner-ci') || (process.env.CI ? 'woodpecker' : 'local'),
       run_id: flagValue(args, '--run-id') || process.env.CI_PIPELINE_NUMBER || '0',
     },
+    clean: workingTreeClean(cwd),
     token: laneTokenFromEnv(lane),
   });
   const out = resolve(cwd, flagValue(args, '--out', `target/certification/lanes/${lane}.json`));

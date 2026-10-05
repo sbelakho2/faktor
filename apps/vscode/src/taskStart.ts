@@ -1250,6 +1250,22 @@ export class ComposerAttachmentStore {
     return true;
   }
 
+  /**
+   * Remove exactly the accepted submission's entries (audit P1-VSCODE): an
+   * attachment the user added for the NEXT task while the request was in
+   * flight keeps its host id and is never cleared by a durable start.
+   * Returns the number removed.
+   */
+  removeMany(ids: readonly string[]): number {
+    let removed = 0;
+    for (const id of ids) {
+      if (this.remove(id)) {
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
   clear(): void {
     this.entries.clear();
     this.totalBytes = 0;
@@ -1266,28 +1282,38 @@ export class ComposerAttachmentStore {
    */
   select(rawIds: unknown): {
     readonly attachments: readonly PendingBinaryAttachment[];
+    readonly ids: readonly string[];
     readonly reason: string | null;
   } {
     if (!Array.isArray(rawIds)) {
-      return { attachments: [], reason: 'attachmentIds must be an array of host ids' };
+      return { attachments: [], ids: [], reason: 'attachmentIds must be an array of host ids' };
     }
     if (rawIds.length > this.maxEntries) {
-      return { attachments: [], reason: `more than ${this.maxEntries} attachments` };
+      return {
+        attachments: [],
+        ids: [],
+        reason: `more than ${this.maxEntries} attachments`,
+      };
     }
     const seen = new Set<string>();
     const attachments: PendingBinaryAttachment[] = [];
     for (const raw of rawIds) {
       if (typeof raw !== 'string' || raw.length === 0 || raw.length > 128) {
-        return { attachments: [], reason: 'attachment id must be a bounded string' };
+        return { attachments: [], ids: [], reason: 'attachment id must be a bounded string' };
       }
       if (seen.has(raw)) {
-        return { attachments: [], reason: `attachment ${JSON.stringify(raw)} was selected twice` };
+        return {
+          attachments: [],
+          ids: [],
+          reason: `attachment ${JSON.stringify(raw)} was selected twice`,
+        };
       }
       seen.add(raw);
       const entry = this.entries.get(raw);
       if (entry === undefined) {
         return {
           attachments: [],
+          ids: [],
           reason: `attachment ${JSON.stringify(raw)} is no longer attached; re-attach it and retry`,
         };
       }
@@ -1299,7 +1325,7 @@ export class ComposerAttachmentStore {
         isImage: entry.isImage,
       });
     }
-    return { attachments, reason: null };
+    return { attachments, ids: [...seen], reason: null };
   }
 
   size(): number {
@@ -1582,6 +1608,13 @@ export interface StartSubmissionSnapshot {
   readonly pending: PendingSubmission;
   readonly files: readonly string[];
   readonly contract: NativeCompletionContract | null;
+  /**
+   * The HOST-SIDE composer attachment ids this snapshot selected (empty for
+   * a legacy raw envelope). On durable acceptance ONLY these entries are
+   * cleared, so an attachment added for the next task during the request
+   * cannot be silently dropped.
+   */
+  readonly attachmentIds: readonly string[];
 }
 
 export type SubmissionStartDecision =
@@ -1727,6 +1760,7 @@ export class TaskStartGate {
     readonly pending: PendingSubmission;
     readonly files: readonly string[];
     readonly contract: NativeCompletionContract | null;
+    readonly attachmentIds?: readonly string[];
     readonly newId: () => string;
   }): SubmissionStartDecision {
     const current = this.current;
@@ -1759,6 +1793,7 @@ export class TaskStartGate {
       pending: input.pending,
       files: input.files,
       contract: input.contract,
+      attachmentIds: input.attachmentIds ?? [],
     };
     this.current = { snapshot, state: 'in_flight' };
     return { action: 'start', retry: false, snapshot };

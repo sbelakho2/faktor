@@ -17,22 +17,21 @@ pub(crate) const TASK_RUN_ROW_KIND: &str =
 /// The state tag of ONE in-session task run: the session's durable typed
 /// task row wins when it is TERMINAL (VerifiedComplete -> "Done", Failed,
 /// Cancelled) — a cancelled or verified run must not read as merely
-/// "parked"; otherwise the session's live AgentState tag applies.
+/// "parked"; otherwise the session's live AgentState tag applies. A durable
+/// read failure is LOUD (never silently "no task row").
 pub(crate) fn in_session_run_state_tag(
     handle: &faktor_session::SessionHandle,
     session_row: &faktor_store::SessionRow,
-) -> &'static str {
-    match handle
+) -> Result<&'static str, ApiError> {
+    let task = handle
         .get_task(session_row.task_id)
-        .ok()
-        .flatten()
-        .map(|t| t.state)
-    {
+        .map_err(|e| faktor_protocol::error::from_core(&e))?;
+    Ok(match task.map(|t| t.state) {
         Some(TaskState::VerifiedComplete) => "Done",
         Some(TaskState::Failed) => "Failed",
         Some(TaskState::Cancelled) => "Cancelled",
         _ => session_run_state_tag(session_row.state),
-    }
+    })
 }
 
 /// The task-run projection of a session (wave-24): every TaskExecutor run

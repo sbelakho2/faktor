@@ -107,6 +107,36 @@ pub(crate) const SHELL_CHANGE_FACT_MAX_PATHS: usize = 16;
 /// never touches the manifest caps.
 pub(crate) const SHELL_MANIFEST_SKIP_DIRS: &[&str] = &[".faktor", "node_modules", "target"];
 
+/// P1-SHELL authority contract: the canonical manifest (and therefore the
+/// manifest diff) skips VCS metadata and build/dependency trees. Mutations
+/// there can still alter SUBSEQUENT authority behavior, so the shell's
+/// attribution additionally digests the bounded authority subset of the
+/// ignored trees: VCS worktree identity (HEAD/index/config/packed-refs and
+/// refs/**) and Faktor-owned tool state (.faktor/**). Build/dependency trees
+/// remain excluded from attribution by an explicit, documented contract:
+/// they are regenerable derived state, not authority (a policy that needs
+/// them bounded must assert it elsewhere). All probes are bounded; an
+/// unreadable probe is the deterministic marker `unreadable`, so its
+/// appearance/disappearance is still a change.
+pub(crate) const SHELL_AUTHORITY_MAX_ENTRIES: usize = 1024;
+pub(crate) const SHELL_AUTHORITY_DIR_ENTRIES: usize = 512;
+pub(crate) const SHELL_AUTHORITY_FILE_READ_BYTES: usize = 8 * 1024 * 1024;
+const SHELL_AUTHORITY_PATH_MAX_BYTES: usize = 300;
+const SHELL_AUTHORITY_FIXED_PATHS: &[&str] = &[
+    ".git",
+    ".git/HEAD",
+    ".git/index",
+    ".git/config",
+    ".git/packed-refs",
+    ".git/MERGE_HEAD",
+    ".git/CHERRY_PICK_HEAD",
+    ".git/REVERT_HEAD",
+    ".git/ORIG_HEAD",
+    ".git/FETCH_HEAD",
+    ".git/shallow",
+    ".git/COMMIT_EDITMSG",
+];
+
 /// Durable memory-fact kind of one shell run's change-attribution state.
 pub(crate) const SHELL_CHANGE_FACT_KIND: &str = "shell_change";
 
@@ -196,6 +226,10 @@ pub(crate) struct ShellManifestCapture {
     pub truncated: Option<String>,
     pub pre_images: BTreeMap<String, String>,
     pub omitted_pre_images: usize,
+    /// P1-SHELL: bounded digest map of authority-relevant state inside the
+    /// trees the canonical manifest skips (.git worktree identity, refs,
+    /// Faktor tool state).
+    pub authority: BTreeMap<String, String>,
 }
 
 /// Build the shared whole-operation walk budget of one shell manifest walk.
@@ -305,6 +339,7 @@ pub(crate) fn capture_pre_shell(
         truncated,
         pre_images,
         omitted_pre_images,
+        authority: capture_authority_state(ws),
     })
 }
 
@@ -318,6 +353,7 @@ impl ShellManifestCapture {
             "cas": self.manifest_cas,
             "digest": self.digest,
             "entries": self.manifest.entries().len(),
+            "authority_entries": self.authority.len(),
             "omitted_pre_images": self.omitted_pre_images,
             "truncated": self.truncated,
         })
@@ -346,6 +382,161 @@ impl ShellManifestCapture {
             "paths": paths,
         })
     }
+}
+
+/// Probe ONE authority file (bounded read). `None` means the path does not
+/// exist as a file OR the stat itself failed before we could hash it.
+fn authority_probe_file(ws: &WorkspaceHandle, rel: &str) -> Option<String> {
+    let abs = ws.root().join(rel);
+    let meta = std::fs::symlink_metadata(&abs).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some("symlink".into());
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    match ws.read(std::path::Path::new(rel), SHELL_AUTHORITY_FILE_READ_BYTES) {
+        Ok(data) => Some(match &data.digest {
+            faktor_fs::ContentDigest::Full(hash) => hash.to_hex(),
+            faktor_fs::ContentDigest::Slice { hash, .. } => format!("slice:{}", hash.to_hex()),
+        }),
+        Err(_) => Some("unreadable".into()),
+    }
+}
+
+/// Walk one authority subtree (sorted, symlink-aware, depth- and
+/// entry-bounded). Directory symlinks are recorded as `symlink`, never
+/// followed.
+fn authority_probe_dir(
+    ws: &WorkspaceHandle,
+    rel: &str,
+    out: &mut BTreeMap<String, String>,
+    budget: &mut usize,
+) {
+    let root = ws.root().join(rel);
+    let Ok(meta) = std::fs::symlink_metadata(&root) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mut stack = vec![(std::path::PathBuf::from(rel), 0usize)];
+    while let Some((dir_rel, depth)) = stack.pop() {
+        if *budget == 0 || depth > 8 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(ws.root().join(&dir_rel)) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+        names.sort_by_key(|entry| entry.file_name());
+        for entry in names.into_iter().take(SHELL_AUTHORITY_DIR_ENTRIES) {
+            if *budget == 0 {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let child_rel = dir_rel.join(entry.file_name());
+            let child = child_rel.to_string_lossy().replace('\\', "/");
+            if child.len() > SHELL_AUTHORITY_PATH_MAX_BYTES {
+                continue;
+            }
+            *budget -= 1;
+            if file_type.is_dir() {
+                stack.push((child_rel, depth + 1));
+            } else if file_type.is_file() {
+                if let Some(hash) = authority_probe_file(ws, &child) {
+                    out.insert(child, hash);
+                }
+            } else if file_type.is_symlink() {
+                out.insert(child, "symlink".into());
+            }
+        }
+    }
+}
+
+/// Capture the bounded authority-state digest map of one workspace (P1-SHELL).
+pub(crate) fn capture_authority_state(ws: &WorkspaceHandle) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut budget = SHELL_AUTHORITY_MAX_ENTRIES;
+    for rel in SHELL_AUTHORITY_FIXED_PATHS {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        if let Some(hash) = authority_probe_file(ws, rel) {
+            out.insert((*rel).to_string(), hash);
+        }
+    }
+    authority_probe_dir(ws, ".git/refs", &mut out, &mut budget);
+    // Linked-worktree identity: HEAD and gitdir of each registered worktree.
+    let worktrees = ws.root().join(".git/worktrees");
+    if let Ok(entries) = std::fs::read_dir(&worktrees) {
+        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+        names.sort_by_key(|entry| entry.file_name());
+        for entry in names.into_iter().take(32) {
+            if budget == 0 {
+                break;
+            }
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            for leaf in ["HEAD", "gitdir"] {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                let rel = format!(".git/worktrees/{name}/{leaf}");
+                if let Some(hash) = authority_probe_file(ws, &rel) {
+                    out.insert(rel, hash);
+                }
+            }
+        }
+    }
+    authority_probe_dir(ws, ".faktor", &mut out, &mut budget);
+    out
+}
+
+/// Diff two authority-state maps into the canonical change vocabulary
+/// (added / deleted / modified, rename = delete+add).
+pub(crate) fn diff_authority(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<ShellFileChange> {
+    let mut keys: Vec<&String> = before.keys().chain(after.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut changes = Vec::new();
+    for key in keys {
+        match (before.get(key), after.get(key)) {
+            (None, Some(after_hash)) => changes.push(ShellFileChange {
+                path: key.clone(),
+                status: ShellChangeStatus::Added,
+                before_hash: None,
+                after_hash: Some(after_hash.clone()),
+            }),
+            (Some(before_hash), None) => changes.push(ShellFileChange {
+                path: key.clone(),
+                status: ShellChangeStatus::Deleted,
+                before_hash: Some(before_hash.clone()),
+                after_hash: None,
+            }),
+            (Some(before_hash), Some(after_hash)) => {
+                if before_hash != after_hash {
+                    changes.push(ShellFileChange {
+                        path: key.clone(),
+                        status: ShellChangeStatus::Modified,
+                        before_hash: Some(before_hash.clone()),
+                        after_hash: Some(after_hash.clone()),
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    changes
 }
 
 /// Diff two canonical manifests into the bounded actual change set. Both
@@ -545,7 +736,7 @@ impl AgentRuntime {
         let outcome = (tool.execute)(ctx, args).await?;
         match capture_manifest(&ws) {
             Ok(after) => {
-                let set = diff_manifests(
+                let mut set = diff_manifests(
                     &capture.manifest,
                     &after,
                     capture.pre_images.clone(),
@@ -553,6 +744,22 @@ impl AgentRuntime {
                     capture.digest.clone(),
                     after.digest().ok(),
                 );
+                // P1-SHELL: ignored-tree AUTHORITY changes (VCS worktree
+                // identity, refs, Faktor tool state) are attributed FIRST so
+                // the bounded durable row cap can never starve them.
+                let after_authority = capture_authority_state(&ws);
+                let mut changes = diff_authority(&capture.authority, &after_authority);
+                changes.extend(set.changes);
+                if changes.len() > SHELL_MANIFEST_MAX_CHANGES {
+                    set.truncated.get_or_insert_with(|| {
+                        format!(
+                            "more than {} changed paths (report truncated at the bound)",
+                            SHELL_MANIFEST_MAX_CHANGES
+                        )
+                    });
+                    changes.truncate(SHELL_MANIFEST_MAX_CHANGES);
+                }
+                set.changes = changes;
                 shell_changes.lock().unwrap().insert(op, set);
             }
             Err(reason) => {

@@ -305,30 +305,39 @@ pub(crate) async fn native_session_tasks(
     // typed task row exists yet (null-safe pre-first-reservation: a typed
     // row without any reservation reads openReservedMicro 0).
     let mut budget: Option<serde_json::Value> = None;
-    if let Ok(Some(task)) = handle.get_task(row.task_id) {
-        let cost = state
+    // Durable read failures are LOUD: a store error must never project as
+    // "no budget"/"$0 reserved" on the money surface (error is not absence).
+    let task_row = match handle.get_task(row.task_id) {
+        Ok(t) => t,
+        Err(e) => return api_err(&e),
+    };
+    if let Some(task) = task_row {
+        let cost = match state
             .deps
             .session
             .store()
             .cost_task_row(handle.id(), row.task_id)
-            .ok()
-            .flatten();
+        {
+            Ok(c) => c,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
         // In-flight reservations (schema v17 vocabulary: `reserved` —
         // dispatch never provably began — and `dispatched`, the request left
         // the process and may have billed) both hold their prediction; the
         // v15-era `open` state was renamed away at schema v17 and never
         // occurs in a migrated store.
-        let open_micro = state
-            .deps
-            .session
-            .store()
-            .cost_reservations_of(handle.id(), row.task_id, MAX_NATIVE_RESERVATIONS_SCAN)
-            .map(|rs| {
-                rs.iter()
-                    .filter(|r| r.status == "reserved" || r.status == "dispatched")
-                    .fold(0u64, |acc, r| acc.saturating_add(r.predicted_micro))
-            })
-            .unwrap_or(0);
+        let reservations = match state.deps.session.store().cost_reservations_of(
+            handle.id(),
+            row.task_id,
+            MAX_NATIVE_RESERVATIONS_SCAN,
+        ) {
+            Ok(rs) => rs,
+            Err(e) => return api_err(&store_err_to_core(e)),
+        };
+        let open_micro = reservations
+            .iter()
+            .filter(|r| r.status == "reserved" || r.status == "dispatched")
+            .fold(0u64, |acc, r| acc.saturating_add(r.predicted_micro));
         budget = Some(serde_json::json!({
             "maxTokens": task.budget.max_tokens,
             "maxTurns": task.budget.max_turns,
@@ -339,6 +348,10 @@ pub(crate) async fn native_session_tasks(
             "openReservedMicro": money::json(open_micro),
         }));
     }
+    let verification = match native_verification_facts(&handle) {
+        Ok(v) => v,
+        Err(e) => return api_err(&e),
+    };
     let progress = state
         .deps
         .agent
@@ -357,7 +370,7 @@ pub(crate) async fn native_session_tasks(
             "failed": ledger_strings(&ledger, "tests_failed"),
         },
         "preferences": ledger_strings(&ledger, "user_preferences"),
-        "verification": native_verification_facts(&handle),
+        "verification": verification,
         "progress": progress,
         "budget": budget,
     }]))
@@ -2111,21 +2124,22 @@ mod tests {
         );
     }
 
-    /// A key whose claim is still pending is an in-flight 409 BEFORE any
-    /// `PromptReceived` append or queue/message write: the claim is the
-    /// first durable act of the prompt path.
+    /// A key whose claim is still pending with the SAME body is an in-flight
+    /// 409 BEFORE any `PromptReceived` append or queue/message write: the
+    /// claim is the first durable act of the prompt path.
     #[tokio::test]
-    async fn prompt_pending_key_is_an_in_flight_409_before_any_mutation() {
+    async fn prompt_pending_key_with_the_same_body_is_an_in_flight_409_before_any_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let (state, sid) = test_state(dir.path(), "prompt-in-flight");
         let handle = state.deps.session.get_session(sid).unwrap().unwrap();
         let store = state.deps.session.store();
+        let digest = prompt_admission_digest(sid, "hi", &[]);
         assert_eq!(
             store
                 .prompt_admission_claim(
                     sid,
                     PROMPT_KEY,
-                    "digest-from-another-writer",
+                    &digest,
                     "tx-00000000000000bb",
                     handle.now_ms()
                 )
@@ -2151,6 +2165,43 @@ mod tests {
         );
         assert_eq!(store.message_count(sid).unwrap(), 0, "no message row");
         assert_eq!(handle.queued_prompt_count().unwrap(), 0, "no queue row");
+    }
+
+    /// A pending key whose stored digest is DIFFERENT from this body is the
+    /// typed key-reuse conflict (never a lease-long in-flight answer), with
+    /// zero mutation: no `PromptReceived` append, message or queue row.
+    #[tokio::test]
+    async fn prompt_pending_key_with_a_different_body_is_a_typed_key_reuse_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "prompt-pending-key-reused");
+        let handle = state.deps.session.get_session(sid).unwrap().unwrap();
+        let store = state.deps.session.store();
+        assert_eq!(
+            store
+                .prompt_admission_claim(
+                    sid,
+                    PROMPT_KEY,
+                    "digest-from-another-writer",
+                    "tx-00000000000000bc",
+                    handle.now_ms()
+                )
+                .unwrap(),
+            PromptAdmissionClaim::Fresh
+        );
+        let (status, text) = prompt_call(&state, sid, prompt_body(sid, PROMPT_KEY, "hi")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["code"], "conflict", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("different prompt"),
+            "a pending key with different bytes names the reuse, not in-flight: {body}"
+        );
+        assert_eq!(prompt_received_count(&handle), 0);
+        assert_eq!(store.message_count(sid).unwrap(), 0);
+        assert_eq!(handle.queued_prompt_count().unwrap(), 0);
     }
 
     /// A known pre-admission refusal (an empty prompt) releases the claimed

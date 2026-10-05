@@ -1239,6 +1239,7 @@ mod openai_contract_tests {
             (404, bare, ProviderErrorKind::BadRequest, false),
             // Structured body hints override the bare status.
             (400, bad_key, ProviderErrorKind::Auth, false),
+            (400, quota, ProviderErrorKind::RateLimited, true),
             (403, quota, ProviderErrorKind::RateLimited, true),
             (403, denied, ProviderErrorKind::Auth, false),
         ] {

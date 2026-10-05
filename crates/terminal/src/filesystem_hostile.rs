@@ -227,6 +227,105 @@ fn confined_child_cannot_write_traverse_or_symlink_out() {
     }
 }
 
+/// (P0-SEC) The anchored Landlock root acquisition refuses a symlink at ANY
+/// component: the workspace root swapped to an outside symlink can never
+/// redirect the granted rights, and intermediate symlink components are
+/// equally rejected. Direct, deterministic unit test of the pre-exec
+/// acquisition primitive.
+#[test]
+fn anchored_root_acquisition_refuses_every_symlink_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(real.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    // The real directory opens and pins the object.
+    crate::sandbox::anchored_open_probe(&real).expect("real dir opens");
+
+    // Final component swapped to an outside symlink: ELOOP, never the
+    // outside object.
+    let linked = dir.path().join("linked");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let err = crate::sandbox::anchored_open_probe(&linked).unwrap_err();
+    assert!(
+        matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+        "a symlinked workspace root must be refused (ELOOP/ENOTDIR), got {err:?}"
+    );
+
+    // Intermediate component symlink: equally refused (each component is the
+    // final component of its own openat).
+    let hop = dir.path().join("hop");
+    std::os::unix::fs::symlink(&real, &hop).unwrap();
+    let err = crate::sandbox::anchored_open_probe(&hop.join("sub")).unwrap_err();
+    assert!(
+        matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+        "an intermediate symlink component must be refused, got {err:?}"
+    );
+
+    // `.`/`..` components are refused outright.
+    let err = crate::sandbox::anchored_open_probe(Path::new(&format!("{}/./sub", real.display())))
+        .unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    let err = crate::sandbox::anchored_open_probe(Path::new(&format!("{}/sub/..", real.display())))
+        .unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+
+    // Relative paths are refused (the anchor must be the real root).
+    let err = crate::sandbox::anchored_open_probe(Path::new("real")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+}
+
+/// (P0-SEC) Deterministic pre-exec seam: the policy path is captured, THEN
+/// the workspace root is swapped for an outside symlink BEFORE the child is
+/// spawned. The anchored acquisition must refuse the Required spawn typed
+/// (before exec): the outside marker is never read or written and the child
+/// program body never runs.
+#[test]
+fn workspace_root_swapped_to_a_symlink_is_refused_before_exec() {
+    let _serial = serial();
+    if !landlock_available() {
+        return; // Required is typed-refused everywhere on this kernel
+    }
+    let (_d, sup) = supervisor();
+    let w = workspace();
+    // The spawn config below captures `w.ws` as the policy root. Swap it for
+    // a symlink to the outside directory first.
+    let real = w.ws.with_extension("real");
+    std::fs::rename(&w.ws, &real).unwrap();
+    std::os::unix::fs::symlink(&w.outside, &w.ws).unwrap();
+    let marker = w.outside.join("swapped-marker.txt");
+    assert!(!marker.exists());
+
+    let cfg = confined(
+        "/bin/sh",
+        vec!["-c".into(), format!("echo pwned > '{}'", marker.display())],
+        &w.ws,
+        vec![w.ws.clone()],
+        true,
+    );
+    let err = sup
+        .run_sync(cfg, Duration::from_secs(10), 64 * 1024, 64 * 1024)
+        .unwrap_err();
+    assert_eq!(
+        err.kind,
+        faktor_core::error::ErrorKind::Permission,
+        "a symlink-swapped workspace root must refuse the Required spawn typed: {err:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "the refused child never exec'd and never wrote outside"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&w.secret).unwrap(),
+        "top-secret-outside"
+    );
+
+    // Restore the directory shape so the fixture's Drop cleanup sees a dir.
+    std::fs::remove_file(&w.ws).unwrap();
+    std::fs::rename(&real, &w.ws).unwrap();
+}
+
 /// (b) The confined child still fully reads, writes, creates, renames and
 /// removes inside its workspace root.
 #[test]

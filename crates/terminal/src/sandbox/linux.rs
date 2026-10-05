@@ -1865,10 +1865,106 @@ const ACCESS_WORKSPACE_ROOT: u64 = u64::MAX;
 /// [`ACCESS_WORKSPACE_ROOT`] or a concrete right mask; `optional` marks the
 /// fixed runtime entries (a missing library path is skipped) as opposed to
 /// a configured workspace root (missing is a refusal under `Required`).
+/// Test-only safe probe for the anchored acquisition primitive: builds the
+/// C string, opens, and closes, returning the raw error. Runs in the parent
+/// process (never in a forked child), so allocation is fine here.
+#[cfg(test)]
+pub(crate) fn anchored_open_probe(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: the C string is live for the call; the fd is closed here.
+    let fd = unsafe { open_dir_no_symlinks(&c) }?;
+    // SAFETY: `fd` came from open_dir_no_symlinks and is owned here.
+    unsafe {
+        libc::close(fd);
+    }
+    Ok(())
+}
+
+/// A pre-built Landlock path rule. `anchored` marks UNTRUSTED workspace
+/// roots: those are opened with a component-by-component `openat`
+/// `O_NOFOLLOW` walk from `/` in the pre-exec child (P0-SEC), so a root
+/// swapped to a symlink after policy resolution can never redirect the
+/// granted rights to an outside object. Static trusted runtime paths keep
+/// the plain `O_PATH` open (some, like `/lib`, are distribution symlinks).
 struct FsRule {
     path: std::ffi::CString,
     access: u64,
     optional: bool,
+    anchored: bool,
+}
+
+/// Open an absolute directory path with NO symlink following at any
+/// component: `/` is opened as the anchor, then every component with
+/// `openat(O_PATH | O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)`. `.`/`..`
+/// components are refused. The returned fd is the pinned object identity the
+/// Landlock rule is added against; a symlink anywhere in the path is ELOOP
+/// (fail closed).
+///
+/// # Safety
+///
+/// Calls raw libc syscalls with a NUL-terminated path; the caller owns the
+/// returned fd.
+// SAFETY: callers pass only NUL-terminated absolute paths from the captured
+// rule table and close the returned O_PATH fd exactly once.
+pub(crate) unsafe fn open_dir_no_symlinks(path: &std::ffi::CStr) -> io::Result<i32> {
+    let bytes = path.to_bytes();
+    if !bytes.starts_with(b"/") {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let anchor = c"/";
+    // SAFETY: the anchor literal is a valid NUL-terminated path; O_PATH fd
+    // ownership transfers to `fd` below.
+    let mut fd = unsafe {
+        libc::open(
+            anchor.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for component in bytes[1..].split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == b"." || component == b".." {
+            // SAFETY: `fd` is owned here.
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let name = match std::ffi::CString::new(component) {
+            Ok(name) => name,
+            Err(_) => {
+                // SAFETY: `fd` is owned here.
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        };
+        // SAFETY: `fd` is a live directory fd; `name` is NUL-terminated and
+        // owned here; O_NOFOLLOW turns any symlink component into ELOOP.
+        let next = unsafe {
+            libc::openat(
+                fd,
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        // SAFETY: `fd` is owned here and never used again.
+        unsafe {
+            libc::close(fd);
+        }
+        if next < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        fd = next;
+    }
+    Ok(fd)
 }
 
 /// `struct landlock_ruleset_attr` (linux/landlock.h), ABI v1 field. The
@@ -1918,6 +2014,7 @@ pub(crate) unsafe fn apply_workspace_isolation(
                 path,
                 access: ACCESS_WORKSPACE_ROOT,
                 optional: false,
+                anchored: true,
             }),
             Err(_) => invalid_root = true,
         }
@@ -1940,6 +2037,7 @@ pub(crate) unsafe fn apply_workspace_isolation(
             path: std::ffi::CString::new(*path).expect("static runtime path has no NUL"),
             access,
             optional: true,
+            anchored: false,
         });
     }
     for path in RUNTIME_DEVICE_PATHS {
@@ -1950,6 +2048,7 @@ pub(crate) unsafe fn apply_workspace_isolation(
             path: std::ffi::CString::new(*path).expect("static runtime path has no NUL"),
             access: LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
             optional: true,
+            anchored: false,
         });
     }
     // SAFETY (of the pre_exec call): std requires the caller to uphold the
@@ -2024,12 +2123,26 @@ fn workspace_isolation_pre_exec(
     let ruleset_fd = ruleset as i32;
     let mut failure: Option<io::Error> = None;
     for rule in rules {
-        // O_PATH opens the object without read permission and without
-        // following a final symlink; it is the fd kind Landlock accepts as
-        // `parent_fd`.
-        // SAFETY: `rule.path` is a NUL-terminated C string owned by the
-        // captured table; the returned fd is checked and closed below.
-        let fd = unsafe { libc::open(rule.path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        // O_PATH opens the object without read permission. UNTRUSTED
+        // workspace roots go through the anchored component-by-component
+        // O_NOFOLLOW walk (P0-SEC): the fd Landlock receives is the pinned
+        // object, never a path re-resolved through a swapped symlink.
+        let fd = if rule.anchored {
+            // SAFETY: `rule.path` is a NUL-terminated C string owned by the
+            // captured table; `open_dir_no_symlinks` returns an owned fd that
+            // is checked below (and closed after `landlock_add_rule`).
+            match unsafe { open_dir_no_symlinks(&rule.path) } {
+                Ok(fd) => fd,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        } else {
+            // SAFETY: `rule.path` is a NUL-terminated C string owned by the
+            // captured table; the returned fd is checked and closed below.
+            unsafe { libc::open(rule.path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+        };
         if fd < 0 {
             let e = io::Error::last_os_error();
             if rule.optional

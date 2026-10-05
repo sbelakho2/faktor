@@ -362,15 +362,60 @@ fun workspaceRelativePath(path: String, workspaceRoot: Path?): String {
     return relative
 }
 
-/** The local [File] one attachment path resolves to for a bounded read. */
-private fun readableAttachmentFile(path: String, workspaceRoot: Path?): File {
+/**
+ * Read one attachment under the session workspace with AUTHORITATIVE object
+ * identity (P1-JETBRAINS): the lexical check alone can be satisfied by an
+ * in-workspace symlink that resolves outside, so the candidate's real path
+ * (symlinks resolved) must be contained in the workspace's real path, and
+ * the identity is RE-VALIDATED after the read — a check→read swap that
+ * changed the opened object refuses instead of uploading outside content.
+ * A missing/non-regular/oversized file is `null` (typed refusal upstream).
+ */
+internal fun readAttachmentBounded(path: String, workspaceRoot: Path?, maxBytes: Long): ByteArray? {
     val relative = workspaceRelativePath(path, workspaceRoot)
     val root = normalizedWorkspaceRoot(workspaceRoot)
         ?: throw AttachmentRefusal(
             "workspace_unknown",
             "attachment \"$path\" cannot be resolved without a session workspace root"
         )
-    return root.resolve(relative).toFile()
+    val rootReal = try {
+        root.toRealPath()
+    } catch (e: Exception) {
+        throw AttachmentRefusal(
+            "workspace_unknown",
+            "session workspace $root cannot be resolved: ${e.message}"
+        )
+    }
+    val candidate = root.resolve(relative)
+    val real = try {
+        candidate.toRealPath()
+    } catch (e: NoSuchFileException) {
+        return null
+    } catch (e: Exception) {
+        throw AttachmentRefusal("outside_workspace", "attachment \"$path\" cannot be resolved: ${e.message}")
+    }
+    if (real == rootReal || !real.startsWith(rootReal)) {
+        throw AttachmentRefusal(
+            "outside_workspace",
+            "attachment \"$path\" resolves outside the session workspace $rootReal"
+        )
+    }
+    val bytes = AttachmentImages.readBounded(real.toFile(), maxBytes) ?: return null
+    val after = try {
+        candidate.toRealPath()
+    } catch (e: Exception) {
+        throw AttachmentRefusal(
+            "outside_workspace",
+            "attachment \"$path\" changed identity during the read"
+        )
+    }
+    if (after != real) {
+        throw AttachmentRefusal(
+            "outside_workspace",
+            "attachment \"$path\" changed identity during the read"
+        )
+    }
+    return bytes
 }
 
 /**
@@ -455,8 +500,7 @@ fun planAttachments(
                         policy.imageMimes.joinToString(", ") + ")"
                 )
             }
-            val file = readableAttachmentFile(path, workspaceRoot)
-            val bytes = AttachmentImages.readBounded(file, policy.maxImageBytes)
+            val bytes = readAttachmentBounded(path, workspaceRoot, policy.maxImageBytes)
                 ?: throw AttachmentRefusal(
                     "oversized_image",
                     "image attachment $name is not a regular file or exceeds the advertised " +
@@ -501,8 +545,7 @@ fun planAttachments(
                     )
                 }
             }
-            val file = readableAttachmentFile(path, workspaceRoot)
-            val bytes = AttachmentImages.readBounded(file, policy.maxDocumentBytes)
+            val bytes = readAttachmentBounded(path, workspaceRoot, policy.maxDocumentBytes)
                 ?: throw AttachmentRefusal(
                     "oversized_document",
                     "document attachment $name is not a regular file or exceeds the advertised " +

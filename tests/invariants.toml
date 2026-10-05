@@ -166,13 +166,13 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-TASK-START-IDEMPOTENT"
-statement = "One submission key admits one task: a completed key replays the byte-identical receipt with zero mutations, a live pending key refuses in-flight, a stale/previous-boot pending row is recovery-resolved instead of a perpetual in-flight refusal, and a reused key with a different digest is the typed KeyReused."
+statement = "One submission key admits one task: a completed key replays the byte-identical receipt with zero mutations, a live pending key with the SAME digest refuses in-flight while a pending/stale key with a DIFFERENT digest is the typed KeyReused (claim and peek alike), and a stale/previous-boot pending row is recovery-resolved instead of a perpetual in-flight refusal."
 owner = "crates/store task_admission + crates/orchestrator task_executor"
 authority = "crates/store/src/task_admission.rs Store::task_admission_claim; crates/orchestrator/src/task_executor/mod.rs TaskExecutor::start_task"
 unit_test = "claim_fresh_then_complete_replays_the_exact_receipt_bytes"
 production_wiring = "submission_key_replay_returns_the_byte_identical_receipt_without_a_second_run"
 fault = ""
-mutation_witness = "same_key_with_a_different_digest_is_in_flight_while_live_then_key_reused"
+mutation_witness = "same_key_with_a_different_digest_is_key_reused_in_every_pending_state"
 mutation_command = "node scripts/mutation-run.mjs INV-TASK-START-IDEMPOTENT"
 mutation_debt = ""
 release_critical = true
@@ -382,12 +382,12 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-PROMPT-START-IDEMPOTENT"
-statement = "An ordinary prompt carries a client submission id; a repeated key with the same body replays the stored receipt byte-for-byte (no second prompt/queue/journal row), a different body is KeyReused, and a pending key is a typed in-flight 409 claimed before any mutation."
+statement = "An ordinary prompt carries a client submission id; a repeated key with the same body replays the stored receipt byte-for-byte (no second prompt/queue/journal row), a pending or completed key with a different body is the typed KeyReused (never a lease-long in-flight answer), and a byte-identical live pending key is a typed in-flight 409 claimed before any mutation."
 owner = "crates/store + crates/server prompt admission"
 authority = "prompt_admission_claim and native_prompt"
 unit_test = "prompt_claim_fresh_then_complete_replays_the_exact_receipt_bytes"
 production_wiring = "prompt_replay_returns_the_stored_receipt_byte_for_byte_with_one_prompt_row"
-mutation_witness = "prompt_same_key_with_a_different_digest_is_key_reused_after_completion"
+mutation_witness = "prompt_same_key_with_a_different_digest_is_key_reused_at_every_state"
 mutation_command = "node scripts/mutation-run.mjs INV-PROMPT-START-IDEMPOTENT"
 mutation_debt = ""
 release_critical = true
@@ -421,7 +421,7 @@ platforms = ["linux", "macos", "windows"]
 [[invariant]]
 id = "INV-SANDBOX-PRIVILEGE-DROP"
 statement = "A confined shell drops every capability, sets NO_NEW_PRIVS, and cannot setns back to the host network namespace; any failed drop refuses typed."
-owner = "crates/terminal sandbox/linux.rs"
+owner = "crates/terminal + crates/sandbox sandbox/linux.rs"
 authority = "crates/terminal sandbox/linux.rs"
 unit_test = "deny_all_spawn_isolates_the_child_or_refuses_typed"
 production_wiring = "deny_all_is_refused_before_spawn_without_a_backend"
@@ -463,7 +463,7 @@ platforms = ["linux", "macos", "windows"]
 [[invariant]]
 id = "INV-REDACTION-CAP-FAIL-CLOSED"
 statement = "A redaction cap never passes the unprocessed tail through: decoys cannot shield a later real secret and the tail becomes a fixed truncation marker."
-owner = "crates/security + provider sanitize + commerce-connectors"
+owner = "crates/security + crates/provider sanitize + crates/commerce-connectors"
 authority = "crates/security + provider sanitize + commerce-connectors"
 unit_test = "decoy_hits_before_the_real_secret_never_expose_it"
 production_wiring = "property_no_pattern_secret_survives_any_decoy_count"
@@ -629,7 +629,7 @@ platforms = ["linux", "macos", "windows"]
 [[invariant]]
 id = "INV-RUNTIME-PATH-CANONICALIZATION"
 statement = "The orchestrator runtime resolves every mutating ownership spelling through one canonical workspace-path vocabulary before any spawn, so a `.`-alias spelling is a typed plan violation and can never dodge overlap analysis or widen ownership."
-owner = "crates/core path + crates/orchestrator runtime"
+owner = "crates/core path + crates/scheduler path_identity + crates/orchestrator runtime"
 authority = "crates/core/src/path.rs NormalizedWorkspacePath::new; crates/orchestrator/src/runtime.rs check_plan_disjointness_canonical"
 unit_test = "canonicalized_overlapping_spellings_are_refused_before_spawn"
 production_wiring = "workspace_root_sentinel_survives_canonicalization"
@@ -670,9 +670,9 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-CI-THREE-PLATFORM-AGGREGATE"
-statement = "The release aggregate status may only become success when linux, darwin and windows per-platform certificates are all success for the same tree, each run-bound to its own platform AND all from one pipeline run (stale cross-pipeline certificates refuse); a missing, failing, stale or duplicated platform can never aggregate green."
+statement = "The release aggregate status may only become success when linux, darwin and windows per-platform certificates are all success for the same tree, each run-bound to its own platform, all from one pipeline run (stale cross-pipeline certificates refuse), AND each signed with its platform's OWN secret over the canonical platform/sha/tree/run/state/context payload (unsigned, key-missing or wrongly-signed platforms refuse — unattested is never a pass). A missing, failing, stale or duplicated platform can never aggregate green; the aggregate is main-push-only and a workflow-graph selftest proves every aggregate invocation has all three producers for every event × branch × platform combination."
 owner = "scripts/certification publish-status"
-authority = "scripts/certification/publish-status.mjs AGGREGATE_CONTEXTS/aggregateVerdict (wired in .woodpecker/trusted/trusted.yaml)"
+authority = "scripts/certification/publish-status.mjs AGGREGATE_CONTEXTS/aggregateVerdict/platformSignature (wired in .woodpecker/trusted/trusted.yaml; graph proven by scripts/certification/check-workflow-graph.mjs)"
 script_check = "node scripts/certification/publish-status.mjs selftest"
 mutation_witness = "node scripts/certification/publish-status.mjs selftest"
 mutation_command = "node scripts/mutation-run.mjs INV-CI-THREE-PLATFORM-AGGREGATE"
@@ -683,11 +683,35 @@ platforms = ["linux"]
 [[invariant]]
 id = "INV-FROZEN-CONTRACTS"
 statement = "Every frozen contract vocabulary (ErrorKind, ProviderErrorKind, AgentState, TaskState, EventKind, ReasonCode, native DTO tags and the core error-code map) is generated from the compiled serde implementation; any rename or reorder in docs/contracts fails the gate until deliberately rewritten."
-owner = "docs/contracts + crates/contracts"
+owner = "docs/contracts + crates/contracts + crates/core + crates/protocol"
 authority = "cargo run -p faktor-contracts -- check (wired in .woodpecker/trusted/trusted.yaml static lane; the certificate evidence names contracts_digest)"
 script_check = "cargo run -p faktor-contracts -- check"
 mutation_witness = ""
 mutation_command = "node scripts/mutation-run.mjs INV-FROZEN-CONTRACTS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+statement = "Every HTTP status x structured-hint cell maps to exactly one typed provider error kind through the central classifier, including 400 with a rate-limit/quota hint (RateLimited, retryable) and 400/403 with auth/permission hints (Permission); the exhaustive truth table and every adapter expectation generated from it fail if any cell changes."
+owner = "crates/provider + adapters (anthropic, deepseek, gateway, google, ollama, openai)"
+authority = "crates/provider/src/classify.rs classification_table/classify_http_hint; adapter HTTP-error tests (crates/openai, crates/anthropic, crates/deepseek, crates/gateway, crates/google, crates/ollama) iterate the table"
+script_check = "cargo test -p faktor-provider --lib classify"
+mutation_witness = "exhaustive_status_hint_table_is_the_single_authority"
+mutation_command = "node scripts/mutation-run.mjs INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CAPABILITY-COVERAGE"
+statement = "Every local production crate/package is classified in tests/invariant-coverage.json as release-critical (owned by a registered release-critical invariant), covered (transitively named by registered release-critical invariants), or an explicit gap with a reason; a new crate, an unknown owner or an empty disposition fails the mechanical cargo-metadata completeness check."
+owner = "tests/invariant-coverage.json + scripts/check-invariant-coverage.mjs"
+authority = "scripts/check-invariant-coverage.mjs --check (cargo metadata + registry); wired in .woodpecker/trusted/trusted.yaml linux certificate lane"
+script_check = "node scripts/check-invariant-coverage.mjs --check"
+mutation_witness = "node scripts/check-invariant-coverage.mjs selftest"
+mutation_command = "node scripts/mutation-run.mjs INV-CAPABILITY-COVERAGE"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]

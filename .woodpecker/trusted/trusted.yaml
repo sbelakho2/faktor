@@ -71,6 +71,32 @@
 # `unattested` — visible, never silently passed — with no hard failure:
 # binding is opt-in per configured secret.
 #
+# Clean-checkout binding (P0-CERT): every marker records `clean` (true only
+# when `git diff --exit-code` and `git diff --cached --exit-code` both pass
+# at marker time). `verify-markers` rejects a lane whose marker records a
+# dirty tracked tree: the recorded HEAD^{tree} is not what ran, so the
+# evidence cannot certify. The mutation campaign never touches this tree at
+# all (scripts/mutation-run.mjs runs every planted edit and gate in an
+# isolated copy and check-invariants hashes this checkout continuously while
+# the campaign runs).
+#
+# Platform certificate authentication (P0-CERT, MANDATORY — not opt-in): each
+# per-platform certificate status is HMAC-SHA256-signed over the canonical
+# `faktor-platform-cert/v1` payload (platform/sha/tree/run/state/context)
+# with that platform's OWN secret:
+#
+#   linux    faktor_platform_status_key_linux
+#   darwin   faktor_platform_status_key_darwin
+#   windows  faktor_platform_status_key_windows
+#
+# Register all three on the TRUSTED project. The aggregate step receives all
+# three and publishes green ONLY when every platform status signature
+# verifies with its own key; a missing secret, a missing signature or a
+# signature minted with the wrong platform key is a conclusive non-success.
+# The linux publisher (node), the darwin publisher (python3) and the windows
+# publisher (PowerShell) pin the same canonical-payload test vector so the
+# three implementations cannot drift.
+#
 # Agent routing: `labels.platform` is the documented agent selector. The
 # deprecated `runs_on` key is NOT an agent selector in 3.x (it feeds the
 # run-on-success/failure flag of dependent tasks and would make a workflow
@@ -127,10 +153,14 @@
 # certification require ONLY the dedicated non-matrix aggregate below, which
 # the certificate/status steps publish after every required lane passed:
 # `ci/faktor/trusted-certified-linux`, `...-darwin`, `...-windows` are the
-# per-platform facts; `ci/faktor/trusted-certified` is published ONLY on push
-# by `status-publish` after ALL THREE exact-SHA, same-tree, same-pipeline-run
-# platform certificates are green (a missing, stale or failing platform
-# publishes a conclusive non-success instead).
+# per-platform facts; `ci/faktor/trusted-certified` is published ONLY on
+# pushes to main by `status-publish` after ALL THREE exact-SHA, same-tree,
+# same-pipeline-run platform certificates are green AND each signature
+# verifies with its platform's own key (a missing, UNATTESTED, stale or
+# failing platform publishes a conclusive non-success instead).
+# `scripts/certification/check-workflow-graph.mjs` proves for every
+# event × branch × platform combination that every aggregate invocation has
+# a producer for every mandatory input.
 
 matrix:
   platform:
@@ -262,6 +292,9 @@ steps:
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
       - cargo test -p faktor-tests-fuzz-seeds
+      # Central provider classifier: the exhaustive status x hint truth table
+      # (audit P1: 400 + structured rate-limit/quota hints stay retryable).
+      - cargo test -p faktor-provider --lib classify
       # Frozen contracts: regenerate every vocabulary from the COMPILED types
       # and fail on any rename/reorder in docs/contracts. This is the
       # cargo-capable half; the certificate lane re-hashes the frozen bytes
@@ -837,6 +870,11 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # P1-ASSURANCE: every production crate enumerated from cargo metadata
+      # must carry an explicit disposition (release-critical owner, covered
+      # via registered invariants, or a documented gap). Unknown owners and
+      # unclassified new crates fail.
+      - node scripts/check-invariant-coverage.mjs selftest && node scripts/check-invariant-coverage.mjs --check
       # README/docs capability claims are enforced HERE because this is the
       # node-carrying lane (`check-docs-sync.sh` skips the check without node).
       - node scripts/capabilities-manifest.mjs --selftest && node scripts/capabilities-manifest.mjs --check-claims
@@ -849,6 +887,14 @@ steps:
       # file against manifest.json and binds the contract digest into the
       # certificate evidence below.
       - node scripts/contracts/emit.mjs selftest
+      # P1-PROOF: ONE top-level gate binding the offline-provable release
+      # facts (registry, coverage, workflow graph, publishers, soak sampler,
+      # visual record, contracts) to the ACTUAL checkout bytes — the hash of
+      # every tracked worktree file, not merely HEAD^{tree} — and refusing a
+      # dirty checkout. Runtime-only facts (platform authentication, mutation
+      # tree barrier, quiescence, host UI matrices) stay explicit in the
+      # report's `not_proven_here` list and are enforced by their own lanes.
+      - node scripts/certification/prove-all.mjs
       - |
         set -eu
         contracts_digest="$(node scripts/contracts/emit.mjs verify --print-digest)"
@@ -860,7 +906,9 @@ steps:
 
   # P0-1: the linux platform's own exact-SHA status. The aggregate below
   # requires ALL THREE platform contexts; a missing or failing platform can
-  # never aggregate green.
+  # never aggregate green. The publisher signs the fact with the linux
+  # platform key (P0-CERT), so only the linux lane can mint a linux
+  # certificate.
   - name: certificate-status-linux
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on: [certificate]
@@ -870,6 +918,7 @@ steps:
       status: [success, failure]
     environment:
       GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+      faktor_platform_status_key_linux: { from_secret: faktor_platform_status_key_linux }
     commands:
       - node scripts/certification/publish-status.mjs selftest
       - |
@@ -881,8 +930,8 @@ steps:
         fi
         node scripts/certification/publish-status.mjs publish \
           --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" --state "$state" \
+          --platform linux --tree "$tree" --run-prefix "$CI_PIPELINE_NUMBER" \
           --context ci/faktor/trusted-certified-linux \
-          --description "platform=linux tree=$tree run=$CI_PIPELINE_NUMBER:linux" \
           --target-url "${CI_PIPELINE_URL:-https://woodpecker.invalid/pipelines/$CI_PIPELINE_NUMBER}"
         [ "$state" = success ]
 
@@ -894,8 +943,9 @@ steps:
   # Woodpecker's own forge integration as the pipeline's error status for the
   # same context; scripts/certify.sh re-verifies conclusiveness for the exact
   # shipped SHA through the GitHub API (check_forge_metadata, audit 22/23).
-  # FAIL-CLOSED: the step needs the `faktor_github_status_token` secret; a
-  # missing secret or a non-2xx API answer fails the step (no silent skip).
+  # FAIL-CLOSED: the step needs the `faktor_github_status_token` secret and
+  # the three platform keys; a missing secret or a non-2xx API answer fails
+  # the step (no silent skip).
   - name: status-publish
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -904,20 +954,34 @@ steps:
     when:
       matrix:
         platform: linux/amd64
-      # PUSH ONLY: the aggregate is the branch-protection context. Tag events
-      # run only the linux axis (darwin/windows are main-push lanes), so a
-      # three-platform aggregate can never conclude there; the tagged commit
-      # already carries the push pipeline's aggregate status for the same SHA
-      # and certify.sh binds release certification to that exact-SHA fact.
+      # PUSH + MAIN ONLY: this aggregate is the branch-protection context.
+      # Tag events and non-main pushes run only the linux axis (darwin and
+      # windows are main-push lanes), so a three-platform aggregate can never
+      # conclude there; the tagged/main commit already carries the push
+      # pipeline's aggregate status for the same SHA and certify.sh binds
+      # release certification to that exact-SHA fact. check-workflow-graph.mjs
+      # proves every aggregate invocation has all three producers (P1-CI).
       event: push
+      branch: main
       status: [success, failure]
     environment:
       GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+      # P0-CERT: the aggregate verifies each platform fact's HMAC against the
+      # platform's OWN secret. Holding this step's environment (all three
+      # keys) does not let it fabricate a certificate: it would have to mint
+      # one, and the signed payload binds platform/sha/tree/run/context.
+      faktor_platform_status_key_linux: { from_secret: faktor_platform_status_key_linux }
+      faktor_platform_status_key_darwin: { from_secret: faktor_platform_status_key_darwin }
+      faktor_platform_status_key_windows: { from_secret: faktor_platform_status_key_windows }
     commands:
       - node scripts/certification/publish-status.mjs selftest
-      # P0-1 SEMANTIC AGGREGATE: poll the three PER-PLATFORM exact-SHA
+      # P1-CI: the workflow graph must keep every aggregate invocation
+      # satisfiable (all three axes run wherever the aggregate runs).
+      - node scripts/certification/check-workflow-graph.mjs selftest && node scripts/certification/check-workflow-graph.mjs --check
+      # P0-1/P0-CERT SEMANTIC AGGREGATE: poll the three PER-PLATFORM exact-SHA
       # contexts for the same tree and publish success only when linux AND
-      # darwin AND windows all passed. Missing, failing, stale, or
+      # darwin AND windows all passed AND each signature verifies with its
+      # platform's own key. Missing, unsigned, failing, stale, or
       # run-masqueraded platform statuses publish a conclusive non-success.
       - |
         set -u
@@ -1031,6 +1095,22 @@ steps:
         mkdir -p target/certification
         tree="$(git rev-parse 'HEAD^{tree}')"
         rc=0
+        # Darwin-owned visual-record gate (P1-CERT/UI): the macos JetBrains
+        # visual record must carry a resolved font fingerprint and a digest
+        # distinct from every other platform; a record copied from linux is
+        # not darwin proof. Re-pin on the Mac host with
+        # `bash apps/jetbrains/compile-and-smoke.sh --write-baselines` and
+        # commit visual-baselines.json. Until then this refuses the darwin
+        # certificate by design (fail-closed operator step).
+        python3 scripts/certification/check-visual-baseline.py selftest
+        if python3 scripts/certification/check-visual-baseline.py \
+             --platform macos \
+             --file apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json; then
+          echo "passed darwin-visual-baseline"
+        else
+          echo "FAILED darwin-visual-baseline (missing/unfingerprinted/copied macos record)"
+          rc=1
+        fi
         for lane in darwin-check darwin-test darwin-doctor; do
           f="target/certification/lanes/$lane.json"
           if [ -f "$f" ] && grep -q '"schema":"faktor-woodpecker-lane/v2"' "$f" && grep -q '"status":"passed"' "$f" && grep -q "\"commit\":\"$CI_COMMIT_SHA\"" "$f" && grep -q "\"tree\":\"$tree\"" "$f"; then
@@ -1060,6 +1140,7 @@ steps:
       status: [success, failure]
     environment:
       GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+      faktor_platform_status_key_darwin: { from_secret: faktor_platform_status_key_darwin }
     commands:
       - |
         set -u
@@ -1070,8 +1151,8 @@ steps:
         fi
         python3 scripts/certification/publish-status.py publish \
           --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" --state "$state" \
-          --context ci/faktor/trusted-certified-darwin \
-          --description "platform=darwin tree=$tree run=$CI_PIPELINE_NUMBER:darwin"
+          --platform darwin --tree "$tree" --run-prefix "$CI_PIPELINE_NUMBER" \
+          --context ci/faktor/trusted-certified-darwin
         [ "$state" = success ]
 
   - name: certificate-windows
@@ -1154,17 +1235,63 @@ steps:
       status: [success, failure]
     environment:
       GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+      faktor_platform_status_key_windows: { from_secret: faktor_platform_status_key_windows }
     commands:
       - |
         $ErrorActionPreference = "Stop"
+        # P0-CERT canonical-payload parity: this pinned vector must equal the
+        # node/python implementations' digest before any certificate is
+        # signed, so the three publishers can never drift.
+        $parityKey = "parity-check"
+        $parityPayload = @(
+          "faktor-platform-cert/v1",
+          ("platform=windows"),
+          ("sha=" + ("a" * 40)),
+          ("tree=" + ("c" * 40)),
+          "run=9:windows",
+          "state=success",
+          "context=ci/faktor/trusted-certified-windows"
+        ) -join "`n"
+        $parityHmac = New-Object System.Security.Cryptography.HMACSHA256
+        $parityHmac.Key = [Text.Encoding]::UTF8.GetBytes($parityKey)
+        $paritySig = ([BitConverter]::ToString($parityHmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($parityPayload)))).Replace('-','').ToLower()
+        if ($paritySig -ne "11b4ce142baf6b23938f45d647fe1d7420c633dcf1b1dbd8630b0eacc618c0fa") {
+          Write-Error "windows platform-signature parity vector mismatch: $paritySig"
+          exit 1
+        }
         $tree = (git rev-parse 'HEAD^{tree}').Trim()
         $state = "failure"
         $file = "target/certification/ci-certification-windows.json"
         if ((Test-Path $file) -and (Select-String -Quiet -Path $file -Pattern '"status": *"pass"')) { $state = "success" }
-        $description = "platform=windows tree=$tree run=$($env:CI_PIPELINE_NUMBER):windows"
-        $body = @{ state = $state; context = "ci/faktor/trusted-certified-windows"; description = $description } | ConvertTo-Json -Compress
+        $platform = "windows"
+        $run = "$($env:CI_PIPELINE_NUMBER):windows"
+        $context = "ci/faktor/trusted-certified-windows"
+        if ($state -eq "success") {
+          $key = $env:faktor_platform_status_key_windows
+          if (-not $key) { $key = $env:FAKTOR_PLATFORM_STATUS_KEY_WINDOWS }
+          if (-not $key) {
+            Write-Error "no faktor_platform_status_key_windows secret is configured; an unsigned platform certificate can never be published"
+            exit 1
+          }
+          $payload = @(
+            "faktor-platform-cert/v1",
+            "platform=$platform",
+            "sha=$($env:CI_COMMIT_SHA)",
+            "tree=$tree",
+            "run=$run",
+            "state=success",
+            "context=$context"
+          ) -join "`n"
+          $hmac = New-Object System.Security.Cryptography.HMACSHA256
+          $hmac.Key = [Text.Encoding]::UTF8.GetBytes($key)
+          $sig = ([BitConverter]::ToString($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))).Replace('-','').ToLower()
+          $description = "tree=$tree run=$run sig=$sig"
+        } else {
+          $description = "tree=$tree run=$run state=$state"
+        }
+        $body = @{ state = $state; context = $context; description = $description } | ConvertTo-Json -Compress
         $headers = @{ Authorization = "Bearer $env:GITHUB_STATUS_TOKEN"; Accept = "application/vnd.github+json"; "User-Agent" = "faktor-certification" }
         $url = "https://api.github.com/repos/$($env:CI_REPO)/statuses/$($env:CI_COMMIT_SHA)"
         Invoke-RestMethod -Method Post -Uri $url -Headers $headers -ContentType "application/json" -Body $body | Out-Null
-        Write-Host "github-status-published context=ci/faktor/trusted-certified-windows state=$state"
+        Write-Host "github-status-published context=$context state=$state"
         if ($state -ne "success") { exit 1 }

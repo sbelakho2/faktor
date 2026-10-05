@@ -1,9 +1,9 @@
 {
   "id": "INV-PROMPT-START-IDEMPOTENT",
   "file": "crates/store/src/prompt_admission.rs",
-  "find": "                    if stored_digest != request_digest {\n                        PromptAdmissionClaim::KeyReused { stored_digest }\n                    } else {",
-  "replace": "                    if false {\n                        PromptAdmissionClaim::KeyReused { stored_digest }\n                    } else {",
-  "gate": "cargo test -p faktor-store --lib prompt_same_key_with_a_different_digest_is_key_reused_after_completion",
+  "find": "                \"pending\" => {\n                    // DIGEST FIRST (idempotency contract): different bytes on\n                    // a reused key are KeyReused even while the row is live\n                    // or stale; only an identical claim is InFlight/Stale.\n                    if stored_digest != request_digest {\n                        PromptAdmissionClaim::KeyReused { stored_digest }\n                    } else {",
+  "replace": "                \"pending\" => {\n                    // DIGEST FIRST (idempotency contract): different bytes on\n                    // a reused key are KeyReused even while the row is live\n                    // or stale; only an identical claim is InFlight/Stale.\n                    if false {\n                        PromptAdmissionClaim::KeyReused { stored_digest }\n                    } else {",
+  "gate": "cargo test -p faktor-store --lib prompt_same_key_with_a_different_digest_is_key_reused_at_every_state",
   "expect": "assertion.*failed|left.*right",
   "note": "A completed prompt key with a DIFFERENT body digest is replayed as Complete instead of the typed KeyReused: a changed prompt is silently answered with the previous receipt."
 }

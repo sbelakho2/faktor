@@ -24,6 +24,14 @@
 // Crash safety: SIGINT/SIGTERM/SIGHUP restore the snapshot and kill the active
 // gate process group before exiting, so a mutated source is never left behind.
 //
+// Isolation (audit P0-CERT): mutation gates NEVER run against the trusted
+// source tree. The runner copies the checkout into a scratch root (or uses
+// FAKTOR_MUTATION_ROOT, prepared once by the campaign runner) and applies
+// every planted edit THERE; the main tree's bytes are never touched, so a
+// parallel lane can hash/compile it safely. CARGO_TARGET_DIR defaults to a
+// dedicated cache outside the copy so compilations are reused across specs
+// without ever writing into the trusted artifact tree.
+//
 // Modes:
 //   node scripts/mutation-run.mjs <id>        run one spec (registry command)
 //   node scripts/mutation-run.mjs --check-specs
@@ -37,14 +45,54 @@
 // live); 2 usage or spec errors.
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+/** Scratch root the planted edits and gate commands run in. */
+let GATE_ROOT = process.env.FAKTOR_MUTATION_ROOT
+  ? resolve(process.env.FAKTOR_MUTATION_ROOT)
+  : SCRIPT_ROOT;
+let GATE_ROOT_CLEANUP = null;
+const ISOLATION_EXCLUDES = new Set(['target', '.git', 'node_modules', '.idea']);
 const SPEC_DIR = join(SCRIPT_ROOT, 'scripts/mutations');
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const OUTPUT_TAIL_BYTES = 64 * 1024;
+
+/** TRUE for any path with an excluded component below `root`. */
+function excludedUnder(root, path) {
+  const rel = relative(root, path);
+  if (rel === '') return false;
+  return rel.split(/[\\/]/).some((part) => ISOLATION_EXCLUDES.has(part));
+}
+
+/**
+ * Prepare the scratch checkout when the campaign runner did not supply one:
+ * a recursive copy of the CURRENT working tree (untracked files included, so
+ * local verification sees exactly what the developer sees) minus build/VCS/
+ * dependency trees. The copy is removed in `finally`.
+ */
+function prepareGateRoot() {
+  if (process.env.FAKTOR_MUTATION_ROOT) {
+    return;
+  }
+  const scratch = mkdtempSync(join(tmpdir(), 'faktor-mutation-'));
+  cpSync(SCRIPT_ROOT, scratch, {
+    recursive: true,
+    filter: (source) => !excludedUnder(SCRIPT_ROOT, source),
+  });
+  GATE_ROOT = scratch;
+  GATE_ROOT_CLEANUP = () => rmSync(scratch, { recursive: true, force: true });
+}
+
+function cleanupGateRoot() {
+  if (GATE_ROOT_CLEANUP !== null) {
+    GATE_ROOT_CLEANUP();
+    GATE_ROOT_CLEANUP = null;
+  }
+}
 
 let active = null; // { abs, original }
 let activeChild = null;
@@ -79,6 +127,7 @@ for (const [signal, code] of [
   process.on(signal, () => {
     restore();
     killActiveGate();
+    cleanupGateRoot();
     process.stderr.write(`mutation-run: ${signal} — snapshot restored, gate killed\n`);
     process.exit(code);
   });
@@ -253,9 +302,16 @@ function runGate(spec) {
   return new Promise((settle) => {
     const timeoutMs =
       Number.isInteger(spec.timeout_ms) && spec.timeout_ms > 0 ? spec.timeout_ms : DEFAULT_TIMEOUT_MS;
+    const env = { ...process.env };
+    if (!env.CARGO_TARGET_DIR) {
+      // Never compile mutants into the trusted target/ tree: a dedicated
+      // cache outside the scratch copy, reused across specs.
+      env.CARGO_TARGET_DIR = join(SCRIPT_ROOT, 'target', 'mutation-campaign');
+    }
     const child = spawn(spec.gate, {
       shell: true,
-      cwd: SCRIPT_ROOT,
+      cwd: GATE_ROOT,
+      env,
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -359,64 +415,75 @@ async function runOne(id) {
     return 2;
   }
 
-  const abs = resolve(SCRIPT_ROOT, spec.file);
-  const original = readFileSync(abs);
-  const find = Buffer.from(spec.find, 'utf8');
-  const replace = Buffer.from(spec.replace, 'utf8');
-  const at = original.indexOf(find);
-  const mutated = Buffer.concat([
-    original.subarray(0, at),
-    replace,
-    original.subarray(at + find.length),
-  ]);
+  // The planted edit and both gate runs happen in the ISOLATED scratch root:
+  // the trusted tree is never mutated, even transiently.
+  prepareGateRoot();
+  try {
+    const abs = resolve(GATE_ROOT, spec.file);
+    const original = readFileSync(abs);
+    if (original.indexOf(Buffer.from(spec.find, 'utf8')) === -1) {
+      console.error(`mutation-run: find anchor not found in the scratch copy of ${spec.file}`);
+      return 2;
+    }
+    const find = Buffer.from(spec.find, 'utf8');
+    const replace = Buffer.from(spec.replace, 'utf8');
+    const at = original.indexOf(find);
+    const mutated = Buffer.concat([
+      original.subarray(0, at),
+      replace,
+      original.subarray(at + find.length),
+    ]);
 
-  // Pristine control run: the gate must be green BEFORE the mutation, or a
-  // failure with the mutation live says nothing about the oracle.
-  const control = await runGate(spec);
-  const controlReason = controlProblem(control);
-  if (controlReason !== null) {
-    console.error(`mutation-run: ${spec.id} FAILED — ${controlReason}`);
-    if ((control.tail ?? '').trim() !== '') {
-      console.error(`mutation-run: control output tail:\n${control.tail.trimEnd()}`);
+    // Pristine control run: the gate must be green BEFORE the mutation, or a
+    // failure with the mutation live says nothing about the oracle.
+    const control = await runGate(spec);
+    const controlReason = controlProblem(control);
+    if (controlReason !== null) {
+      console.error(`mutation-run: ${spec.id} FAILED — ${controlReason}`);
+      if ((control.tail ?? '').trim() !== '') {
+        console.error(`mutation-run: control output tail:\n${control.tail.trimEnd()}`);
+      }
+      return 1;
+    }
+
+    let detected = false;
+    let reason = '';
+    let tail = '';
+    active = { abs, original };
+    try {
+      writeFileSync(abs, mutated);
+      const result = await runGate(spec);
+      tail = result.tail ?? '';
+      const how = howOf(result);
+      if (result.error !== undefined) {
+        reason = `the gate could not be spawned: ${result.error}`;
+      } else if (result.timedOut) {
+        reason = 'the gate hit the harness timeout while the mutation was live';
+      } else if (looksLikeToolchainMissing(result)) {
+        reason = `the gate toolchain is unavailable (${how}); an environment failure is not a detection`;
+      } else if (result.code === 0) {
+        reason = `planted mutation NOT detected: gate '${spec.gate}' exited 0 with the violation live`;
+      } else if (looksLikeCompileFailure(result.tail ?? '')) {
+        reason = `the mutated source does not compile (${how}); the oracle never ran`;
+      } else if (spec.expect !== undefined && !new RegExp(spec.expect).test(result.tail ?? '')) {
+        reason = `the gate failed (${how}) without the expected signature /${spec.expect}/; a failure for another reason is not a detection`;
+      } else {
+        detected = true;
+        console.log(`mutation-run: ${spec.id} detected by gate (${how})`);
+      }
+    } finally {
+      restore();
+    }
+
+    if (detected) return 0;
+    console.error(`mutation-run: ${spec.id} FAILED — ${reason}`);
+    if (tail.trim() !== '') {
+      console.error(`mutation-run: gate output tail:\n${tail.trimEnd()}`);
     }
     return 1;
-  }
-
-  let detected = false;
-  let reason = '';
-  let tail = '';
-  active = { abs, original };
-  try {
-    writeFileSync(abs, mutated);
-    const result = await runGate(spec);
-    tail = result.tail ?? '';
-    const how = howOf(result);
-    if (result.error !== undefined) {
-      reason = `the gate could not be spawned: ${result.error}`;
-    } else if (result.timedOut) {
-      reason = 'the gate hit the harness timeout while the mutation was live';
-    } else if (looksLikeToolchainMissing(result)) {
-      reason = `the gate toolchain is unavailable (${how}); an environment failure is not a detection`;
-    } else if (result.code === 0) {
-      reason = `planted mutation NOT detected: gate '${spec.gate}' exited 0 with the violation live`;
-    } else if (looksLikeCompileFailure(result.tail ?? '')) {
-      reason = `the mutated source does not compile (${how}); the oracle never ran`;
-    } else if (spec.expect !== undefined && !new RegExp(spec.expect).test(result.tail ?? '')) {
-      reason = `the gate failed (${how}) without the expected signature /${spec.expect}/; a failure for another reason is not a detection`;
-    } else {
-      detected = true;
-      console.log(`mutation-run: ${spec.id} detected by gate (${how})`);
-    }
   } finally {
-    restore();
+    cleanupGateRoot();
   }
-
-  if (detected) return 0;
-  console.error(`mutation-run: ${spec.id} FAILED — ${reason}`);
-  if (tail.trim() !== '') {
-    console.error(`mutation-run: gate output tail:\n${tail.trimEnd()}`);
-  }
-  return 1;
 }
 
 async function main() {
@@ -442,6 +509,7 @@ main().then(
   },
   (error) => {
     restore();
+    cleanupGateRoot();
     console.error(`mutation-run: fatal: ${error && error.stack ? error.stack : error}`);
     process.exitCode = 1;
   },

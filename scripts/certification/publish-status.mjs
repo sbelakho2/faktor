@@ -70,7 +70,51 @@ export function validate({ repo, sha, state, context, description, targetUrl }) 
   }
 }
 
-export async function publish({ api, repo, sha, state, context, description, targetUrl, token, fetchImpl = fetch }) {
+export async function publish({
+  api,
+  repo,
+  sha,
+  state,
+  context,
+  description,
+  targetUrl,
+  token,
+  platform,
+  tree,
+  runPrefix,
+  platformKey,
+  fetchImpl = fetch,
+}) {
+  // Platform mode: the publisher CONSTRUCTS the description (tree/run/sig) so
+  // the signed fields can never diverge from the published text. A success
+  // without the platform's own secret is refused (fail closed): an unsigned
+  // platform certificate cannot exist.
+  if (platform) {
+    if (!tree || !SHA_RE.test(tree)) {
+      fail('tree', `--platform ${platform} requires --tree as the exact 40-lowercase-hex tree`);
+    }
+    if (!runPrefix) {
+      fail('run-prefix', `--platform ${platform} requires --run-prefix (or CI_PIPELINE_NUMBER)`);
+    }
+    const run = `${runPrefix}:${platform}`;
+    let sig = null;
+    if (state === 'success') {
+      const key = platformKey || platformKeyFromEnv(platform);
+      if (!key) {
+        fail(
+          'platform-key-missing',
+          `no faktor_platform_status_key_${platform} secret is configured; an unsigned platform certificate can never be published`,
+        );
+      }
+      sig = platformSignature({ platform, sha, tree, run, state, context }, key);
+    }
+    // GitHub caps status descriptions at 140 chars: the platform identity
+    // rides the CONTEXT, so only tree/run/sig need the description.
+    description =
+      sig === null
+        ? `tree=${tree} run=${run} state=${state}`
+        : `tree=${tree} run=${run} sig=${sig}`;
+  }
   validate({ repo, sha, state, context, description, targetUrl });
   if (!token) fail('token-missing', 'GITHUB_STATUS_TOKEN/GH_TOKEN/GITHUB_TOKEN is required (fail closed)');
   const body = { state, context, description };
@@ -98,12 +142,17 @@ export async function publish({ api, repo, sha, state, context, description, tar
 // `ci/faktor/trusted-certified` is an AGGREGATE: it may only become success
 // when the linux, darwin AND windows per-platform certificates are success
 // for the SAME exact SHA and tree, all bound to ONE pipeline execution (the
-// same workflow generation/config), each published by its own platform step.
-// A per-platform status description carries `tree=<40hex> run=<pipeline>:<platform>`;
-// the run binding makes a duplicate/forged copy (e.g. the linux execution
-// publishing the windows context) fail, a run mismatch across platforms
-// (a stale certificate from an older pipeline) fails, and missing/stale/
-// failing platforms can never aggregate green.
+// same workflow generation/config), each published by its own platform step,
+// AND each carrying a valid HMAC-SHA256 signature produced with that
+// platform's OWN secret. A per-platform status description carries
+// `tree=<40hex> run=<pipeline>:<platform> sig=<64hex>`; the signature binds
+// platform+sha+tree+run+state+context, so a publisher holding only one
+// platform's credential cannot fabricate another platform's status (audit
+// P0-CERT). A missing signature, a missing platform secret, or a signature
+// computed with the wrong platform key is a conclusive non-success — never
+// `unattested`-and-passing.
+
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export const AGGREGATE_CONTEXTS = {
   linux: 'ci/faktor/trusted-certified-linux',
@@ -112,16 +161,65 @@ export const AGGREGATE_CONTEXTS = {
 };
 const TREE_RE = /(?:^|\s)tree=([0-9a-f]{40})(?:\s|$)/;
 const RUN_RE = /(?:^|\s)run=([^\s]+)(?:\s|$)/;
+const SIG_RE = /(?:^|\s)sig=([0-9a-f]{64})(?:\s|$)/;
+
+/** The platform key env name, lower/upper accepted (mirrors lane-marker). */
+export function platformKeyEnvNames(platform) {
+  const normalized = String(platform)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_');
+  return [`faktor_platform_status_key_${normalized}`, `FAKTOR_PLATFORM_STATUS_KEY_${normalized.toUpperCase()}`];
+}
+
+export function platformKeyFromEnv(platform, env = process.env) {
+  for (const name of platformKeyEnvNames(platform)) {
+    const value = env[name];
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  }
+  return '';
+}
+
+/**
+ * The canonical signed payload for one platform certificate. Byte-identical
+ * in the JS, Python and PowerShell publishers/verifiers. Every field that
+ * binds the certificate to a run is inside the MAC.
+ */
+export function platformSigningPayload({ platform, sha, tree, run, state, context }) {
+  return [
+    'faktor-platform-cert/v1',
+    `platform=${platform}`,
+    `sha=${sha}`,
+    `tree=${tree}`,
+    `run=${run}`,
+    `state=${state}`,
+    `context=${context}`,
+  ].join('\n');
+}
+
+export function platformSignature(fields, key) {
+  return createHmac('sha256', String(key)).update(platformSigningPayload(fields), 'utf8').digest('hex');
+}
+
+function signatureMatches(expectedHex, providedHex) {
+  if (!/^[0-9a-f]{64}$/.test(providedHex) || !/^[0-9a-f]{64}$/.test(expectedHex)) {
+    return false;
+  }
+  return timingSafeEqual(Buffer.from(expectedHex, 'hex'), Buffer.from(providedHex, 'hex'));
+}
 
 export function platformFacts(status) {
   const description = String(status.description || '');
   const tree = TREE_RE.exec(description);
   const run = RUN_RE.exec(description);
-  return { tree: tree ? tree[1] : null, run: run ? run[1] : null };
+  const sig = SIG_RE.exec(description);
+  return { tree: tree ? tree[1] : null, run: run ? run[1] : null, sig: sig ? sig[1] : null };
 }
 
-/// `statuses` is the newest-first commit-status list for ONE sha.
-export function aggregateVerdict({ statuses, tree }) {
+/// `statuses` is the newest-first commit-status list for ONE sha. `keys`
+/// maps platform -> secret; a missing key can never aggregate green.
+export function aggregateVerdict({ statuses, tree, sha, keys = {} }) {
   const reasons = [];
   const runs = new Set();
   let pipelineRun = null;
@@ -135,7 +233,7 @@ export function aggregateVerdict({ statuses, tree }) {
       reasons.push(`${platform}=${entry.state}`);
       continue;
     }
-    const { tree: statusTree, run } = platformFacts(entry);
+    const { tree: statusTree, run, sig } = platformFacts(entry);
     if (statusTree !== tree) {
       reasons.push(`${platform}=tree-mismatch`);
       continue;
@@ -154,14 +252,35 @@ export function aggregateVerdict({ statuses, tree }) {
     // pipeline (even for the same tree) is stale evidence and refuses.
     const prefix = run.slice(0, run.lastIndexOf(':'));
     if (pipelineRun === null) pipelineRun = prefix;
-    else if (pipelineRun !== prefix) reasons.push(`${platform}=run-mismatch`);
+    else if (pipelineRun !== prefix) {
+      reasons.push(`${platform}=run-mismatch`);
+      continue;
+    }
+    // Platform authentication: the signature must verify with THIS
+    // platform's own secret over every binding field.
+    if (!sig) {
+      reasons.push(`${platform}=unsigned`);
+      continue;
+    }
+    const key = keys[platform];
+    if (typeof key !== 'string' || key.length === 0) {
+      reasons.push(`${platform}=key-missing`);
+      continue;
+    }
+    const expected = platformSignature(
+      { platform, sha, tree, run, state: 'success', context },
+      key,
+    );
+    if (!signatureMatches(expected, sig)) {
+      reasons.push(`${platform}=bad-signature`);
+    }
   }
   if (reasons.length > 0) {
     return { ok: false, reason: `platform certificates incomplete: ${reasons.join(', ')}` };
   }
   return {
     ok: true,
-    reason: `linux+darwin+windows certificates passed (tree=${tree} run=${pipelineRun})`,
+    reason: `linux+darwin+windows certificates authenticated (tree=${tree} run=${pipelineRun})`,
   };
 }
 
@@ -197,6 +316,7 @@ export async function aggregate({
   sha,
   tree,
   token,
+  keys = {},
   pollSeconds = 0,
   intervalSeconds = 15,
   context = 'ci/faktor/trusted-certified',
@@ -208,7 +328,7 @@ export async function aggregate({
   let verdict;
   for (;;) {
     const statuses = await readStatuses({ api, repo, sha, token, fetchImpl });
-    verdict = aggregateVerdict({ statuses, tree });
+    verdict = aggregateVerdict({ statuses, tree, sha, keys });
     if (verdict.ok || Date.now() >= deadline) break;
     await sleep(intervalSeconds * 1000);
   }
@@ -350,70 +470,153 @@ async function selftest() {
   }
   check('validation refusals make no request', requests.length === netBefore);
 
-  // ---- P0-1: the aggregate table ---------------------------------------
+  // ---- P0-1: the aggregate table (platform-authenticated) --------------
   const tree = 'b'.repeat(40);
   const otherTree = 'c'.repeat(40);
-  const okStatus = (platform) => ({
+  const keys = { linux: 'linux-secret', darwin: 'darwin-secret', windows: 'windows-secret' };
+  const signedDescription = (platform, options = {}) => {
+    const t = options.t ?? tree;
+    const run = options.run ?? `700:${platform}`;
+    const context = options.context ?? AGGREGATE_CONTEXTS[platform];
+    const key = options.key ?? keys[platform];
+    const sig =
+      options.sig ??
+      platformSignature({ platform, sha, tree: t, run, state: 'success', context }, key);
+    return `tree=${t} run=${run} sig=${sig}`;
+  };
+  const okStatus = (platform, overrides = {}) => ({
     context: AGGREGATE_CONTEXTS[platform],
     state: 'success',
-    description: `tree=${tree} run=700:${platform}`,
+    description: overrides.description ?? signedDescription(platform, overrides),
   });
+  const verdictOf = (statuses, options = {}) =>
+    aggregateVerdict({ statuses, tree: options.tree ?? tree, sha, keys: options.keys ?? keys });
   check(
-    'aggregate: linux+darwin+windows pass -> success',
-    aggregateVerdict({ statuses: [okStatus('linux'), okStatus('darwin'), okStatus('windows')], tree }).ok,
+    'aggregate: authenticated linux+darwin+windows pass -> success',
+    verdictOf([okStatus('linux'), okStatus('darwin'), okStatus('windows')]).ok,
   );
   check(
     'aggregate: missing windows -> non-success',
-    !aggregateVerdict({ statuses: [okStatus('linux'), okStatus('darwin')], tree }).ok,
+    !verdictOf([okStatus('linux'), okStatus('darwin')]).ok,
   );
   check(
     'aggregate: failing windows -> non-success',
-    !aggregateVerdict({
-      statuses: [okStatus('linux'), okStatus('darwin'), { ...okStatus('windows'), state: 'failure' }],
-      tree,
-    }).ok,
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin'),
+      { ...okStatus('windows'), state: 'failure' },
+    ]).ok,
   );
   check(
     'aggregate: stable sha with a stale darwin tree -> non-success',
-    !aggregateVerdict({
-      statuses: [okStatus('linux'), { ...okStatus('darwin'), description: `tree=${otherTree} run=700:darwin` }, okStatus('windows')],
-      tree,
-    }).ok,
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin', { t: otherTree }),
+      okStatus('windows'),
+    ]).ok,
   );
   check(
     'aggregate: duplicate linux masquerading as windows -> non-success',
-    !aggregateVerdict({
-      statuses: [okStatus('linux'), okStatus('darwin'), { ...okStatus('windows'), description: `tree=${tree} run=700:linux` }],
-      tree,
-    }).ok,
-  );
-  check(
-    'aggregate: all pass with differing trees cannot happen (tree-mismatch) -> non-success',
-    !aggregateVerdict({
-      statuses: [
-        { ...okStatus('linux'), description: `tree=${otherTree} run=700:linux` },
-        okStatus('darwin'),
-        okStatus('windows'),
-      ],
-      tree,
-    }).ok,
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin'),
+      { context: AGGREGATE_CONTEXTS.windows, state: 'success', description: `tree=${tree} run=700:linux` },
+    ]).ok,
   );
   check(
     'aggregate: platforms from DIFFERENT pipeline runs (stale certificate) -> non-success',
-    !aggregateVerdict({
-      statuses: [
-        okStatus('linux'),
-        { ...okStatus('darwin'), description: `tree=${tree} run=701:darwin` },
-        { ...okStatus('windows'), description: `tree=${tree} run=702:windows` },
-      ],
-      tree,
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin', { run: '701:darwin' }),
+      okStatus('windows', { run: '702:windows' }),
+    ]).ok,
+  );
+  check(
+    'aggregate: unsigned windows status -> non-success (never unattested-pass)',
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin'),
+      { context: AGGREGATE_CONTEXTS.windows, state: 'success', description: `tree=${tree} run=700:windows` },
+    ]).ok,
+  );
+  check(
+    'aggregate: windows status signed with the LINUX key -> bad-signature',
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin'),
+      okStatus('windows', { key: keys.linux }),
+    ]).ok,
+  );
+  check(
+    'aggregate: tampered run after signing -> bad-signature',
+    !verdictOf([
+      okStatus('linux'),
+      okStatus('darwin'),
+      { context: AGGREGATE_CONTEXTS.windows, state: 'success', description: signedDescription('windows').replace('700:windows', '701:windows') },
+    ]).ok,
+  );
+  check(
+    'aggregate: a missing platform secret can never aggregate green',
+    !verdictOf([okStatus('linux'), okStatus('darwin'), okStatus('windows')], {
+      keys: { linux: keys.linux },
     }).ok,
   );
   check(
     'aggregate: windows is a REQUIRED platform (mutation witness: removing the lookup fails here)',
     Object.prototype.hasOwnProperty.call(AGGREGATE_CONTEXTS, 'windows') &&
-      aggregateVerdict({ statuses: [okStatus('linux'), okStatus('darwin')], tree }).reason.includes('windows'),
+      verdictOf([okStatus('linux'), okStatus('darwin')]).reason.includes('windows'),
   );
+
+  // Platform publish mode: signs the description with the platform's own key
+  // and refuses a success without it.
+  const savedWindowsKey = process.env.faktor_platform_status_key_windows;
+  process.env.faktor_platform_status_key_windows = keys.windows;
+  try {
+    await publish({
+      api,
+      repo: 'acme/widgets',
+      sha,
+      state: 'success',
+      context: AGGREGATE_CONTEXTS.windows,
+      platform: 'windows',
+      tree,
+      runPrefix: '700',
+      token: 'selftest-token',
+    });
+    const posted = JSON.parse(requests.at(-1).body);
+    const facts = platformFacts({ description: posted.description });
+    check(
+      'platform publish signs the constructed description',
+      facts.tree === tree &&
+        facts.run === '700:windows' &&
+        facts.sig === platformSignature({ platform: 'windows', sha, tree, run: '700:windows', state: 'success', context: AGGREGATE_CONTEXTS.windows }, keys.windows),
+      posted.description,
+    );
+  } finally {
+    if (savedWindowsKey === undefined) delete process.env.faktor_platform_status_key_windows;
+    else process.env.faktor_platform_status_key_windows = savedWindowsKey;
+  }
+  const netBeforePlatform = requests.length;
+  try {
+    await publish({
+      api,
+      repo: 'acme/widgets',
+      sha,
+      state: 'success',
+      context: AGGREGATE_CONTEXTS.windows,
+      platform: 'windows',
+      tree,
+      runPrefix: '700',
+      token: 'selftest-token',
+    });
+    check('platform publish without its own key refuses (fail closed)', false);
+  } catch (error) {
+    check(
+      'platform publish without its own key refuses (fail closed)',
+      String(error.message).includes('github-status-platform-key-missing'),
+    );
+  }
+  check('platform key refusal makes no request', requests.length === netBeforePlatform);
 
   // Polling: empty at first, complete after one sleep -> aggregate success,
   // and the published context/state are the aggregate ones.
@@ -424,6 +627,7 @@ async function selftest() {
     repo: 'acme/widgets',
     sha,
     tree,
+    keys,
     token: 'selftest-token',
     pollSeconds: 5,
     intervalSeconds: 1,
@@ -468,6 +672,9 @@ if (isMain) {
         context: argValue(args, '--context', 'ci/woodpecker/push/trusted'),
         description: argValue(args, '--description', ''),
         targetUrl: argValue(args, '--target-url', process.env.CI_PIPELINE_URL || ''),
+        platform: argValue(args, '--platform', ''),
+        tree: argValue(args, '--tree', ''),
+        runPrefix: argValue(args, '--run-prefix', process.env.CI_PIPELINE_NUMBER || ''),
         token: tokenFromEnv(process.env),
       });
     } else if (command === 'aggregate') {
@@ -477,6 +684,11 @@ if (isMain) {
         sha: argValue(args, '--sha', process.env.CI_COMMIT_SHA || ''),
         tree: argValue(args, '--tree', ''),
         token: tokenFromEnv(process.env),
+        keys: {
+          linux: platformKeyFromEnv('linux'),
+          darwin: platformKeyFromEnv('darwin'),
+          windows: platformKeyFromEnv('windows'),
+        },
         pollSeconds: Number(argValue(args, '--poll-seconds', '0')),
         intervalSeconds: Number(argValue(args, '--interval-seconds', '15')),
         context: argValue(args, '--context', 'ci/faktor/trusted-certified'),
