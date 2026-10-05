@@ -1,0 +1,9 @@
+{
+  "id": "INV-ADMISSION-RECOVERY-LANDING",
+  "file": "crates/store/src/task_admission.rs",
+  "find": "                AdmissionResolution::Complete(receipt_json) => tx.execute(\n                    \"UPDATE task_admission SET state = 'complete', receipt_json = ?3\n                     WHERE key = ?1 AND state = 'pending' AND reservation IS ?2\",",
+  "replace": "                AdmissionResolution::Complete(receipt_json) => tx.execute(\n                    \"UPDATE task_admission SET state = 'pending', receipt_json = ?3\n                     WHERE key = ?1 AND state = 'pending' AND reservation IS ?2\",",
+  "gate": "cargo test -p faktor-store --lib recovery_completion_lands_the_byte_exact_receipt_and_replays",
+  "expect": "assertion|left.*right",
+  "note": "Recovery's Complete resolution writes the receipt but leaves the row pending: the recovered key no longer replays the byte-exact receipt and can never complete, so no admission is actually landed."
+}

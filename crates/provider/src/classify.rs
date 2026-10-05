@@ -39,7 +39,7 @@
 //! text is NEVER scanned — a message saying "invalid api key" proves
 //! nothing.
 
-use faktor_core::error::ErrorKind;
+use faktor_core::error::{Error, ErrorKind};
 use serde_json::Value;
 
 use crate::sanitize::ErrorScrubber;
@@ -332,6 +332,15 @@ fn hint_for_status(status: u16, body: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Build a typed core error from a classified kind. The NON-streaming
+/// adapter paths that return `faktor_core::Error` (ollama metadata:
+/// `/api/ps`, `/api/tags`, `/api/show`) construct their refusals here, so
+/// the provider taxonomy has exactly one constructor site outside the
+/// streaming envelope.
+pub fn core_error_for(kind: ErrorKind, message: impl Into<String>) -> Error {
+    Error::new(kind, message)
 }
 
 /// Envelope for a structured hint with NO status context (SSE and Responses
@@ -659,6 +668,16 @@ mod tests {
         assert_eq!(err.kind, ProviderErrorKind::BadRequest);
         let err = provider_error_for(ErrorKind::RateLimited, "429", "k");
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
+    }
+
+    #[test]
+    fn core_error_for_carries_the_classified_kind_and_message() {
+        let err = core_error_for(ErrorKind::Permission, "invalid api key");
+        assert_eq!(err.kind, ErrorKind::Permission);
+        assert!(err.message.contains("invalid api key"));
+        assert!(!err.retryable);
+        let err = core_error_for(classify_http(422, None), "malformed request");
+        assert_eq!(err.kind, ErrorKind::Malformed);
     }
 
     #[test]

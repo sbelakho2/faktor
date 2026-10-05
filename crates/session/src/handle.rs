@@ -378,6 +378,21 @@ impl SessionHandle {
         prompt: &str,
         files: &[String],
     ) -> faktor_core::Result<PromptReceipt> {
+        self.submit_prompt_with_op_id(prompt, files, None)
+    }
+
+    /// [`Self::submit_prompt`] under a PREALLOCATED operation id (audit P1):
+    /// the durable admission claim reserves the op id BEFORE the prompt is
+    /// accepted, so the claim's `reservation` (`tx-<op>`) names exactly the
+    /// turn this submit journals and startup recovery can reconstruct the
+    /// receipt from the durable turn/queue facts. `None` mints a fresh id
+    /// exactly as before.
+    pub fn submit_prompt_with_op_id(
+        &self,
+        prompt: &str,
+        files: &[String],
+        reserved_op_id: Option<OpId>,
+    ) -> faktor_core::Result<PromptReceipt> {
         if prompt.len() > crate::MAX_PROMPT_BYTES {
             return Err(SessionError::Oversized(format!(
                 "prompt of {} bytes exceeds MAX_PROMPT_BYTES",
@@ -447,7 +462,10 @@ impl SessionHandle {
         } else {
             (true, current)
         };
-        let op_id = self.manager.try_next_op_id()?;
+        let op_id = match reserved_op_id {
+            Some(op_id) => op_id,
+            None => self.manager.try_next_op_id()?,
+        };
         // Layered lifetimes (audit 26): ONE logical turn is bounded by the
         // manager's configurable `turn_budget_ms` (default 30 min,
         // [`DEFAULT_TURN_BUDGET_MS`]) — never a 24h ceiling. The task's
@@ -540,6 +558,21 @@ impl SessionHandle {
             accepted: true,
             queued,
         })
+    }
+
+    /// Audit P1 crash residue: `true` when the durable machine is OP-ACTIVE
+    /// with NO active turn record and NO pending tool rows — the one shape a
+    /// retry cannot drive (a bare `PromptReceived` journal entry whose turn
+    /// record never committed; no text was materialized, so nothing is
+    /// executable). Admission recovery calls
+    /// [`Self::recover_all`] to land it on the honest crash target so the
+    /// reclaimed key's retry can execute exactly once. A live driver always
+    /// owns a turn record or pending rows, so this never disturbs one.
+    pub fn is_wedged_after_bare_admission(&self) -> faktor_core::Result<bool> {
+        let state = self.state()?;
+        Ok(is_op_active(state)
+            && self.active_turn_record()?.is_none()
+            && self.pending_tool_runs()?.is_empty())
     }
 
     pub fn queue_status_counts(&self) -> faktor_core::Result<serde_json::Value> {
@@ -1626,9 +1659,9 @@ pub(crate) mod tests {
                     AgentState::Cancelled,
                     "the rolled-back turn end leaves the lawful Cancelled landing"
                 );
-                // Recovery touches nothing (no running rows); a later Stop
-                // completes the turn end as a fresh, lawful transition.
-                assert!(!after.recover_all().unwrap().applied);
+                // Recovery now CLOSES the record the dead/cancelled turn left
+                // active (the forever-wedge fix): that is an applied change.
+                assert!(after.recover_all().unwrap().applied);
                 let receipt = after.abort(None).unwrap();
                 assert!(receipt.op_ids.is_empty());
                 assert_eq!(after.state().unwrap(), AgentState::ReadyForNextTurn);

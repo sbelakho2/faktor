@@ -207,6 +207,14 @@ pub struct UpdateOperation {
     pub identity: Option<String>,
     /// The certification level the manifest carried, when any.
     pub certification_level: Option<String>,
+    /// True when the operation's manifest was admitted under the one-time
+    /// legacy (generation-0) allowance. A running `stage` row is the durable
+    /// PENDING anti-rollback admission: only a verified publish COMMITS it
+    /// (raising the floor and consuming the allowance); a failed/refused
+    /// download voids it untouched. Additive: absent on pre-existing rows
+    /// (they never carried a legacy admission).
+    #[serde(default)]
+    pub legacy_admission: bool,
     /// Idempotency key for a replayable `stage`.
     pub idempotency_key: Option<String>,
     pub detail: Option<String>,
@@ -231,6 +239,7 @@ impl UpdateOperation {
             actor: None,
             identity: None,
             certification_level: None,
+            legacy_admission: false,
             idempotency_key: None,
             detail,
             created_ms: now_ms,

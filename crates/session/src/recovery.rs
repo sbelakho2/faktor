@@ -465,6 +465,31 @@ impl SessionHandle {
     /// migrated to a workspace-relative postcondition and verified through
     /// the workspace handle; a claim that cannot be proven lands
     /// Unknown/NeedsUserInput, never Verified.
+    /// Close a turn record left ACTIVE by the dead process (no resumable
+    /// drive): without this every new prompt 409s forever. Runs at the END
+    /// of recovery so the tool-run sweep's durability boundaries are not
+    /// shifted by an extra write.
+    fn close_active_turn_record_if_any(
+        &self,
+        session_id: faktor_core::id::SessionId,
+        report: &mut RecoveryReport,
+    ) -> faktor_core::Result<()> {
+        if let Some(record) = self
+            .manager
+            .store()
+            .active_turn_record(session_id)
+            .map_err(crate::map_store_err)?
+        {
+            self.manager
+                .store()
+                .finish_turn_record(session_id, record.turn_op_id, "failed")
+                .map_err(crate::map_store_err)?;
+            report.interrupted_turn = true;
+            report.applied = true;
+        }
+        Ok(())
+    }
+
     pub fn recover_all(&self) -> faktor_core::Result<RecoveryReport> {
         let _guard = self.command_guard();
         let session_id = self.id;
@@ -520,6 +545,7 @@ impl SessionHandle {
                 report.interrupted_turn = true;
                 report.applied = true;
             }
+            self.close_active_turn_record_if_any(session_id, &mut report)?;
             return Ok(report);
         }
 
@@ -563,6 +589,7 @@ impl SessionHandle {
 
         report.state = crash_state;
         report.applied = true;
+        self.close_active_turn_record_if_any(session_id, &mut report)?;
         Ok(report)
     }
 }
@@ -695,7 +722,8 @@ mod tests {
         let report = s.recover_all().unwrap();
         assert!(report.applied);
         assert!(!report.contradiction);
-        assert!(!report.interrupted_turn);
+        // Recovery closes the dead process's stale ACTIVE turn record.
+        assert!(report.interrupted_turn);
         assert_eq!(report.crashed_ops.len(), 1);
         assert_eq!(report.crashed_ops[0].op_id, op);
         assert_eq!(report.crashed_ops[0].status, "completed");
@@ -1051,8 +1079,8 @@ mod tests {
             "the expiry reconciliation changed durable state"
         );
         assert!(
-            !report.interrupted_turn,
-            "the elapsed permission was the only durable interruption"
+            report.interrupted_turn,
+            "recovery also closed the dead process's active turn record"
         );
         assert_eq!(report.state, AgentState::ReadyForNextTurn);
         assert_eq!(s2.state().unwrap(), AgentState::ReadyForNextTurn);

@@ -1,0 +1,9 @@
+{
+  "id": "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+  "file": "crates/agent/src/runtime/shell_changes.rs",
+  "find": "                    (b.kind != a.kind || b.mode != a.mode || b.payload_digest != a.payload_digest)\n                        .then(|| ShellFileChange {",
+  "replace": "                    false.then(|| ShellFileChange {",
+  "gate": "cargo test -p faktor-agent --lib shell_creates_deletes_renames_reach_change_accounting",
+  "expect": "assertion|left.*right",
+  "note": "The manifest diff no longer reports MODIFIED files (only adds/deletes): a shell that rewrote files has those changes silently dropped from the durable change accounting and the turn ledger."
+}

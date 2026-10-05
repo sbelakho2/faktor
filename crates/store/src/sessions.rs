@@ -21,6 +21,31 @@ pub struct SessionRow {
     pub updated_ms: i64,
 }
 
+/// Bound on pending-permission rows materialized by
+/// [`Store::all_pending_permissions`] (`doctor --deep` wedge scan): the total
+/// count stays exact, only the detail rows are capped.
+pub const MAX_PENDING_PERMISSION_SCAN: usize = 256;
+
+/// One still-`pending` permission row returned by
+/// [`Store::all_pending_permissions`] (read-only `doctor --deep` wedge scan).
+/// The row's waiter lives only in the daemon process, so a reader that is not
+/// that process can never resolve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermissionRow {
+    pub id: i64,
+    pub session_id: SessionId,
+    pub op_id: OpId,
+    pub expires_ms: i64,
+}
+
+/// [`Store::all_pending_permissions`] result: the exact total plus at most
+/// [`MAX_PENDING_PERMISSION_SCAN`] detail rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingPermissionScan {
+    pub total: u64,
+    pub rows: Vec<PendingPermissionRow>,
+}
+
 /// One durable child-runtime projection row (migration v23): the child
 /// session's state plus its bounded blocker truth. All blocker columns are
 /// NULL when the child is not blocked.
@@ -1628,6 +1653,45 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// Every `decision = 'pending'` permission row across all sessions, with
+    /// the exact total and at most [`MAX_PENDING_PERMISSION_SCAN`] rows
+    /// (bounded materialization for `doctor --deep`; the count stays exact).
+    pub fn all_pending_permissions(&self) -> StoreResult<PendingPermissionScan> {
+        let conn = self.read()?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM permission WHERE decision = 'pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, op_id, expires_ms FROM permission
+             WHERE decision = 'pending' ORDER BY id ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![MAX_PENDING_PERMISSION_SCAN as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, session_raw, op_raw, expires_ms) in rows {
+            out.push(PendingPermissionRow {
+                id,
+                session_id: id_field(&format!("permission {id} session_id"), session_raw)?,
+                op_id: id_field(&format!("permission {id} op_id"), op_raw)?,
+                expires_ms,
+            });
+        }
+        Ok(PendingPermissionScan {
+            total: total.max(0) as u64,
+            rows: out,
+        })
     }
 
     /// Every session row id, ascending (`doctor --deep` orphan scans).

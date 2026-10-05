@@ -76,14 +76,19 @@ pub(crate) enum Command {
     /// Headless: create a session and run one prompt.
     Run {
         prompt: String,
-        #[arg(long, default_value = "fake")]
-        provider: String,
+        /// Provider instance id. Omitted, the daemon's single registered
+        /// provider is used; zero or several registered providers refuse
+        /// loudly instead of guessing (never a fake success).
+        #[arg(long)]
+        provider: Option<String>,
         #[arg(long, default_value = "default")]
         model: String,
         #[arg(long, default_value = ".")]
         workspace: String,
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Self-check: storage, CAS, permissions, providers.
     Doctor {
@@ -465,13 +470,15 @@ pub(crate) async fn main() {
             model,
             workspace,
             data_dir,
+            config,
         } => {
             run(
                 prompt,
-                &provider,
+                provider.as_deref(),
                 &model,
                 expand(&workspace),
                 expand(&data_dir),
+                config.map(|c| expand(&c)),
             )
             .await;
         }
@@ -584,14 +591,97 @@ pub(crate) fn build_report_json(include_self_digest: bool) -> Value {
     })
 }
 
+/// Resolve the CLI's requested provider against the daemon's registry.
+///
+/// A requested id must be registered, and an omitted id resolves only when
+/// exactly ONE provider is registered — zero or several refuse loudly. This
+/// runs BEFORE any workspace/session effect: an unknown `--provider` must
+/// never leave a failed session in the store (the old default
+/// `--provider fake` did exactly that in every production build).
+pub(crate) fn resolve_cli_provider(
+    ids: &[String],
+    requested: Option<&str>,
+) -> Result<String, String> {
+    if let Some(requested) = requested {
+        if ids.iter().any(|id| id == requested) {
+            return Ok(requested.to_string());
+        }
+        return Err(format!(
+            "run: provider '{requested}' is not registered; registered: {ids:?}"
+        ));
+    }
+    match ids.len() {
+        1 => Ok(ids[0].clone()),
+        0 => Err(
+            "run: no providers are registered; configure providers in the daemon config or \
+             pass --provider"
+                .into(),
+        ),
+        _ => Err(format!(
+            "run: multiple providers are registered ({ids:?}); pass --provider"
+        )),
+    }
+}
+
+/// Create the durable session one `faktor run` invocation drives and fire
+/// the SessionStart lifecycle hook (audit) immediately after the row exists,
+/// before the session is first used — the SAME ordering the ACP daemon entry
+/// uses. Best-effort: the registry bounds the hook (deadline/caps) and a
+/// failing verdict is audit-only, so session creation can never fail or hang
+/// unboundedly on a hook. A registry-less runtime is a no-op.
+pub(crate) fn create_run_session(
+    session: &Arc<SessionManager>,
+    agent: &Arc<AgentRuntime>,
+    ws: faktor_core::id::WorkspaceId,
+    provider: &str,
+    model: &str,
+) -> Result<faktor_session::SessionHandle, String> {
+    let row = session
+        .create_session(ws, "cli run", provider, model)
+        .map_err(|e| e.to_string())?;
+    agent.run_session_start_hook(row.id());
+    Ok(row)
+}
+
 pub(crate) async fn run(
     prompt: String,
-    provider: &str,
+    provider: Option<&str>,
     model: &str,
     workspace: PathBuf,
     data_dir: PathBuf,
+    config_path: Option<PathBuf>,
 ) {
-    match build_daemon(&data_dir, None) {
+    // `run` used to build an EMPTY registry (no config discovery, no flag),
+    // so it could never see a provider and its refusal text named a surface
+    // it did not have. Explicit --config is strict; the discovered
+    // `<data-dir>/faktor-plus.json` is lenient, exactly like serve/acp.
+    let config = match load_optional_config(&data_dir, config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("run: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // PURE preflight BEFORE the daemon build touches the data dir: a pinned/
+    // balanced routing refusal, an embeddings-policy refusal or a provider
+    // resolution refusal (`--provider ghost`) must leave NO store/db/CAS
+    // behind. The registered ids come from the SAME shared provider builder
+    // the daemon core uses.
+    let preflight = match preflight_daemon_config(&config) {
+        Ok(preflight) => preflight,
+        Err(e) => {
+            eprintln!("run: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let provider = match resolve_cli_provider(&preflight.provider_ids, provider) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    match build_daemon(&data_dir, Some(config)) {
         Ok(graph) => {
             let (session, agent) = (graph.session, graph.agent);
             let ws = match session.create_workspace(workspace.to_str().unwrap_or(".")) {
@@ -601,7 +691,7 @@ pub(crate) async fn run(
                     std::process::exit(1);
                 }
             };
-            let row = match session.create_session(ws, "cli run", provider, model) {
+            let row = match create_run_session(&session, &agent, ws, &provider, model) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("session error: {e}");
@@ -610,7 +700,18 @@ pub(crate) async fn run(
             };
             match agent.run_turn(row.id(), &prompt, &[]).await {
                 Ok(outcome) => {
-                    println!("final state: {}", outcome.final_state.label());
+                    let label = outcome.final_state.label();
+                    if !matches!(
+                        outcome.final_state,
+                        faktor_core::state::AgentState::ReadyForNextTurn
+                    ) {
+                        // Headless callers must be able to detect failure
+                        // without parsing text: a turn that did not reach a
+                        // continuation-ready state is a non-zero exit.
+                        eprintln!("run: turn ended in state '{label}'");
+                        std::process::exit(1);
+                    }
+                    println!("final state: {label}");
                 }
                 Err(e) => {
                     eprintln!("turn error: {e}");
@@ -754,7 +855,7 @@ pub(crate) async fn updater_command(
     data_dir: PathBuf,
     config_path: Option<PathBuf>,
 ) {
-    let (config, _semantic) = match serve_config_and_semantic(config_path) {
+    let (config, _semantic) = match load_entry_config(&data_dir, config_path) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("faktor updater: config error: {e}");
@@ -947,24 +1048,69 @@ pub(crate) async fn updater_command(
 /// `faktor-plus.json` next to the data dir is used when present, and a
 /// broken auto-discovered file falls back to defaults with a loud warning
 /// (the same policy as `serve`/`acp`).
-pub(crate) fn load_commerce_config(
+pub(crate) fn load_optional_config(
     data_dir: &std::path::Path,
     config_path: Option<PathBuf>,
 ) -> Result<config::Config, String> {
-    if let Some(path) = config_path {
-        return config::Config::load_strict(&path);
-    }
-    let path = data_dir.join("faktor-plus.json");
-    if !path.exists() {
-        return Ok(config::Config::default());
-    }
-    match config::Config::load(&path) {
-        Ok(config) => Ok(config),
+    Ok(load_entry_config(data_dir, config_path)?.0)
+}
+
+/// ONE config resolution for every entry point (serve/acp/run/updater/
+/// enterprise/commerce/worker): an explicit `--config` is STRICT (parse +
+/// validate + unknown fields refused); without one, `<data-dir>/
+/// faktor-plus.json` is DISCOVERED leniently (a broken file warns and falls
+/// back to defaults). The additive top-level `semantic` section is stripped
+/// from the raw document before the frozen `Config` shape sees it, so no
+/// entry point can reject a serve-valid file or silently discard the rest
+/// of it.
+pub(crate) fn load_entry_config(
+    data_dir: &std::path::Path,
+    config_path: Option<PathBuf>,
+) -> Result<(config::Config, graph::SemanticCfg), String> {
+    let explicit = config_path.is_some();
+    let path = match config_path {
+        Some(path) => path,
+        None => {
+            let discovered = data_dir.join("faktor-plus.json");
+            if !discovered.exists() {
+                return Ok((config::Config::default(), graph::SemanticCfg::default()));
+            }
+            discovered
+        }
+    };
+    match load_config_document(&path) {
+        Ok(loaded) => Ok(loaded),
+        Err(e) if explicit => Err(e),
         Err(e) => {
             tracing::error!("config error: {e}; using defaults");
-            Ok(config::Config::default())
+            Ok((config::Config::default(), graph::SemanticCfg::default()))
         }
     }
+}
+
+/// Parse one config document: extract `[semantic]`, then parse + validate
+/// the frozen `Config` shape.
+pub(crate) fn load_config_document(
+    path: &std::path::Path,
+) -> Result<(config::Config, graph::SemanticCfg), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("config {}: {e}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("config {}: {e}", path.display()))?;
+    let semantic = match value
+        .as_object_mut()
+        .and_then(|object| object.remove("semantic"))
+    {
+        None | Some(serde_json::Value::Null) => graph::SemanticCfg::default(),
+        Some(section) => serde_json::from_value(section)
+            .map_err(|e| format!("config {} [semantic]: {e}", path.display()))?,
+    };
+    let config: config::Config =
+        serde_json::from_value(value).map_err(|e| format!("config {}: {e}", path.display()))?;
+    config
+        .validate()
+        .map_err(|e| format!("config {}: {e}", path.display()))?;
+    Ok((config, semantic))
 }
 
 /// The local Faktor Acquire admin entry (`faktor commerce <action>`). Never
@@ -975,7 +1121,7 @@ pub(crate) async fn commerce_command(
     data_dir: PathBuf,
     config_path: Option<PathBuf>,
 ) {
-    let config = match load_commerce_config(&data_dir, config_path) {
+    let config = match load_optional_config(&data_dir, config_path) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("faktor commerce: config error: {e}");
@@ -1005,7 +1151,7 @@ pub(crate) async fn enterprise_command(
     data_dir: PathBuf,
     config_path: Option<PathBuf>,
 ) {
-    let (config, _semantic) = match serve_config_and_semantic(config_path) {
+    let (config, _semantic) = match load_entry_config(&data_dir, config_path) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("faktor enterprise: config error: {e}");
@@ -2394,6 +2540,39 @@ pub(crate) fn deep_doctor(
             issues,
         ),
     }
+    // 8b. Durable session wedges (read-only): an op-active session whose
+    //     active turn record has no live drive and no resumable record, a
+    //     pending permission whose waiter lives only in another process, or
+    //     an applied workspace write with neither a verification record for
+    //     its task revision nor an integration record. Recovery closes and
+    //     expires these at restart; a residue is a wedge doctor must fail
+    //     on. The scan is bounded (exact counters, capped detail lines).
+    match session.session_wedge_invariants() {
+        Ok(s) => {
+            lines.push(format!(
+                "session wedges: {} active turn(s) without a drive (of {} active), {} ownerless pending permission(s) (of {} pending), {} applied run(s) without verification/integration (of {} applied-write candidate(s))",
+                s.active_turns_without_drive,
+                s.active_turns,
+                s.ownerless_pending_permissions,
+                s.pending_permissions,
+                s.applied_runs_without_verification,
+                s.applied_write_runs,
+            ));
+            for i in &s.issues {
+                lines.push(format!("session wedge [{}]: {}", i.kind, i.detail));
+            }
+            if s.truncated {
+                lines.push(format!(
+                    "session wedges: more issues exist than the {} printed detail(s); the counters above are exact",
+                    faktor_session::MAX_WEDGE_DETAILS
+                ));
+            }
+            *issues += s.active_turns_without_drive as usize
+                + s.ownerless_pending_permissions as usize
+                + s.applied_runs_without_verification as usize;
+        }
+        Err(e) => add_issue(format!("session wedge scan failed: {e}"), lines, issues),
+    }
     // 9. Orphan children (P0-97/100, read-only): every durable child
     //    identity row must name an existing parent session, every executor
     //    registry row must name an existing child session under its own
@@ -2490,21 +2669,35 @@ pub(crate) fn remove_stale_temp_files(
     }
 }
 
+/// One rendered session row (shared by the CLI and its scenario tests).
+pub(crate) fn session_row_text(r: &faktor_session::SessionHandle) -> String {
+    let state = r.state().map(|s| s.label()).unwrap_or("unknown");
+    let title = r.title().unwrap_or_default();
+    let provider = r.provider().unwrap_or_default();
+    let model = r.model().unwrap_or_default();
+    format!("{}  {title}  {provider}  {model}  [{state}]", r.id())
+}
+
 pub(crate) async fn sessions(data_dir: PathBuf) {
     match SessionManager::open(data_dir.join("store"), data_dir.join("cas"), false) {
         Ok(session) => match session.list_sessions(None) {
             Ok(rows) => {
                 for r in rows {
-                    let state = r.state().map(|s| s.label()).unwrap_or("unknown");
-                    let title = r.title().unwrap_or_default();
-                    let provider = r.provider().unwrap_or_default();
-                    let model = r.model().unwrap_or_default();
-                    println!("{}  {title}  {provider}  {model}  [{state}]", r.id());
+                    println!("{}", session_row_text(&r));
                 }
             }
-            Err(e) => eprintln!("error: {e}"),
+            Err(e) => {
+                // A failed listing is a REFUSAL: exit non-zero so scripts
+                // (and supervisors) never read a broken store as "no
+                // sessions".
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         },
-        Err(e) => eprintln!("error: {e}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

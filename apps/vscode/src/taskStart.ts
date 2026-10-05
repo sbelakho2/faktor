@@ -604,6 +604,33 @@ export function parseCompletionContract(
   return hasCompletionSteps(contract) ? { contract } : { contract: null };
 }
 
+/** One pick of the completion-contract quick pick, keyed by contract member. */
+export interface CompletionContractPick {
+  readonly key: 'include_commit' | 'include_push' | 'include_pr';
+}
+
+/**
+ * The completion-contract DECISION, independent of the VS Code picker:
+ * - `undefined` picks = the operator dismissed the step (Escape / closed):
+ *   the caller must ABORT the new-task flow, never start with the default;
+ * - an explicit empty selection means "no conditional completion steps";
+ * - otherwise the selected members form the contract.
+ * Collapsing a dismissal into `null` started the task on cancel.
+ */
+export function completionContractFromPicks(
+  picks: readonly CompletionContractPick[] | undefined,
+): NativeCompletionContract | null | undefined {
+  if (picks === undefined) {
+    return undefined;
+  }
+  const contract: NativeCompletionContract = {
+    include_commit: picks.some((pick) => pick.key === 'include_commit'),
+    include_push: picks.some((pick) => pick.key === 'include_push'),
+    include_pr: picks.some((pick) => pick.key === 'include_pr'),
+  };
+  return hasCompletionSteps(contract) ? contract : null;
+}
+
 export interface StartTaskSettings {
   /** The raw `faktor.mutationMode` value; parsed strictly at admission. */
   readonly mutationMode: string;

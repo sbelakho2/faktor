@@ -11,6 +11,7 @@
 // `evidence:<n>` refs.
 
 import type { AgentSummary, TaskSummary, UsageSummary, VerificationSummary } from './state';
+import { safeSlice, stripDisplayControls } from './displayText.ts';
 import type {
   NativeBillingUsage,
   NativeEntitlementSnapshot,
@@ -20,7 +21,6 @@ import {
   isMicroLimitName,
   microBalance,
   microToString,
-  microUsdText,
   type MicroMoney,
 } from './money.ts';
 
@@ -710,7 +710,7 @@ function quotaRowsOf(snapshot: NativeEntitlementSnapshot | null, panel: {
   }
   const rows: CockpitUsageQuota[] = [];
   for (const [limit, value] of Object.entries(snapshot.limits).sort(([a], [b]) =>
-    a.localeCompare(b),
+    a < b ? -1 : a > b ? 1 : 0,
   )) {
     let observed: MicroMoney | null = null;
     let reason: string | null = null;
@@ -885,11 +885,14 @@ function microText(value: string): string {
 /** One bounded line per quota row; `[EXCEEDED]` leads so it survives a clamp. */
 export function usageQuotaLine(quota: CockpitUsageQuota): string {
   const head = quota.exceeded === true ? '[EXCEEDED] ' : '';
+  // One unit on BOTH sides: a micro-money ceiling rendered bare next to a
+  // µ$-suffixed observation claimed two scales for one value.
+  const unit = (raw: string): string =>
+    isMicroLimitName(quota.limit) ? microText(raw) : raw;
   if (quota.observed === null) {
-    return `${head}quota ${quota.limit} — limit ${quota.value} (observed not served: ${quota.reason ?? 'unavailable'})`;
+    return `${head}quota ${quota.limit} — limit ${unit(quota.value)} (observed not served: ${quota.reason ?? 'unavailable'})`;
   }
-  const unit = isMicroLimitName(quota.limit) ? microText : String;
-  return `${head}quota ${quota.limit} — observed ${unit(quota.observed)} / limit ${quota.value}`;
+  return `${head}quota ${quota.limit} — observed ${unit(quota.observed)} / limit ${unit(quota.value)}`;
 }
 
 /** The bounded section lines of the usage/credits panel. */
@@ -966,11 +969,20 @@ export function usagePanelLines(panel: CockpitUsagePanel): string[] {
       }`,
     );
   }
-  lines.push(
-    `usage events page — ${panel.page.itemCount} row(s) · cursor ${
-      panel.page.cursor ?? 'first page'
-    } · next ${panel.page.nextCursor ?? 'none'}`,
-  );
+  // A disabled/unavailable billing state has NO served page: rendering
+  // "0 row(s) · cursor first page · next none" would fabricate an empty-page
+  // fact behind a refusal. The line appears only when a page was served or a
+  // cursor exists.
+  // Only a SERVED page may claim page facts: a requested cursor with a
+  // refusal (`state != ok`) is not a served page.
+  if (panel.state === 'ok') {
+    const rows = `${panel.page.itemCount} ${panel.page.itemCount === 1 ? 'row' : 'rows'}`;
+    lines.push(
+      `usage events page — ${rows} · cursor ${panel.page.cursor ?? 'first page'} · next ${
+        panel.page.nextCursor ?? 'none'
+      }`,
+    );
+  }
   lines.push(
     panel.canGrantCredits
       ? 'role grants credits (credits_grant capability present)'
@@ -1162,7 +1174,8 @@ const MAX_LINES = 64;
 const MAX_TEXT = 240;
 
 function clamp(value: string): string {
-  return value.length > MAX_TEXT ? `${value.slice(0, MAX_TEXT)}…` : value;
+  const clean = stripDisplayControls(value);
+  return clean.length > MAX_TEXT ? `${safeSlice(clean, MAX_TEXT)}…` : clean;
 }
 
 function textOf(value: unknown): string | null {
@@ -1441,7 +1454,7 @@ function servedBindingView(binding: ServedBindingInput): {
       return {
         kind,
         reference: items.length > 0 ? `work-item:${items.join(', work-item:')}` : null,
-        detail: items.length > 0 ? `${items.length} required work item(s)` : null,
+        detail: items.length > 0 ? `${items.length} required work item${items.length === 1 ? '' : 's'}` : null,
       };
     }
     case 'file_state':
@@ -2060,7 +2073,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     present: view.steps.length > 0,
     lines:
       view.steps.length > 0
-        ? view.steps.map((step) => {
+        ? view.steps.slice(0, MAX_LINES).map((step) => {
             const deps = step.dependsOn.length > 0 ? ` (after ${step.dependsOn.join(', ')})` : '';
             const kids = step.childIds.length > 0 ? ` → ${step.childIds.join(', ')}` : '';
             return `[${step.status}] ${step.id}: ${step.summary}${deps}${kids}`;
@@ -2085,7 +2098,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
                 .filter((step): step is string => step !== null)
                 .join(', ') || 'none'
             }`,
-            ...view.completion.steps.map(
+            ...view.completion.steps.slice(0, MAX_LINES).map(
               (step) =>
                 `[${step.status}] ${step.step}${
                   step.detail !== null && step.detail.length > 0 ? ` — ${step.detail}` : ''
@@ -2094,7 +2107,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
             `status source: ${view.completion.source}${
               view.completion.reason !== null ? ` (${view.completion.reason})` : ''
             }`,
-          ],
+          ].slice(0, MAX_LINES),
     evidence: [],
   });
   sections.push({
@@ -2103,7 +2116,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     present: view.children.length > 0,
     lines:
       view.children.length > 0
-        ? view.children.map((child) => {
+        ? view.children.slice(0, MAX_LINES).map((child) => {
             const bits = [
               `${child.childId} [${child.state}]`,
               child.presentation === 'background' ? 'background (dimmed)' : null,
@@ -2135,7 +2148,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
             `criteria ${view.tournament.criteria.length}: ${
               view.tournament.criteria.join('; ') || '—'
             }`,
-            ...view.tournament.candidates.map((candidate) => {
+            ...view.tournament.candidates.slice(0, MAX_LINES).map((candidate) => {
               const verdict =
                 candidate.verification === null
                   ? 'unverified'
@@ -2150,7 +2163,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
                     }`;
               return `${candidate.winner ? '* ' : ''}${candidate.childId} [${candidate.state}] ${verdict} ${review} cost ${candidate.costMicro} wall ${candidate.wallMs}ms`;
             }),
-          ],
+          ].slice(0, MAX_LINES),
     evidence: [],
     actions:
       view.tournament === null
@@ -2203,7 +2216,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
                 ? `head ${digestLabel(view.verification.remotePrHead)}`
                 : null,
               view.spend !== null
-                ? `cost ${microUsdText(BigInt(view.spend.spentCostMicro))}`
+                ? `cost ${microText(BigInt(view.spend.spentCostMicro).toString())}`
                 : null,
             ]
               .filter((bit): bit is string => bit !== null)
@@ -2232,12 +2245,12 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
           `tokens ${view.spend.spentTokens ?? '—'}${
             view.spend.maxTokens !== null ? ` / ${view.spend.maxTokens}` : ''
           }`,
-          `cost ${microUsdText(BigInt(view.spend.spentCostMicro))}${
+          `cost ${microText(BigInt(view.spend.spentCostMicro).toString())}${
             view.spend.maxCostMicro !== null
-              ? ` / ${microUsdText(BigInt(view.spend.maxCostMicro))}`
+              ? ` / ${microText(BigInt(view.spend.maxCostMicro).toString())}`
               : ''
           }`,
-          `reserved ${microUsdText(BigInt(view.spend.openReservedMicro))}`,
+          `reserved ${microText(BigInt(view.spend.openReservedMicro).toString())}`,
         ]
       : ['none'],
     evidence: [],

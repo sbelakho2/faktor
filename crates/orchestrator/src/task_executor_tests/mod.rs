@@ -42,9 +42,10 @@ pub(crate) use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePa
 pub(crate) use crate::runtime::completion_steps::commit_message;
 pub(crate) use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 pub(crate) use crate::runtime::task_executor::{
-    compose_no_op_root_verification_status, compose_root_verification_status, MutationMode,
-    PreparedRunIntegration, RunSettlement, SettlementOutcome, ShadowFinalizeAction, TaskExecutor,
-    TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
+    compose_no_op_root_verification_status, compose_root_verification_status,
+    recover_pending_task_admissions, task_start_digest, MutationMode, PreparedRunIntegration,
+    RunSettlement, SettlementOutcome, ShadowFinalizeAction, TaskExecutor, TaskRunMode,
+    TaskRunReceipt, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
 };
 pub(crate) use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 pub(crate) use crate::test_support::heavy_guard;
@@ -360,6 +361,48 @@ pub(crate) fn open_env_with_shadows(
     })
 }
 
+/// Reopen the SAME session over an existing root after a simulated daemon
+/// death (audit P1 crash matrix): a fresh store open (new boot generation),
+/// fresh provider scripts, the same parent session/owner/isolation roots.
+/// Mirrors [`open_env_with_shadows`] without creating a second workspace or
+/// session row.
+pub(crate) fn reopen_env(
+    root: &std::path::Path,
+    parent: SessionId,
+    scripts: Vec<Vec<ScriptedResponse>>,
+) -> Arc<Env> {
+    let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    let caps = ModelCapabilities {
+        tools: true,
+        parallel_tools: true,
+        ..Default::default()
+    };
+    let provider = Arc::new(PerCallProvider::new("fake", caps, scripts));
+    let mut registry = ProviderRegistry::new();
+    registry.try_register(provider.clone()).unwrap();
+    let agent = build_agent(manager.clone(), registry);
+    let owner_root = root.join("owner");
+    std::fs::create_dir_all(&owner_root).unwrap();
+    let isolated_root = root.join("isolated");
+    std::fs::create_dir_all(&isolated_root).unwrap();
+    let orchestrator = OrchestratorRuntime::new(manager.clone(), agent.clone());
+    let executor = TaskExecutor::new_owner_direct_for_test_harness(
+        &orchestrator,
+        manager.clone(),
+        agent.clone(),
+    );
+    Arc::new(Env {
+        manager,
+        agent,
+        provider,
+        orchestrator,
+        executor,
+        parent,
+        owner_root,
+        isolated_root,
+    })
+}
+
 pub(crate) fn build_agent(
     manager: Arc<SessionManager>,
     registry: ProviderRegistry,
@@ -404,6 +447,7 @@ pub(crate) fn build_agent_with_verification(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap()

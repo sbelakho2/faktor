@@ -395,6 +395,12 @@ pub(crate) async fn native_workers_list(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    // The plane's own gate is answered FIRST: with both [cloud] and
+    // [workers] disabled every worker route must say `workers_disabled`,
+    // not `cloud_disabled` from principal resolution.
+    if let Err(e) = plane(&state) {
+        return wire_status(e);
+    }
     let Query(query) = match query {
         Ok(query) => query,
         Err(_) => return wire_status(malformed_body("invalid query parameters (strict DTO)")),
@@ -434,6 +440,12 @@ pub(crate) async fn native_worker_token_mint(
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // The plane's own gate is answered FIRST: with both [cloud] and
+    // [workers] disabled every worker route must say `workers_disabled`,
+    // not `cloud_disabled` from principal resolution.
+    if let Err(e) = plane(&state) {
+        return wire_status(e);
     }
     let Json(body) = match body {
         Ok(body) => body,
@@ -479,6 +491,12 @@ pub(crate) async fn native_worker_revoke(
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
     }
+    // The plane's own gate is answered FIRST: with both [cloud] and
+    // [workers] disabled every worker route must say `workers_disabled`,
+    // not `cloud_disabled` from principal resolution.
+    if let Err(e) = plane(&state) {
+        return wire_status(e);
+    }
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,
         Err(e) => return wire_status(e),
@@ -517,6 +535,12 @@ pub(crate) async fn native_job_status(
 ) -> Response {
     if let Err(e) = authed(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // The plane's own gate is answered FIRST: with both [cloud] and
+    // [workers] disabled every worker route must say `workers_disabled`,
+    // not `cloud_disabled` from principal resolution.
+    if let Err(e) = plane(&state) {
+        return wire_status(e);
     }
     let principal = match require_principal(&state, &headers) {
         Ok(p) => p,

@@ -1477,6 +1477,14 @@ object JetBrainsParitySmoke {
     private fun realDaemonSuite(binaryPath: String) {
         val binary = Paths.get(binaryPath)
         val dataDir = Files.createTempDirectory("faktor-parity-real-")
+        // The daemon's provider preflight requires a registered provider:
+        // seed the discovered config so the parity rows' `default` id is
+        // served (local ollama entry, no key).
+        Files.write(
+            dataDir.resolve("faktor-plus.json"),
+            """{"config_version":1,"model":"default","providers":[{"kind":"ollama","id":"default","base_url":"http://127.0.0.1:9","allow_loopback":true}]}"""
+                .toByteArray()
+        )
         val workspace = Files.createTempDirectory("faktor-parity-workspace-")
         Files.write(Paths.get(workspace.toString(), "seed.txt"), "parity".toByteArray())
         val service = FaktorFrontendService(binary, dataDir)

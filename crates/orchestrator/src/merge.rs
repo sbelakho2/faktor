@@ -3367,6 +3367,7 @@ mod tests {
                 retry_policy: faktor_core::retry::RetryPolicy::default(),
                 semantic,
                 context_prior: None,
+                secret_registry: None,
                 efficiency: Default::default(),
             };
             let agent = AgentRuntime::new(deps).unwrap();

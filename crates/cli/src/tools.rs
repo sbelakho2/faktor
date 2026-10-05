@@ -1129,6 +1129,16 @@ pub fn run_command_tool() -> Tool {
                 // terminal ENFORCES it or refuses typed.
                 let isolation =
                     faktor_terminal::NetworkIsolation::from(sandbox.spawn_network_requirement());
+                // Audit P1: a workspace-only policy (both external rules
+                // Deny) demands OS-level filesystem confinement too. The
+                // session workspace root is the ONLY data root a shell tool
+                // gets; daemon-owned paths outside it are denied by the
+                // kernel and surface to the command as EACCES — never as a
+                // projection that says `workspace` while the child roams.
+                let filesystem_isolation = faktor_terminal::FilesystemIsolation::for_requirement(
+                    sandbox.spawn_filesystem_requirement(),
+                    vec![ws.root().to_path_buf()],
+                );
                 let cfg = SpawnConfig {
                     cmd: resolved.program.to_string_lossy().into_owned(),
                     args: resolved
@@ -1142,6 +1152,7 @@ pub fn run_command_tool() -> Tool {
                     capture: true,
                     artifact_max: COMMAND_ARTIFACT_MAX,
                     network_isolation: isolation,
+                    filesystem_isolation,
                 };
                 let out = supervisor
                     .run(
@@ -2573,6 +2584,88 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(out.text.contains("hello-from-tool"), "{:?}", out.text);
         assert_eq!(out.effect_status, EffectStatus::Unknown);
+    }
+
+    /// Audit P1 consumer proof: a workspace-only policy (external
+    /// Deny/Deny) projects `workspace` and the tool's spawned shell is
+    /// really confined — the outside file is unreadable (EACCES), the
+    /// inside file is fully usable, and a platform without the kernel
+    /// backend refuses the spawn typed instead of running it unenforced.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_command_enforces_the_workspace_projection_under_a_workspace_guarantee() {
+        let f = fixture_exact(SandboxPolicy {
+            read_external: Rule::Deny,
+            write_external: Rule::Deny,
+            execute_shell: Rule::Allow,
+            network_guarantee: SandboxGuarantee::None,
+            shell_execution: ShellExecutionMode::NetworkCapableUserGranted,
+            ..Default::default()
+        });
+        let profile = f.sandbox.policy().spawn_profile();
+        assert_eq!(
+            profile.filesystem,
+            if cfg!(target_os = "linux") {
+                "workspace"
+            } else {
+                "application-policy-only"
+            },
+            "the projection must be enforcement-honest"
+        );
+        assert_eq!(
+            f.sandbox.spawn_filesystem_requirement(),
+            faktor_terminal::FilesystemIsolationRequirement::Workspace { best_effort: false }
+        );
+        let outside = f._dir.path().join("outside-secret.txt");
+        std::fs::write(&outside, "top-secret-outside").unwrap();
+        let tool = run_command_tool();
+        let read = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({"command": format!("cat '{}'", outside.display())}),
+        )
+        .await;
+        match read {
+            Ok(out) => {
+                #[cfg(not(target_os = "linux"))]
+                panic!("only an OS-level platform may run under a Required workspace demand");
+                #[cfg(target_os = "linux")]
+                {
+                    assert_ne!(
+                        out.exit_code,
+                        Some(0),
+                        "the outside read must fail: {out:?}"
+                    );
+                    assert!(
+                        !out.text.contains("top-secret-outside"),
+                        "the outside file leaked: {:?}",
+                        out.text
+                    );
+                }
+            }
+            Err(e) => {
+                assert_eq!(e.kind, ErrorKind::Permission, "{e:?}");
+                assert!(
+                    e.message
+                        .contains("FilesystemIsolation::Workspace(required)"),
+                    "the typed filesystem refusal must surface: {e:?}"
+                );
+                assert!(
+                    outside.exists(),
+                    "the refused child never touched the outside file"
+                );
+            }
+        }
+        // Inside the workspace the same shell fully reads and writes.
+        let out = (tool.execute)(
+            ctx(&f),
+            serde_json::json!({
+                "command": "echo inside-ok > inside.txt && cat inside.txt"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{out:?}");
+        assert!(out.text.contains("inside-ok"), "{:?}", out.text);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

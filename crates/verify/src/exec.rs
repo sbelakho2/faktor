@@ -376,6 +376,7 @@ impl AsyncCheckExecutor {
             capture: true,
             artifact_max: self.artifact_max,
             network_isolation: faktor_terminal::NetworkIsolation::from(self.network_requirement),
+            filesystem_isolation: faktor_terminal::FilesystemIsolation::Inherit,
         };
         let deadline = ctx
             .deadline

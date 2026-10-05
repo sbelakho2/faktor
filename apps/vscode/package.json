@@ -62,6 +62,10 @@
       {
         "command": "faktor.controlPlaneSignOut",
         "title": "Faktor: Sign out of Control Plane"
+      },
+      {
+        "command": "faktor.reconnectStream",
+        "title": "Faktor: Reconnect Event Stream"
       }
     ],
     "viewsContainers": {

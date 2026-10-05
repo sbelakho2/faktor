@@ -1193,9 +1193,12 @@ impl TaskExecutor {
         let token = CancellationToken::new();
         let run = if prepared.changed.is_empty() && no_op == NoOpDisposition::Refused {
             persist_root_verification_fact(handle, "pending", &[], &[])?;
-            eprintln!(
-                "orchestrated run {} produced an empty aggregate change set and its no-op policy is refused; completion stays blocked",
-                prepared.run_id
+            self.note_root_verification_unavailable(
+                &prepared.run_id,
+                &format!(
+                    "orchestrated run {} produced an empty aggregate change set and its no-op policy is refused; completion stays blocked",
+                    prepared.run_id
+                ),
             );
             return Ok(None);
         } else if prepared.changed.is_empty() && no_op == NoOpDisposition::Allowed {
@@ -1260,9 +1263,12 @@ impl TaskExecutor {
                     }
                     if outcome.pending {
                         persist_root_verification_fact(handle, "pending", &[], &prepared.changed)?;
-                        eprintln!(
-                            "root verification attempt {} of orchestrated run {} is still executing; completion waits",
-                            outcome.attempt_op, prepared.run_id
+                        self.note_root_verification_unavailable(
+                            &prepared.run_id,
+                            &format!(
+                                "root verification attempt {} of orchestrated run {} is still executing; completion waits",
+                                outcome.attempt_op, prepared.run_id
+                            ),
                         );
                         return Ok(None);
                     }
@@ -1281,9 +1287,12 @@ impl TaskExecutor {
                 }
                 Err(e) => {
                     persist_root_verification_fact(handle, "pending", &[], &prepared.changed)?;
-                    eprintln!(
-                        "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
-                        prepared.run_id
+                    self.note_root_verification_unavailable(
+                        &prepared.run_id,
+                        &format!(
+                            "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
+                            prepared.run_id
+                        ),
                     );
                     return Ok(None);
                 }
@@ -1304,9 +1313,12 @@ impl TaskExecutor {
                 Ok(run) => run,
                 Err(e) => {
                     persist_root_verification_fact(handle, "pending", &[], &prepared.changed)?;
-                    eprintln!(
-                        "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
-                        prepared.run_id
+                    self.note_root_verification_unavailable(
+                        &prepared.run_id,
+                        &format!(
+                            "root verification unavailable for orchestrated run {}: {e}; run stays unverified",
+                            prepared.run_id
+                        ),
                     );
                     return Ok(None);
                 }

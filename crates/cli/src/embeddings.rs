@@ -154,6 +154,13 @@ impl faktor_search::Embedder for ProviderEmbedder {
         Some(self.identity())
     }
 
+    /// Declare the provider request cap through the search seam: the search
+    /// service validates it by clamping to `1..=MAX_SEMANTIC_EMBED_BATCH`,
+    /// so this provider's own bound is the one actually applied.
+    fn max_batch_size(&self) -> usize {
+        MAX_EMBEDDING_INPUTS
+    }
+
     fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
         // Best-effort infallible bridge; the fallible seam carries the
         // typed error and is what the search service uses.

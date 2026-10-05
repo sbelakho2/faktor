@@ -925,6 +925,20 @@ impl Store {
                 });
             }
         }
+        // Attachment rows reference CAS bytes too: without them `doctor
+        // --deep` was blind to a deleted attachment blob (the bytes route
+        // 404s while doctor says all references verify).
+        {
+            let mut stmt = conn.prepare("SELECT id, digest FROM attachment")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                out.push(CasHashRef {
+                    source: "attachment",
+                    row_id: row.get(0)?,
+                    hash: row.get(1)?,
+                });
+            }
+        }
         Ok(out)
     }
 }

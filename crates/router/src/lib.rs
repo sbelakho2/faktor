@@ -759,6 +759,7 @@ pub fn qualified_candidates<'a>(
     prefer_quality_target(&mut qualified, req, |d, target| {
         clears_quality_floor(&d.performance(), req.phase, target)
     });
+
     Ok(qualified)
 }
 

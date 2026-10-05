@@ -1,19 +1,24 @@
 {
   "schema": "faktor-parity-visual-baselines/v3",
   "method": "offscreen-swing-render+component-tree-state-digest-vs-pinned-baseline",
+  "rePin": {
+    "windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1 -WriteBaselines (on the Windows agent); commit target/certification/visual-baselines-windows.json into this file's windows record",
+    "linux": "bash apps/jetbrains/compile-and-smoke.sh --write-baselines (or ./gradlew :frontend:smoke -PwriteBaselines=true) on the Linux host, under the pinned core-fonts fontconfig",
+    "fonts": "apps/jetbrains/frontend/src/test/resources/parity/fonts/core-fonts.conf (FONTCONFIG_FILE); digest bounds derive from resolved font metrics"
+  },
   "requiredPlatforms": ["linux", "macos", "windows"],
   "platforms": {
     "linux": {
-      "environment": "linux-amd64-jvm17",
+      "environment": "linux-amd64-jvm17-f29cb65792a65",
       "digests": {
-        "task-tree": "1d31d35ebfc841e2803df4c1db44d760ece086364f4f216b7293ab85721d38c1",
+        "task-tree": "ea5e3db724ddfbc7e86a4cc60568ee5deb9ba32fb0ab4eb874a9e49d848b6c02",
         "blockers": "6143e12e0d2cc7fef1696752b2f00250a65031f04ff6788db4cc217ca8166c53",
         "tournament": "40e36e790bd56c812ad9d896f1697dc74c4b04c2ddcbe012514e6d0b8d91712e",
         "permissions": "351135711ac2530248859c191483701d6ef3e4faa3a451a9a8e1d70d5ca1ce8c",
         "terminal": "798425c5fa368ee2886a58f07866f309612367542193fc5aa5c87837949bf20e",
         "evidence": "7d0c35d650bdbcac5e5979f6536a2dbd410761bbd1d46d3be7840a06bf41d963",
         "settings": "73af8743c5a046055cd0dcef92843776306e2240b8afcdb15c2e56852720216d",
-        "history": "3c8421e31a46a98ccd9255f97d35409e0825a16a5f3e152948833b0be37fcbd0"
+        "history": "e82fab3e4feabb09407a6204d7a99b3232ca5937a50902edd22a9ebdbf991d6a"
       }
     },
     "macos": {

@@ -63,6 +63,7 @@ import java.nio.file.Paths
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 object NativeClientTest {
 
@@ -77,8 +78,12 @@ object NativeClientTest {
         assertClientRoutes()
         assertErrorMapping()
         assertBodyBound()
+        assertBodyDeadline()
         assertSseStreaming()
+        assertHeartbeatIdNeverAdvancesCursor()
         assertSseBlockedStates()
+        assertNonRetryableStatusBlocks()
+        assertDeepJsonIsTypedFailure()
         assertSseBlockedRecovery()
         println("PASS all native client unit assertions")
     }
@@ -839,6 +844,37 @@ private class FakeResponse(private val out: BufferedOutputStream) {
         out.flush()
         block(FakeSseWriter(out))
     }
+
+    /**
+     * HEADERS immediately, then one byte every [intervalMs] until [bytes] is
+     * reached, [stop] is set, or the client hangs up. Content-Length stays
+     * [declaredLength] (under the client's byte cap), so only the request
+     * deadline can end the exchange: the observed dribble fault where the
+     * byte cap is never reached and the body never settles.
+     */
+    fun dribble(
+        status: Int,
+        contentType: String,
+        declaredLength: Long,
+        bytes: Int,
+        intervalMs: Long,
+        stop: AtomicBoolean
+    ) {
+        val head = "HTTP/1.1 $status X\r\nContent-Type: $contentType\r\n" +
+            "Content-Length: $declaredLength\r\nConnection: close\r\n\r\n"
+        out.write(head.toByteArray(Charsets.UTF_8))
+        out.flush()
+        try {
+            for (i in 0 until bytes) {
+                if (stop.get()) return
+                out.write(' '.code)
+                out.flush()
+                Thread.sleep(intervalMs)
+            }
+        } catch (e: Exception) {
+            // The client hung up at its deadline; expected.
+        }
+    }
 }
 
 /**
@@ -846,6 +882,117 @@ private class FakeResponse(private val out: BufferedOutputStream) {
  * chunk-free streaming responses. One thread per connection; all threads
  * are daemons, so a test can abandon a held SSE stream.
  */
+
+/**
+ * A persistent non-retryable HTTP status (404/401/403...) must enter the
+ * stable typed blocked state after ONE request: retrying the same rejected
+ * request forever would leave the UI "retrying" indefinitely and hammer the
+ * daemon.
+ */
+private fun assertNonRetryableStatusBlocks() {
+    val daemon = FakeDaemon()
+    val path = "/native/session/blk-status/events"
+    daemon.on("GET", path) { _, response ->
+        response.json(
+            404,
+            "{\"error\":{\"code\":\"not_found\",\"message\":\"gone\",\"retryable\":false}}"
+        )
+    }
+    daemon.start()
+    val blockedLatch = CountDownLatch(1)
+    val blocks = Collections.synchronizedList(ArrayList<ProtocolBlocked>())
+    val stream = NativeEventStream(
+        daemon.baseUrl, "tok", "blk-status", 0,
+        minBackoffMs = 10, maxBackoffMs = 20,
+        onEvent = { },
+        onBlocked = { block ->
+            blocks.add(block)
+            blockedLatch.countDown()
+        }
+    )
+    try {
+        stream.start()
+        awaitLatch(blockedLatch, 10_000, "the non-retryable status block")
+        Thread.sleep(300)
+        assertEquals(ProtocolBlocked.Kind.STREAM_REJECTED, blocks[0].kind)
+        assertEquals(
+            1,
+            daemon.requestCount("GET", path),
+            "a terminal status must never be retried"
+        )
+        assertEquals("blocked", stream.status, "the stream must report the stable state")
+        println("  sse blocked: non-retryable 404 -> ${blocks[0].kind}, requests=1")
+    } finally {
+        stream.stop()
+        daemon.stop()
+    }
+}
+
+/**
+ * Deeply nested JSON is a typed protocol failure: the recursive parser must
+ * refuse on depth instead of overflowing the thread stack (a
+ * StackOverflowError escaped every typed handler and silently killed the
+ * stream while the UI still rendered it as live).
+ */
+private fun assertDeepJsonIsTypedFailure() {
+    val deep = "[".repeat(5000) + "]".repeat(5000)
+    val failure = runCatching { JsonCodec.parse(deep) }.exceptionOrNull()
+    assertTrue(
+        failure is NativeProtocolException,
+        "deep nesting must be a typed NativeProtocolException, got $failure"
+    )
+    assertTrue(
+        failure!!.message!!.contains("nesting"),
+        "the refusal must name the nesting bound: ${failure.message}"
+    )
+    println("  json depth: 5000 nested arrays -> typed refusal")
+}
+
+
+/**
+ * The contract says keep-alives carry NO id. A hostile heartbeat id must
+ * never advance the resume cursor: doing so would silently skip every
+ * durable event below it and the reconnect `after=` could never replay them.
+ */
+private fun assertHeartbeatIdNeverAdvancesCursor() {
+    val daemon = FakeDaemon()
+    val held = CountDownLatch(1)
+    daemon.on("GET", "/native/session/hb/events") { _, response ->
+        response.stream(200, "text/event-stream") { writer ->
+            writer.write("event: heartbeat\nid: 99\ndata: {}\n\n")
+            writer.frame(2, "agent_state_changed", "{\"event\":\"agent_state_changed\",\"state\":\"ready\"}")
+            held.await(10, TimeUnit.SECONDS)
+        }
+    }
+    daemon.start()
+    val events = Collections.synchronizedList(ArrayList<NativeSseEvent>())
+    val delivered = CountDownLatch(1)
+    val errors = Collections.synchronizedList(ArrayList<String>())
+    val stream = NativeEventStream(
+        daemon.baseUrl, "tok", "hb", 0,
+        minBackoffMs = 10, maxBackoffMs = 20,
+        onEvent = { event ->
+            events.add(event)
+            delivered.countDown()
+        },
+        onError = { error -> errors.add(error.message ?: "error") }
+    )
+    try {
+        stream.start()
+        awaitLatch(delivered, 10_000, "the durable frame after a hostile heartbeat id")
+        Thread.sleep(150)
+        assertEquals(1, events.size)
+        assertEquals(2L, events[0].id)
+        assertEquals(2L, stream.cursor, "a heartbeat id must not move the resume cursor")
+        assertTrue(errors.isEmpty(), "no frame errors expected: $errors")
+        println("  sse heartbeat: hostile id 99 ignored, cursor stayed 2")
+    } finally {
+        stream.stop()
+        held.countDown()
+        daemon.stop()
+    }
+}
+
 private class FakeDaemon {
     private val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
     val requests: MutableList<FakeRequest> = Collections.synchronizedList(ArrayList<FakeRequest>())
@@ -1337,6 +1484,79 @@ private fun assertBodyBound() {
     }
 }
 
+/**
+ * The request deadline covers the WHOLE request, not just header arrival: a
+ * fake daemon that sends headers then dribbles one byte per interval (never
+ * reaching the byte cap) must be refused typed at the deadline for JSON,
+ * raw-byte and error-body reads alike, and a header-only stall maps to the
+ * same typed refusal instead of leaking an IOException.
+ */
+private fun assertBodyDeadline() {
+    val daemon = FakeDaemon()
+    val stop = AtomicBoolean(false)
+    val headerGate = CountDownLatch(1)
+    val intervalMs = 150L
+    val timeoutMs = 900L
+    daemon.on("GET", "/native/health") { _, response ->
+        response.dribble(200, "application/json", 1L shl 20, 64, intervalMs, stop)
+    }
+    val digest = "a".repeat(64)
+    daemon.on("GET", "/native/session/7/attachments/blob/$digest/bytes") { _, response ->
+        response.dribble(200, "application/octet-stream", 1L shl 20, 64, intervalMs, stop)
+    }
+    daemon.on("GET", "/native/ready") { _, _ ->
+        headerGate.await(5, TimeUnit.SECONDS)
+    }
+    daemon.start()
+    try {
+        val client = NativeClient(daemon.baseUrl, "tok", timeoutMs = timeoutMs)
+
+        val jsonStarted = System.nanoTime()
+        try {
+            client.health()
+            fail("a dribbling JSON body must be refused at the deadline")
+        } catch (e: NativeApiException) {
+            assertEquals("timeout", e.code, "the JSON body deadline is a typed timeout")
+            assertTrue(
+                e.detail.contains("timed out after ${timeoutMs}ms"),
+                "detail must name the deadline: ${e.detail}"
+            )
+            val elapsedMs = (System.nanoTime() - jsonStarted) / 1_000_000L
+            assertTrue(
+                elapsedMs in (timeoutMs / 2)..5_000L,
+                "the JSON deadline must settle at the deadline, took ${elapsedMs}ms"
+            )
+            println("  body deadline: JSON dribble -> ${e.code} after ${elapsedMs}ms")
+        }
+
+        val bytesStarted = System.nanoTime()
+        try {
+            client.attachmentBlobBytes("7", digest)
+            fail("a dribbling raw body must be refused at the deadline")
+        } catch (e: NativeApiException) {
+            assertEquals("timeout", e.code, "the raw-byte body deadline is a typed timeout")
+            val elapsedMs = (System.nanoTime() - bytesStarted) / 1_000_000L
+            assertTrue(
+                elapsedMs in (timeoutMs / 2)..5_000L,
+                "the raw deadline must settle at the deadline, took ${elapsedMs}ms"
+            )
+            println("  body deadline: raw bytes dribble -> ${e.code} after ${elapsedMs}ms")
+        }
+
+        try {
+            client.ready()
+            fail("a header-only stall must be refused at the deadline")
+        } catch (e: NativeApiException) {
+            assertEquals("timeout", e.code, "a header stall is the same typed timeout")
+            println("  body deadline: header-only stall -> ${e.code}")
+        }
+    } finally {
+        stop.set(true)
+        headerGate.countDown()
+        daemon.stop()
+    }
+}
+
 // ------------------------------------------------------------------- SSE
 
 private fun awaitLatch(latch: CountDownLatch, timeoutMs: Long, what: String) {
@@ -1615,6 +1835,14 @@ object NativeBridgeSmoke {
         }
         val binary = Paths.get(args[0])
         val dataDir = Files.createTempDirectory("faktor-native-smoke-")
+        // The daemon's provider preflight requires a registered provider: seed
+        // the discovered config so the smoke's `default` id is served (an
+        // ollama entry is local-only and needs no key).
+        Files.write(
+            dataDir.resolve("faktor-plus.json"),
+            """{"config_version":1,"model":"default","providers":[{"kind":"ollama","id":"default","base_url":"http://127.0.0.1:9","allow_loopback":true}]}"""
+                .toByteArray()
+        )
 
         step("native protocol unit assertions") { NativeClientTest.runAll() }
 

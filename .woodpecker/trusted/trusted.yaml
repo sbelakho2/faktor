@@ -41,6 +41,36 @@
 #     windows agents; cross-platform lanes cannot be folded into the linux
 #     certificate because workflows share no filesystem.
 #
+# Lane-bound marker auth (attribution, per-lane marker HMAC): every linux lane
+# emits its marker through scripts/certification/lane-marker.sh, which adds
+# `"auth":"hmac-sha256:<hex>"` over the canonical unsigned marker JSON using
+# the lane's OWN CI secret. To enable verification, register one secret per
+# lane on the TRUSTED project and map it BOTH in the lane step's
+# `environment:` and in the `certificate` step's `environment:` (see
+# scripts/woodpecker/setup.md §4 for registration):
+#
+#   linux                  faktor_lane_token_linux
+#   static                 faktor_lane_token_static
+#   docs                   faktor_lane_token_docs
+#   soak-smoke             faktor_lane_token_soak_smoke
+#   vscode                 faktor_lane_token_vscode
+#   vscode-e2e             faktor_lane_token_vscode_e2e
+#   jetbrains-build        faktor_lane_token_jetbrains_build
+#   jetbrains-smoke        faktor_lane_token_jetbrains_smoke
+#   perf                   faktor_lane_token_perf
+#   release-artifacts      faktor_lane_token_release_artifacts
+#
+# env var name = `faktor_lane_token_<lane>` with '-' -> '_' (the uppercase
+# FAKTOR_LANE_TOKEN_<LANE> form is also accepted), e.g. in a lane step:
+#   environment:
+#     faktor_lane_token_linux: { from_secret: faktor_lane_token_linux }
+# A lane step only receives its own token, so it cannot mint another lane's
+# MAC; the certificate step receives all of them and rejects wrong or missing
+# auth. While a mapping is absent (untrusted/PR project, unconfigured
+# operator) the marker carries no auth and verify-markers records that lane as
+# `unattested` — visible, never silently passed — with no hard failure:
+# binding is opt-in per configured secret.
+#
 # Agent routing: `labels.platform` is the documented agent selector. The
 # deprecated `runs_on` key is NOT an agent selector in 3.x (it feeds the
 # run-on-success/failure flag of dependent tasks and would make a workflow
@@ -95,7 +125,12 @@
 # status PER AXIS (contexts like `ci/woodpecker/push/trusted/<axis_id>`).
 # Those per-axis contexts are informational; branch protection and release
 # certification require ONLY the dedicated non-matrix aggregate below, which
-# the certificate step publishes after every required lane passed.
+# the certificate/status steps publish after every required lane passed:
+# `ci/faktor/trusted-certified-linux`, `...-darwin`, `...-windows` are the
+# per-platform facts; `ci/faktor/trusted-certified` is published ONLY on push
+# by `status-publish` after ALL THREE exact-SHA, same-tree, same-pipeline-run
+# platform certificates are green (a missing, stale or failing platform
+# publishes a conclusive non-success instead).
 
 matrix:
   platform:
@@ -203,16 +238,9 @@ steps:
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"linux","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/linux.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane linux --status passed \
+          --out target/certification/lanes/linux.json
   - name: static
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
@@ -234,6 +262,11 @@ steps:
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
       - cargo test -p faktor-tests-fuzz-seeds
+      # Frozen contracts: regenerate every vocabulary from the COMPILED types
+      # and fail on any rename/reorder in docs/contracts. This is the
+      # cargo-capable half; the certificate lane re-hashes the frozen bytes
+      # and binds the digest into the certificate evidence.
+      - cargo run -p faktor-contracts -- check
       # License / bans / sources policy (root deny.toml) evaluated against the
       # locked cargo metadata graph; cargo-deny itself re-checks when present.
       - bash scripts/check-licenses.sh
@@ -245,20 +278,14 @@ steps:
         cargo test -p faktor-tests-static-authority
         cargo test -p faktor-security
         cargo test -p faktor-tests-fuzz-seeds
+        cargo run -p faktor-contracts -- check
         bash scripts/check-licenses.sh
         SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"static","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/static.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane static --status passed \
+          --out target/certification/lanes/static.json
   - name: docs
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
@@ -289,21 +316,16 @@ steps:
         bash scripts/check-docs-sync.sh
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"docs","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/docs.json
-  # Bounded accelerated release-soak smoke (scripts/soak.sh): one representative
-  # ignored [soak]/[fault]/[perf] test per group, scale 1. The campaign records
-  # target/certification/soak.json and FAILS when it executes zero tests. The
-  # long scaled run is the nightly `soak` lane; this gate keeps the driver and
-  # its representative tests exercised on every push.
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane docs --status passed \
+          --out target/certification/lanes/docs.json
+  # Per-release accelerated churn (scripts/soak.sh --mode churn): the
+  # convergence churn workload runs for FAKTOR_SOAK_CHURN_SECONDS with the
+  # mandatory quiescent-convergence checker. Every recorded metric must pass
+  # (RSS/FD bands, zero children/background tasks, drained writer/reader
+  # queues, WAL/temp/CAS convergence, no journal/index latency trend,
+  # reconnect correctness); missing samples are a typed failure, never a
+  # skip. The real-time 12-24h run is the nightly `soak` lane.
   - name: soak-smoke
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     when:
@@ -312,37 +334,32 @@ steps:
     environment:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
-      FAKTOR_SOAK_MODE: smoke
-      FAKTOR_SOAK_SCALE: "1"
+      FAKTOR_SOAK_MODE: churn
+      FAKTOR_SOAK_CHURN_SECONDS: "1800"
+      FAKTOR_SOAK_CONVERGENCE: required
+      FAKTOR_SOAK_LANE: soak-smoke
       # Bounded even though the first (cold) release build dominates: a
-      # non-positive budget is refused and a zero-test run fails the step.
+      # non-positive budget is refused, a zero-test run fails the step, and a
+      # failed convergence metric fails the lane.
       FAKTOR_SOAK_MAX_WALL_SECONDS: "3600"
-      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "2700"
+      FAKTOR_SOAK_TEST_TIMEOUT_SECONDS: "3300"
     volumes:
       - faktor-trusted-cargo-registry:/usr/local/cargo/registry
       - faktor-trusted-cargo-git:/usr/local/cargo/git
       - faktor-trusted-target-soak-smoke:/woodpecker-cache/target
     commands:
-      - bash scripts/soak.sh
+      - bash scripts/soak.sh --mode churn -p faktor-tests-soak --release -- --ignored --exact soak_convergence_churn
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
-        bash scripts/soak.sh
+        bash scripts/soak.sh --mode churn -p faktor-tests-soak --release -- --ignored --exact soak_convergence_churn
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || printf 'unknown')"
-        artifact_path="target/certification/soak.json"
-        artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
-        artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
-        artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"soak-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/soak-smoke.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane soak-smoke --status passed \
+          --artifact target/certification/soak.json \
+          --out target/certification/lanes/soak-smoke.json
   - name: vscode
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     when:
@@ -387,18 +404,10 @@ steps:
         cd "$CI_WORKSPACE"
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifact_path="apps/vscode/faktor-ci.vsix"
-        artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
-        artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
-        artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane vscode --status passed \
+          --artifact apps/vscode/faktor-ci.vsix \
+          --out target/certification/lanes/vscode.json
   # Real VS Code Extension Host / webview E2E behind the VS Code lane. Runs
   # `--extensionDevelopmentPath=apps/vscode` against a PINNED linux-x64 VS Code
   # tarball (version+commit+sha256 recorded in scripts/vscode-e2e.sh, sha
@@ -427,11 +436,6 @@ steps:
         bash scripts/vscode-e2e.sh --cache-dir /woodpecker-cache/vscode-e2e/cache
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         # The playwright image may lack git; the vscode lane's marker (this
         # lane depends_on vscode) carries the same tree.
         tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
@@ -439,12 +443,10 @@ steps:
           tree="$(sed -n 's/.*"tree":"\([^"]*\)".*/\1/p' target/certification/lanes/vscode.json | head -n 1)"
         fi
         [ -n "$tree" ] || tree="unknown"
-        artifact_path="target/certification/vscode-e2e.json"
-        artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
-        artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
-        artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"vscode-e2e","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/vscode-e2e.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane vscode-e2e --status passed --tree "$tree" \
+          --artifact target/certification/vscode-e2e.json \
+          --out target/certification/lanes/vscode-e2e.json
   - name: jetbrains-build
     # Runs on the digest-pinned Faktor CI image: it carries git (the lane
     # marker's `git rev-parse 'HEAD^{tree}'` tree binding) and the JDK 17
@@ -473,27 +475,19 @@ steps:
         cd "$CI_WORKSPACE"
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
         artifact_path="$(find apps/jetbrains/frontend/build/distributions -maxdepth 1 -name '*.zip' -print -quit 2>/dev/null || true)"
-        if [ -n "$artifact_path" ]; then
-          artifact_sha="$(sha256sum "$artifact_path" | cut -d' ' -f1)"
-          artifacts="[{\"path\":\"$artifact_path\",\"sha256\":\"sha256:$artifact_sha\"}]"
-          artifact_digest="$(printf 'sha256:%s\t%s\n' "$artifact_sha" "$artifact_path" | sha256sum | cut -d' ' -f1)"
-        else
-          artifacts="[]"
-          artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        fi
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-build","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-build.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane jetbrains-build --status passed \
+          --optional-artifact "$artifact_path" \
+          --out target/certification/lanes/jetbrains-build.json
   - name: jetbrains-smoke
     image: ghcr.io/sbelakho2/faktor-ci@sha256:04d473828cc7634f0168a62c9340f1cf3d585f97adc655755f780af82bd6ee13 # faktor-ci (linux/amd64) built from docker/faktor-ci/Dockerfile; digest recorded in docker/faktor-ci/image-digest.txt; pull:false requires the locally produced image
     pull: false
-    depends_on: [ci-image]
+    # `jetbrains-build` produces the plugin ZIP this lane proves: the host
+    # matrix runs against the BUILT ZIP (never source classes), so the ZIP is
+    # a hard dependency and FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 makes a
+    # missing ZIP a typed failure, never a silent source-only downgrade.
+    depends_on: [ci-image, jetbrains-build]
     when:
       matrix:
         platform: linux/amd64
@@ -517,7 +511,7 @@ steps:
         [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
         /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
       - . "$HOME/.cargo/env"
-      - bash apps/jetbrains/compile-and-smoke.sh
+      - FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 bash apps/jetbrains/compile-and-smoke.sh
       # Node (pinned, sha256-verified) for the executable planted-mutation
       # campaign: this lane is the only one carrying cargo, JDK/gradle and
       # Node together.
@@ -539,7 +533,7 @@ steps:
         [ -n "$RUST_CHANNEL" ] || { echo "rust-toolchain.toml: missing channel" >&2; exit 1; }
         /tmp/rustup-init -y --profile minimal --default-toolchain "$RUST_CHANNEL"
         . "$HOME/.cargo/env"
-        bash apps/jetbrains/compile-and-smoke.sh
+        FAKTOR_JETBRAINS_REQUIRE_PLUGIN_ZIP=1 bash apps/jetbrains/compile-and-smoke.sh
         set -eu
         curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.11.1/node-v24.11.1-linux-x64.tar.xz
         printf '%s  %s\n' 60e3b0a8500819514aca603487c254298cd776de0698d3cd08f11dba5b8289a8 /tmp/node.tar.xz | sha256sum -c -
@@ -547,16 +541,10 @@ steps:
         export PATH="/opt/node-v24.11.1-linux-x64/bin:$PATH" && node --version && node scripts/check-invariants.mjs --mutations
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"jetbrains-smoke","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/jetbrains-smoke.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane jetbrains-smoke --status passed \
+          --artifact target/certification/jetbrains-host-matrix.json \
+          --out target/certification/lanes/jetbrains-smoke.json
   - name: perf
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
     depends_on: [linux, static, docs]
@@ -585,16 +573,9 @@ steps:
         cargo test -p faktor-tests-performance --release -- --ignored
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[]"
-        artifact_digest="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"perf","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/perf.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane perf --status passed \
+          --out target/certification/lanes/perf.json
   - name: darwin-check
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
     environment:
@@ -770,6 +751,9 @@ steps:
     commands:
       - |
         $ErrorActionPreference = "Stop"
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1 -SelfTest
+      - |
+        $ErrorActionPreference = "Stop"
         powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1
   - name: release-artifacts
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -810,16 +794,10 @@ steps:
         mkdir -p target/release && cp "$CARGO_TARGET_DIR/release/faktor-cli" target/release/faktor-cli
         CMDS
         )"
-        cmds_digest="sha256:$(printf '%s' "$CMDS" | sha256sum | cut -d' ' -f1)"
-        cmds_b64="$(printf '%s' "$CMDS" | base64 | tr -d '\n')"
-        iso_ts() { t="$1"; if [ -n "$t" ]; then date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; else date -u +%Y-%m-%dT%H:%M:%SZ; fi; }
-        started_at="$(iso_ts "${CI_PIPELINE_STARTED:-}")"
-        finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        tree="$(git rev-parse 'HEAD^{tree}')"
-        artifacts="[{\"path\":\"target/release/faktor-cli\",\"sha256\":\"sha256:$cli_sha\"}]"
-        artifact_digest="$(printf 'sha256:%s\t%s\n' "$cli_sha" "target/release/faktor-cli" | sha256sum | cut -d' ' -f1)"
-        printf '{"schema":"faktor-woodpecker-lane/v2","lane":"release-artifacts","status":"passed","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s","ci":"woodpecker","run_id":"%s"},"started_at":"%s","finished_at":"%s","commands_b64":"%s","commands_digest":"%s","artifacts":%s,"artifact_digest":"sha256:%s"}\n' \
-          "$CI_COMMIT_SHA" "$tree" "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" "${CI_PIPELINE_NUMBER:-0}" "$started_at" "$finished_at" "$cmds_b64" "$cmds_digest" "$artifacts" "$artifact_digest" > target/certification/lanes/release-artifacts.json
+        printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
+          --lane release-artifacts --status passed \
+          --artifact target/release/faktor-cli \
+          --out target/certification/lanes/release-artifacts.json
   - name: certificate
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -837,6 +815,21 @@ steps:
       matrix:
         platform: linux/amd64
       status: [success, failure]
+    # Lane-bound auth verification (opt-in): map every registered lane token
+    # here so verify-markers can check each marker's `auth` HMAC. Unmapped
+    # lanes are still checked but recorded `unattested`. All lines are
+    # comments today so the pipeline compiles without the secrets:
+    # environment:
+    #   faktor_lane_token_linux: { from_secret: faktor_lane_token_linux }
+    #   faktor_lane_token_static: { from_secret: faktor_lane_token_static }
+    #   faktor_lane_token_docs: { from_secret: faktor_lane_token_docs }
+    #   faktor_lane_token_soak_smoke: { from_secret: faktor_lane_token_soak_smoke }
+    #   faktor_lane_token_vscode: { from_secret: faktor_lane_token_vscode }
+    #   faktor_lane_token_vscode_e2e: { from_secret: faktor_lane_token_vscode_e2e }
+    #   faktor_lane_token_jetbrains_build: { from_secret: faktor_lane_token_jetbrains_build }
+    #   faktor_lane_token_jetbrains_smoke: { from_secret: faktor_lane_token_jetbrains_smoke }
+    #   faktor_lane_token_perf: { from_secret: faktor_lane_token_perf }
+    #   faktor_lane_token_release_artifacts: { from_secret: faktor_lane_token_release_artifacts }
     commands:
       # Enforce the ignored-test inventory first: every #[ignore] site must be
       # conventionally tagged and lane-assigned in .woodpecker/trusted/nightly.yaml
@@ -844,12 +837,54 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # README/docs capability claims are enforced HERE because this is the
+      # node-carrying lane (`check-docs-sync.sh` skips the check without node).
+      - node scripts/capabilities-manifest.mjs --selftest && node scripts/capabilities-manifest.mjs --check-claims
       # The planted-mutation campaign runs in the jetbrains-smoke lane, which
       # carries cargo, JDK/gradle and Node; this node-only image has none of
       # those toolchains, so running it here would count exit-127 environment
       # failures as detections.
-      - node scripts/certification/evidence.mjs verify-markers --workflow trusted --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
-      - node scripts/certification/evidence.mjs write --kind ci_certification_trusted --status passed --from-markers target/certification/lanes --commands "woodpecker trusted linux workflow certificate"
+      # Frozen contracts: the compiled-vs-frozen drift check ran in the static
+      # lane (cargo); this node-only half re-hashes every checked-in canonical
+      # file against manifest.json and binds the contract digest into the
+      # certificate evidence below.
+      - node scripts/contracts/emit.mjs selftest
+      - |
+        set -eu
+        contracts_digest="$(node scripts/contracts/emit.mjs verify --print-digest)"
+        node scripts/certification/evidence.mjs verify-markers --workflow trusted --yaml-dir .woodpecker/trusted --lanes-dir target/certification/lanes --out target/certification/ci-certification.json --pipeline-status "$CI_PIPELINE_STATUS" --run-id "$CI_PIPELINE_NUMBER"
+        node scripts/certification/evidence.mjs write --kind ci_certification_trusted --status passed \
+          --from-markers target/certification/lanes \
+          --field "contracts_digest=$contracts_digest" \
+          --commands "woodpecker trusted linux workflow certificate contracts_digest=$contracts_digest"
+
+  # P0-1: the linux platform's own exact-SHA status. The aggregate below
+  # requires ALL THREE platform contexts; a missing or failing platform can
+  # never aggregate green.
+  - name: certificate-status-linux
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
+    depends_on: [certificate]
+    when:
+      matrix:
+        platform: linux/amd64
+      status: [success, failure]
+    environment:
+      GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+    commands:
+      - node scripts/certification/publish-status.mjs selftest
+      - |
+        set -eu
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        state=failure
+        if [ -f target/certification/ci-certification.json ] && grep -qE '"status": *"pass"' target/certification/ci-certification.json; then
+          state=success
+        fi
+        node scripts/certification/publish-status.mjs publish \
+          --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" --state "$state" \
+          --context ci/faktor/trusted-certified-linux \
+          --description "platform=linux tree=$tree run=$CI_PIPELINE_NUMBER:linux" \
+          --target-url "${CI_PIPELINE_URL:-https://woodpecker.invalid/pipelines/$CI_PIPELINE_NUMBER}"
+        [ "$state" = success ]
 
   # Audit 23: exact-SHA GitHub commit status for the trusted pipeline. Runs
   # AFTER the certificate step on success AND failure, so a failed lane or a
@@ -865,28 +900,32 @@ steps:
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
       - certificate
+      - certificate-status-linux
     when:
       matrix:
         platform: linux/amd64
+      # PUSH ONLY: the aggregate is the branch-protection context. Tag events
+      # run only the linux axis (darwin/windows are main-push lanes), so a
+      # three-platform aggregate can never conclude there; the tagged commit
+      # already carries the push pipeline's aggregate status for the same SHA
+      # and certify.sh binds release certification to that exact-SHA fact.
+      event: push
       status: [success, failure]
     environment:
       GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
     commands:
       - node scripts/certification/publish-status.mjs selftest
+      # P0-1 SEMANTIC AGGREGATE: poll the three PER-PLATFORM exact-SHA
+      # contexts for the same tree and publish success only when linux AND
+      # darwin AND windows all passed. Missing, failing, stale, or
+      # run-masqueraded platform statuses publish a conclusive non-success.
       - |
         set -u
-        mkdir -p target/certification
-        state=failure
-        description="Faktor trusted certification failed (pipeline=$CI_PIPELINE_STATUS)"
-        if [ "$CI_PIPELINE_STATUS" = "success" ] && [ -f target/certification/ci-certification.json ] && grep -q '"status":"pass"' target/certification/ci-certification.json; then
-          state=success
-          description="Faktor trusted certification passed"
-        fi
-        node scripts/certification/publish-status.mjs publish \
-          --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" \
-          --context "${CI_STATUS_CONTEXT:-ci/faktor/trusted-certified}" \
-          --state "$state" --description "$description" \
-          --target-url "${CI_PIPELINE_URL:-https://woodpecker.invalid/pipelines/$CI_PIPELINE_NUMBER}"
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        node scripts/certification/publish-status.mjs aggregate \
+          --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" --tree "$tree" \
+          --poll-seconds 3600 --interval-seconds 20 \
+          --context "${CI_STATUS_CONTEXT:-ci/faktor/trusted-certified}"
 
   # Trusted-build attestation (P1-J): binds this certified run to the exact
   # source and to the bytes it produced. Runs only after the certificate step
@@ -1010,6 +1049,31 @@ steps:
           "$CI_COMMIT_SHA" "$tree" "$CI_PIPELINE_NUMBER" "$st" > target/certification/ci-certification-darwin.json
         echo "certification=$st platform=darwin"
         [ "$rc" -eq 0 ]
+  # P0-1: the darwin platform's own exact-SHA status (node-free host:
+  # python3 stdlib publisher, fail-closed).
+  - name: certificate-status-darwin
+    image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled
+    depends_on: [certificate-darwin]
+    when:
+      matrix:
+        platform: darwin/arm64
+      status: [success, failure]
+    environment:
+      GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+    commands:
+      - |
+        set -u
+        tree="$(git rev-parse 'HEAD^{tree}')"
+        state=failure
+        if [ -f target/certification/ci-certification-darwin.json ] && grep -qE '"status": *"pass"' target/certification/ci-certification-darwin.json; then
+          state=success
+        fi
+        python3 scripts/certification/publish-status.py publish \
+          --repo "$CI_REPO" --sha "$CI_COMMIT_SHA" --state "$state" \
+          --context ci/faktor/trusted-certified-darwin \
+          --description "platform=darwin tree=$tree run=$CI_PIPELINE_NUMBER:darwin"
+        [ "$state" = success ]
+
   - name: certificate-windows
     image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
     depends_on: [windows-check, windows-test, windows-visual-baseline]
@@ -1032,6 +1096,45 @@ steps:
             $rc = 1
           }
         }
+        # Windows visual evidence is REQUIRED (canonical spec: the `windows`
+        # workflow in scripts/certification/evidence.mjs): the visual lane must
+        # have recorded target/certification/ci-certification-windows-visual.json,
+        # the lane marker's artifact entry must hash to the file, and the record
+        # must be a passed faktor-windows-visual-baseline/v1 for this commit/tree
+        # with its own distinct windows environment fingerprint. A certificate
+        # without it can never pass.
+        $visualRecord = "target/certification/ci-certification-windows-visual.json"
+        $visualLane = "target/certification/lanes/windows-visual-baseline.json"
+        if (-not (Test-Path $visualRecord)) {
+          Write-Host "FAILED windows-visual-baseline: missing required artifact $visualRecord"
+          $rc = 1
+        } else {
+          foreach ($pattern in @('"schema"\s*:\s*"faktor-windows-visual-baseline/v1"', '"status"\s*:\s*"passed"', ('"commit"\s*:\s*"' + [regex]::Escape($env:CI_COMMIT_SHA) + '"'), ('"tree"\s*:\s*"' + [regex]::Escape($tree) + '"'), '"windows_environment"\s*:\s*"windows-', '"windows=certified"')) {
+            if (-not (Select-String -Quiet -Path $visualRecord -Pattern $pattern)) {
+              Write-Host "FAILED windows-visual-baseline: record misses $pattern"
+              $rc = 1
+            }
+          }
+          if (Test-Path $visualLane) {
+            try {
+              $marker = Get-Content -Raw $visualLane | ConvertFrom-Json
+              $entry = @($marker.artifacts) | Where-Object { $_.path -eq $visualRecord } | Select-Object -First 1
+              if ($null -eq $entry) {
+                Write-Host "FAILED windows-visual-baseline: lane marker does not declare $visualRecord"
+                $rc = 1
+              } else {
+                $hash = (Get-FileHash -Algorithm SHA256 -Path $visualRecord).Hash.ToLower()
+                if ($entry.sha256 -ne "sha256:$hash") {
+                  Write-Host "FAILED windows-visual-baseline: record sha256 drift ($($entry.sha256) != sha256:$hash)"
+                  $rc = 1
+                }
+              }
+            } catch {
+              Write-Host "FAILED windows-visual-baseline: unreadable lane marker: $($_.Exception.Message)"
+              $rc = 1
+            }
+          }
+        }
         if ($env:CI_PIPELINE_STATUS -ne "success") {
           Write-Host "FAILED workflow status=$env:CI_PIPELINE_STATUS"
           $rc = 1
@@ -1041,3 +1144,27 @@ steps:
         Set-Content -Path target/certification/ci-certification-windows.json -Value $manifest
         Write-Host "certification=$st platform=windows"
         if ($rc -ne 0) { exit 1 }
+  # P0-1: the windows platform's own exact-SHA status (PowerShell native).
+  - name: certificate-status-windows
+    image: powershell # digest-exempt: self-hosted Windows agents execute the shell natively; no docker.io library image exists to record a digest from
+    depends_on: [certificate-windows]
+    when:
+      matrix:
+        platform: windows/amd64
+      status: [success, failure]
+    environment:
+      GITHUB_STATUS_TOKEN: { from_secret: faktor_github_status_token }
+    commands:
+      - |
+        $ErrorActionPreference = "Stop"
+        $tree = (git rev-parse 'HEAD^{tree}').Trim()
+        $state = "failure"
+        $file = "target/certification/ci-certification-windows.json"
+        if ((Test-Path $file) -and (Select-String -Quiet -Path $file -Pattern '"status": *"pass"')) { $state = "success" }
+        $description = "platform=windows tree=$tree run=$($env:CI_PIPELINE_NUMBER):windows"
+        $body = @{ state = $state; context = "ci/faktor/trusted-certified-windows"; description = $description } | ConvertTo-Json -Compress
+        $headers = @{ Authorization = "Bearer $env:GITHUB_STATUS_TOKEN"; Accept = "application/vnd.github+json"; "User-Agent" = "faktor-certification" }
+        $url = "https://api.github.com/repos/$($env:CI_REPO)/statuses/$($env:CI_COMMIT_SHA)"
+        Invoke-RestMethod -Method Post -Uri $url -Headers $headers -ContentType "application/json" -Body $body | Out-Null
+        Write-Host "github-status-published context=ci/faktor/trusted-certified-windows state=$state"
+        if ($state -ne "success") { exit 1 }

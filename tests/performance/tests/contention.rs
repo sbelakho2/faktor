@@ -788,6 +788,7 @@ fn run_contention(scale_sessions: usize, turns: usize, with_sse: bool) -> Report
                 retry_policy: faktor_core::retry::RetryPolicy::default(),
                 semantic: faktor_agent::fallback_semantic_registry(),
                 context_prior: None,
+                secret_registry: None,
                 efficiency: Default::default(),
             };
             deps.permission_requester = perm.clone();

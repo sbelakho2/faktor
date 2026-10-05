@@ -5,7 +5,10 @@
 
 use super::tests::test_deps;
 use super::*;
-use faktor_cloud::{ControlPlane, ManualClock, MemoryControlPlaneStore, SqliteControlPlaneStore};
+use faktor_cloud::{
+    ControlPlane, ManualClock, MemoryControlPlaneStore, SqliteControlPlaneStore,
+    DEFAULT_INVITATION_TTL_MS,
+};
 use faktor_scm::{MemoryScmStore, RepositoryRow, ScmStore};
 
 const NOW_MS: i64 = 1_700_000_000_000;
@@ -71,7 +74,7 @@ async fn cloud_disabled_answers_typed_409_and_changes_nothing_else() {
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.addr);
 
-    let cases: [(&str, &str, serde_json::Value); 7] = [
+    let cases: [(&str, &str, serde_json::Value); 8] = [
         ("GET", "/native/identity", serde_json::Value::Null),
         ("GET", "/native/orgs", serde_json::Value::Null),
         (
@@ -84,6 +87,11 @@ async fn cloud_disabled_answers_typed_409_and_changes_nothing_else() {
             "POST",
             "/native/orgs/org_1/members",
             serde_json::json!({"email": "x@y.test", "role": "member"}),
+        ),
+        (
+            "POST",
+            "/native/invitations/accept",
+            serde_json::json!({"token": "t", "idempotency_key": "k"}),
         ),
         ("GET", "/native/repositories", serde_json::Value::Null),
         ("GET", "/native/approvals", serde_json::Value::Null),
@@ -500,6 +508,10 @@ async fn strict_dtos_reject_unknown_fields_and_malformed_values() {
             "/native/approvals",
             serde_json::json!({"action": "run_create", "resource": "r", "smuggled": 1}),
         ),
+        (
+            "/native/invitations/accept",
+            serde_json::json!({"token": "t", "idempotency_key": "k", "smuggled": 1}),
+        ),
     ] {
         let resp = client
             .post(url(&base, path))
@@ -619,4 +631,267 @@ async fn sqlite_backed_control_plane_survives_a_route_restart() {
         .await
         .unwrap();
     assert_eq!(members["items"].as_array().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------- invitation acceptance
+
+/// `POST /native/invitations/accept` as one control-plane principal.
+async fn accept_invitation_request(
+    client: &reqwest::Client,
+    base: &str,
+    daemon: &str,
+    principal: &str,
+    token: &str,
+    key: &str,
+) -> reqwest::Response {
+    client
+        .post(url(base, "/native/invitations/accept"))
+        .bearer_auth(daemon)
+        .header("x-faktor-control-token", principal)
+        .json(&serde_json::json!({ "token": token, "idempotency_key": key }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The invitation dead end is closed: the single-use token redeems through
+/// `accept_invitation`, the same idempotency key replays the recorded
+/// membership, and a NEW key against the decided invitation is a typed
+/// conflict that can never mint a second membership.
+#[tokio::test]
+async fn invitation_accept_route_is_single_use_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, _scm, _cp, daemon) = cloud_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org_a, token_a) =
+        bootstrap_org(&client, &base, &daemon, "Alpha", "owner@alpha.test", "k-a").await;
+    // The invitee already exists as the owner of another organization: that
+    // principal's control token is the accepting identity.
+    let (_org_b, token_b) =
+        bootstrap_org(&client, &base, &daemon, "Beta", "invitee@acme.test", "k-b").await;
+
+    let invite = client
+        .post(url(&base, &format!("/native/orgs/{org_a}/members")))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token_a)
+        .header("idempotency-key", "inv-1")
+        .json(&serde_json::json!({"email": "invitee@acme.test", "role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invite.status(), 200);
+    let invite_body: serde_json::Value = invite.json().await.unwrap();
+    let invitation_token = invite_body["token"]
+        .as_str()
+        .expect("the invitation token is presented once")
+        .to_string();
+
+    // Valid single-use accept by the invited principal.
+    let accepted = accept_invitation_request(
+        &client,
+        &base,
+        &daemon,
+        &token_b,
+        &invitation_token,
+        "acc-1",
+    )
+    .await;
+    assert_eq!(accepted.status(), 200);
+    let accepted_body: serde_json::Value = accepted.json().await.unwrap();
+    assert_eq!(accepted_body["ok"], true);
+    assert_eq!(accepted_body["membership"]["organization"], org_a);
+    assert_eq!(accepted_body["membership"]["role"], "member");
+    let membership_id = accepted_body["membership"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Same key + same token replays the recorded membership, never a second
+    // one.
+    let replay = accept_invitation_request(
+        &client,
+        &base,
+        &daemon,
+        &token_b,
+        &invitation_token,
+        "acc-1",
+    )
+    .await;
+    assert_eq!(replay.status(), 200);
+    let replay_body: serde_json::Value = replay.json().await.unwrap();
+    assert_eq!(
+        replay_body["membership"]["id"].as_str(),
+        Some(membership_id.as_str())
+    );
+
+    // The same token under a NEW key is a terminal typed conflict: the
+    // invitation was already accepted and no second membership appears.
+    let again = accept_invitation_request(
+        &client,
+        &base,
+        &daemon,
+        &token_b,
+        &invitation_token,
+        "acc-2",
+    )
+    .await;
+    assert_eq!(again.status(), 409);
+    let again_body: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again_body["error"]["code"], "conflict", "{again_body}");
+    assert!(
+        again_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already accepted"),
+        "{again_body}"
+    );
+
+    let members: serde_json::Value = client
+        .get(url(&base, &format!("/native/orgs/{org_a}/members")))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        members["items"].as_array().unwrap().len(),
+        2,
+        "owner + exactly one accepted invitee: {members}"
+    );
+}
+
+/// A principal from another organization whose email is NOT the invited
+/// address is refused typed (403) and no membership is created: invitation
+/// acceptance binds to the invited email, never to "any authenticated
+/// user".
+#[tokio::test]
+async fn invitation_accept_route_refuses_a_foreign_org_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, _scm, _cp, daemon) = cloud_deps(dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org_a, token_a) =
+        bootstrap_org(&client, &base, &daemon, "Alpha", "owner@alpha.test", "k-a").await;
+    let (_org_b, token_b) =
+        bootstrap_org(&client, &base, &daemon, "Beta", "stranger@beta.test", "k-b").await;
+
+    let invite = client
+        .post(url(&base, &format!("/native/orgs/{org_a}/members")))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token_a)
+        .header("idempotency-key", "inv-1")
+        .json(&serde_json::json!({"email": "invitee@acme.test", "role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    let invite_body: serde_json::Value = invite.json().await.unwrap();
+    let invitation_token = invite_body["token"].as_str().unwrap().to_string();
+
+    let refused = accept_invitation_request(
+        &client,
+        &base,
+        &daemon,
+        &token_b,
+        &invitation_token,
+        "acc-wrong-org",
+    )
+    .await;
+    assert_eq!(refused.status(), 403);
+    let refused_body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        refused_body["error"]["code"], "permission_denied",
+        "{refused_body}"
+    );
+    assert!(
+        refused_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("different email"),
+        "{refused_body}"
+    );
+
+    // The invited organization did not gain the stranger.
+    let members: serde_json::Value = client
+        .get(url(&base, &format!("/native/orgs/{org_a}/members")))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["items"].as_array().unwrap().len(), 1, "{members}");
+}
+
+/// An invitation that expired before acceptance is refused typed and no
+/// membership is created.
+#[tokio::test]
+async fn invitation_accept_route_refuses_an_expired_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let control_plane = Arc::new(ControlPlane::new(
+        Arc::new(MemoryControlPlaneStore::new()),
+        clock.clone(),
+    ));
+    let deps = test_deps(dir.path()).with_control_plane(control_plane);
+    let daemon = deps.auth_token.as_str().to_string();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+    let (org_a, token_a) =
+        bootstrap_org(&client, &base, &daemon, "Alpha", "owner@alpha.test", "k-a").await;
+    let (_org_b, token_b) =
+        bootstrap_org(&client, &base, &daemon, "Beta", "invitee@acme.test", "k-b").await;
+
+    let invite = client
+        .post(url(&base, &format!("/native/orgs/{org_a}/members")))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token_a)
+        .header("idempotency-key", "inv-late")
+        .json(&serde_json::json!({"email": "invitee@acme.test", "role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    let invite_body: serde_json::Value = invite.json().await.unwrap();
+    let invitation_token = invite_body["token"].as_str().unwrap().to_string();
+
+    // The session stays valid for 30 days; the invitation expires at 7.
+    clock.advance(DEFAULT_INVITATION_TTL_MS + 1);
+
+    let refused = accept_invitation_request(
+        &client,
+        &base,
+        &daemon,
+        &token_b,
+        &invitation_token,
+        "acc-late",
+    )
+    .await;
+    assert_eq!(refused.status(), 409);
+    let refused_body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refused_body["error"]["code"], "conflict", "{refused_body}");
+    assert!(
+        refused_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expired"),
+        "{refused_body}"
+    );
+
+    let members: serde_json::Value = client
+        .get(url(&base, &format!("/native/orgs/{org_a}/members")))
+        .bearer_auth(&daemon)
+        .header("x-faktor-control-token", &token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["items"].as_array().unwrap().len(), 1, "{members}");
 }

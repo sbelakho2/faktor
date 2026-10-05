@@ -1130,6 +1130,9 @@ impl WorkerPlane {
             if existing.digest == digest
                 && existing.worker_id == worker.worker_id
                 && existing.lease_id == *lease_id
+                // The OUTCOME is part of the result identity: a replay that
+                // flips succeeded/failed was accepted as a Duplicate.
+                && existing.outcome == outcome
             {
                 self.journal(
                     organization.as_str(),

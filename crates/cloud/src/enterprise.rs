@@ -1443,7 +1443,9 @@ impl EnterpriseService {
             Action::RetentionWrite,
         )?;
         let Some(mut artifact) = self.store.artifact(id).map_err(ControlPlaneError::from)? else {
-            return Ok(false);
+            // A missing row is NOT "not yet eligible": clients could not
+            // distinguish it from an existing artifact still in retention.
+            return Err(ControlPlaneError::NotFound("artifact not found".into()));
         };
         if artifact.organization != organization {
             return Err(ControlPlaneError::NotFound("artifact not found".into()));

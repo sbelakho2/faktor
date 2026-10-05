@@ -1,0 +1,48 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "provider_error_kind",
+  "type": "faktor_provider::ProviderErrorKind",
+  "representation": "external",
+  "variants": [
+    {
+      "name": "Network",
+      "wire": "network",
+      "retryable": true
+    },
+    {
+      "name": "Timeout",
+      "wire": "timeout",
+      "retryable": true
+    },
+    {
+      "name": "RateLimited",
+      "wire": "rate_limited",
+      "retryable": true
+    },
+    {
+      "name": "BadRequest",
+      "wire": "bad_request",
+      "retryable": false
+    },
+    {
+      "name": "Auth",
+      "wire": "auth",
+      "retryable": false
+    },
+    {
+      "name": "Server",
+      "wire": "server",
+      "retryable": true
+    },
+    {
+      "name": "Cancelled",
+      "wire": "cancelled",
+      "retryable": false
+    },
+    {
+      "name": "Malformed",
+      "wire": "malformed",
+      "retryable": false
+    }
+  ]
+}

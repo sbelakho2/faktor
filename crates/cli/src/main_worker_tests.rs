@@ -77,6 +77,7 @@ pub(crate) fn test_agent(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     AgentRuntime::new(deps).unwrap()
@@ -1747,4 +1748,99 @@ fn daemon_outbound_scan_registers_every_configured_commerce_credential_value() {
     std::env::remove_var(KEY_ENV);
     std::env::remove_var(ID_ENV);
     std::env::remove_var(SECRET_ENV);
+}
+
+/// The builder's single-registry contract: the EGRESS scan config, the
+/// supervisor's artifact filter and the runtime's tool-output scrubber are
+/// all built from ONE `Arc<SecretRegistry>` — the exact expressions
+/// `build_daemon_core` uses. A same-value planted in one must be caught by
+/// all three.
+#[test]
+fn builder_shares_one_configured_secret_registry_across_egress_tool_and_artifact_filter() {
+    use faktor_terminal::ArtifactSecretFilter as _;
+    const KEY_ENV: &str = "FAKTOR_TEST_CLI_SHARED_SECRET_KEY";
+    // Pattern-invisible: only the configured registry can catch this value.
+    const KEY: &str = "kp-shared-secret-7f21";
+    assert!(
+        faktor_security::scan_secrets(KEY, &faktor_security::SecretPolicy::default()).is_empty()
+    );
+    std::env::set_var(KEY_ENV, KEY);
+    let mut cfg = config::Config::default();
+    cfg.commerce.enabled = true;
+    cfg.commerce.connectors.mouser = Some(config::CommerceApiConnectorCfg {
+        enabled: true,
+        api_key_env: Some(KEY_ENV.to_string()),
+    });
+
+    let registry = daemon_secret_registry(&cfg);
+    // (1) Egress: the scan config carries the SAME instance.
+    let egress = outbound_scan_config(registry.clone());
+    let egress_registry = egress.registry.expect("egress registry installed");
+    assert!(
+        Arc::ptr_eq(&egress_registry, &registry),
+        "the egress scan must share the one configured-secret registry instance"
+    );
+    assert!(!egress_registry
+        .scan_exact(format!("Bearer {KEY}").as_bytes())
+        .is_empty());
+    // (2) Supervisor artifact filter: same instance, exact ranges.
+    let filter = RegistryArtifactFilter::new(registry.clone());
+    assert_eq!(filter.max_match_len(), KEY.len());
+    assert_eq!(
+        filter.matches(format!("x{KEY}y").as_bytes()),
+        vec![(1, KEY.len())]
+    );
+    // (3) The runtime registry (what AgentDeps receives) is behaviorally the
+    // same configured set — asserted on a BUILT daemon in the test below.
+    std::env::remove_var(KEY_ENV);
+}
+
+/// Built-daemon end-to-end: [providers] key -> the ONE registry -> the
+/// egress gate hard-blocks a request body carrying it (and the server is
+/// never contacted), while the runtime's `secret_registry` — the same
+/// configured set the tool/CAS scrubbers use — exact-scans the value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn built_daemon_egress_and_tool_registry_share_the_configured_provider_key() {
+    const KEY_ENV: &str = "FAKTOR_TEST_CLI_BUILT_SHARED_SECRET_KEY";
+    const KEY: &str = "kp-built-secret-31ad";
+    std::env::set_var(KEY_ENV, KEY);
+    let server = MockServer::new();
+    let base = server.base_url().await;
+    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+    let allow_row = format!("http://127.0.0.1:{port}");
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = egress_cfg(
+        dir.path(),
+        "shared-secret.json",
+        &base,
+        Some(KEY_ENV),
+        Some(std::slice::from_ref(&allow_row)),
+    );
+    let graph = build_daemon(dir.path(), Some(cfg)).unwrap();
+
+    // Egress: the body carries the configured value -> typed hard block
+    // BEFORE any connect (the allowlisted server sees nothing).
+    let err = chat_text(graph.providers.get("mocked").unwrap(), KEY)
+        .await
+        .expect_err("the configured key must be egress-blocked");
+    assert!(
+        err.message.contains("configured_secret"),
+        "the egress block must name the configured-secret registry: {}",
+        err.message
+    );
+    assert_eq!(server.request_count(), 0, "blocked before connect");
+
+    // Tool/CAS half: the runtime was given the SAME configured set.
+    let tool_registry = graph
+        .agent
+        .deps()
+        .secret_registry
+        .clone()
+        .expect("the builder must wire the runtime secret registry");
+    assert!(
+        !tool_registry.scan_exact(KEY.as_bytes()).is_empty(),
+        "the tool scrubber must know the configured provider key"
+    );
+    assert!(tool_registry.scan_exact(b"unrelated-value").is_empty());
+    std::env::remove_var(KEY_ENV);
 }

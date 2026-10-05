@@ -518,6 +518,25 @@ pub enum NetworkIsolationRequirement {
     Inherit,
 }
 
+/// What a sandbox policy requires of the spawn layer's filesystem
+/// confinement (the sandbox DECIDES; the spawn layer ENFORCES). The
+/// requirement is a demand, not an enforcement claim: the spawn layer
+/// either confines the child to the requested roots or fails closed typed
+/// BEFORE exec (never a warn-and-run downgrade).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemIsolationRequirement {
+    /// OS-level filesystem confinement to the workspace-shaped roots is
+    /// requested. `best_effort` distinguishes the two honest contracts:
+    /// `false` (Required) refuses the spawn typed when the kernel cannot
+    /// enforce the confinement; `true` (BestEffort) falls back to
+    /// application-policy-only execution at the spawn layer and never
+    /// presents the fallback as OS confinement.
+    Workspace { best_effort: bool },
+    /// No OS-level filesystem confinement is requested (`Inherit`).
+    Inherit,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

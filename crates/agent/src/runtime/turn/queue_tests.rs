@@ -774,6 +774,7 @@ async fn end_session_kills_session_owned_processes() {
         capture: true,
         artifact_max: 1024 * 1024,
         network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+        filesystem_isolation: faktor_terminal::FilesystemIsolation::Inherit,
     };
     let sup = runtime.deps().supervisor.clone().unwrap();
     let child_task = tokio::spawn({

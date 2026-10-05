@@ -1,0 +1,120 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "event_kind",
+  "type": "faktor_core::event::EventKind",
+  "representation": "external",
+  "variants": [
+    {
+      "name": "SessionCreated",
+      "wire": "session_created"
+    },
+    {
+      "name": "PromptReceived",
+      "wire": "prompt_received"
+    },
+    {
+      "name": "ContextPrepared",
+      "wire": "context_prepared"
+    },
+    {
+      "name": "ModelStarted",
+      "wire": "model_started"
+    },
+    {
+      "name": "ModelChunkReceived",
+      "wire": "model_chunk_received"
+    },
+    {
+      "name": "ToolRequested",
+      "wire": "tool_requested"
+    },
+    {
+      "name": "ToolStarted",
+      "wire": "tool_started"
+    },
+    {
+      "name": "FileChanged",
+      "wire": "file_changed"
+    },
+    {
+      "name": "ToolCompleted",
+      "wire": "tool_completed"
+    },
+    {
+      "name": "ToolCancelled",
+      "wire": "tool_cancelled"
+    },
+    {
+      "name": "CheckpointCreated",
+      "wire": "checkpoint_created"
+    },
+    {
+      "name": "ContextCompacted",
+      "wire": "context_compacted"
+    },
+    {
+      "name": "CompactRejected",
+      "wire": "compact_rejected"
+    },
+    {
+      "name": "SubagentStarted",
+      "wire": "subagent_started"
+    },
+    {
+      "name": "SubagentCompleted",
+      "wire": "subagent_completed"
+    },
+    {
+      "name": "TurnCompleted",
+      "wire": "turn_completed"
+    },
+    {
+      "name": "PermissionGranted",
+      "wire": "permission_granted"
+    },
+    {
+      "name": "PermissionDenied",
+      "wire": "permission_denied"
+    },
+    {
+      "name": "PermissionExpired",
+      "wire": "permission_expired"
+    },
+    {
+      "name": "PromptAdmitted",
+      "wire": "prompt_admitted"
+    },
+    {
+      "name": "PhaseChanged",
+      "wire": "phase_changed"
+    },
+    {
+      "name": "ReplayStarted",
+      "wire": "replay_started"
+    },
+    {
+      "name": "CrashDetected",
+      "wire": "crash_detected"
+    },
+    {
+      "name": "RecoveryApplied",
+      "wire": "recovery_applied"
+    },
+    {
+      "name": "SessionEnded",
+      "wire": "session_ended"
+    },
+    {
+      "name": "Suspended",
+      "wire": "suspended"
+    },
+    {
+      "name": "Resumed",
+      "wire": "resumed"
+    },
+    {
+      "name": "Failed",
+      "wire": "failed"
+    }
+  ]
+}

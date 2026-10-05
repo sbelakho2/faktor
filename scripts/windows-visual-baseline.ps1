@@ -8,7 +8,12 @@
 #   1. FAILS when the `windows` record is missing or malformed -- a platform
 #      is never certified by inheriting linux/macos digests (the v2 canonical
 #      pool is refused, and an identical windows<->linux/macos digest for the
-#      same panel is an explicit inheritance failure);
+#      same panel is an explicit inheritance failure). The windows record must
+#      ALSO carry its own distinct `windows-...` environment fingerprint with
+#      a resolved-font token: a re-pin made on a Windows agent records
+#      `windows-amd64-jvm17-f<hex>` (or the host's equivalent) and the policy
+#      refuses a record that reuses another platform's fingerprint or has
+#      none;
 #   2. renders this platform's panels and compares them against the pinned
 #      windows record by running `bash apps/jetbrains/compile-and-smoke.sh`
 #      (the JetBrains parity matrix compares per-platform records and fails on
@@ -17,6 +22,13 @@
 #      `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`, copies the
 #      produced file to `target/certification/visual-baselines-windows.json`
 #      for retrieval, and then re-runs the comparison against it.
+#
+# On success the lane writes its own
+# `target/certification/ci-certification-windows-visual.json` record
+# (`faktor-windows-visual-baseline/v1`) and lists it as a REQUIRED artifact of
+# the `windows-visual-baseline` lane marker, which `certificate-windows`
+# verifies (and `scripts/certification/evidence.mjs` models as the canonical
+# `windows` workflow: no Windows certificate without this lane + artifact).
 #
 # Fail-closed: no Git Bash / JetBrains toolchain on the agent, a missing or
 # inherited baseline, or a render drift all fail the lane. Nothing is ever
@@ -53,6 +65,18 @@ function Test-Digest {
     return ($Value -match '^[0-9a-f]{64}$')
 }
 
+# True when an environment string carries a resolved-font fingerprint token
+# (`-f` followed by at least 8 hex chars), the same shape the Kotlin
+# `visualEnvironment()` writes. A windows record without one is a pre-pin
+# placeholder, never a certified environment.
+function Test-FontFingerprint {
+    param([string]$Value)
+    $marker = $Value.LastIndexOf("-f")
+    if ($marker -lt 0) { return $false }
+    $token = $Value.Substring($marker + 2)
+    return ($token.Length -ge 8 -and $token -match '^[0-9a-f]+$')
+}
+
 # Pure baseline policy function: returns an object with ok/reasons/coverage
 # and the windows digest map. No side effects, so -SelfTest can exercise it.
 function Test-VisualBaselineText {
@@ -61,6 +85,8 @@ function Test-VisualBaselineText {
     $reasons = New-Object System.Collections.ArrayList
     $coverage = [ordered]@{ linux = "not_certified"; macos = "not_certified"; windows = "not_certified" }
     $windowsDigests = $null
+    $environments = @{}
+    $windowsEnvironment = ""
 
     $root = $null
     try {
@@ -96,6 +122,10 @@ function Test-VisualBaselineText {
             $environment = [string]$record.environment
             if ([string]::IsNullOrWhiteSpace($environment)) {
                 [void]$reasons.Add("missing-environment:$($property.Name)")
+            }
+            else {
+                $environments[$property.Name] = $environment
+                if ($property.Name -eq "windows") { $windowsEnvironment = $environment }
             }
             $digests = @{}
             if ($null -ne $record.digests) {
@@ -135,6 +165,23 @@ function Test-VisualBaselineText {
             }
         }
     }
+    # A windows record is certified only with a DISTINCT windows environment
+    # fingerprint. Reusing linux/macos (or a fingerprint-less placeholder)
+    # means the record was not produced by a Windows re-pin and must be
+    # refused, never accepted as an inherited or fabricated pin.
+    if (-not [string]::IsNullOrWhiteSpace($windowsEnvironment)) {
+        if (-not $windowsEnvironment.StartsWith("windows-")) {
+            [void]$reasons.Add("windows-environment-mismatch:$windowsEnvironment")
+        }
+        if (-not (Test-FontFingerprint $windowsEnvironment)) {
+            [void]$reasons.Add("missing-font-fingerprint:windows")
+        }
+        foreach ($other in @("linux", "macos")) {
+            if ($environments.ContainsKey($other) -and $environments[$other] -eq $windowsEnvironment) {
+                [void]$reasons.Add("inherited-environment:windows-from-$other")
+            }
+        }
+    }
     foreach ($platform in @("linux", "macos")) {
         if ($platforms.ContainsKey($platform)) { $coverage[$platform] = "certified" }
     }
@@ -144,6 +191,7 @@ function Test-VisualBaselineText {
         reasons         = @($reasons)
         coverage        = $coverage
         windows_digests = $windowsDigests
+        windows_environment = $windowsEnvironment
     }
 }
 
@@ -177,7 +225,15 @@ function Write-LaneMarker {
     )
     $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $tree = Get-RepoTree
-    $cmds = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1"
+    # The lane declares BOTH commands (offline refusal self-test, then the
+    # compare): the marker digest must cover exactly what ran.
+    $cmds = @'
+$ErrorActionPreference = "Stop"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1 -SelfTest
+$ErrorActionPreference = "Stop"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1
+'@ -replace "`r`n", "`n"
+    $cmds = $cmds.TrimEnd("`n")
     $bytes = [Text.Encoding]::UTF8.GetBytes($cmds)
     $sha256 = [Security.Cryptography.SHA256]::Create()
     $cmdsDigest = ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace("-", "").ToLower()
@@ -186,9 +242,12 @@ function Write-LaneMarker {
     $artifactEntries = @()
     $artifactDigest = "sha256:$EMPTY_ARTIFACT_DIGEST"
     if ($Artifacts.Count -gt 0) {
+        # Same canonical digest as scripts/certification/evidence.mjs: artifact
+        # entries sorted by path, each line `sha256:<hex>\t<path>\n`.
         $concatenated = ""
-        foreach ($artifact in $Artifacts) {
-            $hash = (Get-FileHash -Algorithm SHA256 -Path $artifact).Hash.ToLower()
+        foreach ($artifact in ($Artifacts | Sort-Object)) {
+            $full = if ([System.IO.Path]::IsPathRooted($artifact)) { $artifact } else { Join-Path $RepoRoot $artifact }
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $full).Hash.ToLower()
             $artifactEntries += [ordered]@{ path = $artifact; sha256 = "sha256:$hash" }
             $concatenated += "sha256:$hash`t$artifact`n"
         }
@@ -243,11 +302,17 @@ function Invoke-SelfTest {
     $hexB = "b" * 64
     $hexC = "c" * 64
     $hexD = "d" * 64
+    $linuxEnv = "linux-amd64-jvm17-f2927b2734270"
+    $macEnv = "mac-os-x-aarch64-jvm17-f0123456789ab"
+    $winEnv = "windows-amd64-jvm17-fcafef00d123"
+    # A complete v3 baseline: every required platform carries its own record
+    # and the windows record carries a DISTINCT windows font fingerprint (the
+    # shape a -WriteBaselines re-pin writes on the Windows agent).
     $complete = @"
-{"schema":"$BASELINE_SCHEMA","requiredPlatforms":["linux","macos","windows"],"platforms":{"linux":{"environment":"linux-amd64-jvm17","digests":{"task-tree":"$hexA","settings":"$hexB"}},"macos":{"environment":"mac-os-x-aarch64-jvm17","digests":{"task-tree":"$hexB","settings":"$hexA"}},"windows":{"environment":"windows-amd64-jvm17","digests":{"task-tree":"$hexC","settings":"$hexD"}}}}
+{"schema":"$BASELINE_SCHEMA","requiredPlatforms":["linux","macos","windows"],"platforms":{"linux":{"environment":"$linuxEnv","digests":{"task-tree":"$hexA","settings":"$hexB"}},"macos":{"environment":"$macEnv","digests":{"task-tree":"$hexB","settings":"$hexA"}},"windows":{"environment":"$winEnv","digests":{"task-tree":"$hexC","settings":"$hexD"}}}}
 "@
     $noWindows = @"
-{"schema":"$BASELINE_SCHEMA","requiredPlatforms":["linux","macos","windows"],"platforms":{"linux":{"environment":"linux-amd64-jvm17","digests":{"task-tree":"$hexA"}},"macos":{"environment":"mac-os-x-aarch64-jvm17","digests":{"task-tree":"$hexB"}}}}
+{"schema":"$BASELINE_SCHEMA","requiredPlatforms":["linux","macos","windows"],"platforms":{"linux":{"environment":"$linuxEnv","digests":{"task-tree":"$hexA"}},"macos":{"environment":"$macEnv","digests":{"task-tree":"$hexB"}}}}
 "@
     $failures = 0
     $cases = @()
@@ -256,14 +321,24 @@ function Invoke-SelfTest {
     $cases += [pscustomobject]@{ name = "missing windows record fails"; text = $noWindows; expectOk = $false; expectReason = "windows-baseline-missing" }
     $cases += [pscustomobject]@{ name = "inherited windows digest fails"; text = $complete.Replace($hexC, $hexA); expectOk = $false; expectReason = "inherited-digest:task-tree-from-linux" }
     $cases += [pscustomobject]@{ name = "malformed digest fails"; text = $complete.Replace($hexA, "not-a-digest"); expectOk = $false; expectReason = "bad-digest:linux/task-tree" }
+    $cases += [pscustomobject]@{ name = "wrong windows digest (not 64-hex) fails"; text = $complete.Replace('"settings":"' + $hexD + '"', '"settings":"not-a-digest"'); expectOk = $false; expectReason = "bad-digest:windows/settings" }
     $cases += [pscustomobject]@{ name = "v2 canonical pool fails"; text = '{"schema":"faktor-parity-visual-baselines/v2","panelDigests":{}}'; expectOk = $false; expectReason = "wrong-schema:faktor-parity-visual-baselines/v2" }
-    $cases += [pscustomobject]@{ name = "empty windows digests fail"; text = $complete.Replace('"windows":{"environment":"windows-amd64-jvm17","digests":{"task-tree":"' + $hexC + '","settings":"' + $hexD + '"}}', '"windows":{"environment":"windows-amd64-jvm17","digests":{}}'); expectOk = $false; expectReason = "empty-digests:windows" }
+    $cases += [pscustomobject]@{ name = "empty windows digests fail"; text = $complete.Replace('"windows":{"environment":"' + $winEnv + '","digests":{"task-tree":"' + $hexC + '","settings":"' + $hexD + '"}}', '"windows":{"environment":"' + $winEnv + '","digests":{}}'); expectOk = $false; expectReason = "empty-digests:windows" }
+    # Re-pin policy: the windows record must be produced by a Windows render
+    # (own windows- environment + font fingerprint), never inherited.
+    $cases += [pscustomobject]@{ name = "windows record reusing the linux environment fails"; text = $complete.Replace($winEnv, $linuxEnv); expectOk = $false; expectReason = "windows-environment-mismatch:$linuxEnv" }
+    $cases += [pscustomobject]@{ name = "windows record without a font fingerprint fails"; text = $complete.Replace($winEnv, "windows-amd64-jvm17"); expectOk = $false; expectReason = "missing-font-fingerprint:windows" }
 
     foreach ($case in $cases) {
         $result = Test-VisualBaselineText -Text $case.text
         $ok = ($result.ok -eq $case.expectOk)
         if ($ok -and $null -ne $case.expectReason) {
             $ok = ($result.reasons -contains $case.expectReason)
+        }
+        if ($ok -and $case.expectOk) {
+            # The re-pin contract: a passing windows record exposes the
+            # distinct windows environment fingerprint the pin recorded.
+            $ok = ($result.windows_environment -eq $winEnv)
         }
         if ($ok) {
             Write-Host "windows-visual-baseline selftest ok: $($case.name)"
@@ -277,7 +352,7 @@ function Invoke-SelfTest {
         Write-Host "windows-visual-baseline selftest: FAIL ($failures case(s))" -ForegroundColor Red
         return 1
     }
-    Write-Host "windows-visual-baseline selftest: PASS (missing/inherited/malformed baselines are refused)"
+    Write-Host "windows-visual-baseline selftest: PASS (missing/inherited/malformed/foreign-fingerprint windows baselines are refused)"
     return 0
 }
 
@@ -286,7 +361,10 @@ if ($SelfTest) {
 }
 
 $baselineFull = Join-Path $RepoRoot $BaselinePath
-$recordPath = Join-Path $RepoRoot (Join-Path $OutDir "windows-visual-baseline.json")
+# The certifying record `certificate-windows` (and the canonical `windows`
+# workflow in scripts/certification/evidence.mjs) requires.
+$recordPath = Join-Path $RepoRoot (Join-Path $OutDir "ci-certification-windows-visual.json")
+$recordRel = "$OutDir/ci-certification-windows-visual.json"
 $artifacts = @()
 $mode = "compare"
 
@@ -313,7 +391,7 @@ try {
             New-Item -ItemType Directory -Force -Path $directory | Out-Null
         }
         Copy-Item -Path $baselineFull -Destination $produced -Force
-        $artifacts += $produced
+        $artifacts += "$OutDir/visual-baselines-windows.json"
         Write-Host "windows-visual-baseline: recorded $produced (commit it into $BaselinePath)"
     }
 
@@ -332,8 +410,10 @@ try {
         baseline_path    = $BaselinePath
         baseline_sha256  = (Get-FileHash -Algorithm SHA256 -Path $baselineFull).Hash.ToLower()
         windows_panels   = $panelCount
+        windows_environment = $policy.windows_environment
         coverage         = $coverage
-        coverage_note    = "the windows record is its own render; no linux/macos digest is ever inherited"
+        coverage_note    = "the windows record is its own render with its own windows font fingerprint; no linux/macos digest or environment is ever inherited"
+        re_pinned        = [bool]$WriteBaselines
         does_not_prove   = @("screenshot/pixel comparison", "interactive IDE behavior outside the parity smoke")
         commit           = "$env:CI_COMMIT_SHA"
         tree             = Get-RepoTree
@@ -341,8 +421,11 @@ try {
         finished_at      = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
     Write-JsonFile -Path $recordPath -Object $record
+    # The lane marker REQUIRES this record: certificate-windows verifies the
+    # artifact entry (path + sha256) and refuses a certificate without it.
+    $artifacts += $recordRel
     Write-LaneMarker -Status "passed" -Reason "" -Artifacts $artifacts
-    Write-Host "windows-visual-baseline: PASS ($panelCount windows panels, $coverage)"
+    Write-Host "windows-visual-baseline: PASS ($panelCount windows panels, $coverage; record $recordRel)"
     exit 0
 }
 catch {
@@ -359,6 +442,7 @@ catch {
             finished_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         }
         Write-JsonFile -Path $recordPath -Object $failedRecord
+        $artifacts += $recordRel
         Write-LaneMarker -Status "failed" -Reason $reason -Artifacts $artifacts
     }
     catch {

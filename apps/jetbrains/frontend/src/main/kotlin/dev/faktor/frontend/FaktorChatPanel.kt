@@ -252,6 +252,10 @@ class FaktorChatPanel(
     // exactly from their recorded cursors, never recomputed.
     private var billingCursor: String? = null
 
+    /** True while a usage page request is in flight: rapid Next/Previous
+     * clicks must not push the same cursor twice against a stale model. */
+    private val usagePagingInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private val billingPrevCursors = ArrayList<String>()
 
     private val tabs = JTabbedPane()
@@ -601,11 +605,16 @@ class FaktorChatPanel(
         // A transport-failure retry of the SAME immutable draft reuses the
         // submission id (the daemon replays the original receipt); any other
         // start is a new logical submission with a fresh id.
+        val sessionId = service.currentSessionId()
         val pending = pendingTaskSubmission
-        val submission = if (pending != null && pending.draft.sameDraftAs(draft)) {
+        val submission = if (
+            pending != null &&
+            pending.sessionId == sessionId &&
+            pending.draft.sameDraftAs(draft)
+        ) {
             pending
         } else {
-            TaskStartSubmission(UUID.randomUUID().toString(), draft)
+            TaskStartSubmission(UUID.randomUUID().toString(), draft, sessionId)
         }
         // Disable the start surface for the whole flight; the retry click
         // cannot even reach the queue while a start is pending.
@@ -633,6 +642,18 @@ class FaktorChatPanel(
     }
 
     private fun runTaskStart(submission: TaskStartSubmission) {
+        if (service.currentSessionId() != submission.sessionId) {
+            // The session switched between capture and dispatch (all jobs are
+            // FIFO on one worker, so a queued open-session job can run
+            // first): never durably start a run minted for the old session
+            // against the new one. Mirrors the prompt path guard.
+            startInFlight.set(false)
+            onEdt {
+                setStartControlsEnabled(true)
+                appendSystem("session changed; the draft is kept")
+            }
+            return
+        }
         val draft = submission.draft
         var succeeded = false
         var message: String
@@ -689,7 +710,7 @@ class FaktorChatPanel(
             }
             val attached = plan.pathFiles.size + plan.uploads.size
             message = "task run ${started.runId} started (${started.state})" +
-                if (attached == 0) "" else " with $attached attachment(s)" +
+                if (attached == 0) "" else " with " + plural(attached, "attachment") +
                 contractText
         } catch (e: AttachmentRefusal) {
             pendingTaskSubmission = null
@@ -904,14 +925,16 @@ class FaktorChatPanel(
             runControl("stop daemon") {
                 service.stop()
                 submittedCompletion = null
+                resetSessionView()
                 onEdt {
-                    boardPanel.reset()
                     setControlsEnabled(false)
                     appendSystem("daemon stopped")
                 }
             }
         }
-        newSessionButton.addActionListener { newSessionFromControls() }
+        newSessionButton.addActionListener {
+            newSessionFromControls(selectedProviderOrDefault(), selectedModelOrDefault())
+        }
         refreshButton.addActionListener {
             runAsync("refresh") { refreshAllBlocking() }
         }
@@ -940,10 +963,17 @@ class FaktorChatPanel(
         }
         treePanel.setListener(object : TaskTreePanel.Listener {
             override fun onEvidenceSelected(ref: EvidenceRef) {
-                onEdt { tabs.selectedComponent = navigator }
-                runAsync("evidence ${ref.id}") {
+                // Selection is a Swing mutation: run it on the EDT. The
+                // selector is a Swing READ, so it is captured on the EDT too;
+                // only the network retrieval runs on the worker.
+                onEdt {
+                    tabs.selectedComponent = navigator
                     navigator.selectEvidence(ref)
-                    if (ref.id != null) retrieveEvidenceIntoNavigator(ref.id, navigator.selectorJson())
+                }
+                if (ref.id != null) {
+                    runAsync("evidence ${ref.id}") {
+                        retrieveEvidenceIntoNavigator(ref.id, onEdtValue { navigator.selectorJson() })
+                    }
                 }
             }
 
@@ -987,15 +1017,23 @@ class FaktorChatPanel(
         })
         usagePanel.setListener(object : UsagePanel.Listener {
             override fun onNextPage() {
-                val model = usagePanel.model() ?: return
-                val next = model.nextCursor ?: return
+                if (!usagePagingInFlight.compareAndSet(false, true)) return
+                val next = usagePanel.model()?.nextCursor
+                if (next == null) {
+                    usagePagingInFlight.set(false)
+                    return
+                }
                 billingPrevCursors.add(billingCursor ?: "")
                 billingCursor = next
                 runAsync("usage next page") { refreshUsagePanelBlocking() }
             }
 
             override fun onPreviousPage() {
-                if (billingPrevCursors.isEmpty()) return
+                if (!usagePagingInFlight.compareAndSet(false, true)) return
+                if (billingPrevCursors.isEmpty()) {
+                    usagePagingInFlight.set(false)
+                    return
+                }
                 val previous = billingPrevCursors.removeAt(billingPrevCursors.size - 1)
                 billingCursor = previous.ifEmpty { null }
                 runAsync("usage previous page") { refreshUsagePanelBlocking() }
@@ -1208,6 +1246,7 @@ class FaktorChatPanel(
             override fun onOpenSession(sessionId: String) {
                 runAsync("open session $sessionId") {
                     service.useSession(sessionId)
+                    resetSessionView()
                     service.watchSession(sessionId, 0)
                     onEdt { appendSystem("session $sessionId opened from history") }
                     refreshAllBlocking()
@@ -1238,19 +1277,36 @@ class FaktorChatPanel(
 
     /** Starts the daemon off the EDT (public so the app entry point can call it). */
     fun startDaemon() {
+        // Settings are Swing controls: read them on the EDT once, then hand
+        // the captured values to the worker (reading them off-EDT is a race).
+        val provider = selectedProviderOrDefault()
+        val model = selectedModelOrDefault()
         // The credential watch starts BEFORE the daemon: its first poll
         // applies the vault value, so an external PasswordSafe update between
         // panel construction and startup is reconciled, never missed.
         startControlPlaneWatch()
+        // One start at a time from the UI: a queued duplicate click must not
+        // spawn after a Stop (the service aborts internally too).
+        onEdt { startButton.isEnabled = false }
         runAsync("start daemon") {
-            val health = service.start()
-            onEdt {
-                setControlsEnabled(true)
-                appendSystem("daemon ready: version ${health.version}")
+            try {
+                val health = service.start()
+                onEdt {
+                    setControlsEnabled(true)
+                    appendSystem("daemon ready: version ${health.version}")
+                }
+                newSessionFromControls(provider, model)
+            } finally {
+                onEdt { startButton.isEnabled = true }
             }
-            newSessionFromControls()
         }
     }
+
+    private fun selectedProviderOrDefault(): String =
+        settingsPanel.selectedProvider() ?: providerField.text.trim().ifEmpty { "default" }
+
+    private fun selectedModelOrDefault(): String =
+        settingsPanel.selectedModel() ?: modelField.text.trim().ifEmpty { "default" }
 
     /**
      * The New-session composer path: the Settings provider selection (or the
@@ -1259,22 +1315,20 @@ class FaktorChatPanel(
      * refuses absolute `files`, so both halves must agree), then the SSE
      * stream at cursor 0 and a full refresh.
      */
-    private fun newSessionFromControls() {
+    private fun newSessionFromControls(provider: String, model: String) {
         if (startInFlight.get()) {
             appendSystem("a task start is in flight; wait for its result before starting a new task")
             return
         }
         runAsync("new session") {
-            val provider = settingsPanel.selectedProvider()
-                ?: providerField.text.trim().ifEmpty { "default" }
-            val model = settingsPanel.selectedModel()
-                ?: modelField.text.trim().ifEmpty { "default" }
             val created = service.createSession(
                 provider, model, workspace = workspaceRoot?.toString(), title = "JetBrains session"
             )
             submittedCompletion = null
+            // Reset is enqueued BEFORE the confirmation line: both are FIFO
+            // onEdt calls, so the reset must not wipe the confirmation.
+            resetSessionView()
             onEdt {
-                boardPanel.reset()
                 appendSystem("session ${created.id} created (${created.title})")
             }
             service.watchSession(created.id, 0)
@@ -1293,8 +1347,12 @@ class FaktorChatPanel(
             return
         }
         val text = input.text.trim()
-        if (text.isEmpty()) return
+        if (text.isEmpty()) {
+            appendSystem("cannot send: the prompt is empty")
+            return
+        }
         if (!promptInFlight.compareAndSet(false, true)) {
+            appendSystem("a prompt is already in flight; wait for its result")
             return
         }
         // The host owns the logical prompt id: it is reused ONLY for a retry
@@ -1307,6 +1365,13 @@ class FaktorChatPanel(
         ) { UUID.randomUUID().toString() }
         pendingPromptSubmission = pending
         runAsync("prompt") {
+            if (service.currentSessionId() != sessionId) {
+                // The session switched between capture and dispatch: never
+                // durably accept this prompt under the new session.
+                promptInFlight.set(false)
+                onEdt { appendSystem("session changed; the draft is kept") }
+                return@runAsync
+            }
             try {
                 val receipt = service.prompt(text, submissionId = pending.submissionId)
                 pendingPromptSubmission = null
@@ -1623,7 +1688,10 @@ class FaktorChatPanel(
      * locally") — never fabricated numbers. No session is required.
      */
     private fun refreshUsagePanelBlocking() {
-        if (!service.isRunning()) return
+        if (!service.isRunning()) {
+            usagePagingInFlight.set(false)
+            return
+        }
         val cursor = billingCursor
         val hasPrev = billingPrevCursors.isNotEmpty()
         try {
@@ -1634,6 +1702,7 @@ class FaktorChatPanel(
                 usagePanel.setModel(
                     usagePanelModelOf(identity, entitlements, usage, null, null, cursor, hasPrev)
                 )
+                usagePagingInFlight.set(false)
             }
         } catch (e: NativeApiException) {
             onEdt {
@@ -1643,6 +1712,7 @@ class FaktorChatPanel(
                         "${e.status} ${e.code}: ${e.detail}", cursor, hasPrev
                     )
                 )
+                usagePagingInFlight.set(false)
             }
         } catch (e: Exception) {
             onEdt {
@@ -1652,6 +1722,7 @@ class FaktorChatPanel(
                         e.message ?: e.javaClass.simpleName, cursor, hasPrev
                     )
                 )
+                usagePagingInFlight.set(false)
             }
         }
     }
@@ -1679,11 +1750,13 @@ class FaktorChatPanel(
             service.tournaments()
         } catch (e: NativeApiException) {
             surfaceTournamentError("listing", e)
+            clearTrackedTournament()
             return
         } catch (e: Exception) {
             onEdt {
                 appendSystem("tournament listing failed: ${e.message ?: e.javaClass.simpleName}")
             }
+            clearTrackedTournament()
             return
         }
         onEdt { tournamentPanel.setSummaries(summaries) }
@@ -1704,11 +1777,20 @@ class FaktorChatPanel(
             onEdt { applyTournament(tournament) }
         } catch (e: NativeApiException) {
             surfaceTournamentError("load", e)
+            clearTrackedTournament()
         } catch (e: Exception) {
             onEdt {
                 appendSystem("tournament $target load failed: ${e.message ?: e.javaClass.simpleName}")
             }
+            clearTrackedTournament()
         }
+    }
+
+    /** Drops the tracked tournament target and its rendered view. */
+    private fun clearTrackedTournament() {
+        trackedTournamentId = null
+        trackedTournament = null
+        onEdt { tournamentPanel.setTournament(null) }
     }
 
     private fun surfaceTournamentError(action: String, e: NativeApiException) {
@@ -1840,13 +1922,15 @@ class FaktorChatPanel(
     }
 
     private fun retrieveEvidenceIntoNavigator(evidenceId: Long, selectorJson: String?) {
+        val session = service.currentSessionId()
         val selector = selectorJson
             ?: dev.faktor.shared.NativeRequests.evidenceSelectorAll()
         try {
             val meta = service.evidence(evidenceId)
             val retrieval = service.retrieveEvidence(evidenceId, selector)
-            val preview = String(retrieval.bytes, Charsets.UTF_8).take(MAX_EVIDENCE_PREVIEW_CHARS)
+            val preview = safeTake(String(retrieval.bytes, Charsets.UTF_8), MAX_EVIDENCE_PREVIEW_CHARS)
             onEdt {
+                if (service.currentSessionId() != session) return@onEdt
                 navigator.showRetrieval(
                     evidenceId,
                     "id=${meta.id} retained=${meta.backingRetained} " +
@@ -1861,6 +1945,7 @@ class FaktorChatPanel(
         } catch (e: Exception) {
             val message = e.message ?: e.javaClass.simpleName
             onEdt {
+                if (service.currentSessionId() != session) return@onEdt
                 navigator.showError(evidenceId, message)
                 appendSystem("evidence $evidenceId error: $message")
             }
@@ -1873,12 +1958,14 @@ class FaktorChatPanel(
     }
 
     private fun loadChildTranscript(child: ChildNode) {
+        val session = service.currentSessionId()
         runAsync("child transcript ${child.childId}") {
             val page = service.messagesFor(child.sessionId.toString(), limit = 50)
             val text = page.messages.joinToString("\n") {
                 "#${it.seq} ${it.role}: ${it.text}"
             }
             onEdt {
+                if (service.currentSessionId() != session) return@onEdt
                 navigator.showTranscriptSlice(
                     "child ${child.childId} (session ${child.sessionId})",
                     text.ifEmpty { "(no messages in the child transcript window)" }
@@ -2061,7 +2148,7 @@ class FaktorChatPanel(
     internal fun transcriptTextForTest(): String = transcript.text
 
     internal fun newSessionForTest() {
-        newSessionFromControls()
+        newSessionFromControls(selectedProviderOrDefault(), selectedModelOrDefault())
     }
 
     /** Runs one refreshAllBlocking cycle on the worker; true when it finished. */
@@ -2141,8 +2228,14 @@ class FaktorChatPanel(
         completionPr.isEnabled = effective
     }
 
+    /**
+     * A deadline refusal is transport-shaped: the response never arrived, so
+     * the request may still have been accepted inside the daemon. Retaining
+     * the immutable submission id is what makes the retry idempotent, for
+     * both a `transport` failure and a typed `timeout`.
+     */
     private fun isTransportFailure(e: NativeApiException): Boolean =
-        e.status == 0 && e.code == "transport"
+        e.status == 0 && (e.code == "transport" || e.code == "timeout")
 
     private fun runAsync(label: String, work: () -> Unit) {
         worker.execute {
@@ -2184,7 +2277,7 @@ class FaktorChatPanel(
             if (lineCount <= MAX_TRANSCRIPT_LINES) return
         }
         val kept = text.split('\n').takeLast(MAX_TRANSCRIPT_LINES).joinToString("\n")
-        transcript.text = kept.takeLast(MAX_TRANSCRIPT_CHARS)
+        transcript.text = safeTakeLast(kept, MAX_TRANSCRIPT_CHARS)
         transcript.caretPosition = transcript.text.length
         // Offsets no longer map onto the rebuilt text; message navigation
         // falls back to a loud "outside the retained window" notice.
@@ -2196,6 +2289,50 @@ class FaktorChatPanel(
             block()
         } else {
             SwingUtilities.invokeLater { block() }
+        }
+    }
+
+    /**
+     * One Swing READ from a worker: the value is produced on the EDT and
+     * returned (a Swing control read off the EDT is a data race). Never call
+     * this while already holding a lock the EDT might need.
+     */
+    private fun <T> onEdtValue(block: () -> T): T {
+        if (SwingUtilities.isEventDispatchThread()) return block()
+        val holder = java.util.concurrent.atomic.AtomicReference<T>()
+        try {
+            SwingUtilities.invokeAndWait { holder.set(block()) }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw IllegalStateException("EDT read interrupted", e)
+        } catch (e: Exception) {
+            throw IllegalStateException("EDT read failed: ${e.message}", e)
+        }
+        return holder.get()
+    }
+
+    /**
+     * Clears every per-session durable view on a session switch: message
+     * seqs are per-session (a new session restarts below the previous max),
+     * so a stale `renderedSeq` filtered every new message out while the old
+     * transcript text stayed visible.
+     */
+    private fun resetSessionView() {
+        onEdt {
+            transcript.text = ""
+            transcriptOffsets.clear()
+            renderedSeq = 0
+            boardPanel.reset()
+            navigator.resetSessionView()
+            // Session-scoped identities and tracked targets never cross a
+            // switch: a stale completion contract or tournament id would be
+            // rendered (and acted on) as if it belonged to the new session.
+            pendingTaskSubmission = null
+            pendingPromptSubmission = null
+            submittedCompletion = null
+            trackedTournamentId = null
+            trackedTournament = null
+            tournamentPanel.setTournament(null)
         }
     }
 }
@@ -2234,7 +2371,9 @@ private data class TaskStartDraft(
 /** One logical start: the client submission id plus its immutable draft. */
 private data class TaskStartSubmission(
     val submissionId: String,
-    val draft: TaskStartDraft
+    val draft: TaskStartDraft,
+    /** The session the id was minted for; a switch must never reuse it. */
+    val sessionId: String?
 )
 
 /** Standalone launcher for the Swing panel (the tool-window host entry). */

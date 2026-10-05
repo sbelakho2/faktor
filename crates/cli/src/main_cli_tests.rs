@@ -47,6 +47,16 @@ pub(crate) fn test_agent(
     session: Arc<SessionManager>,
     registry: ProviderRegistry,
 ) -> Arc<AgentRuntime> {
+    test_agent_with_hooks(session, registry, None)
+}
+
+/// [`test_agent`] with an explicit lifecycle-hook registry (the SAME
+/// `AgentDeps.hooks` field the production `FAKTOR_HOOKS` registry fills).
+pub(crate) fn test_agent_with_hooks(
+    session: Arc<SessionManager>,
+    registry: ProviderRegistry,
+    hooks: Option<Arc<faktor_hooks::HookRegistry>>,
+) -> Arc<AgentRuntime> {
     let cas = session.cas();
     let deps = AgentDeps {
         session: session.clone(),
@@ -62,7 +72,7 @@ pub(crate) fn test_agent(
         sandbox: None,
         supervisor: None,
         verification: faktor_agent::VerificationService::disabled(),
-        hooks: None,
+        hooks,
         instructions_resolver: daemon_instructions_resolver(&session),
         // Test graph: the passthrough pin (session-configured
         // provider/model win) + the REAL durable ledger over this
@@ -79,6 +89,7 @@ pub(crate) fn test_agent(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     AgentRuntime::new(deps).unwrap()
@@ -194,6 +205,7 @@ pub(crate) fn test_agent_with_evidence(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     AgentRuntime::new(deps).unwrap()
@@ -1035,6 +1047,117 @@ fn parsed_env_hook_registers_and_fires_on_a_real_registry() {
     assert_eq!(audit[0].event, faktor_hooks::HookEvent::PostTool);
 }
 
+/// The `faktor run` session-creation path (`create_run_session`) fires
+/// SessionStart through the SAME agent hook registry the production
+/// `FAKTOR_HOOKS` wiring builds: exactly once, with the created session id,
+/// after the durable row exists. The spec below is the exact shape
+/// `parse_hooks_env("session_start:<script>")` produces.
+#[cfg(unix)]
+#[test]
+fn run_session_creation_fires_session_start_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("run-session-start.log");
+    let session =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let mut registry = ProviderRegistry::new();
+    registry
+        .try_register(Arc::new(FakeProvider::new(
+            "fake",
+            ModelCapabilities::default(),
+        )))
+        .unwrap();
+    let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone registry"));
+    hooks
+        .register(faktor_hooks::HookSpec {
+            id: "env-0".into(),
+            events: vec![faktor_hooks::HookEvent::SessionStart],
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("echo \"$FAKTOR_HOOK_INPUT\" >> '{}'", marker.display()),
+            ],
+            env_allowlist: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let agent = test_agent_with_hooks(session.clone(), registry, Some(hooks.clone()));
+    let ws = session.create_workspace("/tmp").unwrap();
+    let row = create_run_session(&session, &agent, ws, "fake", "m").expect("session created");
+    assert!(
+        session.get_session(row.id()).unwrap().is_some(),
+        "the hook fired after the durable session row exists"
+    );
+    let log = std::fs::read_to_string(&marker).unwrap();
+    let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "the hook runs exactly once: {log}");
+    let sid = row.id().to_string();
+    assert!(
+        lines[0].contains(&format!("\"session_id\":\"{sid}\"")),
+        "the payload names the created session: {log}"
+    );
+    assert!(lines[0].contains("\"event\":\"session_start\""), "{log}");
+    let audit = hooks.audit();
+    assert_eq!(audit.len(), 1, "exactly one audit record");
+    assert_eq!(audit[0].hook_id, "env-0");
+    assert_eq!(audit[0].event, faktor_hooks::HookEvent::SessionStart);
+    assert_eq!(audit[0].exit_code, Some(0));
+}
+
+/// A failing or hanging SessionStart hook is bounded by its registry
+/// deadline and NEVER fails session creation for either the `faktor run`
+/// path (the same registry seam `FAKTOR_HOOKS` builds).
+#[cfg(unix)]
+#[test]
+fn run_session_creation_survives_a_failing_or_hanging_hook() {
+    for (id, script, deadline_ms) in [
+        ("fail", "exit 3".to_string(), 2000u64),
+        ("hang", "sleep 30".to_string(), 250u64),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry
+            .try_register(Arc::new(FakeProvider::new(
+                "fake",
+                ModelCapabilities::default(),
+            )))
+            .unwrap();
+        let hooks = Arc::new(faktor_hooks::HookRegistry::try_new().expect("standalone registry"));
+        hooks
+            .register(faktor_hooks::HookSpec {
+                id: format!("env-{id}"),
+                events: vec![faktor_hooks::HookEvent::SessionStart],
+                command: "sh".into(),
+                args: vec!["-c".into(), script],
+                env_allowlist: true,
+                deadline_ms,
+                failure_policy: faktor_hooks::FailurePolicy::FailClosed,
+                ..Default::default()
+            })
+            .unwrap();
+        let agent = test_agent_with_hooks(session.clone(), registry, Some(hooks.clone()));
+        let ws = session.create_workspace("/tmp").unwrap();
+        let t0 = std::time::Instant::now();
+        let row = create_run_session(&session, &agent, ws, "fake", "m")
+            .unwrap_or_else(|e| panic!("{id}: session creation must not fail on a hook: {e}"));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(8),
+            "{id}: the hook deadline must bound session creation"
+        );
+        assert!(
+            session.get_session(row.id()).unwrap().is_some(),
+            "{id}: the durable session exists"
+        );
+        let audit = hooks.audit();
+        assert_eq!(audit.len(), 1, "{id}: exactly one audit record");
+        assert_eq!(
+            audit[0].verdict, "deny",
+            "{id}: a fail-closed hook outcome is audit-only"
+        );
+    }
+}
+
 #[test]
 fn agent_info_names_faktor_and_lists_registered_provider_families() {
     let (_dir, session, agent) = acp_test_daemon(vec![]);
@@ -1299,4 +1422,31 @@ fn the_build_report_names_the_running_artifact_honestly() {
     let cheap = build_report_json(false);
     assert!(cheap["self_sha256"].is_null());
     assert_eq!(cheap["version"], faktor_core::VERSION);
+}
+
+#[test]
+fn cli_provider_resolution_refuses_zero_several_and_unknown_before_any_effect() {
+    let none: Vec<String> = Vec::new();
+    assert!(resolve_cli_provider(&none, None).is_err());
+    assert!(
+        resolve_cli_provider(&none, Some("fake")).is_err(),
+        "an unknown explicit provider must refuse even with an empty registry"
+    );
+    let one = vec!["openai".to_string()];
+    assert_eq!(resolve_cli_provider(&one, None).unwrap(), "openai");
+    assert_eq!(
+        resolve_cli_provider(&one, Some("openai")).unwrap(),
+        "openai"
+    );
+    assert!(
+        resolve_cli_provider(&one, Some("bogus")).is_err(),
+        "a requested id must be registered"
+    );
+    let many = vec!["openai".to_string(), "anthropic".to_string()];
+    let err = resolve_cli_provider(&many, None).unwrap_err();
+    assert!(err.contains("--provider"), "{err}");
+    assert_eq!(
+        resolve_cli_provider(&many, Some("anthropic")).unwrap(),
+        "anthropic"
+    );
 }

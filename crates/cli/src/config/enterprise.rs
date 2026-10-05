@@ -167,7 +167,11 @@ impl EnterpriseCfg {
             return Ok(());
         }
         let _ = self.organization()?;
-        let _ = self.layers()?;
+        let layers = self.layers()?;
+        // The ONE resolver decides whether preferences fit policy: without
+        // this the config booted and created enterprise DBs before the
+        // refusal appeared at first use.
+        faktor_cloud::resolve_layers(&layers).map_err(|e| format!("enterprise: {e}"))?;
         Ok(())
     }
 }

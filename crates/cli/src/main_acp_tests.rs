@@ -70,6 +70,7 @@ pub(crate) fn test_agent(
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     AgentRuntime::new(deps).unwrap()
@@ -172,6 +173,7 @@ pub(crate) fn acp_shadow_rig(scripts: Vec<ScriptedResponse>) -> AcpShadowRig {
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     };
     let agent = AgentRuntime::new(deps).unwrap();

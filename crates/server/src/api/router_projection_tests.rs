@@ -164,6 +164,7 @@ async fn native_projection_after_driven_turn_reports_ledger_files() {
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap();
@@ -299,6 +300,7 @@ async fn native_projection_prefix_stability_reflects_recorded_observations() {
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap();

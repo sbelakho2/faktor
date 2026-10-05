@@ -482,6 +482,41 @@ async fn credits_grant_is_admin_only_idempotency_keyed_and_strict() {
     let (org, owner_token) = bootstrap(&control_plane, "A", "a@a.test");
     let organization = OrganizationId::try_new(org.clone()).unwrap();
     provision_account(&billing, &organization);
+    // This test service has NO configured billing organization, so the
+    // configured default plan applies to NOBODY: the snapshot is unentitled.
+    // (The configured-organization case is covered by
+    // `foreign_tenant_gets_an_unentitled_snapshot_not_the_configured_default_plan`.)
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let unentitled: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        unentitled["entitlements"]["plan_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(unentitled["entitlements"]["plan_found"], false);
+    assert!(unentitled["entitlements"]["limits"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    // An active subscription ALWAYS wins, regardless of organization: set
+    // it for the rest of the test (it is replaced by the expired one below).
+    billing
+        .set_subscription(&Subscription {
+            id: faktor_cloud::SubscriptionId::try_new("sub_active").unwrap(),
+            organization: organization.clone(),
+            plan_id: "pro".into(),
+            status: SubscriptionStatus::Active,
+            started_ms: 0,
+            expires_ms: None,
+            updated_ms: NOW_MS,
+        })
+        .unwrap();
     // A member-scoped service account: role Member + no billing scope.
     let owner_principal = control_plane.authenticate(&owner_token).unwrap();
     let member_token = control_plane
@@ -848,4 +883,111 @@ async fn usage_overflow_is_a_typed_ledger_refusal_on_the_routes() {
             "no saturated total is ever reported: {message}"
         );
     }
+}
+
+/// Adversarial route test of the default-plan tenant isolation: with
+/// `[billing] organization = A`, org A's token resolves the configured
+/// default plan, while a foreign/unprovisioned tenant's token gets an
+/// UNENTITLED snapshot (`plan_found: false`, no plan id, empty
+/// features/limits) — the configured tenant's plan is never handed down. A
+/// subscription always wins, regardless of organization.
+#[tokio::test]
+async fn foreign_tenant_gets_an_unentitled_snapshot_not_the_configured_default_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let control_plane = Arc::new(faktor_cloud::ControlPlane::new(
+        Arc::new(faktor_cloud::MemoryControlPlaneStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+    ));
+    let (org_a, token_a) = bootstrap(&control_plane, "A", "a@a.test");
+    let (org_b, token_b) = bootstrap(&control_plane, "B", "b@b.test");
+    // The configured billing organization is A; B exists but is not it.
+    let billing = EntitlementService::new_for_organization(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(NOW_MS)),
+        billing_config(),
+        Some(OrganizationId::try_new(org_a.clone()).unwrap()),
+    )
+    .unwrap();
+    let deps = test_deps(dir.path())
+        .with_control_plane(control_plane)
+        .with_billing(billing.clone());
+    let token = deps.auth_token.clone();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+
+    // The configured organization's token resolves the default plan.
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &token_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let configured: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(configured["entitlements"]["plan_id"], "pro");
+    assert_eq!(configured["entitlements"]["plan_found"], true);
+    assert!(!configured["entitlements"]["limits"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+
+    // The foreign tenant's token: 200 with an unentitled snapshot, never the
+    // configured plan.
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &token_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_money_encoding(&body);
+    assert_eq!(body["entitlements"]["organization_id"], org_b.as_str());
+    assert_eq!(body["entitlements"]["plan_id"], serde_json::Value::Null);
+    assert_eq!(body["entitlements"]["plan_found"], false);
+    assert!(
+        body["entitlements"]["features"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no inherited features: {body}"
+    );
+    assert!(
+        body["entitlements"]["limits"]
+            .as_object()
+            .unwrap()
+            .is_empty(),
+        "no inherited limits: {body}"
+    );
+    assert_eq!(body["entitlements"]["subscription_active"], false);
+
+    // A subscription ALWAYS wins: B's own active subscription resolves its
+    // plan, still without inheriting anything from the configured tenant.
+    let organization_b = OrganizationId::try_new(org_b.clone()).unwrap();
+    billing
+        .set_subscription(&Subscription {
+            id: faktor_cloud::SubscriptionId::try_new("sub_b").unwrap(),
+            organization: organization_b,
+            plan_id: "pro".into(),
+            status: SubscriptionStatus::Active,
+            started_ms: 0,
+            expires_ms: None,
+            updated_ms: NOW_MS,
+        })
+        .unwrap();
+    let resp = client
+        .get(format!("{base}/native/entitlements"))
+        .bearer_auth(token.as_str())
+        .header("x-faktor-control-token", &token_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["entitlements"]["plan_id"], "pro");
+    assert_eq!(body["entitlements"]["plan_found"], true);
+    assert_eq!(body["entitlements"]["limits"][LIMIT_MAX_ACTIVE_TASKS], 3);
 }

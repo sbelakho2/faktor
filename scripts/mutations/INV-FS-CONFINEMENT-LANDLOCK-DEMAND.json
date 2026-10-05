@@ -1,0 +1,9 @@
+{
+  "id": "INV-FS-CONFINEMENT-LANDLOCK-DEMAND",
+  "file": "crates/terminal/src/lib.rs",
+  "find": "            FilesystemIsolationRequirement::Workspace { best_effort } => {\n                FilesystemIsolation::Workspace {\n                    roots,\n                    required: !best_effort,\n                }\n            }",
+  "replace": "            FilesystemIsolationRequirement::Workspace { best_effort: _ } => {\n                FilesystemIsolation::Workspace {\n                    roots,\n                    required: false,\n                }\n            }",
+  "gate": "cargo test -p faktor-terminal --lib filesystem_isolation_mapping_and_tags_are_exact",
+  "expect": "assertion|left.*right|workspace",
+  "note": "A REQUIRED workspace demand maps to required=false: the fail-closed demand silently degrades to best-effort, so the projection tag and the spawn gate no longer enforce the declared guarantee."
+}

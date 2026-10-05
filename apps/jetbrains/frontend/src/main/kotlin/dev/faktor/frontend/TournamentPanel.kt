@@ -83,7 +83,11 @@ class TournamentPanel : JPanel(BorderLayout()) {
         loadRow.add(JLabel("winners are proposed only; integration stays the explicit approved-merge path"))
         loadButton.addActionListener {
             val id = loadField.text.trim()
-            if (id.isNotEmpty()) listener?.onLoadTournament(id)
+            if (id.isEmpty()) {
+                title.text = "tournament: load refused (no id entered)"
+            } else {
+                listener?.onLoadTournament(id)
+            }
         }
 
         val startRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))

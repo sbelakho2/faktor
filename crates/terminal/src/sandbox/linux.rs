@@ -1700,3 +1700,443 @@ unsafe fn apply_broker_only_isolation(cmd: &mut std::process::Command, ns_fd: i3
         drop_isolated_child_privileges()
     });
 }
+
+// ---------------------------------------------------------------------------
+// Filesystem-workspace confinement (audit P1): Landlock path rules plus a
+// best-effort mount namespace.
+//
+// The sandbox projection may only say `workspace` when the spawn layer can
+// actually bound the child's filesystem view. This backend installs, in the
+// forked single-threaded child before exec:
+//
+//  1. a Landlock ruleset (`landlock_create_ruleset`/`landlock_add_rule`/
+//     `landlock_restrict_self`, ABI v1+) whose handled access set covers
+//     every filesystem right the running kernel's ABI advertises (v1 core
+//     rights; REFER from v2; TRUNCATE from v3 — the set is masked to the
+//     probed ABI, never guessed), and whose path-beneath rules grant:
+//       * FULL handled rights on each configured workspace root (so the
+//         child can read/write/mkdir/remove/rename/truncate inside it), and
+//       * READ_FILE|READ_DIR|EXECUTE on a fixed runtime allowlist that any
+//         dynamically linked binary needs to exec at all (`/usr`, `/lib*`,
+//         the loader cache) plus READ|WRITE on the null/random/tty devices.
+//     Every path not covered is denied by the kernel for the whole process
+//     tree (`EACCES`), including `..` traversal out of a root and symlink
+//     escapes (Landlock checks the resolved object, not the spelling).
+//
+//  2. best-effort mount-namespace confinement on top: `unshare(CLONE_NEWNS)`
+//     followed by recursive `MS_PRIVATE` propagation, so the child's mounts
+//     can never propagate to the host and it sees its own mount namespace.
+//     Path read/write confinement is Landlock's job (a read-only remount of
+//     a shared host root cannot provide read confinement); failures of this
+//     additional layer are non-fatal because Landlock is already
+//     irreversible for the child.
+//
+// Fail-closed contract: `Required` refuses the spawn typed (the pre-exec
+// error rides std's errno transport and `spawn_failure` maps it) when the
+// kernel has no Landlock ABI, when `PR_SET_NO_NEW_PRIVS` or any ruleset
+// syscall fails, or when a configured workspace root cannot be opened. A
+// `BestEffort` request runs application-policy-only in those cases — the
+// projection tag `workspace_best_effort` never claims otherwise. Nothing is
+// ever logged as warn-and-continue in the Required case.
+//
+// The closure captures ONLY pre-built `CString`s and scalars: after fork it
+// calls raw async-signal-safe syscalls (`landlock_*`, `open`, `close`,
+// `prctl`, `unshare`, `mount`) and reads errno — no allocation, no locks.
+
+/// Test-only simulation of a kernel without the Landlock ABI (or without
+/// permission to install a ruleset): set before a Required workspace spawn
+/// to prove the fail-closed typed refusal path. The pre-exec hook only
+/// reads this atomic.
+#[cfg(test)]
+static FORCE_LANDLOCK_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force the next workspace-confinement pre-exec calls to fail as an
+/// unsupported kernel would (tests).
+#[cfg(test)]
+pub(crate) fn force_landlock_failure_for_tests(force: bool) {
+    FORCE_LANDLOCK_FAILURE.store(force, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The running kernel's real Landlock ABI version, or `None` when Landlock
+/// is absent/unavailable. Read-only probe (safe outside a forked child).
+#[cfg(test)]
+pub(crate) fn landlock_abi_for_tests() -> Option<u32> {
+    // SAFETY: the version probe passes a null ruleset pointer with size 0
+    // and the VERSION flag; the kernel dereferences nothing.
+    let v = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<std::ffi::c_char>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION as libc::c_ulong,
+        )
+    };
+    (v >= 1).then_some(v as u32)
+}
+
+/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
+const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
+/// `LANDLOCK_RULE_PATH_BENEATH`.
+const LANDLOCK_RULE_PATH_BENEATH: libc::c_ulong = 1;
+
+// Filesystem access rights (linux/landlock.h). ABI v1 defines bits 0..=12,
+// ABI v2 adds REFER, ABI v3 adds TRUNCATE. IOCTL_DEV (v5) is deliberately
+// NOT handled: device ioctls on inherited stdio are outside the workspace
+// boundary this confinement claims.
+const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+
+/// Every ABI v1 filesystem right.
+const LANDLOCK_FS_RIGHTS_V1: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+    | LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_READ_FILE
+    | LANDLOCK_ACCESS_FS_READ_DIR
+    | LANDLOCK_ACCESS_FS_REMOVE_DIR
+    | LANDLOCK_ACCESS_FS_REMOVE_FILE
+    | LANDLOCK_ACCESS_FS_MAKE_CHAR
+    | LANDLOCK_ACCESS_FS_MAKE_DIR
+    | LANDLOCK_ACCESS_FS_MAKE_REG
+    | LANDLOCK_ACCESS_FS_MAKE_SOCK
+    | LANDLOCK_ACCESS_FS_MAKE_FIFO
+    | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+    | LANDLOCK_ACCESS_FS_MAKE_SYM;
+
+/// The handled right set of the probed ABI: all rights the kernel knows
+/// about. Rights newer than the ABI are cleared, because handling an
+/// unknown right makes `landlock_create_ruleset` fail with EINVAL.
+fn handled_fs_rights(abi: u32) -> u64 {
+    let mut rights = LANDLOCK_FS_RIGHTS_V1;
+    if abi >= 2 {
+        rights |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if abi >= 3 {
+        rights |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    rights
+}
+
+/// Minimal runtime access needed to exec any dynamically linked child: the
+/// executable itself, its loader and shared libraries, and the loader
+/// cache. None of these are workspace data.
+const RUNTIME_READ_EXECUTE_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/ld.so.preload",
+];
+
+/// Device nodes a shell legitimately redirects to. Path read/write
+/// confinement is the workspace rule's job; these carry no daemon data.
+const RUNTIME_DEVICE_PATHS: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+];
+
+/// Sentinel meaning "full handled rights" (resolved to the probed ABI's
+/// right set inside the pre-exec child).
+const ACCESS_WORKSPACE_ROOT: u64 = u64::MAX;
+
+/// One prepared path-beneath rule. `access` is either
+/// [`ACCESS_WORKSPACE_ROOT`] or a concrete right mask; `optional` marks the
+/// fixed runtime entries (a missing library path is skipped) as opposed to
+/// a configured workspace root (missing is a refusal under `Required`).
+struct FsRule {
+    path: std::ffi::CString,
+    access: u64,
+    optional: bool,
+}
+
+/// `struct landlock_ruleset_attr` (linux/landlock.h), ABI v1 field. The
+/// v4+ `handled_access_net` field is deliberately omitted (size 8): network
+/// confinement is a separate authority's job and passing a zero net field
+/// would be a false claim of handling it.
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+}
+
+/// `struct landlock_path_beneath_attr` (linux/landlock.h), packed to its
+/// exact 12-byte kernel ABI size (no trailing padding).
+#[repr(C, packed)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+/// Install the workspace-confinement pre-exec hook on `cmd`.
+///
+/// # Safety
+///
+/// The installed closure runs in the forked child between fork and exec: it
+/// must not allocate, lock, or call anything but async-signal-safe
+/// operations. The rule table (including every `CString`) is built here, in
+/// the parent, before the fork.
+// SAFETY: the arguments are validated by the caller per this function's documented contract and the call has no additional aliasing or lifetime requirements.
+pub(crate) unsafe fn apply_workspace_isolation(
+    cmd: &mut std::process::Command,
+    roots: &[std::path::PathBuf],
+    required: bool,
+) {
+    use std::os::unix::ffi::OsStrExt;
+    let mut rules: Vec<FsRule> = Vec::new();
+    // A root that cannot be represented as a C string, does not exist, or
+    // is not a directory can never carry a path-beneath rule: treat it as a
+    // missing workspace root (fail closed when Required).
+    let mut invalid_root = roots.is_empty();
+    for root in roots {
+        if !root.is_dir() {
+            invalid_root = true;
+            continue;
+        }
+        match std::ffi::CString::new(root.as_os_str().as_bytes()) {
+            Ok(path) => rules.push(FsRule {
+                path,
+                access: ACCESS_WORKSPACE_ROOT,
+                optional: false,
+            }),
+            Err(_) => invalid_root = true,
+        }
+    }
+    for path in RUNTIME_READ_EXECUTE_PATHS {
+        // `landlock_add_rule` rejects directory-only rights on a regular
+        // file (the loader cache) and file-only rights are pointless on a
+        // directory: pick the mask from the parent-side metadata. Missing
+        // paths are simply not rule-able here and are skipped (the child
+        // would ENOENT them anyway).
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        let access = if meta.is_dir() {
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_EXECUTE
+        } else {
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE
+        };
+        rules.push(FsRule {
+            path: std::ffi::CString::new(*path).expect("static runtime path has no NUL"),
+            access,
+            optional: true,
+        });
+    }
+    for path in RUNTIME_DEVICE_PATHS {
+        if std::fs::metadata(path).is_err() {
+            continue;
+        }
+        rules.push(FsRule {
+            path: std::ffi::CString::new(*path).expect("static runtime path has no NUL"),
+            access: LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE,
+            optional: true,
+        });
+    }
+    // SAFETY (of the pre_exec call): std requires the caller to uphold the
+    // pre-exec restrictions; the closure below only iterates the pre-built
+    // table and calls raw async-signal-safe syscalls (documented above).
+    cmd.pre_exec(move || workspace_isolation_pre_exec(&rules, required, invalid_root));
+}
+
+/// The pre-exec body: Landlock ruleset, then the best-effort mount
+/// namespace. Async-signal-safe only (raw syscalls, pre-built strings).
+fn workspace_isolation_pre_exec(
+    rules: &[FsRule],
+    required: bool,
+    invalid_root: bool,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_LANDLOCK_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+        return workspace_outcome(required, io::Error::from_raw_os_error(libc::ENOSYS));
+    }
+    if invalid_root {
+        return workspace_outcome(required, io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // ABI probe: a null ruleset pointer asks for the version. Absent
+    // Landlock (ENOSYS/EOPNOTSUPP) or a disabled LSM is the unsupported
+    // kernel case.
+    // SAFETY: the version probe passes a null pointer with size 0; the
+    // kernel dereferences nothing.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<std::ffi::c_char>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi < 1 {
+        return workspace_outcome(required, io::Error::last_os_error());
+    }
+    let handled = handled_fs_rights(abi as u32);
+    // `landlock_restrict_self` requires no-new-privs for unprivileged
+    // callers; the DenyAll network hook may already have set it.
+    // SAFETY: prctl(PR_SET_NO_NEW_PRIVS, 1, ...) takes scalar arguments.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            PR_SET_NO_NEW_PRIVS,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if r != 0 {
+        return workspace_outcome(required, io::Error::last_os_error());
+    }
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: handled,
+    };
+    // SAFETY: `attr` is a live, correctly sized ruleset attribute buffer;
+    // the syscall only reads it and its return is checked.
+    let ruleset = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0 as libc::c_ulong,
+        )
+    };
+    if ruleset < 0 {
+        return workspace_outcome(required, io::Error::last_os_error());
+    }
+    let ruleset_fd = ruleset as i32;
+    let mut failure: Option<io::Error> = None;
+    for rule in rules {
+        // O_PATH opens the object without read permission and without
+        // following a final symlink; it is the fd kind Landlock accepts as
+        // `parent_fd`.
+        // SAFETY: `rule.path` is a NUL-terminated C string owned by the
+        // captured table; the returned fd is checked and closed below.
+        let fd = unsafe { libc::open(rule.path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            if rule.optional
+                && matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOENT | libc::EACCES | libc::ENOTDIR)
+                )
+            {
+                continue;
+            }
+            failure = Some(e);
+            break;
+        }
+        let access = if rule.access == ACCESS_WORKSPACE_ROOT {
+            handled
+        } else {
+            rule.access
+        };
+        let path_attr = LandlockPathBeneathAttr {
+            allowed_access: access,
+            parent_fd: fd,
+        };
+        // SAFETY: `path_attr` is a live, packed, kernel-ABI-sized buffer;
+        // the fd is live for the duration of the call; the return is
+        // checked and the fd closed exactly once below.
+        let added = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_add_rule,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &path_attr as *const LandlockPathBeneathAttr,
+                0 as libc::c_ulong,
+            )
+        };
+        // SAFETY: `fd` came from open(2) above and is owned here.
+        unsafe {
+            libc::close(fd);
+        }
+        if added != 0 {
+            failure = Some(io::Error::last_os_error());
+            break;
+        }
+    }
+    if let Some(e) = failure {
+        // SAFETY: `ruleset_fd` came from landlock_create_ruleset above.
+        unsafe {
+            libc::close(ruleset_fd);
+        }
+        // No restrict_self ran: for BestEffort this is the honest
+        // application-policy-only fallback (the ruleset is discarded).
+        return workspace_outcome(required, e);
+    }
+    // SAFETY: `ruleset_fd` is the live ruleset created above; the syscall
+    // consumes it (the fd stays owned by this scope).
+    let restricted = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_restrict_self,
+            ruleset_fd,
+            0 as libc::c_ulong,
+        )
+    };
+    let restrict_error = (restricted != 0).then(io::Error::last_os_error);
+    // SAFETY: `ruleset_fd` came from landlock_create_ruleset above.
+    unsafe {
+        libc::close(ruleset_fd);
+    }
+    if let Some(e) = restrict_error {
+        return workspace_outcome(required, e);
+    }
+    // Additional best-effort mount-namespace confinement. Failures are
+    // non-fatal: the Landlock ruleset above is already irreversible for
+    // this process tree and is the read/write path boundary.
+    mount_namespace_confinement();
+    Ok(())
+}
+
+/// Map a Landlock failure to the spawn outcome: `Required` refuses typed
+/// (the pre-exec error refuses the spawn), `BestEffort` continues
+/// application-policy-only with no restriction installed.
+fn workspace_outcome(required: bool, error: io::Error) -> io::Result<()> {
+    if required {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+/// Best-effort mount-namespace layer: give the child its own mount
+/// namespace and sever propagation to the host. Never fatal (see the
+/// section contract).
+fn mount_namespace_confinement() {
+    // SAFETY: unshare(CLONE_NEWNS) takes scalar flags; failure is ignored
+    // by contract.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return;
+    }
+    let target = c"/";
+    // SAFETY: `target` is a NUL-terminated literal; a null source/fstype
+    // and null data are valid for a propagation-only mount(2) call, and
+    // failure is ignored by contract.
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        );
+    }
+}

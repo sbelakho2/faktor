@@ -280,6 +280,34 @@ impl SessionHandle {
             .map_err(|e| crate::map_store_err(e).into())
     }
 
+    /// Record the durable generic-shell pre-manifest envelope on one tool run
+    /// (v29, P0-2 remainder): written before the shell may execute and
+    /// rewritten by settlement/crash reconciliation with the discovered
+    /// change set. Unlike the postcondition setter this also updates terminal
+    /// rows (reconciliation happens after the finish).
+    pub fn record_tool_pre_manifest(
+        &self,
+        op: OpId,
+        pre_manifest: &serde_json::Value,
+    ) -> faktor_core::Result<()> {
+        self.manager
+            .store()
+            .record_tool_pre_manifest(self.id, op, pre_manifest)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
+    /// Bounded newest-first scan of this session's tool runs carrying a
+    /// pre-manifest envelope (v29): crash recovery's reconciliation input.
+    pub fn tool_runs_with_pre_manifest(
+        &self,
+        limit: usize,
+    ) -> faktor_core::Result<Vec<ToolRunRow>> {
+        self.manager
+            .store()
+            .tool_runs_with_pre_manifest(self.id, limit)
+            .map_err(|e| crate::map_store_err(e).into())
+    }
+
     /// Bump the physical-attempt counter of one still-running tool run (a
     /// crash-recovery replay is a new physical attempt of the same logical
     /// operation). Returns the new attempt number.
@@ -920,7 +948,17 @@ impl SessionHandle {
     pub(crate) fn expire_pending_permissions_locked(
         &self,
     ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
-        let now = self.now_ms();
+        self.expire_pending_permissions_locked_until(
+            self.now_ms(),
+            "durable permission deadline elapsed while no live waiter owned the request",
+        )
+    }
+
+    fn expire_pending_permissions_locked_until(
+        &self,
+        now: i64,
+        reason: &str,
+    ) -> faktor_core::Result<faktor_store::ExpiredPermissionResolution> {
         let expired = self
             .manager
             .store()
@@ -946,7 +984,7 @@ impl SessionHandle {
             op_id,
             now,
             Some(serde_json::json!({
-                "reason": "durable permission deadline elapsed while no live waiter owned the request",
+                "reason": reason,
                 "expired_count": expired.len(),
             })),
         )?;

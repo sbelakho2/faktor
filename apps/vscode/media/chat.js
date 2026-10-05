@@ -11,14 +11,43 @@
       return String(draft == null ? '' : draft);
     },
   };
+  // Board presentation policy comes from media/board-state.js (loaded first);
+  // the fallback keeps the panel functional without it but never fabricates.
+  var boardPolicy = (typeof FaktorBoard !== 'undefined' && FaktorBoard) || {
+    MAX_BOARD_SUBJECT_BYTES: 512,
+    MAX_BOARD_BODY_BYTES: 16 * 1024,
+    boardHeader: function (board) {
+      return board == null ? 'board: not read yet' : 'board: unavailable (policy missing)';
+    },
+    boardDraftRefusal: function (subject, body) {
+      if (String(subject == null ? '' : subject).trim().length === 0) {
+        return 'subject is required';
+      }
+      if (String(body == null ? '' : body).trim().length === 0) {
+        return 'body is required';
+      }
+      return null;
+    },
+    boardPostsForDisplay: function () {
+      return [];
+    },
+  };
 
   // One logical submission at a time. The flag gates the composer BEFORE the
   // post, so a double click / Enter+click race can never emit a second
   // sendGoal; it is released ONLY by an explicit host result.
   var submitting = false;
+  /** True while a board post awaits its durable ack (double-click guard). */
+  var boardPosting = false;
+  /** The exact draft a board post submitted (token-correlated ack). */
+  var submittedBoard = null;
+  var boardSubmitSeq = 0;
+  /** True while an IME composition is active (chord/Enter must not submit). */
+  var composing = false;
   // Scroll-ownership state: the signature of the rendered transcript and the
   // one-shot pin requested by the user's own submission.
   var transcriptKey = null;
+  var transcriptEntryKeys = null;
   var transcriptPinRequested = false;
   var TRANSCRIPT_PIN_SLACK_PX = 24;
   // Host-side attachment metadata (id + filename + mime + size only: the
@@ -33,6 +62,109 @@
 
   function byId(id) {
     return document.getElementById(id);
+  }
+
+  /**
+   * 128-bit content digest: four independent FNV-1a lanes. A 32-bit lane is
+   * cheaply collidable (a provider-controlled same-length string with the
+   * same hash would freeze the DOM), so per-entry identity uses 128 bits and
+   * the streaming tuple compare backs it up.
+   */
+  function hash128(text) {
+    var value = text == null ? '' : String(text);
+    var seeds = [2166136261, 2166136261 ^ 0x9e3779b9, 2166136261 ^ 0x85ebca6b, 2166136261 ^ 0xc2b2ae35];
+    var out = '';
+    for (var lane = 0; lane < seeds.length; lane++) {
+      var h = seeds[lane] >>> 0;
+      for (var i = 0; i < value.length; i++) {
+        h ^= value.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      out += (h.toString(16) + '00000000').slice(0, 8);
+    }
+    return out;
+  }
+
+  /** Child-index path from `root` to `node`; null when not a descendant. */
+  function elementPath(root, node) {
+    var path = [];
+    var cursor = node;
+    while (cursor && cursor !== root) {
+      var parent = cursor.parentNode;
+      if (!parent || !parent.children) {
+        return null;
+      }
+      var index = -1;
+      for (var i = 0; i < parent.children.length; i++) {
+        if (parent.children[i] === cursor) {
+          index = i;
+          break;
+        }
+      }
+      if (index < 0) {
+        return null;
+      }
+      path.unshift(index);
+      cursor = parent;
+    }
+    return cursor === root ? path : null;
+  }
+
+  function elementAtPath(root, path) {
+    var cursor = root;
+    for (var i = 0; i < path.length; i++) {
+      cursor = cursor && cursor.children ? cursor.children[path[i]] : null;
+      if (!cursor) {
+        return null;
+      }
+    }
+    return cursor;
+  }
+
+  /**
+   * Capture the focused control inside a container across a rebuild. The
+   * structural path is the primary identity: duplicate visible labels AND
+   * duplicate aria-labels (two "Remove" buttons, two "Pause" buttons) must
+   * keep focus on the SAME control, which text/aria matching alone cannot.
+   */
+  function captureFocus(container) {
+    var active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (!active || !container || !container.contains || !container.contains(active)) {
+      return null;
+    }
+    return {
+      path: elementPath(container, active),
+      tag: active.tagName,
+      text: active.textContent,
+      aria: active.getAttribute ? active.getAttribute('aria-label') : null,
+    };
+  }
+
+  function restoreFocus(container, descriptor) {
+    if (!descriptor || !container || !container.querySelectorAll) {
+      return;
+    }
+    if (descriptor.path) {
+      var exact = elementAtPath(container, descriptor.path);
+      if (exact && exact.tagName === descriptor.tag && typeof exact.focus === 'function') {
+        exact.focus();
+        return;
+      }
+    }
+    var nodes = container.querySelectorAll('button, input, textarea, select, a, [tabindex]');
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      var match =
+        descriptor.aria !== null
+          ? node.getAttribute && node.getAttribute('aria-label') === descriptor.aria
+          : node.textContent === descriptor.text;
+      if (match && node.tagName === descriptor.tag) {
+        if (typeof node.focus === 'function') {
+          node.focus();
+        }
+        return;
+      }
+    }
   }
 
   function clear(node) {
@@ -67,6 +199,7 @@
 
   function renderCockpit(view, sections) {
     var node = byId('cockpit');
+    var focus = captureFocus(node);
     clear(node);
     if (!Array.isArray(sections) || sections.length === 0) {
       return;
@@ -137,6 +270,7 @@
       }
       node.appendChild(block);
     }
+    restoreFocus(node, focus);
   }
 
   // Usage/credits lines carry honest state markers: a breached quota, an
@@ -448,6 +582,7 @@
   function renderAgents(agents) {
     var card = byId('agents-card');
     var list = byId('agent-list');
+    var focus = captureFocus(list);
     clear(list);
     if (!agents || agents.length === 0) {
       card.hidden = true;
@@ -556,6 +691,7 @@
       }
       list.appendChild(item);
     }
+    restoreFocus(list, focus);
   }
 
   // ----------------------------------------------------------- transcript
@@ -582,40 +718,135 @@
     };
   }
 
-  /** Cheap structural signature of the rendered entries (host-mirroring). */
-  function transcriptKeyOf(entries) {
-    if (!entries || entries.length === 0) {
-      return 'empty';
-    }
-    var out = '';
-    for (var i = 0; i < entries.length; i++) {
-      var entry = entries[i];
-      var tools = entry.tools || [];
+  /** Content identity of one rendered entry (host-mirroring). */
+  function transcriptEntryKey(entry) {
+    var tools = entry.tools || [];
+    var out =
+      entry.seq +
+      ':' +
+      entry.role +
+      ':' +
+      hash128(entry.text) +
+      ':' +
+      hash128(entry.reasoning) +
+      ':' +
+      hash128(entry.summary) +
+      ':';
+    for (var t = 0; t < tools.length; t++) {
       out +=
-        entry.seq +
+        tools[t].state +
         ':' +
-        entry.role +
+        hash128(tools[t].name) +
         ':' +
-        (entry.text || '').length +
+        hash128(tools[t].excerpt) +
         ':' +
-        (entry.reasoning || '').length +
+        hash128(tools[t].artifact) +
         ':' +
-        (entry.summary || '').length +
-        ':';
-      for (var t = 0; t < tools.length; t++) {
-        out +=
-          tools[t].state +
-          ':' +
-          ((tools[t].excerpt || '').length) +
-          ':' +
-          (tools[t].exitCode === null || tools[t].exitCode === undefined
-            ? 'n'
-            : tools[t].exitCode) +
-          ';';
-      }
-      out += '|';
+        (tools[t].exitCode === null || tools[t].exitCode === undefined
+          ? 'n'
+          : tools[t].exitCode) +
+        ';';
     }
     return out;
+  }
+
+  /** Per-entry content signatures; joined for the cheap no-op compare. */
+  function transcriptKeysOf(entries) {
+    if (!entries || entries.length === 0) {
+      return [];
+    }
+    var keys = [];
+    for (var i = 0; i < entries.length; i++) {
+      keys.push(transcriptEntryKey(entries[i]));
+    }
+    return keys;
+  }
+
+  /** Cheap signature of the rendered entries (host-mirroring). */
+  function transcriptKeyOf(entries) {
+    var keys = transcriptKeysOf(entries);
+    return keys.length === 0 ? 'empty' : keys.join('|');
+  }
+
+  /** Capture open details / delivered evidence / focus of one entry node. */
+  function captureEntryState(node) {
+    var state = { open: [], evidence: [], focus: null };
+    if (!node || !node.querySelectorAll) {
+      return state;
+    }
+    var details = node.querySelectorAll('details');
+    for (var i = 0; i < details.length; i++) {
+      state.open.push(details[i].open === true);
+    }
+    var holders = node.querySelectorAll('[data-evidence]');
+    var occurrence = {};
+    for (var h = 0; h < holders.length; h++) {
+      var evidenceId = holders[h].getAttribute('data-evidence');
+      var pre = holders[h].querySelector ? holders[h].querySelector('pre') : null;
+      if (pre) {
+        occurrence[evidenceId] = occurrence[evidenceId] === undefined ? 0 : occurrence[evidenceId] + 1;
+        state.evidence.push({
+          id: evidenceId,
+          occurrence: occurrence[evidenceId],
+          node: pre.cloneNode(true),
+        });
+      }
+    }
+    var active = typeof document !== 'undefined' ? document.activeElement : null;
+    if (active && node.contains && node.contains(active)) {
+      state.focus = {
+        path: elementPath(node, active),
+        tag: active.tagName,
+        text: active.textContent,
+        aria: active.getAttribute ? active.getAttribute('aria-label') : null,
+      };
+    }
+    return state;
+  }
+
+  /** Restore open details / delivered evidence / focus onto a fresh node. */
+  function restoreEntryState(node, state) {
+    if (!node || !state || !node.querySelectorAll) {
+      return;
+    }
+    var details = node.querySelectorAll('details');
+    for (var i = 0; i < details.length && i < state.open.length; i++) {
+      details[i].open = state.open[i];
+    }
+    for (var e = 0; e < state.evidence.length; e++) {
+      var recovered = state.evidence[e];
+      // Pair by OCCURRENCE: two tool refs to the same artifact must each get
+      // their own delivered text back, never both onto the first holder.
+      var holders = node.querySelectorAll('[data-evidence="' + recovered.id + '"]');
+      var holder = holders[recovered.occurrence];
+      if (holder) {
+        clear(holder);
+        holder.appendChild(recovered.node);
+      }
+    }
+    if (state.focus) {
+      if (state.focus.path) {
+        var exact = elementAtPath(node, state.focus.path);
+        if (exact && exact.tagName === state.focus.tag && typeof exact.focus === 'function') {
+          exact.focus();
+          return;
+        }
+      }
+      var candidates = node.querySelectorAll('button, input, textarea, select, a, [tabindex]');
+      for (var c = 0; c < candidates.length; c++) {
+        var candidate = candidates[c];
+        var match =
+          state.focus.aria !== null && state.focus.aria !== undefined
+            ? candidate.getAttribute && candidate.getAttribute('aria-label') === state.focus.aria
+            : candidate.textContent === state.focus.text;
+        if (match && candidate.tagName === state.focus.tag) {
+          if (typeof candidate.focus === 'function') {
+            candidate.focus();
+          }
+          return;
+        }
+      }
+    }
   }
 
   /** The first visible entry (index + pixel offset) of the CURRENT list. */
@@ -648,23 +879,61 @@
   function renderTranscript(entries) {
     var container = byId('entries');
     var key = transcriptKeyOf(entries);
+    var keys = transcriptKeysOf(entries);
+    var previousKey = transcriptKey;
+    // Scroll intent is computed BEFORE any mutation: the streaming fast path
+    // must honor the same pinned-follows / unpinned-anchor contract as a
+    // rebuild, or a pinned reader silently stops following the stream.
+    var plan = transcriptScrollPlan({
+      scrollHeight: container.scrollHeight,
+      scrollTop: container.scrollTop,
+      clientHeight: container.clientHeight,
+    });
+    var pin = transcriptKey === null || plan.pinned || transcriptPinRequested;
+    var anchor = pin ? null : transcriptAnchorOf(container);
+    // Streaming fast path: every entry EXCEPT the last is byte-identical and
+    // the last entry changed (a text/reasoning/tool delta). Replacing only
+    // the last node preserves open details, delivered evidence, focus and
+    // the reading position; a full rebuild here re-announced the whole
+    // transcript and destroyed all of it on every chunk.
+    var lastOnlyChanged =
+      transcriptEntryKeys !== null &&
+      transcriptEntryKeys.length === keys.length &&
+      keys.length > 0 &&
+      container.children.length === keys.length &&
+      keys[keys.length - 1] !== transcriptEntryKeys[transcriptEntryKeys.length - 1] &&
+      (function () {
+        for (var p = 0; p < keys.length - 1; p++) {
+          if (keys[p] !== transcriptEntryKeys[p]) {
+            return false;
+          }
+        }
+        return true;
+      })();
+    if (lastOnlyChanged) {
+      var oldNode = container.children[container.children.length - 1];
+      var preserved = captureEntryState(oldNode);
+      var freshNode = renderEntry(entries[entries.length - 1]);
+      // Attach FIRST: focus() on a detached node is a real-browser no-op, so
+      // restoring before replaceChild lost keyboard focus on every delta.
+      container.replaceChild(freshNode, oldNode);
+      restoreEntryState(freshNode, preserved);
+      transcriptKey = key;
+      transcriptEntryKeys = keys;
+      transcriptPinRequested = false;
+      if (pin) {
+        container.scrollTop = container.scrollHeight;
+      } else {
+        scrollToTranscriptAnchor(container, anchor);
+      }
+      return;
+    }
     if (transcriptKey !== null && key === transcriptKey) {
       // No transcript delta: no rebuild and ZERO scroll mutation, so an
       // expanded evidence block and the reading position both survive a
       // background snapshot.
       return;
     }
-    var previousKey = transcriptKey;
-    var plan = transcriptScrollPlan({
-      scrollHeight: container.scrollHeight,
-      scrollTop: container.scrollTop,
-      clientHeight: container.clientHeight,
-    });
-    // Initial load, a previously pinned view and the user's own submission
-    // all pin to the bottom; an unpinned reader keeps the first visible
-    // entry and its pixel offset across the rebuild.
-    var pin = transcriptKey === null || plan.pinned || transcriptPinRequested;
-    var anchor = pin ? null : transcriptAnchorOf(container);
     // A strict prefix extension (the common snapshot append) adds ONLY the
     // new entries: existing DOM nodes are never re-inserted, so the live
     // region announces additions instead of re-announcing the history.
@@ -683,6 +952,7 @@
       clear(container);
       if (!entries || entries.length === 0) {
         transcriptKey = key;
+        transcriptEntryKeys = keys;
         transcriptPinRequested = false;
         line(container, 'No messages yet.', 'muted');
         if (pin) {
@@ -695,6 +965,7 @@
       }
     }
     transcriptKey = key;
+    transcriptEntryKeys = keys;
     transcriptPinRequested = false;
     if (pin) {
       container.scrollTop = container.scrollHeight;
@@ -840,6 +1111,7 @@
     if (!list || !clearButton) {
       return;
     }
+    var focus = captureFocus(list);
     clear(list);
     var firstRefusal = null;
     for (var i = 0; i < attachments.length; i++) {
@@ -882,6 +1154,28 @@
     if (notice) {
       notice.hidden = firstRefusal === null;
       notice.textContent = firstRefusal === null ? '' : 'Attachment refused: ' + firstRefusal;
+    }
+    restoreFocus(list, focus);
+  }
+
+  /** Human wording for the stream status: never a raw `protocol_blocked`
+   * tag in the meta row. */
+  function streamStatusLabel(status) {
+    var raw = status == null || status === '' ? 'stopped' : String(status);
+    switch (raw) {
+      case 'open':
+        return 'live';
+      case 'connecting':
+        return 'connecting';
+      case 'retrying':
+        return 'reconnecting';
+      case 'blocked':
+      case 'protocol_blocked':
+        return 'blocked (recovery available)';
+      case 'stopped':
+        return 'stopped';
+      default:
+        return raw.replace(/_/g, ' ');
     }
   }
 
@@ -999,6 +1293,74 @@
     }
   }
 
+  /**
+   * The local Post-button policy: disabled while the draft violates the
+   * shared byte bounds, with the exact refusal shown once a draft exists.
+   */
+  function updateBoardPostEnabled() {
+    var subjectNode = byId('board-subject');
+    var bodyNode = byId('board-body');
+    var button = byId('btn-board-post');
+    var notice = byId('board-draft-notice');
+    if (!subjectNode || !bodyNode || !button || !notice) {
+      return;
+    }
+    var reason = boardPolicy.boardDraftRefusal(subjectNode.value, bodyNode.value);
+    var draftStarted = subjectNode.value.length > 0 || bodyNode.value.length > 0;
+    button.disabled = reason !== null || boardPosting;
+    if (reason !== null && draftStarted) {
+      notice.hidden = false;
+      // aria-atomic status: assigning the same string again re-announces it;
+      // only replace the text node when the refusal actually changed.
+      if (notice.textContent !== reason) {
+        notice.textContent = reason;
+      }
+    } else if (!notice.hidden || notice.textContent !== '') {
+      notice.hidden = true;
+      notice.textContent = '';
+    }
+  }
+
+  /**
+   * The coordination board: truthful header, bounded post rows, and the
+   * bounded composer. Every daemon string is rendered through textContent.
+   */
+  function renderBoard(board) {
+    var header = byId('board-header');
+    var list = byId('board-posts');
+    if (!header || !list) {
+      return;
+    }
+    header.textContent = boardPolicy.boardHeader(board);
+    clear(list);
+    var posts = boardPolicy.boardPostsForDisplay(board);
+    if (board && board.available && posts.length === 0) {
+      var empty = document.createElement('li');
+      empty.className = 'muted';
+      empty.textContent = 'no posts on this run-family board';
+      list.appendChild(empty);
+    }
+    for (var i = 0; i < posts.length; i++) {
+      var post = posts[i];
+      var item = document.createElement('li');
+      item.className = 'board-post';
+      var head = document.createElement('div');
+      head.className = 'board-post-head';
+      head.textContent = '#' + (post.revision === null ? '?' : post.revision) + ' · ' + post.author;
+      var subject = document.createElement('div');
+      subject.className = 'board-post-subject';
+      subject.textContent = post.subject;
+      var body = document.createElement('div');
+      body.className = 'board-post-body';
+      body.textContent = post.body;
+      item.appendChild(head);
+      item.appendChild(subject);
+      item.appendChild(body);
+      list.appendChild(item);
+    }
+    updateBoardPostEnabled();
+  }
+
   function renderSnapshot(snapshot) {
     if (!snapshot) {
       return;
@@ -1015,11 +1377,12 @@
     setDaemon(snapshot.daemon, snapshot.daemonDetail);
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
-    setText('stream-status', snapshot.streamStatus);
+    setText('stream-status', streamStatusLabel(snapshot.streamStatus));
     renderStreamRecovery(snapshot.streamStatus);
     renderTask(snapshot.task, snapshot.cockpit);
     renderCockpit(snapshot.cockpit, snapshot.cockpitSections);
     renderAgents(snapshot.agents);
+    renderBoard(snapshot.board);
     renderTranscript(snapshot.transcript);
     if (snapshot.lastError) {
       showNotice('error', snapshot.lastError);
@@ -1050,7 +1413,12 @@
       var pre = document.createElement('pre');
       pre.className = 'excerpt';
       pre.textContent = truncated ? text + '\n… (truncated)' : text;
+      pre.setAttribute('tabindex', '-1');
       holder.appendChild(pre);
+      // Keyboard activation replaced the button; focus follows the content.
+      if (typeof pre.focus === 'function') {
+        pre.focus();
+      }
     }
   }
 
@@ -1088,6 +1456,28 @@
       renderSnapshot(message.snapshot);
     } else if (message.type === 'evidence') {
       deliverEvidence(message.id, message.text, message.truncated);
+    } else if (message.type === 'boardPosted' || message.type === 'boardRefused') {
+      // Answered by the host for EVERY post outcome and correlated by the
+      // submission token: a stale ack can neither release a newer post nor
+      // clear a newer (possibly identical) draft. Text edited while the post
+      // was in flight is never touched.
+      var boardSubject = byId('board-subject');
+      var boardBody = byId('board-body');
+      if (submittedBoard !== null && message.token === submittedBoard.token) {
+        if (
+          message.type === 'boardPosted' &&
+          boardSubject &&
+          boardBody &&
+          boardSubject.value === submittedBoard.subject &&
+          boardBody.value === submittedBoard.body
+        ) {
+          boardSubject.value = '';
+          boardBody.value = '';
+        }
+        boardPosting = false;
+        submittedBoard = null;
+        updateBoardPostEnabled();
+      }
     } else if (message.type === 'startResult') {
       // The explicit result releases the submitting lock on EVERY outcome.
       setSubmitting(false);
@@ -1108,6 +1498,11 @@
         if (goalNode && typeof goalNode.focus === 'function') {
           goalNode.focus();
         }
+      } else if (goalNode && typeof goalNode.focus === 'function') {
+        // A refused/failed start keeps the draft; focus returns to the
+        // composer where the retry happens (the now-disabled Run button had
+        // dropped keyboard focus to the body).
+        goalNode.focus();
       }
     } else if (message.type === 'attachments') {
       setAttachments(message.items);
@@ -1198,8 +1593,63 @@
     requestStart();
   });
 
+  // Board: an explicit top-of-board read acknowledges the page; the bounded
+  // composer posts exactly the subject/body the host re-validates.
+  byId('btn-board-read').addEventListener('click', function () {
+    vscode.postMessage({ type: 'boardRead', since: null, limit: null });
+  });
+  byId('board-post').addEventListener('submit', function (event) {
+    if (composing) {
+      return;
+    }
+    if (event.preventDefault) {
+      event.preventDefault();
+    }
+    var subjectNode = byId('board-subject');
+    var bodyNode = byId('board-body');
+    var reason = boardPolicy.boardDraftRefusal(subjectNode.value, bodyNode.value);
+    if (reason !== null || boardPosting) {
+      updateBoardPostEnabled();
+      return;
+    }
+    boardPosting = true;
+    boardSubmitSeq += 1;
+    submittedBoard = {
+      token: 'bp-' + boardSubmitSeq,
+      subject: subjectNode.value,
+      body: bodyNode.value,
+    };
+    vscode.postMessage({
+      type: 'boardPost',
+      token: submittedBoard.token,
+      subject: submittedBoard.subject,
+      body: submittedBoard.body,
+    });
+    updateBoardPostEnabled();
+  });
+  byId('board-subject').addEventListener('input', updateBoardPostEnabled);
+  byId('board-body').addEventListener('input', updateBoardPostEnabled);
+
   // Keyboard: Enter inserts a newline; Ctrl/Cmd+Enter starts the task.
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('compositionstart', function () {
+      composing = true;
+    });
+    document.addEventListener('compositionend', function () {
+      composing = false;
+    });
+  }
+
   byId('goal').addEventListener('keydown', function (event) {
+    if (
+      composing ||
+      event.isComposing === true ||
+      event.keyCode === 229 ||
+      event.key === 'Process'
+    ) {
+      // IME composition confirm: never start the task from a composing chord.
+      return;
+    }
     if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
       if (event.preventDefault) {
         event.preventDefault();

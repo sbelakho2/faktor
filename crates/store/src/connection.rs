@@ -445,6 +445,12 @@ pub struct Store {
     pub(crate) writer: WriterService,
     pub(crate) pool: Arc<ReaderPool>,
     pub(crate) seam: Arc<CrashSeam>,
+    /// Boot-instance identity of THIS store open (audit P1): a fresh opaque
+    /// token minted by every `Store::open`/`open_fast`. Admission claims are
+    /// stamped with it so a `pending` row written by a previous daemon boot
+    /// is distinguishable from a live claim of this one; startup recovery
+    /// resolves every foreign-generation pending row.
+    pub(crate) generation: String,
     /// Long-running maintenance tasks (online backups, audit item 6) on their
     /// own dedicated connections/threads — NEVER the mutation owner. The
     /// registry carries each task's cancellation token so a store shutdown
@@ -758,6 +764,27 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Mint the boot-instance identity of one store open (audit P1). Opaque,
+/// bounded, collision-resistant across processes and reopens within one
+/// process: pid + wall clock + a process-local boot counter + this frame's
+/// address under a domain-separated BLAKE3. The value only ever needs to
+/// differ between boots that could see each other's pending admission rows.
+fn mint_boot_generation() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BOOT_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+    let now = now_ms() as u64;
+    let stack = (&BOOT_SEQ as *const AtomicU64).addr() as u64;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"faktor.store.boot-generation/v1");
+    hasher.update(&pid.to_le_bytes());
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(&stack.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Checked narrowing of a persisted non-negative integer column to `u32`.
@@ -1845,9 +1872,18 @@ impl Store {
             writer,
             pool,
             seam: Arc::new(CrashSeam::default()),
+            generation: mint_boot_generation(),
             fact_seq,
             maintenance: Arc::new(MaintenanceRegistry::new()),
         }
+    }
+
+    /// This store instance's boot-instance identity (audit P1). A `pending`
+    /// admission claim whose stored `owner_generation` differs from this
+    /// value belongs to a DEAD previous boot and is resolved by startup
+    /// recovery, never served as a live in-flight claim.
+    pub fn generation(&self) -> &str {
+        &self.generation
     }
 
     /// The next monotonic memory-fact stamp: the wall clock when it is

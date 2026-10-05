@@ -995,7 +995,7 @@ object TaskTree {
             "integration_coverage" -> if (binding.requiredWorkItems.isEmpty()) {
                 null
             } else {
-                binding.requiredWorkItems.size.toString() + " required work item(s)"
+                plural(binding.requiredWorkItems.size, "required work item")
             }
             "file_state" -> binding.expectedDigest?.let { "expected digest " + it }
                 ?: binding.path?.let { "path " + it }
@@ -1027,10 +1027,19 @@ object TaskTree {
     private fun timestampText(record: NativeVerificationRecord?): String? {
         if (record == null) return null
         val bits = ArrayList<String>()
-        record.startedMs?.let { bits.add("started " + it + "ms") }
-        record.completedMs?.let { bits.add("completed " + it + "ms") }
+        record.startedMs?.let { bits.add("started " + utcMs(it)) }
+        record.completedMs?.let { bits.add("completed " + utcMs(it)) }
         return if (bits.isEmpty()) null else bits.joinToString(" · ")
     }
+
+    /** ISO-8601 UTC, matching the VS Code rendering of the same record. */
+    private fun utcMs(ms: Long): String =
+        java.time.Instant.ofEpochMilli(ms)
+            .truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+            .toString()
+
+    /** Smoke-visible ISO rendering (whole seconds carry exactly one Z). */
+    internal fun utcSecondsForTest(ms: Long): String = utcMs(ms)
 
     /** Bounded digest label so the proof facts survive the panel clamp. */
     private fun digestLabel(digest: String): String = shortDigest(digest)

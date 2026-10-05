@@ -9,7 +9,10 @@
 //!   managed-provider set come from [`BillingConfig`]; this module contains
 //!   no price and no default limit. A subscription naming a plan the config
 //!   does not define denies admission naming the plan gap — it never falls
-//!   back to a guessed plan;
+//!   back to a guessed plan. The configured default plan applies ONLY to the
+//!   configured billing organization; a foreign/unprovisioned organization
+//!   resolves an unentitled snapshot and is denied typed, never handed the
+//!   configured tenant's plan;
 //! - **No entitlement change ever interrupts an in-flight transaction.** The
 //!   gate is consulted at exactly three boundaries (new task admission, new
 //!   child spawn, new provider attempt BEFORE dispatch). Continuation
@@ -102,6 +105,13 @@ pub struct EntitlementService {
     store: Arc<dyn BillingStore>,
     clock: Arc<dyn Clock>,
     config: BillingConfig,
+    /// The ONE organization the daemon's `[billing] organization` wiring
+    /// meters. The configured `default_plan` applies EXCLUSIVELY to it:
+    /// every other (foreign or unprovisioned) organization gets an
+    /// unentitled snapshot (`plan_found: false`, no fabricated plan),
+    /// never a handed-down default. `None` = no organization is
+    /// configured, so no organization inherits the default.
+    billing_organization: Option<OrganizationId>,
 }
 
 impl std::fmt::Debug for EntitlementService {
@@ -115,20 +125,38 @@ impl std::fmt::Debug for EntitlementService {
 impl EntitlementService {
     /// Build the service. The configuration is validated eagerly: a strict
     /// config error is refused at construction, never at first admission.
+    ///
+    /// No organization is configured, so the configured default plan applies
+    /// to NO organization (fail closed). Use
+    /// [`Self::new_for_organization`] on the daemon wiring path.
     pub fn new(
         store: Arc<dyn BillingStore>,
         clock: Arc<dyn Clock>,
         config: BillingConfig,
+    ) -> Result<Arc<Self>, ControlPlaneError> {
+        Self::new_for_organization(store, clock, config, None)
+    }
+
+    /// Build the service for the ONE organization the `[billing]
+    /// organization` wiring meters: `config.default_plan` applies exclusively
+    /// to it. The configuration is validated eagerly.
+    pub fn new_for_organization(
+        store: Arc<dyn BillingStore>,
+        clock: Arc<dyn Clock>,
+        config: BillingConfig,
+        billing_organization: Option<OrganizationId>,
     ) -> Result<Arc<Self>, ControlPlaneError> {
         config.validate()?;
         Ok(Arc::new(Self {
             store,
             clock,
             config,
+            billing_organization,
         }))
     }
 
-    /// Build with the system clock (production hosts).
+    /// Build with the system clock (production hosts; no default-plan
+    /// organization: fail closed).
     pub fn with_system_clock(
         store: Arc<dyn BillingStore>,
         config: BillingConfig,
@@ -136,8 +164,40 @@ impl EntitlementService {
         Self::new(store, Arc::new(SystemClock), config)
     }
 
+    /// Build with the system clock for the configured billing organization
+    /// (the daemon wiring path): `config.default_plan` applies ONLY to it.
+    pub fn with_system_clock_for_organization(
+        store: Arc<dyn BillingStore>,
+        config: BillingConfig,
+        billing_organization: OrganizationId,
+    ) -> Result<Arc<Self>, ControlPlaneError> {
+        Self::new_for_organization(
+            store,
+            Arc::new(SystemClock),
+            config,
+            Some(billing_organization),
+        )
+    }
+
     pub fn config(&self) -> &BillingConfig {
         &self.config
+    }
+
+    /// The ONE organization the configured default plan applies to (`None`
+    /// when no organization is wired: the default applies to nobody).
+    pub fn billing_organization(&self) -> Option<&OrganizationId> {
+        self.billing_organization.as_ref()
+    }
+
+    /// The default plan applicable to `organization`: the configured
+    /// `default_plan`, but ONLY when `organization` is the configured billing
+    /// organization. Every other organization resolves `None` (unentitled).
+    fn default_plan_for(&self, organization: &OrganizationId) -> Option<String> {
+        if self.billing_organization.as_ref() == Some(organization) {
+            self.config.default_plan.clone()
+        } else {
+            None
+        }
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -160,13 +220,18 @@ impl EntitlementService {
         let accounts = self.store.billing_accounts(organization, None, 1)?;
         let account = accounts.into_iter().next();
         let subscription = self.store.subscription(organization)?;
-        // Plan resolution: the subscription's plan when one exists, else the
-        // configured default plan. A named-but-undefined plan is reported
-        // (plan_found false) and denies at admission — never a silent guess.
+        // Plan resolution: the subscription's plan when one exists (it wins
+        // regardless of organization), else the configured default plan —
+        // but ONLY for the organization the `[billing] organization` wiring
+        // meters. A foreign/unprovisioned organization gets NO fabricated
+        // plan: `plan_id` stays absent and `plan_found` is false, so the
+        // admission gate denies it typed (`CAUSE_PLAN`). A named-but-undefined
+        // plan is reported the same way — never a silent guess.
+        let default_plan = self.default_plan_for(organization);
         let plan_id = subscription
             .as_ref()
             .map(|s| s.plan_id.clone())
-            .or_else(|| self.config.default_plan.clone());
+            .or(default_plan);
         let plan = plan_id.as_deref().and_then(|id| self.config.plan(id));
         let credits = self.store.credit_balance(organization)?;
         let events = self.scan_events(organization)?;

@@ -859,7 +859,8 @@ fn run_tool_calls_fills_reads_writes_from_tool_ownership() {
     // The scheduler's ownership sets must come from the tool's declared
     // path args: write_file with a path arg writes that path (the audit
     // requires the ScheduledOp's reads/writes to be non-empty so edit
-    // overlap serialization works).
+    // overlap serialization works), canonicalized against the session root.
+    let base = tempfile::tempdir().unwrap();
     let write_file = Arc::new(Tool {
         name: "write_file".into(),
         description: "w".into(),
@@ -873,9 +874,19 @@ fn run_tool_calls_fills_reads_writes_from_tool_ownership() {
     let (reads, writes) = ownership_sets(
         &write_file,
         &serde_json::json!({"path": "src/main.rs", "content": "x"}),
+        Some(base.path()),
     );
     assert!(!writes.is_empty(), "write_file must declare its write path");
     assert!(reads.is_empty(), "write_file declares no reads");
+    let (_, alias_writes) = ownership_sets(
+        &write_file,
+        &serde_json::json!({"path": "./src/x/../main.rs", "content": "x"}),
+        Some(base.path()),
+    );
+    assert!(
+        writes.overlaps(&alias_writes),
+        "alias spellings of one declared path must share one scheduler resource"
+    );
     let (reads, read_writes) = ownership_sets(
         &Arc::new(Tool {
             path_args: vec!["path".into()],
@@ -883,9 +894,358 @@ fn run_tool_calls_fills_reads_writes_from_tool_ownership() {
             ..(write_file.as_ref()).clone()
         }),
         &serde_json::json!({"path": "src/main.rs"}),
+        Some(base.path()),
     );
     assert!(!reads.is_empty(), "read_file must declare its read path");
     assert!(read_writes.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// P1 alias canonicalization through the REAL tool-loop scheduler: the
+// declared spellings are canonicalized against the session workspace root
+// before they become `ScheduledOp::reads/writes`, so aliases of one
+// filesystem object are one resource. These tests drive the real runtime
+// (not `OwnershipSet` directly): the model's batch carries aliased path args,
+// the tools mutate the real workspace through the rooted FS, and the bodies
+// rendezvous so a missing canonicalization shows up as a peak concurrent
+// writer count > 1.
+
+/// Timed rendezvous for the real tool bodies. `tokio::sync::Barrier` is
+/// explicitly NOT cancel safe, so a bounded wait around it could poison the
+/// barrier; this waits on an arrival counter until the batch's expected
+/// calls have entered or the hold expires. A serialized body pays the
+/// bounded hold and proceeds, so the turn can never hang on the
+/// synchronizer.
+struct AliasBarrier {
+    expected: usize,
+    hold: Duration,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    entered: AtomicUsize,
+}
+
+/// Keeps one tool body counted as active for its whole execution.
+struct AliasActive<'a> {
+    barrier: &'a AliasBarrier,
+}
+
+impl Drop for AliasActive<'_> {
+    fn drop(&mut self) {
+        self.barrier.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl AliasBarrier {
+    fn new(expected: usize, hold: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            expected,
+            hold,
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
+        })
+    }
+
+    /// Enter the active section and wait (bounded) until the other expected
+    /// bodies entered too. The returned guard holds the active count until
+    /// the whole body finishes.
+    async fn enter(&self) -> AliasActive<'_> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + self.hold;
+        while self.entered.load(Ordering::SeqCst) < self.expected
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        AliasActive { barrier: self }
+    }
+
+    /// Peak number of tool bodies concurrently active in one batch.
+    fn peak(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+/// Lexically normalize a declared workspace-relative alias exactly the way
+/// the rooted filesystem treats it: drop `.`, collapse duplicate separators
+/// and resolve `..` inside the path. The runtime's scheduler must derive the
+/// same identity INDEPENDENTLY in `ownership_sets`; the body needs this
+/// because the production `WorkspaceHandle::resolve` rejects `..` traversal
+/// by policy, so the real mutation needs the normalized spelling.
+fn alias_relative(raw: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// A REAL mutating test tool: DiskWrite with a declared `path` arg; its body
+/// writes through the session workspace (the rooted fs) while counted by
+/// `barrier`.
+fn alias_write_tool(name: &str, barrier: Arc<AliasBarrier>) -> Tool {
+    Tool {
+        name: name.to_string(),
+        description: "aliased workspace write".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+        resource_class: faktor_core::resource::ResourceClass::DiskWrite,
+        capability: None,
+        recovery_hint: RecoveryHint::WorkspaceWrite,
+        path_args: vec!["path".into()],
+        execute: Arc::new(move |ctx, args| {
+            let barrier = barrier.clone();
+            Box::pin(async move {
+                let raw = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let _active = barrier.enter().await;
+                let Some(ws) = &ctx.workspace else {
+                    return Err(Error::internal("no workspace wired"));
+                };
+                let rel = alias_relative(&raw);
+                ws.write_atomic(
+                    std::path::Path::new(&rel),
+                    format!("wrote {raw}\n").as_bytes(),
+                )
+                .map_err(|e| Error::internal(format!("alias write {raw}: {e}")))?;
+                Ok(ToolOutcome {
+                    text: format!("wrote {raw}"),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// A generic shell tool (P0-2): explicit `ExecuteShell` capability, NO
+/// declared path args, and a body that mutates a workspace file its
+/// declaration does not name — exactly the escape a pathless scheduler model
+/// would miss.
+fn alias_shell_tool(barrier: Arc<AliasBarrier>) -> Tool {
+    Tool {
+        name: "alias_shell".into(),
+        description: "generic shell".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: faktor_core::resource::ResourceClass::Terminal,
+        capability: Some(faktor_core::capability::Capability::ExecuteShell {
+            command: "alias-shell".into(),
+        }),
+        recovery_hint: RecoveryHint::UnknownEffect,
+        path_args: vec![],
+        execute: Arc::new(move |ctx, _args| {
+            let barrier = barrier.clone();
+            Box::pin(async move {
+                let _active = barrier.enter().await;
+                let Some(ws) = &ctx.workspace else {
+                    return Err(Error::internal("no workspace wired"));
+                };
+                ws.write_atomic(std::path::Path::new("src/a"), b"shell mutation\n")
+                    .map_err(|e| Error::internal(format!("shell write: {e}")))?;
+                Ok(ToolOutcome {
+                    text: "shell ran".into(),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// The alias spellings one filesystem target admits in THIS environment:
+/// lexical aliases always; Windows separator aliases; macOS case aliases
+/// only while the target volume actually folds ASCII case (a case-sensitive
+/// APFS volume treats them as distinct objects and must not be conflated).
+fn aliased_targets(root: &std::path::Path) -> Vec<String> {
+    let mut aliases: Vec<String> = vec![
+        "src/a".into(),
+        "./src/a".into(),
+        "src/x/../a".into(),
+        "src//a".into(),
+    ];
+    #[cfg(windows)]
+    aliases.extend(["src\\a".into(), ".\\src\\a".into()]);
+    // The root is only consulted by the macOS case probe; keep the binding
+    // used on every platform so Windows builds stay warning-free.
+    let _ = root;
+    #[cfg(target_os = "macos")]
+    if macos_fs_folds_ascii_case(root) {
+        aliases.extend(["src/A".into(), "SRC/a".into()]);
+    }
+    // Deterministic batch order (also exercises `mut` on every platform).
+    aliases.sort();
+    aliases
+}
+
+#[cfg(target_os = "macos")]
+fn macos_fs_folds_ascii_case(root: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::metadata(root.join("src/lib.rs")),
+        std::fs::metadata(root.join("src/LIB.rs")),
+    ) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// All aliased spellings of ONE filesystem object scheduled in ONE real batch:
+/// the peak concurrent writer count must be exactly 1.
+#[tokio::test]
+async fn aliased_target_spellings_serialize_writers_through_the_real_tool_loop() {
+    let (manager, session, dir) = verified_shared_env();
+    let root = dir.path().join("ws");
+    let targets = aliased_targets(&root);
+    let barrier = AliasBarrier::new(targets.len(), Duration::from_millis(150));
+    let mut script: Vec<ScriptedResponse> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, path)| ScriptedResponse::ToolCall {
+            id: format!("alias_{i}"),
+            name: if i % 2 == 0 {
+                "alias_write_a"
+            } else {
+                "alias_write_b"
+            }
+            .into(),
+            input: serde_json::json!({"path": path}),
+        })
+        .collect();
+    script.push(ScriptedResponse::Text("done".into()));
+    script.push(ScriptedResponse::End);
+    let tools = vec![
+        alias_write_tool("alias_write_a", barrier.clone()),
+        alias_write_tool("alias_write_b", barrier.clone()),
+    ];
+    let (deps, _cas) = deps_sharing_session(manager, Arc::new(scripted_provider(script)), tools);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "write every aliased spelling", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let statuses = tool_completed_statuses(&handle);
+    assert_eq!(statuses.len(), targets.len(), "{statuses:?}");
+    assert!(
+        statuses.iter().all(|(_, s)| s == "completed"),
+        "every aliased call must execute: {statuses:?}"
+    );
+    assert_eq!(
+        barrier.peak(),
+        1,
+        "aliases of one filesystem object must serialize: peak {} for {targets:?}",
+        barrier.peak()
+    );
+    let written = std::fs::read_to_string(root.join("src/a")).expect("the real write landed");
+    assert!(written.starts_with("wrote "), "{written:?}");
+    assert!(
+        !root.join("src/x").exists(),
+        "the `..` alias must mutate src/a, never create src/x"
+    );
+}
+
+/// No over-serialization: two writers with distinct canonical targets run
+/// concurrently (the DiskWrite class budget allows it and ownership must not
+/// falsely collide).
+#[tokio::test]
+async fn disjoint_targets_stay_concurrent_through_the_real_tool_loop() {
+    let (manager, session, dir) = verified_shared_env();
+    let root = dir.path().join("ws");
+    let barrier = AliasBarrier::new(2, Duration::from_millis(500));
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "disjoint_a".into(),
+            name: "alias_write_a".into(),
+            input: serde_json::json!({"path": "src/a"}),
+        },
+        ScriptedResponse::ToolCall {
+            id: "disjoint_b".into(),
+            name: "alias_write_b".into(),
+            input: serde_json::json!({"path": "src/b"}),
+        },
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let tools = vec![
+        alias_write_tool("alias_write_a", barrier.clone()),
+        alias_write_tool("alias_write_b", barrier.clone()),
+    ];
+    let (deps, _cas) = deps_sharing_session(manager, Arc::new(scripted_provider(script)), tools);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "write two distinct targets", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(
+        barrier.peak(),
+        2,
+        "distinct canonical targets must still run concurrently"
+    );
+    assert!(root.join("src/a").exists(), "src/a landed");
+    assert!(root.join("src/b").exists(), "src/b landed");
+}
+
+/// The P0-2 rule survives canonicalization end to end: a generic shell
+/// (no declared path args, `ExecuteShell` capability) still owns the whole
+/// workspace, so it serializes against a path writer even though the sentinel
+/// is a policy token, not a path.
+#[tokio::test]
+async fn generic_shell_still_barriers_against_a_path_writer_through_the_real_tool_loop() {
+    let (manager, session, _dir) = verified_shared_env();
+    let barrier = AliasBarrier::new(2, Duration::from_millis(150));
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "shell".into(),
+            name: "alias_shell".into(),
+            input: serde_json::json!({}),
+        },
+        ScriptedResponse::ToolCall {
+            id: "writer".into(),
+            name: "alias_write_a".into(),
+            input: serde_json::json!({"path": "src/a"}),
+        },
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let tools = vec![
+        alias_shell_tool(barrier.clone()),
+        alias_write_tool("alias_write_a", barrier.clone()),
+    ];
+    let (deps, _cas) = deps_sharing_session(manager, Arc::new(scripted_provider(script)), tools);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "shell and a writer", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
+    let statuses = tool_completed_statuses(&handle);
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert!(
+        statuses.iter().all(|(_, s)| s == "completed"),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        barrier.peak(),
+        1,
+        "a generic shell's full-workspace ownership must serialize with every writer"
+    );
 }
 
 #[tokio::test]
@@ -1264,6 +1624,210 @@ async fn tool_results_echoing_secrets_are_redacted_benign_outputs_byte_identical
         benign.1, "output: fmt",
         "benign tool output must stay byte-identical"
     );
+}
+
+/// The planted configured key of the audit finding: `sk-` followed by a
+/// run that a dash interrupts, so the DEFAULT pattern engine never sees it —
+/// only the exact configured-secret registry catches this value.
+const PLANTED_CONFIGURED_KEY: &str = "sk-PLANTED-MOCK-KEY-abc123";
+
+fn planted_registry(value: &str) -> Arc<faktor_security::registry::SecretRegistry> {
+    let mut registry = faktor_security::registry::SecretRegistry::new();
+    registry.register(value.as_bytes());
+    Arc::new(registry)
+}
+
+/// The egress gate's exact body decision (same engines, same payload, same
+/// order as `PolicyCheckedHttpTransport::gate_outbound_body`): the pattern
+/// payload scan plus the exact registry scan. `true` = the send would be
+/// hard-blocked before connect.
+fn egress_would_block(body: &[u8], registry: &faktor_security::registry::SecretRegistry) -> bool {
+    let scan = faktor_security::payload::scan_payload(
+        body,
+        &faktor_security::payload::ScanPolicy::default(),
+    );
+    matches!(scan, faktor_security::payload::ScanOutcome::Found(_))
+        || !registry.scan_exact(body).is_empty()
+}
+
+/// Recursively assert a byte pattern appears in NO file under `root`
+/// (journal, SQLite/WAL, CAS blob, spill-adjacent artifacts).
+fn assert_no_bytes_under(root: &std::path::Path, needle: &[u8]) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            assert_no_bytes_under(&path, needle);
+        } else {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "raw configured secret found in {}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The audit fault, end to end at the agent layer: a tool echoes the
+/// configured provider key; the durable message part must carry the
+/// redacted form, no byte under the session root (journal + CAS) may hold
+/// the raw value, and the NEXT provider request built from that history
+/// must pass the egress gate (pattern scan + exact registry) so the turn is
+/// never hard-blocked.
+#[tokio::test]
+async fn configured_secret_echoed_by_a_tool_is_redacted_and_never_blocks_the_next_request() {
+    assert!(
+        faktor_security::scan_secrets(
+            PLANTED_CONFIGURED_KEY,
+            &faktor_security::SecretPolicy::default()
+        )
+        .is_empty(),
+        "the planted value must be pattern-invisible for the fault to be real"
+    );
+    let command_tool = Tool {
+        name: "run_command".into(),
+        description: "runs a command".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        resource_class: faktor_core::resource::ResourceClass::Cpu,
+        capability: None,
+        recovery_hint: RecoveryHint::UnknownEffect,
+        path_args: vec![],
+        execute: Arc::new(|_ctx, _args| {
+            Box::pin(async move {
+                Ok(ToolOutcome {
+                    text: format!("the key printed: {PLANTED_CONFIGURED_KEY} end"),
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    };
+    let registry = planted_registry(PLANTED_CONFIGURED_KEY);
+    // Inspect EVERY provider request the way the egress transport would:
+    // a request whose serialized body would trip the gate fails the turn.
+    let registry_for_hook = registry.clone();
+    let inspecting = Arc::new(InspectingProvider::new(
+        Arc::new(scripted_provider(vec![
+            ScriptedResponse::ToolCall {
+                id: "c1".into(),
+                name: "run_command".into(),
+                input: serde_json::json!({ "command": "cat token" }),
+            },
+            ScriptedResponse::Text("done".into()),
+            ScriptedResponse::End,
+        ])),
+        move |_n, req| {
+            // The adapter wire body always serializes the system prefix, the
+            // message parts (with tool_result excerpts) and the tool schemas;
+            // the egress gate scans that full payload. Emulate it over the
+            // same content and run the gate's exact decision.
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": req.model,
+                "system": req.system,
+                "messages": req.messages,
+                "tools": req.tools,
+            }))
+            .map_err(|e| e.to_string())?;
+            if egress_would_block(&body, &registry_for_hook) {
+                return Err("egress gate would hard-block this request".into());
+            }
+            Ok(())
+        },
+    ));
+    let (mut deps, dir) = deps_with(inspecting.clone(), vec![command_tool]);
+    deps.secret_registry = Some(registry);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let outcome = runtime
+        .run_turn(session, "run and show", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert!(
+        inspecting.counter.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the post-tool request must actually have been inspected"
+    );
+
+    // (a) The durable message part carries the redaction marker, never raw.
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    let msgs = runtime
+        .history_messages(&handle, &ContextBudget::default())
+        .await
+        .unwrap();
+    let results: Vec<String> = msgs
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|c| match &c.kind {
+            ContentKind::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        results
+            .iter()
+            .any(|r| r == "the key printed: <redacted:configured_secret> end"),
+        "the durable tool result must be exact-redacted: {results:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| {
+            m.content.iter().any(|c| match &c.kind {
+                ContentKind::ToolResult { content, .. } => content.contains(PLANTED_CONFIGURED_KEY),
+                _ => false,
+            })
+        }),
+        "no durable message may carry the raw configured secret"
+    );
+
+    // (b) No durable byte under the session root carries the raw value.
+    assert_no_bytes_under(dir.path(), PLANTED_CONFIGURED_KEY.as_bytes());
+}
+
+/// The same planted value through the artifact sink: the inline and CAS
+/// paths both store the exact-redacted bytes, and the CAS scan finds no raw
+/// value anywhere under the data root.
+#[test]
+fn configured_secret_in_an_artifact_put_is_redacted_inline_and_in_cas() {
+    let (mut deps, dir) = deps(scripted_provider(vec![]), vec![]);
+    deps.secret_registry = Some(planted_registry(PLANTED_CONFIGURED_KEY));
+    let session = new_session(&deps);
+    let sink = deps.artifact_sink(session);
+    let payload = format!("before {PLANTED_CONFIGURED_KEY} after");
+
+    // Inline path: the returned inline text is the scrubbed form.
+    let inline = sink
+        .store("command_output", payload.as_bytes(), 4096)
+        .unwrap();
+    assert_eq!(
+        inline.inline.as_deref(),
+        Some("before <redacted:configured_secret> after"),
+        "inline artifact content must be exact-redacted"
+    );
+
+    // CAS path (zero inline cap forces the blob): the stored bytes are the
+    // scrubbed form and the hard-link-free scan finds no raw value.
+    let artifact = sink.store("command_output", payload.as_bytes(), 0).unwrap();
+    let reference = artifact.artifact.expect("blob stored");
+    let hash =
+        faktor_core::hash::FileHash::from_hex(reference.strip_prefix("artifact://").unwrap())
+            .unwrap();
+    let bytes = deps.cas.as_ref().unwrap().get_verified_now(hash).unwrap();
+    assert!(
+        !bytes
+            .windows(PLANTED_CONFIGURED_KEY.len())
+            .any(|w| w == PLANTED_CONFIGURED_KEY.as_bytes()),
+        "raw configured secret reached the CAS blob"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "before <redacted:configured_secret> after"
+    );
+    assert_no_bytes_under(dir.path(), PLANTED_CONFIGURED_KEY.as_bytes());
 }
 
 #[tokio::test]

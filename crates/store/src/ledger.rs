@@ -493,6 +493,7 @@ mod evidence_store_tests {
                  DROP TABLE IF EXISTS evidence;
                  ALTER TABLE task DROP COLUMN attachments;
                  DROP TABLE IF EXISTS attachment;
+                 ALTER TABLE tool_run DROP COLUMN pre_manifest;
                  PRAGMA user_version = 21;",
             )
             .unwrap();
@@ -502,10 +503,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(
-                version, 29,
-                "v28 (per-session artifact identity) is the migration head"
-            );
+            assert_eq!(version, 31, "v30 (admission leases) is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",
@@ -1441,6 +1439,57 @@ impl Store {
             |r| r.get::<_, i64>(0),
         )?;
         Ok(out)
+    }
+
+    /// ONE exact memory fact value by `(session, kind, key)` (bounded,
+    /// indexed lookup; admission recovery uses it instead of paging the
+    /// whole fact space). Absent is `None`; a duplicate is impossible by the
+    /// table's UNIQUE constraint.
+    pub fn memory_fact_get(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        key: &str,
+    ) -> StoreResult<Option<String>> {
+        let conn = self.read()?;
+        Ok(conn
+            .query_row(
+                "SELECT value FROM memory_fact
+             WHERE session_id = ?1 AND kind = ?2 AND key = ?3",
+                params![session_id.raw() as i64, kind, key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `true` when at least one fact of `kind` for the session has a key
+    /// beginning with `prefix` (admission recovery probes the orchestrated
+    /// run's `<run_id>/<child>` rows without loading the fact space). The
+    /// prefix is LIKE-escaped, so a hostile `%`/`_` never widens the probe.
+    pub fn memory_fact_key_prefix_exists(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        prefix: &str,
+    ) -> StoreResult<bool> {
+        let mut escaped = String::with_capacity(prefix.len());
+        for ch in prefix.chars() {
+            if matches!(ch, '\\' | '%' | '_') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        escaped.push('%');
+        let conn = self.read()?;
+        let found: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM memory_fact
+                WHERE session_id = ?1 AND kind = ?2 AND key LIKE ?3 ESCAPE '\\'
+             )",
+            params![session_id.raw() as i64, kind, escaped],
+            |r| r.get(0),
+        )?;
+        Ok(found != 0)
     }
 
     // ---------------------------------------------------------------- compactions

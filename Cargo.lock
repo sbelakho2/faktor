@@ -1089,6 +1089,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-contracts"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-protocol",
+ "faktor-provider",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "faktor-core"
 version = "0.1.0"
 dependencies = [
@@ -1553,6 +1567,7 @@ dependencies = [
  "faktor-core",
  "faktor-evidence",
  "faktor-fs",
+ "faktor-hooks",
  "faktor-instructions",
  "faktor-openai",
  "faktor-orchestrator",
@@ -1638,6 +1653,7 @@ version = "0.1.0"
 dependencies = [
  "faktor-cas",
  "faktor-core",
+ "faktor-sandbox",
  "faktor-winjob",
  "libc",
  "serde",

@@ -18,7 +18,7 @@ use faktor_cloud::{
     EntitlementExceeded, EntitlementService, InFlightKind, ManualClock, MemoryBillingStore,
     ObservedUsage, OrganizationId, PlanConfig, ReconciliationState, SpendCategory,
     SqliteControlPlaneStore, Subscription, SubscriptionId, SubscriptionStatus, UsageEvent,
-    UsageEventId, UsageUnit, CAUSE_LEDGER_OVERFLOW, CAUSE_SUBSCRIPTION_ACTIVE,
+    UsageEventId, UsageUnit, CAUSE_LEDGER_OVERFLOW, CAUSE_PLAN, CAUSE_SUBSCRIPTION_ACTIVE,
 };
 
 fn org(id: &str) -> OrganizationId {
@@ -2211,4 +2211,99 @@ fn usage_overflow_is_typed_at_the_fold_snapshot_and_admission_decision() {
         denied.limit,
         format!("{CAUSE_LEDGER_OVERFLOW}:cache_read_tokens")
     );
+}
+
+/// Adversarial: the configured `default_plan` belongs to the configured
+/// `[billing] organization` ALONE. A foreign/unprovisioned organization gets
+/// an unentitled snapshot (`plan_found: false`, no plan id, empty
+/// features/limits) and the admission gate refuses it typed naming the plan;
+/// an active subscription always wins, regardless of organization.
+#[test]
+fn the_configured_default_plan_is_scoped_to_the_configured_organization() {
+    let mut config = configured();
+    config.plans.insert(
+        "team".into(),
+        PlanConfig {
+            plan_id: "team".into(),
+            features: [FEATURE_BYOK.to_string()].into_iter().collect(),
+            limits: [(LIMIT_MAX_ACTIVE_TASKS.to_string(), 9)]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let configured_organization = org("org_configured");
+    let foreign_organization = org("org_foreign");
+    let service = EntitlementService::new_for_organization(
+        Arc::new(MemoryBillingStore::new()),
+        Arc::new(ManualClock::new(1_000)),
+        config,
+        Some(configured_organization.clone()),
+    )
+    .unwrap();
+
+    // The configured organization resolves the configured default plan.
+    let snapshot = service
+        .entitlement_snapshot(&configured_organization)
+        .unwrap();
+    assert_eq!(snapshot.plan_id.as_deref(), Some("pro"));
+    assert!(snapshot.plan_found);
+    assert!(!snapshot.features.is_empty());
+    assert!(!snapshot.limits.is_empty());
+
+    // A foreign/unprovisioned organization never inherits it: no plan, no
+    // features, no limits, and the gate refuses TYPED (never a fabricated
+    // entitlement).
+    let snapshot = service.entitlement_snapshot(&foreign_organization).unwrap();
+    assert_eq!(snapshot.plan_id, None, "no fabricated plan id");
+    assert!(!snapshot.plan_found, "no fabricated plan");
+    assert!(snapshot.features.is_empty(), "no inherited features");
+    assert!(snapshot.limits.is_empty(), "no inherited limits");
+    assert!(!snapshot.subscription_active);
+    let denied = service
+        .check_admission(
+            &foreign_organization,
+            &AdmissionRequest::boundary(AdmissionBoundary::NewTask),
+        )
+        .unwrap_err();
+    assert_eq!(denied.limit, CAUSE_PLAN);
+    assert_eq!(denied.boundary, AdmissionBoundary::NewTask);
+
+    // A subscription ALWAYS wins regardless of organization: the foreign
+    // organization's own active subscription resolves its own plan (not the
+    // configured default).
+    service
+        .set_subscription(&Subscription {
+            id: SubscriptionId::try_new("sub_foreign").unwrap(),
+            organization: foreign_organization.clone(),
+            plan_id: "team".into(),
+            status: SubscriptionStatus::Active,
+            started_ms: 0,
+            expires_ms: None,
+            updated_ms: 0,
+        })
+        .unwrap();
+    let snapshot = service.entitlement_snapshot(&foreign_organization).unwrap();
+    assert_eq!(snapshot.plan_id.as_deref(), Some("team"));
+    assert!(snapshot.plan_found);
+    assert_eq!(snapshot.limit(LIMIT_MAX_ACTIVE_TASKS), Some(9));
+
+    // And a subscription beats the default on the configured organization
+    // too.
+    service
+        .set_subscription(&Subscription {
+            id: SubscriptionId::try_new("sub_configured").unwrap(),
+            organization: configured_organization.clone(),
+            plan_id: "team".into(),
+            status: SubscriptionStatus::Active,
+            started_ms: 0,
+            expires_ms: None,
+            updated_ms: 0,
+        })
+        .unwrap();
+    let snapshot = service
+        .entitlement_snapshot(&configured_organization)
+        .unwrap();
+    assert_eq!(snapshot.plan_id.as_deref(), Some("team"));
+    assert!(snapshot.plan_found);
+    assert_eq!(snapshot.limit(LIMIT_MAX_ACTIVE_TASKS), Some(9));
 }

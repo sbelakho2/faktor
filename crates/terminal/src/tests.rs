@@ -1144,6 +1144,128 @@ async fn huge_output_spills_to_cas_ram_bounded() {
     assert!(out.artifact.is_some(), "overflow must spill to the CAS");
 }
 
+/// A minimal exact-value filter for the artifact-scrub tests.
+struct ExactFilter {
+    value: Vec<u8>,
+}
+
+impl ArtifactSecretFilter for ExactFilter {
+    fn max_match_len(&self) -> usize {
+        self.value.len()
+    }
+
+    fn matches(&self, window: &[u8]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if self.value.is_empty() || window.len() < self.value.len() {
+            return out;
+        }
+        let mut at = 0;
+        while at + self.value.len() <= window.len() {
+            if &window[at..at + self.value.len()] == self.value.as_slice() {
+                out.push((at, self.value.len()));
+                at += self.value.len();
+            } else {
+                at += 1;
+            }
+        }
+        out
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_artifact_filter_scrubs_the_cas_blob_before_put() {
+    let dir = tempdir().unwrap();
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = ProcessSupervisor::new(cas.clone());
+    const SECRET: &str = "cfg-secret-planted-42";
+    sup.install_artifact_filter(Arc::new(ExactFilter {
+        value: SECRET.as_bytes().to_vec(),
+    }));
+    let mut cfg = sh(&format!("printf 'before {SECRET} after\\n'"));
+    cfg.artifact_max = 64 * 1024;
+    let out = sup
+        .run(cfg, Duration::from_secs(30), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, Some(0));
+    let artifact = out.artifact.expect("spilled artifact");
+    let hash = faktor_core::hash::FileHash::from_hex(artifact.strip_prefix("artifact://").unwrap())
+        .unwrap();
+    let bytes = cas.get_verified_now(hash).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains(SECRET),
+        "the raw configured secret reached the CAS: {text}"
+    );
+    assert!(
+        text.contains("<redacted:configured_secret>"),
+        "the CAS blob must carry the redaction marker: {text}"
+    );
+    assert!(text.contains("before ") && text.contains(" after"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_filter_matches_a_secret_split_across_read_chunks() {
+    // The value starts 6 bytes before the 1 MiB read-window boundary and
+    // ends 16 bytes after it: only the overlap-carry can see it whole.
+    let dir = tempdir().unwrap();
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = ProcessSupervisor::new(cas.clone());
+    const SECRET: &str = "cfg-secret-planted-42"; // 22 bytes
+    sup.install_artifact_filter(Arc::new(ExactFilter {
+        value: SECRET.as_bytes().to_vec(),
+    }));
+    let pad = 1024 * 1024 - 6;
+    let mut cfg = sh(&format!(
+        "yes a | head -c {pad}; printf '{SECRET}'; yes b | head -c 10"
+    ));
+    cfg.artifact_max = 4 * 1024 * 1024;
+    let out = sup
+        .run(cfg, Duration::from_secs(60), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, Some(0));
+    let artifact = out.artifact.expect("spilled artifact");
+    let hash = faktor_core::hash::FileHash::from_hex(artifact.strip_prefix("artifact://").unwrap())
+        .unwrap();
+    let bytes = cas.get_verified_now(hash).unwrap();
+    assert!(
+        !bytes.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
+        "a boundary-split secret survived the CAS scrub"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn artifact_filter_ignores_hostile_ranges_instead_of_panicking() {
+    // A hostile range (past the window, or an overflowing one) must be
+    // ignored, never trusted to slice a panic; the stored blob stays the
+    // untouched original then.
+    struct HostileFilter;
+    impl ArtifactSecretFilter for HostileFilter {
+        fn max_match_len(&self) -> usize {
+            8
+        }
+        fn matches(&self, _window: &[u8]) -> Vec<(usize, usize)> {
+            vec![(usize::MAX, usize::MAX), (0, usize::MAX)]
+        }
+    }
+    let dir = tempdir().unwrap();
+    let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
+    let sup = ProcessSupervisor::new(cas.clone());
+    sup.install_artifact_filter(Arc::new(HostileFilter));
+    let mut cfg = sh("printf 'benign output'");
+    cfg.artifact_max = 4096;
+    let out = sup
+        .run(cfg, Duration::from_secs(30), CancellationToken::new())
+        .await
+        .unwrap();
+    let artifact = out.artifact.expect("artifact");
+    let hash = faktor_core::hash::FileHash::from_hex(artifact.strip_prefix("artifact://").unwrap())
+        .unwrap();
+    let bytes = cas.get_verified_now(hash).unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes), "benign output");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_terminates_process_group() {
     let (_d, sup) = supervisor();
@@ -1808,6 +1930,7 @@ async fn spawn_timeline_records_pid_argv_and_exit() {
         capture: true,
         artifact_max: 1024 * 1024,
         network_isolation: NetworkIsolation::Inherit,
+        filesystem_isolation: FilesystemIsolation::Inherit,
     };
     let out = sup
         .run(
@@ -1841,6 +1964,7 @@ async fn spawn_timeline_records_pid_argv_and_exit() {
                     capture: true,
                     artifact_max: 1024,
                     network_isolation: NetworkIsolation::Inherit,
+                    filesystem_isolation: FilesystemIsolation::Inherit,
                 },
                 std::time::Duration::from_secs(5),
                 CancellationToken::new(),
@@ -1873,6 +1997,7 @@ async fn timeline_ring_stays_bounded_under_300_spawns() {
                     capture: true,
                     artifact_max: 1024,
                     network_isolation: NetworkIsolation::Inherit,
+                    filesystem_isolation: FilesystemIsolation::Inherit,
                 },
                 std::time::Duration::from_secs(5),
                 CancellationToken::new(),
@@ -2417,6 +2542,7 @@ fn spawn_probe_child(
         capture: true,
         artifact_max: 1024 * 1024,
         network_isolation: isolation,
+        filesystem_isolation: FilesystemIsolation::Inherit,
     };
     sup.run_sync(cfg, Duration::from_secs(60), 64 * 1024, 64 * 1024)
 }
@@ -2803,6 +2929,7 @@ fn spawn_broker_only_probe_child(
         capture: true,
         artifact_max: 1024 * 1024,
         network_isolation: NetworkIsolation::BrokerOnly { endpoint },
+        filesystem_isolation: FilesystemIsolation::Inherit,
     };
     sup.run_sync(cfg, Duration::from_secs(60), 64 * 1024, 64 * 1024)
 }
@@ -2977,6 +3104,7 @@ fn broker_only_devtools_exposure_relays_into_the_sandbox() {
         network_isolation: NetworkIsolation::BrokerOnly {
             endpoint: "127.0.0.1:45999".parse().unwrap(),
         },
+        filesystem_isolation: FilesystemIsolation::Inherit,
     };
     let spawned = match sup.spawn_detached_with_pipes(cfg) {
         Ok(spawned) => spawned,
@@ -3054,4 +3182,521 @@ fn broker_only_non_loopback_endpoint_is_refused_typed() {
         broker_only_supported(),
         "this test module only exists on the BrokerOnly platform"
     );
+}
+
+// ============ daemon-death guardian (Linux): zero orphans on SIGKILL =====
+
+/// Bounded generic wait used by the guardian rows.
+#[cfg(target_os = "linux")]
+fn wait_until<F: FnMut() -> bool>(what: &str, bound: Duration, mut cond: F) {
+    let deadline = std::time::Instant::now() + bound;
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Live process ids whose full command line matches `marker` (`pgrep -f`).
+/// The unique marker is the identity proof: a recycled or unrelated pid can
+/// never carry it.
+#[cfg(target_os = "linux")]
+fn marker_processes(marker: &str) -> Vec<u32> {
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", "--", marker])
+        .output()
+        .expect("pgrep");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Read one pid written by a spawned fixture (bounded).
+#[cfg(target_os = "linux")]
+fn read_pid_file(path: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse() {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no pid in {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Spawn a detached marked tree: `sh` backgrounds a `sleep 300` (reporting
+/// its pid), then waits. Returns (handle, descendant pid, guardian pid).
+#[cfg(target_os = "linux")]
+fn spawn_marked_wait_tree(
+    sup: &ProcessSupervisor,
+    dir: &std::path::Path,
+    marker: &str,
+) -> (ChildHandle, u32, u32) {
+    let pidfile = dir.join(format!("descendant-{marker}.pid"));
+    let script = format!(
+        "sleep 300 & echo $! > '{}'; wait # {marker}",
+        pidfile.display()
+    );
+    let handle = sup.spawn(sh(&script)).expect("spawn marked tree");
+    let descendant = read_pid_file(&pidfile);
+    let guardian = sup
+        .guardian_pid_for_tests(handle.id)
+        .expect("every supervised child must own a guardian");
+    (handle, descendant, guardian)
+}
+
+/// ADVERSARIAL (a): with the owner alive, dropping the guardian's control
+/// pipe — exactly what a daemon SIGKILL does to the last write end — must
+/// SIGTERM→SIGKILL the whole recorded group, and the guardian must then
+/// exit on its own (no guardian leak).
+#[test]
+#[cfg(target_os = "linux")]
+fn guardian_owner_death_kills_the_whole_group() {
+    let (dir, sup) = supervisor();
+    let marker = format!("faktor-guardian-owner-death-{}", std::process::id());
+    let (handle, descendant, guardian) = spawn_marked_wait_tree(&sup, dir.path(), &marker);
+    assert!(
+        !pid_is_gone(handle.pid),
+        "leader must be alive before release"
+    );
+    assert!(!pid_is_gone(descendant), "descendant must be alive");
+    assert!(!pid_is_gone(guardian), "guardian must be alive");
+    assert!(
+        !marker_processes(&marker).is_empty(),
+        "the marker proves the shell is alive"
+    );
+
+    assert!(
+        sup.release_guardian_for_tests(handle.id),
+        "the row owns a live guardian"
+    );
+    wait_until("owner-death group kill", Duration::from_secs(10), || {
+        group_gone(handle.pid)
+            && pid_is_gone(handle.pid)
+            && pid_is_gone(descendant)
+            && pid_is_gone(guardian)
+            && marker_processes(&marker).is_empty()
+    });
+    for _ in 0..200 {
+        if !sup.reap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(sup.registered(), 0, "the row is collectible");
+}
+
+/// ADVERSARIAL (a, post-reap gap): the direct child exits first while its
+/// background descendant survives in the group; the row's guarded signal
+/// paths correctly refuse after the reap, so only the identity-verified
+/// guardian can end the descendant when the owner dies.
+#[test]
+#[cfg(target_os = "linux")]
+fn guardian_owner_death_kills_descendants_of_a_consumed_leader() {
+    let (dir, sup) = supervisor();
+    let marker = format!("faktor-guardian-post-reap-{}", std::process::id());
+    let pidfile = dir.path().join("post-reap.pid");
+    let script = format!(
+        "sleep 300 & echo $! > '{}'; true # {marker}",
+        pidfile.display()
+    );
+    let handle = sup.spawn(sh(&script)).expect("spawn leader+descendant");
+    let descendant = read_pid_file(&pidfile);
+    let guardian = sup.guardian_pid_for_tests(handle.id).unwrap();
+    wait_until(
+        "the single reaper consumes the leader",
+        Duration::from_secs(10),
+        || {
+            sup.reap_state(handle.id)
+                .map(|reap| reap.reaped())
+                .unwrap_or(true)
+        },
+    );
+    assert!(pid_is_gone(handle.pid), "the leader was consumed");
+    assert!(
+        !pid_is_gone(descendant),
+        "the descendant still holds the group after the reap"
+    );
+
+    assert!(sup.release_guardian_for_tests(handle.id));
+    wait_until("post-reap group kill", Duration::from_secs(10), || {
+        group_gone(handle.pid)
+            && pid_is_gone(descendant)
+            && pid_is_gone(guardian)
+            && marker_processes(&marker).is_empty()
+    });
+    let _ = sup.reap();
+}
+
+/// ADVERSARIAL (b): the normal kill route must leave neither a descendant
+/// nor a guardian behind once the row is collected.
+#[test]
+#[cfg(target_os = "linux")]
+fn normal_kill_route_leaves_no_guardian_or_descendant() {
+    let (dir, sup) = supervisor();
+    let marker = format!("faktor-guardian-normal-kill-{}", std::process::id());
+    let (handle, descendant, guardian) = spawn_marked_wait_tree(&sup, dir.path(), &marker);
+    sup.kill(handle.id, 500).expect("normal kill");
+    wait_until(
+        "normal kill group extinction",
+        Duration::from_secs(10),
+        || group_gone(handle.pid) && pid_is_gone(descendant),
+    );
+    let mut collected = false;
+    for _ in 0..200 {
+        if sup.reap().iter().any(|r| r.id == handle.id) {
+            collected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(collected, "the killed row is collectible");
+    wait_until("guardian release exit", Duration::from_secs(10), || {
+        pid_is_gone(guardian) && marker_processes(&marker).is_empty()
+    });
+    assert_eq!(sup.registered(), 0);
+}
+
+/// ADVERSARIAL (c): a forged (recycled) identity record is refused and the
+/// addressed pid is never signalled; a structurally impossible record is
+/// refused before any fork. The unique marker proves the exact target
+/// stayed alive.
+#[test]
+#[cfg(target_os = "linux")]
+fn guardian_refuses_forged_identity_without_killing_the_target() {
+    use std::os::unix::process::CommandExt;
+    let marker = format!("faktor-guardian-forged-{}", std::process::id());
+    let script = format!("sleep 300 # {marker}");
+    let mut decoy = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn decoy");
+    let pid = decoy.id();
+    wait_until("decoy visible", Duration::from_secs(5), || {
+        marker_processes(&marker).contains(&pid)
+    });
+    let live = guardian::ProcessIdentity::capture(pid, pid);
+    assert!(live.start_time.is_some(), "marker captured while alive");
+    let forged = guardian::ProcessIdentity {
+        start_time: live.start_time.map(|t| t.wrapping_add(1)),
+        ..live
+    };
+    let mut guardian = guardian::GuardianHandle::spawn_with_identity(forged).unwrap();
+    let guardian_pid = guardian.pid();
+    assert_eq!(
+        guardian.release(),
+        Some(guardian::GUARDIAN_EXIT_REFUSED_RECYCLED),
+        "a recycled record must refuse"
+    );
+    assert!(pid_is_gone(guardian_pid), "the refusing guardian exits");
+    assert!(
+        marker_processes(&marker).contains(&pid),
+        "a forged record must never signal the addressed pid"
+    );
+    // Structurally impossible records are refused before any fork.
+    for malformed in [
+        guardian::ProcessIdentity {
+            pid,
+            pgid: 0,
+            start_time: live.start_time,
+        },
+        guardian::ProcessIdentity {
+            pid: 0,
+            pgid: 0,
+            start_time: None,
+        },
+        guardian::ProcessIdentity {
+            pid,
+            pgid: pid + 1,
+            start_time: live.start_time,
+        },
+    ] {
+        assert!(
+            guardian::GuardianHandle::spawn_with_identity(malformed).is_err(),
+            "malformed identity must be refused: {malformed:?}"
+        );
+    }
+    let _ = decoy.kill();
+    let _ = decoy.wait();
+    wait_until("decoy cleanup", Duration::from_secs(5), || {
+        marker_processes(&marker).is_empty()
+    });
+}
+
+/// ADVERSARIAL (c, scoping): releasing one row's guardian kills exactly its
+/// own group — a sibling supervised tree, marker included, stays alive.
+#[test]
+#[cfg(target_os = "linux")]
+fn guardian_kill_is_scoped_to_its_own_group() {
+    let (dir, sup) = supervisor();
+    let marker_a = format!("faktor-guardian-scope-a-{}", std::process::id());
+    let marker_b = format!("faktor-guardian-scope-b-{}", std::process::id());
+    let (a, a_descendant, a_guardian) = spawn_marked_wait_tree(&sup, dir.path(), &marker_a);
+    let (b, b_descendant, _b_guardian) = spawn_marked_wait_tree(&sup, dir.path(), &marker_b);
+    assert!(sup.release_guardian_for_tests(a.id));
+    wait_until("scoped kill of A", Duration::from_secs(10), || {
+        group_gone(a.pid)
+            && pid_is_gone(a_descendant)
+            && pid_is_gone(a_guardian)
+            && marker_processes(&marker_a).is_empty()
+    });
+    assert!(
+        !pid_is_gone(b.pid) && !pid_is_gone(b_descendant),
+        "killing A's group must never touch B's tree"
+    );
+    assert!(
+        marker_processes(&marker_b).contains(&b.pid),
+        "B's marker must survive A's guardian"
+    );
+    sup.kill(b.id, 500).expect("cleanup B");
+    let _ = sup.reap();
+}
+
+/// ADVERSARIAL (d): a rapid spawn/kill storm leaves no zombie (every child
+/// pid is reaped), no live guardian, and no marker process.
+#[test]
+#[cfg(target_os = "linux")]
+fn rapid_spawn_kill_storm_leaves_no_zombies_or_guardians() {
+    let (_dir, sup) = supervisor();
+    let marker = format!("faktor-guardian-storm-{}", std::process::id());
+    let mut guardians = Vec::new();
+    for round in 0..16u32 {
+        let handle = sup
+            .spawn(sh(&format!("sleep 300 # {marker}")))
+            .unwrap_or_else(|e| panic!("round {round}: spawn: {e}"));
+        let guardian = sup
+            .guardian_pid_for_tests(handle.id)
+            .unwrap_or_else(|| panic!("round {round}: no guardian"));
+        guardians.push(guardian);
+        sup.kill(handle.id, 0)
+            .unwrap_or_else(|e| panic!("round {round}: kill: {e}"));
+        wait_until(
+            &format!("round {round}: row collectible"),
+            Duration::from_secs(5),
+            || sup.reap().iter().any(|r| r.id == handle.id),
+        );
+        wait_until(
+            &format!("round {round}: child pid extinct (no zombie)"),
+            Duration::from_secs(5),
+            || pid_is_gone(handle.pid),
+        );
+    }
+    for guardian in guardians {
+        wait_until("storm guardian extinction", Duration::from_secs(10), || {
+            pid_is_gone(guardian)
+        });
+    }
+    assert_eq!(sup.registered(), 0, "registry fully drained");
+    wait_until("no marker processes", Duration::from_secs(10), || {
+        marker_processes(&marker).is_empty()
+    });
+}
+
+// ---- end-to-end daemon SIGKILL: a re-exec'd helper is the daemon -------
+
+const SIM_REPORT_ENV: &str = "FAKTOR_TERMINAL_SIM_REPORT_FILE";
+const SIM_MARKER_ENV: &str = "FAKTOR_TERMINAL_SIM_MARKER";
+const SIM_LEADER_EXITS_ENV: &str = "FAKTOR_TERMINAL_SIM_LEADER_EXITS";
+const SIM_DIR_ENV: &str = "FAKTOR_TERMINAL_SIM_DIR";
+
+/// `pgrep -af <marker>` output: the live-tree evidence a test can print
+/// under `--nocapture` and the exact probe the assertions use.
+#[cfg(target_os = "linux")]
+fn pgrep_dump(marker: &str) -> String {
+    let out = std::process::Command::new("pgrep")
+        .args(["-af", "--", marker])
+        .output()
+        .expect("pgrep");
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+/// The simulated daemon, re-exec'd by [`daemon_sigkill_kills_the_supervised_tree`]
+/// through `--exact`. Without the report env it is an inert pass in the
+/// ordinary suite; with it, it supervises a marked `sh` tree, reports the
+/// pids, and holds the guardian control pipe until the parent SIGKILLs it.
+#[test]
+#[cfg(target_os = "linux")]
+fn simulated_terminal_daemon_helper() {
+    let Ok(report) = std::env::var(SIM_REPORT_ENV) else {
+        return;
+    };
+    let marker = std::env::var(SIM_MARKER_ENV).expect("sim marker");
+    // The PARENT owns the directory (the helper is SIGKILLed, so its own
+    // TempDir Drop would never run): scratch files must not leak.
+    let dir = std::path::PathBuf::from(std::env::var(SIM_DIR_ENV).expect("sim dir"));
+    let cas = Arc::new(faktor_cas::Cas::open(dir.join("cas")).unwrap());
+    let sup = ProcessSupervisor::new(cas);
+    let pidfile = dir.join("descendant.pid");
+    // The background leaf carries the marker IN ITS OWN ARGV (`tail -f
+    // <marker-named file>`), so `pgrep -f <marker>` proves the descendant
+    // itself died, not only the shell that named it.
+    let keep = dir.join(format!("{marker}.keep"));
+    std::fs::write(&keep, b"keep").expect("marker keep file");
+    // Default shape: the shell waits on the background descendant. With
+    // `SIM_LEADER_EXITS` the shell exits immediately, so the descendant
+    // survives AFTER the direct child was already reaped — the post-reap
+    // gap only the guardian can close.
+    let tail = if std::env::var(SIM_LEADER_EXITS_ENV).as_deref() == Ok("1") {
+        "true"
+    } else {
+        "wait"
+    };
+    let script = format!(
+        "tail -f '{}' & echo $! > '{}'; {tail} # {marker}",
+        keep.display(),
+        pidfile.display()
+    );
+    let handle = sup.spawn(sh(&script)).expect("sim spawn");
+    let descendant = read_pid_file(&pidfile);
+    if tail == "true" {
+        // Prove the leader was consumed by its reaper before the daemon
+        // dies: the guardian's Gone-but-group-alive path is what must act.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !sup
+            .reap_state(handle.id)
+            .map(|reap| reap.reaped())
+            .unwrap_or(true)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader must be reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let guardian = sup
+        .guardian_pid_for_tests(handle.id)
+        .expect("guardian forked for the sim child");
+    std::fs::write(
+        &report,
+        format!("{} {} {} {}\n", handle.pid, guardian, descendant, marker),
+    )
+    .expect("write sim report");
+    // Hold the control pipe until the parent SIGKILLs this process: only
+    // process death closes the last write end (no Drop, no release).
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+/// Discover the libtest name of the simulated daemon helper (the module
+/// path is an implementation detail; `--list` is the authority).
+#[cfg(target_os = "linux")]
+fn simulated_daemon_helper_name() -> String {
+    let out = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .arg("--list")
+        .output()
+        .expect("test binary --list");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let name = line.strip_suffix(": test")?.trim();
+            name.ends_with("simulated_terminal_daemon_helper")
+                .then(|| name.to_string())
+        })
+        .expect("helper test must be present in --list")
+}
+
+/// SIGKILL the re-exec'd daemon, then assert the whole supervised tree and
+/// the marker are gone within the bound.
+#[cfg(target_os = "linux")]
+fn run_daemon_sigkill_case(marker: &str, leader_exits: bool) {
+    let dir = tempdir().unwrap();
+    let report = dir.path().join("sim.report");
+    let sim_dir = dir.path().join("sim");
+    std::fs::create_dir(&sim_dir).unwrap();
+    let mut daemon = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg(simulated_daemon_helper_name())
+        .env(SIM_REPORT_ENV, &report)
+        .env(SIM_MARKER_ENV, marker)
+        .env(SIM_LEADER_EXITS_ENV, if leader_exits { "1" } else { "0" })
+        .env(SIM_DIR_ENV, &sim_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("re-exec the simulated daemon");
+    wait_until("simulated daemon report", Duration::from_secs(30), || {
+        std::fs::read_to_string(&report)
+            .map(|text| text.split_whitespace().count() == 4)
+            .unwrap_or(false)
+    });
+    let text = std::fs::read_to_string(&report).unwrap();
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let leader: u32 = fields[0].parse().unwrap();
+    let guardian: u32 = fields[1].parse().unwrap();
+    let descendant: u32 = fields[2].parse().unwrap();
+    assert_eq!(fields[3], marker);
+    // Proof taken BEFORE the crash: the daemon-held write end and the
+    // descendant are signallable right now.
+    if leader_exits {
+        assert!(
+            pid_is_gone(leader),
+            "the direct child was already consumed before the daemon SIGKILL"
+        );
+    } else {
+        assert!(!pid_is_gone(leader), "leader must be alive at crash time");
+    }
+    assert!(
+        !pid_is_gone(descendant),
+        "descendant must be alive at crash time"
+    );
+    assert!(
+        !pid_is_gone(guardian),
+        "guardian must be alive at crash time"
+    );
+    eprintln!("[pgrep before daemon SIGKILL] {}", pgrep_dump(marker));
+    // Simulated daemon SIGKILL: no Drop, no deliberate release — kernel
+    // death closes the write end and arms the child's PDEATHSIG.
+    daemon.kill().expect("SIGKILL the simulated daemon");
+    let _ = daemon.wait();
+    wait_until(
+        "the whole supervised tree to die after the daemon SIGKILL",
+        Duration::from_secs(10),
+        || {
+            pid_is_gone(leader)
+                && pid_is_gone(descendant)
+                && pid_is_gone(guardian)
+                && pgrep_dump(marker).is_empty()
+        },
+    );
+    eprintln!(
+        "[pgrep after daemon SIGKILL] {:?} (empty = no orphan)",
+        pgrep_dump(marker)
+    );
+}
+
+/// THE end-to-end fault test: the daemon process is SIGKILLed while a
+/// supervised `sh` waits on a background `sleep`. The direct child dies via
+/// PDEATHSIG; the guardian — seeing the pipe EOF that SIGKILL produces —
+/// must take the descendant, and both the guardian and the marker must
+/// vanish within the bound.
+#[test]
+#[cfg(target_os = "linux")]
+fn daemon_sigkill_kills_the_supervised_tree() {
+    let marker = format!("faktor-terminal-sim-daemon-{}", std::process::id());
+    run_daemon_sigkill_case(&marker, false);
+}
+
+/// THE exact observed fault (leader already consumed): `sh -c
+/// 'sleep 554 &'` exits, its background `sleep` survives the reap, then the
+/// daemon is SIGKILLed. Only the guardian's verified Gone-but-group-alive
+/// kill can end the descendant.
+#[test]
+#[cfg(target_os = "linux")]
+fn daemon_sigkill_kills_descendants_of_an_exited_supervisor_leader() {
+    let marker = format!("faktor-terminal-sim-reaped-{}", std::process::id());
+    run_daemon_sigkill_case(&marker, true);
 }

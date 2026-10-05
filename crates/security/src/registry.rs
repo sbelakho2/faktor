@@ -47,6 +47,10 @@ use crate::SecretHit;
 /// Canonical kind label of exact registry hits.
 pub const CONFIGURED_SECRET_KIND: &str = "configured_secret";
 
+/// The replacement every exact configured-secret redaction emits (same
+/// shape as the pattern engine's `<redacted:{kind}>`).
+pub const CONFIGURED_SECRET_REDACTED: &str = "<redacted:configured_secret>";
+
 /// A live source of exact secrets (active credentials). Values are read at
 /// scan time and never stored by the registry.
 pub trait ExactSecretSource: Send + Sync {
@@ -182,6 +186,99 @@ impl SecretRegistry {
             })
             .collect()
     }
+
+    /// Longest CONFIGURED value in bytes (0 when none is registered). Live
+    /// active-source values are unknown before a scan and are deliberately
+    /// not counted: a streaming caller sizing an overlap window must size it
+    /// from configured values (the daemon's registries carry no active
+    /// source).
+    pub fn longest_secret_len(&self) -> usize {
+        self.fingerprints.iter().map(|f| f.len).max().unwrap_or(0)
+    }
+
+    /// Redact every exact registered (and active) value in `payload`: each
+    /// matched byte span is replaced by [`CONFIGURED_SECRET_REDACTED`], and a
+    /// payload with no hit is returned byte-identical. The "never leave a
+    /// detected secret" property is enforced, not assumed: the output is
+    /// re-scanned and bounded re-redaction resolves a replacement that would
+    /// itself form a registered value (or a deletion that juxtaposes one);
+    /// the pathological residue is dropped entirely rather than returned
+    /// raw, because the empty payload contains no secret.
+    pub fn redact_bytes(&self, payload: &[u8]) -> Vec<u8> {
+        let mut current = payload.to_vec();
+        for _ in 0..3 {
+            let hits = self.scan_exact(&current);
+            if hits.is_empty() {
+                return current;
+            }
+            current = apply_exact_redaction(&current, &hits, &self.safe_replacement());
+        }
+        if self.scan_exact(&current).is_empty() {
+            current
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// [`SecretRegistry::redact_bytes`] over UTF-8 text. The output is
+    /// always valid UTF-8 (a replacement that cannot land on char boundaries
+    /// degrades through `from_utf8_lossy`); hostile registered values can
+    /// never panic here.
+    pub fn redact_text(&self, text: &str) -> String {
+        String::from_utf8_lossy(&self.redact_bytes(text.as_bytes())).into_owned()
+    }
+
+    /// A replacement byte string that is NOT itself a registered value
+    /// (checked against the same exact scanner). Bounded: if every candidate
+    /// collides — a genuinely adversarial registration — the empty string is
+    /// used, which can never contain a registered value.
+    fn safe_replacement(&self) -> Vec<u8> {
+        for n in 0..8u32 {
+            let candidate = if n == 0 {
+                CONFIGURED_SECRET_REDACTED.to_string()
+            } else {
+                format!("<redacted:configured_secret:{n}>")
+            };
+            let bytes = candidate.into_bytes();
+            if self.scan_exact(&bytes).is_empty() {
+                return bytes;
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// Replace the byte spans of `hits` in `payload` (overlaps merged, the
+/// longest span wins per start) with `replacement`. Out-of-range hits are
+/// ignored — a malformed hit can never panic the redactor.
+fn apply_exact_redaction(payload: &[u8], hits: &[SecretHit], replacement: &[u8]) -> Vec<u8> {
+    let mut spans: Vec<(usize, usize)> = hits
+        .iter()
+        .filter(|h| {
+            h.len > 0
+                && h.offset
+                    .checked_add(h.len)
+                    .is_some_and(|end| end <= payload.len())
+        })
+        .map(|h| (h.offset, h.offset + h.len))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some((_, cur_end)) if start <= *cur_end => *cur_end = (*cur_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out = Vec::with_capacity(payload.len() + merged.len() * replacement.len());
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        out.extend_from_slice(&payload[cursor..start]);
+        out.extend_from_slice(replacement);
+        cursor = end;
+    }
+    out.extend_from_slice(&payload[cursor..]);
+    out
 }
 
 /// Rolling-hash constant: an odd 64-bit multiplier (no particular
@@ -698,5 +795,66 @@ mod tests {
         assert_eq!(hits[1].offset, a.len());
         assert_eq!(hits[1].len, b.len());
         assert_eq!(hits[2].offset, a.len() + b.len());
+    }
+
+    #[test]
+    fn redact_text_removes_every_configured_value_and_keeps_benign_bytes() {
+        let mut reg = SecretRegistry::new();
+        reg.register(b"cfg-secret-alpha");
+        reg.register(b"cfg-secret-beta-long");
+        let text = "a cfg-secret-alpha b cfg-secret-beta-long c";
+        let out = reg.redact_text(text);
+        assert!(!out.contains("cfg-secret-alpha") && !out.contains("cfg-secret-beta-long"));
+        assert_eq!(
+            out,
+            "a <redacted:configured_secret> b <redacted:configured_secret> c"
+        );
+        // Benign text stays byte-identical; no hit input is untouched.
+        assert_eq!(reg.redact_text("nothing to see"), "nothing to see");
+        assert_eq!(reg.redact_bytes(b"plain bytes"), b"plain bytes");
+        // Every occurrence is replaced, including adjacent duplicates.
+        let repeated = "Xcfg-secret-alphaXcfg-secret-alphaX";
+        let out = reg.redact_text(repeated);
+        assert_eq!(
+            out,
+            "X<redacted:configured_secret>X<redacted:configured_secret>X"
+        );
+        assert!(reg.scan_exact(out.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn redact_never_leaves_a_detected_secret_even_when_the_marker_is_registered() {
+        // Adversarial: the canonical replacement itself is registered, so a
+        // naive "replace with the marker" redactor would re-introduce a
+        // registered value. The redactor must choose a non-matching
+        // replacement and re-verify.
+        let mut reg = SecretRegistry::new();
+        reg.register(b"cfg-secret");
+        reg.register(CONFIGURED_SECRET_REDACTED.as_bytes());
+        let out = reg.redact_text("x cfg-secret y");
+        assert!(reg.scan_exact(out.as_bytes()).is_empty(), "{out:?}");
+        assert!(!out.contains("cfg-secret"));
+        // Binary payloads are redacted byte-exactly too.
+        let mut payload = vec![0u8, 0xff];
+        payload.extend_from_slice(b"cfg-secret");
+        payload.push(0x00);
+        let out = reg.redact_bytes(&payload);
+        assert!(reg.scan_exact(&out).is_empty(), "{out:?}");
+        assert_eq!(&out[..2], &[0u8, 0xff]);
+        assert_eq!(*out.last().unwrap(), 0u8);
+    }
+
+    #[test]
+    fn redact_bytes_merges_overlapping_registered_spans_without_panicking() {
+        let mut reg = SecretRegistry::new();
+        reg.register(b"abcd");
+        reg.register(b"cdef");
+        let out = reg.redact_bytes(b"zzabcdefyy");
+        assert_eq!(out, b"zz<redacted:configured_secret>yy");
+        assert!(reg.scan_exact(&out).is_empty());
+        // A degenerate adjacent pair is fully removed, not partially.
+        let out = reg.redact_bytes(b"abcdcdef");
+        assert!(reg.scan_exact(&out).is_empty());
+        assert_eq!(out, b"<redacted:configured_secret>");
     }
 }

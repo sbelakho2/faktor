@@ -816,7 +816,74 @@ pub(crate) const MIGRATIONS: &[&str] = &[
      );
      INSERT INTO artifact (id, session_id, kind, cas_hash, summary, created_ms, size)
         SELECT id, session_id, kind, cas_hash, summary, created_ms, size FROM artifact_v28;
-     DROP TABLE artifact_v28;",
+      DROP TABLE artifact_v28;",
+    // v29 — shell-change attribution (P0-2 remainder; schema target 30;
+    // array index 29). A generic shell (`Capability::ExecuteShell`) declares
+    // no path args, so its mutations previously escaped change accounting.
+    // The runtime now captures a bounded pre-execution workspace manifest
+    // (content hash per file) and records it on the run row BEFORE the shell
+    // may execute: `pre_manifest` is a small JSON envelope naming the
+    // CAS-stored canonical manifest (`{"schema":1,"state":"captured",
+    // "turn_op":N,"cas":"<blake3>","digest":"tm1:...","entries":N,
+    // "truncated":null|reason}`). Live settlement rewrites it to
+    // `state:"reconciled"` with the discovered change list; crash recovery
+    // rewrites it to `state:"discovered"` by diffing the durable pre-manifest
+    // against the current tree. NULL on every non-shell row and on legacy
+    // rows (parity: absent pre-manifest = today's behavior).
+    "ALTER TABLE tool_run ADD COLUMN pre_manifest TEXT;",
+    // v30 — durable admission ownership, leases and recovery linkage (audit
+    // P1; schema target 31; array index 30). A `pending` admission row
+    // written by ONE daemon boot must never look like a live claim to the
+    // NEXT boot: the row now carries `owner_generation` (the boot-instance
+    // identity of the claimer, minted per `Store::open`) and
+    // `lease_deadline_ms` (a bounded claim lifetime), and the durable
+    // `reservation` names the accepted fact the claim is bound to (`tx-<op>`
+    // for an in-session run, `run-<op>` for an orchestrated one) so startup
+    // recovery can classify the row against durable facts instead of
+    // guessing. Both admission tables are rebuilt (the CHECK vocabulary
+    // gains the typed `conflict` landing) and every pre-existing row is
+    // preserved with an empty owner generation, deadline 0 and a NULL
+    // reservation: a legacy pending row has no trustworthy linkage, so
+    // recovery resolves it to a typed key-reuse conflict rather than gamble
+    // on a double execution.
+    "ALTER TABLE task_admission RENAME TO task_admission_v30;
+     CREATE TABLE task_admission (
+        key TEXT PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending','complete','conflict')),
+        receipt_json TEXT,
+        created_ms INTEGER NOT NULL,
+        owner_generation TEXT NOT NULL DEFAULT '',
+        lease_deadline_ms INTEGER NOT NULL DEFAULT 0,
+        reservation TEXT
+     );
+     INSERT INTO task_admission(
+        key, session_id, request_digest, state, receipt_json, created_ms)
+        SELECT key, session_id, request_digest, state, receipt_json, created_ms
+        FROM task_admission_v30;
+     DROP TABLE task_admission_v30;
+     ALTER TABLE prompt_admission RENAME TO prompt_admission_v30;
+     CREATE TABLE prompt_admission (
+        key TEXT PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending','complete','conflict')),
+        receipt_json TEXT,
+        created_ms INTEGER NOT NULL,
+        owner_generation TEXT NOT NULL DEFAULT '',
+        lease_deadline_ms INTEGER NOT NULL DEFAULT 0,
+        reservation TEXT
+     );
+     INSERT INTO prompt_admission(
+        key, session_id, request_digest, state, receipt_json, created_ms)
+        SELECT key, session_id, request_digest, state, receipt_json, created_ms
+        FROM prompt_admission_v30;
+     DROP TABLE prompt_admission_v30;
+     CREATE INDEX IF NOT EXISTS idx_task_admission_pending
+        ON task_admission(state, key);
+     CREATE INDEX IF NOT EXISTS idx_prompt_admission_pending
+        ON prompt_admission(state, key);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

@@ -172,7 +172,7 @@ data class UsagePanelModel(
         }
         if (state == "ok" || cursor != null || nextCursor != null) {
             out.add(
-                "usage events page — $itemCount row(s) · cursor ${cursor ?: "first page"} · " +
+                "usage events page — ${plural(itemCount, "row")} · cursor ${cursor ?: "first page"} · " +
                     "next ${nextCursor ?: "none"}"
             )
         }

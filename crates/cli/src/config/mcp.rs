@@ -22,6 +22,7 @@ impl Default for Config {
                     .into(),
             providers: vec![],
             routing_mode: None,
+            retry: RetryCfg::default(),
             mcp: vec![],
             verification: VerificationCfg::default(),
             sandbox: SandboxCfg::default(),

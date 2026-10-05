@@ -96,6 +96,7 @@ fn agent_for(session: Arc<SessionManager>, tools: bool, compact_at: f64) -> Arc<
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     })
     .unwrap()
@@ -246,6 +247,7 @@ fn agent_deps(session: Arc<SessionManager>) -> AgentDeps {
         retry_policy: faktor_core::retry::RetryPolicy::default(),
         semantic: faktor_agent::fallback_semantic_registry(),
         context_prior: None,
+        secret_registry: None,
         efficiency: Default::default(),
     }
 }
@@ -342,4 +344,294 @@ async fn ui_disconnect_agent_continues() {
     let handle = session.get_session(row.id()).unwrap().unwrap();
     let state = handle.state().unwrap();
     assert_eq!(state, AgentState::ReadyForNextTurn);
+}
+
+// ---------------------------------------------------------------------------
+// Convergence churn: the workload the soak driver samples for QUIESCENT
+// CONVERGENCE (never "no crash"). It drives the REAL runtime/store at a paced,
+// bounded rate for a driver-set real wall-clock target, emits bounded runtime
+// gauges (queues, background tasks, journal/index latency) as JSONL for the
+// driver's checker, and performs real daemon restarts + reconnects.
+// ---------------------------------------------------------------------------
+
+/// Bounded metrics emitter for `scripts/certification/soak-convergence.py`.
+/// Every line is one sample; emits are O(1) appends (never buffered in RAM).
+struct ConvergenceEmitter {
+    file: Option<std::fs::File>,
+    started: std::time::Instant,
+}
+
+impl ConvergenceEmitter {
+    fn new() -> Self {
+        let file = std::env::var("FAKTOR_SOAK_METRICS_FILE")
+            .ok()
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        Self {
+            file,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn emit(&mut self, value: serde_json::Value) {
+        if let Some(file) = self.file.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(file, "{value}");
+            let _ = file.flush();
+        }
+    }
+
+    fn gauge(
+        &mut self,
+        turn: u64,
+        writer_queue: u64,
+        reader_queue: u64,
+        background_tasks: u64,
+        journal_us: u64,
+        index_us: u64,
+    ) {
+        self.emit(serde_json::json!({
+            "t": self.started.elapsed().as_millis() as u64,
+            "turn": turn,
+            "writer_queue": writer_queue,
+            "reader_queue": reader_queue,
+            "background_tasks": background_tasks,
+            "journal_us": journal_us,
+            "index_us": index_us,
+        }));
+    }
+
+    fn reconnect(&mut self, ok: bool, count: u64) {
+        self.emit(serde_json::json!({
+            "t": self.started.elapsed().as_millis() as u64,
+            "event": "reconnect",
+            "ok": ok,
+            "reconnects": count,
+        }));
+    }
+}
+
+fn bounded_p95(window: &std::collections::VecDeque<u128>) -> u64 {
+    if window.is_empty() {
+        return 0;
+    }
+    let mut values: Vec<u128> = window.iter().copied().collect();
+    values.sort_unstable();
+    let index = (((values.len() - 1) as f64) * 0.95).round() as usize;
+    values[index.min(values.len() - 1)].min(u64::MAX as u128) as u64
+}
+
+fn push_bounded(window: &mut std::collections::VecDeque<u128>, value: u128) {
+    if window.len() >= 128 {
+        window.pop_front();
+    }
+    window.push_back(value);
+}
+
+/// [soak] convergence churn (driver-targeted real wall clock).
+///
+/// `scripts/soak.sh --mode churn|realtime` runs this test with
+/// `FAKTOR_SOAK_TARGET_SECONDS` (the real target), `FAKTOR_SOAK_DATA_DIR`
+/// (persistent sampled data dir) and `FAKTOR_SOAK_METRICS_FILE` (the runtime
+/// gauge stream). The paced rate keeps durable growth linear and bounded
+/// while still exercising WAL, journal and CAS churn; a successful run ends
+/// quiescent (no active turns, no running tools, empty writer queue).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "[soak] convergence churn (driver-targeted real wall clock) — run via scripts/soak.sh"]
+async fn soak_convergence_churn() {
+    let target_seconds = std::env::var("FAKTOR_SOAK_TARGET_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 25 * 60 * 60);
+    let root = std::env::var("FAKTOR_SOAK_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("faktor-soak-convergence-{}", std::process::id()))
+        });
+    std::fs::create_dir_all(&root).unwrap();
+    let store_dir = root.join("store");
+    let cas_dir = root.join("cas");
+
+    // Publish this process as the convergence subject: the driver's sampler
+    // follows the subject pidfile, so compile/build processes are never
+    // mistaken for workload state.
+    if let Ok(pidfile) = std::env::var("FAKTOR_SOAK_SUBJECT_PIDFILE") {
+        let _ = std::fs::write(pidfile, format!("{}\n", std::process::id()));
+    }
+
+    let mut manager = SessionManager::open(&store_dir, &cas_dir, true).unwrap();
+    let ws = manager.create_workspace("/soak-convergence").unwrap();
+    let mut session_id = manager
+        .create_session(ws, "convergence-churn", "fake", "m")
+        .unwrap()
+        .id();
+
+    let mut emitter = ConvergenceEmitter::new();
+    let started = std::time::Instant::now();
+    let target = Duration::from_secs(target_seconds);
+    // Bounded churn rate: the real gate is wall-clock duration, not maximal
+    // disk growth. Long targets pace slower so a 12-24h run stays linear.
+    let pace = if target_seconds > 3600 {
+        Duration::from_millis(200)
+    } else if target_seconds > 300 {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_millis(5)
+    };
+    let gauge_every = if target_seconds > 600 {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(1)
+    };
+    let reconnect_every = if target_seconds > 600 {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(15)
+    };
+    let mut turns = 0u64;
+    let mut reconnects = 0u64;
+    let mut last_gauge = std::time::Instant::now();
+    let mut last_reconnect = std::time::Instant::now();
+    let mut journal_window: std::collections::VecDeque<u128> = std::collections::VecDeque::new();
+    let mut index_window: std::collections::VecDeque<u128> = std::collections::VecDeque::new();
+
+    // One real restart/reconnect before the first gauge so even a short run
+    // records a reconnect event (the checker requires at least one).
+    manager = SessionManager::open(&store_dir, &cas_dir, true).unwrap();
+    {
+        let reports = manager.recover_all_sessions().unwrap();
+        let ok = reports.iter().all(|report| report.crashed_ops.is_empty());
+        reconnects += 1;
+        emitter.reconnect(ok, reconnects);
+    }
+    if manager.get_session(session_id).unwrap().is_none() {
+        session_id = manager
+            .create_session(ws, "convergence-churn", "fake", "m")
+            .unwrap()
+            .id();
+    }
+
+    while started.elapsed() < target {
+        let agent = agent_for(manager.clone(), true, 1.0);
+        let outcome = agent
+            .run_turn(session_id, &format!("convergence turn {turns}"), &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        drop(agent);
+        turns += 1;
+
+        {
+            let handle = manager.get_session(session_id).unwrap().unwrap();
+            // Bounded durable-journal tail read (the UI's latest-page path,
+            // not a whole-journal replay): a latency that must not trend
+            // upward under churn.
+            let journal_start = std::time::Instant::now();
+            let _ = handle.latest_messages_page(100).unwrap();
+            push_bounded(&mut journal_window, journal_start.elapsed().as_micros());
+            // Index-backed pagination from the conversation head.
+            let index_start = std::time::Instant::now();
+            let _ = handle.messages_page(None, 50).unwrap();
+            push_bounded(&mut index_window, index_start.elapsed().as_micros());
+        }
+
+        tokio::time::sleep(pace).await;
+
+        // Rotate the churn session so journal replay and durable growth stay
+        // bounded (a deleted session is terminal; its rows remain auditable).
+        if turns.is_multiple_of(100) {
+            let _ = manager.clone().delete_session(session_id);
+            session_id = manager
+                .create_session(ws, "convergence-churn", "fake", "m")
+                .unwrap()
+                .id();
+        }
+
+        // Warm the bounded latency windows before the first gauge: a p95 over
+        // a handful of startup measurements trends spuriously.
+        if last_gauge.elapsed() >= gauge_every && journal_window.len() >= 32 {
+            last_gauge = std::time::Instant::now();
+            let telemetry = manager.store().writer_telemetry();
+            let queued = {
+                let counts = manager.store().queue_status_counts(session_id).unwrap();
+                ["pending", "claimed", "running"]
+                    .iter()
+                    .map(|key| {
+                        counts
+                            .get(key)
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0)
+                    })
+                    .sum::<u64>()
+            };
+            let active = manager.store().all_active_turns().unwrap().len() as u64;
+            let tool_rows = manager.store().all_running_tool_rows().unwrap().len() as u64;
+            emitter.gauge(
+                turns,
+                telemetry.pending_depth as u64,
+                queued,
+                active + tool_rows,
+                bounded_p95(&journal_window),
+                bounded_p95(&index_window),
+            );
+        }
+
+        if last_reconnect.elapsed() >= reconnect_every {
+            last_reconnect = std::time::Instant::now();
+            // Daemon restart: drop the manager (all handles closed above),
+            // reopen the SAME data dir, recover, and verify no crashed ops.
+            manager = SessionManager::open(&store_dir, &cas_dir, true).unwrap();
+            let reports = manager.recover_all_sessions().unwrap();
+            let ok = reports.iter().all(|report| report.crashed_ops.is_empty());
+            reconnects += 1;
+            emitter.reconnect(ok, reconnects);
+            if manager.get_session(session_id).unwrap().is_none() {
+                session_id = manager
+                    .create_session(ws, "convergence-churn", "fake", "m")
+                    .unwrap()
+                    .id();
+            }
+        }
+    }
+
+    // Quiescent convergence: background work must settle and the writer
+    // queue must drain to zero after the churn stops.
+    let mut settled = false;
+    for _ in 0..60 {
+        let active = manager.store().all_active_turns().unwrap().len();
+        let tools = manager.store().all_running_tool_rows().unwrap().len();
+        if active == 0 && tools == 0 {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(settled, "background tasks did not settle before quiescence");
+    assert_eq!(
+        manager.store().writer_telemetry().pending_depth,
+        0,
+        "writer queue must quiesce to zero"
+    );
+    emitter.gauge(
+        turns,
+        0,
+        0,
+        0,
+        bounded_p95(&journal_window),
+        bounded_p95(&index_window),
+    );
+    drop(manager);
+    // A quiet window lets the driver's bounded samplers capture the
+    // post-quiescence process/data-dir state before this process exits.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    eprintln!(
+        "soak convergence churn: target={target_seconds}s elapsed={:.1}s turns={turns} reconnects={reconnects}",
+        started.elapsed().as_secs_f64()
+    );
 }

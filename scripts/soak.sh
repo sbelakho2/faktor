@@ -10,29 +10,60 @@
 #     `rounds = ceil(min(FAKTOR_SOAK_SCALE, FAKTOR_SOAK_MAX_SCALE))`, bounded
 #     further by `FAKTOR_SOAK_MAX_ROUNDS` and the whole-run wall budget
 #     `FAKTOR_SOAK_MAX_WALL_SECONDS`. `smoke` mode pins rounds to 1 (the
-#     always-fast CI gate); `long` mode applies the scale (the scheduled
-#     release campaign).
-#   * The default is accelerated: `FAKTOR_SOAK_SCALE=1`, `smoke` mode.
+#     always-fast gate used before the churn promotion); `long` mode applies
+#     the scale (the legacy scheduled campaign).
+#   * `churn` mode is the per-release accelerated churn (30-60 min): rounds
+#     repeat until at least `FAKTOR_SOAK_CHURN_SECONDS` of real wall time has
+#     elapsed, bounded by `FAKTOR_SOAK_MAX_WALL_SECONDS`.
+#   * `realtime` mode is the nightly/RC real-time durability run (12-24 h):
+#     rounds repeat until `FAKTOR_SOAK_REALTIME_SECONDS` of REAL wall clock
+#     has elapsed (the workload cannot shorten it), bounded by the wall
+#     budget.
 #   * A run that executes NO test is a FAILURE (no-op refusal). A zero,
 #     negative or unparseable scale is refused before any test runs. A
 #     non-positive wall/test budget is refused. The campaign never runs
 #     unbounded: per-invocation `timeout` plus a checked global wall budget.
-#   * `FAKTOR_SOAK_SCALE` is also exported to each test process so a future
-#     scale-aware test can read the same multiplier.
+#   * `FAKTOR_SOAK_SCALE`, `FAKTOR_SOAK_MODE`, `FAKTOR_SOAK_TARGET_SECONDS`,
+#     `FAKTOR_SOAK_DATA_DIR` and `FAKTOR_SOAK_METRICS_FILE` are exported to
+#     each test process so the convergence-aware workload can honor them.
+#
+# QUIESCENT CONVERGENCE (mandatory in churn/realtime): when the workload has
+# quiesced the driver samples the subject process tree and the soak data dir
+# with bounded samplers (`scripts/certification/soak-convergence.py sample`)
+# and evaluates typed pass/fail metrics (`... check`):
+#   rss_bounded, fds_bounded, child_processes_zero,
+#   background_tasks_settled, writer_queue_zero, reader_queue_zero,
+#   wal_converged, temp_files_removed, cas_unreachable_stable,
+#   journal_latency_no_upward_trend, index_latency_no_upward_trend,
+#   reconnect_correct, duration_target_met.
+# ANY failed metric fails the lane; missing metric samples are a typed
+# FAILURE (the samplers exist and must produce data), never a skip.
 #
 # Modes of selection:
-#   * Default groups (both modes): run the exact ignored sets of the `soak`,
+#   * Default groups (smoke/long): run the exact ignored sets of the `soak`,
 #     `fault` and `perf` lanes from `scripts/certification/ignored-tests.json`.
 #     In `smoke` mode each group runs ONE representative ignored test with
-#     `--exact` (bounded CI smoke); in `long` mode the whole ignored set runs.
+#     `--exact` (bounded CI smoke); in `long`/`churn`/`realtime` mode the
+#     whole ignored set runs.
 #   * Custom cargo args: `bash scripts/soak.sh -p <pkg> --release -- --ignored`
 #     forwards everything from the first cargo option/`--` verbatim to
-#     `cargo test` (this is how the nightly `soak` lane keeps the registry's
-#     exact lane command while adding scale/rounds).
+#     `cargo test` (this is how the trusted/nightly lane keeps the registry's
+#     exact lane command while adding churn/realtime and convergence).
 #
 # Env:
 #   FAKTOR_SOAK_SCALE               float > 0, default 1 (multiplier)
-#   FAKTOR_SOAK_MODE                smoke|long, default smoke
+#   FAKTOR_SOAK_MODE                smoke|long|churn|realtime, default smoke
+#   FAKTOR_SOAK_CHURN_SECONDS       default 1800 (churn target wall time)
+#   FAKTOR_SOAK_REALTIME_SECONDS    default 43200 (real-time target wall time)
+#   FAKTOR_SOAK_CONVERGENCE         required|off (default required for
+#                                   churn/realtime, off otherwise)
+#   FAKTOR_SOAK_LANE                lane id recorded in soak.json (default soak)
+#   FAKTOR_SOAK_DATA_DIR            workload data dir sampled after quiescence
+#   FAKTOR_SOAK_METRICS_FILE        workload runtime-metrics JSONL stream
+#   FAKTOR_SOAK_CONVERGENCE_SAMPLES explicit sampler stream override (selftest)
+#   FAKTOR_SOAK_SAMPLE_INTERVAL     sampler tick seconds (default 1)
+#   FAKTOR_SOAK_MAX_SAMPLES         sampler sample cap (default 100000)
+#   FAKTOR_SOAK_PYTHON              python3 binary override
 #   FAKTOR_SOAK_GROUPS              csv subset of soak,fault,perf
 #   FAKTOR_SOAK_MAX_SCALE           default 8 (scale clamp, recorded)
 #   FAKTOR_SOAK_MAX_ROUNDS          default 8
@@ -42,13 +73,16 @@
 #   FAKTOR_SOAK_OUT_DIR             default <repo>/target/certification
 #
 # Usage:
-#   bash scripts/soak.sh [--mode smoke|long] [--groups soak,fault,perf]
+#   bash scripts/soak.sh [--mode smoke|long|churn|realtime]
+#                        [--groups soak,fault,perf] [--churn-seconds N]
+#                        [--realtime-seconds N] [--convergence required|off]
+#                        [--lane L] [--sample-interval S] [--max-samples N]
 #                        [--scale N] [--max-rounds N] [--max-wall-seconds N]
 #                        [--test-timeout-seconds N] [--cargo-bin PATH]
 #                        [--out-dir DIR] [--print-plan] [--selftest]
 #                        [CARGO TEST ARGS...]
 #
-# Exit codes: 0 passed; 1 a campaign/refusal failure; 2 usage error.
+# Exit codes: 0 passed; 1 a campaign/refusal/convergence failure; 2 usage error.
 set -uo pipefail
 
 SELF="${BASH_SOURCE[0]}"
@@ -63,6 +97,14 @@ OUT_DIR="${FAKTOR_SOAK_OUT_DIR:-$ROOT/target/certification}"
 CARGO_BIN="${FAKTOR_SOAK_CARGO:-cargo}"
 MAX_WALL_RAW="${FAKTOR_SOAK_MAX_WALL_SECONDS:-}"
 TEST_TIMEOUT_RAW="${FAKTOR_SOAK_TEST_TIMEOUT_SECONDS:-}"
+CHURN_SECONDS_RAW="${FAKTOR_SOAK_CHURN_SECONDS:-1800}"
+REALTIME_SECONDS_RAW="${FAKTOR_SOAK_REALTIME_SECONDS:-43200}"
+CONVERGENCE_RAW="${FAKTOR_SOAK_CONVERGENCE:-}"
+LANE="${FAKTOR_SOAK_LANE:-soak}"
+SAMPLE_INTERVAL_RAW="${FAKTOR_SOAK_SAMPLE_INTERVAL:-1}"
+MAX_SAMPLES_RAW="${FAKTOR_SOAK_MAX_SAMPLES:-100000}"
+PYTHON_BIN="${FAKTOR_SOAK_PYTHON:-python3}"
+CONVERGENCE_PY="$ROOT/scripts/certification/soak-convergence.py"
 SELFTEST=0
 PRINT_PLAN=0
 CARGO_ARGS=()
@@ -96,7 +138,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
   --selftest) SELFTEST=1; shift ;;
   --print-plan) PRINT_PLAN=1; shift ;;
-  --mode | --groups | --scale | --max-rounds | --max-wall-seconds | --test-timeout-seconds | --cargo-bin | --out-dir)
+  --mode | --groups | --scale | --max-rounds | --max-wall-seconds | --test-timeout-seconds | --cargo-bin | --out-dir | --churn-seconds | --realtime-seconds | --convergence | --lane | --sample-interval | --max-samples | --python-bin)
     [ "$#" -ge 2 ] || die_usage "$1 needs a value"
     case "$1" in
     --mode) MODE="$2" ;;
@@ -107,6 +149,13 @@ while [ "$#" -gt 0 ]; do
     --test-timeout-seconds) TEST_TIMEOUT_RAW="$2" ;;
     --cargo-bin) CARGO_BIN="$2" ;;
     --out-dir) OUT_DIR="$2" ;;
+    --churn-seconds) CHURN_SECONDS_RAW="$2" ;;
+    --realtime-seconds) REALTIME_SECONDS_RAW="$2" ;;
+    --convergence) CONVERGENCE_RAW="$2" ;;
+    --lane) LANE="$2" ;;
+    --sample-interval) SAMPLE_INTERVAL_RAW="$2" ;;
+    --max-samples) MAX_SAMPLES_RAW="$2" ;;
+    --python-bin) PYTHON_BIN="$2" ;;
     esac
     shift 2
     ;;
@@ -248,16 +297,23 @@ write_record() { # status reason started finished duration executed passed faile
   [ "${SCALE_CLAMPED:-0}" = "1" ] && scale_clamped_json=true
   local rounds_capped_json=false
   [ "${ROUNDS_CAPPED:-0}" = "1" ] && rounds_capped_json=true
+  local convergence_json="${CONVERGENCE_JSON:-}"
+  if [ -z "$convergence_json" ]; then
+    convergence_json="{\"schema\":\"faktor-soak-convergence/v1\",\"status\":\"not-run\",\"required\":${CONVERGENCE_REQUIRED:-false}}"
+  fi
   TMP_OUT="$OUT_FILE.tmp.$$"
-  printf '{"schema":"faktor-soak/v1","lane":"soak","status":"%s","reason":"%s","mode":"%s","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s"},"started_at":"%s","finished_at":"%s","duration_seconds":%s,"scale_requested":%s,"scale_effective":%s,"max_scale":%s,"scale_clamped":%s,"rounds":%s,"max_rounds":%s,"rounds_capped":%s,"max_wall_seconds":%s,"test_timeout_seconds":%s,"bounded":true,"executed_total":%s,"passed_total":%s,"failed_total":%s,"groups":%s,"logs":%s}\n' \
-    "$(json_escape "$status")" "$(json_escape "$reason")" "$(json_escape "$MODE")" \
+  local target_clamped_json=false
+  [ "${TARGET_CLAMPED:-0}" = "1" ] && target_clamped_json=true
+  printf '{"schema":"faktor-soak/v1","lane":"%s","status":"%s","reason":"%s","mode":"%s","commit":"%s","tree":"%s","runner":{"os":"%s","arch":"%s"},"started_at":"%s","finished_at":"%s","duration_seconds":%s,"target_seconds":%s,"target_clamped":%s,"scale_requested":%s,"scale_effective":%s,"max_scale":%s,"scale_clamped":%s,"rounds":%s,"max_rounds":%s,"rounds_capped":%s,"max_wall_seconds":%s,"test_timeout_seconds":%s,"bounded":true,"executed_total":%s,"passed_total":%s,"failed_total":%s,"convergence_required":%s,"convergence":%s,"groups":%s,"logs":%s}\n' \
+    "$(json_escape "$LANE")" "$(json_escape "$status")" "$(json_escape "$reason")" "$(json_escape "$MODE")" \
     "$(json_escape "$COMMIT")" "$(json_escape "$TREE")" \
     "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)" \
     "$started" "$finished" "$duration" \
+    "${TARGET_SECONDS:-0}" "$target_clamped_json" \
     "${SCALE_REQUESTED:-0}" "${SCALE_EFFECTIVE:-0}" "${MAX_SCALE:-0}" "$scale_clamped_json" \
     "${ROUNDS:-0}" "${MAX_ROUNDS:-0}" "$rounds_capped_json" \
     "${MAX_WALL:-0}" "${TEST_TIMEOUT:-0}" \
-    "$executed" "$passed" "$failed" "$groups_json" "$logs_json" >"$TMP_OUT"
+    "$executed" "$passed" "$failed" "${CONVERGENCE_REQUIRED:-false}" "$convergence_json" "$groups_json" "$logs_json" >"$TMP_OUT"
   mv "$TMP_OUT" "$OUT_FILE"
   echo "soak: recorded $OUT_FILE (status=$status reason=${reason:-none})"
 }
@@ -273,6 +329,21 @@ parse_counts() { # log -> "executed passed failed"
     }
     END { printf "%d %d %d\n", passed + failed, passed, failed }
   ' "$1"
+}
+
+# churn/realtime modes are REAL wall-clock targets: a successful round that
+# finished before the target extends the campaign (bounded by MAX_ROUNDS)
+# instead of ending early. `round`/`start_epoch`/`TARGET_SECONDS` are visible
+# through bash dynamic scoping.
+maybe_extend_rounds() {
+  local mode="${1:-$MODE}"
+  if [ "$mode" != churn ] && [ "$mode" != realtime ]; then
+    return 0
+  fi
+  local elapsed=$(($(date +%s) - start_epoch))
+  if [ "$elapsed" -lt "$TARGET_SECONDS" ] && [ "$round" -lt "$MAX_ROUNDS" ]; then
+    ROUNDS=$((ROUNDS + 1))
+  fi
 }
 
 run_campaign() {
@@ -296,7 +367,66 @@ run_campaign() {
 
   local executed_total=0 passed_total=0 failed_total=0
   local rounds=1 round=1 rc=0 reason=""
+  local sampler_pid="" convergence_samples=""
+  local SUBJECT_PIDFILE="" SOAK_DATA_DIR=""
 
+  # ------------------------------------------------------- convergence setup
+  # The samplers are real and bounded; when convergence is required their
+  # inputs MUST exist, so a missing sampler/dir/stream is a typed failure
+  # (never a skip). The explicit FAKTOR_SOAK_CONVERGENCE_SAMPLES override is
+  # the fake-metrics seam used by --selftest and nothing else.
+  if [ "$CONVERGENCE" = required ]; then
+    CONVERGENCE_REQUIRED=true
+    SOAK_DATA_DIR="${FAKTOR_SOAK_DATA_DIR:-$OUT_DIR/soak-data}"
+    if [ -z "${FAKTOR_SOAK_DATA_DIR:-}" ]; then
+      rm -rf "$SOAK_DATA_DIR"
+    fi
+    mkdir -p "$SOAK_DATA_DIR"
+    WORKLOAD_METRICS="${FAKTOR_SOAK_METRICS_FILE:-$LOG_DIR/workload-metrics.jsonl}"
+    mkdir -p "$(dirname "$WORKLOAD_METRICS")"
+    : >"$WORKLOAD_METRICS"
+    export FAKTOR_SOAK_DATA_DIR="$SOAK_DATA_DIR"
+    export FAKTOR_SOAK_METRICS_FILE="$WORKLOAD_METRICS"
+    export FAKTOR_SOAK_TARGET_SECONDS="${TARGET_SECONDS:-0}"
+    SUBJECT_PIDFILE="$LOG_DIR/subject.pid"
+    ROOT_PIDFILE="$LOG_DIR/subject-root.pid"
+    if [ -n "${FAKTOR_SOAK_CONVERGENCE_SAMPLES:-}" ]; then
+      convergence_samples="$FAKTOR_SOAK_CONVERGENCE_SAMPLES"
+      mkdir -p "$(dirname "$convergence_samples")"
+      : >"$convergence_samples"
+    else
+      convergence_samples="$LOG_DIR/convergence.jsonl"
+      : >"$convergence_samples"
+      if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+        echo "soak: convergence requires '$PYTHON_BIN' (bounded samplers are implemented, never skipped)" >&2
+        CONVERGENCE_JSON='{"schema":"faktor-soak-convergence/v1","status":"failed","required":true,"failed_metrics":["sampler-unavailable"]}'
+        reason="convergence-failed: sampler-unavailable"
+        rc=1
+      else
+        # Bounded sampler: follows the per-round subject pidfile, samples the
+        # process tree + data dir every tick, writes one final quiescent
+        # sample + final scan on SIGTERM. Launched directly (not behind
+        # `timeout`) so the driver's SIGTERM reaches the python process and
+        # its own --duration/--max-samples caps keep it bounded regardless.
+        "$PYTHON_BIN" "$CONVERGENCE_PY" sample \
+          --out "$convergence_samples" \
+          --pidfile "$SUBJECT_PIDFILE" \
+          --root-pidfile "$ROOT_PIDFILE" \
+          --data-dir "$SOAK_DATA_DIR" \
+          --final-scan "$LOG_DIR/convergence-final.json" \
+          --interval "$SAMPLE_INTERVAL" \
+          --duration "$MAX_WALL" \
+          --max-samples "$MAX_SAMPLES" \
+          ${FAKTOR_SOAK_PROBE_URL:+--probe-url "$FAKTOR_SOAK_PROBE_URL"} \
+          >"$LOG_DIR/convergence-sampler.log" 2>&1 &
+        sampler_pid=$!
+      fi
+    fi
+  else
+    CONVERGENCE_REQUIRED=false
+  fi
+
+  if [ "$rc" -eq 0 ]; then
   if [ "${#CARGO_ARGS[@]}" -gt 0 ]; then
     # Custom cargo args mode: one logical command, repeated per round.
     local cmd="cargo test ${CARGO_ARGS[*]}"
@@ -333,6 +463,7 @@ run_campaign() {
         rc=1
         break
       fi
+      maybe_extend_rounds
       round=$((round + 1))
     done
     GROUP_JSON="${GROUP_JSON}{\"name\":\"custom\",\"command\":\"$(json_escape "$cmd")\",\"rounds\":$((round - 1)),\"executed\":$executed_total,\"passed\":$passed_total,\"failed\":$failed_total},"
@@ -379,10 +510,27 @@ run_campaign() {
       done
       IFS="$old_ifs"
       [ "$rc" -eq 0 ] || break
+      maybe_extend_rounds
       round=$((round + 1))
     done
     IFS="$old_ifs"
   fi
+  fi  # convergence preflight ok
+
+  # ------------------------------------------------- convergence evaluation
+  # The sampler is stopped FIRST so its final quiescent sample + final scan
+  # land on disk before the checker reads them.
+  if [ -n "$sampler_pid" ]; then
+    kill -TERM "$sampler_pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$sampler_pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    kill -KILL "$sampler_pid" 2>/dev/null || true
+    wait "$sampler_pid" 2>/dev/null || true
+  fi
+  [ -z "$SUBJECT_PIDFILE" ] || rm -f "$SUBJECT_PIDFILE" "$ROOT_PIDFILE"
 
   finished="$(iso_now)"
   now_epoch="$(date +%s)"
@@ -394,6 +542,36 @@ run_campaign() {
   if [ "$rc" -eq 0 ] && [ "$duration" -gt "$MAX_WALL" ]; then
     reason="wall-budget: campaign ran ${duration}s over the ${MAX_WALL}s budget"
     rc=1
+  fi
+  if [ "$CONVERGENCE" = required ]; then
+    local conv_rc=0
+    "$PYTHON_BIN" "$CONVERGENCE_PY" check \
+      --samples "$convergence_samples" \
+      --workload "$WORKLOAD_METRICS" \
+      --final "$LOG_DIR/convergence-final.json" \
+      --lane "$LANE" --mode "$MODE" \
+      --commit "$COMMIT" --tree "$TREE" \
+      --elapsed-seconds "$duration" \
+      --target-seconds "$TARGET_SECONDS" \
+      --max-seconds "$MAX_WALL" \
+      --out "$OUT_DIR/soak-convergence.json" \
+      >"$LOG_DIR/convergence-check.stdout" 2>&1 || conv_rc=$?
+    if [ -f "$OUT_DIR/soak-convergence.json" ]; then
+      CONVERGENCE_JSON="$(tr -d '\n' <"$OUT_DIR/soak-convergence.json")"
+    else
+      CONVERGENCE_JSON='{"schema":"faktor-soak-convergence/v1","status":"failed","required":true,"failed_metrics":["checker-produced-no-report"]}'
+    fi
+    if [ "$conv_rc" -ne 0 ]; then
+      local failed_names
+      failed_names="$(printf '%s' "$CONVERGENCE_JSON" | sed -n 's/.*"failed_metrics": *\[\([^]]*\)\].*/\1/p' | tr -d '"' | sed 's/^ *//;s/ *$//')"
+      echo "soak: convergence FAILED (${failed_names:-unknown})" >&2
+      if [ "$rc" -eq 0 ]; then
+        reason="convergence-failed: ${failed_names:-unknown}"
+        rc=1
+      fi
+    else
+      echo "soak: convergence passed (all required metrics converged)" >&2
+    fi
   fi
   if [ "$rc" -eq 0 ]; then
     write_record passed "" "$started" "$finished" "$duration" "$executed_total" "$passed_total" "$failed_total"
@@ -431,9 +609,34 @@ run_command() {
     bound="$remaining"
   fi
   echo "soak: bound=${bound}s (test-timeout=${TEST_TIMEOUT}s remaining-wall=${remaining}s)" >&2
-  # Scale-awareness hook: the effective multiplier and mode are visible to the
-  # test processes as well as to the driver.
+  # Scale-/convergence-awareness hook: the effective multiplier, mode, real
+  # target and the convergence paths are visible to the test processes.
+  local target_left=0
+  if [ "$CONVERGENCE" = required ]; then
+    target_left=$((TARGET_SECONDS - ($(date +%s) - start_epoch)))
+    [ "$target_left" -ge 1 ] || target_left=1
+  fi
+  #
+  # With convergence required the command runs as a background job so its
+  # timeout/process-tree root can be published to the sampler pidfile; the
+  # pipeline exit status is preserved (wait returns the job's status).
+  if [ "$CONVERGENCE" = required ] && [ -n "$SUBJECT_PIDFILE" ]; then
+    rm -f "$SUBJECT_PIDFILE" "$ROOT_PIDFILE"
+    FAKTOR_SOAK_SCALE="$SCALE_EFFECTIVE" FAKTOR_SOAK_MODE="$MODE" \
+      FAKTOR_SOAK_TARGET_SECONDS="$target_left" \
+      FAKTOR_SOAK_DATA_DIR="$SOAK_DATA_DIR" \
+      FAKTOR_SOAK_METRICS_FILE="$WORKLOAD_METRICS" \
+      FAKTOR_SOAK_SUBJECT_PIDFILE="$SUBJECT_PIDFILE" \
+      "$TIMEOUT_BIN" "$bound" "${argv[@]}" > >(tee "$log") 2>&1 &
+    local subject_pid=$!
+    printf '%s\n' "$subject_pid" >"$ROOT_PIDFILE"
+    wait "$subject_pid"
+    local subject_rc=$?
+    rm -f "$SUBJECT_PIDFILE" "$ROOT_PIDFILE"
+    return "$subject_rc"
+  fi
   FAKTOR_SOAK_SCALE="$SCALE_EFFECTIVE" FAKTOR_SOAK_MODE="$MODE" \
+    FAKTOR_SOAK_TARGET_SECONDS="$target_left" \
     "$TIMEOUT_BIN" "$bound" "${argv[@]}" 2>&1 | tee "$log"
   return "${PIPESTATUS[0]}"
 }
@@ -447,11 +650,46 @@ selftest() {
 #!/bin/sh
 printf '%s\n' "$*" >>"${FAKE_CARGO_LOG:-/dev/null}"
 printf 'FAKTOR_SOAK_SCALE=%s FAKTOR_SOAK_MODE=%s\n' "${FAKTOR_SOAK_SCALE:-unset}" "${FAKTOR_SOAK_MODE:-unset}" >>"${FAKE_CARGO_LOG:-/dev/null}"
+# Fake convergence metrics: `metrics-good` writes a converging world,
+# `metrics-bad` writes a leaky one. The loops are bounded (12 samples/round).
+emit_convergence() {
+  world="$1"
+  samples="${FAKTOR_SOAK_CONVERGENCE_SAMPLES:-}"
+  work="${FAKTOR_SOAK_METRICS_FILE:-}"
+  i=0
+  while [ "$i" -lt 12 ]; do
+    if [ "$world" = good ]; then
+      rss=120000; fds=40; children=0; wal=1048576; temp=0; cas=0
+      wq=0; rq=0; bg=0; lat=100; ok=true; final=false
+      [ "$i" -eq 11 ] && final=true
+    else
+      rss=$((300000 + i * 400000)); fds=$((100 + i * 60)); children=2
+      wal=$((1048576 + i * 8388608)); temp=3; cas=$((i * 40))
+      wq=5; rq=5; bg=5; lat=$((100 + i * 20000)); ok=false; final=false
+    fi
+    [ -n "$samples" ] && printf '{"t":%s,"rss_kb":%s,"fds":%s,"children":%s,"orphans":0,"wal_bytes":%s,"temp_files":%s,"cas_blobs":50,"cas_unreachable":%s,"probe_ok":true,"final":%s}\n' \
+      "$((i * 1000))" "$rss" "$fds" "$children" "$wal" "$temp" "$cas" "$final" >>"$samples"
+    [ -n "$work" ] && printf '{"t":%s,"writer_queue":%s,"reader_queue":%s,"background_tasks":%s,"journal_us":%s,"index_us":%s}\n' \
+      "$((i * 1000))" "$wq" "$rq" "$bg" "$lat" "$lat" >>"$work"
+    i=$((i + 1))
+  done
+  [ -n "$work" ] && printf '{"t":12000,"event":"reconnect","ok":%s}\n' "$ok" >>"$work"
+}
 case "${FAKE_CARGO_MODE:-ok}" in
 ok) printf 'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' ;;
 zero) printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n' ;;
 fail) printf 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'; exit 101 ;;
 sleep) printf 'running 2 tests\n'; sleep 30 ;;
+metrics-good)
+  printf 'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+  emit_convergence good
+  sleep 0.3
+  ;;
+metrics-bad)
+  printf 'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+  emit_convergence bad
+  sleep 2.5
+  ;;
 esac
 exit 0
 FAKE
@@ -564,11 +802,62 @@ SHIM
   check "wall-budget reason recorded" "$(contains "$out/soak.json" 'wall-budget' && echo 0 || echo 1)"
   check "over-budget run never records passed" "$([ "$(field "$out/soak.json" status)" = failed ] && echo 0 || echo 1)"
 
+  # 9. the convergence checker's own metric algebra (pass/fail/missing/
+  # duration) with fake metrics
+  if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    "$PYTHON_BIN" "$CONVERGENCE_PY" selftest >"$tmp/conv-tool.out" 2>&1
+    rc=$?
+    check "convergence checker selftest passes" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+    check "convergence checker passed its full matrix" "$(contains "$tmp/conv-tool.out" 'soak-convergence selftest: PASS' && echo 0 || echo 1)"
+  else
+    check "python3 present for the convergence gate (samplers are never skipped)" 1
+  fi
+
+  # 10. accelerated churn + REQUIRED convergence with converging fake metrics:
+  # the lane passes only with a typed all-metrics-passed convergence record
+  out="$tmp/out-conv-ok"
+  conv_samples="$tmp/conv-ok-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-conv-ok.log" FAKE_CARGO_MODE=metrics-good \
+  FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    bash "$SELF" --mode churn --churn-seconds 2 --max-wall-seconds 60 \
+    --test-timeout-seconds 30 --sample-interval 0.2 --convergence required \
+    --lane soak-smoke --cargo-bin "$tmp/fake-cargo" --out-dir "$out" \
+    -p faktor-tests-soak --release -- --ignored >"$tmp/conv-ok.stdout" 2>"$tmp/conv-ok.stderr"
+  rc=$?
+  check "churn + required convergence passes" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+  check "convergence report passed" "$(contains "$out/soak-convergence.json" '"status": "passed"' && echo 0 || echo 1)"
+  check "convergence required recorded" "$(contains "$out/soak.json" '"convergence_required":true' && echo 0 || echo 1)"
+  check "lane recorded" "$(contains "$out/soak.json" '"lane":"soak-smoke"' && echo 0 || echo 1)"
+  check "duration target recorded" "$(contains "$out/soak.json" '"target_seconds":2' && echo 0 || echo 1)"
+  metrics_ok=1
+  for metric_name in rss_bounded fds_bounded child_processes_zero \
+    background_tasks_settled writer_queue_zero reader_queue_zero wal_converged \
+    temp_files_removed cas_unreachable_stable journal_latency_no_upward_trend \
+    index_latency_no_upward_trend reconnect_correct duration_target_met; do
+    contains "$out/soak.json" "$metric_name" || metrics_ok=0
+  done
+  check "every convergence metric is recorded in soak.json" "$([ "$metrics_ok" -eq 1 ] && echo 0 || echo 1)"
+
+  # 11. any failed metric fails the lane: leaky fake metrics never record passed
+  out="$tmp/out-conv-bad"
+  conv_samples="$tmp/conv-bad-samples.jsonl"
+  FAKE_CARGO_LOG="$tmp/fake-conv-bad.log" FAKE_CARGO_MODE=metrics-bad \
+  FAKTOR_SOAK_CONVERGENCE_SAMPLES="$conv_samples" \
+    bash "$SELF" --mode churn --churn-seconds 2 --max-wall-seconds 60 \
+    --test-timeout-seconds 30 --sample-interval 0.2 --convergence required \
+    --lane soak-smoke --cargo-bin "$tmp/fake-cargo" --out-dir "$out" \
+    -p faktor-tests-soak --release -- --ignored >"$tmp/conv-bad.stdout" 2>"$tmp/conv-bad.stderr"
+  rc=$?
+  check "leaky convergence fails the lane" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+  check "convergence-failed reason recorded" "$(contains "$out/soak.json" 'convergence-failed' && echo 0 || echo 1)"
+  check "failed metrics named in soak.json" "$(contains "$out/soak.json" 'rss_bounded' && contains "$out/soak.json" 'reconnect_correct' && echo 0 || echo 1)"
+  check "failed lane never records passed status" "$([ "$(field "$out/soak.json" status)" = failed ] && echo 0 || echo 1)"
+
   if [ "$failures" -gt 0 ]; then
     echo "soak selftest: FAIL ($failures case(s))" >&2
     return 1
   fi
-  echo "soak selftest: PASS (scale bounds, zero-duration, no-op and per-invocation wall-budget refusals exercised)"
+  echo "soak selftest: PASS (scale bounds, zero-duration, no-op and per-invocation wall-budget refusals; convergence metric algebra pass/fail/missing/duration; churn integration passes only on all-metrics-converged evidence)"
   return 0
 }
 
@@ -577,13 +866,76 @@ if [ "$SELFTEST" -eq 1 ]; then
   exit $?
 fi
 
-if [ "$MODE" != smoke ] && [ "$MODE" != long ]; then
-  echo "soak: FAKTOR_SOAK_MODE must be smoke|long (got '$MODE')" >&2
+case "$MODE" in
+smoke | long | churn | realtime) ;;
+*)
+  echo "soak: FAKTOR_SOAK_MODE must be smoke|long|churn|realtime (got '$MODE')" >&2
   exit 2
-fi
+  ;;
+esac
 
-[ -n "$MAX_WALL_RAW" ] || { [ "$MODE" = smoke ] && MAX_WALL_RAW=1800 || MAX_WALL_RAW=21600; }
-[ -n "$TEST_TIMEOUT_RAW" ] || { [ "$MODE" = smoke ] && TEST_TIMEOUT_RAW=1200 || TEST_TIMEOUT_RAW=3600; }
+# churn/realtime require the convergence checker; smoke/long keep it off
+# unless explicitly requested. An explicit invalid value is always refused.
+case "$CONVERGENCE_RAW" in
+'')
+  if [ "$MODE" = churn ] || [ "$MODE" = realtime ]; then
+    CONVERGENCE=required
+  else
+    CONVERGENCE=off
+  fi
+  ;;
+required | off) CONVERGENCE="$CONVERGENCE_RAW" ;;
+*)
+  echo "soak: FAKTOR_SOAK_CONVERGENCE must be required|off (got '$CONVERGENCE_RAW')" >&2
+  exit 2
+  ;;
+esac
+CONVERGENCE_REQUIRED=false
+[ "$CONVERGENCE" = required ] && CONVERGENCE_REQUIRED=true
+TARGET_SECONDS=0
+TARGET_CLAMPED=0
+if [ "$MODE" = churn ]; then
+  if ! is_nonneg_integer "$CHURN_SECONDS_RAW" || [ "$CHURN_SECONDS_RAW" -lt 1 ]; then
+    echo "soak: FAKTOR_SOAK_CHURN_SECONDS must be a positive integer (got '$CHURN_SECONDS_RAW')" >&2
+    exit 2
+  fi
+  TARGET_SECONDS="$CHURN_SECONDS_RAW"
+elif [ "$MODE" = realtime ]; then
+  if ! is_nonneg_integer "$REALTIME_SECONDS_RAW" || [ "$REALTIME_SECONDS_RAW" -lt 1 ]; then
+    echo "soak: FAKTOR_SOAK_REALTIME_SECONDS must be a positive integer (got '$REALTIME_SECONDS_RAW')" >&2
+    exit 2
+  fi
+  TARGET_SECONDS="$REALTIME_SECONDS_RAW"
+fi
+if [ "$CONVERGENCE" = required ]; then
+  if ! is_positive_number "$SAMPLE_INTERVAL_RAW"; then
+    echo "soak: FAKTOR_SOAK_SAMPLE_INTERVAL must be a positive number (got '$SAMPLE_INTERVAL_RAW')" >&2
+    exit 2
+  fi
+  if ! is_nonneg_integer "$MAX_SAMPLES_RAW" || [ "$MAX_SAMPLES_RAW" -lt 1 ]; then
+    echo "soak: FAKTOR_SOAK_MAX_SAMPLES must be a positive integer (got '$MAX_SAMPLES_RAW')" >&2
+    exit 2
+  fi
+fi
+SAMPLE_INTERVAL="$SAMPLE_INTERVAL_RAW"
+MAX_SAMPLES="$MAX_SAMPLES_RAW"
+
+if [ -z "$MAX_WALL_RAW" ]; then
+  case "$MODE" in
+  smoke) MAX_WALL_RAW=1800 ;;
+  long) MAX_WALL_RAW=21600 ;;
+  churn) MAX_WALL_RAW=$((TARGET_SECONDS + 1800)) ;;
+  realtime) MAX_WALL_RAW=$((TARGET_SECONDS + 3600)) ;;
+  esac
+fi
+if [ -z "$TEST_TIMEOUT_RAW" ]; then
+  case "$MODE" in
+  smoke) TEST_TIMEOUT_RAW=1200 ;;
+  long) TEST_TIMEOUT_RAW=3600 ;;
+  churn) TEST_TIMEOUT_RAW=$((TARGET_SECONDS + 1200)) ;;
+  realtime) TEST_TIMEOUT_RAW=$((TARGET_SECONDS + 3000)) ;;
+  esac
+fi
 
 if ! is_positive_number "$MAX_SCALE_RAW"; then
   echo "soak: FAKTOR_SOAK_MAX_SCALE must be a positive number (got '$MAX_SCALE_RAW')" >&2
@@ -600,6 +952,12 @@ fi
 if ! is_nonneg_integer "$TEST_TIMEOUT_RAW" || [ "$TEST_TIMEOUT_RAW" -lt 1 ]; then
   echo "soak: FAKTOR_SOAK_TEST_TIMEOUT_SECONDS must be a positive integer (got '$TEST_TIMEOUT_RAW')" >&2
   exit 2
+fi
+
+if [ "$TARGET_SECONDS" -gt "$MAX_WALL_RAW" ]; then
+  echo "soak: $MODE target ${TARGET_SECONDS}s exceeds the wall budget ${MAX_WALL_RAW}s; clamped" >&2
+  TARGET_SECONDS="$MAX_WALL_RAW"
+  TARGET_CLAMPED=1
 fi
 
 TIMEOUT_BIN="$(command -v timeout 2>/dev/null || true)"
@@ -635,7 +993,14 @@ if ! is_positive_number "$SCALE_RAW"; then
   fi
   refuse "invalid-scale: FAKTOR_SOAK_SCALE must be a positive number (got '$SCALE_RAW')"
 fi
-if [ "$MODE" = smoke ] && [ "${#CARGO_ARGS[@]}" -eq 0 ]; then
+if [ "$MODE" = churn ] || [ "$MODE" = realtime ]; then
+  # Target-driven modes: one workload invocation honors FAKTOR_SOAK_TARGET_SECONDS;
+  # a round that ends early is repeated by maybe_extend_rounds (bounded by
+  # MAX_ROUNDS) so the campaign cannot shrink below the real target.
+  SCALE_EFFECTIVE="$(awk -v s="$SCALE_RAW" -v m="$MAX_SCALE" 'BEGIN { print (s < m ? s : m) }')"
+  SCALE_CLAMPED="$(awk -v s="$SCALE_RAW" -v m="$MAX_SCALE" 'BEGIN { print (s > m ? 1 : 0) }')"
+  ROUNDS=1
+elif [ "$MODE" = smoke ] && [ "${#CARGO_ARGS[@]}" -eq 0 ]; then
   SCALE_EFFECTIVE="$SCALE_RAW"
   SCALE_CLAMPED=0
   ROUNDS=1
@@ -655,8 +1020,8 @@ fi
 build_plan || exit 2
 
 if [ "$PRINT_PLAN" -eq 1 ]; then
-  printf '{"schema":"faktor-soak-plan/v1","mode":"%s","groups":"%s","scale_requested":%s,"scale_effective":%s,"scale_clamped":%s,"rounds":%s,"max_rounds":%s,"max_wall_seconds":%s,"test_timeout_seconds":%s,"commands":[' \
-    "$MODE" "$PLAN_GROUPS" "$SCALE_REQUESTED" "$SCALE_EFFECTIVE" "$SCALE_CLAMPED" "$ROUNDS" "$MAX_ROUNDS" "$MAX_WALL" "$TEST_TIMEOUT"
+  printf '{"schema":"faktor-soak-plan/v1","lane":"%s","mode":"%s","groups":"%s","target_seconds":%s,"convergence":"%s","scale_requested":%s,"scale_effective":%s,"scale_clamped":%s,"rounds":%s,"max_rounds":%s,"max_wall_seconds":%s,"test_timeout_seconds":%s,"commands":[' \
+    "$(json_escape "$LANE")" "$MODE" "$PLAN_GROUPS" "$TARGET_SECONDS" "$CONVERGENCE" "$SCALE_REQUESTED" "$SCALE_EFFECTIVE" "$SCALE_CLAMPED" "$ROUNDS" "$MAX_ROUNDS" "$MAX_WALL" "$TEST_TIMEOUT"
   first=1
   while IFS=$'\t' read -r g c; do
     [ -n "$g" ] || continue

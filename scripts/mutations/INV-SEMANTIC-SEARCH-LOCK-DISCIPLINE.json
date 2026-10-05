@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE",
+  "file": "crates/search/src/lib.rs",
+  "find": "        // Path probe under the lock, released before the query embed.\n        let persisted = {\n            let index = recover_lock(&self.index);\n            if index.has_embedding_index(ws) {\n                true\n            } else if index.file_count(ws) == 0 {\n                return Ok(vec![]);\n            } else {\n                false\n            }\n        };\n        // Provider call OUTSIDE the lock: persisted-vector retrieval only\n        // embeds the QUERY (the corpus comes from the durable vectors); the\n        // fallback embeds the query first and the reduced candidate set\n        // later, also outside the lock.\n        let query_emb = embedder.try_embed(&[query.to_string()])?;\n        let q = validated_query_vector(&query_emb)?;",
+  "replace": "        let index = recover_lock(&self.index);\n        let persisted = if index.has_embedding_index(ws) {\n            true\n        } else if index.file_count(ws) == 0 {\n            return Ok(vec![]);\n        } else {\n            false\n        };\n        let query_emb = embedder.try_embed(&[query.to_string()])?;\n        let q = validated_query_vector(&query_emb)?;\n        drop(index);",
+  "gate": "cargo test -p faktor-search --lib slow_provider_never_stalls_lexical_symbol_or_index_updates",
+  "expect": "stalled behind the blocked provider",
+  "note": "The path-probe guard is held across the query embed: a blocked provider now owns the index mutex, so lexical/symbol search and index updates stall behind it (the audit P1 lock-discipline bug)."
+}

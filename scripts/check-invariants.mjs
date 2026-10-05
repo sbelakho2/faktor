@@ -9,16 +9,28 @@
 //   2. every invariant must carry a `mutation_witness` test fn (a test that
 //      plants a deliberate violation and proves the oracle fires) or a
 //      non-empty `mutation_debt` reason — never both, never neither;
-//   3. `script_check` entries (non-Rust gates) must resolve to a literal
+//   3. criticality: every invariant is release-critical by default because
+//      its `authority` names a production gate. A release-critical invariant
+//      MUST ship an executable `mutation_command`; a non-empty
+//      `mutation_debt` on it is a hard failure in BOTH modes. An entry may be
+//      explicitly downgraded with `release_critical = false`, which requires
+//      a non-empty `criticality_reason`; only then may `mutation_debt`
+//      remain, reported as a warning (never silently);
+//   4. `script_check` entries (non-Rust gates) must resolve to a literal
 //      VS Code selftest step label (`apps/vscode/scripts/selftest.mjs`) or to
 //      a command line wired in a `.woodpecker` workflow;
-//   4. ids are unique `INV-...` and `platforms` is non-empty.
+//   5. ids are unique `INV-...` and `platforms` is non-empty.
 //
 // Usage:
 //   node scripts/check-invariants.mjs [--root DIR] [--registry FILE]
+//   node scripts/check-invariants.mjs --mutations
 //   node scripts/check-invariants.mjs --root FIXTURE --registry FIXTURE.toml --expect-fail CODE
 //
 // Exit codes: 0 pass (or expected failure matched); 1 violations; 2 usage.
+//
+// `--mutations` additionally executes every release-critical invariant's
+// `mutation_command` and requires the planted violation to be detected; a
+// release-critical entry without one already fails before this mode runs.
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execSync } from 'node:child_process';
@@ -169,6 +181,8 @@ function parseRegistry(text) {
       current[key] = unquote(rest, i + 1, problems);
     } else if (rest.startsWith('[')) {
       current[key] = parseArray(rest, i + 1, problems);
+    } else if (rest === 'true' || rest === 'false') {
+      current[key] = rest === 'true';
     } else {
       problems.push({ line: i + 1, message: `unsupported value '${rest}' for '${key}'` });
     }
@@ -303,18 +317,45 @@ function ciCommands(root) {
 
 function runCheck({ root, registryPath }) {
   const problems = [];
+  const warnings = [];
   const add = (code, detail) => problems.push(`${code}: ${detail}`);
 
   if (!existsSync(registryPath)) {
     add('missing-registry', `${relative(SCRIPT_ROOT, registryPath)} does not exist`);
-    return { problems, counts: { invariants: 0, witnesses: 0, debts: 0 }, entries: [] };
+    return {
+      problems,
+      warnings,
+      counts: {
+        invariants: 0,
+        witnesses: 0,
+        debts: 0,
+        releaseCritical: 0,
+        downgraded: 0,
+        criticalDebts: 0,
+        nonCriticalDebts: 0,
+      },
+      entries: [],
+    };
   }
   const { entries, problems: parseProblems } = parseRegistry(readFileSync(registryPath, 'utf8'));
   for (const problem of parseProblems) {
     add('parse-error', `line ${problem.line}: ${problem.message}`);
   }
   if (parseProblems.length > 0) {
-    return { problems, counts: { invariants: entries.length, witnesses: 0, debts: 0 }, entries };
+    return {
+      problems,
+      warnings,
+      counts: {
+        invariants: entries.length,
+        witnesses: 0,
+        debts: 0,
+        releaseCritical: 0,
+        downgraded: 0,
+        criticalDebts: 0,
+        nonCriticalDebts: 0,
+      },
+      entries,
+    };
   }
 
   const fnIndex = buildFnIndex(root);
@@ -326,6 +367,10 @@ function runCheck({ root, registryPath }) {
   const ids = new Set();
   let witnesses = 0;
   let debts = 0;
+  let releaseCritical = 0;
+  let downgraded = 0;
+  let criticalDebts = 0;
+  let nonCriticalDebts = 0;
 
   const requireFn = (invariant, field, value) => {
     const sites = fnIndex.get(value);
@@ -381,6 +426,28 @@ function runCheck({ root, registryPath }) {
       }
     }
 
+    // Criticality policy: every invariant is release-critical by default —
+    // its `authority` names a production gate, so the registry must prove it
+    // with a real planted mutation. Only an explicit downgrade
+    // (`release_critical = false`) with a documented reason may keep debt.
+    const critical = entry.release_critical !== false;
+    const criticalityReason =
+      typeof entry.criticality_reason === 'string' ? entry.criticality_reason.trim() : '';
+    if (entry.release_critical !== undefined && typeof entry.release_critical !== 'boolean') {
+      add('bad-criticality', `${id} release_critical must be a boolean`);
+    }
+    if (entry.release_critical === false) {
+      downgraded += 1;
+      if (criticalityReason === '') {
+        add(
+          'missing-criticality-reason',
+          `${id} is downgraded (release_critical = false) without a non-empty criticality_reason`,
+        );
+      }
+    } else {
+      releaseCritical += 1;
+    }
+
     const witness = typeof entry.mutation_witness === 'string' ? entry.mutation_witness.trim() : '';
     const debt = typeof entry.mutation_debt === 'string' ? entry.mutation_debt.trim() : '';
     const mutationCommand =
@@ -388,7 +455,9 @@ function runCheck({ root, registryPath }) {
     // Proof model: a behavioral witness is evidence, not proof. Every
     // invariant must either ship an executable `mutation_command` that plants
     // the violation and is detected, or carry an explicit mutation_debt; the
-    // two are mutually exclusive.
+    // two are mutually exclusive. A release-critical invariant may NOT carry
+    // debt: the checker fails both modes instead of accepting a documented
+    // hole in the release gate.
     if (mutationCommand === '' && debt === '') {
       add('missing-mutation-proof', `${id} needs a mutation_command or a mutation_debt reason`);
     }
@@ -413,6 +482,16 @@ function runCheck({ root, registryPath }) {
     }
     if (debt !== '') {
       debts += 1;
+      if (critical) {
+        criticalDebts += 1;
+        add(
+          'release-critical-mutation-debt',
+          `${id} is release-critical but carries mutation_debt ('${debt}'); release-critical invariants must ship an executable mutation_command`,
+        );
+      } else {
+        nonCriticalDebts += 1;
+        warnings.push(`${id} (non-critical) carries mutation_debt: ${debt}`);
+      }
     }
 
     if (typeof entry.fault === 'string' && entry.fault.trim() !== '') {
@@ -420,21 +499,35 @@ function runCheck({ root, registryPath }) {
     }
   }
 
-  return { problems, counts: { invariants: entries.length, witnesses, debts }, entries };
+  return {
+    problems,
+    warnings,
+    counts: {
+      invariants: entries.length,
+      witnesses,
+      debts,
+      releaseCritical,
+      downgraded,
+      criticalDebts,
+      nonCriticalDebts,
+    },
+    entries,
+  };
 }
 
 function main() {
   const args = process.argv.slice(2);
   if (args.includes('-h') || args.includes('--help')) {
     console.log(
-      'usage: node scripts/check-invariants.mjs [--root DIR] [--registry FILE] [--expect-fail CODE]',
+      'usage: node scripts/check-invariants.mjs [--root DIR] [--registry FILE] [--expect-fail CODE] [--mutations]',
     );
     return 2;
   }
   const root = resolve(argValue(args, '--root', SCRIPT_ROOT));
   const registryPath = resolve(argValue(args, '--registry', join(root, 'tests/invariants.toml')));
   const mutations = args.includes('--mutations');
-  const { problems, counts, entries } = runCheck({ root, registryPath });
+  const { problems, warnings, counts, entries } = runCheck({ root, registryPath });
+  for (const warning of warnings) console.warn(`invariants-warning: ${warning}`);
   const expectFail = argValue(args, '--expect-fail');
   if (expectFail) {
     if (problems.some((problem) => problem.startsWith(`${expectFail}:`))) {
@@ -482,7 +575,9 @@ function main() {
         console.error(`invariants-mutations: ${id} has neither a mutation_command nor a mutation_debt`);
       }
       for (const entry of undetected) {
-        console.error(`invariants-mutations: ${entry} exited 0; the planted violation was NOT detected`);
+        console.error(
+          `invariants-mutations: ${entry} gate did not exit 0 (mutation-run refuses to call an environment/compile/gate failure a detection); the planted violation was NOT proven`,
+        );
       }
       console.error(
         `check-invariants --mutations: FAIL (${missing.length} missing, ${undetected.length} undetected)`,
@@ -490,11 +585,15 @@ function main() {
       return 1;
     }
     console.log(
-      `check-invariants --mutations: PASS (${proven} planted violation(s) detected by their gates; ${counts.debts} documented debt(s))`,
+      `check-invariants --mutations: PASS (${proven} planted violation(s) detected by their gates; ` +
+        `${counts.releaseCritical} release-critical invariant(s) all proven; ` +
+        `${counts.nonCriticalDebts} non-critical documented debt(s))`,
     );
   }
   console.log(
-    `check-invariants: PASS (${counts.invariants} invariants, ${counts.witnesses} mutation witnesses, ${counts.debts} documented debts)`,
+    `check-invariants: PASS (${counts.invariants} invariants, ${counts.witnesses} mutation witnesses, ` +
+      `${counts.releaseCritical} release-critical (0 debt), ${counts.downgraded} downgraded, ` +
+      `${counts.nonCriticalDebts} non-critical documented debt(s))`,
   );
   return 0;
 }

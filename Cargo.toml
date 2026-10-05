@@ -5,6 +5,7 @@ members = [
     "crates/core",
     "crates/commerce",
     "crates/commerce-connectors",
+    "crates/contracts",
     "crates/browser",
     "crates/evidence",
     "crates/semantic",
@@ -80,6 +81,7 @@ faktor-core = { path = "crates/core" }
 faktor-acquire = { path = "crates/acquire" }
 faktor-commerce = { path = "crates/commerce" }
 faktor-commerce-connectors = { path = "crates/commerce-connectors" }
+faktor-contracts = { path = "crates/contracts" }
 faktor-semantic = { path = "crates/semantic" }
 faktor-protocol = { path = "crates/protocol" }
 faktor-cas = { path = "crates/cas" }

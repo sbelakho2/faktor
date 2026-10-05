@@ -22,6 +22,19 @@
 //! for diagnostics (Linux is `AppLevel` until one DenyAll spawn proves the
 //! unshare path at spawn).
 //!
+//! Filesystem confinement is per-spawn and fail-closed the same way (audit
+//! P1): [`FilesystemIsolation::Workspace`] installs a Landlock ruleset
+//! (ABI v1+, handled rights masked to the probed ABI) in the forked child
+//! before exec, granting full rights on the configured roots plus a fixed
+//! read/execute runtime allowlist and denying every other path for the
+//! whole tree; a best-effort mount namespace layers private propagation on
+//! top. A `required: true` demand refuses the spawn typed BEFORE exec when
+//! the kernel lacks the ABI or any ruleset step fails, on every entry
+//! point; `required: false` (BestEffort) honestly falls back to
+//! application-policy-only execution. The sandbox projection only says
+//! `workspace` where this backend exists and is demanded — never on a
+//! platform that cannot enforce it.
+//!
 //! This crate owns THE process supervisor for the whole workspace (audit
 //! P0-40): git, lsp, mcp, hooks and the CLI daemon all spawn children
 //! through [`ProcessSupervisor`]. A bounded live-child ceiling refuses
@@ -47,6 +60,13 @@
 //! Drop and kill are mutually exclusive through that serial, so no signal
 //! can be issued after a `wait` consumed the child and no signal can race a
 //! concurrent kill.
+//!
+//! The post-reap gap (a descendant that survives a consumed leader) is
+//! closed by the per-spawn Linux guardian instead of by re-signalling the
+//! consumed pid: it owns the child's start-time-verified group identity, so
+//! on row drop / daemon death (pipe EOF, SIGKILL included) it
+//! SIGTERM→SIGKILLs whatever remains of the group and refuses when the
+//! identity was recycled. See [`guardian`].
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
@@ -76,6 +96,11 @@ pub use faktor_core::command::{CommandSpec, ShellKind};
 /// ENFORCES it: [`NetworkIsolation::from`] maps it to the concrete mode and
 /// a `DenyAll` spawn either isolates the child or fails closed typed.
 pub use faktor_core::command::NetworkIsolationRequirement;
+
+/// What the sandbox policy demands of the spawn layer's filesystem
+/// confinement (audit P1). The terminal crate ENFORCES it: a workspace
+/// demand either confines the child or (Required) fails closed typed.
+pub use faktor_core::command::FilesystemIsolationRequirement;
 
 /// The daemon names a supervised Chromium child may inherit (values copied
 /// when set): executable resolution plus locale/timezone. Provider keys,
@@ -228,6 +253,86 @@ impl From<NetworkIsolationRequirement> for NetworkIsolation {
         match requirement {
             NetworkIsolationRequirement::DenyAll => NetworkIsolation::DenyAll,
             NetworkIsolationRequirement::Inherit => NetworkIsolation::Inherit,
+        }
+    }
+}
+
+/// Filesystem isolation requested for one spawned child (audit P1). The
+/// policy seam (`faktor-sandbox`) maps a workspace guarantee to a
+/// [`FilesystemIsolationRequirement`]; this crate converts it here (adding
+/// the session workspace root) and ENFORCES it in the child or refuses the
+/// spawn typed — never a projection that claims `workspace` while the
+/// child runs unconfined.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FilesystemIsolation {
+    /// The child shares the daemon's filesystem view (no OS-level
+    /// filesystem confinement is requested or applied). This is the
+    /// default for spawn sites that carry no workspace-confinement demand.
+    #[default]
+    Inherit,
+    /// OS-level confinement to the listed roots. On Linux the pre-exec hook
+    /// installs a Landlock ruleset that grants full filesystem rights on
+    /// `roots` plus a fixed read/execute runtime allowlist (the shell
+    /// binary, its loader and libraries, and the null/random/tty devices)
+    /// and denies every other path for the whole process tree — including
+    /// `..` traversal and symlink escapes. A best-effort mount namespace
+    /// (recursive private propagation) is layered on top.
+    ///
+    /// `required = true` is fail-closed: a kernel without the Landlock ABI
+    /// (or any ruleset setup failure) refuses the spawn typed BEFORE exec,
+    /// on every entry point. `required = false` is the honest BestEffort
+    /// contract: when the mechanism is unavailable the child runs with the
+    /// application-policy gates only, and the projection tag is
+    /// `workspace_best_effort` (never a guaranteed jail).
+    Workspace {
+        /// The roots the child may access (read/write/etc.; everything
+        /// beneath each root is covered by the kernel rule).
+        roots: Vec<PathBuf>,
+        /// Fail closed when the OS mechanism cannot be installed.
+        required: bool,
+    },
+}
+
+impl FilesystemIsolation {
+    /// Build the spawn-layer demand for a policy requirement, carrying the
+    /// session's workspace roots. `Inherit` maps to no confinement.
+    pub fn for_requirement(
+        requirement: FilesystemIsolationRequirement,
+        roots: Vec<PathBuf>,
+    ) -> FilesystemIsolation {
+        match requirement {
+            FilesystemIsolationRequirement::Workspace { best_effort } => {
+                FilesystemIsolation::Workspace {
+                    roots,
+                    required: !best_effort,
+                }
+            }
+            FilesystemIsolationRequirement::Inherit => FilesystemIsolation::Inherit,
+        }
+    }
+
+    /// The stable snake_case tag of this mode (`inherit` | `workspace` |
+    /// `workspace_best_effort`): the exact spelling recorded as durable
+    /// spawn evidence (the terminal authority's effective execution
+    /// profile).
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            FilesystemIsolation::Inherit => "inherit",
+            FilesystemIsolation::Workspace { required: true, .. } => "workspace",
+            FilesystemIsolation::Workspace { .. } => "workspace_best_effort",
+        }
+    }
+
+    /// True when the demand is fail-closed (no silent fallback).
+    pub fn is_required(&self) -> bool {
+        matches!(self, FilesystemIsolation::Workspace { required: true, .. })
+    }
+
+    /// The roots the confinement grants (empty for `Inherit`).
+    pub fn roots(&self) -> &[PathBuf] {
+        match self {
+            FilesystemIsolation::Inherit => &[],
+            FilesystemIsolation::Workspace { roots, .. } => roots,
         }
     }
 }
@@ -471,6 +576,12 @@ impl BrokerOnlyBridge {
     }
 }
 
+/// Per-spawn daemon-death guardian (Linux): a forked helper owns a control
+/// pipe's read end and the child's start-time-verified group identity, so a
+/// daemon SIGKILL (which bypasses every destructor) still ends the whole
+/// supervised process group. See the module docs for the EOF protocol.
+mod guardian;
+
 /// Process-tree resource budgets: the authorization side of the terminal
 /// authority's `TerminalBudgets`. Linux cgroup v2 (with `prlimit`
 /// fallback), Windows Job Object limits, unix pre-exec rlimits and the wall
@@ -505,6 +616,12 @@ pub struct SpawnConfig {
     /// fail-closed `DenyAll` semantics). Derive it from the policy with
     /// [`NetworkIsolation::from(NetworkIsolationRequirement::from(guarantee))`].
     pub network_isolation: NetworkIsolation,
+    /// OS-level filesystem confinement requested for this child
+    /// ([`FilesystemIsolation::Inherit`] by default). Derive it from the
+    /// policy with [`FilesystemIsolation::for_requirement`] and the
+    /// session's workspace roots; see the enum for the fail-closed
+    /// `Workspace { required: true }` semantics.
+    pub filesystem_isolation: FilesystemIsolation,
 }
 
 impl Default for SpawnConfig {
@@ -518,6 +635,7 @@ impl Default for SpawnConfig {
             capture: true,
             artifact_max: 100 * 1024 * 1024,
             network_isolation: NetworkIsolation::Inherit,
+            filesystem_isolation: FilesystemIsolation::Inherit,
         }
     }
 }
@@ -691,6 +809,12 @@ struct ChildState {
     /// so the bridge can never outlive its child's registry entry.
     #[allow(dead_code)] // ownership is the point; there is no read path
     broker_bridge: Option<Arc<BrokerOnlyBridge>>,
+    /// Daemon-death guardian of this child's process group: the row owns the
+    /// control pipe's write end. Dropping the row (reap, supervisor
+    /// shutdown) closes it and the forked guardian SIGTERM→SIGKILLs every
+    /// surviving group member after verifying the leader's identity.
+    #[allow(dead_code)] // ownership is the point; the read path is test-only
+    guardian: Option<guardian::GuardianHandle>,
 }
 
 /// Per-child containment: on Windows its OWN `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
@@ -1114,6 +1238,38 @@ type HeadSlot = Arc<Mutex<(String, bool)>>;
 /// The FINAL bounded head a reader thread sends once its stream reaches EOF.
 type HeadFinal = std::sync::mpsc::Receiver<(String, bool)>;
 
+/// Exact-secret filter for captured command artifacts. The supervisor runs
+/// the filter over the spill file BEFORE the blob is written to the CAS, so
+/// a configured credential echoed by a command (e.g. `cat` of a key file)
+/// never reaches durable storage raw.
+///
+/// Implementations report exact byte ranges; the supervisor replaces each
+/// range with [`ArtifactSecretFilter::replacement`]. `max_match_len` is the
+/// longest value the filter can match: the streaming pass keeps that many
+/// bytes of overlap between read windows so a value split across a chunk
+/// boundary is still seen whole. A `max_match_len` of 0 means "nothing
+/// registered" and disables the filter entirely.
+pub trait ArtifactSecretFilter: Send + Sync {
+    /// Longest registered value in bytes (0 = no values registered).
+    fn max_match_len(&self) -> usize;
+    /// Every exact match in `window` as `(offset, len)` byte ranges. The
+    /// implementation may return overlapping ranges; the supervisor merges
+    /// them. Out-of-range entries are ignored (never trusted).
+    fn matches(&self, window: &[u8]) -> Vec<(usize, usize)>;
+    /// Bytes that replace each matched range.
+    fn replacement(&self) -> Vec<u8> {
+        b"<redacted:configured_secret>".to_vec()
+    }
+}
+
+/// Read window of the artifact filter's streaming pass.
+const ARTIFACT_FILTER_CHUNK: usize = 1024 * 1024;
+
+/// Fail-closed bound on collected secret ranges: past this the artifact is
+/// not written to the CAS at all. Better no artifact than a raw leak; the
+/// bounded excerpt the tool already received is sanitized independently.
+const ARTIFACT_FILTER_MAX_RANGES: usize = 1_000_000;
+
 /// The bounded capture state; mutated only by the reader task.
 struct SharedCapture {
     ring: RingBuffer,
@@ -1131,6 +1287,9 @@ struct SharedCapture {
     spill_path: Option<PathBuf>,
     artifact: Option<String>,
     cas: Arc<faktor_cas::Cas>,
+    /// Optional exact-secret filter applied to the spill BEFORE the CAS put
+    /// (installed once on the owning supervisor; `None` = historical path).
+    filter: Option<Arc<dyn ArtifactSecretFilter>>,
 }
 
 impl SharedCapture {
@@ -1178,17 +1337,155 @@ impl SharedCapture {
     }
 
     /// Stream the spill file into the CAS (put_reader — never read-whole),
-    /// then clean up the temp file.
+    /// then clean up the temp file. When a [`ArtifactSecretFilter`] is
+    /// installed the spill is scrubbed BEFORE the put: the filter's ranges
+    /// are collected over the original bytes (streamed, bounded RAM), then a
+    /// second streaming pass writes the redacted bytes to a sibling temp
+    /// file that is what enters the CAS. A scan failure or an over-bound
+    /// number of matches fails closed (no artifact at all, never a raw one).
     fn finalize_artifact(&mut self) {
         if let Some(path) = self.spill_path.take() {
-            if let Ok(f) = std::fs::File::open(&path) {
-                if let Ok(hash) = self.cas.put_reader_bounded(f, self.artifact_max) {
-                    self.artifact = Some(format!("artifact://{}", hash.to_hex()));
+            let hash = match &self.filter {
+                Some(filter) if filter.max_match_len() > 0 => {
+                    self.store_scrubbed_artifact(&path, filter)
                 }
+                _ => std::fs::File::open(&path)
+                    .ok()
+                    .and_then(|f| self.cas.put_reader_bounded(f, self.artifact_max).ok()),
+            };
+            if let Some(hash) = hash {
+                self.artifact = Some(format!("artifact://{}", hash.to_hex()));
             }
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    /// The filtered CAS put (see [`SharedCapture::finalize_artifact`]).
+    fn store_scrubbed_artifact(
+        &self,
+        path: &std::path::Path,
+        filter: &Arc<dyn ArtifactSecretFilter>,
+    ) -> Option<faktor_core::hash::FileHash> {
+        let ranges = match collect_secret_ranges(path, filter.as_ref(), self.artifact_max) {
+            Ok(ranges) => ranges,
+            Err(err) => {
+                tracing::error!(
+                    path = %path.display(),
+                    "artifact secret scan failed; refusing to store the artifact: {err}"
+                );
+                return None;
+            }
+        };
+        if ranges.is_empty() {
+            let f = std::fs::File::open(path).ok()?;
+            return self.cas.put_reader_bounded(f, self.artifact_max).ok();
+        }
+        let scrubbed = path.with_extension("scrubbed");
+        if let Err(err) = write_redacted_copy(path, &ranges, &filter.replacement(), &scrubbed) {
+            tracing::error!(
+                path = %path.display(),
+                "artifact redaction failed; refusing to store the artifact: {err}"
+            );
+            let _ = std::fs::remove_file(&scrubbed);
+            return None;
+        }
+        let hash = std::fs::File::open(&scrubbed)
+            .ok()
+            .and_then(|f| self.cas.put_reader_bounded(f, self.artifact_max).ok());
+        let _ = std::fs::remove_file(&scrubbed);
+        hash
+    }
+}
+
+/// Collect the exact-secret byte ranges of `path` through a streaming pass
+/// with `filter.max_match_len() - 1` bytes of window overlap, so a value
+/// split across two read chunks is still matched whole. Ranges are sorted,
+/// deduplicated and overlap-merged; past [`ARTIFACT_FILTER_MAX_RANGES`] the
+/// scan errors so the caller fails closed instead of storing raw bytes.
+fn collect_secret_ranges(
+    path: &std::path::Path,
+    filter: &dyn ArtifactSecretFilter,
+    max_bytes: usize,
+) -> std::io::Result<Vec<(usize, usize)>> {
+    let mut file = std::fs::File::open(path)?;
+    let overlap = filter
+        .max_match_len()
+        .saturating_sub(1)
+        .min(ARTIFACT_FILTER_CHUNK);
+    let mut carry: Vec<u8> = Vec::new();
+    // Absolute file offset of `carry[0]`.
+    let mut base = 0usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    loop {
+        let remaining = max_bytes.saturating_sub(base + carry.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut buf = vec![0u8; ARTIFACT_FILTER_CHUNK.min(remaining)];
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let mut window = std::mem::take(&mut carry);
+        window.extend_from_slice(&buf[..n]);
+        let window_end = base + window.len();
+        for (offset, len) in filter.matches(&window) {
+            // Never trust a hostile range: it must lie inside the window.
+            let Some(end) = offset.checked_add(len) else {
+                continue;
+            };
+            if len == 0 || offset >= window.len() || end > window.len() {
+                continue;
+            }
+            ranges.push((base + offset, base + end));
+            if ranges.len() > ARTIFACT_FILTER_MAX_RANGES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "artifact contains more exact-secret ranges than the bounded scan allows",
+                ));
+            }
+        }
+        let keep = overlap.min(window.len());
+        base = window_end - keep;
+        carry = window[window.len() - keep..].to_vec();
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, cur_end)) if start <= *cur_end => *cur_end = (*cur_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
+}
+
+/// Copy `src` to `dst`, replacing every `(start, end)` byte range with
+/// `replacement` and copying everything else byte-for-byte. Streaming:
+/// RAM stays at the buffer sizes of the two `BufReader`/`BufWriter` hops.
+fn write_redacted_copy(
+    src: &std::path::Path,
+    ranges: &[(usize, usize)],
+    replacement: &[u8],
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut input = std::io::BufReader::new(std::fs::File::open(src)?);
+    let mut output = std::io::BufWriter::new(std::fs::File::create(dst)?);
+    let mut pos: u64 = 0;
+    for &(start, end) in ranges {
+        let (start, end) = (start as u64, end as u64);
+        if start < pos {
+            continue; // merged ranges are ordered/non-overlapping; defensively skip
+        }
+        std::io::copy(&mut (&mut input).take(start - pos), &mut output)?;
+        std::io::copy(&mut (&mut input).take(end - start), &mut std::io::sink())?;
+        std::io::Write::write_all(&mut output, replacement)?;
+        pos = end;
+    }
+    std::io::copy(&mut input, &mut output)?;
+    std::io::Write::flush(&mut output)?;
+    Ok(())
 }
 
 /// Diagnostic timeline of one supervised child (audit round 10: the Linux
@@ -1216,6 +1513,12 @@ pub struct ProcessSupervisor {
     /// Serializes [admit → spawn → register] so the live ceiling is exact
     /// even under a spawn race (100 concurrent spawners never overshoot).
     spawn_serial: Mutex<()>,
+    /// The optional exact-secret filter installed by the daemon owner: every
+    /// artifact this supervisor puts into the CAS is scrubbed through it
+    /// first. Install-once at daemon assembly (see
+    /// [`ProcessSupervisor::install_artifact_filter`]); `None` keeps the
+    /// historical byte-identical CAS path.
+    artifact_filter: std::sync::RwLock<Option<Arc<dyn ArtifactSecretFilter>>>,
     /// The ephemeral CAS root [`ProcessSupervisor::try_shared`] created for
     /// this supervisor, OWNED for the supervisor's whole lifetime (dropped
     /// together with the last `Arc`, so the temp dir can never be deleted
@@ -1252,6 +1555,16 @@ impl Drop for ProcessSupervisor {
         for (id, pid) in targets {
             let _ = self.terminate_registered_sync(id, pid, 300);
         }
+        // Release every row exactly once (the registry map may still be
+        // shared with in-flight reaper threads, so the rows are taken out
+        // here): closing a guardian's control pipe lets it SIGTERM→SIGKILL
+        // any surviving group member, so descendants of already-exited
+        // leaders die with the daemon's supervisor too.
+        let rows: Vec<ChildState> = {
+            let mut reg = self.registry.lock().unwrap();
+            std::mem::take(&mut *reg).into_values().collect()
+        };
+        drop(rows);
     }
 }
 
@@ -1279,8 +1592,18 @@ impl ProcessSupervisor {
             timeline: Arc::new(Mutex::new(VecDeque::new())),
             max_live,
             spawn_serial: Mutex::new(()),
+            artifact_filter: std::sync::RwLock::new(None),
             _standalone_root: standalone_root,
         })
+    }
+
+    /// Install the exact-secret filter every captured artifact is scrubbed
+    /// through before its CAS put (daemon assembly calls this ONCE, with the
+    /// same configured-secret registry the egress scan uses). Idempotent and
+    /// last-wins; concurrent runs only ever see a fully-installed filter
+    /// because the daemon installs at assembly, before any child spawns.
+    pub fn install_artifact_filter(&self, filter: Arc<dyn ArtifactSecretFilter>) {
+        *self.artifact_filter.write().unwrap() = Some(filter);
     }
 
     /// The process-wide standalone supervisor, for callers that genuinely
@@ -1391,11 +1714,23 @@ impl ProcessSupervisor {
             cmd.process_group(0);
         }
         #[cfg(target_os = "linux")]
+        guardian::install_pdeathsig(&mut cmd);
+        #[cfg(target_os = "linux")]
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             // SAFETY: `apply_deny_all_isolation` installs the documented
             // allocation-free unshare pre-exec hook (post-fork, pre-exec).
             unsafe {
                 sandbox::apply_deny_all_isolation(&mut cmd);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let FilesystemIsolation::Workspace { roots, required } = &cfg.filesystem_isolation {
+            // SAFETY: `apply_workspace_isolation` installs the documented
+            // allocation-free Landlock pre-exec hook (post-fork, pre-exec);
+            // the rule table and its C strings are built here, in the
+            // parent, before the fork.
+            unsafe {
+                sandbox::apply_workspace_isolation(&mut cmd, roots, *required);
             }
         }
         cmd
@@ -1497,6 +1832,7 @@ impl ProcessSupervisor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // one row identity per live child
     fn register(
         &self,
         pid: u32,
@@ -1505,6 +1841,7 @@ impl ProcessSupervisor {
         containment: ChildContainment,
         reap: Arc<ReapState>,
         broker_bridge: Option<Arc<BrokerOnlyBridge>>,
+        guardian: Option<guardian::GuardianHandle>,
     ) -> u64 {
         let id = self.alloc_id();
         self.registry.lock().unwrap().insert(
@@ -1517,6 +1854,7 @@ impl ProcessSupervisor {
                 reap,
                 containment,
                 broker_bridge,
+                guardian,
             },
         );
         id
@@ -1681,9 +2019,7 @@ impl ProcessSupervisor {
         // The run OWNS the materialized cmd script (when lowering produced
         // one): deleted on every return path after the child is gone.
         let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
-        if cfg.network_isolation == NetworkIsolation::DenyAll {
-            isolation_gate(&cfg)?;
-        }
+        isolation_gate(&cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         use tokio::io::AsyncReadExt;
         use tokio::process::Command as TokioCommand;
@@ -1726,6 +2062,12 @@ impl ProcessSupervisor {
             reap: reap.clone(),
             pid,
         };
+        // Fail closed: a child whose guardian cannot be forked is not
+        // exposed — the RunGroupGuard drop SIGKILLs and consumes it.
+        let guardian = match guardian::GuardianHandle::try_spawn(pid) {
+            Ok(g) => g,
+            Err(e) => return Err(e),
+        };
         #[cfg(windows)]
         win_spawn::assign_and_resume_tokio(&containment.job, &mut child).await?;
         #[cfg(target_os = "linux")]
@@ -1737,6 +2079,7 @@ impl ProcessSupervisor {
             containment,
             reap.clone(),
             bridge.clone(),
+            guardian,
         );
         self.timeline_spawn(
             id,
@@ -1759,6 +2102,7 @@ impl ProcessSupervisor {
             spill_path: None,
             artifact: None,
             cas: self.cas.clone(),
+            filter: self.artifact_filter.read().unwrap().clone(),
         }));
 
         // Async reader task: drains both streams into the bounded ring.
@@ -2078,9 +2422,7 @@ impl ProcessSupervisor {
         // The run OWNS the materialized cmd script (when lowering produced
         // one): deleted on every return path after the child is gone.
         let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
-        if cfg.network_isolation == NetworkIsolation::DenyAll {
-            isolation_gate(&cfg)?;
-        }
+        isolation_gate(&cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         let effective_deadline = budgets
             .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
@@ -2110,6 +2452,17 @@ impl ProcessSupervisor {
             #[cfg(target_os = "linux")]
             mark_network_isolation_proven(&cfg);
             let pid = child.id();
+            // Fail closed: a child whose guardian cannot be forked is
+            // killed and reaped, never exposed unguarded.
+            let guardian = match guardian::GuardianHandle::try_spawn(pid) {
+                Ok(g) => g,
+                Err(e) => {
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            };
             let reap = ReapState::new();
             let id = self.register(
                 pid,
@@ -2118,6 +2471,7 @@ impl ProcessSupervisor {
                 containment,
                 reap.clone(),
                 bridge.clone(),
+                guardian,
             );
             self.timeline_spawn(id, pid, argv, &cfg.owner);
             (child, pid, id, reap)
@@ -2203,9 +2557,7 @@ impl ProcessSupervisor {
         // produced one): cmd reads the batch file while it runs, so it is
         // deleted only after the child exits.
         let cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
-        if cfg.network_isolation == NetworkIsolation::DenyAll {
-            isolation_gate(&cfg)?;
-        }
+        isolation_gate(&cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         cfg.capture = false;
         let mut cmd = contain_on_create(self.command(&cfg));
@@ -2221,6 +2573,16 @@ impl ProcessSupervisor {
         #[cfg(target_os = "linux")]
         mark_network_isolation_proven(&cfg);
         let pid = child.id();
+        // Fail closed: a child whose guardian cannot be forked is killed
+        // and reaped, never exposed unguarded.
+        let guardian = match guardian::GuardianHandle::try_spawn(pid) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
         let stdin = child
             .stdin
             .take()
@@ -2241,6 +2603,7 @@ impl ProcessSupervisor {
             containment,
             reap.clone(),
             bridge.clone(),
+            guardian,
         );
         self.timeline_spawn(
             id,
@@ -2283,9 +2646,7 @@ impl ProcessSupervisor {
         // The reaper thread owns the materialized cmd script (when lowering
         // produced one): deleted only after the child exits.
         let cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
-        if cfg.network_isolation == NetworkIsolation::DenyAll {
-            isolation_gate(&cfg)?;
-        }
+        isolation_gate(&cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         let mut cmd = contain_on_create(self.command(&cfg));
         install_network_isolation(&mut cmd, bridge.as_ref());
@@ -2303,6 +2664,17 @@ impl ProcessSupervisor {
             #[cfg(target_os = "linux")]
             mark_network_isolation_proven(&cfg);
             let pid = child.id();
+            // Fail closed: a child whose guardian cannot be forked is
+            // killed and reaped, never exposed unguarded.
+            let guardian = match guardian::GuardianHandle::try_spawn(pid) {
+                Ok(g) => g,
+                Err(e) => {
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            };
             let reap = ReapState::new();
             let id = self.register(
                 pid,
@@ -2311,6 +2683,7 @@ impl ProcessSupervisor {
                 containment,
                 reap.clone(),
                 bridge.clone(),
+                guardian,
             );
             self.timeline_spawn(
                 id,
@@ -2398,23 +2771,61 @@ impl ProcessSupervisor {
         process_alive(pid)
     }
 
+    /// The daemon-death guardian pid of one registered row (tests only).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn guardian_pid_for_tests(&self, id: u64) -> Option<u32> {
+        self.registry
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|s| s.guardian.as_ref())
+            .map(|g| g.pid())
+    }
+
+    /// Simulate the owning daemon's death for one row: drop the guardian's
+    /// control pipe WITHOUT terminating the child — exactly what a SIGKILL
+    /// of the daemon does to the last write end. Returns whether a guardian
+    /// was present (tests only).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn release_guardian_for_tests(&self, id: u64) -> bool {
+        let taken = self
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .and_then(|s| s.guardian.take());
+        let present = taken.is_some();
+        drop(taken); // release outside the registry lock
+        present
+    }
+
     /// Collect exited children (no zombies).
     pub fn reap(&self) -> Vec<Reaped> {
         let mut out = Vec::new();
-        let mut reg = self.registry.lock().unwrap();
-        let ids: Vec<u64> = reg.keys().copied().collect();
-        for id in ids {
-            let state = reg.get(&id).unwrap();
-            if let Some(code) = state.exited {
-                out.push(Reaped {
-                    id,
-                    pid: state.pid,
-                    exit_code: code,
-                    owner: state.owner.clone(),
-                });
-                reg.remove(&id);
+        let mut removed: Vec<ChildState> = Vec::new();
+        {
+            let mut reg = self.registry.lock().unwrap();
+            let ids: Vec<u64> = reg.keys().copied().collect();
+            for id in ids {
+                let state = reg.get(&id).unwrap();
+                if let Some(code) = state.exited {
+                    out.push(Reaped {
+                        id,
+                        pid: state.pid,
+                        exit_code: code,
+                        owner: state.owner.clone(),
+                    });
+                    if let Some(state) = reg.remove(&id) {
+                        removed.push(state);
+                    }
+                }
             }
         }
+        // Drop the rows OUTSIDE the registry lock: each one closes its
+        // guardian's control pipe and the guardian SIGTERM→SIGKILLs any
+        // surviving member of the collected child's group, so descendants
+        // cannot outlive the row that owned them.
+        drop(removed);
         out
     }
 
@@ -2504,7 +2915,9 @@ fn now_ms() -> i64 {
 
 /// Canonical refusal wording for DenyAll isolation failures (mirrors the
 /// sandbox crate's "sandbox unavailable" phrasing so daemon error text
-/// stays consistent).
+/// stays consistent). Linux's typed refusal is built in [`spawn_failure`];
+/// only the backend-less pre-spawn gate uses this literal.
+#[cfg(not(target_os = "linux"))]
 const DENY_ALL_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
                                        NetworkIsolation::DenyAll";
 
@@ -2515,6 +2928,15 @@ const DENY_ALL_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under
 /// refused typed.
 const BROKER_ONLY_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
                                          NetworkIsolation::BrokerOnly";
+
+/// Canonical refusal wording for a Required filesystem-workspace demand that
+/// this build/spawn cannot enforce. The spawn is refused typed BEFORE exec —
+/// the child never runs while the projection would claim `workspace`. Linux
+/// enforces via Landlock; only the backend-less pre-spawn gate uses this
+/// literal.
+#[cfg(not(target_os = "linux"))]
+const FILESYSTEM_REFUSAL_PREFIX: &str = "sandbox unavailable: refusing spawn under \
+                                         FilesystemIsolation::Workspace(required)";
 
 /// Prepare the requested per-spawn network isolation BEFORE any process
 /// exists. `Inherit`/`DenyAll` need nothing here (DenyAll's pre-exec hook is
@@ -2582,12 +3004,15 @@ fn install_network_isolation(
     let _ = (cmd, bridge);
 }
 
-/// Pre-spawn fail-closed gate for a DenyAll request. On linux the real
-/// backend exists (pre-exec `unshare(CLONE_NEWNET)`) and is ALWAYS
-/// attempted — capability heuristics never pre-judge it, only the actual
-/// syscall proves or refuses; its failure refuses the spawn typed via
-/// [`spawn_failure`]. Every other platform has no backend at all, so the
-/// request is refused BEFORE spawn, typed, and no process is forked.
+/// Pre-spawn fail-closed gate for OS-confinement requests. On Linux the
+/// real backends exist (pre-exec `unshare(CLONE_NEWNET)` and/or Landlock)
+/// and are ALWAYS attempted — capability heuristics never pre-judge them,
+/// only the actual syscalls prove or refuse; a failure refuses the spawn
+/// typed via [`spawn_failure`]. Every other platform has no filesystem
+/// backend at all, so a `Required` workspace demand is refused BEFORE
+/// spawn, typed, and no process is forked; `BestEffort` falls back to the
+/// honest application-policy-only execution (the projection never claimed
+/// otherwise).
 #[cfg(target_os = "linux")]
 fn isolation_gate(_cfg: &SpawnConfig) -> Result<(), Error> {
     Ok(())
@@ -2595,33 +3020,50 @@ fn isolation_gate(_cfg: &SpawnConfig) -> Result<(), Error> {
 
 #[cfg(not(target_os = "linux"))]
 fn isolation_gate(cfg: &SpawnConfig) -> Result<(), Error> {
-    Err(Error::permission(format!(
-        "{DENY_ALL_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform provides no \
-         per-process network-isolation backend; never running the child unenforced",
-        cfg.cmd
-    )))
+    if cfg.network_isolation == NetworkIsolation::DenyAll {
+        return Err(Error::permission(format!(
+            "{DENY_ALL_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform provides no \
+             per-process network-isolation backend; never running the child unenforced",
+            cfg.cmd
+        )));
+    }
+    if cfg.filesystem_isolation.is_required() {
+        return Err(Error::permission(format!(
+            "{FILESYSTEM_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform provides no \
+             per-process filesystem-confinement backend; never running the child while the \
+             workspace guarantee claims enforcement",
+            cfg.cmd
+        )));
+    }
+    Ok(())
 }
 
-/// Map one spawn() io error. Under a DenyAll request ANY failure to bring
-/// the child up ISOLATED is a typed permission refusal (audit 4/28/35-39:
-/// never warn-and-run unenforced); `e` carries the OS error — for a
-/// pre-exec unshare refusal std transports the raw errno, whose OS message
-/// names the kernel/user-namespace denial. All other configs keep the
-/// historic not_found mapping.
+/// Map one spawn() io error. Under a Required confinement request
+/// (`NetworkIsolation::DenyAll`/`BrokerOnly` or a required filesystem
+/// workspace) ANY failure to bring the child up CONFINED is a typed
+/// permission refusal (audit 4/28/35-39, P1: never warn-and-run
+/// unenforced); `e` carries the OS error — for a pre-exec refusal std
+/// transports the raw errno, whose OS message names the kernel denial. All
+/// other configs keep the historic not_found mapping.
 fn spawn_failure(cfg: &SpawnConfig, e: std::io::Error) -> Error {
+    let mut demands: Vec<&str> = Vec::new();
     match cfg.network_isolation {
-        NetworkIsolation::DenyAll => Error::permission(format!(
-            "{DENY_ALL_REFUSAL_PREFIX} of `{}`: the isolated child could not be created \
-             ({e}); never running it unenforced",
-            cfg.cmd
-        )),
-        NetworkIsolation::BrokerOnly { .. } => Error::permission(format!(
-            "{BROKER_ONLY_REFUSAL_PREFIX} of `{}`: the confined child could not enter its \
-             sandbox network namespace ({e}); never running it unconfined",
-            cfg.cmd
-        )),
-        NetworkIsolation::Inherit => Error::not_found(format!("spawn {}: {e}", cfg.cmd)),
+        NetworkIsolation::DenyAll => demands.push("NetworkIsolation::DenyAll"),
+        NetworkIsolation::BrokerOnly { .. } => demands.push("NetworkIsolation::BrokerOnly"),
+        NetworkIsolation::Inherit => {}
     }
+    if cfg.filesystem_isolation.is_required() {
+        demands.push("FilesystemIsolation::Workspace(required)");
+    }
+    if demands.is_empty() {
+        return Error::not_found(format!("spawn {}: {e}", cfg.cmd));
+    }
+    Error::permission(format!(
+        "sandbox unavailable: refusing spawn under {} of `{}`: the confined child could not be \
+         created ({e}); never running it unenforced",
+        demands.join(" + "),
+        cfg.cmd
+    ))
 }
 
 /// A successful isolated spawn proves its backend active at spawn: the
@@ -2687,6 +3129,63 @@ pub fn deny_all_spawn_confinement() -> Option<SpawnConfinementHook> {
 pub fn record_deny_all_isolation_proven() {
     #[cfg(target_os = "linux")]
     DENY_ALL_PROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The workspace-confinement spawn seam for spawn authorities that build
+/// their own child command (the interactive PTY launcher): the EXACT
+/// Landlock + mount-namespace pre-exec hook the supervisor installs for
+/// [`FilesystemIsolation::Workspace`] — one backend, two spawn seams, never
+/// a second confinement implementation.
+///
+/// `None` for [`FilesystemIsolation::Inherit`] and on every platform with
+/// no backend (macOS/Windows). `None` for a `Workspace { required: false }`
+/// demand is the honest BestEffort fallback (application-policy-only); for
+/// a `required: true` demand it is platform truth the caller must map to a
+/// typed refusal BEFORE any child exists — never a silent no-op.
+#[allow(unsafe_code)]
+pub fn workspace_spawn_confinement(
+    isolation: &FilesystemIsolation,
+) -> Option<SpawnConfinementHook> {
+    #[cfg(target_os = "linux")]
+    {
+        match isolation {
+            FilesystemIsolation::Inherit => None,
+            FilesystemIsolation::Workspace { roots, required } => {
+                let roots = roots.clone();
+                let required = *required;
+                Some(Arc::new(move |cmd: &mut std::process::Command| {
+                    // SAFETY: `apply_workspace_isolation` installs the
+                    // documented allocation-free Landlock pre-exec hook on
+                    // `cmd` (post-fork, pre-exec); the rule table and its C
+                    // strings are built here, in the parent, before the fork.
+                    unsafe {
+                        sandbox::apply_workspace_isolation(cmd, &roots, required);
+                    }
+                }))
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = isolation;
+        None
+    }
+}
+
+/// Compose confinement hooks into one, applied in order. `None` when there
+/// is nothing to install — callers then spawn unconfined, which is only
+/// honest when every demand was `Inherit`/BestEffort.
+pub fn combined_spawn_confinement(
+    hooks: Vec<SpawnConfinementHook>,
+) -> Option<SpawnConfinementHook> {
+    if hooks.is_empty() {
+        return None;
+    }
+    Some(Arc::new(move |cmd: &mut std::process::Command| {
+        for hook in &hooks {
+            hook(cmd);
+        }
+    }))
 }
 
 // ------------------------------------------------------------------ windows
@@ -3194,541 +3693,14 @@ mod tests;
 pub use faktor_winjob::JobGuard;
 
 // ================================================================ windows tests
-// P0-59 process-tree certification through the REAL windows spawn path of
-// this crate: every child is spawned CREATE_SUSPENDED into its own
+// P0-59 process-tree certification through the REAL windows spawn path (see
+// `windows_tests.rs`): every child is spawned CREATE_SUSPENDED into its own
 // KILL_ON_JOB_CLOSE job (assign_strict + membership verification before
-// resume); cancel/kill terminate the job and dropping the supervisor closes
-// it (kill-on-close). taskkill is only a best-effort fallback for pids the
-// supervisor never owned. Runtime-certification only on a windows host — on
-// unix hosts this module does not exist.
+// resume); kill-on-close is the daemon-death containment. Runtime
+// certification only on a windows host.
 #[cfg(all(test, windows))]
-mod windows_tests {
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-    };
-
-    use super::*;
-    use faktor_core::error::ErrorKind;
-
-    #[allow(unsafe_code)]
-    fn pid_alive(pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        // SAFETY: Win32: every handle/pointer passed here is live, initialized, and owned by this function per the documented call contract; results are checked and owned handles closed exactly once.
-        unsafe {
-            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-            if handle.is_null() {
-                return false;
-            }
-            let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
-            CloseHandle(handle);
-            running
-        }
-    }
-
-    fn wait_until<F: FnMut() -> bool>(what: &str, limit: Duration, mut cond: F) {
-        let deadline = Instant::now() + limit;
-        while Instant::now() < deadline {
-            if cond() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("timed out after {limit:?} waiting for {what}");
-    }
-
-    /// powershell (direct child) sleeps 60 s; the ping grandchild is born
-    /// ~1.5 s in — after spawn/resume returned, and since the direct child
-    /// was assigned to its job WHILE SUSPENDED, the grandchild lands in the
-    /// job by descent — writes its pid, and sleeps ~60 s. `ping -n 60` is a
-    /// deterministic ~60 s sleeper even on a network-blocked runner (ICMP
-    /// failure still paces the retries).
-    fn sleeper_tree_script(pid_file: &Path) -> String {
-        // Proven-correct on CI (mirrors the pty lifecycle suite): absolute
-        // system ping path (no PATH reliance under a hidden window) and an
-        // ascii Set-Content write.
-        format!(
-            "Start-Sleep -Milliseconds 1500; \
-             $ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
-             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
-                 -WindowStyle Hidden -PassThru; \
-             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
-             Start-Sleep -Seconds 60",
-            pid_file.display()
-        )
-    }
-
-    fn tree_cfg(pid_file: &Path) -> SpawnConfig {
-        SpawnConfig {
-            cmd: "powershell.exe".into(),
-            args: vec![
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                sleeper_tree_script(pid_file).into(),
-            ],
-            cwd: std::env::temp_dir(),
-            env: EnvSpec::default_baseline(),
-            owner: ProcessOwner::Daemon,
-            capture: false, // no pipe drama: the tree is killed, not drained
-            artifact_max: 1024 * 1024,
-            network_isolation: NetworkIsolation::Inherit,
-        }
-    }
-
-    fn supervisor_with_tree(
-        dir: &tempfile::TempDir,
-        pid_file: &Path,
-    ) -> (Arc<ProcessSupervisor>, SpawnConfig) {
-        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-        let sup = ProcessSupervisor::new(cas);
-        (sup, tree_cfg(pid_file))
-    }
-
-    fn wait_for_grandchild(pid_file: &Path) -> u32 {
-        wait_until("grandchild pid file", Duration::from_secs(60), || {
-            pid_file.exists()
-        });
-        std::fs::read_to_string(pid_file)
-            .expect("grandchild pid file readable")
-            .trim()
-            .parse()
-            .expect("grandchild pid file holds a pid")
-    }
-
-    /// The task-cancellation path (run + CancellationToken) must kill the
-    /// whole supervised tree: direct powershell child AND ping grandchild,
-    /// through the child's kill-on-close job (OS-enumerated membership).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn task_cancellation_kills_the_whole_supervised_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("gc.pid");
-        let (sup, cfg) = supervisor_with_tree(&dir, &pid_file);
-        let token = CancellationToken::new();
-
-        let sup2 = sup.clone();
-        let token2 = token.clone();
-        let task =
-            tokio::spawn(async move { sup2.run(cfg, Duration::from_secs(120), token2).await });
-
-        // The direct child pid is registered + timeline-logged once run()
-        // spawns; poll the timeline instead of guessing.
-        let direct = wait_for_direct_pid(&sup, Duration::from_secs(20));
-        let grandchild = wait_for_grandchild(&pid_file);
-        assert!(
-            pid_alive(direct) && pid_alive(grandchild),
-            "parent + grandchild must be alive before cancellation"
-        );
-
-        token.cancel();
-        let err = task.await.unwrap().unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Cancelled, "{err:?}");
-
-        wait_until("cancelled tree death", Duration::from_secs(10), || {
-            !pid_alive(direct) && !pid_alive(grandchild)
-        });
-    }
-
-    fn wait_for_direct_pid(sup: &ProcessSupervisor, limit: Duration) -> u32 {
-        let deadline = Instant::now() + limit;
-        loop {
-            if let Some(t) = sup.recent_spawns().first() {
-                if t.pid > 0 {
-                    return t.pid;
-                }
-            }
-            assert!(Instant::now() < deadline, "run() must spawn the child");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// Daemon-crash semantics end-to-end: dropping the LAST supervisor
-    /// reference kills the live tree — the per-child job is terminated on
-    /// the drop path and its handle closes right after (kill-on-close), so
-    /// the OS takes every remaining member with no taskkill involved.
-    #[test]
-    fn dropping_the_supervisor_kills_the_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("gc2.pid");
-        let (direct, grandchild) = {
-            let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-            let sup = ProcessSupervisor::new(cas);
-            let cfg = tree_cfg(&pid_file);
-            let handle = sup.spawn(cfg).expect("supervised spawn");
-            let grandchild = wait_for_grandchild(&pid_file);
-            assert!(pid_alive(grandchild), "grandchild must be alive pre-drop");
-            (handle.pid, grandchild) // sup drops here: daemon crash
-        };
-
-        wait_until("drop-killed tree death", Duration::from_secs(10), || {
-            !pid_alive(direct) && !pid_alive(grandchild)
-        });
-    }
-
-    /// Suspended-assign ordering + descendant membership before resume: the
-    /// script starts a `-WindowStyle Hidden` ping as its FIRST action (the
-    /// hidden window gives ping its OWN console, so ONLY job membership can
-    /// reach it) and writes the pid. `CREATE_SUSPENDED` → assign_strict →
-    /// membership check → resume makes the direct child a job member before
-    /// it executes one instruction, so the grandchild is contained by
-    /// descent; a spawn-then-assign race lets it escape. `sup.kill`
-    /// terminates that job and BOTH die (no taskkill pid walk).
-    #[test]
-    fn immediate_detached_grandchild_is_a_job_member_before_resume() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("imm.pid");
-        let (sup, mut cfg) = supervisor_with_tree(&dir, &pid_file);
-        cfg.args[3] = format!(
-            "$ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
-             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
-                 -WindowStyle Hidden -PassThru; \
-             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii; \
-             Start-Sleep -Seconds 60",
-            pid_file.display()
-        );
-        let handle = sup.spawn(cfg).expect("supervised spawn");
-        let grandchild = wait_for_grandchild(&pid_file);
-        assert!(
-            pid_alive(handle.pid) && pid_alive(grandchild),
-            "direct child + immediate detached grandchild must be alive before the kill"
-        );
-        sup.kill(handle.id, 500).expect("containment kill");
-        wait_until("job-terminated tree death", Duration::from_secs(10), || {
-            !pid_alive(handle.pid) && !pid_alive(grandchild)
-        });
-    }
-
-    /// One containment job per CHILD (never one shared job): killing one
-    /// supervised tree terminates exactly that child's job — the other
-    /// tree, detached grandchild included, keeps running until its own job
-    /// is terminated.
-    #[test]
-    fn kill_takes_only_the_target_childs_job() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_a = dir.path().join("a.pid");
-        let pid_b = dir.path().join("b.pid");
-        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-        let sup = ProcessSupervisor::new(cas);
-        let a = sup.spawn(tree_cfg(&pid_a)).expect("tree a");
-        let b = sup.spawn(tree_cfg(&pid_b)).expect("tree b");
-        let ga = wait_for_grandchild(&pid_a);
-        let gb = wait_for_grandchild(&pid_b);
-        assert!(pid_alive(a.pid) && pid_alive(ga) && pid_alive(b.pid) && pid_alive(gb));
-
-        sup.kill(a.id, 500).expect("kill tree a");
-        wait_until("target tree death", Duration::from_secs(10), || {
-            !pid_alive(a.pid) && !pid_alive(ga)
-        });
-        assert!(
-            pid_alive(b.pid) && pid_alive(gb),
-            "killing one child's job must never touch another child's tree"
-        );
-        sup.kill(b.id, 500).expect("cleanup tree b");
-    }
-
-    /// Exited-leader containment: the direct child starts a detached
-    /// grandchild and exits immediately. `reap()` drops the leader's row —
-    /// and with it the job handle — so kill-on-close takes the descendant.
-    /// A taskkill/pid-walk kill cannot do this: the tree's root pid is
-    /// already gone when the descendant must die.
-    #[test]
-    fn reap_kills_the_descendants_of_an_exited_leader() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("orphan.pid");
-        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-        let sup = ProcessSupervisor::new(cas);
-        let mut cfg = tree_cfg(&pid_file);
-        cfg.args[3] = format!(
-            "$ping = Join-Path $env:SystemRoot 'System32\\ping.exe'; \
-             $p = Start-Process -FilePath $ping -ArgumentList '-n','60','127.0.0.1' \
-                 -WindowStyle Hidden -PassThru; \
-             Set-Content -Path '{}' -Value ([string]$p.Id) -Encoding ascii",
-            pid_file.display()
-        );
-        let handle = sup.spawn(cfg).expect("supervised spawn");
-        let grandchild = wait_for_grandchild(&pid_file);
-        assert!(
-            pid_alive(grandchild),
-            "detached descendant alive before reap"
-        );
-        wait_until(
-            "exited leader is collectible",
-            Duration::from_secs(20),
-            || !sup.reap().is_empty(),
-        );
-        assert!(!pid_alive(handle.pid), "leader exited");
-        wait_until(
-            "kill-on-close descendant death after reap",
-            Duration::from_secs(10),
-            || !pid_alive(grandchild),
-        );
-    }
-
-    // --------------- platform-default shell through the supervisor -------
-
-    /// Lower a user/model snippet through the typed command authority and
-    /// run it through the real supervisor. On Windows
-    /// [`ShellKind::PlatformDefault`] must resolve to cmd.exe — never a
-    /// Git-Bash `sh`.
-    fn shell_cfg(script: &str) -> SpawnConfig {
-        let resolved = CommandSpec::shell(script, ShellKind::PlatformDefault)
-            .lower()
-            .expect("platform-default shell must resolve");
-        SpawnConfig {
-            cmd: resolved.program.to_string_lossy().into_owned(),
-            args: resolved
-                .args
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect(),
-            cwd: std::env::temp_dir(),
-            env: EnvSpec::default_baseline(),
-            owner: ProcessOwner::Daemon,
-            capture: true,
-            artifact_max: 1024 * 1024,
-            network_isolation: NetworkIsolation::Inherit,
-        }
-    }
-
-    fn shell_supervisor() -> (tempfile::TempDir, Arc<ProcessSupervisor>) {
-        let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(faktor_cas::Cas::open(dir.path().join("cas")).unwrap());
-        (dir, ProcessSupervisor::new(cas))
-    }
-
-    /// Every shell round-trip assertion names its case and dumps both
-    /// bounded heads (tails): a Windows CI failure must be root-causable
-    /// from the message alone — exit code, timeout flag, stdout/stderr.
-    fn case_tails(out: &SyncRunOutput) -> String {
-        let tail = |s: &str| {
-            let bytes = s.as_bytes();
-            let start = bytes.len().saturating_sub(400);
-            String::from_utf8_lossy(&bytes[start..]).into_owned()
-        };
-        format!(
-            "exit_code={:?} timed_out={} stdout_truncated={} stderr_truncated={} \
-             stdout_tail={:?} stderr_tail={:?}",
-            out.exit_code,
-            out.timed_out,
-            out.stdout_truncated,
-            out.stderr_truncated,
-            tail(&out.stdout_head),
-            tail(&out.stderr_head),
-        )
-    }
-
-    /// Run one shell case and assert the success contract with the case
-    /// label + heads attached to the failure.
-    fn shell_case(
-        sup: &ProcessSupervisor,
-        label: &str,
-        cfg: SpawnConfig,
-        deadline: Duration,
-    ) -> SyncRunOutput {
-        let out = sup
-            .run_sync(cfg, deadline, 64 * 1024, 64 * 1024)
-            .unwrap_or_else(|e| panic!("[{label}] run failed: {e:?}"));
-        let tails = case_tails(&out);
-        assert!(!out.timed_out, "[{label}] must not time out: {tails}");
-        assert_eq!(
-            out.exit_code,
-            Some(0),
-            "[{label}] expected success: {tails}"
-        );
-        out
-    }
-
-    #[test]
-    fn platform_default_shell_is_cmd_exe_not_git_bash() {
-        let resolved = CommandSpec::shell("echo hi", ShellKind::PlatformDefault)
-            .lower()
-            .unwrap();
-        assert_eq!(resolved.program, std::ffi::OsString::from("cmd.exe"));
-        assert!(
-            !resolved
-                .program
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("bash"),
-            "the default shell must never be Git Bash: {:?}",
-            resolved.program
-        );
-        assert_eq!(resolved.args[0], std::ffi::OsString::from("/d"));
-        assert_eq!(resolved.args[1], std::ffi::OsString::from("/c"));
-        // The script is MATERIALIZED: cmd is handed a path, never the raw
-        // embedded-quote snippet (whose /C quote stripping mangled
-        // `echo "a b"` into exit 1 / empty stdout).
-        let script = std::path::PathBuf::from(&resolved.args[2]);
-        assert!(
-            script
-                .file_name()
-                .map(|n| n.to_string_lossy().starts_with("faktor-cmd-"))
-                .unwrap_or(false),
-            "the cmd form must hand over a materialized script path: {:?}",
-            resolved.args
-        );
-        assert!(
-            !resolved
-                .args
-                .iter()
-                .any(|a| a.to_string_lossy().contains("echo hi")),
-            "the raw script must never ride on the cmd command line: {:?}",
-            resolved.args
-        );
-        let _ = std::fs::remove_file(script);
-    }
-
-    #[test]
-    fn materialized_cmd_script_is_deleted_after_the_run() {
-        // The runner owns the materialized script: after the supervised run
-        // the temp `.cmd` file must be gone (cmd reads it while executing,
-        // so deletion happens only once the child has exited).
-        let (_dir, sup) = shell_supervisor();
-        let resolved = CommandSpec::shell("echo cleanup-check", ShellKind::PlatformDefault)
-            .lower()
-            .unwrap();
-        let script = std::path::PathBuf::from(&resolved.args[2]);
-        assert!(script.exists(), "lowering materializes the script");
-        let cfg = SpawnConfig {
-            cmd: resolved.program.to_string_lossy().into_owned(),
-            args: resolved
-                .args
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect(),
-            cwd: std::env::temp_dir(),
-            env: EnvSpec::default_baseline(),
-            owner: ProcessOwner::Daemon,
-            capture: true,
-            artifact_max: 1024 * 1024,
-            network_isolation: NetworkIsolation::Inherit,
-        };
-        let out = sup
-            .run_sync(cfg, Duration::from_secs(20), 64 * 1024, 64 * 1024)
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
-        assert!(
-            out.stdout_head.contains("cleanup-check"),
-            "{:?}",
-            out.stdout_head
-        );
-        assert!(
-            !script.exists(),
-            "the supervisor must delete the run's materialized cmd script"
-        );
-    }
-
-    #[test]
-    fn shell_echo_quoted_spaces_unicode_and_exit_codes_round_trip() {
-        let (_dir, sup) = shell_supervisor();
-        let out = shell_case(
-            &sup,
-            "cmd echo",
-            shell_cfg("echo hello-from-cmd"),
-            Duration::from_secs(20),
-        );
-        assert!(
-            out.stdout_head.contains("hello-from-cmd"),
-            "[cmd echo] stdout must carry the echo: {}",
-            case_tails(&out)
-        );
-
-        let out = shell_case(
-            &sup,
-            "cmd echo quoted spaces",
-            shell_cfg("echo \"a b\""),
-            Duration::from_secs(20),
-        );
-        assert!(
-            out.stdout_head.contains("a b"),
-            "[cmd echo quoted spaces] stdout must carry the quoted text: {}",
-            case_tails(&out)
-        );
-
-        // Unicode through PowerShell: the lowered `-Command` script carries
-        // the terminal-wide UTF-8 prelude (see
-        // `faktor_core::command::POWERSHELL_UTF8_PRELUDE`), so the captured
-        // bytes decode as UTF-8. A loaded Windows runner can take tens of
-        // seconds to cold-start PowerShell under the parallel tree tests
-        // (the pty/fault suites budget 60 s), so this case uses the same
-        // proven budget.
-        let resolved = CommandSpec::shell("Write-Output '日本語'", ShellKind::PowerShell)
-            .lower()
-            .unwrap();
-        let cfg = SpawnConfig {
-            cmd: resolved.program.to_string_lossy().into_owned(),
-            args: resolved
-                .args
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect(),
-            cwd: std::env::temp_dir(),
-            env: EnvSpec::default_baseline(),
-            owner: ProcessOwner::Daemon,
-            capture: true,
-            artifact_max: 1024 * 1024,
-            network_isolation: NetworkIsolation::Inherit,
-        };
-        let out = shell_case(
-            &sup,
-            "powershell unicode UTF-8",
-            cfg,
-            Duration::from_secs(60),
-        );
-        assert!(
-            out.stdout_head.contains("日本語"),
-            "[powershell unicode UTF-8] the UTF-8 prelude must make 日本語 \
-             round-trip (only real UTF-8 bytes decode to it): {}",
-            case_tails(&out)
-        );
-
-        // `exit /b 7` inside the materialized script must propagate exactly
-        // through `cmd.exe /d /c <path>` (the batch's exit code becomes
-        // cmd.exe's exit code).
-        let out = sup
-            .run_sync(
-                shell_cfg("exit /b 7"),
-                Duration::from_secs(20),
-                64 * 1024,
-                64 * 1024,
-            )
-            .unwrap_or_else(|e| panic!("[cmd exit /b 7] run failed: {e:?}"));
-        assert!(
-            !out.timed_out,
-            "[cmd exit /b 7] must not time out: {}",
-            case_tails(&out)
-        );
-        assert_eq!(
-            out.exit_code,
-            Some(7),
-            "[cmd exit /b 7] the batch exit code must propagate exactly: {}",
-            case_tails(&out)
-        );
-    }
-
-    #[test]
-    fn deadline_kills_the_windows_shell_tree() {
-        let (_dir, sup) = shell_supervisor();
-        let out = sup
-            .run_sync(
-                shell_cfg("ping -n 60 127.0.0.1"),
-                Duration::from_millis(500),
-                64 * 1024,
-                64 * 1024,
-            )
-            .unwrap();
-        assert!(out.timed_out, "the deadline must dominate: {out:?}");
-        assert!(
-            sup.alive().is_empty(),
-            "no live child after the timeout kill"
-        );
-    }
-}
+#[path = "windows_tests.rs"]
+mod windows_tests;
 
 // ============================================== containment policy (portable)
 // The Windows containment ordering policy and the supervisor's kill-path
@@ -3934,6 +3906,9 @@ mod containment_policy_tests {
 #[cfg(test)]
 #[path = "budget_hostile.rs"]
 mod budget_hostile;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "filesystem_hostile.rs"]
+mod filesystem_hostile;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "sandbox_hostile.rs"]
 mod sandbox_hostile;

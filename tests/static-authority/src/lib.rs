@@ -6495,6 +6495,7 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/fs/src/platform/windows.rs", 1),
         ("crates/fs/src/rooted.rs", 1),
         ("crates/terminal/src/budget.rs", 1),
+        ("crates/terminal/src/guardian.rs", 1),
         ("crates/terminal/src/sandbox/linux.rs", 1),
         ("crates/winjob/src/lib.rs", 1),
         // fd-identity exec of the verified updater artifact (`fexecve`); the
@@ -6506,6 +6507,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // the pinned handle.
         ("crates/updater/src/win_exec.rs", 1),
         // --- function-level allows in mixed files ---
+        // `terminal/src/lib.rs` now carries TEN: the DenyAll/BrokerOnly PTY
+        // confinement seams plus the filesystem-workspace confinement seam
+        // (`workspace_spawn_confinement`, audit P1), each an allocation-free
+        // pre-exec hook installer with its own per-site SAFETY comment.
         ("crates/terminal/src/lib.rs", 10),
         ("crates/fs/src/tree_manifest.rs", 3),
         ("crates/git/src/guard.rs", 3),
@@ -6520,6 +6525,10 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         // The terminal unix test module (moved out of lib.rs by the audit-17
         // split): the three libc probes keep their per-site SAFETY comments.
         ("crates/terminal/src/tests.rs", 3),
+        // The terminal windows runtime-certification module (split out of
+        // lib.rs by the source-size ceiling): its one libc probe keeps the
+        // per-site SAFETY justification.
+        ("crates/terminal/src/windows_tests.rs", 1),
         // The CLI's test-gated out-of-line modules (the module-decomposition
         // move out of main.rs): the two libc::kill zero-signal probes.
         ("crates/cli/src/main_acp_tests.rs", 1),
@@ -7615,13 +7624,11 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         ("crates/cli/src/tools_market.rs", 5555),
         ("crates/git/src/lib.rs", 4269),
         ("crates/ollama/src/lib.rs", 4107),
-        ("crates/openai/src/lib.rs", 4234),
         ("crates/orchestrator/src/completion_steps.rs", 4631),
         ("crates/orchestrator/src/runtime.rs", 4262),
         ("crates/orchestrator/src/runtime_tests.rs", 5259),
         ("crates/provider/src/egress.rs", 5699),
         ("crates/scheduler/src/lib.rs", 4176),
-        ("crates/server/src/native/terminal_authority.rs", 5189),
         ("crates/session/src/budget.rs", 4010),
     ];
 

@@ -1751,3 +1751,36 @@ fn compaction_cap_guard_is_pinned_against_mutation() {
         "the witness must detect oversized acceptance"
     );
 }
+
+/// A tiny history must never reach the compactor: the wire plan is
+/// dominated by the system prompt/tool bundle (which compaction does not
+/// touch), and a fresh session's first turn used to be failed by a summary
+/// that could only GROW a 3-token history.
+#[tokio::test]
+async fn try_compact_skips_a_tiny_history_without_any_model_call() {
+    let (seed_deps, _dir) = deps(
+        scripted_provider(vec![ScriptedResponse::Text("SHOULD-NOT-RUN".into())]),
+        vec![],
+    );
+    let (manager, session) = shared_session(&seed_deps);
+    let runtime = AgentRuntime::new(seed_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let tiny = vec![RecentTurn {
+        role: "user".into(),
+        text: "hello".into(),
+    }];
+    let plan = runtime
+        .try_compact(
+            &handle,
+            &tiny,
+            &TaskLedger::default(),
+            &ContextBudget::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        plan.is_none(),
+        "a history below the compactable floor must skip compaction"
+    );
+}

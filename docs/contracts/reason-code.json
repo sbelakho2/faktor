@@ -1,0 +1,78 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "reason_code",
+  "type": "faktor_core::state::ReasonCode",
+  "representation": "external",
+  "variants": [
+    {
+      "name": "CheckFailed",
+      "wire": "check_failed",
+      "code": "check_failed"
+    },
+    {
+      "name": "CheckUnavailable",
+      "wire": "check_unavailable",
+      "code": "check_unavailable"
+    },
+    {
+      "name": "ReviewBlocked",
+      "wire": "review_blocked",
+      "code": "review_blocked"
+    },
+    {
+      "name": "BudgetExceeded",
+      "wire": "budget_exceeded",
+      "code": "budget_exceeded"
+    },
+    {
+      "name": "SpendOverBudget",
+      "wire": "spend_over_budget",
+      "code": "spend_over_budget"
+    },
+    {
+      "name": "ChangeBudgetExceeded",
+      "wire": "change_budget_exceeded",
+      "code": "change_budget_exceeded"
+    },
+    {
+      "name": "Stalled",
+      "wire": "stalled",
+      "code": "stalled"
+    },
+    {
+      "name": "LoopDetected",
+      "wire": "loop_detected",
+      "code": "loop_detected"
+    },
+    {
+      "name": "Cancelled",
+      "wire": "cancelled",
+      "code": "cancelled"
+    },
+    {
+      "name": "CriteriaMissing",
+      "wire": "criteria_missing",
+      "code": "criteria_missing"
+    },
+    {
+      "name": "CriteriaInconsistent",
+      "wire": "criteria_inconsistent",
+      "code": "criteria_inconsistent"
+    },
+    {
+      "name": "PatchRevertPatch",
+      "wire": "patch_revert_patch",
+      "code": "patch_revert_patch"
+    },
+    {
+      "name": "RepeatedEvidenceSet",
+      "wire": "repeated_evidence_set",
+      "code": "repeated_evidence_set"
+    },
+    {
+      "name": "UnattributedChange",
+      "wire": "unattributed_change",
+      "code": "unattributed_change"
+    }
+  ]
+}

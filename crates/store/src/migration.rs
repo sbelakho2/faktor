@@ -778,6 +778,17 @@ pub(crate) fn migrate(conn: &mut Connection) -> StoreResult<()> {
             continue;
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Re-read the cursor INSIDE the write lock: a concurrent opener may
+        // have applied this step while we were waiting. Trusting the stale
+        // pre-lock read replayed non-idempotent ALTERs and could commit the
+        // cursor BACKWARDS, permanently bricking the data directory.
+        let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current >= target {
+            tx.commit()
+                .map_err(|e| StoreError::Migration(format!("v{target} skip commit: {e}")))?;
+            version = current;
+            continue;
+        }
         tx.execute_batch(sql)
             .map_err(|e| StoreError::Migration(format!("v{target}: {e}")))?;
         // The v9 op-id sequence table needs its one global row seeded from
@@ -803,6 +814,53 @@ pub(crate) fn migrate(conn: &mut Connection) -> StoreResult<()> {
     // always exist; a store with no legacy rows pays one indexed SELECT.
     import_legacy_verification_facts_conn(conn)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod concurrent_migration_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    /// Adversarial first-open race: two openers migrate the SAME fresh store
+    /// concurrently. Rounds used to end with a complete schema and a cursor
+    /// written BACKWARDS (the loser replayed an idempotent step and then died
+    /// on a non-idempotent one), permanently bricking every later open.
+    #[test]
+    fn concurrent_migration_races_never_brick_the_cursor() {
+        for _round in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("m.db");
+            drop(rusqlite::Connection::open(&path).unwrap());
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut conn = rusqlite::Connection::open(&path).unwrap();
+                        barrier.wait();
+                        migrate(&mut conn)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().expect("no panic"))
+                .collect();
+            assert!(
+                results.iter().any(|r| r.is_ok()),
+                "at least one opener must migrate: {results:?}"
+            );
+            // The directory must STILL open: a later opener applies only what
+            // is pending and never trusts a stale cursor.
+            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            migrate(&mut conn).expect("the raced store must still migrate cleanly");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, MIGRATIONS.len() as i64);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1271,6 +1329,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -1399,6 +1460,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
             s.id
@@ -1527,6 +1591,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 7", []).unwrap();
             }
             s.id
@@ -1644,6 +1711,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 8", []).unwrap();
             }
             (s.id, ws)
@@ -1739,6 +1809,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ws)
@@ -1839,6 +1912,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ledger)
@@ -2126,6 +2202,9 @@ mod tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 13", []).unwrap();
             }
             (s.id, row)
@@ -2202,6 +2281,9 @@ mod tests {
                     ],
                 )
                 .unwrap();
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 25", []).unwrap();
             }
             s.id
@@ -2261,6 +2343,9 @@ mod tests {
                     params![s.id.raw() as i64],
                 )
                 .unwrap();
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 28", []).unwrap();
             }
             s.id
@@ -2440,6 +2525,9 @@ mod typed_ledger_tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 14", []).unwrap();
             }
             (s.id, TaskId::new(1))
@@ -2594,6 +2682,9 @@ mod typed_ledger_tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 16", []).unwrap();
             }
             (s.id, tid)
@@ -2988,6 +3079,9 @@ mod typed_ledger_tests {
                 let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
                 let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
                 let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
+                // The v30 shell-attribution column is post-this-version too:
+                // drop it (tolerantly) so the full chain replays cleanly.
+                let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
                 conn.execute("PRAGMA user_version = 17", []).unwrap();
             }
             (s.id, tid)

@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-EMBED-BATCH-BOUNDS",
+  "file": "crates/search/src/lib.rs",
+  "find": "    let batch_size = embedder.max_batch_size().clamp(1, MAX_SEMANTIC_EMBED_BATCH);",
+  "replace": "    let batch_size = embedder.max_batch_size().max(1);",
+  "gate": "cargo test -p faktor-search --lib provider_batch_cap_is_validated_and_clamped",
+  "expect": "panicked|130",
+  "note": "The upper clamp is dropped: an overclaiming provider's declared batch size raises the effective request size above the hard MAX_SEMANTIC_EMBED_BATCH bound instead of being clamped."
+}

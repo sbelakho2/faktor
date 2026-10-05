@@ -22,6 +22,7 @@ fn server_deps_new_refuses_a_degenerate_empty_store_root_typed() {
         session.clone(),
         permissions.clone(),
         faktor_provider::ProviderRegistry::new(),
+        None,
     );
     match ServerDeps::new(session, agent, permissions) {
         Err(ServerDepsError::DegenerateShadowRoot(

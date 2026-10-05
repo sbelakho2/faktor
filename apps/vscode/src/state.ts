@@ -13,6 +13,8 @@ import type { PixelPresence } from './pixelAgents.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
 import type { NativeBoardPage, NativeIndexCoverageSnapshot } from './nativeClient.ts';
 
+import { safeSlice, stripDisplayControls } from './displayText.ts';
+
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 export const MAX_TRANSCRIPT_ENTRIES = 500;
@@ -264,10 +266,26 @@ export function boardStateFromPage(
 }
 
 function boundText(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) {
-    return value;
+  const clean = stripDisplayControls(value);
+  if (Buffer.byteLength(clean, 'utf8') <= maxBytes) {
+    return clean;
   }
-  return `${value.slice(0, maxBytes)}…`;
+  // Byte-accurate, code-point-iterating truncation: slicing `maxBytes`
+  // CHARACTERS kept up to 4x the byte bound for multibyte text and could
+  // split a surrogate pair. The ellipsis bytes are reserved so the result
+  // honors the byte bound exactly.
+  const budget = maxBytes > 3 ? maxBytes - 3 : maxBytes;
+  let bytes = 0;
+  let end = 0;
+  for (const ch of clean) {
+    const size = Buffer.byteLength(ch, 'utf8');
+    if (bytes + size > budget) {
+      break;
+    }
+    bytes += size;
+    end += ch.length;
+  }
+  return `${clean.slice(0, end)}…`;
 }
 
 /** One bounded `boardRead` host request, or a typed refusal reason. */
@@ -537,7 +555,7 @@ function clampText(existing: string, addition: string): string {
   if (existing.length >= MAX_ENTRY_CHARS) {
     return existing;
   }
-  return (existing + addition).slice(0, MAX_ENTRY_CHARS);
+  return safeSlice(existing + addition, MAX_ENTRY_CHARS);
 }
 
 function emptyEntry(id: string, role: string, seq: number, createdMs: number): TranscriptEntry {
@@ -734,7 +752,7 @@ export function boundJson(value: Json, depth = 0): Json {
     return value;
   }
   if (typeof value === 'string') {
-    return value.length > MAX_SUMMARY_STRING ? `${value.slice(0, MAX_SUMMARY_STRING)}…` : value;
+    return value.length > MAX_SUMMARY_STRING ? `${safeSlice(value, MAX_SUMMARY_STRING)}…` : value;
   }
   if (depth >= 6) {
     return '[…]';
@@ -762,7 +780,7 @@ function boundedJsonText(value: Json): string {
       return 'null';
     }
     return encoded.length > MAX_SUMMARY_JSON_CHARS
-      ? `${encoded.slice(0, MAX_SUMMARY_JSON_CHARS)}…`
+      ? `${safeSlice(encoded, MAX_SUMMARY_JSON_CHARS)}…`
       : encoded;
   } catch {
     return '[unserializable]';
@@ -772,7 +790,7 @@ function boundedJsonText(value: Json): string {
 /** One capability entry as a bounded, renderable string. */
 function capabilityOf(value: Json): string {
   if (typeof value === 'string') {
-    return value.length > MAX_SUMMARY_STRING ? `${value.slice(0, MAX_SUMMARY_STRING)}…` : value;
+    return value.length > MAX_SUMMARY_STRING ? `${safeSlice(value, MAX_SUMMARY_STRING)}…` : value;
   }
   return boundedJsonText(value);
 }
@@ -782,7 +800,7 @@ function agentBlockers(agent: Record<string, Json>): string[] {
   const out: string[] = [];
   const push = (value: Json | undefined): void => {
     if (typeof value === 'string' && value.trim().length > 0) {
-      out.push(value.trim().slice(0, MAX_SUMMARY_STRING));
+      out.push(safeSlice(value.trim(), MAX_SUMMARY_STRING));
     }
   };
   const pushObject = (value: Json | undefined): void => {
@@ -898,7 +916,7 @@ export function summarizeAgents(
       kind: asString(agent.kind) ?? 'child',
       runId: asString(agent.run_id) ?? '',
       state,
-      goal: (asString(agent.goal) ?? '').slice(0, MAX_ENTRY_CHARS),
+      goal: safeSlice(asString(agent.goal) ?? '', MAX_ENTRY_CHARS),
       model,
       provider: provider ?? null,
       reasoning: info?.reasoning ?? null,

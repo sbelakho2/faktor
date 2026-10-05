@@ -428,6 +428,26 @@ pub fn drain_chunk_stream(deps: &mut ServerDeps) {
 /// two listeners) without constructing a second dependency envelope. The
 /// caller must have drained the chunk stream already (see
 /// [`drain_chunk_stream`]); [`serve`] does that itself.
+/// A method with no handler on a known route: typed JSON, never a bare 405.
+async fn native_method_not_allowed() -> axum::response::Response {
+    wire_status(faktor_protocol::error::ApiError {
+        code: "method_not_allowed",
+        message: "method not allowed".into(),
+        http_status: 405,
+        retryable: false,
+    })
+}
+
+/// An unknown native path: typed JSON, never a bare empty 404.
+async fn native_not_found() -> axum::response::Response {
+    wire_status(faktor_protocol::error::ApiError {
+        code: "not_found",
+        message: "no such native route".into(),
+        http_status: 404,
+        retryable: false,
+    })
+}
+
 pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<ServerHandle> {
     // Bind first, then compute the line (needs the bound address) and
     // finally move the deps into the router.
@@ -688,6 +708,11 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
             "/native/orgs/{id}/members",
             get(native_org_members_list).post(native_org_members_invite),
         )
+        // Invitation acceptance (the single-use redemption end of the
+        // invite flow): `accept_invitation` was previously unreachable over
+        // the wire. Rides the daemon password + a control-plane principal;
+        // the body carries the single-use token and the idempotency key.
+        .route("/native/invitations/accept", post(native_invitation_accept))
         .route("/native/repositories", get(native_repositories))
         // GitHub App webhook ingress (additive; disabled by default): the
         // ONLY route without the daemon password — the HMAC signature is the
@@ -788,6 +813,12 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
             "/native/enterprise/effective-config",
             post(native_enterprise_effective_config),
         )
+        // Every rejection is the frozen typed envelope, never an empty body.
+        .method_not_allowed_fallback(native_method_not_allowed)
+        .fallback(native_not_found)
+        // The tower limit alone leaves axum's 2 MiB Json-extractor default in
+        // force: a 2 MiB..10 MiB body was a misleading `400 malformed`.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(AppState {
             deps,

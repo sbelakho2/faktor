@@ -86,6 +86,7 @@ until a review-visible edit of that list — while `generated`, `no-body` and
 | `GET /native/health` | handwritten-grandfathered |  |
 | `GET /native/identity` | handwritten-grandfathered |  |
 | `GET /native/index/coverage` | handwritten-grandfathered |  |
+| `POST /native/invitations/accept` | handwritten-grandfathered |  |
 | `GET /native/jobs/{id}` | handwritten-grandfathered |  |
 | `POST /native/jobs/{id}/result` | handwritten-grandfathered |  |
 | `POST /native/jobs/claim` | handwritten-grandfathered |  |

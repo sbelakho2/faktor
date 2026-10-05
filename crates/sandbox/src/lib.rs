@@ -36,12 +36,112 @@
 //! a broker endpoint and no shell guarantee maps to it: `Required` stays
 //! DenyAll (a broker-less confinement), so a shell can never be handed the
 //! weaker broker-mediated mode.
+//!
+//! ## Filesystem-workspace projection honesty (audit P1)
+//!
+//! [`SpawnProfile::filesystem`] previously said `workspace` whenever both
+//! external rules were `Deny`, even on platforms with NO process-level
+//! filesystem confinement — the executed shell could read/write arbitrary
+//! daemon-accessible paths while the projection claimed a workspace jail.
+//! The projection is now derived from the same three facts the spawn layer
+//! enforces:
+//!
+//! - both external rules `Deny` + [`FilesystemGuarantee::Required`] + a
+//!   build with an OS confinement backend (Linux Landlock) ⇒ `workspace`:
+//!   the spawn layer confines the child or refuses typed BEFORE exec, never
+//!   an unconfined run;
+//! - both external rules `Deny` + [`FilesystemGuarantee::BestEffort`] +
+//!   backend ⇒ `workspace_best_effort`: the spawn layer installs the
+//!   confinement when the kernel provides the ABI and otherwise runs
+//!   application-policy-only — the tag never claims a guaranteed jail;
+//! - no backend on this build (macOS/Windows today) or
+//!   [`FilesystemGuarantee::None`] ⇒ `application-policy-only`: only the
+//!   app-level capability engine is behind the external `Deny` rules; a
+//!   `Required` demand on such a build is a typed spawn refusal, never an
+//!   unconfined run.
+//!
+//! Policy code still performs NO runtime platform probing: the backend
+//! presence is the compile-time [`filesystem_backend_available`] build fact,
+//! and whether the running kernel's Landlock ABI can actually enforce the
+//! ruleset is decided ONLY by the spawn layer's real syscalls (Required
+//! refuses typed when the ABI is absent).
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_security::destination::{Decision, DeniedReason, DestinationPolicy, RequestTarget};
+
+/// True when THIS build has an OS-level per-process filesystem-confinement
+/// backend (Linux Landlock + mount namespace). A compile-time build fact
+/// only, never an enforcement claim: the runtime can still refuse a
+/// `Required` spawn typed (e.g. an old kernel without Landlock ABI v1), and
+/// a `BestEffort` spawn can fall back to application-policy-only. The
+/// spawn layer owns all runtime capability decisions.
+pub const fn filesystem_backend_available() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// The strongest filesystem-confinement contract a policy claims for its
+/// workspace-only shape (both external rules `Deny`). Mirrors
+/// [`SandboxGuarantee`] for the filesystem dimension: `Required` is the
+/// secure default (confine or refuse typed), `BestEffort` allows the honest
+/// application-policy-only fallback, `None` claims nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemGuarantee {
+    /// OS-level workspace confinement is REQUIRED: when both external rules
+    /// are `Deny` the spawn layer confines the child to the workspace root
+    /// (plus the minimal runtime read/execute allowlist and any explicitly
+    /// allowed daemon resources) or refuses typed BEFORE exec. The secure
+    /// default. On builds without a backend the Required demand is a typed
+    /// spawn refusal and the projection is `application-policy-only`.
+    #[default]
+    Required,
+    /// Best-effort: the spawn layer installs OS-level workspace confinement
+    /// where the platform backend exists and otherwise executes behind the
+    /// app-level capability gates only. The limitation is surfaced by the
+    /// `workspace_best_effort` projection tag; it is NEVER presented as a
+    /// guaranteed workspace jail.
+    BestEffort,
+    /// No OS-level filesystem-confinement guarantee is claimed: the spawn
+    /// layer applies no filesystem confinement and the projection is
+    /// `application-policy-only`.
+    None,
+}
+
+impl FilesystemGuarantee {
+    /// The stable snake_case tag of this guarantee (also its serde tag).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            FilesystemGuarantee::Required => "required",
+            FilesystemGuarantee::BestEffort => "best_effort",
+            FilesystemGuarantee::None => "none",
+        }
+    }
+
+    /// The one mapping from a workspace guarantee to the spawn-layer demand:
+    /// `Required` demands a fail-closed workspace confinement, `BestEffort`
+    /// demands an install-if-available confinement, `None` demands nothing.
+    /// Platform enforcement is never pre-judged here.
+    pub const fn filesystem_requirement(self) -> FilesystemIsolationRequirement {
+        match self {
+            FilesystemGuarantee::Required => {
+                FilesystemIsolationRequirement::Workspace { best_effort: false }
+            }
+            FilesystemGuarantee::BestEffort => {
+                FilesystemIsolationRequirement::Workspace { best_effort: true }
+            }
+            FilesystemGuarantee::None => FilesystemIsolationRequirement::Inherit,
+        }
+    }
+}
+
+impl From<FilesystemGuarantee> for FilesystemIsolationRequirement {
+    fn from(guarantee: FilesystemGuarantee) -> Self {
+        guarantee.filesystem_requirement()
+    }
+}
 
 /// What a sandbox policy requires of the spawn layer's network isolation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -117,6 +217,12 @@ impl ShellExecutionMode {
 /// closed typed when the demand cannot be met.
 pub use faktor_core::command::NetworkIsolationRequirement;
 
+/// What the policy DEMANDS of the spawn layer's filesystem confinement.
+/// [`FilesystemGuarantee::filesystem_requirement`] is the single mapping
+/// locus; the terminal crate converts it to its concrete confinement mode
+/// and fails closed typed when a `Required` demand cannot be met.
+pub use faktor_core::command::FilesystemIsolationRequirement;
+
 /// The descriptive spawn projection of one [`SandboxPolicy`]: the effective
 /// filesystem and network profile a spawn admitted under the policy carries.
 /// This is evidence, never a decision — [`PermissionEngine::evaluate`] and
@@ -125,8 +231,22 @@ pub use faktor_core::command::NetworkIsolationRequirement;
 /// the exact profile a child was admitted under.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpawnProfile {
-    /// `workspace` when both external rules are `Deny`, else
-    /// `workspace+external:<read>-<write>` with the rule tags.
+    /// The enforcement-honest filesystem projection of the policy:
+    ///
+    /// - `workspace` — both external rules `Deny`, the workspace guarantee
+    ///   is `Required`, and this build has an OS confinement backend. The
+    ///   spawn layer confines the child or refuses typed BEFORE exec.
+    /// - `workspace_best_effort` — as above with a `BestEffort` guarantee:
+    ///   confinement is installed where the kernel backend supports it and
+    ///   execution falls back to application-policy-only otherwise. NEVER
+    ///   an OS-jail guarantee.
+    /// - `application-policy-only` — no OS confinement backend on this
+    ///   build, or the guarantee is `None`: only the app-level capability
+    ///   engine backs the rules. A `Required` demand here refuses the spawn
+    ///   typed.
+    /// - `workspace+external:<read>-<write>` — at least one external rule
+    ///   is not `Deny`: the profile names the rule tags; no workspace-only
+    ///   confinement is claimed.
     pub filesystem: String,
     /// The typed network guarantee tag of the policy
     /// (`none|best_effort|required`).
@@ -152,11 +272,21 @@ impl SandboxGuarantee {
 impl SandboxPolicy {
     /// Project the policy's filesystem/network profile for one admitted
     /// spawn. Deterministic and side-effect free: the same policy always
-    /// yields the same profile.
+    /// yields the same profile. The filesystem projection is derived from
+    /// the guarantee AND the compile-time backend fact (see the variant
+    /// docs on [`SpawnProfile::filesystem`]) so it never says `workspace`
+    /// where no OS-level confinement can be produced; it remains evidence,
+    /// never a decision — the spawn layer owes the actual syscall proof.
     pub fn spawn_profile(&self) -> SpawnProfile {
         let external_denied = self.read_external == Rule::Deny && self.write_external == Rule::Deny;
         let filesystem = if external_denied {
-            "workspace".to_string()
+            match (self.filesystem_guarantee, filesystem_backend_available()) {
+                (FilesystemGuarantee::None, _) | (_, false) => {
+                    "application-policy-only".to_string()
+                }
+                (FilesystemGuarantee::Required, true) => "workspace".to_string(),
+                (FilesystemGuarantee::BestEffort, true) => "workspace_best_effort".to_string(),
+            }
         } else {
             format!(
                 "workspace+external:{}-{}",
@@ -179,6 +309,23 @@ impl SandboxPolicy {
         ShellExecutionState {
             mode: self.shell_execution,
             network_guarantee: self.network_guarantee,
+        }
+    }
+
+    /// The typed filesystem-confinement demand this policy imposes (audit
+    /// P1). The demand is workspace-shaped: it exists only where the policy
+    /// claims the jail (both external rules `Deny`); elsewhere the profile
+    /// names the external rules and no workspace confinement is demanded.
+    /// The spawn site converts it through the terminal crate's
+    /// `FilesystemIsolation` (adding the session workspace root) and the
+    /// spawn layer enforces it or refuses typed BEFORE exec. No platform
+    /// pre-judgement happens here: a `Required` demand on a backend-less
+    /// build is the spawn layer's typed refusal.
+    pub fn spawn_filesystem_requirement(&self) -> FilesystemIsolationRequirement {
+        if self.read_external == Rule::Deny && self.write_external == Rule::Deny {
+            self.filesystem_guarantee.filesystem_requirement()
+        } else {
+            FilesystemIsolationRequirement::Inherit
         }
     }
 
@@ -416,6 +563,16 @@ pub struct SandboxPolicy {
     /// [`SpawnProfile::shell`].
     #[serde(default)]
     pub shell_execution: ShellExecutionMode,
+    /// The filesystem-confinement contract of a workspace-only policy
+    /// (audit P1). It takes effect exactly where the policy claims the
+    /// workspace jail (both external rules `Deny`): `Required` (the secure
+    /// default) demands OS-level confinement or a typed refusal BEFORE
+    /// exec, `BestEffort` installs it where the kernel supports it and
+    /// otherwise runs application-policy-only, `None` claims nothing. The
+    /// effective tag is projected through [`SpawnProfile::filesystem`] and
+    /// demanded through [`PermissionEngine::spawn_filesystem_requirement`].
+    #[serde(default)]
+    pub filesystem_guarantee: FilesystemGuarantee,
 }
 
 impl Default for SandboxPolicy {
@@ -434,6 +591,11 @@ impl Default for SandboxPolicy {
             // refuse the spawn typed instead of running it unenforced.
             network_guarantee: SandboxGuarantee::Required,
             shell_execution: ShellExecutionMode::OsIsolated,
+            // Audit P1 secure default: a policy that claims the workspace
+            // jail (both external rules Deny) demands OS-level filesystem
+            // confinement and refuses the spawn typed where the kernel
+            // cannot enforce it.
+            filesystem_guarantee: FilesystemGuarantee::Required,
         }
     }
 }
@@ -528,6 +690,19 @@ impl PermissionEngine {
     /// isolated or refuses typed before exec.
     pub fn spawn_network_requirement(&self) -> NetworkIsolationRequirement {
         self.policy.network_guarantee.network_requirement()
+    }
+
+    /// The typed filesystem-confinement demand this policy imposes (audit
+    /// P1). The demand is workspace-shaped: it exists only where the policy
+    /// claims the jail (both external rules `Deny`); elsewhere the profile
+    /// names the external rules and no workspace confinement is demanded.
+    /// The spawn site converts it through the terminal crate's
+    /// `FilesystemIsolation` (adding the session workspace root) and the
+    /// spawn layer enforces it or refuses typed BEFORE exec. No platform
+    /// pre-judgement happens here: a `Required` demand on a backend-less
+    /// build is the spawn layer's typed refusal.
+    pub fn spawn_filesystem_requirement(&self) -> FilesystemIsolationRequirement {
+        self.policy.spawn_filesystem_requirement()
     }
 
     /// Evaluate one capability against the policy.

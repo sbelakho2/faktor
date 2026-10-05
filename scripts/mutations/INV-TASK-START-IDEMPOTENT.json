@@ -1,8 +1,9 @@
 {
   "id": "INV-TASK-START-IDEMPOTENT",
   "file": "crates/store/src/task_admission.rs",
-  "find": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(TaskAdmissionClaim::InFlight)\n                }",
-  "replace": "                \"pending\" => {\n                    tx.commit()?;\n                    Ok(TaskAdmissionClaim::Fresh)\n                }",
+  "find": "                        let receipt_json: String = tx.query_row(\n                            \"SELECT receipt_json FROM task_admission WHERE key = ?1\",\n                            params![key.as_str()],\n                            |r| r.get(0),\n                        )?;\n                        TaskAdmissionClaim::Complete(receipt_json)",
+  "replace": "                        let receipt_json: String = tx.query_row(\n                            \"SELECT receipt_json FROM task_admission WHERE key = ?1\",\n                            params![key.as_str()],\n                            |r| r.get(0),\n                        )?;\n                        let _ = receipt_json;\n                        TaskAdmissionClaim::Fresh",
   "gate": "cargo test -p faktor-store --lib claim_fresh_then_complete_replays_the_exact_receipt_bytes",
-  "note": "A pending submission key is admitted as Fresh again: the concurrent duplicate is no longer refused as in-flight."
+  "expect": "assertion.*failed|left.*right",
+  "note": "A completed submission key is answered Fresh again instead of replaying the stored byte-exact receipt: the same logical start can execute a second time and the idempotent receipt contract is broken."
 }

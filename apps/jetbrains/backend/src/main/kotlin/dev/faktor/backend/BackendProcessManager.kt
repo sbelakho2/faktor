@@ -65,6 +65,7 @@ data class ReleaseTrustFailure(val code: String, val message: String) {
 }
 
 private const val MAX_BUFFERED_LINES = 1024
+private const val MAX_BUFFERED_LINE_CHARS = 64 shl 10
 private const val PID_PROBE_TIMEOUT_MS = 5_000L
 private const val STOP_POLL_MS = 50L
 private const val HEALTH_PROBE_TIMEOUT_MS = 2_000L
@@ -247,7 +248,16 @@ class BackendProcessManager(
             throw BackendException("failed to launch the faktor-cli binary: ${e.message}", cause = e)
         }
         val sink = StdoutSink(process)
-        val port = sink.awaitStartupLine(STARTUP_TIMEOUT_MS)
+        // An interrupt (worker cancellation/thread-pool shutdown) during the
+        // startup wait must not leak the child and its drain thread with no
+        // handle to stop them (Zero orphans): reap before rethrowing.
+        val port = try {
+            sink.awaitStartupLine(STARTUP_TIMEOUT_MS)
+        } catch (e: Throwable) {
+            process.destroyForcibly()
+            sink.stop()
+            throw e
+        }
         if (port == null) {
             val exit = try {
                 process.exitValue()
@@ -310,6 +320,16 @@ class BackendProcessManager(
      * connection and nothing is signalled.
      */
     fun stop(connection: BackendConnection) {
+        try {
+            stopInner(connection)
+        } finally {
+            // The drainer must stop even if an interrupt escaped the waits:
+            // a reader thread outliving stop() is an orphan.
+            connection.sink.stop()
+        }
+    }
+
+    private fun stopInner(connection: BackendConnection) {
         val releasePid = connection.resolvedReleasePid()
         val launcherPid = connection.process.pid()
         var signalled = false
@@ -322,7 +342,14 @@ class BackendProcessManager(
                 terminatePid(releasePid, force = false)
                 val deadline = System.currentTimeMillis() + STOP_GRACE_MS
                 while (pidAlive(releasePid) && System.currentTimeMillis() < deadline) {
-                    Thread.sleep(STOP_POLL_MS)
+                    try {
+                        Thread.sleep(STOP_POLL_MS)
+                    } catch (e: InterruptedException) {
+                        // Keep tearing down: restore the flag and escalate now
+                        // instead of abandoning a live release daemon.
+                        Thread.currentThread().interrupt()
+                        break
+                    }
                 }
                 if (pidAlive(releasePid)) {
                     terminatePid(releasePid, force = true)
@@ -332,9 +359,19 @@ class BackendProcessManager(
         val process = connection.process
         if (process.isAlive) {
             process.destroy()
-            if (!process.waitFor(STOP_GRACE_MS, TimeUnit.MILLISECONDS)) {
+            val exited = try {
+                process.waitFor(STOP_GRACE_MS, TimeUnit.MILLISECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!exited) {
                 process.destroyForcibly()
-                process.waitFor(1, TimeUnit.SECONDS)
+                try {
+                    process.waitFor(1, TimeUnit.SECONDS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
             }
         }
         if (!signalled && connection.stopRefusal == null && connection.releaseTrustError != null) {
@@ -343,7 +380,6 @@ class BackendProcessManager(
             // silent no-op.
             connection.recordStopRefusal(connection.releaseTrustError)
         }
-        connection.sink.stop()
     }
 
     private fun generatePassword(): String {
@@ -535,7 +571,15 @@ private class BoundedDrainer(
     fun awaitFinish(timeoutMs: Long): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (!finished && System.currentTimeMillis() < deadline) {
-            Thread.sleep(5L)
+            try {
+                Thread.sleep(5L)
+            } catch (e: InterruptedException) {
+                // runCommand promises "never throws": treat the drainer as
+                // unfinished, restore the flag and let the caller's
+                // close-and-reawait fallback run instead of escaping.
+                Thread.currentThread().interrupt()
+                return false
+            }
         }
         return finished
     }
@@ -577,7 +621,14 @@ internal fun runCommand(
     val drainThread = Thread(drainer, "faktor-command-drain")
     drainThread.isDaemon = true
     drainThread.start()
-    val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+    val finished = try {
+        process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (e: InterruptedException) {
+        // Contract: never throws, never orphans. Restore the flag, treat the
+        // child as unfinished and force-reap it below.
+        Thread.currentThread().interrupt()
+        false
+    }
     if (!finished) {
         process.destroyForcibly()
         try {
@@ -653,7 +704,12 @@ class StdoutSink(process: Process) {
         // The latch may have been tripped by onExit a micro-instant before
         // the drainer parsed the line; give it a brief chance.
         while (startupPort == null && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10)
+            try {
+                Thread.sleep(10)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return startupPort
+            }
         }
         return startupPort
     }
@@ -676,27 +732,71 @@ class StdoutSink(process: Process) {
     }
 
     private fun drain(process: Process) {
-        val reader = BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8))
+        val reader = InputStreamReader(process.inputStream, Charsets.UTF_8)
+        val chunk = CharArray(DRAIN_CHUNK_BYTES)
+        val line = StringBuilder()
+        var overlong = false
+        var skipLf = false
+
+        fun emit(truncated: Boolean) {
+            val text = if (truncated) {
+                line.toString() + "… (line truncated at $MAX_BUFFERED_LINE_CHARS chars)"
+            } else {
+                line.toString()
+            }
+            if (announcedHandshake == null) {
+                val announced = ReleasePidLine.parse(line.toString())
+                if (announced != null) {
+                    announcedHandshake = announced
+                }
+            }
+            val parsed = StartupLine.parse(line.toString())
+            if (parsed != null && startupPort == null) {
+                startupPort = parsed.port
+                startup.countDown()
+            }
+            synchronized(lock) {
+                ring.addLast(text)
+                while (ring.size > MAX_BUFFERED_LINES) {
+                    ring.removeFirst()
+                }
+            }
+            line.setLength(0)
+            overlong = false
+        }
+
         try {
             while (!stopped) {
-                val line = reader.readLine() ?: break
-                if (announcedHandshake == null) {
-                    val announced = ReleasePidLine.parse(line)
-                    if (announced != null) {
-                        announcedHandshake = announced
+                val n = reader.read(chunk)
+                if (n < 0) break
+                for (k in 0 until n) {
+                    val c = chunk[k]
+                    when {
+                        c == '\r' -> {
+                            emit(overlong)
+                            skipLf = true
+                        }
+                        c == '\n' -> {
+                            if (skipLf) {
+                                skipLf = false
+                            } else {
+                                emit(overlong)
+                            }
+                        }
+                        overlong -> skipLf = false
+                        line.length < MAX_BUFFERED_LINE_CHARS -> {
+                            line.append(c)
+                            skipLf = false
+                        }
+                        else -> {
+                            overlong = true
+                            skipLf = false
+                        }
                     }
                 }
-                val parsed = StartupLine.parse(line)
-                if (parsed != null && startupPort == null) {
-                    startupPort = parsed.port
-                    startup.countDown()
-                }
-                synchronized(lock) {
-                    ring.addLast(line)
-                    while (ring.size > MAX_BUFFERED_LINES) {
-                        ring.removeFirst()
-                    }
-                }
+            }
+            if (line.isNotEmpty() || overlong) {
+                emit(overlong)
             }
         } catch (e: IOException) {
             // Stream closed under us (e.g. destroyForcibly during stop()).

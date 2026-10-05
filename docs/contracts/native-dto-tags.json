@@ -1,0 +1,29 @@
+{
+  "schema": "faktor-frozen-contract/v1",
+  "vocabulary": "native_dto_tags",
+  "type": "faktor_protocol::native::Part",
+  "representation": "internal",
+  "tag": "type",
+  "variants": [
+    {
+      "name": "Text",
+      "wire": "text"
+    },
+    {
+      "name": "Reasoning",
+      "wire": "reasoning"
+    },
+    {
+      "name": "ToolCall",
+      "wire": "tool_call"
+    },
+    {
+      "name": "ToolResult",
+      "wire": "tool_result"
+    },
+    {
+      "name": "Summary",
+      "wire": "summary"
+    }
+  ]
+}

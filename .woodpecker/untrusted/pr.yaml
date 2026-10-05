@@ -169,6 +169,7 @@ steps:
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
       - cargo test -p faktor-tests-fuzz-seeds
+      - cargo run -p faktor-contracts -- check
       - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="target/release/faktor-cli" bash scripts/supply-chain.sh
       - |
         set -eu
@@ -177,6 +178,7 @@ steps:
         cargo test -p faktor-tests-static-authority
         cargo test -p faktor-security
         cargo test -p faktor-tests-fuzz-seeds
+        cargo run -p faktor-contracts -- check
         SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="target/release/faktor-cli" bash scripts/supply-chain.sh
         CMDS
         )"

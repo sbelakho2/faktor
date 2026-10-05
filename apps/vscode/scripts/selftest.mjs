@@ -26,7 +26,9 @@ import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import * as cpa from '../src/controlPlaneAuth.ts';
 import * as mn from '../src/money.ts';
+import * as dt from '../src/displayText.ts';
 import composerPolicy from '../media/composer-state.js';
+import boardPolicy from '../media/board-state.js';
 import {
   chmodSync,
   existsSync,
@@ -38,6 +40,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
@@ -760,6 +763,44 @@ function chunkReader(chunks) {
     },
     async cancel() {
       this.cancelled += 1;
+    },
+  };
+}
+
+/**
+ * One fake body reader for the observed dribble fault: HEADERS have already
+ * arrived, the body keeps yielding a single byte every `intervalMs` under the
+ * byte cap, and it never finishes on its own. `cancel()` must stop the timer
+ * (no leaked handles). `budgetMs` is a hard self-stop so a client that never
+ * enforces its deadline fails the assertion instead of wedging the selftest.
+ */
+function dribbleReader({ intervalMs, budgetMs, byte = 0x20 }) {
+  const value = new Uint8Array([byte]);
+  const started = Date.now();
+  let stopped = false;
+  let timer = null;
+  return {
+    reads: 0,
+    cancelled: 0,
+    async read() {
+      this.reads += 1;
+      if (stopped || Date.now() - started >= budgetMs) {
+        return { done: true };
+      }
+      return await new Promise((resolve) => {
+        timer = setTimeout(() => {
+          timer = null;
+          resolve(stopped ? { done: true } : { done: false, value });
+        }, intervalMs);
+      });
+    },
+    async cancel() {
+      this.cancelled += 1;
+      stopped = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
     },
   };
 }
@@ -1679,6 +1720,72 @@ async function clientRejects() {
       'request timeout',
     );
   });
+
+  await test('client deadline covers the whole bounded body read (headers are not completion)', async () => {
+    // The observed fault: the old client cleared its abort timer when response
+    // HEADERS arrived, so a body that dribbled under the byte cap never
+    // settled. The deadline must cancel the reader and refuse typed.
+    const timeoutMs = 1200;
+    const readers = [];
+    const dribbleRoute = (status, contentType) => () => {
+      const reader = dribbleReader({ intervalMs: 300, budgetMs: 6000 });
+      readers.push(reader);
+      return {
+        status,
+        ok: status >= 200 && status < 300,
+        headers: {
+          get: (name) => (name.toLowerCase() === 'content-type' ? contentType : null),
+        },
+        body: { getReader: () => reader },
+        arrayBuffer: async () => new ArrayBuffer(0),
+        text: async () => '',
+      };
+    };
+    const { client } = makeClient(
+      {
+        'GET /native/health': dribbleRoute(200, 'application/json'),
+        'GET /native/session/7/attachments/ref/9/bytes': dribbleRoute(
+          200,
+          'application/octet-stream',
+        ),
+        'GET /native/ready': dribbleRoute(500, 'application/json'),
+      },
+      { timeoutMs },
+    );
+    const deadlineError = (error) =>
+      error instanceof nc.NativeProtocolError &&
+      error.message.includes(`request timed out after ${timeoutMs}ms`);
+    // readBounded (JSON 2xx) must settle at the deadline, cancel the reader,
+    // and not wait for the body to finish.
+    const jsonStarted = Date.now();
+    await assertRejects(
+      () => client.health(),
+      deadlineError,
+      'dribbling JSON body',
+    );
+    const jsonElapsed = Date.now() - jsonStarted;
+    assert(jsonElapsed >= timeoutMs - 100, `JSON dribble timed out early at ${jsonElapsed}ms`);
+    assert(jsonElapsed < 3000, `JSON dribble settled long past the deadline at ${jsonElapsed}ms`);
+    assert(readers[0].cancelled >= 1, 'the timed-out JSON reader must be cancelled');
+    // readBoundedBytes (raw attachment route) is bounded by the same deadline.
+    const bytesStarted = Date.now();
+    await assertRejects(
+      () => client.attachmentReferenceBytes('7', 9),
+      deadlineError,
+      'dribbling raw body',
+    );
+    const bytesElapsed = Date.now() - bytesStarted;
+    assert(bytesElapsed < 3000, `raw dribble settled long past the deadline at ${bytesElapsed}ms`);
+    assert(readers[1].cancelled >= 1, 'the timed-out byte reader must be cancelled');
+    // A dribbling NON-2xx body is the same request deadline, not an unbounded
+    // error-body read.
+    await assertRejects(
+      () => client.ready(),
+      deadlineError,
+      'dribbling error body',
+    );
+    assert(readers[2].cancelled >= 1, 'the timed-out error-body reader must be cancelled');
+  });
 }
 
 // ------------------------------------------------- 4. daemon contract drift
@@ -1690,7 +1797,6 @@ async function clientRejects() {
  */
 async function contractDriftTests() {
   const lifecycleUrl = new URL('../../../crates/server/src/api/lifecycle.rs', import.meta.url);
-  const eventKindUrl = new URL('../../../crates/core/src/event.rs', import.meta.url);
   const nativeSessionUrl = new URL(
     '../../../crates/server/src/native/session.rs',
     import.meta.url,
@@ -1746,15 +1852,22 @@ async function contractDriftTests() {
     assert(!eventStreamSource.includes('/api/session'), 'the old SSE path must not return');
   });
 
-  await test('client event vocabulary matches the daemon EventKind list', () => {
-    const eventRs = readFileSync(eventKindUrl, 'utf8');
-    const enumStart = eventRs.indexOf('pub enum EventKind');
-    const enumEnd = eventRs.indexOf('impl EventKind');
-    assert(enumStart >= 0 && enumEnd > enumStart, 'EventKind enum must be parseable');
-    const kinds = new Set();
-    for (const match of eventRs.slice(enumStart, enumEnd).matchAll(/^ {4}([A-Z][A-Za-z0-9]*),/gm)) {
-      kinds.add(match[1].replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase());
-    }
+  await test('client event vocabulary matches the frozen compiled EventKind contract', () => {
+    // The vocabulary authority is the generated frozen contract (derived from
+    // the compiled serde implementation by `cargo run -p faktor-contracts --
+    // check`), never a hand-parsed source scan.
+    const contractUrl = new URL('../../../docs/contracts/event-kind.json', import.meta.url);
+    assert(
+      existsSync(contractUrl),
+      'the generated EventKind contract docs/contracts/event-kind.json must be checked in',
+    );
+    const contract = JSON.parse(readFileSync(contractUrl, 'utf8'));
+    assert(contract.schema === 'faktor-frozen-contract/v1', 'EventKind contract schema');
+    assert(
+      contract.type === 'faktor_core::event::EventKind',
+      'EventKind contract must name the compiled type',
+    );
+    const kinds = new Set(contract.variants.map((variant) => variant.wire));
     for (const canonical of [
       'prompt_received',
       'model_chunk_received',
@@ -1894,7 +2007,11 @@ async function eventStreamTests() {
     await stream.whenStopped();
     assertDeepEqual(delivered.map((event) => event.id), [1, 2]);
     assertEqual(delivered[0].event, 'prompt_received');
-    assertEqual(stream.cursor, 5, 'heartbeat ids must advance the cursor');
+    assertEqual(
+      stream.cursor,
+      2,
+      'heartbeat ids must NEVER advance the resume cursor (a hostile id would skip durable events)',
+    );
     assert(statuses.includes('open'), `statuses included open: ${statuses.join(',')}`);
     assertEqual(errors.length, 2);
     assert(
@@ -1986,8 +2103,10 @@ async function eventStreamTests() {
     await stream.whenStopped();
     assertEqual(urls.length, 2, 'one reconnect was expected');
     assertEqual(new URL(urls[0]).searchParams.get('after'), '6');
-    assertEqual(new URL(urls[1]).searchParams.get('after'), '7');
-    assertDeepEqual(delivered, [8], 'the replayed frame behind the cursor must not redeliver');
+    // The heartbeat announced id 7 but carried no durable event: the resume
+    // cursor stays 6, so frame 7 is delivered (never skipped) on reconnect.
+    assertEqual(new URL(urls[1]).searchParams.get('after'), '6');
+    assertDeepEqual(delivered, [7, 8], 'the heartbeat-only id must not skip frame 7');
     assert(sleeps.length >= 1 && sleeps[0] >= 5, `backoff slept: ${JSON.stringify(sleeps)}`);
     assertEqual(stream.status, 'stopped');
   });
@@ -4954,6 +5073,153 @@ async function boardAndForwardingTests() {
     assertEqual(calls.length, 0, 'invalid board posts must never reach the wire');
   });
 
+  await test('the webview board policy mirrors the host bounds and never fabricates', () => {
+    // Bound parity: the panel's local policy must equal the host authority,
+    // or a draft the panel accepts is refused after the round trip.
+    assertEqual(boardPolicy.MAX_BOARD_SUBJECT_BYTES, st.MAX_BOARD_SUBJECT_BYTES);
+    assertEqual(boardPolicy.MAX_BOARD_BODY_BYTES, st.MAX_BOARD_BODY_BYTES);
+    // Header vocabulary: unread/not-read/unavailable are distinct.
+    assertEqual(boardPolicy.boardHeader(null), 'board: not read yet');
+    assert(
+      boardPolicy
+        .boardHeader(st.unavailableBoardState('route absent (HTTP 404 not_found)'))
+        .includes('unavailable'),
+      'an unavailable board must say so',
+    );
+    const page = st.boardStateFromPage(clone(boardPageJson), 2).board;
+    assertEqual(boardPolicy.boardHeader(page), 'board: rev=3 unread=1 posts=2');
+    // Draft policy matches the host byte bounds (multibyte counted by bytes).
+    assertEqual(boardPolicy.boardDraftRefusal('', 'body'), 'subject is required');
+    assertEqual(boardPolicy.boardDraftRefusal('subject', '  '), 'body is required');
+    assert(
+      boardPolicy.boardDraftRefusal('s'.repeat(513), 'b').includes('512'),
+      'an over-bound subject names the byte bound',
+    );
+    assert(
+      boardPolicy.boardDraftRefusal('subject', 'b'.repeat(16 * 1024 + 1)).includes('16384'),
+      'an over-bound body names the byte bound',
+    );
+    // 170 * 2 bytes = 340 bytes of "sé", under 512; 257 * 2 = 514 over.
+    assertEqual(boardPolicy.boardDraftRefusal('s\u00e9'.repeat(170), 'b'), null);
+    assert(
+      boardPolicy.boardDraftRefusal('s\u00e9'.repeat(257), 'b').startsWith('subject exceeds'),
+      'multibyte subjects are measured in UTF-8 bytes',
+    );
+    assertEqual(boardPolicy.boardDraftRefusal('subject', 'body'), null);
+    // Display view: hostile/long daemon strings are bounded, never raw.
+    const posts = boardPolicy.boardPostsForDisplay(page);
+    assertEqual(posts.length, 2);
+    assertEqual(posts[0].author, 'child:8');
+    const hostile = boardPolicy.boardPostsForDisplay({
+      available: true,
+      posts: [
+        {
+          id: 1,
+          revision: 4,
+          author: 'x'.repeat(5000),
+          subject: 'y'.repeat(5000),
+          body: 'z'.repeat(5000),
+        },
+      ],
+    });
+    assertEqual(hostile[0].author.length, boardPolicy.MAX_BOARD_LINE_CHARS + 1);
+    assertEqual(hostile[0].subject.endsWith('\u2026'), true);
+    assertEqual(hostile[0].body.endsWith('\u2026'), true);
+    assertDeepEqual(boardPolicy.boardPostsForDisplay(st.unavailableBoardState('x')), []);
+    assertDeepEqual(boardPolicy.boardPostsForDisplay(null), []);
+  });
+
+  await test('the board DOM renders bounded rows, gates the draft and clears on ack', () => {
+    const snapshot = webviewSnapshot([]);
+    snapshot.board = st.boardStateFromPage(clone(boardPageJson), 2).board;
+    const { posted, dom, deliver } = runChatWebview(snapshot);
+    assertEqual(dom.document.getElementById('board-header').textContent, 'board: rev=3 unread=1 posts=2');
+    const list = dom.document.getElementById('board-posts');
+    const rows = list.children.filter((node) => node.className === 'board-post');
+    assertEqual(rows.length, 2, 'one row per projected post');
+    assert(fakeText(rows[0]).includes('handoff'), fakeText(rows[0]));
+    assert(fakeText(rows[0]).includes('child:8'), fakeText(rows[0]));
+
+    const subject = dom.document.getElementById('board-subject');
+    const body = dom.document.getElementById('board-body');
+    const postButton = dom.document.getElementById('btn-board-post');
+    assertEqual(postButton.disabled, true, 'Post is disabled while the draft is empty');
+    subject.value = 'subj';
+    subject.dispatch('input', {});
+    assertEqual(postButton.disabled, true, 'the body is still required');
+    body.value = 'hello board';
+    body.dispatch('input', {});
+    assertEqual(postButton.disabled, false, 'a valid draft enables Post');
+    dom.document.getElementById('board-post').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'boardPost',
+      token: 'bp-1',
+      subject: 'subj',
+      body: 'hello board',
+    });
+    // The durable, token-correlated ack clears exactly the submitted draft
+    // (a refusal arrives as boardRefused and keeps it); the button returns
+    // to disabled.
+    const boardToken = posted[posted.length - 1].token;
+    deliver({ type: 'boardPosted', revision: 4, token: boardToken });
+    assertEqual(subject.value, '');
+    assertEqual(body.value, '');
+    assertEqual(postButton.disabled, true);
+
+    // A typed refusal releases the in-flight lock and KEEPS the draft.
+    subject.value = 'subj-2';
+    body.value = 'body-2';
+    subject.dispatch('input', {});
+    dom.document.getElementById('board-post').dispatch('submit', { preventDefault() {} });
+    const refusedToken = posted[posted.length - 1].token;
+    deliver({ type: 'boardRefused', token: refusedToken, reason: 'server refused' });
+    assertEqual(subject.value, 'subj-2', 'a refusal must keep the newer draft');
+    assertEqual(postButton.disabled, false, 'a refusal releases the in-flight lock');
+
+    // Read posts an explicit top-of-board read (watermark moves server-side).
+    dom.document.getElementById('btn-board-read').click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'boardRead', since: null, limit: null });
+
+    // Unavailable board: the typed reason is shown and NO row is fabricated.
+    const down = webviewSnapshot([]);
+    down.board = st.unavailableBoardState('route absent (HTTP 404 not_found)');
+    const second = runChatWebview(down);
+    assert(
+      second.dom.document.getElementById('board-header').textContent.includes('unavailable'),
+      second.dom.document.getElementById('board-header').textContent,
+    );
+    assertEqual(second.dom.document.getElementById('board-posts').children.length, 0);
+  });
+
+  await test('display bounds are byte-accurate, surrogate-safe and control-free', () => {
+    const emoji = '\u{1F600}';
+    // Byte-accurate projection bound: 300 emoji (1200 bytes) must shrink to
+    // <= 512 UTF-8 bytes, not 512 characters.
+    const page = clone(boardPageJson);
+    page.posts[0].subject = emoji.repeat(300);
+    page.posts[0].body = 'ok\u0000\u200ehidden';
+    const board = st.boardStateFromPage(page, null).board;
+    const subject = board.posts[0].subject;
+    assert(
+      Buffer.byteLength(subject, 'utf8') <= st.MAX_BOARD_SUBJECT_BYTES,
+      `projected subject must honor the byte bound: ${Buffer.byteLength(subject, 'utf8')} bytes`,
+    );
+    assertEqual(dt.hasLoneSurrogate(subject), false, 'no lone surrogate may survive truncation');
+    assert(subject.endsWith('\u2026'), subject);
+    assertEqual(board.posts[0].body, 'okhidden', 'invisible controls must not reach the panel');
+    // Primitives: a cut between a high and low surrogate backs off one unit.
+    assertEqual(dt.safeSlice('a\u{1F600}b', 2), 'a');
+    assertEqual(dt.safeSlice('a\u{1F600}b', 3), 'a\u{1F600}');
+    assertEqual(dt.safeSlice('a\u{1F600}b', 1), 'a');
+    assertEqual(dt.stripDisplayControls('a\u200eb\u0000c'), 'abc');
+    // The webview policy mirrors the same protection for display lines.
+    const long = boardPolicy.boundBoardLine('a\u{1F600}b'.repeat(100));
+    assertEqual(long.length, boardPolicy.MAX_BOARD_LINE_CHARS + 1);
+    assertEqual(dt.hasLoneSurrogate(long), false, 'the webview line bound must not split a pair');
+    assertEqual(long.includes('\uFFFD'), false);
+    assertEqual(boardPolicy.boundBoardLine('a\u200eb\u0000c'), 'abc');
+  });
+
   await test('composer files are bounded per-entry and forwarded to the native task-run', async () => {
     const { files, refused } = ts.boundedWebviewFiles([
       'src/a.ts',
@@ -5082,6 +5348,24 @@ async function boardAndForwardingTests() {
     });
     const parsed = ts.parseCompletionContract(inherited);
     assert('reason' in parsed, 'inherited-only members must be refused');
+  });
+
+  await test('a dismissed completion-contract picker aborts instead of starting a task', () => {
+    // Escape / closed picker: the caller must ABORT (undefined), never
+    // silently start the run with the default path.
+    assertEqual(ts.completionContractFromPicks(undefined), undefined);
+    // Explicit empty selection: no conditional steps.
+    assertEqual(ts.completionContractFromPicks([]), null);
+    assertDeepEqual(ts.completionContractFromPicks([{ key: 'include_commit' }]), {
+      include_commit: true,
+      include_push: false,
+      include_pr: false,
+    });
+    assertEqual(
+      ts.completionContractFromPicks([{ key: 'include_commit' }, { key: 'include_pr' }])
+        .include_pr,
+      true,
+    );
   });
 }
 
@@ -5619,7 +5903,7 @@ async function cockpitTests() {
         byKey.verification.lines[1].includes('tree ver1234') &&
         byKey.verification.lines[1].includes('commit abcdef12') &&
         byKey.verification.lines[1].includes('head refs/9') &&
-        byKey.verification.lines[1].includes('cost 0.0000'),
+        byKey.verification.lines[1].includes('cost 12\u00b5$'),
       JSON.stringify(byKey.verification.lines),
     );
     assert(
@@ -5631,6 +5915,13 @@ async function cockpitTests() {
       JSON.stringify(byKey.evidence),
     );
     assert(byKey.spend.present && byKey.spend.lines[0].includes('tokens 130'));
+    assertEqual(byKey.spend.lines[1], 'cost 12\u00b5$', 'one unit per money value');
+    assertEqual(byKey.spend.lines[2], 'reserved 0\u00b5$', 'one unit per reserved value');
+    assertEqual(
+      byKey.verification.lines[1].includes('\u00b5$\u00b5$'),
+      false,
+      'the verification cost line must not double the unit',
+    );
     assertEqual(cp.evidenceRefOf('evidence:41').id, 41);
     assertEqual(cp.evidenceRefOf('plain text').id, null);
     assertEqual(cp.phaseOf({ stage: 'verify' }), 'verify');
@@ -6292,6 +6583,30 @@ async function acceptanceProofTests() {
 
 // ----------------------------------------- presentation webview (fake DOM)
 
+function matchesFakeSelector(node, selector) {
+  return String(selector)
+    .split(',')
+    .map((part) => part.trim())
+    .some((part) => {
+      if (!part) {
+        return false;
+      }
+      if (part.startsWith('.')) {
+        return String(node.className)
+          .split(/\s+/)
+          .includes(part.slice(1));
+      }
+      const attr = /^\[([a-zA-Z-]+)(?:="([^"]*)")?\]$/.exec(part);
+      if (attr) {
+        if (!(attr[1] in node.attributes)) {
+          return false;
+        }
+        return attr[2] === undefined || node.attributes[attr[1]] === attr[2];
+      }
+      return node.tagName === part;
+    });
+}
+
 function makeFakeDom() {
   const nodesById = new Map();
   function makeNode(tagName) {
@@ -6318,6 +6633,17 @@ function makeFakeDom() {
     };
     node.focus = () => {
       node.focused = true;
+      // Mirror the browser: focus() on a DETACHED node is a no-op.
+      let root = node;
+      while (root.parentNode) {
+        root = root.parentNode;
+      }
+      for (const candidate of nodesById.values()) {
+        if (candidate === root) {
+          document.activeElement = node;
+          return;
+        }
+      }
     };
     Object.defineProperty(node, 'scrollHeight', {
       get: () =>
@@ -6339,8 +6665,18 @@ function makeFakeDom() {
       const index = node.children.indexOf(child);
       if (index >= 0) {
         node.children.splice(index, 1);
+        child.parentNode = null;
       }
       return child;
+    };
+    node.replaceChild = (next, old) => {
+      const index = node.children.indexOf(old);
+      if (index >= 0) {
+        node.children[index] = next;
+        next.parentNode = node;
+        old.parentNode = null;
+      }
+      return old;
     };
     node.setAttribute = (key, value) => {
       node.attributes[key] = String(value);
@@ -6358,10 +6694,42 @@ function makeFakeDom() {
       }
     };
     node.click = () => node.dispatch('click', {});
+    node.contains = (other) => {
+      let cursor = other;
+      while (cursor) {
+        if (cursor === node) {
+          return true;
+        }
+        cursor = cursor.parentNode;
+      }
+      return false;
+    };
+    node.querySelectorAll = (selector) => {
+      const found = [];
+      const collect = (current) => {
+        for (const child of current.children) {
+          if (matchesFakeSelector(child, selector)) {
+            found.push(child);
+          }
+          collect(child);
+        }
+      };
+      collect(node);
+      return found;
+    };
+    node.querySelector = (selector) => node.querySelectorAll(selector)[0] || null;
     node.cloneNode = () => {
       const copy = makeNode(tagName);
       copy.className = node.className;
       copy.textContent = node.textContent;
+      copy.hidden = node.hidden;
+      copy.disabled = node.disabled;
+      copy.value = node.value;
+      copy.checked = node.checked;
+      copy.attributes = { ...node.attributes };
+      for (const child of node.children) {
+        copy.appendChild(child.cloneNode());
+      }
       return copy;
     };
     Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
@@ -6369,6 +6737,19 @@ function makeFakeDom() {
     return node;
   }
   const document = {
+    activeElement: null,
+    listeners: {},
+    addEventListener(type, callback) {
+      if (!this.listeners[type]) {
+        this.listeners[type] = [];
+      }
+      this.listeners[type].push(callback);
+    },
+    dispatch(type, event) {
+      for (const callback of this.listeners[type] || []) {
+        callback(event || {});
+      }
+    },
     getElementById(id) {
       if (!nodesById.has(id)) {
         nodesById.set(id, makeNode('div'));
@@ -6378,14 +6759,10 @@ function makeFakeDom() {
     createElement: makeNode,
     createElementNS: (namespace, tagName) => makeNode(tagName),
     querySelectorAll(selector) {
-      const match = /^\[data-evidence="([^"]+)"\]$/.exec(String(selector));
-      if (!match) {
-        return [];
-      }
       const found = [];
       for (const root of nodesById.values()) {
         walkFake(root, (node) => {
-          if (node.attributes['data-evidence'] === match[1]) {
+          if (matchesFakeSelector(node, selector)) {
             found.push(node);
           }
         });
@@ -6424,6 +6801,99 @@ function fakeText(root) {
   return out;
 }
 
+/**
+ * Canonical DOM identity (one line per node: structure + classes + flags +
+ * text), bounded by depth and node count. This is the VS Code analogue of
+ * the JetBrains component-tree/state digest: markup or render drift fails a
+ * pinned test before any browser is involved.
+ */
+function canonicalNode(node, depth, budget, out) {
+  if (budget.count >= 2000 || depth > 24) {
+    return;
+  }
+  budget.count += 1;
+  const attrs = Object.keys(node.attributes || {})
+    .sort()
+    .map((key) => `${key}=${JSON.stringify(node.attributes[key])}`)
+    .join(',');
+  out.push(
+    `${'  '.repeat(depth)}${node.tagName} class=${JSON.stringify(node.className || '')}` +
+      ` hidden=${node.hidden === true} disabled=${node.disabled === true}` +
+      ` checked=${node.checked === true} value=${JSON.stringify(String(node.value || ''))}` +
+      ` text=${JSON.stringify(String(node.textContent || '').slice(0, 2000))} attrs=[${attrs}]`,
+  );
+  for (const child of node.children || []) {
+    canonicalNode(child, depth + 1, budget, out);
+  }
+}
+
+/** Digest of every id-rooted subtree chat.js populated in the fake DOM. */
+function canonicalDomDigest(nodesById) {
+  const out = [];
+  const budget = { count: 0 };
+  for (const id of [...nodesById.keys()].sort()) {
+    out.push(`#${id}`);
+    canonicalNode(nodesById.get(id), 0, budget, out);
+  }
+  return createHash('sha256').update(out.join('\n'), 'utf8').digest('hex');
+}
+
+/** Static-markup digest: nonces/URIs/CSP normalized, whitespace folded. */
+function webviewMarkupDigest(markup) {
+  const bodyStart = markup.indexOf('<body>');
+  const bodyEnd = markup.indexOf('</body>');
+  assert(bodyStart >= 0 && bodyEnd > bodyStart, 'the webview markup must carry a body');
+  const normalized = markup
+    .slice(bodyStart, bodyEnd)
+    .replace(/nonce="\$\{nonce\}"/g, 'nonce="N"')
+    .replace(/src="\$\{[A-Za-z]+\}"/g, 'src="URI"')
+    .replace(/content="\$\{csp\}"/g, 'content="CSP"')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+/**
+ * The canonical snapshot the DOM digest is pinned over: deterministic
+ * fixtures only (no clocks, no daemon, no filesystem).
+ */
+function canonicalDomSnapshot() {
+  const snapshot = webviewSnapshot(st.summarizeAgents(nc.validateAgents(clone(agentsJson))));
+  snapshot.board = st.boardStateFromPage(clone(boardPageJson), 2).board;
+  // The pin must exercise the render paths a regression can silently break:
+  // a transcript entry with reasoning + a tool evidence ref (renderEntry /
+  // renderTool / evidence button) and a cockpit section (renderCockpit).
+  snapshot.transcript = [
+    transcriptEntry(1, 'canonical entry', {
+      reasoning: 'because',
+      tools: [
+        {
+          name: 'read_file',
+          state: 'completed',
+          excerpt: 'canonical excerpt',
+          exitCode: null,
+          artifact: 'evidence:7',
+        },
+      ],
+    }),
+  ];
+  snapshot.cockpit = { state: 'ok' };
+  snapshot.cockpitSections = [
+    {
+      key: 'task',
+      title: 'Task',
+      present: true,
+      lines: ['canonical cockpit line'],
+      evidence: [],
+      actions: [],
+    },
+  ];
+  return snapshot;
+}
+
+const DOM_BASELINE_SCHEMA = 'faktor-vscode-dom/v1';
+const DOM_BASELINE_URL = new URL('./baselines/dom-baseline.json', import.meta.url);
+
 function webviewSnapshot(agents) {
   return {
     daemon: 'running',
@@ -6451,13 +6921,14 @@ function webviewSnapshot(agents) {
 
 function runChatWebview(snapshot) {
   const source = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
-  // The real webview loads the composer draft policy BEFORE chat.js (see
-  // src/webview.ts); the fake context mirrors that exact script order so the
-  // draft-clearing contract is exercised, not the fallback.
+  // The real webview loads the board and composer policies BEFORE chat.js
+  // (see src/webview.ts); the fake context mirrors that exact script order so
+  // the draft/board contracts are exercised, not the fallbacks.
   const composerSource = readFileSync(
     new URL('../media/composer-state.js', import.meta.url),
     'utf8',
   );
+  const boardSource = readFileSync(new URL('../media/board-state.js', import.meta.url), 'utf8');
   const posted = [];
   const dom = makeFakeDom();
   let messageHandler = null;
@@ -6477,8 +6948,11 @@ function runChatWebview(snapshot) {
     acquireVsCodeApi: () => ({ postMessage: (message) => posted.push(message) }),
     setTimeout: () => 0,
     clearTimeout: () => {},
+    // The browser encoding primitive board-state.js measures drafts with.
+    TextEncoder,
   };
   vm.createContext(sandbox);
+  vm.runInContext(boardSource, sandbox);
   vm.runInContext(composerSource, sandbox);
   vm.runInContext(source, sandbox);
   assert(messageHandler, 'chat.js must register a window message listener');
@@ -6676,11 +7150,26 @@ async function composerAttachmentTests() {
       'stream-recovery',
       'btn-refresh-snapshot',
       'btn-reconnect-stream',
+      'board-card',
+      'board-header',
+      'board-posts',
+      'board-subject',
+      'board-body',
+      'btn-board-read',
+      'btn-board-post',
     ]) {
       assert(markup.includes(`id="${id}"`), `the markup must carry #${id}`);
     }
     assert(/<label for="goal"/.test(markup), 'the goal textarea must have a real <label for>');
     assert(markup.includes('>Task goal</label>'), 'the accessible name must be the visible label text');
+    assert(/<label for="board-subject"/.test(markup), 'the board subject must have a real <label for>');
+    assert(/<label for="board-body"/.test(markup), 'the board body must have a real <label for>');
+    assert(/<label for="board-subject"[^>]*>Subject<\/label>/.test(markup), 'board subject visible label text');
+    assert(/<label for="board-body"[^>]*>Body<\/label>/.test(markup), 'board body visible label text');
+    assert(
+      /<button id="btn-board-post" type="submit">Post<\/button>/.test(markup),
+      'the board post control must be a submit inside the board form',
+    );
     assert(markup.includes('never skipped'), 'the recovery affordance must say the frame is replayed');
     assert(markup.includes('faktor-cli doctor'), 'the recovery affordance must name the daemon doctor');
     const entries = /<div id="entries"([^>]*)>/.exec(markup);
@@ -6689,7 +7178,13 @@ async function composerAttachmentTests() {
     assert(entries[1].includes('aria-live="polite"'), entries[1]);
     assert(entries[1].includes('aria-relevant="additions"'), entries[1]);
     // Predictable Tab traversal: the composer markup order IS the tab order.
-    const composer = markup.slice(markup.indexOf('<form id="composer">'), markup.indexOf('</form>'));
+    // The slice must end at the composer's OWN closing tag: another form
+    // (the board composer) earlier in the markup made a file-wide first
+    // `</form>` search slice the wrong region.
+    const composerStart = markup.indexOf('<form id="composer">');
+    const composerEnd = markup.indexOf('</form>', composerStart);
+    assert(composerStart >= 0 && composerEnd > composerStart, 'the composer form must be present');
+    const composer = markup.slice(composerStart, composerEnd);
     const order = [
       'id="goal"',
       'id="btn-attach"',
@@ -6719,6 +7214,100 @@ async function composerAttachmentTests() {
     for (const id of referenced) {
       assert(markup.includes(`id="${id}"`), `chat.js references #${id} but the markup lacks it`);
     }
+  });
+
+  await test('every contributed setting is declared with its pinned type and description', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    const props = pkg.contributes.configuration.properties;
+    const expected = {
+      'faktor.binaryPath': 'string',
+      'faktor.dataDir': 'string',
+      'faktor.installRoot': 'string',
+      'faktor.extraArgs': 'array',
+      'faktor.startupTimeoutMs': 'number',
+      'faktor.autoStart': 'boolean',
+      'faktor.defaultProvider': 'string',
+      'faktor.defaultModel': 'string',
+      'faktor.mutationMode': 'string',
+      'faktor.budgetTokens': 'number',
+      'faktor.budgetCostMicro': 'number',
+      'faktor.controlPlaneEndpoint': 'string',
+      'faktor.controlPlaneOrganization': 'string',
+      'faktor.controlPlaneAuthSession': 'string',
+      'faktor.controlToken': 'string',
+    };
+    assertDeepEqual(
+      Object.keys(props).sort(),
+      Object.keys(expected).sort(),
+      'the contributed setting id set is pinned',
+    );
+    for (const [id, type] of Object.entries(expected)) {
+      assertEqual(props[id].type, type, `${id} type`);
+      assert(
+        typeof props[id].description === 'string' && props[id].description.length > 0,
+        `${id} must carry a description`,
+      );
+    }
+    assertEqual(props['faktor.extraArgs'].items.type, 'string', 'extraArgs item type');
+    assertEqual(typeof props['faktor.startupTimeoutMs'].minimum, 'number', 'startup minimum');
+    assertEqual(
+      props['faktor.startupTimeoutMs'].minimum < props['faktor.startupTimeoutMs'].default,
+      true,
+      'the startup timeout minimum must be below the default',
+    );
+    assertEqual(
+      typeof props['faktor.controlToken'].deprecationMessage === 'string',
+      true,
+      'the legacy plaintext token must stay marked deprecated',
+    );
+  });
+
+  await test('the webview markup and canonical DOM identity are pinned against drift', () => {
+    const markup = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    const { dom } = runChatWebview(canonicalDomSnapshot());
+    const observed = {
+      schema: DOM_BASELINE_SCHEMA,
+      markupDigest: webviewMarkupDigest(markup),
+      renderDigest: canonicalDomDigest(dom.nodesById),
+    };
+    // Mutation witness: the pin is not vacuous — a one-character markup
+    // change and a one-text-node render change each move the digest.
+    assert(
+      webviewMarkupDigest(markup.replace('id="goal"', 'id="goa1"')) !== observed.markupDigest,
+      'the markup digest must react to a one-character change',
+    );
+    const probe = runChatWebview(canonicalDomSnapshot());
+    probe.dom.document.getElementById('board-header').textContent = 'board: mutated';
+    assert(
+      canonicalDomDigest(probe.dom.nodesById) !== observed.renderDigest,
+      'the DOM digest must react to a rendered-text change',
+    );
+    const entryProbe = runChatWebview(canonicalDomSnapshot());
+    const entryNode = entryProbe.dom.document.getElementById('entries').children[0];
+    const evidenceHolder = entryNode.querySelector('[data-evidence="7"]');
+    assert(evidenceHolder !== null, 'the canonical entry must carry an evidence holder');
+    evidenceHolder.removeChild(evidenceHolder.querySelector('button'));
+    assert(
+      canonicalDomDigest(entryProbe.dom.nodesById) !== observed.renderDigest,
+      'the DOM digest must react to a removed evidence button',
+    );
+    if (process.env.FAKTOR_UPDATE_DOM_BASELINE === '1') {
+      mkdirSync(new URL('./baselines/', import.meta.url), { recursive: true });
+      writeFileSync(DOM_BASELINE_URL, `${JSON.stringify(observed, null, 2)}\n`);
+      return;
+    }
+    const baseline = JSON.parse(readFileSync(DOM_BASELINE_URL, 'utf8'));
+    assertEqual(baseline.schema, DOM_BASELINE_SCHEMA, 'dom baseline schema');
+    assertEqual(
+      observed.markupDigest,
+      baseline.markupDigest,
+      'the static webview markup drifted; re-pin with FAKTOR_UPDATE_DOM_BASELINE=1',
+    );
+    assertEqual(
+      observed.renderDigest,
+      baseline.renderDigest,
+      'the canonical DOM render drifted; re-pin with FAKTOR_UPDATE_DOM_BASELINE=1',
+    );
   });
 
   await test('host attachment metadata renders filename/MIME/size with refusal, remove and clear', () => {
@@ -7839,6 +8428,103 @@ async function transcriptScrollTests() {
     );
   });
 
+  await test('streaming preserves delivered evidence occurrences and focus on the last entry', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const entries = [
+      transcriptEntry(1, 'one'),
+      transcriptEntry(2, 'two', {
+        tools: [
+          { name: 'read', state: 'completed', excerpt: 'a', exitCode: null, artifact: 'evidence:7' },
+          { name: 'grep', state: 'completed', excerpt: 'b', exitCode: null, artifact: 'evidence:7' },
+        ],
+      }),
+    ];
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    harness.deliver({ type: 'evidence', id: 7, text: 'EVIDENCE-TEXT', truncated: false });
+    const container = harness.dom.document.getElementById('entries');
+    const holders = container.children[1].querySelectorAll('[data-evidence="7"]');
+    assertEqual(holders.length, 2, 'two holder occurrences');
+    assertEqual(holders[1].querySelectorAll('pre').length, 1, 'the second holder has its delivery');
+    // deliverEvidence replaced each button with the delivered text and moved
+    // focus to the LAST delivery (the control the operator activated).
+    const focusTarget = holders[1].querySelector('pre');
+    assert(focusTarget !== null, 'the second delivery must exist');
+    assertEqual(
+      harness.dom.document.activeElement === focusTarget,
+      true,
+      'focus starts on the second delivery',
+    );
+    // A stream delta on the last entry: both occurrences keep their exact
+    // delivery and focus stays on the same control (duplicate labels and
+    // duplicate artifact refs are both adversarial cases).
+    entries[1] = transcriptEntry(2, 'two plus', { tools: entries[1].tools });
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    const refreshed = container.children[1];
+    const refreshedHolders = refreshed.querySelectorAll('[data-evidence="7"]');
+    assertEqual(refreshedHolders.length, 2, 'both occurrences survive');
+    assertEqual(
+      refreshedHolders[0].querySelectorAll('pre')[0].textContent,
+      'EVIDENCE-TEXT',
+      'first delivery restored',
+    );
+    assertEqual(
+      refreshedHolders[1].querySelectorAll('pre')[0].textContent,
+      'EVIDENCE-TEXT',
+      'second delivery restored to the SAME occurrence',
+    );
+    assertEqual(
+      harness.dom.document.activeElement === refreshedHolders[1].querySelector('pre'),
+      true,
+      'focus follows the SAME occurrence, not the first duplicate',
+    );
+  });
+
+  await test('a same-length content change updates the DOM; streaming replaces only the last entry', () => {
+    const harness = runChatWebview(transcriptSnapshot([]));
+    const container = harness.dom.document.getElementById('entries');
+    const entries = [transcriptEntry(1, 'one'), transcriptEntry(2, 'two')];
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.children.length, 2);
+    const firstNode = container.children[0];
+    // Same LENGTH, different content: a length-only signature left the old
+    // text, old tool name and missing evidence button on screen.
+    entries[1] = transcriptEntry(2, 'TWO');
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.children[0], firstNode, 'earlier entries keep their DOM node');
+    assert(
+      fakeText(container.children[1]).includes('TWO'),
+      fakeText(container.children[1]),
+    );
+    assertEqual(
+      fakeText(container.children[1]).includes('two '),
+      false,
+      'the old same-length text must be gone',
+    );
+    // A streaming delta on the last entry replaces ONLY that node: earlier
+    // nodes (and their open details/evidence/focus) are never rebuilt.
+    const lastNode = container.children[1];
+    entries[1] = transcriptEntry(2, 'TWO and more text');
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(container.children.length, 2);
+    assertEqual(container.children[0], firstNode, 'streaming must not rebuild earlier entries');
+    assert(container.children[1] !== lastNode, 'the changed last entry is re-rendered');
+    assert(
+      fakeText(container.children[1]).includes('TWO and more text'),
+      fakeText(container.children[1]),
+    );
+    // The fast path must honor the pinned-follows contract: a reader at the
+    // bottom keeps following the stream.
+    container.clientHeight = 200;
+    container.scrollTop = container.scrollHeight;
+    entries[1] = transcriptEntry(2, 'TWO and more text, streamed further');
+    harness.deliver({ type: 'snapshot', snapshot: transcriptSnapshot(entries) });
+    assertEqual(
+      container.scrollTop,
+      container.scrollHeight,
+      'a pinned reader keeps following through the streaming fast path',
+    );
+  });
+
   await test('an unpinned reader keeps the first visible entry and pixel offset', () => {
     const harness = runChatWebview(transcriptSnapshot([]));
     const container = harness.dom.document.getElementById('entries');
@@ -8111,6 +8797,183 @@ async function reducedMotionTests() {
   });
 }
 
+// ------------------------------------------- acceptance-verdict contrast (AA)
+
+/** sRGB channel -> linear light (WCAG 2.x relative luminance). */
+function srgbToLinear(channel) {
+  const c = channel / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/** WCAG relative luminance of a #rrggbb color. */
+function relativeLuminance(hex) {
+  const value = hex.replace('#', '');
+  return (
+    0.2126 * srgbToLinear(parseInt(value.slice(0, 2), 16)) +
+    0.7152 * srgbToLinear(parseInt(value.slice(2, 4), 16)) +
+    0.0722 * srgbToLinear(parseInt(value.slice(4, 6), 16))
+  );
+}
+
+/** WCAG contrast ratio (>= 1, order-independent) of two #rrggbb colors. */
+function contrastRatio(foreground, background) {
+  const a = relativeLuminance(foreground);
+  const b = relativeLuminance(background);
+  const high = Math.max(a, b);
+  const low = Math.min(a, b);
+  return (high + 0.05) / (low + 0.05);
+}
+
+/** One `.selector { ... }` block's declaration text, or null. */
+function cssRuleBlock(css, selector) {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`(?:^|[\\s,}])${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+  return match ? match[1] : null;
+}
+
+/** Declaration value by property name (later wins, `!important` stripped). */
+function cssDeclaration(block, property) {
+  const pattern = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`, 'g');
+  let value = null;
+  for (const match of block.matchAll(pattern)) {
+    value = match[1].trim().replace(/!important\s*$/i, '').trim();
+  }
+  return value;
+}
+
+/**
+ * Resolve a declared color to a #rrggbb token. A `var(--name, fallback)`
+ * form resolves to its FALLBACK: the static pin cannot know a theme's value,
+ * so a verdict chip that leans on a theme variable fails closed here (and
+ * `verdictChipPairs` separately rejects theme-variable backgrounds).
+ */
+function resolveDeclaredColor(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return null;
+  }
+  const varMatch = /^var\(\s*(--[\w-]+)\s*,\s*([^)]+)\)$/.exec(value);
+  if (varMatch) {
+    return resolveDeclaredColor(varMatch[2]);
+  }
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value.toLowerCase() : null;
+}
+
+const VERDICT_CHIP_SELECTORS = [
+  '.criterion-verdict-pass',
+  '.criterion-verdict-fail',
+  '.criterion-verdict-unavailable',
+];
+
+/**
+ * Pure checker over chat.css text: every verdict chip must declare a
+ * resolvable foreground/background pair with a WCAG contrast ratio >= 4.5:1
+ * (AA for normal-size text; the chips render at 0.8em). Returns one record
+ * per chip so callers can assert without parsing CSS themselves, and THROWS
+ * on a missing/unresolvable declaration: a chip that cannot be measured is
+ * never a pass.
+ */
+function verdictChipPairs(css) {
+  return VERDICT_CHIP_SELECTORS.map((selector) => {
+    const block = cssRuleBlock(css, selector);
+    assert(block, `chat.css must declare ${selector}`);
+    const background = resolveDeclaredColor(cssDeclaration(block, 'background'));
+    const foreground = resolveDeclaredColor(cssDeclaration(block, 'color'));
+    assert(background, `${selector} must declare a measurable background color`);
+    assert(foreground, `${selector} must declare a measurable color`);
+    return {
+      selector,
+      background,
+      foreground,
+      ratio: contrastRatio(foreground, background),
+    };
+  });
+}
+
+async function verdictContrastTests() {
+  await test('every acceptance-verdict pair meets WCAG AA 4.5:1 in chat.css', () => {
+    const css = readFileSync(new URL('../media/chat.css', import.meta.url), 'utf8');
+    const pairs = verdictChipPairs(css);
+    assertEqual(pairs.length, 3, 'all three verdict chips must be measurable');
+    for (const pair of pairs) {
+      assert(
+        pair.ratio >= 4.5,
+        `${pair.selector} contrast ${pair.ratio.toFixed(3)}:1 (${pair.foreground} on ${pair.background}) is below 4.5:1`,
+      );
+    }
+  });
+
+  await test('the verdict checker rejects the historical white-on-accent colors', () => {
+    // Mutation witness: the exact defect this pin exists to catch. If the
+    // historical declarations return, `verdictChipPairs` must report a
+    // failing ratio (2.540:1 and 3.352:1), not silently accept them.
+    const historical = `
+      .criterion-verdict-pass { background: var(--vscode-testing-iconPassed, #3fb950); color: #fff; }
+      .criterion-verdict-fail { background: var(--vscode-testing-iconFailed, #f85149); color: #fff; }
+      .criterion-verdict-unavailable { background: var(--vscode-editorWarning-foreground, #d29922); color: var(--vscode-editorWarning-foreground, #d29922); }
+    `;
+    const parsed = verdictChipPairs(historical.replace(/color: #fff;/g, 'color: #ffffff;'));
+    const pass = parsed.find((pair) => pair.selector === '.criterion-verdict-pass');
+    const fail = parsed.find((pair) => pair.selector === '.criterion-verdict-fail');
+    assert(pass && Math.abs(pass.ratio - 2.54) < 0.01, `white on #3fb950 must measure 2.540:1, got ${pass && pass.ratio}`);
+    assert(fail && Math.abs(fail.ratio - 3.352) < 0.01, `white on #f85149 must measure 3.352:1, got ${fail && fail.ratio}`);
+    assert(
+      parsed.some((pair) => pair.ratio < 4.5),
+      'the historical pairs must FAIL the 4.5:1 gate',
+    );
+    // A chip whose pair cannot be resolved (transparent background) is an
+    // error, never an automatic pass.
+    let unresolvable = false;
+    try {
+      verdictChipPairs(
+        `.criterion-verdict-pass { background: transparent; color: #ffffff; }
+         .criterion-verdict-fail { background: #4c1114; color: #ffa198; }
+         .criterion-verdict-unavailable { background: #3a2d05; color: #f2cc60; }`,
+      );
+    } catch {
+      unresolvable = true;
+    }
+    assert(unresolvable, 'an unmeasurable pair must fail closed');
+  });
+
+  await test('verdict chips never take their pair from theme variables', () => {
+    // The real-renderer defect: `background: var(--vscode-testing-iconPassed)`
+    // kept the background, but `color: #fff` did not follow the theme (white
+    // on the stock dark-theme accent #73c991 measured 2.001:1). A fixed pair
+    // is what keeps the static pin and the rendered result identical in every
+    // theme; selftest.mjs' rendered-E2E matrix re-measures it per theme.
+    const css = readFileSync(new URL('../media/chat.css', import.meta.url), 'utf8');
+    for (const selector of VERDICT_CHIP_SELECTORS) {
+      const block = cssRuleBlock(css, selector);
+      assert(block, `chat.css must declare ${selector}`);
+      assert(
+        !/var\(--vscode-/.test(block),
+        `${selector} must not depend on a theme variable for its fg/bg pair`,
+      );
+    }
+  });
+
+  await test('webview verdict styling is class-driven (no inline color overrides)', () => {
+    const chat = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+    const webview = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    // The verdict badge is resolved through the documented class contract...
+    assert(
+      chat.includes("'criterion-verdict criterion-verdict-' + verdict"),
+      'chat.js must derive the verdict chip class from the verdict value',
+    );
+    // ...and nothing in the panel may re-skin a verdict with an inline color
+    // or background: the CSS pair is the single measured surface.
+    for (const [name, source] of [
+      ['media/chat.js', chat],
+      ['src/webview.ts', webview],
+    ]) {
+      assert(
+        !/\.style\.(color|background|backgroundColor|cssText)\b/.test(source),
+        `${name} must not assign inline color/background styles`,
+      );
+    }
+  });
+}
+
 // ------------------------------------------------------- packaged VSIX layout
 
 /** Assert the packaged layout is the Faktor-owned panel, self-contained. */
@@ -8125,6 +8988,7 @@ async function packagedLayoutTests(dir) {
       'media/chat.js',
       'media/chat.css',
       'media/composer-state.js',
+      'media/board-state.js',
       'media/faktor.svg',
     ]) {
       assert(existsSync(join(dir, ...rel.split('/'))), `packaged extension is missing ${rel}`);
@@ -8132,7 +8996,11 @@ async function packagedLayoutTests(dir) {
     // The Faktor-owned panel ships exactly the hand-written media files: an
     // allowlist makes ANY extra file (a vendored closure included) a failure.
     const media = readdirSync(join(dir, 'media')).sort();
-    assertDeepEqual(media, ['chat.css', 'chat.js', 'composer-state.js', 'faktor.svg'], 'media/ ships exactly the Faktor-owned panel');
+    assertDeepEqual(
+      media,
+      ['board-state.js', 'chat.css', 'chat.js', 'composer-state.js', 'faktor.svg'],
+      'media/ ships exactly the Faktor-owned panel',
+    );
     // out/ ships exactly one compiled module per src/ module: an extra
     // bridge/closure artifact is a failure even when nobody names it.
     const sources = readdirSync(new URL('../src', import.meta.url))
@@ -8152,7 +9020,12 @@ async function packagedLayoutTests(dir) {
       !built.includes('FAKTOR_UI_BUNDLE') && !/'\.\.',\s*'\.\.'/.test(built),
       'compiled webview.js must not reference a bundle override or checkout escape',
     );
-    for (const rel of ['media/chat.js', 'media/composer-state.js', 'media/chat.css']) {
+    for (const rel of [
+      'media/chat.js',
+      'media/composer-state.js',
+      'media/board-state.js',
+      'media/chat.css',
+    ]) {
       const text = readFileSync(join(dir, ...rel.split('/')), 'utf8');
       assert(text.length > 0, `packaged ${rel} must not be empty`);
     }
@@ -9530,6 +10403,7 @@ async function main() {
   await transcriptScrollTests();
   await tournamentWebviewTests();
   await reducedMotionTests();
+  await verdictContrastTests();
   if (packagedDir !== null && packagedDir !== undefined) {
     await packagedLayoutTests(packagedDir);
   }

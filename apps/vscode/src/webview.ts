@@ -24,6 +24,13 @@ export interface ChatMessage {
 /** The extension-side handler the provider delegates every message to. */
 export interface ChatHost {
   handle(message: ChatMessage): void | Promise<void>;
+  /**
+   * The view was (re)resolved. Host-owned state that is NOT carried by the
+   * snapshot (composer attachment metadata, the current stream-block reason)
+   * must be re-posted here: a disposed/reopened view starts with an empty
+   * panel, and the host-side bytes/refusals would otherwise stay invisible.
+   */
+  onViewResolved?(): void | Promise<void>;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -53,6 +60,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this.snapshot !== null) {
       this.post({ type: 'snapshot', snapshot: this.snapshot });
     }
+    void this.host.onViewResolved?.();
   }
 
   /** Push a full state snapshot; the webview re-renders from it. */
@@ -85,6 +93,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   postSendMessageFailed(pending: { readonly text: string }, error: string): void {
     console.error(`[faktor-chat] task start failed; the draft was kept: ${error}`);
     this.post({ type: 'startResult', goal: pending.text, ok: false });
+  }
+
+  /**
+   * One durable board post was acknowledged (the host read it back at
+   * `revision`); the panel may clear the submitted draft.
+   */
+  postBoardPosted(revision: number, token: string | null = null): void {
+    this.post({ type: 'boardPosted', revision, token });
+  }
+
+  /**
+   * The host answered a board post with a refusal: the panel releases its
+   * in-flight lock but keeps the draft (the refusal reason is also posted as
+   * a notice), correlated by the submission token.
+   */
+  postBoardRefused(token: string | null, reason: string): void {
+    this.post({ type: 'boardRefused', token, reason });
   }
 
   /** One transient notice line (last error, control ack, ...). */
@@ -126,6 +151,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const composerUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'composer-state.js'),
+    );
+    const boardUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'board-state.js'),
     );
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'chat.css'),
@@ -173,13 +201,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <h2>Agents</h2>
     <ul id="agent-list"></ul>
   </section>
+  <section id="board-card" class="card">
+    <h2>Board</h2>
+    <div id="board-header" class="muted">board: not read yet</div>
+    <ul id="board-posts" class="board-posts" aria-label="Coordination board posts"></ul>
+    <form id="board-post" class="board-composer">
+      <label for="board-subject" class="composer-label">Subject</label>
+      <input id="board-subject" type="text" maxlength="512" autocomplete="off" />
+      <label for="board-body" class="composer-label">Body</label>
+      <textarea id="board-body" rows="2" maxlength="16384"></textarea>
+      <div id="board-draft-notice" class="muted" role="status" hidden></div>
+      <div class="composer-actions">
+        <button id="btn-board-read" type="button">Read board</button>
+        <button id="btn-board-post" type="submit">Post</button>
+      </div>
+    </form>
+  </section>
   <section id="transcript-card" class="card">
     <h2>Conversation</h2>
     <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript"></div>
   </section>
   <section id="stream-recovery" class="card" hidden>
     <h2>Event stream blocked</h2>
-    <div id="stream-recovery-reason" class="warn"></div>
+    <div id="stream-recovery-reason" class="warn" role="alert"></div>
     <div class="composer-actions">
       <button id="btn-refresh-snapshot" type="button" title="Re-read the durable state (the blocked cursor is not skipped)">Refresh from snapshot</button>
       <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good cursor after the daemon is upgraded">Reconnect stream</button>
@@ -209,6 +253,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </form>
 </div>
+<script nonce="${nonce}" src="${boardUri}"></script>
 <script nonce="${nonce}" src="${composerUri}"></script>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

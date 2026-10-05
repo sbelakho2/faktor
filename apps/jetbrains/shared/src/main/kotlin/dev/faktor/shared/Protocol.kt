@@ -28,7 +28,12 @@ data class StartupLine(val port: Int) {
         fun parse(line: String): StartupLine? {
             val m = PATTERN.matcher(line)
             if (!m.matches()) return null
-            return StartupLine(m.group(1).toInt())
+            // Digits outside Int (or the TCP port range) are malformed, not a
+            // NumberFormatException that kills the stdout drain thread and
+            // strands `start()` on its startup latch.
+            val port = m.group(1).toIntOrNull() ?: return null
+            if (port !in 1..65535) return null
+            return StartupLine(port)
         }
     }
 }

@@ -16,6 +16,10 @@ use faktor_protocol::error::ApiError;
 
 use crate::api::{AppState, ServerDeps};
 
+/// Durable admission recovery (audit P1): startup classification of
+/// previous-generation pending prompt/task claims next to session recovery.
+/// Public: the daemon boot path calls it before the first request.
+pub mod admission_recovery;
 pub(crate) mod agents;
 pub(crate) mod attachment;
 /// Wave 3 commercial metering routes (usage fold / entitlements / credits).
@@ -62,6 +66,7 @@ pub(crate) mod verification;
 /// `[workers]` section is enabled).
 pub(crate) mod workers;
 
+pub use admission_recovery::{recover_pending_admissions, AdmissionRecoverySummary};
 pub(crate) use agents::*;
 pub(crate) use attachment::*;
 /// The strict-protocol canonical base64 decoder and the decoded-byte

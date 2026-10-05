@@ -1617,6 +1617,11 @@ impl SessionHandle {
         Ok(self.row()?.task_id)
     }
 
+    /// The session's durable worktree identity (read-only).
+    pub fn worktree_id(&self) -> faktor_core::Result<faktor_core::id::WorktreeId> {
+        Ok(self.row()?.worktree_id)
+    }
+
     /// Create ONE durable task row (audit P0-7). Creation is the ONLY place
     /// a row may seed with `Pending`/`Planning`/`Running`; every other
     /// state is refused (creating a "verified" task would mint completion

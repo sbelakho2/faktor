@@ -89,6 +89,10 @@ pub(crate) fn build_daemon_with_seams_and_planner(
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
+    // PURE preflight BEFORE the data dir/store/CAS exist: a refused config
+    // (pinned/balanced routing, embeddings policy, sandbox/egress) leaves no
+    // store directory, database or CAS behind.
+    preflight_daemon_config(&config)?;
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     // 1-2: the durable store + CAS (full integrity scan on this entry);
     // 3: ONE daemon supervisor, exactly as [`build_daemon`].
@@ -195,6 +199,9 @@ pub(crate) async fn build_daemon_with_mcp_inner(
     semantic: graph::SemanticCfg,
 ) -> Result<DaemonGraph, String> {
     let config = config.unwrap_or_default();
+    // PURE preflight BEFORE the data dir/store/CAS exist (same single
+    // authority as `build_daemon_with_seams_and_planner`).
+    preflight_daemon_config(&config)?;
     let entries = config.mcp_servers()?;
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     let session = if fast_open {
@@ -453,13 +460,18 @@ pub(crate) fn daemon_instructions_resolver(
     ))
 }
 
-/// The outbound secret-scan config of the daemon's transports: every
-/// request body is whole-payload scanned with a [`SecretRegistry`] fed from
-/// the CONFIGURED provider keys AND every configured commerce connector
+/// Build the daemon's ONE configured-secret registry from CONFIG: every
+/// configured provider key plus every configured commerce connector
 /// credential (resolved from its configured env-var NAME; the name itself
 /// is never a secret and nothing is logged). The registry fingerprints
 /// values only — its Debug stays redacted (counts only).
-pub(crate) fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfig {
+///
+/// The builder constructs this ONCE and shares the SAME `Arc` between the
+/// outbound egress scan, the runtime's tool-output/CAS scrubbing
+/// ([`AgentDeps::secret_registry`]) and the process supervisor's artifact
+/// filter, so a configured value can neither ride a provider request nor
+/// reach durable storage raw.
+pub(crate) fn daemon_secret_registry(config: &config::Config) -> Arc<SecretRegistry> {
     let mut registry = SecretRegistry::new();
     for p in &config.providers {
         if let Some(key) = p.key() {
@@ -471,10 +483,33 @@ pub(crate) fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfi
             register_commerce_credential(&mut registry, credential);
         }
     }
+    Arc::new(registry)
+}
+
+/// The outbound scan config over a GIVEN registry: the exact seam the
+/// builder uses so the egress scan and the tool/CAS scrubbers share one
+/// instance. [`daemon_outbound_scan`] is the config-only convenience used
+/// by tests that need a fresh registry.
+pub(crate) fn outbound_scan_config(registry: Arc<SecretRegistry>) -> OutboundScanConfig {
     OutboundScanConfig {
-        registry: Some(Arc::new(registry)),
+        registry: Some(registry),
         ..Default::default()
     }
+}
+
+/// The outbound secret-scan config of the daemon's transports: every
+/// request body is whole-payload scanned with a [`SecretRegistry`] fed from
+/// the CONFIGURED provider keys AND every configured commerce connector
+/// credential (resolved from its configured env-var NAME; the name itself
+/// is never a secret and nothing is logged). The registry fingerprints
+/// values only — its Debug stays redacted (counts only).
+///
+/// Test-only convenience over [`daemon_secret_registry`] +
+/// [`outbound_scan_config`]; the daemon builder itself constructs the
+/// registry once and shares it with the tool/CAS scrubbers.
+#[cfg(test)]
+pub(crate) fn daemon_outbound_scan(config: &config::Config) -> OutboundScanConfig {
+    outbound_scan_config(daemon_secret_registry(config))
 }
 
 /// Register one configured commerce credential VALUE with the outbound
@@ -513,6 +548,36 @@ pub(crate) fn register_commerce_credential(
     }
 }
 
+/// The ONE process-supervisor artifact filter of the daemon: exact
+/// redaction over the SAME configured-secret registry the egress scan uses.
+/// A supervised command that echoes a configured key (`cat` of a key file)
+/// spills its output to a temp file; the supervisor scrubs the spill
+/// through this filter BEFORE the CAS put, so the durable blob never
+/// carries the raw value.
+pub(crate) struct RegistryArtifactFilter {
+    registry: Arc<SecretRegistry>,
+}
+
+impl RegistryArtifactFilter {
+    pub(crate) fn new(registry: Arc<SecretRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl faktor_terminal::ArtifactSecretFilter for RegistryArtifactFilter {
+    fn max_match_len(&self) -> usize {
+        self.registry.longest_secret_len()
+    }
+
+    fn matches(&self, window: &[u8]) -> Vec<(usize, usize)> {
+        self.registry
+            .scan_exact(window)
+            .into_iter()
+            .map(|hit| (hit.offset, hit.len))
+            .collect()
+    }
+}
+
 /// The ONE egress transport every configured adapter executes through:
 /// policy-checked with the daemon's SandboxPolicy network gate installed
 /// (default-deny on any destination the allowlist does not match, BEFORE a
@@ -543,6 +608,110 @@ pub(crate) fn daemon_egress_transport(
     )
     .map_err(|e| format!("egress client construction: {e}"))?;
     Ok(Arc::new(transport))
+}
+
+/// The configured provider registry plus the concrete Ollama instances kept
+/// alive for live probing (spec §10: warm-up must reach the instance the
+/// registry serves). Built by ONE shared function so the boot preflight and
+/// the daemon core can never disagree about which providers exist.
+pub(crate) struct ConfiguredProviders {
+    pub(crate) providers: ProviderRegistry,
+    pub(crate) ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>>,
+}
+
+/// Build every configured provider adapter over the transport its entry
+/// selected (the explicit loopback exception only for `allow_loopback`
+/// entries). Pure construction: no store, no CAS, no durability, so the boot
+/// preflight can run it before any store write. A provider that fails to
+/// build is a loud warning (never a daemon failure): the registry simply does
+/// not contain it, so a pinned route or embedding selection naming it is
+/// refused by the shared `router_candidates`/`semantic_embedder` checks.
+pub(crate) fn build_configured_providers(
+    config: &config::Config,
+    transport: &Arc<dyn HttpTransport>,
+    loopback_transport: &Arc<dyn HttpTransport>,
+) -> Result<ConfiguredProviders, String> {
+    let mut providers = ProviderRegistry::new();
+    let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
+    for p in &config.providers {
+        let provider_transport = if p.allows_loopback() {
+            loopback_transport.clone()
+        } else {
+            transport.clone()
+        };
+        if let Some(ollama) = p.build_ollama(provider_transport.clone()) {
+            // The registered instance carries this entry's catalog
+            // authorities (strict billing origin + pricing overrides + the
+            // `quality` declaration) while the CONCRETE Arc stays for live
+            // probing.
+            let dyn_arc: Arc<dyn Provider> = ollama.clone();
+            match p.wrap_catalog_authority(dyn_arc) {
+                Ok(wrapped) => {
+                    providers
+                        .try_register(wrapped)
+                        .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
+                    ollama_warmers.push(ollama);
+                }
+                Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
+            }
+            continue;
+        }
+        match p.build(provider_transport) {
+            Ok(provider) => providers
+                .try_register(provider)
+                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?,
+            Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
+        }
+    }
+    Ok(ConfiguredProviders {
+        providers,
+        ollama_warmers,
+    })
+}
+
+/// The pure boot preflight of the daemon configuration: every refusal that
+/// can be decided WITHOUT the durable store runs here, BEFORE
+/// `SessionManager::open` and any store/CAS write — so a refused
+/// `serve`/`run`/`acp` leaves no `store/`, database or `cas/` directory
+/// behind. The checks are the SAME shared functions the core uses (single
+/// authority): sandbox policy + checked egress/secret construction, the
+/// configured provider registry, `router_candidates` admissibility
+/// (pinned/balanced) and the `[embeddings]` policy resolution.
+pub(crate) struct DaemonPreflight {
+    /// The registered provider instance ids, in registry order. The CLI
+    /// resolves `--provider` against these BEFORE building the daemon.
+    pub(crate) provider_ids: Vec<String>,
+}
+
+pub(crate) fn preflight_daemon_config(config: &config::Config) -> Result<DaemonPreflight, String> {
+    let sandbox_policy = config
+        .sandbox_policy()
+        .map_err(|e| format!("sandbox config: {e}"))?;
+    let registry = daemon_secret_registry(config);
+    let egress = outbound_scan_config(registry);
+    let transport = daemon_egress_transport(
+        &sandbox_policy,
+        egress.clone(),
+        EgressAddressPolicy::EXTERNAL,
+    )?;
+    let loopback_transport =
+        daemon_egress_transport(&sandbox_policy, egress, EgressAddressPolicy::LOCAL)?;
+    let built = build_configured_providers(config, &transport, &loopback_transport)?;
+    // Pinned/balanced candidate admissibility through the ONE shared
+    // candidate authority (`router_candidates`): a pin naming an
+    // unregistered provider/model and a balanced mode with no admitted
+    // candidate both refuse HERE, before any store exists.
+    let routing_mode = config
+        .routing_mode
+        .clone()
+        .unwrap_or(faktor_core::model::RoutingMode::Economy);
+    graph::validate_router_candidates(&built.providers, &routing_mode)?;
+    // The `[embeddings]` policy resolution (provider/model admissibility)
+    // is pure and single-sourced with step 10 of the core.
+    let retry_policy = config.retry.to_policy();
+    drop(config.semantic_embedder(&built.providers, &retry_policy)?);
+    let provider_ids = built.providers.ids();
+    Ok(DaemonPreflight { provider_ids })
 }
 
 /// The daemon verification service from the configured `[verification]`
@@ -776,6 +945,9 @@ pub(crate) fn build_daemon_core(
     planner: Option<Arc<dyn faktor_commerce::service::AcquisitionPlanning>>,
     scm_seams: GithubAppSeams,
 ) -> Result<DaemonGraph, String> {
+    // ONE policy instance for every provider call of this daemon (chat turns
+    // and the semantic embedder): the additive [retry] section, class-aware.
+    let retry_policy = config.retry.to_policy();
     // Step 4 — checked transport/security: the daemon's ONE sandbox policy
     // from the `[sandbox]` section (destination gate + OS-level
     // network-isolation guarantee), the outbound whole-payload secret scan
@@ -786,7 +958,18 @@ pub(crate) fn build_daemon_core(
     let sandbox_policy = config
         .sandbox_policy()
         .map_err(|e| format!("sandbox config: {e}"))?;
-    let egress = daemon_outbound_scan(&config);
+    // ONE configured-secret registry for the WHOLE daemon (built here,
+    // step 4): the outbound egress scan, the process supervisor's artifact
+    // scrub (every command spill is filtered BEFORE its CAS put) and the
+    // runtime's tool-output/message-part redaction all share this exact
+    // `Arc`. A configured provider key echoed by `cat` therefore never
+    // reaches the journal/CAS and can never hard-block the next provider
+    // request at the egress gate.
+    let secret_registry = daemon_secret_registry(&config);
+    supervisor.install_artifact_filter(Arc::new(RegistryArtifactFilter::new(
+        secret_registry.clone(),
+    )));
+    let egress = outbound_scan_config(secret_registry.clone());
     // The scan config is shared: the provider transport and the commerce
     // checked transport each install their own destination policy over the
     // SAME configured-secret registry (provider keys + commerce credentials).
@@ -806,39 +989,14 @@ pub(crate) fn build_daemon_core(
     // Ollama providers are kept CONCRETE for live probing (spec §10:
     // warm-up must reach the instance the registry serves). Catalog/pricing
     // rows (built-in tables + configured overrides/ceilings) ride the
-    // adapter constructions and the registry's catalog rows.
-    let mut providers = ProviderRegistry::new();
-    let mut ollama_warmers: Vec<Arc<faktor_ollama::OllamaProvider>> = Vec::new();
-    for p in &config.providers {
-        let provider_transport = if p.allows_loopback() {
-            loopback_transport.clone()
-        } else {
-            transport.clone()
-        };
-        if let Some(ollama) = p.build_ollama(provider_transport.clone()) {
-            // The registered instance carries this entry's catalog
-            // authorities (strict billing origin + pricing overrides + the
-            // `quality` declaration, item 1) while the CONCRETE Arc stays
-            // for live probing.
-            let dyn_arc: Arc<dyn Provider> = ollama.clone();
-            match p.wrap_catalog_authority(dyn_arc) {
-                Ok(wrapped) => {
-                    providers
-                        .try_register(wrapped)
-                        .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?;
-                    ollama_warmers.push(ollama);
-                }
-                Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
-            }
-            continue;
-        }
-        match p.build(provider_transport) {
-            Ok(provider) => providers
-                .try_register(provider)
-                .map_err(|e| format!("provider {} failed to register: {e}", p.id()))?,
-            Err(e) => tracing::warn!("provider {} failed to build: {e}", p.id()),
-        }
-    }
+    // adapter constructions and the registry's catalog rows. The SAME
+    // shared builder runs in the boot preflight (before any store exists),
+    // so the refusal surface and the served registry can never disagree.
+    let configured = build_configured_providers(&config, &transport, &loopback_transport)?;
+    let ConfiguredProviders {
+        providers,
+        ollama_warmers,
+    } = configured;
     let providers = Arc::new(providers);
     let store = session.store();
     let cas = session.cas();
@@ -903,7 +1061,7 @@ pub(crate) fn build_daemon_core(
     // assembly): an absent/unresolvable selection under `best_effort`
     // degrades to lexical/symbol-only retrieval, never a fabricated vector.
     let embedder = config
-        .semantic_embedder(&providers, &faktor_core::retry::RetryPolicy::default())
+        .semantic_embedder(&providers, &retry_policy)
         .map_err(|e| format!("embeddings config: {e}"))?;
     let repo_evidence = Arc::new(RepoEvidence::new(session.clone(), embedder));
     // Step 11 — per-workspace repository instructions (P0-32): the
@@ -1079,7 +1237,7 @@ pub(crate) fn build_daemon_core(
         clock: Arc::new(SystemClock),
         tool_call_mode: ToolCallMode::NativeWithRepair,
         tool_deadline_ms: 30_000,
-        retry_policy: faktor_core::retry::RetryPolicy::default(),
+        retry_policy,
         semantic: semantic.clone(),
         // Audit 68: the parsed `failure_learning` flag decides whether a
         // prior handle is installed (and the runtime then applies it);
@@ -1088,6 +1246,9 @@ pub(crate) fn build_daemon_core(
         // the graph holds the SAME Arc.
         context_prior: learning.clone(),
         efficiency: efficiency_flags(&config.efficiency),
+        // The SAME configured-secret registry the egress scan and the
+        // supervisor artifact filter use (built once at step 4 above).
+        secret_registry: Some(secret_registry.clone()),
     })
     .map_err(|e| e.to_string())?;
     for ollama in ollama_warmers {

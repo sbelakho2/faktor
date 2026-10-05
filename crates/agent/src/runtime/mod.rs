@@ -104,6 +104,8 @@ mod provider_loop;
 pub use provider_loop::*;
 mod tool_loop;
 pub use tool_loop::*;
+mod shell_changes;
+pub(crate) use shell_changes::*;
 mod retry;
 mod settlement;
 pub(crate) use settlement::*;
@@ -144,6 +146,10 @@ mod provider_loop_tests;
 #[cfg(test)]
 #[path = "tool_loop_tests.rs"]
 mod tool_loop_tests;
+
+#[cfg(test)]
+#[path = "shell_changes_tests.rs"]
+mod shell_changes_tests;
 
 #[cfg(test)]
 #[path = "retry_tests.rs"]

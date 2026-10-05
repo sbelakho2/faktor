@@ -415,11 +415,25 @@ pub(crate) async fn native_task_run_start(
             }
         }
         None => {
+            // Budget fields are TASK-level caps: the plain-prompt path has
+            // no task-row seam to persist/enforce them, and silently
+            // dropping them admitted a paid call against `max_cost_micro:1`
+            // (observed: 1 upstream call, reservation 34092 micro). A typed
+            // refusal replaces the silent drop.
+            if req.max_tokens.is_some() || req.max_cost_micro.is_some() {
+                return wire_status(malformed_body(
+                    "max_tokens/max_cost_micro require explicit work_items; the plain-prompt path cannot enforce a task cap",
+                ));
+            }
             // The ordinary native prompt: one in-session mutating run
             // through the SAME PromptExecutionService (shadow by default).
             let request = PromptRequest {
                 prompt: req.goal,
                 submission_id: Some(req.submission_id),
+                // The task-start admission inside the executor reserves its
+                // own op id and computes the digest itself.
+                reserved_op_id: None,
+                admission_digest: None,
                 files,
                 attachments,
                 model: req.model,

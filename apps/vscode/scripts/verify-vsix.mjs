@@ -93,6 +93,8 @@ const PANEL_MARKERS = [
   'agentControl',
   'tournamentControl',
   'retrieveEvidence',
+  'boardRead',
+  'boardPost',
 ];
 
 const DEFAULT_MIN_MEDIA_FILES = 4;

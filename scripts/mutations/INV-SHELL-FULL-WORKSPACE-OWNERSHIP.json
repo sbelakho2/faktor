@@ -1,0 +1,9 @@
+{
+  "id": "INV-SHELL-FULL-WORKSPACE-OWNERSHIP",
+  "file": "crates/agent/src/runtime/tool_loop.rs",
+  "find": "    if matches!(\n        capability,\n        Some(faktor_core::capability::Capability::ExecuteShell { .. })\n    ) {\n        return (\n            OwnershipSet::workspace_root(),\n            OwnershipSet::workspace_root(),\n        );\n    }",
+  "replace": "    if false\n        && matches!(\n            capability,\n            Some(faktor_core::capability::Capability::ExecuteShell { .. })\n        )\n    {\n        return (\n            OwnershipSet::workspace_root(),\n            OwnershipSet::workspace_root(),\n        );\n    }",
+  "gate": "cargo test -p faktor-agent --lib a_generic_shell_owns_the_whole_workspace_for_writes",
+  "expect": "assertion|full workspace",
+  "note": "The ExecuteShell branch of the ownership rule is disabled: a generic shell keeps its declared (usually empty) write set instead of the whole-workspace sentinel, so it no longer serializes with every workspace writer."
+}

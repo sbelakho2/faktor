@@ -418,7 +418,7 @@ fn store_per_version_fixture_roundtrip_matrix() {
             "migration-matrix case #{case} (fixture v{version}): every chain must reach the head"
         );
     }
-    assert_eq!(case, 30, "per-version fixture matrix size drifted");
+    assert_eq!(case, 32, "per-version fixture matrix size drifted");
 }
 
 #[test]
@@ -459,7 +459,7 @@ fn store_torn_migration_cursor_never_half_migrates_silently() {
             ),
         }
     }
-    assert_eq!(case, 29, "torn-migration matrix size drifted");
+    assert_eq!(case, 31, "torn-migration matrix size drifted");
 }
 
 #[test]
@@ -1496,35 +1496,50 @@ fn store_task_admission_claim_matrix() {
     for (i, key) in keys.iter().enumerate() {
         case += 1;
         let digest = digests[i % digests.len()];
+        let res = format!("tx-{i:016x}");
         assert_eq!(
-            store.task_admission_claim(sid, key, digest, 1).unwrap(),
+            store
+                .task_admission_claim(sid, key, digest, &res, 1)
+                .unwrap(),
             TaskAdmissionClaim::Fresh,
             "admission case #{case} (key {key:?}): first claim is Fresh"
         );
         case += 1;
         assert_eq!(
-            store.task_admission_claim(sid, key, digest, 2).unwrap(),
+            store
+                .task_admission_claim(sid, key, digest, "tx-00000000000000ff", 2)
+                .unwrap(),
             TaskAdmissionClaim::InFlight,
             "admission case #{case} (key {key:?}): duplicate while pending is InFlight"
         );
         case += 1;
         assert_eq!(
-            store.task_admission_peek(sid, key, digest).unwrap(),
+            store.task_admission_peek(sid, key, digest, 2).unwrap(),
             Some(TaskAdmissionClaim::InFlight),
             "admission case #{case} (key {key:?}): peek mirrors the claim without writing"
         );
         let receipt = format!("{{\"key\":{}}}", serde_json::to_string(key).unwrap());
         case += 1;
-        store.task_admission_complete(sid, key, &receipt).unwrap();
+        store
+            .task_admission_complete(sid, key, &res, &receipt)
+            .unwrap();
         assert_eq!(
-            store.task_admission_claim(sid, key, digest, 3).unwrap(),
+            store
+                .task_admission_claim(sid, key, digest, "tx-00000000000000f0", 3)
+                .unwrap(),
             TaskAdmissionClaim::Complete(receipt.clone()),
             "admission case #{case} (key {key:?}): completed replay returns the byte-exact receipt"
         );
         case += 1;
         assert_eq!(
             store
-                .task_admission_claim(sid, key, digests[(i + 1) % digests.len()], 4)
+                .task_admission_claim(
+                    sid,
+                    key,
+                    digests[(i + 1) % digests.len()],
+                    "tx-00000000000000f1",
+                    4
+                )
                 .unwrap(),
             TaskAdmissionClaim::KeyReused {
                 stored_digest: digest.to_string()
@@ -1533,16 +1548,22 @@ fn store_task_admission_claim_matrix() {
         );
         case += 1;
         assert_eq!(
-            store.task_admission_claim(sid2, key, digest, 5).unwrap(),
+            store
+                .task_admission_claim(sid2, key, digest, "tx-00000000000000f2", 5)
+                .unwrap(),
             TaskAdmissionClaim::KeyReused {
                 stored_digest: digest.to_string()
             },
             "admission case #{case} (key {key:?}): a foreign session can never reuse the key"
         );
         case += 1;
-        store.task_admission_release(sid2, key).unwrap();
+        store
+            .task_admission_release(sid2, key, "tx-00000000000000f2")
+            .unwrap();
         assert_eq!(
-            store.task_admission_claim(sid, key, digest, 6).unwrap(),
+            store
+                .task_admission_claim(sid, key, digest, "tx-00000000000000f3", 6)
+                .unwrap(),
             TaskAdmissionClaim::Complete(receipt),
             "admission case #{case} (key {key:?}): release is a no-op on a completed row"
         );
@@ -1557,46 +1578,52 @@ fn store_task_admission_bounds_and_corruption() {
     let too_long_key = "k".repeat(MAX_TASK_ADMISSION_KEY_BYTES + 1);
     case += 1;
     assert!(matches!(
-        store.task_admission_claim(sid, &too_long_key, "d", 1),
+        store.task_admission_claim(sid, &too_long_key, "d", "r", 1),
         Err(StoreError::Oversized(_))
     ));
     case += 1;
     assert!(matches!(
-        store.task_admission_claim(sid, "", "d", 1),
+        store.task_admission_claim(sid, "", "d", "r", 1),
         Err(StoreError::Oversized(_))
     ));
     let too_long_digest = "d".repeat(MAX_TASK_ADMISSION_DIGEST_BYTES + 1);
     case += 1;
     assert!(matches!(
-        store.task_admission_claim(sid, "k", &too_long_digest, 1),
+        store.task_admission_claim(sid, "k", &too_long_digest, "r", 1),
         Err(StoreError::Oversized(_))
     ));
     case += 1;
     assert!(matches!(
-        store.task_admission_claim(sid, "k", "", 1),
+        store.task_admission_claim(sid, "k", "", "r", 1),
         Err(StoreError::Oversized(_))
     ));
-    store.task_admission_claim(sid, "k", "d", 1).unwrap();
+    store
+        .task_admission_claim(sid, "k", "d", "res-1", 1)
+        .unwrap();
     let huge = "x".repeat(MAX_TASK_ADMISSION_RECEIPT_BYTES + 1);
     case += 1;
     assert!(matches!(
-        store.task_admission_complete(sid, "k", &huge),
+        store.task_admission_complete(sid, "k", "res-1", &huge),
         Err(StoreError::Oversized(_))
     ));
     case += 1;
     assert_eq!(
-        store.task_admission_claim(sid, "k", "d", 2).unwrap(),
+        store
+            .task_admission_claim(sid, "k", "d", "res-2", 2)
+            .unwrap(),
         TaskAdmissionClaim::InFlight,
         "a refused oversized receipt never mutates the pending row"
     );
     case += 1;
-    match store.task_admission_complete(sid, "missing", "r") {
+    match store.task_admission_complete(sid, "missing", "res-1", "r") {
         Err(StoreError::Conflict(m)) => assert!(m.contains("no admission row"), "{m}"),
         other => panic!("admission case #{case}: {other:?}"),
     }
     case += 1;
-    store.task_admission_complete(sid, "k", "r").unwrap();
-    match store.task_admission_complete(sid, "k", "r2") {
+    store
+        .task_admission_complete(sid, "k", "res-1", "r")
+        .unwrap();
+    match store.task_admission_complete(sid, "k", "res-1", "r2") {
         Err(StoreError::Conflict(m)) => assert!(m.contains("not pending"), "{m}"),
         other => panic!("admission case #{case}: {other:?}"),
     }
@@ -1612,7 +1639,10 @@ fn store_task_admission_bounds_and_corruption() {
                 request_digest TEXT NOT NULL,
                 state TEXT NOT NULL,
                 receipt_json TEXT,
-                created_ms INTEGER NOT NULL
+                created_ms INTEGER NOT NULL,
+                owner_generation TEXT NOT NULL DEFAULT '',
+                lease_deadline_ms INTEGER NOT NULL DEFAULT 0,
+                reservation TEXT
              );",
         )
         .unwrap();
@@ -1622,7 +1652,7 @@ fn store_task_admission_bounds_and_corruption() {
          VALUES ('k', ?1, 'd', 'bogus', NULL, 0)",
         &[(sid.raw() as i64).into()],
     );
-    match store.task_admission_claim(sid, "k", "d", 3) {
+    match store.task_admission_claim(sid, "k", "d", "res-1", 3) {
         Err(StoreError::Corrupt(_)) => {}
         other => panic!("admission case #{case}: unknown state must be loud corruption: {other:?}"),
     }
@@ -1632,7 +1662,7 @@ fn store_task_admission_bounds_and_corruption() {
         "UPDATE task_admission SET state = 'complete', receipt_json = NULL WHERE key = 'k'",
         &[],
     );
-    match store.task_admission_claim(sid, "k", "d", 4) {
+    match store.task_admission_claim(sid, "k", "d", "res-1", 4) {
         Err(StoreError::Corrupt(_)) => {}
         other => {
             panic!("admission case #{case}: receipt-less complete must be corruption: {other:?}")
@@ -1644,7 +1674,7 @@ fn store_task_admission_bounds_and_corruption() {
         "UPDATE task_admission SET receipt_json = ?1 WHERE key = 'k'",
         &[rusqlite::types::Value::Text(huge)],
     );
-    match store.task_admission_peek(sid, "k", "d") {
+    match store.task_admission_peek(sid, "k", "d", 5) {
         Err(StoreError::Oversized(_)) => {}
         other => {
             panic!("admission case #{case}: oversized injected receipt must refuse: {other:?}")
@@ -1672,28 +1702,39 @@ fn store_prompt_admission_claim_matrix() {
     for (i, key) in keys.iter().enumerate() {
         case += 1;
         let digest = format!("digest-{i}");
+        let res = format!("tx-{i:016x}");
         assert_eq!(
-            store.prompt_admission_claim(sid, key, &digest, 1).unwrap(),
+            store
+                .prompt_admission_claim(sid, key, &digest, &res, 1)
+                .unwrap(),
             PromptAdmissionClaim::Fresh,
             "prompt-admission case #{case} (key {key:?}): Fresh"
         );
         case += 1;
         assert_eq!(
-            store.prompt_admission_claim(sid, key, &digest, 2).unwrap(),
+            store
+                .prompt_admission_claim(sid, key, &digest, "tx-00000000000000ff", 2)
+                .unwrap(),
             PromptAdmissionClaim::InFlight,
             "prompt-admission case #{case} (key {key:?}): InFlight"
         );
         let receipt = format!("{{\"r\":{i}}}");
         case += 1;
-        store.prompt_admission_complete(sid, key, &receipt).unwrap();
+        store
+            .prompt_admission_complete(sid, key, &res, &receipt)
+            .unwrap();
         assert_eq!(
-            store.prompt_admission_claim(sid, key, &digest, 3).unwrap(),
+            store
+                .prompt_admission_claim(sid, key, &digest, "tx-00000000000000f0", 3)
+                .unwrap(),
             PromptAdmissionClaim::Complete(receipt),
             "prompt-admission case #{case} (key {key:?}): byte-exact replay"
         );
         case += 1;
         assert_eq!(
-            store.prompt_admission_claim(sid2, key, &digest, 4).unwrap(),
+            store
+                .prompt_admission_claim(sid2, key, &digest, "tx-00000000000000f1", 4)
+                .unwrap(),
             PromptAdmissionClaim::KeyReused {
                 stored_digest: digest.clone()
             },
@@ -1703,28 +1744,28 @@ fn store_prompt_admission_claim_matrix() {
     case += 1;
     let too_long = "k".repeat(MAX_PROMPT_ADMISSION_KEY_BYTES + 1);
     assert!(matches!(
-        store.prompt_admission_claim(sid, &too_long, "d", 1),
+        store.prompt_admission_claim(sid, &too_long, "d", "r", 1),
         Err(StoreError::Oversized(_))
     ));
     case += 1;
     let too_long_digest = "d".repeat(MAX_PROMPT_ADMISSION_DIGEST_BYTES + 1);
     assert!(matches!(
-        store.prompt_admission_claim(sid, "k", &too_long_digest, 1),
+        store.prompt_admission_claim(sid, "k", &too_long_digest, "r", 1),
         Err(StoreError::Oversized(_))
     ));
     case += 1;
     let huge = "x".repeat(MAX_PROMPT_ADMISSION_RECEIPT_BYTES + 1);
     store
-        .prompt_admission_claim(sid, "pending", "d", 1)
+        .prompt_admission_claim(sid, "pending", "d", "res-p", 1)
         .unwrap();
     assert!(matches!(
-        store.prompt_admission_complete(sid, "pending", &huge),
+        store.prompt_admission_complete(sid, "pending", "res-p", &huge),
         Err(StoreError::Oversized(_))
     ));
     case += 1;
     assert_eq!(
         store
-            .prompt_admission_claim(sid, "pending", "d", 2)
+            .prompt_admission_claim(sid, "pending", "d", "res-p2", 2)
             .unwrap(),
         PromptAdmissionClaim::InFlight,
         "a refused oversized prompt receipt leaves the pending row untouched"
@@ -1741,7 +1782,10 @@ fn store_prompt_admission_claim_matrix() {
                 request_digest TEXT NOT NULL,
                 state TEXT NOT NULL,
                 receipt_json TEXT,
-                created_ms INTEGER NOT NULL
+                created_ms INTEGER NOT NULL,
+                owner_generation TEXT NOT NULL DEFAULT '',
+                lease_deadline_ms INTEGER NOT NULL DEFAULT 0,
+                reservation TEXT
              );",
         )
         .unwrap();
@@ -1751,7 +1795,7 @@ fn store_prompt_admission_claim_matrix() {
          VALUES ('pending', ?1, 'd', 'bogus', NULL, 0)",
         &[(sid.raw() as i64).into()],
     );
-    match store.prompt_admission_claim(sid, "pending", "d", 3) {
+    match store.prompt_admission_claim(sid, "pending", "d", "res-p", 3) {
         Err(StoreError::Corrupt(_)) => {}
         other => panic!("prompt-admission case #{case}: {other:?}"),
     }
@@ -1770,8 +1814,9 @@ fn store_admission_concurrent_claimers_and_independence() {
         for t in 0..8 {
             let store = Arc::clone(&store);
             let key = key.clone();
+            let res = format!("tx-{t:016x}");
             handles.push(std::thread::spawn(move || {
-                store.task_admission_claim(sid, &key, "d", t).unwrap()
+                store.task_admission_claim(sid, &key, "d", &res, t).unwrap()
             }));
         }
         let claims: Vec<TaskAdmissionClaim> =
@@ -1791,7 +1836,13 @@ fn store_admission_concurrent_claimers_and_independence() {
         case += 1;
         assert_eq!(
             store
-                .prompt_admission_claim(sid, &format!("p{i}"), &format!("d{i}"), i as i64)
+                .prompt_admission_claim(
+                    sid,
+                    &format!("p{i}"),
+                    &format!("d{i}"),
+                    &format!("tx-{i:016x}"),
+                    i as i64
+                )
                 .unwrap(),
             PromptAdmissionClaim::Fresh,
             "admission-independence case #{case}: distinct keys are independent"

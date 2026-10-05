@@ -93,6 +93,142 @@ export async function publish({ api, repo, sha, state, context, description, tar
   return { status: response.status, body: text };
 }
 
+// ------------------------------------------------- platform aggregation (P0-1)
+//
+// `ci/faktor/trusted-certified` is an AGGREGATE: it may only become success
+// when the linux, darwin AND windows per-platform certificates are success
+// for the SAME exact SHA and tree, all bound to ONE pipeline execution (the
+// same workflow generation/config), each published by its own platform step.
+// A per-platform status description carries `tree=<40hex> run=<pipeline>:<platform>`;
+// the run binding makes a duplicate/forged copy (e.g. the linux execution
+// publishing the windows context) fail, a run mismatch across platforms
+// (a stale certificate from an older pipeline) fails, and missing/stale/
+// failing platforms can never aggregate green.
+
+export const AGGREGATE_CONTEXTS = {
+  linux: 'ci/faktor/trusted-certified-linux',
+  darwin: 'ci/faktor/trusted-certified-darwin',
+  windows: 'ci/faktor/trusted-certified-windows',
+};
+const TREE_RE = /(?:^|\s)tree=([0-9a-f]{40})(?:\s|$)/;
+const RUN_RE = /(?:^|\s)run=([^\s]+)(?:\s|$)/;
+
+export function platformFacts(status) {
+  const description = String(status.description || '');
+  const tree = TREE_RE.exec(description);
+  const run = RUN_RE.exec(description);
+  return { tree: tree ? tree[1] : null, run: run ? run[1] : null };
+}
+
+/// `statuses` is the newest-first commit-status list for ONE sha.
+export function aggregateVerdict({ statuses, tree }) {
+  const reasons = [];
+  const runs = new Set();
+  let pipelineRun = null;
+  for (const [platform, context] of Object.entries(AGGREGATE_CONTEXTS)) {
+    const entry = statuses.find((status) => status.context === context);
+    if (!entry) {
+      reasons.push(`${platform}=missing`);
+      continue;
+    }
+    if (entry.state !== 'success') {
+      reasons.push(`${platform}=${entry.state}`);
+      continue;
+    }
+    const { tree: statusTree, run } = platformFacts(entry);
+    if (statusTree !== tree) {
+      reasons.push(`${platform}=tree-mismatch`);
+      continue;
+    }
+    if (!run || !run.endsWith(`:${platform}`)) {
+      reasons.push(`${platform}=run-unbound`);
+      continue;
+    }
+    if (runs.has(run)) {
+      reasons.push(`${platform}=duplicate-run`);
+      continue;
+    }
+    runs.add(run);
+    // Same workflow generation/config: every matrix axis of one pipeline
+    // shares the pipeline number, so a certificate from a different
+    // pipeline (even for the same tree) is stale evidence and refuses.
+    const prefix = run.slice(0, run.lastIndexOf(':'));
+    if (pipelineRun === null) pipelineRun = prefix;
+    else if (pipelineRun !== prefix) reasons.push(`${platform}=run-mismatch`);
+  }
+  if (reasons.length > 0) {
+    return { ok: false, reason: `platform certificates incomplete: ${reasons.join(', ')}` };
+  }
+  return {
+    ok: true,
+    reason: `linux+darwin+windows certificates passed (tree=${tree} run=${pipelineRun})`,
+  };
+}
+
+export async function readStatuses({ api, repo, sha, token, fetchImpl = fetch }) {
+  if (!token) fail('token-missing', 'GITHUB_STATUS_TOKEN/GH_TOKEN/GITHUB_TOKEN is required (fail closed)');
+  const response = await fetchImpl(
+    `${api.replace(/\/+$/, '')}/repos/${repo}/commits/${sha}/statuses?per_page=100`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'faktor-certification',
+      },
+    },
+  );
+  const text = await response.text();
+  if (response.status !== 200) {
+    fail('read-failed', `HTTP ${response.status} from the statuses API: ${text.slice(0, 200)}`);
+  }
+  return JSON.parse(text).map((entry) => ({
+    context: entry.context,
+    state: entry.state,
+    description: entry.description || '',
+  }));
+}
+
+/// Poll the three platform contexts (bounded), then publish the aggregate
+/// verdict. Non-success exits 1 AFTER publishing: the pipeline must be red
+/// and the exact-SHA status must be conclusive either way.
+export async function aggregate({
+  api,
+  repo,
+  sha,
+  tree,
+  token,
+  pollSeconds = 0,
+  intervalSeconds = 15,
+  context = 'ci/faktor/trusted-certified',
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  if (!SHA_RE.test(tree)) fail('tree', '--tree must be the exact 40-lowercase-hex tree');
+  const deadline = Date.now() + pollSeconds * 1000;
+  let verdict;
+  for (;;) {
+    const statuses = await readStatuses({ api, repo, sha, token, fetchImpl });
+    verdict = aggregateVerdict({ statuses, tree });
+    if (verdict.ok || Date.now() >= deadline) break;
+    await sleep(intervalSeconds * 1000);
+  }
+  await publish({
+    api,
+    repo,
+    sha,
+    state: verdict.ok ? 'success' : 'failure',
+    context,
+    description: verdict.reason.slice(0, MAX_DESCRIPTION),
+    token,
+    fetchImpl,
+  });
+  if (!verdict.ok) {
+    console.error(`github-status-aggregate-refused: ${verdict.reason}`);
+    process.exitCode = 1;
+  }
+  return verdict;
+}
+
 // ------------------------------------------------------------------ selftest
 
 async function selftest() {
@@ -107,11 +243,17 @@ async function selftest() {
   };
 
   const requests = [];
+  let statusesFixture = [];
   const server = createServer((req, res) => {
     let data = '';
     req.on('data', (chunk) => (data += chunk));
     req.on('end', () => {
       requests.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: data });
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(statusesFixture));
+        return;
+      }
       if (req.url.includes('reject') || data.includes('reject')) {
         res.writeHead(422, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ message: 'Validation Failed' }));
@@ -208,6 +350,100 @@ async function selftest() {
   }
   check('validation refusals make no request', requests.length === netBefore);
 
+  // ---- P0-1: the aggregate table ---------------------------------------
+  const tree = 'b'.repeat(40);
+  const otherTree = 'c'.repeat(40);
+  const okStatus = (platform) => ({
+    context: AGGREGATE_CONTEXTS[platform],
+    state: 'success',
+    description: `tree=${tree} run=700:${platform}`,
+  });
+  check(
+    'aggregate: linux+darwin+windows pass -> success',
+    aggregateVerdict({ statuses: [okStatus('linux'), okStatus('darwin'), okStatus('windows')], tree }).ok,
+  );
+  check(
+    'aggregate: missing windows -> non-success',
+    !aggregateVerdict({ statuses: [okStatus('linux'), okStatus('darwin')], tree }).ok,
+  );
+  check(
+    'aggregate: failing windows -> non-success',
+    !aggregateVerdict({
+      statuses: [okStatus('linux'), okStatus('darwin'), { ...okStatus('windows'), state: 'failure' }],
+      tree,
+    }).ok,
+  );
+  check(
+    'aggregate: stable sha with a stale darwin tree -> non-success',
+    !aggregateVerdict({
+      statuses: [okStatus('linux'), { ...okStatus('darwin'), description: `tree=${otherTree} run=700:darwin` }, okStatus('windows')],
+      tree,
+    }).ok,
+  );
+  check(
+    'aggregate: duplicate linux masquerading as windows -> non-success',
+    !aggregateVerdict({
+      statuses: [okStatus('linux'), okStatus('darwin'), { ...okStatus('windows'), description: `tree=${tree} run=700:linux` }],
+      tree,
+    }).ok,
+  );
+  check(
+    'aggregate: all pass with differing trees cannot happen (tree-mismatch) -> non-success',
+    !aggregateVerdict({
+      statuses: [
+        { ...okStatus('linux'), description: `tree=${otherTree} run=700:linux` },
+        okStatus('darwin'),
+        okStatus('windows'),
+      ],
+      tree,
+    }).ok,
+  );
+  check(
+    'aggregate: platforms from DIFFERENT pipeline runs (stale certificate) -> non-success',
+    !aggregateVerdict({
+      statuses: [
+        okStatus('linux'),
+        { ...okStatus('darwin'), description: `tree=${tree} run=701:darwin` },
+        { ...okStatus('windows'), description: `tree=${tree} run=702:windows` },
+      ],
+      tree,
+    }).ok,
+  );
+  check(
+    'aggregate: windows is a REQUIRED platform (mutation witness: removing the lookup fails here)',
+    Object.prototype.hasOwnProperty.call(AGGREGATE_CONTEXTS, 'windows') &&
+      aggregateVerdict({ statuses: [okStatus('linux'), okStatus('darwin')], tree }).reason.includes('windows'),
+  );
+
+  // Polling: empty at first, complete after one sleep -> aggregate success,
+  // and the published context/state are the aggregate ones.
+  statusesFixture = [];
+  const sleeps = [];
+  const polled = await aggregate({
+    api,
+    repo: 'acme/widgets',
+    sha,
+    tree,
+    token: 'selftest-token',
+    pollSeconds: 5,
+    intervalSeconds: 1,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      statusesFixture = [okStatus('linux'), okStatus('darwin'), okStatus('windows')];
+    },
+  });
+  check('aggregate polling reaches success', polled.ok && sleeps.length === 1);
+  const aggPost = JSON.parse(requests.at(-1).body);
+  check(
+    'aggregate publishes the trusted context as success',
+    aggPost.context === 'ci/faktor/trusted-certified' && aggPost.state === 'success',
+    requests.at(-1).body,
+  );
+  check(
+    'platform statuses are read from the exact-sha statuses API',
+    requests.some((r) => r.method === 'GET' && r.url === `/repos/acme/widgets/commits/${sha}/statuses?per_page=100`),
+  );
+
   await new Promise((resolve) => server.close(resolve));
   if (failures > 0) {
     console.error(`publish-status selftest: FAIL (${failures})`);
@@ -234,8 +470,19 @@ if (isMain) {
         targetUrl: argValue(args, '--target-url', process.env.CI_PIPELINE_URL || ''),
         token: tokenFromEnv(process.env),
       });
+    } else if (command === 'aggregate') {
+      await aggregate({
+        api: argValue(args, '--api', process.env.GITHUB_STATUS_API || API_DEFAULT),
+        repo: argValue(args, '--repo', process.env.CI_REPO || ''),
+        sha: argValue(args, '--sha', process.env.CI_COMMIT_SHA || ''),
+        tree: argValue(args, '--tree', ''),
+        token: tokenFromEnv(process.env),
+        pollSeconds: Number(argValue(args, '--poll-seconds', '0')),
+        intervalSeconds: Number(argValue(args, '--interval-seconds', '15')),
+        context: argValue(args, '--context', 'ci/faktor/trusted-certified'),
+      });
     } else {
-      fail('args', 'usage: publish-status.mjs publish|selftest');
+      fail('args', 'usage: publish-status.mjs publish|aggregate|selftest');
     }
   } catch (error) {
     console.error(error instanceof StatusError ? error.message : `github-status-internal: ${error.message}`);
