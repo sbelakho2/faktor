@@ -28,6 +28,7 @@ thiserror.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
+faktor-session = { path = "../session", features = ["test-utils"] }
 faktor-provider.workspace = true
 faktor-cas.workspace = true
 # The parity waits read the store's ONE terminal-turn-record vocabulary

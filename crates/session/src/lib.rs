@@ -130,9 +130,11 @@ pub use ledger::{
     TOURNAMENT_REVIEW_BLOCK, TOURNAMENT_REVIEW_CLEAN, TOURNAMENT_REVIEW_CONCERN,
     TOURNAMENT_STATE_CANCELLED, TOURNAMENT_STATE_DONE, TOURNAMENT_STATE_FAILED,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use manager::TestAdmissionClock;
 pub use manager::{
-    SessionManager, ShadowRow, ShadowRowState, SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES,
-    SHADOW_ROW_KEY, SHADOW_ROW_KIND,
+    AdmissionClock, MonotonicAdmissionClock, SessionManager, ShadowRow, ShadowRowState,
+    SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES, SHADOW_ROW_KEY, SHADOW_ROW_KIND,
 };
 pub use ops::{OpKind, PermissionRequest, ToolRunHandle};
 pub use payload::{decode_payload, PAYLOAD_SCHEMA_V};

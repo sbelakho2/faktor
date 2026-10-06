@@ -2104,7 +2104,11 @@ impl TaskExecutor {
         // fresh key still CLAIMS inside `start_in_session` /
         // `start_orchestrated` (that claim is authoritative; this peek only
         // keeps duplicates from touching pre-run state).
-        if let Some(receipt) = peek_start_admission(&self.session, parent, &req, handle.now_ms())? {
+        // Admission time is the MONOTONIC clock: a wall-clock jump never
+        // moves a lease (P1-IDEMPOTENCY).
+        if let Some(receipt) =
+            peek_start_admission(&self.session, parent, &req, self.session.admission_now_ms())?
+        {
             return Ok(receipt);
         }
         // Admit-time binary-attachment resolution (defense in depth behind
@@ -2458,7 +2462,7 @@ impl TaskExecutor {
             parent,
             &req,
             StartAdmissionKind::InSession,
-            handle.now_ms(),
+            self.session.admission_now_ms(),
         )? {
             StartAdmission::Replay(receipt) => return Ok(receipt),
             StartAdmission::Fresh(admission) => admission,
@@ -2863,7 +2867,7 @@ impl TaskExecutor {
             parent,
             &req,
             StartAdmissionKind::Orchestrated,
-            handle.now_ms(),
+            self.session.admission_now_ms(),
         )? {
             StartAdmission::Replay(receipt) => return Ok(receipt),
             StartAdmission::Fresh(admission) => admission,

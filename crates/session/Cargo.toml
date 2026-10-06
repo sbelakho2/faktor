@@ -23,3 +23,7 @@ libc = "0.2"
 
 [lints]
 workspace = true
+
+[features]
+# Test-only: exposes the adjustable admission clock to dependent crates.
+test-utils = []

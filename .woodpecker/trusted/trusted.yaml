@@ -76,9 +76,12 @@
 # at marker time). `verify-markers` rejects a lane whose marker records a
 # dirty tracked tree: the recorded HEAD^{tree} is not what ran, so the
 # evidence cannot certify. The mutation campaign never touches this tree at
-# all (scripts/mutation-run.mjs runs every planted edit and gate in an
-# isolated copy and check-invariants hashes this checkout continuously while
-# the campaign runs).
+# all: scripts/mutation-run.mjs runs every planted edit and gate in an
+# isolated scratch copy (with immutable support-artifact snapshots) and
+# check-invariants samples this checkout's metadata every 200 ms plus
+# before/after content digests while the campaign runs; a metadata-preserving
+# same-bytes rewrite is outside that sampler's contract and is prevented by
+# the copy isolation itself.
 #
 # Platform certificate authentication (P0-CERT, MANDATORY — not opt-in): each
 # per-platform certificate status is HMAC-SHA256-signed over the canonical
@@ -870,11 +873,14 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
-      # P1-ASSURANCE: every production crate enumerated from cargo metadata
-      # must carry an explicit disposition (release-critical owner, covered
-      # via registered invariants, or a documented gap). Unknown owners and
-      # unclassified new crates fail.
-      - node scripts/check-invariant-coverage.mjs selftest && node scripts/check-invariant-coverage.mjs --check
+      # P1-ASSURANCE / P0-PROOF: every production crate enumerated from
+      # cargo metadata must carry an explicit RELEASE disposition: a
+      # release-critical owner plus capability rows whose unit proofs exist
+      # exactly once and whose mutations are registered release-critical
+      # invariants, covered via registered invariants, or a documented gap.
+      # RELEASE MODE: any remaining gap fails certification (unproved
+      # production capability is never certified).
+      - node scripts/check-invariant-coverage.mjs selftest && node scripts/check-invariant-coverage.mjs --release
       # README/docs capability claims are enforced HERE because this is the
       # node-carrying lane (`check-docs-sync.sh` skips the check without node).
       - node scripts/capabilities-manifest.mjs --selftest && node scripts/capabilities-manifest.mjs --check-claims

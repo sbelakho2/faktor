@@ -122,19 +122,19 @@ pub(crate) const SHELL_AUTHORITY_MAX_ENTRIES: usize = 1024;
 pub(crate) const SHELL_AUTHORITY_DIR_ENTRIES: usize = 512;
 pub(crate) const SHELL_AUTHORITY_FILE_READ_BYTES: usize = 8 * 1024 * 1024;
 const SHELL_AUTHORITY_PATH_MAX_BYTES: usize = 300;
-const SHELL_AUTHORITY_FIXED_PATHS: &[&str] = &[
-    ".git",
-    ".git/HEAD",
-    ".git/index",
-    ".git/config",
-    ".git/packed-refs",
-    ".git/MERGE_HEAD",
-    ".git/CHERRY_PICK_HEAD",
-    ".git/REVERT_HEAD",
-    ".git/ORIG_HEAD",
-    ".git/FETCH_HEAD",
-    ".git/shallow",
-    ".git/COMMIT_EDITMSG",
+const SHELL_AUTHORITY_FIXED_FILES: &[&str] = &[
+    "HEAD",
+    "index",
+    "config",
+    "packed-refs",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "ORIG_HEAD",
+    "FETCH_HEAD",
+    "shallow",
+    "COMMIT_EDITMSG",
+    "commondir",
 ];
 
 /// Durable memory-fact kind of one shell run's change-attribution state.
@@ -384,8 +384,122 @@ impl ShellManifestCapture {
     }
 }
 
-/// Probe ONE authority file (bounded read). `None` means the path does not
-/// exist as a file OR the stat itself failed before we could hash it.
+/// One resolved Git metadata layout (P1-SHELL): a plain repository keeps
+/// everything under `<root>/.git`; a LINKED worktree (git worktree add) has
+/// `<root>/.git` as a FILE pointing at `<common>/worktrees/<name>`, with the
+/// refs and packed-refs living in the COMMON dir. Authority transitions
+/// (git add/reset/checkout/commit/update-ref) mutate those external files,
+/// so they are fingerprinted by absolute path with stable `gitdir/` and
+/// `commondir/` labels that never leak an absolute path into durable state.
+struct GitAuthority {
+    git_dir: std::path::PathBuf,
+    common_dir: std::path::PathBuf,
+    in_workspace: bool,
+}
+
+/// Lexically clean an absolute path (fold `.`/`..`; no filesystem access).
+fn clean_absolute(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
+    let dot = root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot).ok()?;
+    if meta.is_dir() {
+        return Some(GitAuthority {
+            git_dir: dot.clone(),
+            common_dir: dot,
+            in_workspace: true,
+        });
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    // `<root>/.git` is a file: `gitdir: <path>` (absolute or workspace-relative).
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let raw = text
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("gitdir:"))?
+        .trim();
+    let git_dir = {
+        let joined = root.join(raw);
+        let path = if std::path::Path::new(raw).is_absolute() {
+            std::path::Path::new(raw)
+        } else {
+            joined.as_path()
+        };
+        clean_absolute(path)
+    };
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => {
+            let raw = common.trim();
+            {
+                let joined = git_dir.join(raw);
+                let path = if std::path::Path::new(raw).is_absolute() {
+                    std::path::Path::new(raw)
+                } else {
+                    joined.as_path()
+                };
+                clean_absolute(path)
+            }
+        }
+        Err(_) => git_dir.clone(),
+    };
+    Some(GitAuthority {
+        git_dir,
+        common_dir,
+        in_workspace: false,
+    })
+}
+
+/// Probe ONE authority file by absolute path (bounded read). `None` means the
+/// path does not exist as a file.
+fn authority_probe_abs(abs: &std::path::Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(abs).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some("symlink".into());
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(abs) else {
+        return Some("unreadable".into());
+    };
+    let mut bytes = Vec::new();
+    if file
+        .by_ref()
+        .take(SHELL_AUTHORITY_FILE_READ_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Some("unreadable".into());
+    }
+    let truncated = bytes.len() > SHELL_AUTHORITY_FILE_READ_BYTES;
+    if truncated {
+        bytes.truncate(SHELL_AUTHORITY_FILE_READ_BYTES);
+    }
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    Some(if truncated {
+        format!("slice:{hash}")
+    } else {
+        hash
+    })
+}
+
+/// Probe ONE workspace-relative authority file through the rooted handle
+/// (used for `.faktor` state; Git authority is probed by absolute path).
 fn authority_probe_file(ws: &WorkspaceHandle, rel: &str) -> Option<String> {
     let abs = ws.root().join(rel);
     let meta = std::fs::symlink_metadata(&abs).ok()?;
@@ -404,9 +518,8 @@ fn authority_probe_file(ws: &WorkspaceHandle, rel: &str) -> Option<String> {
     }
 }
 
-/// Walk one authority subtree (sorted, symlink-aware, depth- and
-/// entry-bounded). Directory symlinks are recorded as `symlink`, never
-/// followed.
+/// Probe the workspace-relative `.faktor` tree through the rooted handle
+/// (sorted, symlink-aware, depth- and entry-bounded).
 fn authority_probe_dir(
     ws: &WorkspaceHandle,
     rel: &str,
@@ -456,41 +569,130 @@ fn authority_probe_dir(
     }
 }
 
-/// Capture the bounded authority-state digest map of one workspace (P1-SHELL).
+/// Bounded recursive walk of an ABSOLUTE authority subtree (refs/** of a
+/// linked worktree's common dir), labels prefixed by `label`.
+fn authority_probe_abs_dir(
+    dir: &std::path::Path,
+    label: &str,
+    out: &mut BTreeMap<String, String>,
+    budget: &mut usize,
+) {
+    let mut stack = vec![(dir.to_path_buf(), 0usize, String::from(label))];
+    while let Some((path, depth, prefix)) = stack.pop() {
+        if *budget == 0 || depth > 8 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+        names.sort_by_key(|entry| entry.file_name());
+        for entry in names.into_iter().take(SHELL_AUTHORITY_DIR_ENTRIES) {
+            if *budget == 0 {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_label = format!("{prefix}/{name}");
+            if child_label.len() > SHELL_AUTHORITY_PATH_MAX_BYTES {
+                continue;
+            }
+            *budget -= 1;
+            if file_type.is_dir() {
+                stack.push((entry.path(), depth + 1, child_label));
+            } else if file_type.is_file() {
+                if let Some(hash) = authority_probe_abs(&entry.path()) {
+                    out.insert(child_label, hash);
+                }
+            } else if file_type.is_symlink() {
+                out.insert(child_label, "symlink".into());
+            }
+        }
+    }
+}
+
+/// Capture the bounded authority-state digest map of one workspace (P1-SHELL):
+/// `.faktor` tool state plus the RESOLVED Git authority — `<root>/.git` for a
+/// plain repository, or the worktree `gitdir` and the shared `commondir` for
+/// a linked worktree, so `git add/reset/checkout/commit/update-ref` cannot
+/// mutate authority outside the workspace root unnoticed.
 pub(crate) fn capture_authority_state(ws: &WorkspaceHandle) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut budget = SHELL_AUTHORITY_MAX_ENTRIES;
-    for rel in SHELL_AUTHORITY_FIXED_PATHS {
-        if budget == 0 {
-            break;
+    let root = ws.root();
+    if let Some(git) = resolve_git_authority(root) {
+        let git_label = if git.in_workspace { ".git" } else { "gitdir" };
+        // The `.git` pointer file itself (worktree identity) when it is a file.
+        if !git.in_workspace {
+            if let Some(hash) = authority_probe_abs(&root.join(".git")) {
+                out.insert(".git".to_string(), hash);
+            }
         }
-        budget -= 1;
-        if let Some(hash) = authority_probe_file(ws, rel) {
-            out.insert((*rel).to_string(), hash);
-        }
-    }
-    authority_probe_dir(ws, ".git/refs", &mut out, &mut budget);
-    // Linked-worktree identity: HEAD and gitdir of each registered worktree.
-    let worktrees = ws.root().join(".git/worktrees");
-    if let Ok(entries) = std::fs::read_dir(&worktrees) {
-        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
-        names.sort_by_key(|entry| entry.file_name());
-        for entry in names.into_iter().take(32) {
+        for leaf in SHELL_AUTHORITY_FIXED_FILES {
             if budget == 0 {
                 break;
             }
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
+            budget -= 1;
+            let path = git.git_dir.join(leaf);
+            if let Some(hash) = authority_probe_abs(&path) {
+                out.insert(format!("{git_label}/{leaf}"), hash);
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            for leaf in ["HEAD", "gitdir"] {
+            if git.common_dir != git.git_dir {
                 if budget == 0 {
                     break;
                 }
                 budget -= 1;
-                let rel = format!(".git/worktrees/{name}/{leaf}");
-                if let Some(hash) = authority_probe_file(ws, &rel) {
-                    out.insert(rel, hash);
+                if let Some(hash) = authority_probe_abs(&git.common_dir.join(leaf)) {
+                    out.insert(format!("commondir/{leaf}"), hash);
+                }
+            }
+        }
+        authority_probe_abs_dir(
+            &git.common_dir.join("refs"),
+            if git.in_workspace {
+                ".git/refs"
+            } else {
+                "commondir/refs"
+            },
+            &mut out,
+            &mut budget,
+        );
+        if git.git_dir != git.common_dir {
+            authority_probe_abs_dir(
+                &git.git_dir.join("refs"),
+                "gitdir/refs",
+                &mut out,
+                &mut budget,
+            );
+        }
+        // Registered linked worktrees (their HEAD/gitdir/index are authority).
+        let worktrees = git.common_dir.join("worktrees");
+        if let Ok(entries) = std::fs::read_dir(&worktrees) {
+            let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+            names.sort_by_key(|entry| entry.file_name());
+            for entry in names.into_iter().take(32) {
+                if budget == 0 {
+                    break;
+                }
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                for leaf in ["HEAD", "gitdir", "index"] {
+                    if budget == 0 {
+                        break;
+                    }
+                    budget -= 1;
+                    let worktrees_label = if git.in_workspace {
+                        ".git"
+                    } else {
+                        "commondir"
+                    };
+                    if let Some(hash) = authority_probe_abs(&entry.path().join(leaf)) {
+                        out.insert(format!("{worktrees_label}/worktrees/{name}/{leaf}"), hash);
+                    }
                 }
             }
         }

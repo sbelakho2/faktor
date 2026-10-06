@@ -166,7 +166,7 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-TASK-START-IDEMPOTENT"
-statement = "One submission key admits one task: a completed key replays the byte-identical receipt with zero mutations, a live pending key with the SAME digest refuses in-flight while a pending/stale key with a DIFFERENT digest is the typed KeyReused (claim and peek alike), and a stale/previous-boot pending row is recovery-resolved instead of a perpetual in-flight refusal."
+statement = "One submission key admits one task: a completed key replays the byte-identical receipt with zero mutations, a live pending key with the SAME digest refuses in-flight while a pending/stale key with a DIFFERENT digest is the typed KeyReused (claim and peek alike), and a stale/previous-boot pending row is recovery-resolved instead of a perpetual in-flight refusal; lease liveness is MONOTONIC within one daemon generation, so wall-clock jumps forward or backward never expire or extend a claim."
 owner = "crates/store task_admission + crates/orchestrator task_executor"
 authority = "crates/store/src/task_admission.rs Store::task_admission_claim; crates/orchestrator/src/task_executor/mod.rs TaskExecutor::start_task"
 unit_test = "claim_fresh_then_complete_replays_the_exact_receipt_bytes"
@@ -382,7 +382,7 @@ platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
 id = "INV-PROMPT-START-IDEMPOTENT"
-statement = "An ordinary prompt carries a client submission id; a repeated key with the same body replays the stored receipt byte-for-byte (no second prompt/queue/journal row), a pending or completed key with a different body is the typed KeyReused (never a lease-long in-flight answer), and a byte-identical live pending key is a typed in-flight 409 claimed before any mutation."
+statement = "An ordinary prompt carries a client submission id; a repeated key with the same body replays the stored receipt byte-for-byte (no second prompt/queue/journal row), a pending or completed key with a different body is the typed KeyReused (never a lease-long in-flight answer), and a byte-identical live pending key is a typed in-flight 409 claimed before any mutation; lease liveness is MONOTONIC within one daemon generation (wall-clock jumps never move it)."
 owner = "crates/store + crates/server prompt admission"
 authority = "prompt_admission_claim and native_prompt"
 unit_test = "prompt_claim_fresh_then_complete_replays_the_exact_receipt_bytes"
@@ -706,12 +706,141 @@ platforms = ["linux"]
 
 [[invariant]]
 id = "INV-CAPABILITY-COVERAGE"
-statement = "Every local production crate/package is classified in tests/invariant-coverage.json as release-critical (owned by a registered release-critical invariant), covered (transitively named by registered release-critical invariants), or an explicit gap with a reason; a new crate, an unknown owner or an empty disposition fails the mechanical cargo-metadata completeness check."
+statement = "Every local production crate is classified in tests/invariant-coverage.json as release-critical (owned by a registered release-critical invariant AND enumerating capability rows whose unit proofs exist exactly once in the owning source tree and whose mutation is a registered release-critical invariant), covered (transitively named by registered invariants), or an explicit gap with a reason; the IDE surfaces apps/vscode and apps/jetbrains carry capability rows with the same proof discipline; a new crate, unknown owner, malformed capability id, unknown mutation, unproven unit or empty disposition fails the mechanical check, and --release fails on any remaining gap."
 owner = "tests/invariant-coverage.json + scripts/check-invariant-coverage.mjs"
 authority = "scripts/check-invariant-coverage.mjs --check (cargo metadata + registry); wired in .woodpecker/trusted/trusted.yaml linux certificate lane"
-script_check = "node scripts/check-invariant-coverage.mjs --check"
+script_check = "node scripts/check-invariant-coverage.mjs --release"
+unit_test = ""
+production_wiring = ""
+fault = ""
 mutation_witness = "node scripts/check-invariant-coverage.mjs selftest"
 mutation_command = "node scripts/mutation-run.mjs INV-CAPABILITY-COVERAGE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MCP-BOUNDED-WRITER-QUEUE"
+statement = "A full MCP child stdin writer queue is a typed Oversized refusal, never a dropped completion or a vague transport error; the bounded FIFO's backpressure is observable and typed."
+owner = "crates/mcp process writer"
+authority = "crates/mcp/src/lib.rs bounded stdin writer queue full-refusal"
+unit_test = "full_writer_queue_is_a_typed_oversized_refusal"
+production_wiring = "production_paths_never_construct_a_command_or_supervisor"
+fault = ""
+mutation_witness = "full_writer_queue_is_a_typed_oversized_refusal"
+mutation_command = "node scripts/mutation-run.mjs INV-MCP-BOUNDED-WRITER-QUEUE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-LSP-BOUNDED-WRITER-QUEUE"
+statement = "A full LSP server stdin writer queue is a typed Oversized refusal on both the async and sync send paths, never a silently dropped enqueue."
+owner = "crates/lsp process writer"
+authority = "crates/lsp/src/lib.rs bounded stdin writer queue full-refusal"
+unit_test = "lsp_full_writer_queue_is_a_typed_oversized_refusal"
+production_wiring = "missing_server_is_not_found_and_manager_survives"
+fault = ""
+mutation_witness = "lsp_full_writer_queue_is_a_typed_oversized_refusal"
+mutation_command = "node scripts/mutation-run.mjs INV-LSP-BOUNDED-WRITER-QUEUE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACP-DUPLICATE-FRAME-HEADER"
+statement = "ACP framing refuses a duplicate Content-Length header and a missing Content-Length as typed recoverable frame errors, never letting a second header silently override the first."
+owner = "crates/acp framing"
+authority = "crates/acp/src/protocol.rs duplicate Content-Length refusal"
+unit_test = "missing_or_duplicate_content_length_rejected"
+production_wiring = "hostile_content_length_rejected_without_body"
+fault = ""
+mutation_witness = "missing_or_duplicate_content_length_rejected"
+mutation_command = "node scripts/mutation-run.mjs INV-ACP-DUPLICATE-FRAME-HEADER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-EGRESS-DEFAULT-DENY"
+statement = "Browser egress is default-deny: only first-party allowlisted hosts are allowed, unknown hosts are blocked, and an explicit deny always wins over an allow."
+owner = "crates/browser egress policy"
+authority = "crates/browser/src/egress.rs first-party allowlist decision"
+unit_test = "policy_denies_unknown_hosts_and_deny_wins"
+production_wiring = "connect_refuses_hostile_endpoints_before_dialing"
+fault = ""
+mutation_witness = "policy_denies_unknown_hosts_and_deny_wins"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-EGRESS-DEFAULT-DENY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+statement = "A semantic provider's claimed capabilities can only ever REDUCE the parent session capability set (intersection), never widen it; a claim of Network can never grant Network."
+owner = "crates/semantic risk/capabilities"
+authority = "crates/semantic/src/risk.rs capability_intersection"
+unit_test = "capability_intersection_only_reduces_and_never_grants"
+production_wiring = "process_client_round_trips_the_typed_frame"
+fault = ""
+mutation_witness = "capability_intersection_only_reduces_and_never_grants"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-CAPABILITY-INTERSECTION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+statement = "SCM reconcile cadence validates jitter and backoff bounds exactly: negative or over-maximum jitter, jitter beyond the interval, and out-of-band backoff are typed refusals."
+owner = "crates/scm reconcile"
+authority = "crates/scm/src/reconcile.rs cadence validation"
+unit_test = "cadence_jitter_and_backoff_bounds_are_enforced"
+production_wiring = "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound"
+fault = ""
+mutation_witness = "cadence_jitter_and_backoff_bounds_are_enforced"
+mutation_command = "node scripts/mutation-run.mjs INV-SCM-RECONCILE-CADENCE-BOUNDS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACQUIRE-HEALTH-REFUSAL"
+statement = "Connector health is monotonic where it must be: authentication-required, verification-required and unavailable states never become usable by the passage of time, while transient states may recover."
+owner = "crates/acquire health"
+authority = "crates/acquire/src/health.rs usable_at state matrix"
+unit_test = "time_based_health_recovers_and_human_states_do_not"
+production_wiring = "non_canonical_destination_hosts_and_ports_are_refused"
+fault = ""
+mutation_witness = "time_based_health_recovers_and_human_states_do_not"
+mutation_command = "node scripts/mutation-run.mjs INV-ACQUIRE-HEALTH-REFUSAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-COMMERCE-BOM-BOUND"
+statement = "A commerce BOM is bounded at exactly MAX_BOM_LINES items: a request at the bound is accepted and one over is a typed refusal."
+owner = "crates/commerce bom"
+authority = "crates/commerce/src/bom.rs line bound"
+unit_test = "bom_is_bounded_at_500_lines"
+production_wiring = "hostile_part_numbers_are_typed_errors"
+fault = ""
+mutation_witness = "bom_is_bounded_at_500_lines"
+mutation_command = "node scripts/mutation-run.mjs INV-COMMERCE-BOM-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CLOUD-BACKUP-RETENTION-BOUND"
+statement = "Cloud rotating backups keep exactly the bounded maximum file count and byte budget: rotation never deletes one too few or one too many, and a restore round-trip is verified."
+owner = "crates/cloud durability"
+authority = "crates/cloud/src/durability.rs rotation bound"
+unit_test = "backup_roundtrip_is_restore_verified_and_rotation_is_bounded"
+production_wiring = "wire_dto_accepts_a_real_provider_payload_and_converts_immediately"
+fault = ""
+mutation_witness = "backup_roundtrip_is_restore_verified_and_rotation_is_bounded"
+mutation_command = "node scripts/mutation-run.mjs INV-CLOUD-BACKUP-RETENTION-BOUND"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]

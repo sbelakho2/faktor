@@ -1,0 +1,9 @@
+{
+  "id": "INV-LSP-BOUNDED-WRITER-QUEUE",
+  "file": "crates/lsp/src/lib.rs",
+  "find": "            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(Error::new(\n                ErrorKind::Oversized,\n                format!(\"lsp {what}: stdin writer queue is full (the server is not draining)\"),\n            )),",
+  "replace": "            Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(()),",
+  "gate": "cargo test -p faktor-lsp --lib lsp_full_writer_queue_is_a_typed_oversized_refusal",
+  "expect": "FAILED",
+  "note": "Accepting a full bounded writer queue drops the enqueue and its completion instead of the typed Oversized refusal."
+}

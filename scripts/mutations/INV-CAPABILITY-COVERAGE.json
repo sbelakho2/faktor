@@ -1,9 +1,9 @@
 {
   "id": "INV-CAPABILITY-COVERAGE",
   "file": "tests/invariant-coverage.json",
-  "find": "   \"crate\": \"faktor-acquire\",\n   \"class\": \"gap\",",
-  "replace": "   \"crate\": \"faktor-acquire\",\n   \"class\": \"release-critical\",",
+  "find": "   \"capabilities\": [\n    {\n     \"id\": \"acquire.health\",",
+  "replace": "   \"capabilities\": [\n    {\n     \"id\": \"acquire\",",
   "gate": "node scripts/check-invariant-coverage.mjs --check",
   "expect": "FAIL",
-  "note": "Silently promotes a documented gap to release-critical with no owner invariant: the mechanical coverage check must fail on the ownerless classification."
+  "note": "Renames the unique acquire.health capability id into a malformed one: the mechanical capability check must fail on the bad id and on the now-missing unit binding."
 }

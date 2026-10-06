@@ -114,11 +114,76 @@ struct OpIdRange {
     remaining: u64,
 }
 
+/// A MONOTONIC admission-clock authority (P1-IDEMPOTENCY): lease liveness
+/// must not depend on adjustable wall time. Within one daemon generation the
+/// monotonic reading is authoritative; across generations the stored
+/// `owner_generation` already classifies a row stale, so the two epochs are
+/// never compared.
+pub trait AdmissionClock: Send + Sync + std::fmt::Debug {
+    /// Milliseconds since this daemon OPENED (monotonic, never wall time).
+    fn now_ms(&self) -> i64;
+}
+
+#[derive(Debug)]
+pub struct MonotonicAdmissionClock {
+    epoch: std::time::Instant,
+}
+
+impl Default for MonotonicAdmissionClock {
+    fn default() -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+        }
+    }
+}
+
+impl AdmissionClock for MonotonicAdmissionClock {
+    fn now_ms(&self) -> i64 {
+        i64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(i64::MAX)
+    }
+}
+
+/// Test-only adjustable monotonic clock (feature `test-utils`).
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Default)]
+pub struct TestAdmissionClock {
+    ms: std::sync::atomic::AtomicI64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl TestAdmissionClock {
+    pub fn new(start_ms: i64) -> Self {
+        Self {
+            ms: std::sync::atomic::AtomicI64::new(start_ms),
+        }
+    }
+
+    pub fn set(&self, ms: i64) {
+        self.ms.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn advance(&self, delta_ms: i64) {
+        self.ms
+            .fetch_add(delta_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl AdmissionClock for TestAdmissionClock {
+    fn now_ms(&self) -> i64 {
+        self.ms.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// The entry point of `faktor-session`. One manager per daemon data root.
 pub struct SessionManager {
     store: Arc<Store>,
     cas: Arc<Cas>,
     clock: Arc<dyn Clock>,
+    /// The MONOTONIC admission clock (P1-IDEMPOTENCY): lease liveness for
+    /// task/prompt admission never reads adjustable wall time. Replaceable
+    /// only through the `test-utils` seam.
+    admission_clock: std::sync::RwLock<Arc<dyn AdmissionClock>>,
     /// The async append actor over the SAME `Arc<Store>` (audit 42): hot
     /// append paths run through it; every other call stays direct sync.
     actor: Arc<crate::actor::DbActor>,
@@ -221,6 +286,7 @@ impl SessionManager {
             store,
             cas,
             clock,
+            admission_clock: std::sync::RwLock::new(Arc::new(MonotonicAdmissionClock::default())),
             actor,
             reads,
             op_ids: Mutex::new(OpIdRange::default()),
@@ -240,6 +306,23 @@ impl SessionManager {
     pub fn turn_budget_ms(&self) -> u64 {
         self.turn_budget_ms
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The MONOTONIC admission-time reading for every lease decision
+    /// (P1-IDEMPOTENCY): immune to wall-clock jumps within one generation.
+    pub fn admission_now_ms(&self) -> i64 {
+        self.admission_clock
+            .read()
+            .expect("admission clock lock")
+            .now_ms()
+    }
+
+    /// Replace the admission clock (feature `test-utils`): tests advance a
+    /// controllable monotonic epoch to exercise lease expiry without waiting
+    /// or touching wall time. Install it before spawning work.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_admission_clock(&self, clock: Arc<dyn AdmissionClock>) {
+        *self.admission_clock.write().expect("admission clock lock") = clock;
     }
 
     /// The durable store, shared with snapshot/redo consumers (the wire

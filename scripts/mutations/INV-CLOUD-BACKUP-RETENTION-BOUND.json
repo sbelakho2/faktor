@@ -1,0 +1,9 @@
+{
+  "id": "INV-CLOUD-BACKUP-RETENTION-BOUND",
+  "file": "crates/cloud/src/durability.rs",
+  "find": "    for victim in files.iter().rev() {\n        let over_count = kept > MAX_BACKUP_FILES;\n        let over_bytes = total > MAX_BACKUP_TOTAL_BYTES && kept > 1;\n        if !over_count && !over_bytes {\n            break;",
+  "replace": "    for victim in files.iter().rev() {\n        let over_count = kept >= MAX_BACKUP_FILES;\n        let over_bytes = total > MAX_BACKUP_TOTAL_BYTES && kept > 1;\n        if !over_count && !over_bytes {\n            break;",
+  "gate": "cargo test -p faktor-cloud --lib backup_roundtrip_is_restore_verified_and_rotation_is_bounded",
+  "expect": "FAILED",
+  "note": "Rotation must keep exactly MAX backup files; >= rotates one too many."
+}

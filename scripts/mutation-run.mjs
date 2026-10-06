@@ -45,6 +45,7 @@
 // live); 2 usage or spec errors.
 
 import { spawn } from 'node:child_process';
+import { provisionSupport } from './mutation-support.mjs';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -68,32 +69,16 @@ function excludedUnder(root, path) {
   return rel.split(/[\\/]/).some((part) => ISOLATION_EXCLUDES.has(part));
 }
 
-/**
- * Provision the scratch copy with the two SUPPORT trees gates need but that
- * must never be copied (multi-GB, machine-specific): the built CLI binary
- * (the JetBrains gradle smokes execute it) and the VS Code extension's
- * installed dev dependencies (the TS loader `require`s them). Both are
- * symlinked back to the real checkout; cargo still compiles into the
- * dedicated mutation target dir, never this tree.
- */
-function linkGateSupports(sourceRoot, scratch) {
-  const cli = join(sourceRoot, 'target', 'debug', 'faktor-cli');
-  if (existsSync(cli)) {
-    mkdirSync(join(scratch, 'target', 'debug'), { recursive: true });
-    try {
-      symlinkSync(cli, join(scratch, 'target', 'debug', 'faktor-cli'));
-    } catch {
-      // Existing link or unsupported platform: the gradle gates will fail
-      // their control run loudly rather than run a stale mutant.
-    }
+/** Snapshot the gate support trees (see scripts/mutation-support.mjs). */
+function provisionGateSupports(sourceRoot, scratch) {
+  const record = provisionSupport(sourceRoot, scratch);
+  if (record.cli !== null) {
+    console.log(`mutation-support: cli=${record.cli.method} sha256=${record.cli.sha256}`);
   }
-  const modules = join(sourceRoot, 'apps', 'vscode', 'node_modules');
-  if (existsSync(modules)) {
-    try {
-      symlinkSync(modules, join(scratch, 'apps', 'vscode', 'node_modules'));
-    } catch {
-      // As above: a missing dev-dependency tree is a control-gate failure.
-    }
+  if (record.node_modules !== null && record.node_modules.digest) {
+    console.log(
+      `mutation-support: node_modules=${record.node_modules.method} digest=${record.node_modules.digest} entries=${record.node_modules.entries}`,
+    );
   }
 }
 
@@ -112,7 +97,7 @@ function prepareGateRoot() {
     recursive: true,
     filter: (source) => !excludedUnder(SCRIPT_ROOT, source),
   });
-  linkGateSupports(SCRIPT_ROOT, scratch);
+  provisionGateSupports(SCRIPT_ROOT, scratch);
   GATE_ROOT = scratch;
   GATE_ROOT_CLEANUP = () => rmSync(scratch, { recursive: true, force: true });
 }

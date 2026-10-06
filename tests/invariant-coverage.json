@@ -1,15 +1,75 @@
 {
- "schema": "faktor-invariant-coverage/v1",
+ "schema": "faktor-invariant-coverage/v2",
  "entries": [
   {
    "crate": "faktor-acp",
-   "class": "gap",
-   "reason": "ACP conformance is exercised by tests/acp-official but no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-ACP-DUPLICATE-FRAME-HEADER"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "acp.framing",
+     "unit": "missing_or_duplicate_content_length_rejected",
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+    },
+    {
+     "id": "acp.content_length_corpus",
+     "unit": "acp_content_length_corpus_matches_every_outcome",
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+    },
+    {
+     "id": "acp.cancel",
+     "unit": "cancel_request_cancels_the_matching_running_prompt_exactly_once",
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+    },
+    {
+     "id": "acp.shutdown",
+     "unit": "shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes",
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+    },
+    {
+     "id": "acp.writer_backpressure",
+     "unit": "d_writer_queue_full_is_bounded_and_cancel_lane_lands",
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+    }
+   ]
   },
   {
    "crate": "faktor-acquire",
-   "class": "gap",
-   "reason": "commerce acquisition surface has dedicated adversarial suites but no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-ACQUIRE-HEALTH-REFUSAL"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "acquire.health",
+     "unit": "time_based_health_recovers_and_human_states_do_not",
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+    },
+    {
+     "id": "acquire.retry_after",
+     "unit": "hostile_retry_after_values_are_rejected_never_guessed",
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+    },
+    {
+     "id": "acquire.destination_identity",
+     "unit": "non_canonical_destination_hosts_and_ports_are_refused",
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+    },
+    {
+     "id": "acquire.planner",
+     "unit": "capability_credentials_health_and_quota_each_disqualify_the_api",
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+    },
+    {
+     "id": "acquire.retry_gate",
+     "unit": "the_retry_after_gate_is_clamped_to_the_window_reset",
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+    }
+   ]
   },
   {
    "crate": "faktor-agent",
@@ -24,7 +84,14 @@
     "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
     "INV-SHELL-CRASH-DISCOVERY"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "agent.authority",
+     "unit": "compaction_summary_one_over_the_cap_is_refused",
+     "mutation": "INV-COMPACTION-SUMMARY-CAP"
+    }
+   ]
   },
   {
    "crate": "faktor-anthropic",
@@ -32,12 +99,65 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "anthropic.authority",
+     "unit": "http_status_retry_classification_is_shared_by_both_families",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "source": "crates/openai/src/lib_tests.rs"
+    }
+   ]
   },
   {
    "crate": "faktor-browser",
-   "class": "gap",
-   "reason": "browser confinement has a large adversarial suite and the sandbox projection invariant, but no crate-owned mutation-killed invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-BROWSER-EGRESS-DEFAULT-DENY"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "browser.egress",
+     "unit": "policy_denies_unknown_hosts_and_deny_wins",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.download_policy",
+     "unit": "downloads_are_denied_by_default_and_native_is_always_denied",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.download_filename",
+     "unit": "download_filename_is_always_one_bounded_component",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.launch_rollback",
+     "unit": "failed_launch_rolls_back_child_broker_and_temp_profile",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.shutdown_orphans",
+     "unit": "idle_shutdown_kills_the_child_and_leaves_no_orphan",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.interception",
+     "unit": "interception_drops_blocked_resource_types_and_tracking_hosts",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.profile_confinement",
+     "unit": "profile_store_refuses_symlink_swaps_including_cookie_and_incognito",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "browser.capture_cleanup",
+     "unit": "repeated_cancelled_captures_never_wedge_the_profile",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    }
+   ]
   },
   {
    "crate": "faktor-cas",
@@ -59,13 +179,73 @@
   },
   {
    "crate": "faktor-cloud",
-   "class": "gap",
-   "reason": "cloud/RBAC/billing surfaces have no new concrete blocker but no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-CLOUD-BACKUP-RETENTION-BOUND"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "cloud.backup_retention",
+     "unit": "backup_roundtrip_is_restore_verified_and_rotation_is_bounded",
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+    },
+    {
+     "id": "cloud.restore_verification",
+     "unit": "a_corrupted_backup_fails_restore_verification_and_is_never_adopted",
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+    },
+    {
+     "id": "cloud.money_strings",
+     "unit": "money_fields_serialize_as_quoted_decimal_strings_at_every_boundary",
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+    },
+    {
+     "id": "cloud.billing_overflow",
+     "unit": "usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary",
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+    },
+    {
+     "id": "cloud.migration_claim",
+     "unit": "migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema",
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+    }
+   ]
   },
   {
    "crate": "faktor-commerce",
-   "class": "gap",
-   "reason": "commerce policy surface has dedicated adversarial suites but no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-COMMERCE-BOM-BOUND"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "commerce.bom_bound",
+     "unit": "bom_is_bounded_at_500_lines",
+     "mutation": "INV-COMMERCE-BOM-BOUND"
+    },
+    {
+     "id": "commerce.part_identity",
+     "unit": "hostile_part_numbers_are_typed_errors",
+     "mutation": "INV-COMMERCE-BOM-BOUND"
+    },
+    {
+     "id": "commerce.matching",
+     "unit": "a_different_part_number_is_a_mismatch",
+     "mutation": "INV-COMMERCE-BOM-BOUND"
+    },
+    {
+     "id": "commerce.digest_stability",
+     "unit": "bom_digest_is_order_sensitive_and_deterministic",
+     "mutation": "INV-COMMERCE-BOM-BOUND"
+    },
+    {
+     "id": "commerce.quote_scope",
+     "unit": "account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers",
+     "mutation": "INV-COMMERCE-BOM-BOUND"
+    }
+   ]
   },
   {
    "crate": "faktor-commerce-connectors",
@@ -73,7 +253,14 @@
    "owners": [
     "INV-REDACTION-CAP-FAIL-CLOSED"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "commerce-connectors.authority",
+     "unit": "planted_secrets_never_reach_any_sink",
+     "mutation": "INV-REDACTION-CAP-FAIL-CLOSED"
+    }
+   ]
   },
   {
    "crate": "faktor-context",
@@ -91,7 +278,14 @@
    "owners": [
     "INV-FROZEN-CONTRACTS"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "contracts.authority",
+     "unit": "check_fails_on_a_renamed_and_reordered_variant_in_a_scratch_copy",
+     "mutation": "INV-FROZEN-CONTRACTS"
+    }
+   ]
   },
   {
    "crate": "faktor-core",
@@ -100,7 +294,14 @@
     "INV-RUNTIME-PATH-CANONICALIZATION",
     "INV-FROZEN-CONTRACTS"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "core.authority",
+     "unit": "overlap_uses_canonical_component_boundaries",
+     "mutation": "INV-RUNTIME-PATH-CANONICALIZATION"
+    }
+   ]
   },
   {
    "crate": "faktor-deepseek",
@@ -108,7 +309,15 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "deepseek.authority",
+     "unit": "http_status_retry_classification_is_shared_by_both_families",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "source": "crates/openai/src/lib_tests.rs"
+    }
+   ]
   },
   {
    "crate": "faktor-edit",
@@ -134,7 +343,14 @@
    "owners": [
     "INV-FS-MUTATION-PARENT-REVERIFY"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "fs.authority",
+     "unit": "merge_apply_content_refuses_a_parent_swapped_to_an_outside_symlink",
+     "mutation": "INV-FS-MUTATION-PARENT-REVERIFY"
+    }
+   ]
   },
   {
    "crate": "faktor-gateway",
@@ -142,7 +358,15 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "gateway.authority",
+     "unit": "http_status_retry_classification_is_shared_by_both_families",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "source": "crates/openai/src/lib_tests.rs"
+    }
+   ]
   },
   {
    "crate": "faktor-git",
@@ -159,7 +383,15 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "google.authority",
+     "unit": "http_status_retry_classification_is_shared_by_both_families",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "source": "crates/openai/src/lib_tests.rs"
+    }
+   ]
   },
   {
    "crate": "faktor-hooks",
@@ -176,7 +408,14 @@
    "owners": [
     "INV-INDEX-EVICTION-DETERMINISTIC"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "index.authority",
+     "unit": "eviction_is_canonical_across_100_permutations_and_hash_seeds",
+     "mutation": "INV-INDEX-EVICTION-DETERMINISTIC"
+    }
+   ]
   },
   {
    "crate": "faktor-instructions",
@@ -198,13 +437,63 @@
   },
   {
    "crate": "faktor-lsp",
-   "class": "gap",
-   "reason": "LSP process/session surface has no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-LSP-BOUNDED-WRITER-QUEUE"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "lsp.writer_backpressure",
+     "unit": "lsp_full_writer_queue_is_a_typed_oversized_refusal",
+     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+    },
+    {
+     "id": "lsp.initialize",
+     "unit": "initialize_carries_real_root_and_owner",
+     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+    },
+    {
+     "id": "lsp.shutdown",
+     "unit": "shutdown_request_then_exit_notification_within_grace",
+     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+    },
+    {
+     "id": "lsp.reader_bounds",
+     "unit": "stderr_flood_is_drained_bounded_and_never_blocks",
+     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+    }
+   ]
   },
   {
    "crate": "faktor-mcp",
-   "class": "gap",
-   "reason": "MCP bounded writer queue/delivery-unknown surface has no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-MCP-BOUNDED-WRITER-QUEUE"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "mcp.bounded_writer",
+     "unit": "full_writer_queue_is_a_typed_oversized_refusal",
+     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+    },
+    {
+     "id": "mcp.delivery_unknown",
+     "unit": "delivery_unknown_is_typed_by_code_and_not_retryable",
+     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+    },
+    {
+     "id": "mcp.spawn_lifecycle",
+     "unit": "a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock",
+     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+    },
+    {
+     "id": "mcp.call_cancellation",
+     "unit": "timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown",
+     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+    }
+   ]
   },
   {
    "crate": "faktor-memory",
@@ -221,7 +510,14 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "ollama.authority",
+     "unit": "adapter_media_gate_refuses_hostile_oversized_payload_typed",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+    }
+   ]
   },
   {
    "crate": "faktor-openai",
@@ -229,7 +525,15 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "openai.authority",
+     "unit": "http_status_retry_classification_is_shared_by_both_families",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "source": "crates/openai/src/lib_tests.rs"
+    }
+   ]
   },
   {
    "crate": "faktor-orchestrator",
@@ -239,7 +543,14 @@
     "INV-ADMISSION-RECOVERY-LANDING",
     "INV-RUNTIME-PATH-CANONICALIZATION"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "orchestrator.authority",
+     "unit": "a_pending_row_blocks_a_duplicate_start_without_touching_anything",
+     "mutation": "INV-TASK-START-IDEMPOTENT"
+    }
+   ]
   },
   {
    "crate": "faktor-protocol",
@@ -247,7 +558,14 @@
    "owners": [
     "INV-FROZEN-CONTRACTS"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "protocol.authority",
+     "unit": "error_codes_cover_every_kind_once",
+     "mutation": "INV-FROZEN-CONTRACTS"
+    }
+   ]
   },
   {
    "crate": "faktor-provider",
@@ -255,7 +573,14 @@
    "owners": [
     "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "provider.authority",
+     "unit": "exhaustive_status_hint_table_is_the_single_authority",
+     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+    }
+   ]
   },
   {
    "crate": "faktor-pty",
@@ -263,7 +588,14 @@
    "owners": [
     "INV-PTY-CONTROL-PIPE-CLOEXEC"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "pty.authority",
+     "unit": "control_pipe_is_cloexec_at_creation",
+     "mutation": "INV-PTY-CONTROL-PIPE-CLOEXEC"
+    }
+   ]
   },
   {
    "crate": "faktor-router",
@@ -272,7 +604,14 @@
     "INV-MAX-QUALITY-ONE-AUTHORITY",
     "INV-MEMO-READ-ONLY-VIEW"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "router.authority",
+     "unit": "maximum_quality_path_consumes_only_qualified_candidates",
+     "mutation": "INV-MAX-QUALITY-ONE-AUTHORITY"
+    }
+   ]
   },
   {
    "crate": "faktor-sandbox",
@@ -280,7 +619,14 @@
    "owners": [
     "INV-SANDBOX-PRIVILEGE-DROP"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "sandbox.authority",
+     "unit": "filesystem_projection_is_enforcement_honest",
+     "mutation": "INV-SANDBOX-PRIVILEGE-DROP"
+    }
+   ]
   },
   {
    "crate": "faktor-scheduler",
@@ -288,12 +634,49 @@
    "owners": [
     "INV-RUNTIME-PATH-CANONICALIZATION"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "scheduler.authority",
+     "unit": "lexical_aliases_share_one_identity_before_existence",
+     "mutation": "INV-RUNTIME-PATH-CANONICALIZATION"
+    }
+   ]
   },
   {
    "crate": "faktor-scm",
-   "class": "gap",
-   "reason": "SCM daemon authority has dedicated adversarial suites but no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "scm.reconcile_cadence",
+     "unit": "cadence_jitter_and_backoff_bounds_are_enforced",
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+    },
+    {
+     "id": "scm.webhook_claims",
+     "unit": "acknowledged_webhook_claim_survives_sigkill_and_reopen",
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+    },
+    {
+     "id": "scm.token_bounds",
+     "unit": "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound",
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+    },
+    {
+     "id": "scm.branch_reconcile",
+     "unit": "branch_create_is_bounded_to_the_exact_head_and_reconciles_existing",
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+    },
+    {
+     "id": "scm.id_bounds",
+     "unit": "installation_ids_above_the_signed_sqlite_bound_are_refused_typed",
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+    }
+   ]
   },
   {
    "crate": "faktor-search",
@@ -302,7 +685,14 @@
     "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE",
     "INV-SEMANTIC-EMBED-BATCH-BOUNDS"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "search.authority",
+     "unit": "slow_provider_never_stalls_lexical_symbol_or_index_updates",
+     "mutation": "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE"
+    }
+   ]
   },
   {
    "crate": "faktor-security",
@@ -310,12 +700,49 @@
    "owners": [
     "INV-REDACTION-CAP-FAIL-CLOSED"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "security.authority",
+     "unit": "decoy_hits_before_the_real_secret_never_expose_it",
+     "mutation": "INV-REDACTION-CAP-FAIL-CLOSED"
+    }
+   ]
   },
   {
    "crate": "faktor-semantic",
-   "class": "gap",
-   "reason": "semantic provider layer has no mutation-killed registry invariant yet"
+   "class": "release-critical",
+   "owners": [
+    "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+   ],
+   "authority": "mutation-killed invariant owners",
+   "capabilities": [
+    {
+     "id": "semantic.capability_reduction",
+     "unit": "capability_intersection_only_reduces_and_never_grants",
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+    },
+    {
+     "id": "semantic.process_client",
+     "unit": "process_client_round_trips_the_typed_frame",
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+    },
+    {
+     "id": "semantic.watchdog",
+     "unit": "process_client_watchdog_is_typed_provider_timeout_and_retires_the_child",
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+    },
+    {
+     "id": "semantic.fallback",
+     "unit": "fallback_serves_every_operation_when_no_provider_is_registered",
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+    },
+    {
+     "id": "semantic.risk_default",
+     "unit": "unknown_risk_level_is_not_safe",
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+    }
+   ]
   },
   {
    "crate": "faktor-server",
@@ -325,7 +752,14 @@
     "INV-PROMPT-START-IDEMPOTENT",
     "INV-TERMINAL-EVENTS-SESSION-ISOLATED"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "server.authority",
+     "unit": "budget_enforcement_is_persisted_effective_vs_requested_and_survives_reopen",
+     "mutation": "INV-ATTACHMENT-REFERENCE-IDENTITY"
+    }
+   ]
   },
   {
    "crate": "faktor-session",
@@ -335,7 +769,14 @@
     "INV-DURABLE-CORRUPTION-LOUD",
     "INV-CHANGE-BUDGET-PREEXEC-REFUSAL"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "session.authority",
+     "unit": "journal_verify_open_maps_a_torn_journal_to_the_typed_corruption_surface",
+     "mutation": "INV-JOURNAL-INTEGRITY"
+    }
+   ]
   },
   {
    "crate": "faktor-snapshot",
@@ -365,7 +806,14 @@
     "INV-ADMISSION-LEASE-FENCING",
     "INV-ADMISSION-RECOVERY-LANDING"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "store.authority",
+     "unit": "attachment_references_are_keyed_by_full_metadata_and_survive_reopen",
+     "mutation": "INV-ATTACHMENT-REFERENCE-IDENTITY"
+    }
+   ]
   },
   {
    "crate": "faktor-terminal",
@@ -374,7 +822,14 @@
     "INV-SANDBOX-PRIVILEGE-DROP",
     "INV-FS-CONFINEMENT-LANDLOCK-DEMAND"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "terminal.authority",
+     "unit": "deny_all_spawn_isolates_the_child_or_refuses_typed",
+     "mutation": "INV-SANDBOX-PRIVILEGE-DROP"
+    }
+   ]
   },
   {
    "crate": "faktor-updater",
@@ -382,7 +837,14 @@
    "owners": [
     "INV-UPDATER-EXEC-IDENTITY"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "updater.authority",
+     "unit": "a_binary_swapped_between_verification_and_exec_never_executes",
+     "mutation": "INV-UPDATER-EXEC-IDENTITY"
+    }
+   ]
   },
   {
    "crate": "faktor-verify",
@@ -390,7 +852,14 @@
    "owners": [
     "INV-MANIFEST-READ-BOUNDED"
    ],
-   "authority": "authority text of the named invariants"
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "verify.authority",
+     "unit": "huge_sparse_manifest_is_refused_from_literal_metadata_bounded",
+     "mutation": "INV-MANIFEST-READ-BOUNDED"
+    }
+   ]
   },
   {
    "crate": "faktor-winjob",
@@ -409,6 +878,78 @@
     "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES"
    ],
    "reason": "worker plane recovery is the admission/landing authority"
+  }
+ ],
+ "surfaces": [
+  {
+   "id": "apps/vscode",
+   "capabilities": [
+    {
+     "id": "vscode.send_task",
+     "unit": "double click / Enter+click / triple submit admit exactly ONE start",
+     "mutation": "INV-CLIENT-ROUTE-CONTRACT"
+    },
+    {
+     "id": "vscode.daemon_single_flight",
+     "unit": "100 concurrent startDaemon callers spawn exactly one process (single-flight)",
+     "mutation": "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES"
+    },
+    {
+     "id": "vscode.refresh_fencing",
+     "unit": "lifecycle fence: 2,000 randomized interleavings never apply a stale generation",
+     "mutation": "INV-CLIENT-ROUTE-CONTRACT"
+    },
+    {
+     "id": "vscode.attachment_identity",
+     "unit": "durable acceptance clears ONLY the accepted attachment ids (next-task attachment survives)",
+     "mutation": "INV-VSCODE-ATTACHMENT-UI-REACHABILITY"
+    },
+    {
+     "id": "vscode.contrast",
+     "unit": "every acceptance-verdict pair meets WCAG AA 4.5:1 in chat.css",
+     "mutation": "INV-VSCODE-ACCESSIBILITY"
+    },
+    {
+     "id": "vscode.stream_bounds",
+     "unit": "frame budget: exactly max cumulative bytes is accepted, one line above is refused",
+     "mutation": "INV-IDE-SSE-FRAME-BOUNDED"
+    }
+   ]
+  },
+  {
+   "id": "apps/jetbrains",
+   "capabilities": [
+    {
+     "id": "jetbrains.prompt_draft",
+     "unit": "prompt submission identity: identical retry reuses the id, edits mint new",
+     "mutation": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE"
+    },
+    {
+     "id": "jetbrains.send_single_flight",
+     "unit": "task start single-flight: transport failure re-enables and keeps draft + attachments",
+     "mutation": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE"
+    },
+    {
+     "id": "jetbrains.stream_blocked",
+     "unit": "private fun assertSseBlockedShape(",
+     "mutation": "INV-IDE-SSE-BLOCKED-DURABLE-JB"
+    },
+    {
+     "id": "jetbrains.process_drain",
+     "unit": "private fun assertCommandDrain(",
+     "mutation": "INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED"
+    },
+    {
+     "id": "jetbrains.attachments",
+     "unit": "attachment reads are canonicalized and symlink escapes refuse",
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+    },
+    {
+     "id": "jetbrains.reconnect",
+     "unit": "real: reconnect at the current cursor",
+     "mutation": "INV-IDE-SSE-BLOCKED-DURABLE-JB"
+    }
+   ]
   }
  ]
 }

@@ -1861,6 +1861,11 @@ const RUNTIME_DEVICE_PATHS: &[&str] = &[
 /// right set inside the pre-exec child).
 const ACCESS_WORKSPACE_ROOT: u64 = u64::MAX;
 
+/// Read-only workspace rights (P1-8): read files/directories and execute,
+/// never write/truncate/create/remove/rename beneath the root.
+const ACCESS_WORKSPACE_READ: u64 =
+    LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_EXECUTE;
+
 /// One prepared path-beneath rule. `access` is either
 /// [`ACCESS_WORKSPACE_ROOT`] or a concrete right mask; `optional` marks the
 /// fixed runtime entries (a missing library path is skipped) as opposed to
@@ -1996,6 +2001,8 @@ struct LandlockPathBeneathAttr {
 pub(crate) unsafe fn apply_workspace_isolation(
     cmd: &mut std::process::Command,
     roots: &[std::path::PathBuf],
+    writable_roots: &[std::path::PathBuf],
+    read_only: bool,
     required: bool,
 ) {
     use std::os::unix::ffi::OsStrExt;
@@ -2004,6 +2011,11 @@ pub(crate) unsafe fn apply_workspace_isolation(
     // is not a directory can never carry a path-beneath rule: treat it as a
     // missing workspace root (fail closed when Required).
     let mut invalid_root = roots.is_empty();
+    let workspace_access = if read_only {
+        ACCESS_WORKSPACE_READ
+    } else {
+        ACCESS_WORKSPACE_ROOT
+    };
     for root in roots {
         if !root.is_dir() {
             invalid_root = true;
@@ -2012,11 +2024,30 @@ pub(crate) unsafe fn apply_workspace_isolation(
         match std::ffi::CString::new(root.as_os_str().as_bytes()) {
             Ok(path) => rules.push(FsRule {
                 path,
-                access: ACCESS_WORKSPACE_ROOT,
+                access: workspace_access,
                 optional: false,
                 anchored: true,
             }),
             Err(_) => invalid_root = true,
+        }
+    }
+    if read_only {
+        // Explicit build/scratch roots stay fully writable; everything else
+        // beneath the workspace roots is kernel-read-only.
+        for root in writable_roots {
+            if !root.is_dir() {
+                invalid_root = true;
+                continue;
+            }
+            match std::ffi::CString::new(root.as_os_str().as_bytes()) {
+                Ok(path) => rules.push(FsRule {
+                    path,
+                    access: ACCESS_WORKSPACE_ROOT,
+                    optional: false,
+                    anchored: true,
+                }),
+                Err(_) => invalid_root = true,
+            }
         }
     }
     for path in RUNTIME_READ_EXECUTE_PATHS {
@@ -2159,7 +2190,9 @@ fn workspace_isolation_pre_exec(
         let access = if rule.access == ACCESS_WORKSPACE_ROOT {
             handled
         } else {
-            rule.access
+            // Concrete masks (runtime allowlist, read-only workspace roots)
+            // request only rights the probed ABI handles.
+            rule.access & handled
         };
         let path_attr = LandlockPathBeneathAttr {
             allowed_access: access,

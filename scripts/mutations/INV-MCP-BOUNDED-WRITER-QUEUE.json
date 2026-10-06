@@ -1,0 +1,9 @@
+{
+  "id": "INV-MCP-BOUNDED-WRITER-QUEUE",
+  "file": "crates/mcp/src/lib.rs",
+  "find": "            Err(std::sync::mpsc::TrySendError::Full(_)) => {\n                return Err(Error::new(\n                    ErrorKind::Oversized,\n                    format!(\"mcp {what}: stdin writer queue is full (the child is not draining)\"),\n                ));\n            }",
+  "replace": "            Err(std::sync::mpsc::TrySendError::Full(_)) => {}",
+  "gate": "cargo test -p faktor-mcp --lib full_writer_queue_is_a_typed_oversized_refusal",
+  "expect": "FAILED",
+  "note": "Removing the queue-full refusal drops the bounded writer completion instead of the typed Oversized refusal."
+}
