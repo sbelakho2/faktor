@@ -1593,6 +1593,7 @@ pub fn idle_expired(config: &BrowserConfig, now_ms: i64, last_used_ms: i64) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn config_bounds_are_enforced() {
@@ -1678,5 +1679,187 @@ mod tests {
             BrowserManager::new(supervisor, BrowserConfig::default(), tmp.path()).unwrap();
         assert_eq!(manager.browser_count(), 0);
         assert!(manager.health().is_empty());
+    }
+
+    /// A stub "chromium": announces the DevTools endpoint on stderr (the
+    /// launcher reads it there) and stays alive until killed.
+    fn write_chromium_stub(dir: &Path) -> PathBuf {
+        let path = dir.join("chromium-stub.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'DevTools listening on ws://127.0.0.1:18111/devtools/browser/stub' 1>&2\nsleep 30\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    async fn launch_stub(
+        manager: &BrowserManager,
+        stub: PathBuf,
+        profiles: &PreparedProfiles,
+        broker_addr: std::net::SocketAddr,
+    ) -> LaunchedBrowser {
+        let scratch_dir = manager.profiles.rooted().join(&profiles.scratch_rel);
+        manager
+            .launcher
+            .launch(
+                LaunchOptions {
+                    executable: stub,
+                    headless: true,
+                    profile_dir: profiles.profile_dir.clone(),
+                    scratch_dir,
+                    scratch_root: manager.profiles.rooted().clone(),
+                    scratch_rel: profiles.scratch_rel.clone(),
+                    proxy_addr: broker_addr,
+                    owner_source: "test".into(),
+                    owner_profile: "p1".into(),
+                    extra_args: vec![],
+                    launch_timeout_ms: 5_000,
+                    network_isolation: faktor_terminal::NetworkIsolation::Inherit,
+                    app_level_reason: Some("test: app-level only".into()),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the stub chromium launches unprivileged")
+    }
+
+    async fn stub_manager(
+        root: &Path,
+    ) -> (Arc<BrowserManager>, BrowserInstanceId, PreparedProfiles) {
+        let cas = Arc::new(faktor_cas::Cas::open(root.join("cas")).unwrap());
+        let supervisor = ProcessSupervisor::new(cas);
+        let config = BrowserConfig {
+            enabled: true,
+            ..BrowserConfig::default()
+        };
+        let manager = BrowserManager::new(supervisor, config, root).unwrap();
+        let id = BrowserInstanceId::persistent(BrowserIdentity::new("acct", "p1", "direct"));
+        let profiles = manager
+            .prepare_profiles(&id, &PagePurpose::new("probe"))
+            .unwrap();
+        (manager, id, profiles)
+    }
+
+    /// P0/P1 capability oracle: `rollback_launch` must KILL the spawned child
+    /// (not merely disarm it) and shut the broker down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_launch_kills_the_spawned_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, _id, mut profiles) = stub_manager(tmp.path()).await;
+        let broker = EgressBroker::start(BrokerConfig {
+            bind: "127.0.0.1:0".parse().expect("loopback literal"),
+            policy: DestinationPolicy::first_party_only(Vec::new()),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        let stub = write_chromium_stub(tmp.path());
+        let launched = launch_stub(&manager, stub, &profiles, broker.addr()).await;
+        let pid = launched.pid;
+        assert!(
+            !crate::launch::wait_for_exit(
+                &manager.supervisor,
+                pid,
+                std::time::Duration::from_millis(1)
+            ),
+            "the stub child is alive before rollback"
+        );
+        manager
+            .rollback_launch(launched, None, None, profiles.take_incognito(), broker)
+            .await;
+        assert!(
+            crate::launch::wait_for_exit(
+                &manager.supervisor,
+                pid,
+                std::time::Duration::from_secs(5)
+            ),
+            "rollback must kill the spawned child"
+        );
+        assert!(
+            manager.supervisor.alive().is_empty(),
+            "no child may survive a rollback"
+        );
+    }
+
+    /// P0/P1 capability oracle: `shutdown_instance` must kill the child (no
+    /// orphan) and leave the supervisor registry empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_instance_kills_the_child_and_leaves_no_orphan() {
+        use futures_util::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (manager, _id, mut profiles) = stub_manager(tmp.path()).await;
+        let broker = EgressBroker::start(BrokerConfig {
+            bind: "127.0.0.1:0".parse().expect("loopback literal"),
+            policy: DestinationPolicy::first_party_only(Vec::new()),
+            ..BrokerConfig::default()
+        })
+        .await
+        .unwrap();
+        let stub = write_chromium_stub(tmp.path());
+        let launched = launch_stub(&manager, stub, &profiles, broker.addr()).await;
+        let pid = launched.pid;
+        // A minimal CDP endpoint: accept the websocket handshake and answer
+        // nothing (shutdown only sends Browser.close and closes the socket;
+        // the send result is ignored by contract).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while (ws.next().await).is_some() {}
+        });
+        let client = CdpClient::connect(
+            &format!("ws://{addr}/devtools/browser/stub"),
+            &CancellationToken::new(),
+            deadline_in(5_000),
+            CdpConfig::default(),
+        )
+        .await
+        .unwrap();
+        let downloads = DownloadManager::new(
+            manager.config.downloads.clone(),
+            manager.profiles.rooted().clone(),
+            &profiles.profile_rel,
+        )
+        .unwrap();
+        let instance = Arc::new(BrowserInstance {
+            id: BrowserInstanceId::persistent(BrowserIdentity::new("acct", "p1", "direct")),
+            source: "test".into(),
+            launched,
+            client,
+            broker,
+            profile_dir: profiles.profile_dir.clone(),
+            incognito: profiles.take_incognito(),
+            context_id: None,
+            policy: DestinationPolicy::first_party_only(Vec::new()),
+            pages: Mutex::new(HashMap::new()),
+            stop: Mutex::new(None),
+            crashed: AtomicBool::new(false),
+            last_used_ms: AtomicI64::new(manager.clock.now_ms()),
+            clock: manager.clock.clone(),
+            lifecycle: tokio::sync::Mutex::new(InstanceLifecycle::Live),
+            admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            event_task: Mutex::new(None),
+            downloads,
+        });
+        assert!(!manager.supervisor.alive().is_empty());
+        manager.shutdown_instance(&instance).await;
+        assert!(
+            crate::launch::wait_for_exit(
+                &manager.supervisor,
+                pid,
+                std::time::Duration::from_secs(5)
+            ),
+            "shutdown must kill the child"
+        );
+        assert!(
+            manager.supervisor.alive().is_empty(),
+            "no orphan may survive a shutdown"
+        );
+        server.abort();
     }
 }

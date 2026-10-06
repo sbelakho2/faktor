@@ -1,0 +1,12 @@
+{
+  "id": "INV-CLOUD-MIGRATION-CLAIM",
+  "file": "crates/cloud/src/durability.rs",
+  "find": "    if live_version != from_version {\n        return Err(CloudStoreError::Backend(format!(\n            \"refusing to label a restore point pre-migration-v{from_version}: the live database \\\n             is at schema v{live_version} (a concurrent opener already migrated it)\"\n        )));\n    }",
+  "replace": "    if live_version == from_version {\n        return Err(CloudStoreError::Backend(format!(\n            \"refusing to label a restore point pre-migration-v{from_version}: the live database \\\n             is at schema v{live_version} (a concurrent opener already migrated it)\"\n        )));\n    }",
+  "gate": "cargo test -p faktor-cloud --lib durability::tests::migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema",
+  "expect": "FAILED",
+  "note": "Inverting the version-claim guard drops the pre-migration refusal.",
+  "capabilities": [
+    "cloud.migration_claim"
+  ]
+}

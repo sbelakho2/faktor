@@ -1,0 +1,12 @@
+{
+  "id": "INV-MCP-SPAWN-LIFECYCLE",
+  "file": "crates/mcp/src/lib.rs",
+  "find": "                if frame.state().cancel_before_write() {\n                    Err(Error::timeout(format!(\n                        \"mcp {what}: stdin write exceeded its deadline (the child is not draining)\"\n                    )))\n                } else {\n                    Err(delivery_unknown(&format!(\"mcp {what}\")))\n                }",
+  "replace": "                if !frame.state().cancel_before_write() {\n                    Err(Error::timeout(format!(\n                        \"mcp {what}: stdin write exceeded its deadline (the child is not draining)\"\n                    )))\n                } else {\n                    Err(delivery_unknown(&format!(\"mcp {what}\")))\n                }",
+  "gate": "cargo test -p faktor-mcp --lib a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock",
+  "expect": "FAILED",
+  "note": "Negating the claim check classifies a claimed frame as a clean timeout.",
+  "capabilities": [
+    "mcp.spawn_lifecycle"
+  ]
+}

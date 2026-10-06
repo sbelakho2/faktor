@@ -1,0 +1,12 @@
+{
+  "id": "INV-BROWSER-LAUNCH-ROLLBACK",
+  "file": "crates/browser/src/manager.rs",
+  "find": "        let _ = launched.kill(&self.supervisor, KILL_GRACE_MS);\n        broker.shutdown().await;\n        if let Some(incognito) = incognito {\n            incognito.remove();\n        }",
+  "replace": "        launched.disarm();\n        broker.shutdown().await;\n        if let Some(incognito) = incognito {\n            incognito.remove();\n        }",
+  "gate": "cargo test -p faktor-browser --lib rollback_launch_kills_the_spawned_child",
+  "expect": "FAILED",
+  "note": "Disarming instead of killing lets the spawned child survive a rollback.",
+  "capabilities": [
+    "browser.launch_rollback"
+  ]
+}

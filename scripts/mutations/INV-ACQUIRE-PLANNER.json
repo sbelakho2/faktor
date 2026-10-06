@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACQUIRE-PLANNER",
+  "file": "crates/acquire/src/planner.rs",
+  "find": "                if let Some(field) = inputs\n                    .capabilities\n                    .first_unsupported(mechanism, &inputs.request.fields)\n                {\n                    notes.push(PlanNote::FieldsUnsupported { mechanism, field });\n                }\n                continue;",
+  "replace": "                if let Some(field) = inputs\n                    .capabilities\n                    .first_unsupported(mechanism, &inputs.request.fields)\n                {\n                    notes.push(PlanNote::FieldsUnsupported { mechanism, field });\n                }",
+  "gate": "cargo test -p faktor-acquire --lib tests::planner::capability_credentials_health_and_quota_each_disqualify_the_api",
+  "expect": "FAILED",
+  "note": "Dropping the continue lets a capability-disqualified mechanism still win.",
+  "capabilities": [
+    "acquire.planner"
+  ]
+}

@@ -100,6 +100,8 @@ const CHECKS = [
   // P2: the REAL checked-in contract digest, not merely the emitter's
   // selftest — a stale generated contract must fail inside prove-all itself.
   { name: 'contracts-verify', command: ['node', ['scripts/contracts/emit.mjs', 'verify', '--print-digest']] },
+  { name: 'compiled-proofs-gate', command: ['python3', ['scripts/certification/check-capability-tests-compiled.py', 'selftest']] },
+  { name: 'visual-accept', command: ['node', ['scripts/certification/accept-visual-baseline.mjs', 'selftest']] },
 ];
 
 function runChecks() {

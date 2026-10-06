@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACP-WRITER-BACKPRESSURE",
+  "file": "crates/acp/src/lib.rs",
+  "find": "        let (main_tx, main_rx) = mpsc::channel(config.writer_queue_capacity);\n        let (lane_tx, lane_rx) = mpsc::channel(CANCEL_LANE_CAPACITY);",
+  "replace": "        let (main_tx, main_rx) = mpsc::channel(usize::MAX);\n        let (lane_tx, lane_rx) = mpsc::channel(CANCEL_LANE_CAPACITY);",
+  "gate": "cargo test -p faktor-acp --lib d_writer_queue_full_is_bounded_and_cancel_lane_lands",
+  "expect": "FAILED",
+  "note": "An unbounded writer channel removes the backpressure the flood test measures.",
+  "capabilities": [
+    "acp.writer_backpressure"
+  ]
+}

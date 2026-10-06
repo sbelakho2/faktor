@@ -1,0 +1,12 @@
+{
+  "id": "INV-SEMANTIC-WATCHDOG",
+  "file": "crates/semantic/src/external.rs",
+  "find": "    if timed_out.load(Ordering::SeqCst) {\n        return Err(SemanticError::ProviderTimeout {\n            provider: provider.to_string(),\n        });\n    }",
+  "replace": "    if !timed_out.load(Ordering::SeqCst) {\n        return Err(SemanticError::ProviderTimeout {\n            provider: provider.to_string(),\n        });\n    }",
+  "gate": "cargo test -p faktor-semantic --lib process_client_watchdog_is_typed_provider_timeout_and_retires_the_child",
+  "expect": "FAILED",
+  "note": "Negating the timed-out flag skips the typed provider timeout.",
+  "capabilities": [
+    "semantic.watchdog"
+  ]
+}

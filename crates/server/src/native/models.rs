@@ -128,6 +128,22 @@ pub(crate) async fn native_capabilities(
     for (instance, entry) in sorted {
         map.insert(instance, entry);
     }
+    // Runtime TOOL capability metadata (audit 14): a reserved, camelCase key
+    // (provider instance ids are lowercase, so it can never collide) telling
+    // the client whether the kernel-enforced read-only shell mode is actually
+    // available on THIS daemon/platform before it attempts a call.
+    let read_only_available = faktor_sandbox::filesystem_backend_available();
+    map.insert(
+        "readOnlyShell".into(),
+        serde_json::json!({
+            "available": read_only_available,
+            "reason": if read_only_available {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("os_filesystem_confinement_unavailable")
+            },
+        }),
+    );
     Json(serde_json::Value::Object(map)).into_response()
 }
 

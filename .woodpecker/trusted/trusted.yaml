@@ -257,6 +257,11 @@ steps:
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
       - cargo test --workspace --all-features
+      # P0-PROOF (audit 3): compiled test enumeration, not source-text
+      # matching. Every proven capability's unit proof must be a REAL libtest
+      # entry exactly once, and tests/production-crates.json must be fresh
+      # against cargo metadata (the node-only certificate lane trusts it).
+      - cargo test --workspace --all-features -- --list | python3 scripts/certification/check-capability-tests-compiled.py
       - cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
       - |
         set -eu

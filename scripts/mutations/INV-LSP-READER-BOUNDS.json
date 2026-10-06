@@ -1,0 +1,12 @@
+{
+  "id": "INV-LSP-READER-BOUNDS",
+  "file": "crates/lsp/src/lib.rs",
+  "find": "        if over > 0 {\n            // `over < self.bytes.len()`: chunk.len() < cap by the branch above.\n            self.bytes.drain(..over);\n        }",
+  "replace": "        if over == 0 {\n            // `over < self.bytes.len()`: chunk.len() < cap by the branch above.\n            self.bytes.drain(..over);\n        }",
+  "gate": "cargo test -p faktor-lsp --lib stderr_flood_is_drained_bounded_and_never_blocks",
+  "expect": "FAILED",
+  "note": "Disabling ring trimming retains the 2 MiB stderr flood whole.",
+  "capabilities": [
+    "lsp.reader_bounds"
+  ]
+}

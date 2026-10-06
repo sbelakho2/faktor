@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACP-CONTENT-LENGTH-CORPUS",
+  "file": "crates/acp/src/protocol.rs",
+  "find": "    if declared > MAX_FRAME_BYTES as u64 {\n        // Hostile declaration: refusing the connection is the only bounded\n        // answer (the declared body may never actually arrive).",
+  "replace": "    if declared <= MAX_FRAME_BYTES as u64 {\n        // Hostile declaration: refusing the connection is the only bounded\n        // answer (the declared body may never actually arrive).",
+  "gate": "cargo test -p faktor-acp --lib acp_content_length_corpus_matches_every_outcome",
+  "expect": "FAILED",
+  "note": "Flipping the declared-size guard turns in-bound frames fatal and the oversize row incomplete.",
+  "capabilities": [
+    "acp.content_length_corpus"
+  ]
+}

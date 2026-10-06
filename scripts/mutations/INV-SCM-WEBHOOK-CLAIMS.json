@@ -1,0 +1,12 @@
+{
+  "id": "INV-SCM-WEBHOOK-CLAIMS",
+  "file": "crates/scm/src/store.rs",
+  "find": "        let first_seen_ms: i64 = conn\n            .query_row(\n                \"SELECT received_ms FROM scm_webhook_delivery WHERE delivery_id = ?1\",\n                params![delivery_id],\n                |r| r.get(0),\n            )\n            .map_err(backend)?;\n        Ok(DeliveryClaim::Duplicate { first_seen_ms })",
+  "replace": "        Ok(DeliveryClaim::Fresh)",
+  "gate": "cargo test -p faktor-scm --lib store::tests::acknowledged_webhook_claim_survives_sigkill_and_reopen",
+  "expect": "FAILED",
+  "note": "Answering Fresh after a reopen loses the acknowledged webhook claim.",
+  "capabilities": [
+    "scm.webhook_claims"
+  ]
+}

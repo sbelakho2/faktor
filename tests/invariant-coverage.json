@@ -17,9 +17,7 @@
     {
      "id": "acp.content_length_corpus",
      "unit": "acp_content_length_corpus_matches_every_outcome",
-     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER",
-     "class": "gap",
-     "reason": "acp.content_length_corpus is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-ACP-CONTENT-LENGTH-CORPUS"
     },
     {
      "id": "acp.cancel",
@@ -34,9 +32,7 @@
     {
      "id": "acp.writer_backpressure",
      "unit": "d_writer_queue_full_is_bounded_and_cancel_lane_lands",
-     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER",
-     "class": "gap",
-     "reason": "acp.writer_backpressure is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-ACP-WRITER-BACKPRESSURE"
     }
    ]
   },
@@ -66,16 +62,12 @@
     {
      "id": "acquire.planner",
      "unit": "capability_credentials_health_and_quota_each_disqualify_the_api",
-     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL",
-     "class": "gap",
-     "reason": "acquire.planner is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-ACQUIRE-PLANNER"
     },
     {
      "id": "acquire.retry_gate",
-     "unit": "the_retry_after_gate_is_clamped_to_the_window_reset",
-     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL",
-     "class": "gap",
-     "reason": "acquire.retry_gate is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "unit": "retry_after_is_clamped_to_the_window_reset",
+     "mutation": "INV-ACQUIRE-RETRY-GATE"
     }
    ]
   },
@@ -142,24 +134,18 @@
     },
     {
      "id": "browser.launch_rollback",
-     "unit": "failed_launch_rolls_back_child_broker_and_temp_profile",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
-     "class": "gap",
-     "reason": "browser.launch_rollback is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "unit": "rollback_launch_kills_the_spawned_child",
+     "mutation": "INV-BROWSER-LAUNCH-ROLLBACK"
     },
     {
      "id": "browser.shutdown_orphans",
-     "unit": "idle_shutdown_kills_the_child_and_leaves_no_orphan",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
-     "class": "gap",
-     "reason": "browser.shutdown_orphans is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "unit": "shutdown_instance_kills_the_child_and_leaves_no_orphan",
+     "mutation": "INV-BROWSER-SHUTDOWN-ORPHANS"
     },
     {
      "id": "browser.interception",
-     "unit": "interception_drops_blocked_resource_types_and_tracking_hosts",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
-     "class": "gap",
-     "reason": "browser.interception is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "unit": "blocked_resource_types_are_dropped_even_on_first_party_hosts",
+     "mutation": "INV-BROWSER-INTERCEPTION"
     },
     {
      "id": "browser.profile_confinement",
@@ -168,10 +154,8 @@
     },
     {
      "id": "browser.capture_cleanup",
-     "unit": "repeated_cancelled_captures_never_wedge_the_profile",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
-     "class": "gap",
-     "reason": "browser.capture_cleanup is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "unit": "lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation",
+     "mutation": "INV-BROWSER-CAPTURE-CLEANUP"
     }
    ]
   },
@@ -229,9 +213,7 @@
     {
      "id": "cloud.restore_verification",
      "unit": "a_corrupted_backup_fails_restore_verification_and_is_never_adopted",
-     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND",
-     "class": "gap",
-     "reason": "cloud.restore_verification is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-CLOUD-RESTORE-VERIFICATION"
     },
     {
      "id": "cloud.money_strings",
@@ -246,9 +228,7 @@
     {
      "id": "cloud.migration_claim",
      "unit": "migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema",
-     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND",
-     "class": "gap",
-     "reason": "cloud.migration_claim is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-CLOUD-MIGRATION-CLAIM"
     }
    ]
   },
@@ -268,9 +248,7 @@
     {
      "id": "commerce.part_identity",
      "unit": "hostile_part_numbers_are_typed_errors",
-     "mutation": "INV-COMMERCE-BOM-BOUND",
-     "class": "gap",
-     "reason": "commerce.part_identity is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-COMMERCE-PART-IDENTITY"
     },
     {
      "id": "commerce.matching",
@@ -280,9 +258,7 @@
     {
      "id": "commerce.digest_stability",
      "unit": "bom_digest_is_order_sensitive_and_deterministic",
-     "mutation": "INV-COMMERCE-BOM-BOUND",
-     "class": "gap",
-     "reason": "commerce.digest_stability is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-COMMERCE-DIGEST-STABILITY"
     },
     {
      "id": "commerce.quote_scope",
@@ -583,9 +559,7 @@
     {
      "id": "lsp.reader_bounds",
      "unit": "stderr_flood_is_drained_bounded_and_never_blocks",
-     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE",
-     "class": "gap",
-     "reason": "lsp.reader_bounds is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-LSP-READER-BOUNDS"
     }
    ]
   },
@@ -610,9 +584,7 @@
     {
      "id": "mcp.spawn_lifecycle",
      "unit": "a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock",
-     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE",
-     "class": "gap",
-     "reason": "mcp.spawn_lifecycle is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-MCP-SPAWN-LIFECYCLE"
     },
     {
      "id": "mcp.call_cancellation",
@@ -802,16 +774,12 @@
     {
      "id": "scm.webhook_claims",
      "unit": "acknowledged_webhook_claim_survives_sigkill_and_reopen",
-     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS",
-     "class": "gap",
-     "reason": "scm.webhook_claims is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-SCM-WEBHOOK-CLAIMS"
     },
     {
      "id": "scm.token_bounds",
      "unit": "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound",
-     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS",
-     "class": "gap",
-     "reason": "scm.token_bounds is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-SCM-TOKEN-BOUNDS"
     },
     {
      "id": "scm.branch_reconcile",
@@ -872,23 +840,17 @@
     {
      "id": "semantic.process_client",
      "unit": "process_client_round_trips_the_typed_frame",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION",
-     "class": "gap",
-     "reason": "semantic.process_client is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-SEMANTIC-PROCESS-CLIENT"
     },
     {
      "id": "semantic.watchdog",
      "unit": "process_client_watchdog_is_typed_provider_timeout_and_retires_the_child",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION",
-     "class": "gap",
-     "reason": "semantic.watchdog is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-SEMANTIC-WATCHDOG"
     },
     {
      "id": "semantic.fallback",
      "unit": "fallback_serves_every_operation_when_no_provider_is_registered",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION",
-     "class": "gap",
-     "reason": "semantic.fallback is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
+     "mutation": "INV-SEMANTIC-FALLBACK"
     },
     {
      "id": "semantic.risk_default",
