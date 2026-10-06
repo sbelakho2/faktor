@@ -1,0 +1,12 @@
+{
+  "id": "INV-LSP-SHUTDOWN-EXIT-NOTIFICATION",
+  "file": "crates/lsp/src/lib.rs",
+  "find": "        // (2) exit NOTIFICATION: fire-and-forget.\n        let _ = self.notify(\"exit\", serde_json::Value::Null);",
+  "replace": "        // (2) exit NOTIFICATION: fire-and-forget.\n        let _ = self.notify(\"exit-notification\", serde_json::Value::Null);",
+  "gate": "cargo test -p faktor-lsp --lib shutdown_request_then_exit_notification_within_grace",
+  "expect": "FAILED",
+  "note": "Sending a wrong notification method means the server never receives exit.",
+  "capabilities": [
+    "lsp.shutdown"
+  ]
+}

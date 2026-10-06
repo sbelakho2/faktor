@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACP-CANCEL-EXACTLY-ONCE",
+  "file": "crates/acp/src/lib.rs",
+  "find": "            if &active.request_id == request_id {\n                active.token.cancel();\n                return Some(session_id.clone());\n            }",
+  "replace": "            if &active.request_id != request_id {\n                active.token.cancel();\n                return Some(session_id.clone());\n            }",
+  "gate": "cargo test -p faktor-acp --lib cancel_request_cancels_the_matching_running_prompt_exactly_once",
+  "expect": "FAILED",
+  "note": "Negating the id match means the cancel never fires for the running prompt.",
+  "capabilities": [
+    "acp.cancel"
+  ]
+}

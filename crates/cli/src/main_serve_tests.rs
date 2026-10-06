@@ -1327,7 +1327,10 @@ fn daemon_hooks_run_env_clear_exact_through_the_daemon_supervisor() {
     let registry = hook_registry(&supervisor, vec![spec]).expect("registry built");
     let verdict = registry.run(
         faktor_hooks::HookEvent::PreTool,
-        &faktor_hooks::HookInput::default(),
+        &faktor_hooks::HookInput {
+            workspace_root: Some(std::env::temp_dir()),
+            ..Default::default()
+        },
     );
     assert_eq!(verdict, faktor_hooks::HookVerdict::Allow);
     let audit = registry.audit();
@@ -1379,7 +1382,10 @@ fn daemon_hook_deadline_kills_the_group_and_audits_the_refusal() {
     let registry = hook_registry(&supervisor, vec![spec]).expect("registry built");
     let verdict = registry.run(
         faktor_hooks::HookEvent::PreTool,
-        &faktor_hooks::HookInput::default(),
+        &faktor_hooks::HookInput {
+            workspace_root: Some(std::env::temp_dir()),
+            ..Default::default()
+        },
     );
     assert!(
         matches!(verdict, faktor_hooks::HookVerdict::Deny { .. }),
@@ -1427,7 +1433,10 @@ fn full_scope_env_hooks_run_under_the_daemon_envelope() {
     let registry = hook_registry(&supervisor, vec![spec]).expect("registry built");
     let verdict = registry.run(
         faktor_hooks::HookEvent::TaskComplete,
-        &faktor_hooks::HookInput::default(),
+        &faktor_hooks::HookInput {
+            workspace_root: Some(std::env::temp_dir()),
+            ..Default::default()
+        },
     );
     assert_eq!(verdict, faktor_hooks::HookVerdict::Allow);
     assert_eq!(registry.audit().len(), 1);

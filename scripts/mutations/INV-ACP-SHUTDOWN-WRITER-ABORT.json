@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACP-SHUTDOWN-WRITER-ABORT",
+  "file": "crates/acp/src/lib.rs",
+  "find": "            Err(_elapsed) => {\n                writer_handle.abort();\n                let _ = writer_handle.await;\n                tracing::warn!(\"acp: writer task did not stop within shutdown timeout\");",
+  "replace": "            Err(_elapsed) => {\n                let _ = &writer_handle;\n                let _ = writer_handle.await;\n                tracing::warn!(\"acp: writer task did not stop within shutdown timeout\");",
+  "gate": "cargo test -p faktor-acp --lib shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes",
+  "expect": "FAILED",
+  "note": "Without abort() the shutdown blocks forever on the wedged writer.",
+  "capabilities": [
+    "acp.shutdown"
+  ]
+}

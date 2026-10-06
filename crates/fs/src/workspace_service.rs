@@ -76,9 +76,15 @@ struct WatchRegistrationRequest {
 /// thread per timed-out pathological root. Registrations are therefore
 /// serialized through this bounded-queue singleton: the number of live
 /// registration threads is at most one no matter how many roots time out.
-static WATCH_REGISTRATION_QUEUE: std::sync::OnceLock<
-    std::sync::mpsc::SyncSender<WatchRegistrationRequest>,
-> = std::sync::OnceLock::new();
+static WATCH_REGISTRATION_QUEUE: std::sync::Mutex<
+    Option<std::sync::mpsc::SyncSender<WatchRegistrationRequest>>,
+> = std::sync::Mutex::new(None);
+
+/// Monotonic milliseconds since the first worker spawn (liveness only).
+static WATCH_WORKER_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// When the CURRENT worker entered `watch()` (0 = idle).
+static WATCH_WORKER_BUSY_SINCE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 static WATCH_REGISTRATION_WORKER_SPAWNS: std::sync::atomic::AtomicUsize =
@@ -89,30 +95,131 @@ pub(crate) fn watch_registration_worker_spawns() -> usize {
     WATCH_REGISTRATION_WORKER_SPAWNS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn watcher_registration_queue() -> &'static std::sync::mpsc::SyncSender<WatchRegistrationRequest> {
-    WATCH_REGISTRATION_QUEUE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<WatchRegistrationRequest>(
-            WATCH_REGISTRATION_QUEUE_DEPTH,
-        );
-        #[cfg(test)]
-        WATCH_REGISTRATION_WORKER_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::thread::Builder::new()
-            .name("faktor-watch-registration".into())
-            .spawn(move || {
-                while let Ok(request) = rx.recv() {
-                    if request.cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                        // The caller already degraded: drop its watcher now.
-                        continue;
-                    }
-                    let mut watcher = request.watcher;
-                    let result = watcher.watch(&request.root, RecursiveMode::Recursive);
-                    // A timed-out caller is gone: the send fails and the
-                    // watcher is dropped with the message.
-                    let _ = request.reply.send((watcher, result));
+/// After this long inside one uninterruptible `watch()` call the worker is
+/// declared wedged; the NEXT registration abandons it and starts a fresh
+/// worker (bounded by [`MAX_WATCH_WORKERS`]), so one pathological root
+/// cannot starve watcher service for every later workspace.
+const WATCH_WORKER_OVERDUE: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_WATCH_WORKERS: usize = 2;
+
+#[cfg(test)]
+static WATCH_WORKER_OVERDUE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_watch_worker_overdue_for_test(ms: u64) {
+    WATCH_WORKER_OVERDUE_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn watch_worker_now_ms() -> u64 {
+    let epoch = WATCH_WORKER_EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn watch_worker_overdue_ms() -> u64 {
+    #[cfg(test)]
+    {
+        let override_ms =
+            WATCH_WORKER_OVERDUE_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if override_ms > 0 {
+            return override_ms;
+        }
+    }
+    u64::try_from(WATCH_WORKER_OVERDUE.as_millis()).unwrap_or(30_000)
+}
+
+/// Spawn one worker generation over a fresh bounded queue.
+fn spawn_watcher_registration_worker() -> std::sync::mpsc::SyncSender<WatchRegistrationRequest> {
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<WatchRegistrationRequest>(WATCH_REGISTRATION_QUEUE_DEPTH);
+    #[cfg(test)]
+    WATCH_REGISTRATION_WORKER_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::thread::Builder::new()
+        .name("faktor-watch-registration".into())
+        .spawn(move || {
+            while let Ok(request) = rx.recv() {
+                if request.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    // The caller already degraded: drop its watcher now.
+                    continue;
                 }
-            });
-        tx
-    })
+                WATCH_WORKER_BUSY_SINCE_MS.store(
+                    watch_worker_now_ms().max(1),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                #[cfg(test)]
+                if WATCH_TEST_WEDGE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_deref()
+                    == Some(request.root.as_path())
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
+                let mut watcher = request.watcher;
+                let result = watcher.watch(&request.root, RecursiveMode::Recursive);
+                WATCH_WORKER_BUSY_SINCE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+                // A timed-out caller is gone: the send fails and the
+                // watcher is dropped with the message.
+                let _ = request.reply.send((watcher, result));
+            }
+        });
+    tx
+}
+
+#[cfg(test)]
+static WATCH_TEST_WEDGE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn wedge_watch_registration_for_test(root: Option<PathBuf>) {
+    *WATCH_TEST_WEDGE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
+}
+
+/// Test cleanup: abandon the current (possibly wedged) worker generation so
+/// later tests in the same process get a fresh, responsive one.
+#[cfg(test)]
+pub(crate) fn reset_watch_worker_for_test() {
+    let mut slot = WATCH_REGISTRATION_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+    WATCH_WORKER_BUSY_SINCE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The live worker sender, respawning a fresh generation when the current
+/// one has been wedged past the overdue bound (bounded by MAX_WATCH_WORKERS).
+fn watcher_registration_queue() -> std::sync::mpsc::SyncSender<WatchRegistrationRequest> {
+    let mut slot = WATCH_REGISTRATION_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(sender) = slot.as_ref() {
+        let busy_since = WATCH_WORKER_BUSY_SINCE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        let overdue = busy_since > 0
+            && watch_worker_now_ms().saturating_sub(busy_since) >= watch_worker_overdue_ms();
+        let workers = {
+            #[cfg(test)]
+            {
+                WATCH_REGISTRATION_WORKER_SPAWNS.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            #[cfg(not(test))]
+            {
+                // Production tracks its generations in the same slot: a
+                // respawn replaces the sender, so the cap is enforced by
+                // construction below.
+                1usize
+            }
+        };
+        if overdue && workers < MAX_WATCH_WORKERS {
+            let replacement = spawn_watcher_registration_worker();
+            *slot = Some(replacement.clone());
+            return replacement;
+        }
+        return sender.clone();
+    }
+    let sender = spawn_watcher_registration_worker();
+    *slot = Some(sender.clone());
+    sender
 }
 
 /// Register one recursive watcher under a wall deadline through the bounded
@@ -641,6 +748,22 @@ impl WorkspaceHandle {
     /// the write instead of redirecting it. The window between that
     /// verification and the rename syscall is the single residual
     /// rename-by-path exposure (documented honest limit).
+    /// Create `rel` (and any missing parents) under the retained workspace
+    /// root WITHOUT following a symlink/reparse-point component: every
+    /// existing component is opened relative to the pinned parent fd with
+    /// `O_NOFOLLOW` (unix) / `FILE_OPEN_REPARSE_POINT` reparse refusal
+    /// (windows), and missing components are created relative to that fd.
+    ///
+    /// This is the ONLY channel through which workspace path text may cause
+    /// daemon-side directory creation (P0): sandbox provisioning (the
+    /// read-only shell's writable build roots) must use it instead of
+    /// `std::fs::create_dir_all`, which follows parent symlinks and can be
+    /// redirected outside the workspace by a hostile `.faktor-derived` link.
+    /// Every failure is a typed refusal BEFORE any process exists.
+    pub fn create_dir_all_no_follow(&self, rel: &Path) -> Result<(), Error> {
+        crate::platform::create_dir_all_no_follow(&self.root, rel)
+    }
+
     pub fn write_atomic(&self, rel: &Path, bytes: &[u8]) -> Result<FileHash, Error> {
         let path = self.resolve(rel)?;
         if let Some(parent) = path.parent() {

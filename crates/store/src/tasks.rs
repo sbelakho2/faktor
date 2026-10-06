@@ -1042,6 +1042,14 @@ pub(crate) fn turn_record_map(r: &rusqlite::Row<'_>) -> StoreResult<TurnRecordRo
 #[path = "verification_job_store_tests.rs"]
 mod verification_job_store_tests;
 
+/// Durable-column serialization is INFALLIBLE by contract: a serialization
+/// failure is a typed corruption error, never a plausible empty default
+/// (`[]` would silently mean "no criteria", "no checks", "no changes").
+pub(crate) fn durable_json<T: serde::Serialize>(label: &str, value: &T) -> StoreResult<String> {
+    serde_json::to_string(value)
+        .map_err(|e| crate::StoreError::Corrupt(vec![format!("{label} serialization: {e}")]))
+}
+
 impl Store {
     /// `start_tool_run` as ONE transaction: insert the running tool_run row and
     /// append `ToolStarted` (state `ExecutingTool`); returns `(row_id, seq)`.
@@ -1253,13 +1261,10 @@ impl Store {
     pub fn upsert_task(&self, t: &TaskRow) -> StoreResult<()> {
         let t = t.to_owned();
         // Preparation BEFORE enqueueing: every serialized TaskRow column.
-        let criteria_json =
-            serde_json::to_string(&t.acceptance_criteria).unwrap_or_else(|_| "[]".into());
-        let plan_json = serde_json::to_string(&t.plan).unwrap_or_else(|_| "[]".into());
-        let state_json = serde_json::to_string(&t.state)
-            .expect("in-process TaskState serialization cannot fail");
-        let attachments_json =
-            serde_json::to_string(&t.attachments).unwrap_or_else(|_| "[]".into());
+        let criteria_json = durable_json("task acceptance_criteria", &t.acceptance_criteria)?;
+        let plan_json = durable_json("task plan", &t.plan)?;
+        let state_json = durable_json("task state", &t.state)?;
+        let attachments_json = durable_json("task attachments", &t.attachments)?;
         // Preparation BEFORE enqueueing: decode/refusal diagnostics.
         let state_label = format!("task {}/{} state", t.session_id, t.task_id);
         let completion_backstop = format!(
@@ -1656,14 +1661,12 @@ impl Store {
         let environment_fingerprint_json = environment_fingerprint_json.map(|v| v.to_owned());
         let candidate_proof_ref_json = candidate_proof_ref_json.map(|v| v.to_owned());
         // Preparation BEFORE enqueueing: every serialized record column.
-        let criteria_json = serde_json::to_string(&rec.criteria).unwrap_or_else(|_| "[]".into());
-        let checks_json = serde_json::to_string(&rec.checks).unwrap_or_else(|_| "[]".into());
-        let changed_files_json =
-            serde_json::to_string(&rec.changed_files).unwrap_or_else(|_| "[]".into());
+        let criteria_json = durable_json("verification criteria", &rec.criteria)?;
+        let checks_json = durable_json("verification checks", &rec.checks)?;
+        let changed_files_json = durable_json("verification changed_files", &rec.changed_files)?;
         let unrelated_changes_json =
-            serde_json::to_string(&rec.unrelated_changes).unwrap_or_else(|_| "[]".into());
-        let status_json =
-            serde_json::to_string(&rec.status).expect("in-process status serialization");
+            durable_json("verification unrelated_changes", &rec.unrelated_changes)?;
+        let status_json = durable_json("verification status", &rec.status)?;
         let reviewer_json = rec.reviewer.as_ref().map(|v| v.to_string());
         self.writer
             .execute("verification_record_put_with_evidence", move |conn| {

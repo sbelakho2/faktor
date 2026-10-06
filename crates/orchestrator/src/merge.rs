@@ -1711,6 +1711,23 @@ fn poll_once_ready<F: Future>(future: F) -> Option<F::Output> {
 
 // ================================================================ runtime
 
+/// The child's durable goal, read TYPED (P1): a genuine missing identity
+/// row is an empty goal; a malformed row or a store failure BLOCKS the
+/// caller with a typed refusal instead of silently rendering a blank
+/// review/handoff.
+pub(crate) fn child_goal_typed(
+    handle: &faktor_session::SessionHandle,
+    label: &str,
+) -> Result<String, ExecError> {
+    match handle.orchestrator_child_identity_get() {
+        Ok(Some(identity)) => Ok(identity.task_goal),
+        Ok(None) => Ok(String::new()),
+        Err(e) => Err(ExecError::Internal(format!(
+            "{label}: child identity read failed ({e}); refusing to render blank intent"
+        ))),
+    }
+}
+
 impl OrchestratorRuntime {
     /// Locate one child durably: the live exec mirrors first (runs are
     /// keyed by run id — every installed run's mirror is scanned), then
@@ -1864,12 +1881,11 @@ impl OrchestratorRuntime {
                 child.child_id, child.session_id, e.message
             ))
         })?;
-        let summary = self
+        let child_handle = self
             .manager
             .get_session(child_session)?
-            .and_then(|h| h.orchestrator_child_identity_get().ok().flatten())
-            .map(|i| i.task_goal)
-            .unwrap_or_default();
+            .ok_or_else(|| ExecError::NotFound(format!("child session {child_session}")))?;
+        let summary = child_goal_typed(&child_handle, &format!("child {child_id}"))?;
         let merges = merge_envelopes(&self.manager, parent, &run, child_id)?;
         Ok(ChildResult {
             child,
@@ -1906,12 +1922,7 @@ impl OrchestratorRuntime {
             .ok_or_else(|| ExecError::NotFound(format!("child session {child_session}")))?;
         let mut handoff = ChildHandoff::new(child_id);
         handoff.child_session = Some(child_session);
-        handoff.goal = handle
-            .orchestrator_child_identity_get()
-            .ok()
-            .flatten()
-            .map(|identity| identity.task_goal)
-            .unwrap_or_default();
+        handoff.goal = child_goal_typed(&handle, &format!("child handoff {child_id}"))?;
         let head = handle
             .ledger_ensure_head()
             .map_err(|e| ExecError::Internal(format!("child handoff ledger: {e}")))?;
@@ -3767,5 +3778,67 @@ mod tests {
             assert!(matches!(err, ExecError::Malformed(_)), "{err:?}");
             assert!(err.to_string().contains("workspace id 0"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod goal_typed_tests {
+    use super::child_goal_typed;
+    use faktor_session::{ChildIdentity, ChildOwnership, SessionManager};
+
+    /// P1: four durable states stay distinct — Missing is an empty goal,
+    /// Malformed and StoreFailure BLOCK the review/handoff typed.
+    #[test]
+    fn child_goal_typed_blocks_malformed_identity_instead_of_blanking_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let ws = manager
+            .create_workspace(dir.path().join("ws").to_str().unwrap())
+            .unwrap();
+        let parent = manager
+            .create_session(ws, "parent", "fake", "m")
+            .unwrap()
+            .id();
+        let child = manager
+            .create_session(ws, "child", "fake", "m")
+            .unwrap()
+            .id();
+        let handle = manager.get_session(child).unwrap().unwrap();
+
+        // Missing: legal, empty goal.
+        assert_eq!(child_goal_typed(&handle, "t").unwrap(), "");
+
+        // PresentValid.
+        let identity = ChildIdentity {
+            parent_session_id: parent,
+            workspace_id: ws.raw(),
+            worktree_id: 1,
+            item_id: "i1".into(),
+            task_goal: "ship it".into(),
+            operation_id: 0,
+            ownership: ChildOwnership::ReadOnlyShared,
+            model: "m".into(),
+            created_ms: 1,
+        };
+        handle.orchestrator_child_identity_put(&identity).unwrap();
+        assert_eq!(child_goal_typed(&handle, "t").unwrap(), "ship it");
+
+        // Malformed: a corrupted durable row must BLOCK, never blank.
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store/faktor-plus.db")).unwrap();
+            conn.execute(
+                "UPDATE memory_fact SET value = '{not-json' WHERE session_id = ?1 AND kind = 'orchestrator' AND key = 'identity'",
+                rusqlite::params![child.raw() as i64],
+            )
+            .unwrap();
+        }
+        let err = child_goal_typed(&handle, "child-review")
+            .expect_err("a malformed identity must block the caller");
+        assert!(
+            err.to_string().contains("child identity read failed"),
+            "{err}"
+        );
+        assert!(!err.to_string().is_empty());
     }
 }

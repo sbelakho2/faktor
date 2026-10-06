@@ -33,7 +33,7 @@
 // release-critical entry without one already fails before this mode runs.
 
 import { createHash } from 'node:crypto';
-import { provisionSupport } from './mutation-support.mjs';
+import { provisionSupport, verifySupportSnapshot } from './mutation-support.mjs';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -703,9 +703,9 @@ function main() {
     // subdirectory. It is removed in the finally below.
     const scratch = mkdtempSync(join(resolve(root, '..'), '.faktor-mutation-campaign-'));
     cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
-    // Snapshot the gate support trees (P2-9): the CLI is an immutable
-    // COPY and node_modules a hardlink snapshot, both content-digested into
-    // evidence — never symlinks back into the trusted checkout.
+    // Snapshot the gate support trees (P2-9 + P1-11): the CLI is an
+    // immutable COPY and node_modules a hardlink snapshot (or full copy,
+    // never a symlink), both CONTENT-digested into evidence.
     const support = provisionSupport(root, scratch);
     console.log(
       `invariants-mutations: support cli=${support.cli?.sha256 ?? 'none'} node_modules=${support.node_modules?.digest ?? 'none'} (${support.node_modules?.method ?? 'none'})`,
@@ -745,6 +745,11 @@ function main() {
         } catch {
           undetected.push(`${entry.id} (${command})`);
         }
+      }
+      const supportAfter = verifySupportSnapshot(scratch, support);
+      if (!supportAfter.ok) {
+        console.error(`check-invariants --mutations: FAIL — ${supportAfter.reason}`);
+        return 1;
       }
     } finally {
       hasher.kill('SIGTERM');

@@ -1541,6 +1541,11 @@ pub struct TaskExecutor {
     /// this executor is byte-identical to the pre-worker-plane executor.
     /// Enabled by the daemon when the `[workers]` section is configured.
     placement: Mutex<WorkerPlacement>,
+    /// Test-only seam (P1): makes the post-admission session read fail so
+    /// the typed "accepted but recovery-required" contract can be proven
+    /// without a real store outage.
+    #[cfg(test)]
+    post_admission_read_seam: std::sync::atomic::AtomicBool,
     /// The runtime OWNER of every detached drive this executor spawns
     /// ([`TaskDriveRegistry`]): handles are held (never dropped), live task
     /// ids are tracked, and [`TaskExecutor::shutdown_drives`] drains them
@@ -1661,6 +1666,8 @@ impl TaskExecutor {
     ) -> Arc<Self> {
         let run_roots = Self::default_run_roots(&session);
         Arc::new(Self {
+            #[cfg(test)]
+            post_admission_read_seam: std::sync::atomic::AtomicBool::new(false),
             orchestrator: orchestrator.clone(),
             session,
             agent,
@@ -2048,6 +2055,13 @@ impl TaskExecutor {
     /// its durable rows by a fresh executor (`resume_run`).
     pub async fn shutdown_drives(&self, grace: Duration) -> DriveDrainReport {
         self.drives.shutdown(grace).await
+    }
+
+    /// P1 test seam: make the NEXT post-admission session read fail.
+    #[cfg(test)]
+    pub(crate) fn fail_post_admission_read_for_test(&self) {
+        self.post_admission_read_seam
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Adversarial test seam: poison the active-run lock exactly as a
@@ -2728,7 +2742,36 @@ impl TaskExecutor {
         } else {
             let agent = self.agent.clone();
             let model = req.model.clone();
-            let handle2 = self.session.get_session(parent).ok().flatten();
+            // P1: the post-admission session read is a DURABLE read. A store
+            // failure (or a vanished row) must NOT silently skip the drive
+            // and return an apparently-successful start: it fails loudly
+            // while the already-recorded durable run stays explicitly
+            // recoverable (the receipt/op row exists; the retry replays it
+            // and the recovery path drives it exactly once).
+            #[cfg(test)]
+            let seam_tripped = self
+                .post_admission_read_seam
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let seam_tripped = false;
+            if seam_tripped {
+                return Err(ExecError::Internal(format!(
+                    "post-admission session read failed for {parent} (injected); the accepted run is durably recorded and recovery-required"
+                )));
+            }
+            let handle2 = match self.session.get_session(parent) {
+                Ok(Some(h)) => Some(h),
+                Ok(None) => {
+                    return Err(ExecError::NotFound(format!(
+                        "post-admission session {parent} vanished; the accepted run is durably recorded and recovery-required"
+                    )));
+                }
+                Err(e) => {
+                    return Err(ExecError::Internal(format!(
+                        "post-admission session read failed for {parent}: {e}; the accepted run is durably recorded and recovery-required"
+                    )));
+                }
+            };
             if let Some(h) = handle2 {
                 let receipt2 = receipt.clone();
                 // Registry-owned drive (audit spawn ownership): the handle is

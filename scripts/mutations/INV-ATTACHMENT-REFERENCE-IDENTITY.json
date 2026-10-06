@@ -4,5 +4,8 @@
   "find": "                \"SELECT id, digest, mime, filename, size FROM attachment\n                 WHERE session_id = ?1 AND digest = ?2 AND mime = ?3\n                   AND filename IS ?4 AND size = ?5\n                 ORDER BY id ASC LIMIT 1\",\n                params![\n                    session_id.raw() as i64,\n                    prepared.digest_hex.as_str(),\n                    prepared.mime.as_str(),\n                    prepared.filename.as_deref(),\n                    prepared.size_i64,\n                ],",
   "replace": "                \"SELECT id, digest, mime, filename, size FROM attachment\n                 WHERE session_id = ?1 AND digest = ?2\n                 ORDER BY id ASC LIMIT 1\",\n                params![session_id.raw() as i64, prepared.digest_hex.as_str()],",
   "gate": "cargo test -p faktor-store --lib attachment_references_are_keyed_by_full_metadata_and_survive_reopen",
-  "note": "Keys the durable reference by digest alone: identical bytes under a different MIME/filename return the first row's metadata."
+  "note": "Keys the durable reference by digest alone: identical bytes under a different MIME/filename return the first row's metadata.",
+  "capabilities": [
+    "store.authority"
+  ]
 }

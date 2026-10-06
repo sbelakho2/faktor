@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACQUIRE-RETRY-AFTER-DIGITS",
+  "file": "crates/acquire/src/quota.rs",
+  "find": "    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {\n        return None;\n    }\n    trimmed.parse::<u64>().ok().map(|s| s.saturating_mul(1_000))",
+  "replace": "    if trimmed.is_empty() {\n        return None;\n    }\n    trimmed\n        .parse::<f64>()\n        .ok()\n        .map(|seconds| (seconds.max(0.0) * 1_000.0) as u64)",
+  "gate": "cargo test -p faktor-acquire --lib tests::quota::hostile_retry_after_values_are_rejected_never_guessed",
+  "expect": "FAILED",
+  "note": "A lenient float parse invents retry-after values from hostile input.",
+  "capabilities": [
+    "acquire.retry_after"
+  ]
+}

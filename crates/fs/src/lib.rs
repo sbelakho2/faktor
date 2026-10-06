@@ -1373,6 +1373,16 @@ mod tests {
     const TEST_WATCH_REGISTRATION_DEADLINE: std::time::Duration =
         std::time::Duration::from_secs(240);
 
+    /// Serializes every test that depends on the PROCESS-WIDE watcher
+    /// worker state (spawn count, wedge seams, overdue overrides).
+    static WATCH_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_watch_tests() -> std::sync::MutexGuard<'static, ()> {
+        WATCH_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn fixture() -> (
         tempfile::TempDir,
         Arc<WorkspaceFileService>,
@@ -1407,6 +1417,7 @@ mod tests {
 
     #[test]
     fn ordinary_workspace_keeps_its_watcher() {
+        let _guard = lock_watch_tests();
         let (_d, _service, handle) = fixture();
         assert!(
             handle.watcher_attached(),
@@ -1416,6 +1427,8 @@ mod tests {
 
     #[test]
     fn watcher_registration_uses_exactly_one_worker_thread() {
+        let _guard = lock_watch_tests();
+        let workers_before = crate::workspace_service::watch_registration_worker_spawns();
         // P2-FS: every registration (including deadline-degraded ones) funnels
         // through one bounded singleton worker, so live registration threads
         // cannot grow per root.
@@ -1436,8 +1449,8 @@ mod tests {
         assert!(handles.iter().all(|handle| handle.watcher_attached()));
         assert_eq!(
             crate::workspace_service::watch_registration_worker_spawns(),
-            1,
-            "watch registration must use exactly one process-wide worker"
+            workers_before,
+            "watch registration must never spawn an additional worker"
         );
         drop(handles);
         drop(roots);
@@ -3465,6 +3478,8 @@ mod tests {
     /// for every later workspace.
     #[test]
     fn pathological_root_degrades_but_an_ordinary_root_still_gets_a_watcher() {
+        let _guard = lock_watch_tests();
+        let workers_before = crate::workspace_service::watch_registration_worker_spawns();
         let pathological = tempfile::tempdir().unwrap();
         for index in 0..200 {
             std::fs::create_dir_all(pathological.path().join(format!("d{index:03}"))).unwrap();
@@ -3488,8 +3503,140 @@ mod tests {
         );
         assert_eq!(
             crate::workspace_service::watch_registration_worker_spawns(),
-            1,
+            workers_before,
             "the degraded path must not spawn another worker"
         );
+    }
+
+    /// P0: rooted directory provisioning must refuse symlinked components
+    /// (final, intermediate, the audit's hostile `.faktor-derived` link) and
+    /// a swap-to-symlink race, and must NEVER create anything outside the
+    /// workspace through workspace-controlled path text.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_no_follow_refuses_symlink_components_and_never_mkdirs_outside() {
+        let _seam = SeamTest::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let ws = WorkspaceHandle::open_scoped(WorkspaceId::new(301), root.clone()).unwrap();
+
+        // The ordinary case still creates nested directories.
+        ws.create_dir_all_no_follow(Path::new("a/b/c")).unwrap();
+        assert!(root.join("a/b/c").is_dir());
+
+        // Final-component symlink: refused, outside untouched.
+        std::os::unix::fs::symlink(&outside, root.join("final")).unwrap();
+        let err = ws.create_dir_all_no_follow(Path::new("final")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+
+        // Intermediate-component symlink: refused.
+        std::os::unix::fs::symlink(&outside, root.join("hop")).unwrap();
+        let err = ws
+            .create_dir_all_no_follow(Path::new("hop/sub"))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(!outside.join("sub").exists());
+
+        // The audit's exact hostile shape: `.faktor-derived` -> outside.
+        std::os::unix::fs::symlink(&outside, root.join(".faktor-derived")).unwrap();
+        let err = ws
+            .create_dir_all_no_follow(Path::new(".faktor-derived/build-scratch"))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(
+            !outside.join("build-scratch").exists(),
+            "the daemon must never mkdir outside the workspace through workspace path text"
+        );
+
+        // Deterministic race: the component is swapped for an outside symlink
+        // BETWEEN walk steps; the no-follow open still refuses it.
+        std::fs::create_dir_all(root.join("race")).unwrap();
+        let outside2 = dir.path().join("outside2");
+        std::fs::create_dir_all(&outside2).unwrap();
+        let root_for_seam = root.clone();
+        let outside_for_seam = outside2.clone();
+        swap_seam(&root_for_seam, "race", move |root| {
+            let real = root.join("race-real");
+            std::fs::rename(root.join("race"), &real).unwrap();
+            std::os::unix::fs::symlink(&outside_for_seam, root.join("race")).unwrap();
+        });
+        let err = ws
+            .create_dir_all_no_follow(Path::new("race/build"))
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission, "{err:?}");
+        assert!(!outside2.join("build").exists());
+    }
+
+    /// P1-10: one wedged registration must not starve watcher service for
+    /// later workspaces: after the overdue bound a FRESH worker generation
+    /// takes over (bounded to MAX_WATCH_WORKERS), and growth stops at the cap.
+    #[test]
+    fn a_wedged_registration_never_starves_later_workspaces() {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::workspace_service::set_watch_worker_overdue_for_test(1);
+        let wedged = tempfile::tempdir().unwrap();
+        crate::workspace_service::wedge_watch_registration_for_test(Some(
+            wedged.path().canonicalize().unwrap(),
+        ));
+        // Workspace A wedges: the registration times out and degrades.
+        let service_a = WorkspaceFileService::with_watch_registration_deadline(
+            std::time::Duration::from_millis(200),
+        );
+        let a = service_a
+            .open(WorkspaceId::new(301), wedged.path().to_path_buf())
+            .unwrap();
+        assert!(!a.watcher_attached(), "the wedged root degrades itself");
+        // Workspace B must still receive a REAL watcher via a fresh worker.
+        let ordinary = tempfile::tempdir().unwrap();
+        std::fs::write(ordinary.path().join("keep.txt"), b"x").unwrap();
+        let service_b = WorkspaceFileService::with_watch_registration_deadline(
+            std::time::Duration::from_secs(5),
+        );
+        let b = service_b
+            .open(WorkspaceId::new(302), ordinary.path().to_path_buf())
+            .unwrap();
+        assert!(
+            b.watcher_attached(),
+            "an ordinary workspace must keep succeeding behind a wedged registration"
+        );
+        // A second wedge consumes the last allowed worker; further roots
+        // degrade WITHOUT growing the thread count past the cap.
+        let wedged2 = tempfile::tempdir().unwrap();
+        crate::workspace_service::wedge_watch_registration_for_test(Some(
+            wedged2.path().canonicalize().unwrap(),
+        ));
+        let service_c = WorkspaceFileService::with_watch_registration_deadline(
+            std::time::Duration::from_millis(200),
+        );
+        let c = service_c
+            .open(WorkspaceId::new(303), wedged2.path().to_path_buf())
+            .unwrap();
+        assert!(!c.watcher_attached());
+        let spawns_at_cap = crate::workspace_service::watch_registration_worker_spawns();
+        let ordinary2 = tempfile::tempdir().unwrap();
+        let service_d = WorkspaceFileService::with_watch_registration_deadline(
+            std::time::Duration::from_millis(200),
+        );
+        let d = service_d
+            .open(WorkspaceId::new(304), ordinary2.path().to_path_buf())
+            .unwrap();
+        assert!(
+            !d.watcher_attached(),
+            "at the worker cap, registrations degrade"
+        );
+        assert_eq!(
+            crate::workspace_service::watch_registration_worker_spawns(),
+            spawns_at_cap,
+            "the worker count must never grow past the cap"
+        );
+        crate::workspace_service::wedge_watch_registration_for_test(None);
+        crate::workspace_service::set_watch_worker_overdue_for_test(0);
+        crate::workspace_service::reset_watch_worker_for_test();
     }
 }

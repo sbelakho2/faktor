@@ -1551,7 +1551,7 @@ impl Store {
         let variant = variant.map(|v| v.to_owned());
         let agent = agent.map(|v| v.to_owned());
         // Preparation BEFORE enqueueing: the queue row's JSON columns.
-        let files_json = serde_json::to_string(&files).unwrap_or_else(|_| "[]".into());
+        let files_json = crate::tasks::durable_json("prompt queue files", &files)?;
         self.writer.execute("enqueue_prompt", move |conn| {
         let tx = conn.unchecked_transaction()?;
         let prev: i64 = tx.query_row(

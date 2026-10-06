@@ -5,5 +5,8 @@
   "replace": "            Self::AuthenticationRequired\n            | Self::VerificationRequired { .. }\n            | Self::Unavailable => true,",
   "gate": "cargo test -p faktor-acquire --lib time_based_health_recovers_and_human_states_do_not",
   "expect": "FAILED",
-  "note": "Human-required/unavailable connector states must stay unusable no matter how much time passes."
+  "note": "Human-required/unavailable connector states must stay unusable no matter how much time passes.",
+  "capabilities": [
+    "acquire.health"
+  ]
 }

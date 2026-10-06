@@ -5,5 +5,8 @@
   "replace": "        if self.first_party.iter().any(|p| p.matches(host)) {\n            return DestinationDecision::Blocked {\n                reason: BlockReason::NotFirstParty,\n            };\n        }",
   "gate": "cargo test -p faktor-browser --lib policy_denies_unknown_hosts_and_deny_wins",
   "expect": "FAILED",
-  "note": "Inverting the default-deny first-party allowlist check blocks allowed hosts and admits unknowns."
+  "note": "Inverting the default-deny first-party allowlist check blocks allowed hosts and admits unknowns.",
+  "capabilities": [
+    "browser.egress"
+  ]
 }

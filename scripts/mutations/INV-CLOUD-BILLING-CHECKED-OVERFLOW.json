@@ -1,0 +1,12 @@
+{
+  "id": "INV-CLOUD-BILLING-CHECKED-OVERFLOW",
+  "file": "crates/cloud/src/billing.rs",
+  "find": "    left.checked_add(right)\n        .ok_or(CreditLedgerError::Overflow { field, left, right })",
+  "replace": "    Some(left.saturating_add(right))\n        .ok_or(CreditLedgerError::Overflow { field, left, right })",
+  "gate": "cargo test -p faktor-cloud --lib billing::tests::usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary",
+  "expect": "FAILED",
+  "note": "Saturating addition silently wraps billing overflow instead of refusing typed.",
+  "capabilities": [
+    "cloud.billing_overflow"
+  ]
+}

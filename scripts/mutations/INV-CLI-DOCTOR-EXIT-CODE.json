@@ -1,0 +1,12 @@
+{
+  "id": "INV-CLI-DOCTOR-EXIT-CODE",
+  "file": "crates/cli/src/main.rs",
+  "find": "    if report.issues == 0 {\n        println!(\"doctor: all checks passed\");\n    } else {\n        println!(\"doctor: {} issue(s)\", report.issues);\n        std::process::exit(1);\n    }",
+  "replace": "    if report.issues > 0 {\n        println!(\"doctor: all checks passed\");\n    } else {\n        println!(\"doctor: {} issue(s)\", report.issues);\n        std::process::exit(1);\n    }",
+  "gate": "cargo test -p faktor-cli --test usage_scenarios doctor_on_a_fresh_dir_passes_without_creating_a_store_side_effect_first",
+  "expect": "FAILED",
+  "note": "Negating the doctor issue-count condition inverts its exit-code contract.",
+  "capabilities": [
+    "cli.surface"
+  ]
+}

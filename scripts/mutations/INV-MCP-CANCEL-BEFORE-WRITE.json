@@ -1,0 +1,12 @@
+{
+  "id": "INV-MCP-CANCEL-BEFORE-WRITE",
+  "file": "crates/mcp/src/lib.rs",
+  "find": "                if frame.state().cancel_before_write() {\n                    Err(Error::timeout(format!(\n                        \"mcp {what}: stdin write exceeded its deadline (the child is not draining)\"",
+  "replace": "                if !frame.state().cancel_before_write() {\n                    Err(Error::timeout(format!(\n                        \"mcp {what}: stdin write exceeded its deadline (the child is not draining)\"",
+  "gate": "cargo test -p faktor-mcp --lib timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown",
+  "expect": "FAILED",
+  "note": "Negating the cancellation race misclassifies timed-out frames.",
+  "capabilities": [
+    "mcp.call_cancellation"
+  ]
+}

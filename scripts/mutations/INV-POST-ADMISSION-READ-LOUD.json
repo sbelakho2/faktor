@@ -1,0 +1,9 @@
+{
+  "id": "INV-POST-ADMISSION-READ-LOUD",
+  "file": "crates/orchestrator/src/task_executor/mod.rs",
+  "find": "            if seam_tripped {\n                return Err(ExecError::Internal(format!(\n                    \"post-admission session read failed for {parent} (injected); the accepted run is durably recorded and recovery-required\"\n                )));\n            }",
+  "replace": "            if seam_tripped {\n                // silently continue\n            }",
+  "gate": "cargo test -p faktor-orchestrator --lib post_admission_read_failure",
+  "expect": "FAILED",
+  "note": "Silencing the post-admission failure makes an undriven accepted run look successful."
+}

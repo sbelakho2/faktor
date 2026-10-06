@@ -1,0 +1,12 @@
+{
+  "id": "INV-BROWSER-DOWNLOAD-DEFAULT-DENY",
+  "file": "crates/browser/src/download.rs",
+  "find": "        Self {\n            enabled: false,\n            directory: None,\n            max_bytes: 64 * 1024 * 1024,\n        }",
+  "replace": "        Self {\n            enabled: true,\n            directory: None,\n            max_bytes: 64 * 1024 * 1024,\n        }",
+  "gate": "cargo test -p faktor-browser --lib downloads_are_denied_by_default_and_native_is_always_denied",
+  "expect": "FAILED",
+  "note": "Flipping the download policy default to enabled breaks the default-deny test.",
+  "capabilities": [
+    "browser.download_policy"
+  ]
+}

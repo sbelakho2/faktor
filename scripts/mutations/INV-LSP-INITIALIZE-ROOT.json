@@ -1,0 +1,12 @@
+{
+  "id": "INV-LSP-INITIALIZE-ROOT",
+  "file": "crates/lsp/src/lib.rs",
+  "find": "            serde_json::json!({\n                \"processId\": null,\n                \"rootUri\": file_uri(root),\n                \"capabilities\": {},\n            }),",
+  "replace": "            serde_json::json!({\n                \"processId\": null,\n                \"rootUri\": file_uri(Path::new(\"/nonexistent-faktor-root\")),\n                \"capabilities\": {},\n            }),",
+  "gate": "cargo test -p faktor-lsp --lib initialize_carries_real_root_and_owner",
+  "expect": "FAILED",
+  "note": "A fabricated rootUri breaks the real-root initialize contract.",
+  "capabilities": [
+    "lsp.initialize"
+  ]
+}

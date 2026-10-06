@@ -273,6 +273,59 @@ fn lexical_components(root: &Path, rel: &Path) -> Result<VecDeque<OsString>, Err
     Ok(out)
 }
 
+/// Create `rel` under the anchored root component by component: every
+/// existing component is opened with `O_NOFOLLOW|O_DIRECTORY` (a symlink or
+/// non-directory is a typed Permission refusal) and a missing component is
+/// created with `mkdirat` RELATIVE TO THE PINNED PARENT FD. The daemon can
+/// therefore never be redirected outside the workspace by workspace path
+/// text (P0: read-only sandbox provisioning).
+pub(crate) fn create_dir_all_no_follow(root: &Path, rel: &Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut pending = lexical_components(root, rel)?;
+    if pending.len() > MAX_COMPONENTS {
+        return Err(Error::oversized(format!(
+            "{rel:?} exceeds the {MAX_COMPONENTS}-component walk bound"
+        )));
+    }
+    let mut dir = open_root(root)?;
+    while let Some(comp) = pending.pop_front() {
+        walk_seam(&comp);
+        match openat_comp(&dir, &comp, O_DIR | libc::O_NOFOLLOW | libc::O_CLOEXEC) {
+            Ok(fd) => dir = fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                let name = CString::new(comp.as_bytes())
+                    .map_err(|_| Error::permission(format!("create {rel:?}: NUL in component")))?;
+                // SAFETY: `dir` is a live directory fd and `name` is a
+                // NUL-terminated component owned here; mkdirat never
+                // follows a symlink in the final component (it creates).
+                let created = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700) };
+                if created != 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(Error::permission(format!(
+                            "create {rel:?}: mkdir {comp:?} failed: {err}"
+                        )));
+                    }
+                }
+                match openat_comp(&dir, &comp, O_DIR | libc::O_NOFOLLOW | libc::O_CLOEXEC) {
+                    Ok(fd) => dir = fd,
+                    Err(e2) => {
+                        return Err(Error::permission(format!(
+                            "create {rel:?}: component {comp:?} appeared as a symlink or non-directory: {e2}"
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(Error::permission(format!(
+                    "create {rel:?}: component {comp:?} is a symlink or non-directory; the rooted create never follows it: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn open_root(root: &Path) -> Result<OwnedFd, Error> {
     let c = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| Error::malformed(format!("workspace root {:?} contains a NUL byte", root)))?;

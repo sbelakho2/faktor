@@ -1,0 +1,12 @@
+{
+  "id": "INV-SCM-INSTALLATION-ID-BOUND",
+  "file": "crates/scm/src/ids.rs",
+  "find": "        if raw > MAX_INSTALLATION_ID {\n            return Err(ScmError::InvalidInput(format!(\n                \"installation id {raw} exceeds the maximum {MAX_INSTALLATION_ID} \\\n                 (i64::MAX, the signed SQLite INTEGER bound)\"\n            )));\n        }",
+  "replace": "        if raw <= MAX_INSTALLATION_ID {\n            return Err(ScmError::InvalidInput(format!(\n                \"installation id {raw} exceeds the maximum {MAX_INSTALLATION_ID} \\\n                 (i64::MAX, the signed SQLite INTEGER bound)\"\n            )));\n        }",
+  "gate": "cargo test -p faktor-scm --test github_adapter installation_ids_above_the_signed_sqlite_bound_are_refused_typed",
+  "expect": "FAILED",
+  "note": "Inverting the bound lets oversized installation ids through.",
+  "capabilities": [
+    "scm.id_bounds"
+  ]
+}

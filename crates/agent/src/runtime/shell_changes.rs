@@ -105,7 +105,8 @@ pub(crate) const SHELL_CHANGE_FACT_MAX_PATHS: usize = 16;
 /// skips `node_modules` and `target*`; here the exact names are used) plus
 /// the agent's own tooling state (`.faktor`). A large ignored tree therefore
 /// never touches the manifest caps.
-pub(crate) const SHELL_MANIFEST_SKIP_DIRS: &[&str] = &[".faktor", "node_modules", "target"];
+pub(crate) const SHELL_MANIFEST_SKIP_DIRS: &[&str] =
+    &[".faktor", ".faktor-derived", "node_modules", "target"];
 
 /// P1-SHELL authority contract: the canonical manifest (and therefore the
 /// manifest diff) skips VCS metadata and build/dependency trees. Mutations
@@ -413,6 +414,20 @@ fn clean_absolute(path: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
+/// Resolve the Git metadata layout ONLY when it is genuinely bound to this
+/// workspace (P1: .git is hostile workspace-controlled text):
+///
+/// * the pointer files (`<root>/.git`, `<gitdir>/gitdir`,
+///   `<gitdir>/commondir`) must be regular non-symlink files;
+/// * a linked-worktree gitdir must RECIPROCALLY point back at this
+///   workspace's `.git` file (Git writes exactly that binding), so a hostile
+///   `gitdir: /etc` or `gitdir: ../../../outside` is refused WITHOUT any
+///   probe of the claimed location;
+/// * a commondir must be the real common ancestor of the worktree layout
+///   (`<common>/worktrees/<name>` == gitdir) or equal to the gitdir.
+///
+/// Any validation failure returns `None`: no external path is ever opened,
+/// statted or hashed on the strength of workspace path text.
 fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
     let dot = root.join(".git");
     let meta = std::fs::symlink_metadata(&dot).ok()?;
@@ -441,10 +456,42 @@ fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
         };
         clean_absolute(path)
     };
-    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(common) => {
+    // Lexical shape FIRST (zero external reads): a claimed gitdir must be
+    // inside the workspace or shaped exactly like Git's worktree layout
+    // (`<common>/worktrees/<name>`). `gitdir: /etc`, `/home` or an arbitrary
+    // traversal is refused before any stat/open of the claimed location.
+    let git_layout_ok = git_dir.starts_with(root)
+        || git_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name == "worktrees")
+            .unwrap_or(false);
+    if !git_layout_ok {
+        return None;
+    }
+    // (a) The gitdir must be a REAL directory (a symlinked claim is refused
+    //     before any probe), and (b) it must carry Git's reciprocal binding
+    //     back to THIS workspace's .git pointer file.
+    let git_meta = std::fs::symlink_metadata(&git_dir).ok()?;
+    if !git_meta.is_dir() {
+        return None;
+    }
+    let back = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
+    let back_meta = std::fs::symlink_metadata(git_dir.join("gitdir")).ok()?;
+    if !back_meta.is_file() {
+        return None;
+    }
+    if clean_absolute(std::path::Path::new(back.trim())) != dot {
+        return None;
+    }
+    // (c) commondir (optional): a regular file whose resolved target is a
+    //     real directory and either the gitdir itself or the real common
+    //     ancestor of this worktree's path (`<common>/worktrees/<name>`).
+    let common_dir = match std::fs::symlink_metadata(git_dir.join("commondir")) {
+        Ok(meta) if meta.is_file() => {
+            let common = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
             let raw = common.trim();
-            {
+            let resolved = {
                 let joined = git_dir.join(raw);
                 let path = if std::path::Path::new(raw).is_absolute() {
                     std::path::Path::new(raw)
@@ -452,8 +499,28 @@ fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
                     joined.as_path()
                 };
                 clean_absolute(path)
+            };
+            // Lexical relation FIRST (zero external reads): the common dir
+            // must be the gitdir itself or a real ANCESTOR of it (Git's
+            // `gitdir/../..` layout). `commondir: /home` is refused before
+            // any stat of the claimed location.
+            if resolved != git_dir && !git_dir.starts_with(&resolved) {
+                return None;
             }
+            let common_meta = std::fs::symlink_metadata(&resolved).ok()?;
+            if !common_meta.is_dir() {
+                return None;
+            }
+            if resolved != git_dir {
+                let worktree_name = git_dir.file_name()?;
+                let expected = resolved.join("worktrees").join(worktree_name);
+                if clean_absolute(&expected) != git_dir {
+                    return None;
+                }
+            }
+            resolved
         }
+        Ok(_) => return None,
         Err(_) => git_dir.clone(),
     };
     Some(GitAuthority {

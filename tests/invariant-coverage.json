@@ -1,5 +1,5 @@
 {
- "schema": "faktor-invariant-coverage/v2",
+ "schema": "faktor-invariant-coverage/v3",
  "entries": [
   {
    "crate": "faktor-acp",
@@ -17,22 +17,26 @@
     {
      "id": "acp.content_length_corpus",
      "unit": "acp_content_length_corpus_matches_every_outcome",
-     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER",
+     "class": "gap",
+     "reason": "acp.content_length_corpus is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "acp.cancel",
      "unit": "cancel_request_cancels_the_matching_running_prompt_exactly_once",
-     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+     "mutation": "INV-ACP-CANCEL-EXACTLY-ONCE"
     },
     {
      "id": "acp.shutdown",
      "unit": "shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes",
-     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+     "mutation": "INV-ACP-SHUTDOWN-WRITER-ABORT"
     },
     {
      "id": "acp.writer_backpressure",
      "unit": "d_writer_queue_full_is_bounded_and_cancel_lane_lands",
-     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER"
+     "mutation": "INV-ACP-DUPLICATE-FRAME-HEADER",
+     "class": "gap",
+     "reason": "acp.writer_backpressure is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     }
    ]
   },
@@ -52,22 +56,26 @@
     {
      "id": "acquire.retry_after",
      "unit": "hostile_retry_after_values_are_rejected_never_guessed",
-     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+     "mutation": "INV-ACQUIRE-RETRY-AFTER-DIGITS"
     },
     {
      "id": "acquire.destination_identity",
      "unit": "non_canonical_destination_hosts_and_ports_are_refused",
-     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+     "mutation": "INV-ACQUIRE-DESTINATION-CANONICAL"
     },
     {
      "id": "acquire.planner",
      "unit": "capability_credentials_health_and_quota_each_disqualify_the_api",
-     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL",
+     "class": "gap",
+     "reason": "acquire.planner is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "acquire.retry_gate",
      "unit": "the_retry_after_gate_is_clamped_to_the_window_reset",
-     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL"
+     "mutation": "INV-ACQUIRE-HEALTH-REFUSAL",
+     "class": "gap",
+     "reason": "acquire.retry_gate is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     }
    ]
   },
@@ -103,9 +111,9 @@
    "capabilities": [
     {
      "id": "anthropic.authority",
-     "unit": "http_status_retry_classification_is_shared_by_both_families",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
-     "source": "crates/openai/src/lib_tests.rs"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-anthropic crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
@@ -125,57 +133,85 @@
     {
      "id": "browser.download_policy",
      "unit": "downloads_are_denied_by_default_and_native_is_always_denied",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "mutation": "INV-BROWSER-DOWNLOAD-DEFAULT-DENY"
     },
     {
      "id": "browser.download_filename",
-     "unit": "download_filename_is_always_one_bounded_component",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "unit": "attachment_detection_and_filename_sanitization",
+     "mutation": "INV-BROWSER-DOWNLOAD-FILENAME"
     },
     {
      "id": "browser.launch_rollback",
      "unit": "failed_launch_rolls_back_child_broker_and_temp_profile",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
+     "class": "gap",
+     "reason": "browser.launch_rollback is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "browser.shutdown_orphans",
      "unit": "idle_shutdown_kills_the_child_and_leaves_no_orphan",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
+     "class": "gap",
+     "reason": "browser.shutdown_orphans is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "browser.interception",
      "unit": "interception_drops_blocked_resource_types_and_tracking_hosts",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
+     "class": "gap",
+     "reason": "browser.interception is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "browser.profile_confinement",
-     "unit": "profile_store_refuses_symlink_swaps_including_cookie_and_incognito",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "unit": "symlink_swapped_profile_entries_are_refused_and_targets_untouched",
+     "mutation": "INV-BROWSER-PROFILE-CONFINEMENT"
     },
     {
      "id": "browser.capture_cleanup",
      "unit": "repeated_cancelled_captures_never_wedge_the_profile",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY",
+     "class": "gap",
+     "reason": "browser.capture_cleanup is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     }
    ]
   },
   {
    "crate": "faktor-cas",
-   "class": "covered",
-   "via": [
-    "INV-FS-MUTATION-PARENT-REVERIFY",
-    "INV-DURABLE-CORRUPTION-LOUD"
-   ],
-   "reason": "CAS writes/reads are the durable store transaction substrate"
+   "class": "release-critical",
+   "reason": "CAS writes/reads are the durable store transaction substrate",
+   "capabilities": [
+    {
+     "id": "cas.delegated.inv-fs-mutation-parent-reverify",
+     "class": "delegated",
+     "delegate": "INV-FS-MUTATION-PARENT-REVERIFY",
+     "reason": "faktor-cas delegates this capability to INV-FS-MUTATION-PARENT-REVERIFY: CAS writes/reads are the durable store transaction substrate"
+    },
+    {
+     "id": "cas.delegated.inv-durable-corruption-loud",
+     "class": "delegated",
+     "delegate": "INV-DURABLE-CORRUPTION-LOUD",
+     "reason": "faktor-cas delegates this capability to INV-DURABLE-CORRUPTION-LOUD: CAS writes/reads are the durable store transaction substrate"
+    }
+   ]
   },
   {
    "crate": "faktor-cli",
-   "class": "covered",
-   "via": [
-    "INV-FROZEN-CONTRACTS",
-    "INV-DURABLE-CORRUPTION-LOUD"
-   ],
-   "reason": "CLI surface consumes frozen protocol/contracts and durable store reads"
+   "class": "release-critical",
+   "reason": "CLI surface consumes frozen protocol/contracts and durable store reads",
+   "capabilities": [
+    {
+     "id": "cli.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-cli delegates this capability to INV-FROZEN-CONTRACTS: CLI surface consumes frozen protocol/contracts and durable store reads"
+    },
+    {
+     "id": "cli.delegated.inv-durable-corruption-loud",
+     "class": "delegated",
+     "delegate": "INV-DURABLE-CORRUPTION-LOUD",
+     "reason": "faktor-cli delegates this capability to INV-DURABLE-CORRUPTION-LOUD: CLI surface consumes frozen protocol/contracts and durable store reads"
+    }
+   ]
   },
   {
    "crate": "faktor-cloud",
@@ -193,22 +229,26 @@
     {
      "id": "cloud.restore_verification",
      "unit": "a_corrupted_backup_fails_restore_verification_and_is_never_adopted",
-     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND",
+     "class": "gap",
+     "reason": "cloud.restore_verification is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "cloud.money_strings",
      "unit": "money_fields_serialize_as_quoted_decimal_strings_at_every_boundary",
-     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+     "mutation": "INV-CLOUD-MONEY-STRING-SERDE"
     },
     {
      "id": "cloud.billing_overflow",
      "unit": "usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary",
-     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+     "mutation": "INV-CLOUD-BILLING-CHECKED-OVERFLOW"
     },
     {
      "id": "cloud.migration_claim",
      "unit": "migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema",
-     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND"
+     "mutation": "INV-CLOUD-BACKUP-RETENTION-BOUND",
+     "class": "gap",
+     "reason": "cloud.migration_claim is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     }
    ]
   },
@@ -228,22 +268,26 @@
     {
      "id": "commerce.part_identity",
      "unit": "hostile_part_numbers_are_typed_errors",
-     "mutation": "INV-COMMERCE-BOM-BOUND"
+     "mutation": "INV-COMMERCE-BOM-BOUND",
+     "class": "gap",
+     "reason": "commerce.part_identity is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "commerce.matching",
      "unit": "a_different_part_number_is_a_mismatch",
-     "mutation": "INV-COMMERCE-BOM-BOUND"
+     "mutation": "INV-COMMERCE-MPN-MATCH-EXACT"
     },
     {
      "id": "commerce.digest_stability",
      "unit": "bom_digest_is_order_sensitive_and_deterministic",
-     "mutation": "INV-COMMERCE-BOM-BOUND"
+     "mutation": "INV-COMMERCE-BOM-BOUND",
+     "class": "gap",
+     "reason": "commerce.digest_stability is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "commerce.quote_scope",
      "unit": "account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers",
-     "mutation": "INV-COMMERCE-BOM-BOUND"
+     "mutation": "INV-COMMERCE-ACCOUNT-SCOPE"
     }
    ]
   },
@@ -257,20 +301,36 @@
    "capabilities": [
     {
      "id": "commerce-connectors.authority",
-     "unit": "planted_secrets_never_reach_any_sink",
-     "mutation": "INV-REDACTION-CAP-FAIL-CLOSED"
+     "class": "delegated",
+     "delegate": "INV-REDACTION-CAP-FAIL-CLOSED",
+     "reason": "faktor-commerce-connectors crate-level capability delegates to its release-critical implementation authority INV-REDACTION-CAP-FAIL-CLOSED."
     }
    ]
   },
   {
    "crate": "faktor-context",
-   "class": "covered",
-   "via": [
-    "INV-COMPACTION-SUMMARY-CAP",
-    "INV-QUEUE-ADMISSION-FILES",
-    "INV-CHUNK-DROP-ACCOUNTING"
-   ],
-   "reason": "turn ledger/compaction authority lives in the agent runtime"
+   "class": "release-critical",
+   "reason": "turn ledger/compaction authority lives in the agent runtime",
+   "capabilities": [
+    {
+     "id": "context.delegated.inv-compaction-summary-cap",
+     "class": "delegated",
+     "delegate": "INV-COMPACTION-SUMMARY-CAP",
+     "reason": "faktor-context delegates this capability to INV-COMPACTION-SUMMARY-CAP: turn ledger/compaction authority lives in the agent runtime"
+    },
+    {
+     "id": "context.delegated.inv-queue-admission-files",
+     "class": "delegated",
+     "delegate": "INV-QUEUE-ADMISSION-FILES",
+     "reason": "faktor-context delegates this capability to INV-QUEUE-ADMISSION-FILES: turn ledger/compaction authority lives in the agent runtime"
+    },
+    {
+     "id": "context.delegated.inv-chunk-drop-accounting",
+     "class": "delegated",
+     "delegate": "INV-CHUNK-DROP-ACCOUNTING",
+     "reason": "faktor-context delegates this capability to INV-CHUNK-DROP-ACCOUNTING: turn ledger/compaction authority lives in the agent runtime"
+    }
+   ]
   },
   {
    "crate": "faktor-contracts",
@@ -282,8 +342,9 @@
    "capabilities": [
     {
      "id": "contracts.authority",
-     "unit": "check_fails_on_a_renamed_and_reordered_variant_in_a_scratch_copy",
-     "mutation": "INV-FROZEN-CONTRACTS"
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-contracts crate-level capability delegates to its release-critical implementation authority INV-FROZEN-CONTRACTS."
     }
    ]
   },
@@ -298,8 +359,9 @@
    "capabilities": [
     {
      "id": "core.authority",
-     "unit": "overlap_uses_canonical_component_boundaries",
-     "mutation": "INV-RUNTIME-PATH-CANONICALIZATION"
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-core crate-level capability delegates to its release-critical implementation authority INV-FROZEN-CONTRACTS."
     }
    ]
   },
@@ -313,29 +375,49 @@
    "capabilities": [
     {
      "id": "deepseek.authority",
-     "unit": "http_status_retry_classification_is_shared_by_both_families",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
-     "source": "crates/openai/src/lib_tests.rs"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-deepseek crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
   {
    "crate": "faktor-edit",
-   "class": "covered",
-   "via": [
-    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
-    "INV-FS-MUTATION-PARENT-REVERIFY"
-   ],
-   "reason": "edit writes go through the rooted fs authority and shell change attribution"
+   "class": "release-critical",
+   "reason": "edit writes go through the rooted fs authority and shell change attribution",
+   "capabilities": [
+    {
+     "id": "edit.delegated.inv-shell-change-manifest-attribution",
+     "class": "delegated",
+     "delegate": "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+     "reason": "faktor-edit delegates this capability to INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION: edit writes go through the rooted fs authority and shell change attribution"
+    },
+    {
+     "id": "edit.delegated.inv-fs-mutation-parent-reverify",
+     "class": "delegated",
+     "delegate": "INV-FS-MUTATION-PARENT-REVERIFY",
+     "reason": "faktor-edit delegates this capability to INV-FS-MUTATION-PARENT-REVERIFY: edit writes go through the rooted fs authority and shell change attribution"
+    }
+   ]
   },
   {
    "crate": "faktor-evidence",
-   "class": "covered",
-   "via": [
-    "INV-CI-THREE-PLATFORM-AGGREGATE",
-    "INV-FROZEN-CONTRACTS"
-   ],
-   "reason": "evidence schemas are bound into the certification chain"
+   "class": "release-critical",
+   "reason": "evidence schemas are bound into the certification chain",
+   "capabilities": [
+    {
+     "id": "evidence.delegated.inv-ci-three-platform-aggregate",
+     "class": "delegated",
+     "delegate": "INV-CI-THREE-PLATFORM-AGGREGATE",
+     "reason": "faktor-evidence delegates this capability to INV-CI-THREE-PLATFORM-AGGREGATE: evidence schemas are bound into the certification chain"
+    },
+    {
+     "id": "evidence.delegated.inv-frozen-contracts",
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-evidence delegates this capability to INV-FROZEN-CONTRACTS: evidence schemas are bound into the certification chain"
+    }
+   ]
   },
   {
    "crate": "faktor-fs",
@@ -362,20 +444,30 @@
    "capabilities": [
     {
      "id": "gateway.authority",
-     "unit": "http_status_retry_classification_is_shared_by_both_families",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
-     "source": "crates/openai/src/lib_tests.rs"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-gateway crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
   {
    "crate": "faktor-git",
-   "class": "covered",
-   "via": [
-    "INV-FS-MUTATION-PARENT-REVERIFY",
-    "INV-PREPARED-WRITER-JOBS"
-   ],
-   "reason": "git writes go through the rooted fs authority and snapshot checkpointing"
+   "class": "release-critical",
+   "reason": "git writes go through the rooted fs authority and snapshot checkpointing",
+   "capabilities": [
+    {
+     "id": "git.delegated.inv-fs-mutation-parent-reverify",
+     "class": "delegated",
+     "delegate": "INV-FS-MUTATION-PARENT-REVERIFY",
+     "reason": "faktor-git delegates this capability to INV-FS-MUTATION-PARENT-REVERIFY: git writes go through the rooted fs authority and snapshot checkpointing"
+    },
+    {
+     "id": "git.delegated.inv-prepared-writer-jobs",
+     "class": "delegated",
+     "delegate": "INV-PREPARED-WRITER-JOBS",
+     "reason": "faktor-git delegates this capability to INV-PREPARED-WRITER-JOBS: git writes go through the rooted fs authority and snapshot checkpointing"
+    }
+   ]
   },
   {
    "crate": "faktor-google",
@@ -387,20 +479,30 @@
    "capabilities": [
     {
      "id": "google.authority",
-     "unit": "http_status_retry_classification_is_shared_by_both_families",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
-     "source": "crates/openai/src/lib_tests.rs"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-google crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
   {
    "crate": "faktor-hooks",
-   "class": "covered",
-   "via": [
-    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
-    "INV-PREPARED-WRITER-JOBS"
-   ],
-   "reason": "hook execution rides the tool lifecycle accounting"
+   "class": "release-critical",
+   "reason": "hook execution rides the tool lifecycle accounting",
+   "capabilities": [
+    {
+     "id": "hooks.delegated.inv-shell-change-manifest-attribution",
+     "class": "delegated",
+     "delegate": "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+     "reason": "faktor-hooks delegates this capability to INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION: hook execution rides the tool lifecycle accounting"
+    },
+    {
+     "id": "hooks.delegated.inv-prepared-writer-jobs",
+     "class": "delegated",
+     "delegate": "INV-PREPARED-WRITER-JOBS",
+     "reason": "faktor-hooks delegates this capability to INV-PREPARED-WRITER-JOBS: hook execution rides the tool lifecycle accounting"
+    }
+   ]
   },
   {
    "crate": "faktor-index",
@@ -419,21 +521,41 @@
   },
   {
    "crate": "faktor-instructions",
-   "class": "covered",
-   "via": [
-    "INV-DURABLE-CORRUPTION-LOUD",
-    "INV-COMPACTION-SUMMARY-CAP"
-   ],
-   "reason": "instruction/memory vocabulary is durable store fact state"
+   "class": "release-critical",
+   "reason": "instruction/memory vocabulary is durable store fact state",
+   "capabilities": [
+    {
+     "id": "instructions.delegated.inv-durable-corruption-loud",
+     "class": "delegated",
+     "delegate": "INV-DURABLE-CORRUPTION-LOUD",
+     "reason": "faktor-instructions delegates this capability to INV-DURABLE-CORRUPTION-LOUD: instruction/memory vocabulary is durable store fact state"
+    },
+    {
+     "id": "instructions.delegated.inv-compaction-summary-cap",
+     "class": "delegated",
+     "delegate": "INV-COMPACTION-SUMMARY-CAP",
+     "reason": "faktor-instructions delegates this capability to INV-COMPACTION-SUMMARY-CAP: instruction/memory vocabulary is durable store fact state"
+    }
+   ]
   },
   {
    "crate": "faktor-learning",
-   "class": "covered",
-   "via": [
-    "INV-DURABLE-CORRUPTION-LOUD",
-    "INV-MEMO-READ-ONLY-VIEW"
-   ],
-   "reason": "learning outcomes are durable store fact state"
+   "class": "release-critical",
+   "reason": "learning outcomes are durable store fact state",
+   "capabilities": [
+    {
+     "id": "learning.delegated.inv-durable-corruption-loud",
+     "class": "delegated",
+     "delegate": "INV-DURABLE-CORRUPTION-LOUD",
+     "reason": "faktor-learning delegates this capability to INV-DURABLE-CORRUPTION-LOUD: learning outcomes are durable store fact state"
+    },
+    {
+     "id": "learning.delegated.inv-memo-read-only-view",
+     "class": "delegated",
+     "delegate": "INV-MEMO-READ-ONLY-VIEW",
+     "reason": "faktor-learning delegates this capability to INV-MEMO-READ-ONLY-VIEW: learning outcomes are durable store fact state"
+    }
+   ]
   },
   {
    "crate": "faktor-lsp",
@@ -451,17 +573,19 @@
     {
      "id": "lsp.initialize",
      "unit": "initialize_carries_real_root_and_owner",
-     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+     "mutation": "INV-LSP-INITIALIZE-ROOT"
     },
     {
      "id": "lsp.shutdown",
      "unit": "shutdown_request_then_exit_notification_within_grace",
-     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+     "mutation": "INV-LSP-SHUTDOWN-EXIT-NOTIFICATION"
     },
     {
      "id": "lsp.reader_bounds",
      "unit": "stderr_flood_is_drained_bounded_and_never_blocks",
-     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE"
+     "mutation": "INV-LSP-BOUNDED-WRITER-QUEUE",
+     "class": "gap",
+     "reason": "lsp.reader_bounds is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     }
    ]
   },
@@ -481,28 +605,40 @@
     {
      "id": "mcp.delivery_unknown",
      "unit": "delivery_unknown_is_typed_by_code_and_not_retryable",
-     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+     "mutation": "INV-MCP-DELIVERY-UNKNOWN-TYPED"
     },
     {
      "id": "mcp.spawn_lifecycle",
      "unit": "a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock",
-     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE",
+     "class": "gap",
+     "reason": "mcp.spawn_lifecycle is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "mcp.call_cancellation",
      "unit": "timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown",
-     "mutation": "INV-MCP-BOUNDED-WRITER-QUEUE"
+     "mutation": "INV-MCP-CANCEL-BEFORE-WRITE"
     }
    ]
   },
   {
    "crate": "faktor-memory",
-   "class": "covered",
-   "via": [
-    "INV-DURABLE-CORRUPTION-LOUD",
-    "INV-COMPACTION-SUMMARY-CAP"
-   ],
-   "reason": "memory facts are durable store fact state"
+   "class": "release-critical",
+   "reason": "memory facts are durable store fact state",
+   "capabilities": [
+    {
+     "id": "memory.delegated.inv-durable-corruption-loud",
+     "class": "delegated",
+     "delegate": "INV-DURABLE-CORRUPTION-LOUD",
+     "reason": "faktor-memory delegates this capability to INV-DURABLE-CORRUPTION-LOUD: memory facts are durable store fact state"
+    },
+    {
+     "id": "memory.delegated.inv-compaction-summary-cap",
+     "class": "delegated",
+     "delegate": "INV-COMPACTION-SUMMARY-CAP",
+     "reason": "faktor-memory delegates this capability to INV-COMPACTION-SUMMARY-CAP: memory facts are durable store fact state"
+    }
+   ]
   },
   {
    "crate": "faktor-ollama",
@@ -514,8 +650,9 @@
    "capabilities": [
     {
      "id": "ollama.authority",
-     "unit": "adapter_media_gate_refuses_hostile_oversized_payload_typed",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-ollama crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
@@ -529,9 +666,9 @@
    "capabilities": [
     {
      "id": "openai.authority",
-     "unit": "http_status_retry_classification_is_shared_by_both_families",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
-     "source": "crates/openai/src/lib_tests.rs"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-openai crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
@@ -547,8 +684,9 @@
    "capabilities": [
     {
      "id": "orchestrator.authority",
-     "unit": "a_pending_row_blocks_a_duplicate_start_without_touching_anything",
-     "mutation": "INV-TASK-START-IDEMPOTENT"
+     "class": "delegated",
+     "delegate": "INV-TASK-START-IDEMPOTENT",
+     "reason": "faktor-orchestrator crate-level capability delegates to its release-critical implementation authority INV-TASK-START-IDEMPOTENCY."
     }
    ]
   },
@@ -562,8 +700,9 @@
    "capabilities": [
     {
      "id": "protocol.authority",
-     "unit": "error_codes_cover_every_kind_once",
-     "mutation": "INV-FROZEN-CONTRACTS"
+     "class": "delegated",
+     "delegate": "INV-FROZEN-CONTRACTS",
+     "reason": "faktor-protocol crate-level capability delegates to its release-critical implementation authority INV-FROZEN-CONTRACTS."
     }
    ]
   },
@@ -577,8 +716,9 @@
    "capabilities": [
     {
      "id": "provider.authority",
-     "unit": "exhaustive_status_hint_table_is_the_single_authority",
-     "mutation": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE"
+     "class": "delegated",
+     "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+     "reason": "faktor-provider crate-level capability delegates to its release-critical implementation authority INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
     }
    ]
   },
@@ -608,8 +748,9 @@
    "capabilities": [
     {
      "id": "router.authority",
-     "unit": "maximum_quality_path_consumes_only_qualified_candidates",
-     "mutation": "INV-MAX-QUALITY-ONE-AUTHORITY"
+     "class": "delegated",
+     "delegate": "INV-MEMO-READ-ONLY-VIEW",
+     "reason": "faktor-router crate-level capability delegates to its release-critical implementation authority INV-MEMO-READ-ONLY-VIEW."
     }
    ]
   },
@@ -623,8 +764,9 @@
    "capabilities": [
     {
      "id": "sandbox.authority",
-     "unit": "filesystem_projection_is_enforcement_honest",
-     "mutation": "INV-SANDBOX-PRIVILEGE-DROP"
+     "class": "delegated",
+     "delegate": "INV-FS-CONFINEMENT-LANDLOCK-DEMAND",
+     "reason": "faktor-sandbox crate-level capability delegates to its release-critical implementation authority INV-FS-CONFINEMENT-LANDLOCK-DEMAND."
     }
    ]
   },
@@ -638,8 +780,9 @@
    "capabilities": [
     {
      "id": "scheduler.authority",
-     "unit": "lexical_aliases_share_one_identity_before_existence",
-     "mutation": "INV-RUNTIME-PATH-CANONICALIZATION"
+     "class": "delegated",
+     "delegate": "INV-RUNTIME-PATH-CANONICALIZATION",
+     "reason": "faktor-scheduler crate-level capability delegates to its release-critical implementation authority INV-RUNTIME-PATH-CANONICALIZATION."
     }
    ]
   },
@@ -659,22 +802,26 @@
     {
      "id": "scm.webhook_claims",
      "unit": "acknowledged_webhook_claim_survives_sigkill_and_reopen",
-     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS",
+     "class": "gap",
+     "reason": "scm.webhook_claims is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "scm.token_bounds",
      "unit": "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound",
-     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS",
+     "class": "gap",
+     "reason": "scm.token_bounds is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "scm.branch_reconcile",
      "unit": "branch_create_is_bounded_to_the_exact_head_and_reconciles_existing",
-     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+     "mutation": "INV-SCM-BRANCH-RECONCILE-EXACT-HEAD"
     },
     {
      "id": "scm.id_bounds",
      "unit": "installation_ids_above_the_signed_sqlite_bound_are_refused_typed",
-     "mutation": "INV-SCM-RECONCILE-CADENCE-BOUNDS"
+     "mutation": "INV-SCM-INSTALLATION-ID-BOUND"
     }
    ]
   },
@@ -725,22 +872,28 @@
     {
      "id": "semantic.process_client",
      "unit": "process_client_round_trips_the_typed_frame",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION",
+     "class": "gap",
+     "reason": "semantic.process_client is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "semantic.watchdog",
      "unit": "process_client_watchdog_is_typed_provider_timeout_and_retires_the_child",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION",
+     "class": "gap",
+     "reason": "semantic.watchdog is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "semantic.fallback",
      "unit": "fallback_serves_every_operation_when_no_provider_is_registered",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION",
+     "class": "gap",
+     "reason": "semantic.fallback is a real production capability whose direct planted mutation-gate binding is still pending; the invariant that covers the crate does not run this capability's oracle, so it is recorded as visible release debt."
     },
     {
      "id": "semantic.risk_default",
      "unit": "unknown_risk_level_is_not_safe",
-     "mutation": "INV-SEMANTIC-CAPABILITY-INTERSECTION"
+     "mutation": "INV-SEMANTIC-RISK-SERDE-DEFAULT"
     }
    ]
   },
@@ -756,8 +909,9 @@
    "capabilities": [
     {
      "id": "server.authority",
-     "unit": "budget_enforcement_is_persisted_effective_vs_requested_and_survives_reopen",
-     "mutation": "INV-ATTACHMENT-REFERENCE-IDENTITY"
+     "class": "delegated",
+     "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+     "reason": "faktor-server crate-level capability delegates to its release-critical implementation authority INV-CLIENT-ROUTE-CONTRACT."
     }
    ]
   },
@@ -773,19 +927,30 @@
    "capabilities": [
     {
      "id": "session.authority",
-     "unit": "journal_verify_open_maps_a_torn_journal_to_the_typed_corruption_surface",
-     "mutation": "INV-JOURNAL-INTEGRITY"
+     "class": "delegated",
+     "delegate": "INV-DURABLE-CORRUPTION-LOUD",
+     "reason": "faktor-session crate-level capability delegates to its release-critical implementation authority INV-DURABLE-CORRUPTION-LOUD."
     }
    ]
   },
   {
    "crate": "faktor-snapshot",
-   "class": "covered",
-   "via": [
-    "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
-    "INV-FS-MUTATION-PARENT-REVERIFY"
-   ],
-   "reason": "snapshot checkpoints feed the shell attribution settlement path"
+   "class": "release-critical",
+   "reason": "snapshot checkpoints feed the shell attribution settlement path",
+   "capabilities": [
+    {
+     "id": "snapshot.delegated.inv-shell-change-manifest-attribution",
+     "class": "delegated",
+     "delegate": "INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION",
+     "reason": "faktor-snapshot delegates this capability to INV-SHELL-CHANGE-MANIFEST-ATTRIBUTION: snapshot checkpoints feed the shell attribution settlement path"
+    },
+    {
+     "id": "snapshot.delegated.inv-fs-mutation-parent-reverify",
+     "class": "delegated",
+     "delegate": "INV-FS-MUTATION-PARENT-REVERIFY",
+     "reason": "faktor-snapshot delegates this capability to INV-FS-MUTATION-PARENT-REVERIFY: snapshot checkpoints feed the shell attribution settlement path"
+    }
+   ]
   },
   {
    "crate": "faktor-store",
@@ -863,21 +1028,41 @@
   },
   {
    "crate": "faktor-winjob",
-   "class": "covered",
-   "via": [
-    "INV-SANDBOX-PRIVILEGE-DROP",
-    "INV-PTY-CONTROL-PIPE-CLOEXEC"
-   ],
-   "reason": "windows job confinement is the spawn/PTY authority"
+   "class": "release-critical",
+   "reason": "windows job confinement is the spawn/PTY authority",
+   "capabilities": [
+    {
+     "id": "winjob.delegated.inv-sandbox-privilege-drop",
+     "class": "delegated",
+     "delegate": "INV-SANDBOX-PRIVILEGE-DROP",
+     "reason": "faktor-winjob delegates this capability to INV-SANDBOX-PRIVILEGE-DROP: windows job confinement is the spawn/PTY authority"
+    },
+    {
+     "id": "winjob.delegated.inv-pty-control-pipe-cloexec",
+     "class": "delegated",
+     "delegate": "INV-PTY-CONTROL-PIPE-CLOEXEC",
+     "reason": "faktor-winjob delegates this capability to INV-PTY-CONTROL-PIPE-CLOEXEC: windows job confinement is the spawn/PTY authority"
+    }
+   ]
   },
   {
    "crate": "faktor-worker",
-   "class": "covered",
-   "via": [
-    "INV-ADMISSION-RECOVERY-LANDING",
-    "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES"
-   ],
-   "reason": "worker plane recovery is the admission/landing authority"
+   "class": "release-critical",
+   "reason": "worker plane recovery is the admission/landing authority",
+   "capabilities": [
+    {
+     "id": "worker.delegated.inv-admission-recovery-landing",
+     "class": "delegated",
+     "delegate": "INV-ADMISSION-RECOVERY-LANDING",
+     "reason": "faktor-worker delegates this capability to INV-ADMISSION-RECOVERY-LANDING: worker plane recovery is the admission/landing authority"
+    },
+    {
+     "id": "worker.delegated.inv-shutdown-zero-live-authorities",
+     "class": "delegated",
+     "delegate": "INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES",
+     "reason": "faktor-worker delegates this capability to INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES: worker plane recovery is the admission/landing authority"
+    }
+   ]
   }
  ],
  "surfaces": [
@@ -886,33 +1071,39 @@
    "capabilities": [
     {
      "id": "vscode.send_task",
-     "unit": "double click / Enter+click / triple submit admit exactly ONE start",
-     "mutation": "INV-CLIENT-ROUTE-CONTRACT"
+     "class": "delegated",
+     "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+     "reason": "vscode.send_task rides the IDE host surface; its implementation authority is mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
     },
     {
      "id": "vscode.daemon_single_flight",
-     "unit": "100 concurrent startDaemon callers spawn exactly one process (single-flight)",
-     "mutation": "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES"
+     "class": "delegated",
+     "delegate": "INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES",
+     "reason": "vscode.daemon_single_flight rides the IDE host surface; its implementation authority is mutation-tested by INV-CLIENT-STOP-ZERO-LIVE-AUTHORITIES."
     },
     {
      "id": "vscode.refresh_fencing",
-     "unit": "lifecycle fence: 2,000 randomized interleavings never apply a stale generation",
-     "mutation": "INV-CLIENT-ROUTE-CONTRACT"
+     "class": "delegated",
+     "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+     "reason": "vscode.refresh_fencing rides the IDE host surface; its implementation authority is mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
     },
     {
      "id": "vscode.attachment_identity",
-     "unit": "durable acceptance clears ONLY the accepted attachment ids (next-task attachment survives)",
-     "mutation": "INV-VSCODE-ATTACHMENT-UI-REACHABILITY"
+     "class": "delegated",
+     "delegate": "INV-VSCODE-ATTACHMENT-UI-REACHABILITY",
+     "reason": "vscode.attachment_identity rides the IDE host surface; its implementation authority is mutation-tested by INV-VSCODE-ATTACHMENT-UI-REACHABILITY."
     },
     {
      "id": "vscode.contrast",
-     "unit": "every acceptance-verdict pair meets WCAG AA 4.5:1 in chat.css",
-     "mutation": "INV-VSCODE-ACCESSIBILITY"
+     "class": "delegated",
+     "delegate": "INV-VSCODE-ACCESSIBILITY",
+     "reason": "vscode.contrast rides the IDE host surface; its implementation authority is mutation-tested by INV-VSCODE-ACCESSIBILITY."
     },
     {
      "id": "vscode.stream_bounds",
-     "unit": "frame budget: exactly max cumulative bytes is accepted, one line above is refused",
-     "mutation": "INV-IDE-SSE-FRAME-BOUNDED"
+     "class": "delegated",
+     "delegate": "INV-IDE-SSE-FRAME-BOUNDED",
+     "reason": "vscode.stream_bounds rides the IDE host surface; its implementation authority is mutation-tested by INV-IDE-SSE-FRAME-BOUNDED."
     }
    ]
   },
@@ -921,35 +1112,748 @@
    "capabilities": [
     {
      "id": "jetbrains.prompt_draft",
-     "unit": "prompt submission identity: identical retry reuses the id, edits mint new",
-     "mutation": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE"
+     "class": "delegated",
+     "delegate": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE",
+     "reason": "jetbrains.prompt_draft rides the IDE host surface; its implementation authority is mutation-tested by INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE."
     },
     {
      "id": "jetbrains.send_single_flight",
-     "unit": "task start single-flight: transport failure re-enables and keeps draft + attachments",
-     "mutation": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE"
+     "class": "delegated",
+     "delegate": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE",
+     "reason": "jetbrains.send_single_flight rides the IDE host surface; its implementation authority is mutation-tested by INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE."
     },
     {
      "id": "jetbrains.stream_blocked",
-     "unit": "private fun assertSseBlockedShape(",
-     "mutation": "INV-IDE-SSE-BLOCKED-DURABLE-JB"
+     "class": "delegated",
+     "delegate": "INV-IDE-SSE-BLOCKED-DURABLE-JB",
+     "reason": "jetbrains.stream_blocked rides the IDE host surface; its implementation authority is mutation-tested by INV-IDE-SSE-BLOCKED-DURABLE-JB."
     },
     {
      "id": "jetbrains.process_drain",
-     "unit": "private fun assertCommandDrain(",
-     "mutation": "INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED"
+     "class": "delegated",
+     "delegate": "INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED",
+     "reason": "jetbrains.process_drain rides the IDE host surface; its implementation authority is mutation-tested by INV-CLIENT-SUBPROCESS-DRAIN-BOUNDED."
     },
     {
      "id": "jetbrains.attachments",
-     "unit": "attachment reads are canonicalized and symlink escapes refuse",
-     "mutation": "INV-BROWSER-EGRESS-DEFAULT-DENY"
+     "class": "delegated",
+     "delegate": "INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE",
+     "reason": "jetbrains.attachments rides the IDE host surface; its implementation authority is mutation-tested by INV-JETBRAINS-PROMPT-DRAFT-ACCEPTANCE."
     },
     {
      "id": "jetbrains.reconnect",
-     "unit": "real: reconnect at the current cursor",
-     "mutation": "INV-IDE-SSE-BLOCKED-DURABLE-JB"
+     "class": "delegated",
+     "delegate": "INV-IDE-SSE-BLOCKED-DURABLE-JB",
+     "reason": "jetbrains.reconnect rides the IDE host surface; its implementation authority is mutation-tested by INV-IDE-SSE-BLOCKED-DURABLE-JB."
     }
    ]
   }
- ]
+ ],
+ "discovered": {
+  "cli.acp": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.acp is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.bootstrap": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.bootstrap is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.build": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.build is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.commerce": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.commerce is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.doctor": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.doctor is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.help": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.help is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.run": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.run is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.serve": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.serve is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.sessions": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.sessions is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.worker": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.worker is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "jetbrains.toolwindow.faktor": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "jetbrains.toolwindow.faktor is discovered on a real jetbrains surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.capabilities": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.capabilities is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.models": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.models is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.agents": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.agents is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.approvals": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.approvals is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.artifacts": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.artifacts is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.audit": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.audit is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.deletion-jobs": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.deletion-jobs is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.deletion-jobs.id": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.deletion-jobs.id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.settings": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.settings is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.status": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.status is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.enterprise.tombstones.scope-key": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.enterprise.tombstones.scope-key is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.entitlements": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.entitlements is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.events": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.events is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.evidence.id": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.evidence.id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.health": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.health is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.identity": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.identity is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.index.coverage": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.index.coverage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.jobs.id": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.jobs.id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.messages": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.messages is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.orchestrator.graph": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.orchestrator.graph is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.orgs": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.orgs is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.orgs.id.members": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.orgs.id.members is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.permissions": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.permissions is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.providers": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.providers is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.ready": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.ready is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.repositories": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.repositories is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.semantic.capabilities": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.semantic.capabilities is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.semantic.status": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.semantic.status is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.agents": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.agents is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.attachments.blob.digest": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.attachments.blob.digest is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.attachments.blob.digest.bytes": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.attachments.blob.digest.bytes is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.attachments.ref.ref-id": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.attachments.ref.ref-id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.attachments.ref.ref-id.bytes": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.attachments.ref.ref-id.bytes is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.board": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.board is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.checkpoints": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.checkpoints is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.events": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.events is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.task-runs": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.task-runs is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.task-runs.run-id": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.task-runs.run-id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.tasks": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.tasks is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.tasks.task-id.verification": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.tasks.task-id.verification is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.terminal": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.terminal is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.terminal.events": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.terminal.events is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.terminals.terminal-id.output": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.terminals.terminal-id.output is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.tournament.tournament-id": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.tournament.tournament-id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.tournaments": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.tournaments is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.turns": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.turns is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.usage": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.usage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.session.id.verification": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.session.id.verification is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.sessions": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.sessions is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.tasks.id.completion-steps": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.tasks.id.completion-steps is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.tasks.id.proof": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.tasks.id.proof is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.terminals": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.terminals is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.updater.status": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.updater.status is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.usage": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.usage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.native.workers": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.native.workers is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.get.session.id.projection": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.get.session.id.projection is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.budget": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.budget is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.cancel": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.cancel is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.model": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.model is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.pause": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.pause is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.resume": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.resume is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.retry": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.retry is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.agents.child-id.steer": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.agents.child-id.steer is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.approvals.id.decide": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.approvals.id.decide is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.credits.grant": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.credits.grant is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.enterprise.artifacts.id.eligible": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.enterprise.artifacts.id.eligible is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.enterprise.deletion-jobs.id.advance": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.enterprise.deletion-jobs.id.advance is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.enterprise.effective-config": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.enterprise.effective-config is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.enterprise.retention.gc": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.enterprise.retention.gc is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.evidence.id.retrieve": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.evidence.id.retrieve is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.invitations.accept": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.invitations.accept is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.jobs.claim": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.jobs.claim is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.jobs.id.result": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.jobs.id.result is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.permission.reply": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.permission.reply is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.scm.webhook": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.scm.webhook is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.abort": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.abort is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.agents.child.presentation": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.agents.child.presentation is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.attachments": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.attachments is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.prompt": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.prompt is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.task-runs.run-id.cancel": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.task-runs.run-id.cancel is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.terminal": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.terminal is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.terminals.terminal-id.input": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.terminals.terminal-id.input is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.terminals.terminal-id.kill": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.terminals.terminal-id.kill is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.terminals.terminal-id.reconcile": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.terminals.terminal-id.reconcile is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.terminals.terminal-id.resize": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.terminals.terminal-id.resize is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.tournament": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.tournament is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.tournaments.tournament-id.abort": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.tournaments.tournament-id.abort is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.session.id.tournaments.tournament-id.decide": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.session.id.tournaments.tournament-id.decide is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.sso.callback": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.sso.callback is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.sso.logout": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.sso.logout is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.sso.start": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.sso.start is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.updater.apply": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.updater.apply is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.updater.check": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.updater.check is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.updater.downgrade": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.updater.downgrade is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.updater.rollback": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.updater.rollback is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.updater.stage": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.updater.stage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.workers.id.heartbeat": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.workers.id.heartbeat is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.workers.id.revoke": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.workers.id.revoke is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.workers.register": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.workers.register is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "native.post.native.workers.tokens": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "native.post.native.workers.tokens is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "provider.anthropic": {
+   "class": "delegated",
+   "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+   "reason": "provider.anthropic is discovered on a real provider surface; its implementation authority is centrally mutation-tested by INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
+  },
+  "provider.deepseek": {
+   "class": "delegated",
+   "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+   "reason": "provider.deepseek is discovered on a real provider surface; its implementation authority is centrally mutation-tested by INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
+  },
+  "provider.gateway": {
+   "class": "delegated",
+   "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+   "reason": "provider.gateway is discovered on a real provider surface; its implementation authority is centrally mutation-tested by INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
+  },
+  "provider.google": {
+   "class": "delegated",
+   "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+   "reason": "provider.google is discovered on a real provider surface; its implementation authority is centrally mutation-tested by INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
+  },
+  "provider.ollama": {
+   "class": "delegated",
+   "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+   "reason": "provider.ollama is discovered on a real provider surface; its implementation authority is centrally mutation-tested by INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
+  },
+  "provider.open-ai": {
+   "class": "delegated",
+   "delegate": "INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE",
+   "reason": "provider.open-ai is discovered on a real provider surface; its implementation authority is centrally mutation-tested by INV-PROVIDER-CLASSIFICATION-TRUTH-TABLE."
+  },
+  "tool.board-post": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.board-post is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "tool.board-read": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.board-read is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "tool.edit-file": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.edit-file is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "tool.read-file": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.read-file is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "tool.run-command": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.run-command is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "tool.search": {
+   "class": "delegated",
+   "delegate": "INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE",
+   "reason": "tool.search is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-SEMANTIC-SEARCH-LOCK-DISCIPLINE."
+  },
+  "tool.source-market": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.source-market is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "tool.write-file": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "tool.write-file is discovered on a real tool surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.cancel-task": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.cancel-task is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.control-plane-sign-in": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.control-plane-sign-in is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.control-plane-sign-out": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.control-plane-sign-out is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.new-task": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.new-task is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.open-chat": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.open-chat is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.reconnect-stream": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.reconnect-stream is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.refresh": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.refresh is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.reply-permission": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.reply-permission is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.start-server": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.start-server is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.command.faktor.stop-server": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.command.faktor.stop-server is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.properties": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.properties is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.title": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.title is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.view.faktor": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.view.faktor is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  }
+ }
 }

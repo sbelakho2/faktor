@@ -1,0 +1,12 @@
+{
+  "id": "INV-BROWSER-DOWNLOAD-FILENAME",
+  "file": "crates/browser/src/download.rs",
+  "find": "fn sanitize_filename(raw: &str) -> Option<String> {\n    let last = raw.rsplit(['/', '\\\\']).next().unwrap_or(\"\");\n    let cleaned: String = last",
+  "replace": "fn sanitize_filename(raw: &str) -> Option<String> {\n    let last = raw;\n    let cleaned: String = last",
+  "gate": "cargo test -p faktor-browser --lib attachment_detection_and_filename_sanitization",
+  "expect": "FAILED",
+  "note": "Dropping last-component extraction lets path traversal survive filename sanitization.",
+  "capabilities": [
+    "browser.download_filename"
+  ]
+}
