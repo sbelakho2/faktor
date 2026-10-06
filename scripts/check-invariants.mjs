@@ -697,7 +697,11 @@ function main() {
       ],
       { stdio: 'ignore' },
     );
-    const scratch = mkdtempSync(join(tmpdir(), 'faktor-mutation-campaign-'));
+    // Same filesystem as the checkout so the node_modules support snapshot can
+    // hardlink instead of copying hundreds of MB; `target/` is excluded from
+    // the tree digests and removed in the finally below.
+    mkdirSync(join(root, 'target'), { recursive: true });
+    const scratch = mkdtempSync(join(root, 'target', 'mutation-campaign-'));
     cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
     // Snapshot the gate support trees (P2-9): the CLI is an immutable
     // COPY and node_modules a hardlink snapshot, both content-digested into
