@@ -1,0 +1,12 @@
+{
+  "id": "INV-SCM-TOKEN-BOUNDS",
+  "file": "crates/scm/src/lib.rs",
+  "find": "        Err(_) => Err(ScmError::Transport(format!(\n            \"{what} exceeded its {} ms HTTP bound\",\n            bound.as_millis()\n        ))),",
+  "replace": "        Err(_) => Err(ScmError::Api {\n            status: 408,\n            detail: format!(\"{what} exceeded its {} ms HTTP bound\", bound.as_millis()),\n        }),",
+  "gate": "cargo test -p faktor-scm --lib token::tests::a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound",
+  "expect": "FAILED",
+  "note": "Downgrading the stalled-attempt timeout to an Api error breaks the typed Transport contract.",
+  "capabilities": [
+    "scm.token_bounds"
+  ]
+}

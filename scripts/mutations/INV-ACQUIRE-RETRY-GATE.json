@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACQUIRE-RETRY-GATE",
+  "file": "crates/acquire/src/quota.rs",
+  "find": "    pub fn record_retry_after(&mut self, retry_after_ms: u64, now_ms: u64) {\n        let at = now_ms.saturating_add(retry_after_ms);\n        self.retry_at_ms = Some(at.min(self.reset_at_ms()).max(now_ms));\n    }",
+  "replace": "    pub fn record_retry_after(&mut self, retry_after_ms: u64, now_ms: u64) {\n        let at = now_ms.saturating_add(retry_after_ms);\n        self.retry_at_ms = Some(at.max(now_ms));\n    }",
+  "gate": "cargo test -p faktor-acquire --lib quota::tests::retry_after_is_clamped_to_the_window_reset",
+  "expect": "FAILED",
+  "note": "Removing the reset clamp lets retry-after exceed the window reset.",
+  "capabilities": [
+    "acquire.retry_gate"
+  ]
+}

@@ -230,7 +230,7 @@ run_canonical_gates() { # runs the canonical list; 0 all pass, 1 any fail
 extract_ci_gate_commands() { # workflow_yaml lane -> unique cargo gate commands
     awk -v lane="$2" '
         /^  - name: / { in_lane = ($3 == lane); next }
-        in_lane && /^      - cargo (fmt|check|clippy|test)( |$)/ { sub(/^      - /, ""); print }
+        in_lane && /^      - cargo (fmt|check|clippy|test)( |$)/ && !/\|/ { sub(/^      - /, ""); print }
     ' "$1" 2>/dev/null | sed 's/[[:space:]]*$//' | sort -u
 }
 

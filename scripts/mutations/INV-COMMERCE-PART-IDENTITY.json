@@ -1,0 +1,12 @@
+{
+  "id": "INV-COMMERCE-PART-IDENTITY",
+  "file": "crates/commerce/src/identity.rs",
+  "find": "        if raw.len() > MAX_PART_NUMBER_BYTES {\n            return Err(PartNumberError::TooLong {\n                max: MAX_PART_NUMBER_BYTES,\n                actual: raw.len(),\n            });\n        }",
+  "replace": "        if false {\n            return Err(PartNumberError::TooLong {\n                max: MAX_PART_NUMBER_BYTES,\n                actual: raw.len(),\n            });\n        }",
+  "gate": "cargo test -p faktor-commerce --lib identity::tests::hostile_part_numbers_are_typed_errors",
+  "expect": "FAILED",
+  "note": "Disabling the size refusal lets hostile part numbers normalize.",
+  "capabilities": [
+    "commerce.part_identity"
+  ]
+}

@@ -1231,3 +1231,288 @@ mutation_command = "node scripts/mutation-run.mjs INV-WATCHER-WORKER-LIVENESS"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACP-CONTENT-LENGTH-CORPUS"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (acp_content_length_corpus_matches_every_outcome)."
+owner = "crates/acp framing corpus"
+authority = "planted mutation scripts/mutations/INV-ACP-CONTENT-LENGTH-CORPUS.json"
+script_check = ""
+unit_test = "acp_content_length_corpus_matches_every_outcome"
+production_wiring = "acp_content_length_corpus_matches_every_outcome"
+fault = ""
+mutation_witness = "acp_content_length_corpus_matches_every_outcome"
+mutation_command = "node scripts/mutation-run.mjs INV-ACP-CONTENT-LENGTH-CORPUS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACP-WRITER-BACKPRESSURE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (d_writer_queue_full_is_bounded_and_cancel_lane_lands)."
+owner = "crates/acp writer backpressure"
+authority = "planted mutation scripts/mutations/INV-ACP-WRITER-BACKPRESSURE.json"
+script_check = ""
+unit_test = "d_writer_queue_full_is_bounded_and_cancel_lane_lands"
+production_wiring = "d_writer_queue_full_is_bounded_and_cancel_lane_lands"
+fault = ""
+mutation_witness = "d_writer_queue_full_is_bounded_and_cancel_lane_lands"
+mutation_command = "node scripts/mutation-run.mjs INV-ACP-WRITER-BACKPRESSURE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-LSP-READER-BOUNDS"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (stderr_flood_is_drained_bounded_and_never_blocks)."
+owner = "crates/lsp reader ring bounds"
+authority = "planted mutation scripts/mutations/INV-LSP-READER-BOUNDS.json"
+script_check = ""
+unit_test = "stderr_flood_is_drained_bounded_and_never_blocks"
+production_wiring = "stderr_flood_is_drained_bounded_and_never_blocks"
+fault = ""
+mutation_witness = "stderr_flood_is_drained_bounded_and_never_blocks"
+mutation_command = "node scripts/mutation-run.mjs INV-LSP-READER-BOUNDS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MCP-SPAWN-LIFECYCLE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock)."
+owner = "crates/mcp spawn lifecycle"
+authority = "planted mutation scripts/mutations/INV-MCP-SPAWN-LIFECYCLE.json"
+script_check = ""
+unit_test = "a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock"
+production_wiring = "a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock"
+fault = ""
+mutation_witness = "a_child_that_stops_draining_is_delivery_unknown_not_a_deadlock"
+mutation_command = "node scripts/mutation-run.mjs INV-MCP-SPAWN-LIFECYCLE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-PROCESS-CLIENT"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (process_client_round_trips_the_typed_frame)."
+owner = "crates/semantic process client"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-PROCESS-CLIENT.json"
+script_check = ""
+unit_test = "process_client_round_trips_the_typed_frame"
+production_wiring = "process_client_round_trips_the_typed_frame"
+fault = ""
+mutation_witness = "process_client_round_trips_the_typed_frame"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-PROCESS-CLIENT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-WATCHDOG"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (process_client_watchdog_is_typed_provider_timeout_and_retires_the_child)."
+owner = "crates/semantic process watchdog"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-WATCHDOG.json"
+script_check = ""
+unit_test = "process_client_watchdog_is_typed_provider_timeout_and_retires_the_child"
+production_wiring = "process_client_watchdog_is_typed_provider_timeout_and_retires_the_child"
+fault = ""
+mutation_witness = "process_client_watchdog_is_typed_provider_timeout_and_retires_the_child"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-WATCHDOG"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-FALLBACK"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (fallback_serves_every_operation_when_no_provider_is_registered)."
+owner = "crates/semantic fallback provider"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-FALLBACK.json"
+script_check = ""
+unit_test = "fallback_serves_every_operation_when_no_provider_is_registered"
+production_wiring = "fallback_serves_every_operation_when_no_provider_is_registered"
+fault = ""
+mutation_witness = "fallback_serves_every_operation_when_no_provider_is_registered"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-FALLBACK"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SCM-WEBHOOK-CLAIMS"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (store::tests::acknowledged_webhook_claim_survives_sigkill_and_reopen)."
+owner = "crates/scm webhook claims"
+authority = "planted mutation scripts/mutations/INV-SCM-WEBHOOK-CLAIMS.json"
+script_check = ""
+unit_test = "acknowledged_webhook_claim_survives_sigkill_and_reopen"
+production_wiring = "acknowledged_webhook_claim_survives_sigkill_and_reopen"
+fault = ""
+mutation_witness = "acknowledged_webhook_claim_survives_sigkill_and_reopen"
+mutation_command = "node scripts/mutation-run.mjs INV-SCM-WEBHOOK-CLAIMS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SCM-TOKEN-BOUNDS"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (token::tests::a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound)."
+owner = "crates/scm http token bounds"
+authority = "planted mutation scripts/mutations/INV-SCM-TOKEN-BOUNDS.json"
+script_check = ""
+unit_test = "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound"
+production_wiring = "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound"
+fault = ""
+mutation_witness = "a_stalled_scm_http_attempt_is_a_typed_timeout_at_the_bound"
+mutation_command = "node scripts/mutation-run.mjs INV-SCM-TOKEN-BOUNDS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CLOUD-RESTORE-VERIFICATION"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (durability::tests::a_corrupted_backup_fails_restore_verification_and_is_never_adopted)."
+owner = "crates/cloud restore verification"
+authority = "planted mutation scripts/mutations/INV-CLOUD-RESTORE-VERIFICATION.json"
+script_check = ""
+unit_test = "a_corrupted_backup_fails_restore_verification_and_is_never_adopted"
+production_wiring = "a_corrupted_backup_fails_restore_verification_and_is_never_adopted"
+fault = ""
+mutation_witness = "a_corrupted_backup_fails_restore_verification_and_is_never_adopted"
+mutation_command = "node scripts/mutation-run.mjs INV-CLOUD-RESTORE-VERIFICATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CLOUD-MIGRATION-CLAIM"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (durability::tests::migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema)."
+owner = "crates/cloud migration claim"
+authority = "planted mutation scripts/mutations/INV-CLOUD-MIGRATION-CLAIM.json"
+script_check = ""
+unit_test = "migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema"
+production_wiring = "migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema"
+fault = ""
+mutation_witness = "migration_backup_refuses_a_version_claim_that_does_not_match_the_live_schema"
+mutation_command = "node scripts/mutation-run.mjs INV-CLOUD-MIGRATION-CLAIM"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-COMMERCE-PART-IDENTITY"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (identity::tests::hostile_part_numbers_are_typed_errors)."
+owner = "crates/commerce part identity"
+authority = "planted mutation scripts/mutations/INV-COMMERCE-PART-IDENTITY.json"
+script_check = ""
+unit_test = "hostile_part_numbers_are_typed_errors"
+production_wiring = "hostile_part_numbers_are_typed_errors"
+fault = ""
+mutation_witness = "hostile_part_numbers_are_typed_errors"
+mutation_command = "node scripts/mutation-run.mjs INV-COMMERCE-PART-IDENTITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-COMMERCE-DIGEST-STABILITY"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (bom::tests::bom_digest_is_order_sensitive_and_deterministic)."
+owner = "crates/commerce bom digest"
+authority = "planted mutation scripts/mutations/INV-COMMERCE-DIGEST-STABILITY.json"
+script_check = ""
+unit_test = "bom_digest_is_order_sensitive_and_deterministic"
+production_wiring = "bom_digest_is_order_sensitive_and_deterministic"
+fault = ""
+mutation_witness = "bom_digest_is_order_sensitive_and_deterministic"
+mutation_command = "node scripts/mutation-run.mjs INV-COMMERCE-DIGEST-STABILITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACQUIRE-PLANNER"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (tests::planner::capability_credentials_health_and_quota_each_disqualify_the_api)."
+owner = "crates/acquire planner"
+authority = "planted mutation scripts/mutations/INV-ACQUIRE-PLANNER.json"
+script_check = ""
+unit_test = "capability_credentials_health_and_quota_each_disqualify_the_api"
+production_wiring = "capability_credentials_health_and_quota_each_disqualify_the_api"
+fault = ""
+mutation_witness = "capability_credentials_health_and_quota_each_disqualify_the_api"
+mutation_command = "node scripts/mutation-run.mjs INV-ACQUIRE-PLANNER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACQUIRE-RETRY-GATE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (quota::tests::retry_after_is_clamped_to_the_window_reset)."
+owner = "crates/acquire retry gate"
+authority = "planted mutation scripts/mutations/INV-ACQUIRE-RETRY-GATE.json"
+script_check = ""
+unit_test = "retry_after_is_clamped_to_the_window_reset"
+production_wiring = "retry_after_is_clamped_to_the_window_reset"
+fault = ""
+mutation_witness = "retry_after_is_clamped_to_the_window_reset"
+mutation_command = "node scripts/mutation-run.mjs INV-ACQUIRE-RETRY-GATE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-LAUNCH-ROLLBACK"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (rollback_launch_kills_the_spawned_child)."
+owner = "crates/browser launch rollback"
+authority = "planted mutation scripts/mutations/INV-BROWSER-LAUNCH-ROLLBACK.json"
+script_check = ""
+unit_test = "rollback_launch_kills_the_spawned_child"
+production_wiring = "rollback_launch_kills_the_spawned_child"
+fault = ""
+mutation_witness = "rollback_launch_kills_the_spawned_child"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-LAUNCH-ROLLBACK"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-SHUTDOWN-ORPHANS"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (shutdown_instance_kills_the_child_and_leaves_no_orphan)."
+owner = "crates/browser shutdown orphan reaping"
+authority = "planted mutation scripts/mutations/INV-BROWSER-SHUTDOWN-ORPHANS.json"
+script_check = ""
+unit_test = "shutdown_instance_kills_the_child_and_leaves_no_orphan"
+production_wiring = "shutdown_instance_kills_the_child_and_leaves_no_orphan"
+fault = ""
+mutation_witness = "shutdown_instance_kills_the_child_and_leaves_no_orphan"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-SHUTDOWN-ORPHANS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-INTERCEPTION"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (blocked_resource_types_are_dropped_even_on_first_party_hosts)."
+owner = "crates/browser request interception"
+authority = "planted mutation scripts/mutations/INV-BROWSER-INTERCEPTION.json"
+script_check = ""
+unit_test = "blocked_resource_types_are_dropped_even_on_first_party_hosts"
+production_wiring = "blocked_resource_types_are_dropped_even_on_first_party_hosts"
+fault = ""
+mutation_witness = "blocked_resource_types_are_dropped_even_on_first_party_hosts"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-INTERCEPTION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-CAPTURE-CLEANUP"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation)."
+owner = "crates/browser page capture cleanup"
+authority = "planted mutation scripts/mutations/INV-BROWSER-CAPTURE-CLEANUP.json"
+script_check = ""
+unit_test = "lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation"
+production_wiring = "lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation"
+fault = ""
+mutation_witness = "lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-CAPTURE-CLEANUP"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]

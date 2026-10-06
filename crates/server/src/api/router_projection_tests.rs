@@ -30,6 +30,28 @@ async fn native_projection_idle_session_shape_auth_and_errors() {
         assert_eq!(resp.status(), 401, "{path}");
     }
 
+    // Runtime tool capability metadata (audit 14): the readOnlyShell
+    // availability rides /capabilities and mirrors the build fact.
+    let resp = client
+        .get(format!("{base}/capabilities"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["readOnlyShell"]["available"],
+        faktor_sandbox::filesystem_backend_available(),
+        "readOnlyShell.available must mirror the sandbox build fact: {body}"
+    );
+    if !faktor_sandbox::filesystem_backend_available() {
+        assert_eq!(
+            body["readOnlyShell"]["reason"],
+            "os_filesystem_confinement_unavailable"
+        );
+    }
+
     // Idle projection: row state, no task data yet.
     let resp = client
         .get(format!("{base}/session/{sid}/projection"))

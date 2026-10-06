@@ -1,0 +1,12 @@
+{
+  "id": "INV-CLOUD-RESTORE-VERIFICATION",
+  "file": "crates/cloud/src/durability.rs",
+  "find": "    let issues = integrity_check(&conn, true).map_err(fail)?;\n    if !issues.is_empty() {\n        return Err(fail(CloudStoreError::Backend(format!(\n            \"integrity_check {}\",\n            issues.join(\"; \")\n        ))));\n    }",
+  "replace": "    if true {\n        return Ok(());\n    }",
+  "gate": "cargo test -p faktor-cloud --lib durability::tests::a_corrupted_backup_fails_restore_verification_and_is_never_adopted",
+  "expect": "FAILED",
+  "note": "Short-circuiting restore verification accepts a corrupted backup.",
+  "capabilities": [
+    "cloud.restore_verification"
+  ]
+}

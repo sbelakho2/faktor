@@ -29,13 +29,14 @@
 //   selftest   synthetic violation corpus + the real manifest must pass.
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { discover } from './discover-capabilities.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const COVERAGE_FILE = join(ROOT, 'tests/invariant-coverage.json');
+const CRATE_SNAPSHOT_FILE = join(ROOT, 'tests/production-crates.json');
 const REGISTRY_FILE = join(ROOT, 'tests/invariants.toml');
 const MUTATIONS_DIR = join(ROOT, 'scripts/mutations');
 const SURFACES = ['apps/vscode', 'apps/jetbrains'];
@@ -350,7 +351,8 @@ function mentionsCrate(invariant, crate) {
   return [crate, `crates/${short}`, `apps/${short}`].some((needle) => haystack.includes(needle));
 }
 
-function load() {
+/** Regenerate the crate snapshot from cargo metadata (dev/refresh mode). */
+export function refreshCrateSnapshot() {
   const metadata = JSON.parse(
     execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], {
       cwd: ROOT,
@@ -358,8 +360,32 @@ function load() {
       maxBuffer: 64 * 1024 * 1024,
     }),
   );
+  const crates = productionCrates(metadata);
+  writeFileSync(
+    CRATE_SNAPSHOT_FILE,
+    `${JSON.stringify(
+      {
+        schema: 'faktor-production-crates/v1',
+        crates,
+        note: 'Generated from `cargo metadata --no-deps` local non-test packages; freshness is enforced by scripts/certification/check-capability-tests-compiled.py in a cargo-bearing lane, so the node-only certificate lane can validate capability completeness without cargo.',
+      },
+      null,
+      1,
+    )}\n`,
+  );
+  return crates;
+}
+
+function load() {
+  // The certificate lane is node-only (no cargo): the production crate list
+  // is a checked-in snapshot mechanically verified against `cargo metadata`
+  // by check-capability-tests-compiled.py in the cargo-bearing linux lane.
+  const snapshot = JSON.parse(readFileSync(CRATE_SNAPSHOT_FILE, 'utf8'));
+  if (!Array.isArray(snapshot.crates) || snapshot.crates.length === 0) {
+    throw new Error('tests/production-crates.json has no crates; run --refresh-crates');
+  }
   return {
-    crates: productionCrates(metadata),
+    crates: snapshot.crates,
     invariants: parseInvariants(readFileSync(REGISTRY_FILE, 'utf8')),
     coverage: JSON.parse(readFileSync(COVERAGE_FILE, 'utf8')),
     discovered: discover(ROOT),
@@ -513,6 +539,11 @@ const isMain = process.argv[1] && process.argv[1].endsWith('check-invariant-cove
 if (isMain) {
   const args = process.argv.slice(2);
   if (args.includes('selftest')) process.exit(selftest());
+  if (args.includes('--refresh-crates')) {
+    const crates = refreshCrateSnapshot();
+    console.log(`check-invariant-coverage: refreshed ${crates.length} production crates`);
+    process.exit(0);
+  }
   if (args.includes('--check')) process.exit(run('--check'));
   if (args.includes('--release')) process.exit(run('--release'));
   console.error('usage: check-invariant-coverage.mjs --check | --release | selftest');

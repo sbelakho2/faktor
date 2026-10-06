@@ -1,0 +1,12 @@
+{
+  "id": "INV-SEMANTIC-FALLBACK",
+  "file": "crates/semantic/src/fallback.rs",
+  "find": "    fn capabilities(&self) -> SemanticCapabilities {\n        SemanticCapabilities::ALL\n    }",
+  "replace": "    fn capabilities(&self) -> SemanticCapabilities {\n        SemanticCapabilities::NONE\n    }",
+  "gate": "cargo test -p faktor-semantic --lib fallback_serves_every_operation_when_no_provider_is_registered",
+  "expect": "FAILED",
+  "note": "Claiming NONE makes the fallback's every-operation support loop fail.",
+  "capabilities": [
+    "semantic.fallback"
+  ]
+}

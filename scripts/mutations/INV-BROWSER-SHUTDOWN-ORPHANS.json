@@ -1,0 +1,12 @@
+{
+  "id": "INV-BROWSER-SHUTDOWN-ORPHANS",
+  "file": "crates/browser/src/manager.rs",
+  "find": "        let _ = instance.launched.kill(&self.supervisor, KILL_GRACE_MS);\n        let _ = instance.client.close().await;\n        instance.broker.shutdown().await;",
+  "replace": "        instance.launched.disarm();\n        let _ = instance.client.close().await;\n        instance.broker.shutdown().await;",
+  "gate": "cargo test -p faktor-browser --lib shutdown_instance_kills_the_child_and_leaves_no_orphan",
+  "expect": "FAILED",
+  "note": "Disarming instead of killing leaves an orphan child after shutdown.",
+  "capabilities": [
+    "browser.shutdown_orphans"
+  ]
+}

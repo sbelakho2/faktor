@@ -1,0 +1,12 @@
+{
+  "id": "INV-SEMANTIC-PROCESS-CLIENT",
+  "file": "crates/semantic/src/external.rs",
+  "find": "    let mut frame = Vec::with_capacity(body.len() + 32);\n    frame.extend_from_slice(format!(\"Content-Length: {}\\r\\n\\r\\n\", body.len()).as_bytes());\n    frame.extend_from_slice(&body);",
+  "replace": "    let mut frame = Vec::with_capacity(body.len() + 32);\n    frame.extend_from_slice(format!(\"Content-Length: {}\\r\\n\\r\\n\", body.len() + 1).as_bytes());\n    frame.extend_from_slice(&body);",
+  "gate": "cargo test -p faktor-semantic --lib process_client_round_trips_the_typed_frame",
+  "expect": "FAILED",
+  "note": "A one-byte-too-large declared length breaks the byte-exact round trip.",
+  "capabilities": [
+    "semantic.process_client"
+  ]
+}
