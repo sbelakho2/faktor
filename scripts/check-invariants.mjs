@@ -33,7 +33,7 @@
 // release-critical entry without one already fails before this mode runs.
 
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
@@ -674,6 +674,26 @@ function main() {
     );
     const scratch = mkdtempSync(join(tmpdir(), 'faktor-mutation-campaign-'));
     cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
+    // Gate support trees that must not be copied (multi-GB): the built CLI
+    // the JetBrains gradle smokes execute, and the VS Code extension's
+    // installed dev dependencies the TS loader requires.
+    const cliSupport = join(root, 'target', 'debug', 'faktor-cli');
+    if (existsSync(cliSupport)) {
+      mkdirSync(join(scratch, 'target', 'debug'), { recursive: true });
+      try {
+        symlinkSync(cliSupport, join(scratch, 'target', 'debug', 'faktor-cli'));
+      } catch {
+        // A missing link makes the affected control gate fail loudly.
+      }
+    }
+    const modulesSupport = join(root, 'apps', 'vscode', 'node_modules');
+    if (existsSync(modulesSupport)) {
+      try {
+        symlinkSync(modulesSupport, join(scratch, 'apps', 'vscode', 'node_modules'));
+      } catch {
+        // As above.
+      }
+    }
     const mutationEnv = {
       ...process.env,
       FAKTOR_MUTATION_ROOT: scratch,

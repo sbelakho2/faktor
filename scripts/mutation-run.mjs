@@ -45,7 +45,7 @@
 // live); 2 usage or spec errors.
 
 import { spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -69,6 +69,35 @@ function excludedUnder(root, path) {
 }
 
 /**
+ * Provision the scratch copy with the two SUPPORT trees gates need but that
+ * must never be copied (multi-GB, machine-specific): the built CLI binary
+ * (the JetBrains gradle smokes execute it) and the VS Code extension's
+ * installed dev dependencies (the TS loader `require`s them). Both are
+ * symlinked back to the real checkout; cargo still compiles into the
+ * dedicated mutation target dir, never this tree.
+ */
+function linkGateSupports(sourceRoot, scratch) {
+  const cli = join(sourceRoot, 'target', 'debug', 'faktor-cli');
+  if (existsSync(cli)) {
+    mkdirSync(join(scratch, 'target', 'debug'), { recursive: true });
+    try {
+      symlinkSync(cli, join(scratch, 'target', 'debug', 'faktor-cli'));
+    } catch {
+      // Existing link or unsupported platform: the gradle gates will fail
+      // their control run loudly rather than run a stale mutant.
+    }
+  }
+  const modules = join(sourceRoot, 'apps', 'vscode', 'node_modules');
+  if (existsSync(modules)) {
+    try {
+      symlinkSync(modules, join(scratch, 'apps', 'vscode', 'node_modules'));
+    } catch {
+      // As above: a missing dev-dependency tree is a control-gate failure.
+    }
+  }
+}
+
+/**
  * Prepare the scratch checkout when the campaign runner did not supply one:
  * a recursive copy of the CURRENT working tree (untracked files included, so
  * local verification sees exactly what the developer sees) minus build/VCS/
@@ -83,6 +112,7 @@ function prepareGateRoot() {
     recursive: true,
     filter: (source) => !excludedUnder(SCRIPT_ROOT, source),
   });
+  linkGateSupports(SCRIPT_ROOT, scratch);
   GATE_ROOT = scratch;
   GATE_ROOT_CLEANUP = () => rmSync(scratch, { recursive: true, force: true });
 }
