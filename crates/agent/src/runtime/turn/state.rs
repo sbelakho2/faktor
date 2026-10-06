@@ -2076,6 +2076,15 @@ impl AgentRuntime {
             session_id: Some(session.to_string()),
             task_id: None,
             operation_id: op_id.map(|o| o.to_string()),
+            // P1: the anchored session workspace, never the daemon cwd. A
+            // store failure here leaves the root None and the hook refuses
+            // typed (audit-only path).
+            workspace_root: self
+                .deps
+                .session
+                .resolve_workspace_root(session)
+                .ok()
+                .flatten(),
             payload,
         };
         if let faktor_hooks::HookVerdict::Deny { reason } = hooks.run(event, &input) {

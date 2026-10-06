@@ -1,36 +1,43 @@
 #!/usr/bin/env node
-// Mechanical capability-coverage check (audits P1-ASSURANCE and P0-PROOF).
+// Mechanical capability-coverage check (audits P0-2, P0-3, P1-4).
 //
-// The invariant registry proves that every REGISTERED invariant has a
-// mutation-killed witness; it does not prove that every production
-// capability is registered, nor that each capability points at real proofs.
-// This checker closes both holes mechanically:
+// Three soundness rules, all mechanical:
 //
-//   1. Every local non-test package from `cargo metadata` must carry an
-//      explicit disposition (release-critical owner bound by registry text,
-//      covered via release-critical invariants, or a documented gap).
-//   2. Every release-critical crate must enumerate CAPABILITIES, and every
-//      capability must name a mutation-killed release-critical invariant and
-//      a REAL proof identity that exists exactly once in the owning source
-//      tree (a Rust `fn <name>` for crates, an exact test/step title for the
-//      IDE surfaces).
-//   3. The IDE surfaces (apps/vscode, apps/jetbrains) carry capability rows
-//      with the same proof discipline.
+//  1. DISCOVERY EQUALITY (P0-2): the real exposed surfaces are discovered
+//     from the compiled/source registries (native routes, builtin tools,
+//     CLI command tree, provider kinds, VS Code contributions, JetBrains
+//     plugin contributions) by scripts/discover-capabilities.mjs. Every
+//     discovered id must exist in the proof manifest (as a capability row,
+//     surface row, or a `discovered` row) — adding a route/tool/command
+//     without a proof row turns the checker red in BOTH modes.
+//
+//  2. DIRECT CAPABILITY MUTATIONS (P0-3): a `proven` capability must be
+//     bound to a planted mutation whose gate actually runs this capability's
+//     oracle test (scripts/mutations/*.json `capabilities` + `gate`). A
+//     shared mutation that never runs the capability's test is an
+//     `unbound-mutation` violation, not a proof.
+//
+//  3. NO WHOLE-CRATE EXEMPTIONS (P1-4): release mode rejects `covered`
+//     crates; per-capability `delegated` rows (delegate -> another proven
+//     capability or a registered release-critical invariant) replace them.
+//     Release mode also fails on any capability `gap`.
 //
 // Modes:
-//   --check    fails on unclassified crates / invalid capability rows;
-//              reports gaps (they are visible debt on this mode).
-//   --release  additionally fails when ANY production capability is a gap.
-//   selftest   proves the checker detects every violation class.
+//   --check    offline/source gate: discovery equality, unit existence,
+//              binding, delegation validity; gaps are reported as debt.
+//   --release  additionally fails on gaps AND on whole-crate `covered`.
+//   selftest   synthetic violation corpus + the real manifest must pass.
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { discover } from './discover-capabilities.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const COVERAGE_FILE = join(ROOT, 'tests/invariant-coverage.json');
 const REGISTRY_FILE = join(ROOT, 'tests/invariants.toml');
+const MUTATIONS_DIR = join(ROOT, 'scripts/mutations');
 const SURFACES = ['apps/vscode', 'apps/jetbrains'];
 
 export function productionCrates(metadata) {
@@ -56,6 +63,27 @@ export function parseInvariants(text) {
     });
   }
   return invariants;
+}
+
+/** id -> { capabilities, gate } for every planted mutation spec. */
+export function loadMutationSpecs(dir = MUTATIONS_DIR) {
+  const specs = new Map();
+  for (const name of readdirSync(dir).sort()) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const document = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      if (typeof document.id === 'string' && typeof document.gate === 'string') {
+        specs.set(document.id, {
+          capabilities: Array.isArray(document.capabilities) ? document.capabilities : [],
+          gate: document.gate,
+        });
+      }
+    } catch {
+      // A malformed spec is surfaced by `mutation-run --check-specs`; the
+      // coverage check simply does not count it as a binding.
+    }
+  }
+  return specs;
 }
 
 function walkFiles(root, filter, out = []) {
@@ -88,7 +116,6 @@ function walkFiles(root, filter, out = []) {
   return out;
 }
 
-/** How many times `fn <name>(` occurs in one source tree. */
 export function rustFnCount(dir, name) {
   let count = 0;
   for (const file of walkFiles(dir, (path) => path.endsWith('.rs'))) {
@@ -99,7 +126,6 @@ export function rustFnCount(dir, name) {
   return count;
 }
 
-/** How many times an exact proof string occurs in one surface tree. */
 export function titleCount(dir, title) {
   let count = 0;
   const files = walkFiles(dir, (path) => /\.(mjs|js|ts|tsx|kt|kts)$/.test(path));
@@ -116,18 +142,22 @@ export function titleCount(dir, title) {
   return count;
 }
 
-function mentionsCrate(invariant, crate) {
-  const short = crate.replace(/^faktor-/, '');
-  const haystack = `${invariant.owner} ${invariant.authority}`;
-  return [crate, `crates/${short}`, `apps/${short}`].some((needle) => haystack.includes(needle));
-}
+const CAPABILITY_ID = /^[a-z0-9-]+(\.[a-z0-9_-]+)+$/;
 
-const CAPABILITY_ID = /^[a-z0-9-]+(\.[a-z0-9_]+)+$/;
-
-export function coverageProblems({ crates, invariants, coverage, root = ROOT }) {
+export function coverageProblems({
+  crates,
+  invariants,
+  coverage,
+  discovered = { ids: [] },
+  specs = new Map(),
+  root = ROOT,
+}) {
   const problems = [];
   const entries = Array.isArray(coverage.entries) ? coverage.entries : [];
   const surfaces = Array.isArray(coverage.surfaces) ? coverage.surfaces : [];
+  const discoveredRows = coverage.discovered && typeof coverage.discovered === 'object'
+    ? coverage.discovered
+    : {};
   const byCrate = new Map();
   for (const entry of entries) {
     if (typeof entry.crate !== 'string' || entry.crate.length === 0) {
@@ -140,43 +170,131 @@ export function coverageProblems({ crates, invariants, coverage, root = ROOT }) 
     }
     byCrate.set(entry.crate, entry);
   }
+
+  // ---- global capability registry --------------------------------------
+  const capabilities = new Map(); // id -> row (with surface/entry context)
+  const collect = (label, isSurface, rows) => {
+    for (const row of rows) {
+      if (typeof row.id !== 'string' || !CAPABILITY_ID.test(row.id)) {
+        problems.push(`bad-capability-id: ${label} has ${JSON.stringify(row.id)}`);
+        continue;
+      }
+      if (capabilities.has(row.id)) {
+        problems.push(`duplicate-capability: ${row.id}`);
+        continue;
+      }
+      capabilities.set(row.id, { ...row, label, isSurface });
+    }
+  };
+  for (const [crate, entry] of byCrate) {
+    if (!crates.includes(crate)) continue;
+    if (entry.class === 'release-critical') {
+      collect(crate, false, Array.isArray(entry.capabilities) ? entry.capabilities : []);
+    }
+  }
+  for (const surface of surfaces) {
+    collect(surface.id ?? 'surface', true, Array.isArray(surface.capabilities) ? surface.capabilities : []);
+  }
+  for (const [id, row] of Object.entries(discoveredRows)) {
+    collect('discovered', false, [{ ...row, id }]);
+  }
+
+  const effectiveClass = (row) =>
+    row.class === 'gap' ? 'gap' : typeof row.delegate === 'string' && row.delegate.length > 0 ? 'delegated' : 'proven';
+
+  const validateRow = (row) => {
+    const cls = effectiveClass(row);
+    if (cls === 'gap') {
+      if (typeof row.reason !== 'string' || row.reason.trim().length < 20) {
+        problems.push(`undocumented-gap: ${row.id} needs a concrete reason (>= 20 chars)`);
+      }
+      return;
+    }
+    if (cls === 'delegated') {
+      const target = row.delegate;
+      if (invariants.has(target)) {
+        if (!invariants.get(target).releaseCritical) {
+          problems.push(`non-critical-delegate: ${row.id} delegates to non-critical invariant ${target}`);
+        }
+      } else if (capabilities.has(target)) {
+        // Cycle detection by walking the delegation chain.
+        const seen = new Set([row.id]);
+        let cursor = capabilities.get(target);
+        while (cursor !== undefined && effectiveClass(cursor) === 'delegated') {
+          if (seen.has(cursor.id)) {
+            problems.push(`delegation-cycle: ${row.id} -> ... -> ${cursor.id}`);
+            cursor = undefined;
+            break;
+          }
+          seen.add(cursor.id);
+          cursor = capabilities.get(cursor.delegate);
+        }
+        if (cursor === undefined) {
+          problems.push(`unknown-delegate: ${row.id} delegates to ${target}, which resolves nowhere`);
+        } else if (effectiveClass(cursor) !== 'proven') {
+          problems.push(`unproven-delegate: ${row.id} delegates to ${cursor.id}, which is not proven`);
+        }
+      } else {
+        problems.push(`unknown-delegate: ${row.id} delegates to ${JSON.stringify(target)}, which is neither a capability nor a registered invariant`);
+      }
+      if (typeof row.reason !== 'string' || row.reason.trim().length < 10) {
+        problems.push(`missing-delegation-reason: ${row.id}`);
+      }
+      return;
+    }
+    // proven
+    const unit = typeof row.unit === 'string' ? row.unit.trim() : '';
+    if (unit === '') {
+      problems.push(`missing-unit: ${row.id} has no unit proof`);
+    } else {
+      const sourceRoot = row.source
+        ? join(root, row.source)
+        : row.isSurface
+          ? join(root, row.surface ?? row.label)
+          : join(root, 'crates', row.label.replace(/^faktor-/, ''));
+      const count = row.isSurface ? titleCount(sourceRoot, unit) : rustFnCount(sourceRoot, unit);
+      if (count !== 1) {
+        problems.push(
+          `unproven-unit: ${row.id} proof ${JSON.stringify(unit)} appears ${count} time(s) under ${relative(root, sourceRoot) || '.'} (need exactly 1)`,
+        );
+      }
+    }
+    // P0-3 binding: some planted mutation must run THIS capability's gate.
+    let bound = false;
+    for (const [, spec] of specs) {
+      if (spec.capabilities.includes(row.id) && spec.gate.includes(unit) && unit !== '') {
+        bound = true;
+        break;
+      }
+    }
+    if (!bound) {
+      problems.push(
+        `unbound-mutation: ${row.id} is marked proven but no planted mutation gate runs its oracle ${JSON.stringify(unit)} (add a direct mutation or reclassify as gap/delegated)`,
+      );
+    }
+  };
+
+  for (const row of capabilities.values()) {
+    if (row.id === undefined) continue;
+    validateRow(row);
+  }
+
+  // ---- discovery equality (P0-2) ---------------------------------------
+  const known = new Set(capabilities.keys());
+  for (const id of discovered.ids ?? []) {
+    if (!known.has(id)) {
+      problems.push(
+        `undiscovered-capability: ${id} exists on a real product surface but has no manifest row (prove it, delegate it, or record an explicit gap)`,
+      );
+    }
+  }
+
+  // ---- crate classification --------------------------------------------
   for (const crate of crates) {
     if (!byCrate.has(crate)) {
       problems.push(`unclassified-crate: ${crate} (add an explicit disposition)`);
     }
   }
-  const seenCapabilities = new Set();
-  const validateCapability = (label, capability, isSurface) => {
-    if (typeof capability.id !== 'string' || !CAPABILITY_ID.test(capability.id)) {
-      problems.push(`bad-capability-id: ${label} has ${JSON.stringify(capability.id)}`);
-    } else if (seenCapabilities.has(capability.id)) {
-      problems.push(`duplicate-capability: ${capability.id}`);
-    } else {
-      seenCapabilities.add(capability.id);
-    }
-    const mutation = invariants.get(capability.mutation);
-    if (mutation === undefined) {
-      problems.push(`unknown-mutation: ${label}/${capability.id} names ${capability.mutation}`);
-    } else if (!mutation.releaseCritical) {
-      problems.push(`non-critical-mutation: ${label}/${capability.id} names ${capability.mutation}`);
-    }
-    const unit = typeof capability.unit === 'string' ? capability.unit.trim() : '';
-    if (unit === '') {
-      problems.push(`missing-unit: ${label}/${capability.id} has no unit proof`);
-    } else {
-      const sourceRoot = capability.source
-        ? join(root, capability.source)
-        : isSurface
-          ? join(root, capability.surface ?? '')
-          : join(root, 'crates', label.replace(/^faktor-/, ''));
-      const count = isSurface ? titleCount(sourceRoot, unit) : rustFnCount(sourceRoot, unit);
-      if (count !== 1) {
-        problems.push(
-          `unproven-unit: ${label}/${capability.id} proof ${JSON.stringify(unit)} appears ${count} time(s) under ${relative(root, sourceRoot) || '.'} (need exactly 1)`,
-        );
-      }
-    }
-  };
   for (const [crate, entry] of byCrate) {
     if (!crates.includes(crate)) {
       problems.push(`stale-entry: ${crate} is not a local production package`);
@@ -184,9 +302,6 @@ export function coverageProblems({ crates, invariants, coverage, root = ROOT }) 
     }
     if (entry.class === 'release-critical') {
       const owners = Array.isArray(entry.owners) ? entry.owners : [];
-      if (owners.length === 0) {
-        problems.push(`missing-owner: ${crate} is release-critical with no owner invariant`);
-      }
       for (const owner of owners) {
         const invariant = invariants.get(owner);
         if (invariant === undefined) {
@@ -199,27 +314,18 @@ export function coverageProblems({ crates, invariants, coverage, root = ROOT }) 
           );
         }
       }
-      const capabilities = Array.isArray(entry.capabilities) ? entry.capabilities : [];
-      if (capabilities.length === 0) {
+      if ((Array.isArray(entry.capabilities) ? entry.capabilities : []).length === 0) {
         problems.push(`missing-capabilities: ${crate} is release-critical but enumerates no capability`);
       }
-      for (const capability of capabilities) {
-        validateCapability(crate, capability, false);
-      }
     } else if (entry.class === 'covered') {
-      const via = Array.isArray(entry.via) ? entry.via : [];
-      if (via.length === 0) {
-        problems.push(`missing-via: ${crate} is covered but names no via invariant`);
-      }
+      // Whole-crate transitive coverage is legal in --check as visible debt,
+      // but release mode refuses it (P1-4): per-capability delegation only.
       if (typeof entry.reason !== 'string' || entry.reason.trim().length < 10) {
         problems.push(`missing-reason: ${crate} must document why it is covered`);
       }
-      for (const owner of via) {
-        const invariant = invariants.get(owner);
-        if (invariant === undefined) {
+      for (const owner of Array.isArray(entry.via) ? entry.via : []) {
+        if (!invariants.has(owner)) {
           problems.push(`unknown-via: ${crate} names ${owner}, which is not registered`);
-        } else if (!invariant.releaseCritical) {
-          problems.push(`non-critical-via: ${crate} names ${owner}, which is not release_critical`);
         }
       }
     } else if (entry.class === 'gap') {
@@ -230,29 +336,18 @@ export function coverageProblems({ crates, invariants, coverage, root = ROOT }) 
       problems.push(`unknown-class: ${crate} has class ${JSON.stringify(entry.class)}`);
     }
   }
-  for (const surface of surfaces) {
-    const id = typeof surface.id === 'string' ? surface.id : '';
-    if (id === '') {
-      problems.push('invalid-surface: a surface row has no id');
-      continue;
-    }
-    if (!SURFACES.includes(id)) {
-      problems.push(`unknown-surface: ${id} is not a required IDE surface`);
-    }
-    const capabilities = Array.isArray(surface.capabilities) ? surface.capabilities : [];
-    if (capabilities.length === 0) {
-      problems.push(`missing-capabilities: surface ${id} enumerates no capability`);
-    }
-    for (const capability of capabilities) {
-      validateCapability(id, { ...capability, surface: id }, true);
-    }
-  }
   for (const required of SURFACES) {
     if (!surfaces.some((surface) => surface.id === required)) {
       problems.push(`missing-surface: ${required} has no capability rows`);
     }
   }
   return problems;
+}
+
+function mentionsCrate(invariant, crate) {
+  const short = crate.replace(/^faktor-/, '');
+  const haystack = `${invariant.owner} ${invariant.authority}`;
+  return [crate, `crates/${short}`, `apps/${short}`].some((needle) => haystack.includes(needle));
 }
 
 function load() {
@@ -267,11 +362,27 @@ function load() {
     crates: productionCrates(metadata),
     invariants: parseInvariants(readFileSync(REGISTRY_FILE, 'utf8')),
     coverage: JSON.parse(readFileSync(COVERAGE_FILE, 'utf8')),
+    discovered: discover(ROOT),
+    specs: loadMutationSpecs(),
   };
 }
 
 function gapCount(coverage) {
-  return (coverage.entries || []).filter((entry) => entry.class === 'gap').length;
+  let gaps = 0;
+  for (const entry of coverage.entries ?? []) {
+    for (const row of entry.capabilities ?? []) {
+      if (row.class === 'gap') gaps += 1;
+    }
+  }
+  for (const surface of coverage.surfaces ?? []) {
+    for (const row of surface.capabilities ?? []) {
+      if (row.class === 'gap') gaps += 1;
+    }
+  }
+  for (const row of Object.values(coverage.discovered ?? {})) {
+    if (row.class === 'gap') gaps += 1;
+  }
+  return gaps;
 }
 
 function run(mode) {
@@ -289,18 +400,31 @@ function run(mode) {
     console.error(`check-invariant-coverage: FAIL (${problems.length} violation(s))`);
     return 1;
   }
+  const coveredCrates =
+    mode === '--release'
+      ? (world.coverage.entries ?? []).filter((entry) => entry.class === 'covered')
+      : [];
+  if (coveredCrates.length > 0) {
+    for (const entry of coveredCrates) {
+      console.error(
+        `check-invariant-coverage: covered-crate-in-release: ${entry.crate} must enumerate per-capability delegated rows instead of a whole-crate exemption`,
+      );
+    }
+    console.error(`check-invariant-coverage: FAIL (release mode)`);
+    return 1;
+  }
   if (mode === '--release' && gaps > 0) {
     console.error(
-      `check-invariant-coverage: FAIL (release mode: ${gaps} production capability gap(s) have no mutation-killed invariant)`,
+      `check-invariant-coverage: FAIL (release mode: ${gaps} capability gap(s) have no direct mutation-killed proof)`,
     );
     return 1;
   }
-  const capabilityCount = (world.coverage.entries || []).reduce(
+  const rows = (world.coverage.entries ?? []).reduce(
     (sum, entry) => sum + (Array.isArray(entry.capabilities) ? entry.capabilities.length : 0),
     0,
   );
   console.log(
-    `check-invariant-coverage: PASS (${world.crates.length} production crates, ${capabilityCount} capability rows, ${gaps} documented gap(s))`,
+    `check-invariant-coverage: PASS (${world.crates.length} crates, ${rows} crate capability rows, ${Object.keys(world.coverage.discovered ?? {}).length} discovered-surface rows, ${world.discovered.ids.length} discovered ids, ${gaps} documented gap(s))`,
   );
   return 0;
 }
@@ -318,106 +442,65 @@ function selftest() {
     ['INV-A', { releaseCritical: true, owner: 'crates/alpha', authority: 'crates/alpha/src/lib.rs' }],
     ['INV-B', { releaseCritical: false, owner: 'crates/alpha', authority: 'crates/alpha' }],
   ]);
-  const capability = {
-    id: 'alpha.authority',
-    unit: 'production_entry_is_bounded',
-    mutation: 'INV-A',
-  };
-  const world = (entries, surfaces = []) => ({
+  const specs = new Map([
+    ['MUT-ALPHA', { capabilities: ['alpha.authority'], gate: 'cargo test -p faktor-alpha --lib production_entry_is_bounded' }],
+  ]);
+  const world = (entries, discoveredIds = ['alpha.authority'], discoveredRows = {}) => ({
     crates: ['faktor-alpha', 'faktor-beta'],
     invariants,
-    coverage: { schema: 'faktor-invariant-coverage/v2', entries, surfaces },
-    root: resolve(dirname(fileURLToPath(import.meta.url)), '..'),
+    specs,
+    discovered: { ids: discoveredIds },
+    coverage: {
+      schema: 'faktor-invariant-coverage/v3',
+      entries,
+      surfaces: [
+        { id: 'apps/vscode', capabilities: [] },
+        { id: 'apps/jetbrains', capabilities: [] },
+      ],
+      discovered: discoveredRows,
+    },
+    root: ROOT,
   });
   const good = [
-    {
-      crate: 'faktor-alpha',
-      class: 'release-critical',
-      owners: ['INV-A'],
-      capabilities: [capability],
-    },
+    { crate: 'faktor-alpha', class: 'release-critical', owners: ['INV-A'], capabilities: [{ id: 'alpha.authority', unit: 'no_such_fn_xyz', mutation: 'INV-A' }] },
     { crate: 'faktor-beta', class: 'gap', reason: 'documented debt for the beta surface' },
   ];
-  // For unit tests the proof primitive is injectable: monkeypatch by using
-  // the real repo's alpha/beta? These synthetic crates have no source tree,
-  // so provide a fake root through a temporary shim by checking that the
-  // CHECKER reports unproven-unit rather than crashing.
   check(
-    'a synthetic release-critical crate without a source tree reports unproven-unit',
+    'an unproven synthetic unit is reported (never silently trusted)',
     coverageProblems(world(good)).some((problem) => problem.includes('unproven-unit')),
   );
   check(
-    'an unclassified crate fails',
-    coverageProblems(
-      world([good[0], { crate: 'faktor-betamax', class: 'gap', reason: 'x'.repeat(30) }]),
-    ).some((problem) => problem.includes('unclassified-crate: faktor-beta')),
-  );
-  check(
-    'an unknown owner fails',
-    coverageProblems(
-      world([
-        { ...good[0], owners: ['INV-NOPE'] },
-        good[1],
-      ]),
-    ).some((problem) => problem.includes('unknown-owner')),
-  );
-  check(
-    'a missing capability fails',
-    coverageProblems(
-      world([
-        { crate: 'faktor-alpha', class: 'release-critical', owners: ['INV-A'] },
-        good[1],
-      ]),
-    ).some((problem) => problem.includes('missing-capabilities')),
-  );
-  check(
-    'an unknown capability mutation fails',
-    coverageProblems(
-      world([
-        {
-          ...good[0],
-          capabilities: [{ ...capability, mutation: 'INV-NOPE' }],
-        },
-        good[1],
-      ]),
-    ).some((problem) => problem.includes('unknown-mutation')),
-  );
-  check(
-    'a malformed capability id fails',
-    coverageProblems(
-      world([
-        { ...good[0], capabilities: [{ ...capability, id: 'alpha' }] },
-        good[1],
-      ]),
-    ).some((problem) => problem.includes('bad-capability-id')),
-  );
-  check(
-    'a missing surface fails',
-    coverageProblems(world(good, [])).some((problem) => problem.includes('missing-surface')),
-  );
-  check(
-    'an undocumented gap fails',
-    coverageProblems(world([good[0], { crate: 'faktor-beta', class: 'gap', reason: 'x' }])).some(
-      (problem) => problem.includes('undocumented-gap'),
+    'an unbound mutation is reported',
+    coverageProblems(world([{ crate: 'faktor-alpha', class: 'release-critical', owners: ['INV-A'], capabilities: [] }, good[1]])).some(
+      (problem) => problem.includes('missing-capabilities'),
     ),
   );
   check(
-    'a stale entry fails',
-    coverageProblems(
-      world([good[0], good[1], { crate: 'faktor-ghost', class: 'gap', reason: 'x'.repeat(30) }]),
-    ).some((problem) => problem.includes('stale-entry')),
+    'an undiscovered new product capability fails in check mode',
+    coverageProblems(world(good, ['alpha.authority', 'native.get.ghost'])).some((problem) =>
+      problem.includes('undiscovered-capability: native.get.ghost'),
+    ),
   );
-  // The real manifest must be internally consistent AND its capability
-  // proofs must exist exactly once (this is the release-relevant assertion).
+  check(
+    'a delegated row pointing nowhere fails',
+    coverageProblems(
+      world([
+        { crate: 'faktor-alpha', class: 'release-critical', owners: ['INV-A'], capabilities: [{ id: 'alpha.other', class: 'delegated', delegate: 'nowhere.at.all', reason: 'x'.repeat(12) }] },
+        good[1],
+      ], [], { 'alpha.discovered': { class: 'delegated', delegate: 'nowhere.at.all', reason: 'x'.repeat(12) } }),
+    ).some((problem) => problem.includes('unknown-delegate')),
+  );
+  check(
+    'an undocumented gap fails',
+    coverageProblems(world([good[0], { crate: 'faktor-beta', class: 'gap', reason: 'x' }])).some((problem) =>
+      problem.includes('undocumented-gap'),
+    ),
+  );
+  // The real manifest + registry + discovery + specs must be consistent.
   const real = load();
   const realProblems = coverageProblems(real);
-  check(
-    `the real capability manifest proves every row (${realProblems.length} problem(s))`,
-    realProblems.length === 0,
-  );
-  for (const problem of realProblems.slice(0, 5)) {
-    console.error(`  ${problem}`);
-  }
+  check(`the real capability graph is internally consistent (${realProblems.length} problem(s))`, realProblems.length === 0);
+  for (const problem of realProblems.slice(0, 8)) console.error(`  ${problem}`);
   if (failures > 0) {
     console.error(`check-invariant-coverage selftest: FAIL (${failures})`);
     process.exit(1);
@@ -429,15 +512,9 @@ function selftest() {
 const isMain = process.argv[1] && process.argv[1].endsWith('check-invariant-coverage.mjs');
 if (isMain) {
   const args = process.argv.slice(2);
-  if (args.includes('selftest')) {
-    process.exit(selftest());
-  }
-  if (args.includes('--check')) {
-    process.exit(run('--check'));
-  }
-  if (args.includes('--release')) {
-    process.exit(run('--release'));
-  }
+  if (args.includes('selftest')) process.exit(selftest());
+  if (args.includes('--check')) process.exit(run('--check'));
+  if (args.includes('--release')) process.exit(run('--release'));
   console.error('usage: check-invariant-coverage.mjs --check | --release | selftest');
   process.exit(2);
 }

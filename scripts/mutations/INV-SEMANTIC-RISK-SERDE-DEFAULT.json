@@ -1,0 +1,12 @@
+{
+  "id": "INV-SEMANTIC-RISK-SERDE-DEFAULT",
+  "file": "crates/semantic/src/types.rs",
+  "find": "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum RiskLevel {\n    Unknown,\n    Safe,",
+  "replace": "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]\n#[serde(rename_all = \"PascalCase\")]\npub enum RiskLevel {\n    Unknown,\n    Safe,",
+  "gate": "cargo test -p faktor-semantic --lib unknown_risk_level_is_not_safe",
+  "expect": "FAILED",
+  "note": "Changing the wire casing makes the unknown risk level encode wrong.",
+  "capabilities": [
+    "semantic.risk_default"
+  ]
+}

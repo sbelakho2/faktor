@@ -5,5 +5,8 @@
   "replace": "            // duplicate Content-Length guard removed",
   "gate": "cargo test -p faktor-acp --lib missing_or_duplicate_content_length_rejected",
   "expect": "FAILED",
-  "note": "Dropping the duplicate-header refusal lets a second Content-Length silently override the first."
+  "note": "Dropping the duplicate-header refusal lets a second Content-Length silently override the first.",
+  "capabilities": [
+    "acp.framing"
+  ]
 }

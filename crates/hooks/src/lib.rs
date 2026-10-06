@@ -137,6 +137,11 @@ pub struct HookInput {
     pub session_id: Option<String>,
     pub task_id: Option<String>,
     pub operation_id: Option<String>,
+    /// The ANCHORED execution root of the session whose lifecycle event
+    /// fired (P1): hook commands run HERE, never in the daemon's process
+    /// CWD. `None` (or a non-directory) is a typed refusal — a hook never
+    /// guesses a working directory.
+    pub workspace_root: Option<std::path::PathBuf>,
     pub payload: serde_json::Value,
 }
 
@@ -147,6 +152,7 @@ impl Default for HookInput {
             session_id: None,
             task_id: None,
             operation_id: None,
+            workspace_root: None,
             payload: serde_json::Value::Null,
         }
     }
@@ -434,10 +440,59 @@ impl HookRegistry {
         }
         entries.extend(spec.env.iter().map(|(k, v)| (k.into(), v.into())));
         entries.push(("FAKTOR_HOOK_INPUT".into(), input_json.to_string().into()));
+        // P1: the hook's execution root is the SESSION workspace supplied
+        // explicitly in the input. Never the daemon's process CWD, never `/`.
+        // A missing or unusable root is a typed refusal before any child.
+        let cwd = match input.workspace_root.as_deref() {
+            Some(root) if root.is_dir() => root.to_path_buf(),
+            Some(root) => {
+                let outcome = HookVerdict::Deny {
+                    reason: format!(
+                        "hook {}: workspace root {} is not a usable directory; refusing to guess a cwd",
+                        spec.id,
+                        root.display()
+                    ),
+                };
+                let duration = started.elapsed().as_millis() as u64;
+                self.audit_push(HookAuditRecord {
+                    hook_id: spec.id.clone(),
+                    event: input.event,
+                    started_ms: now_ms() - duration as i64,
+                    duration_ms: duration,
+                    verdict: verdict_tag(&outcome),
+                    exit_code: None,
+                    stdout_head: String::new(),
+                    stderr_head: String::new(),
+                    failure_policy: spec.failure_policy,
+                });
+                return outcome;
+            }
+            None => {
+                let outcome = HookVerdict::Deny {
+                    reason: format!(
+                        "hook {}: lifecycle event carries no workspace root; a hook never runs in the daemon cwd",
+                        spec.id
+                    ),
+                };
+                let duration = started.elapsed().as_millis() as u64;
+                self.audit_push(HookAuditRecord {
+                    hook_id: spec.id.clone(),
+                    event: input.event,
+                    started_ms: now_ms() - duration as i64,
+                    duration_ms: duration,
+                    verdict: verdict_tag(&outcome),
+                    exit_code: None,
+                    stdout_head: String::new(),
+                    stderr_head: String::new(),
+                    failure_policy: spec.failure_policy,
+                });
+                return outcome;
+            }
+        };
         let cfg = SpawnConfig {
             cmd: spec.command.clone(),
             args: spec.args.clone(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+            cwd,
             env: EnvSpec::Explicit(entries),
             owner,
             ..Default::default()
@@ -572,6 +627,15 @@ fn process_owner(input: &HookInput) -> Result<ProcessOwner, String> {
 
 #[cfg(test)]
 mod tests {
+    /// A rooted hook input: execution tests run in the TEMP dir, never the
+    /// daemon cwd (P1).
+    fn rooted_input() -> HookInput {
+        HookInput {
+            workspace_root: Some(std::env::temp_dir()),
+            ..Default::default()
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -618,7 +682,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            r.run(HookEvent::PreTool, &HookInput::default()),
+            r.run(HookEvent::PreTool, &rooted_input()),
             HookVerdict::Allow
         );
     }
@@ -637,7 +701,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        match r.run(HookEvent::PreTool, &HookInput::default()) {
+        match r.run(HookEvent::PreTool, &rooted_input()) {
             HookVerdict::Deny { reason } => assert_eq!(reason, "policy"),
             v => panic!("expected deny, got {v:?}"),
         }
@@ -656,7 +720,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            r.run(HookEvent::PreEdit, &HookInput::default()),
+            r.run(HookEvent::PreEdit, &rooted_input()),
             HookVerdict::Deny { .. }
         ));
     }
@@ -721,7 +785,7 @@ mod tests {
             ProcessOwner::Session(SessionId::try_from(42).unwrap())
         );
         assert_eq!(
-            process_owner(&HookInput::default()).unwrap(),
+            process_owner(&rooted_input()).unwrap(),
             ProcessOwner::Daemon
         );
     }
@@ -739,7 +803,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            r.run(HookEvent::PreTool, &HookInput::default()),
+            r.run(HookEvent::PreTool, &rooted_input()),
             HookVerdict::Warn { .. }
         ));
         assert!(!r.audit().is_empty());
@@ -762,7 +826,7 @@ mod tests {
         })
         .unwrap();
         let t0 = std::time::Instant::now();
-        let v = r.run(HookEvent::PreModel, &HookInput::default());
+        let v = r.run(HookEvent::PreModel, &rooted_input());
         assert!(
             t0.elapsed().as_millis() < 5000,
             "deadline must bound the hook"
@@ -790,7 +854,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            r.run(HookEvent::PostTool, &HookInput::default()),
+            r.run(HookEvent::PostTool, &rooted_input()),
             HookVerdict::Allow,
             "the unlisted secret must not reach the hook"
         );
@@ -814,7 +878,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            r.run(HookEvent::PreTool, &HookInput::default()),
+            r.run(HookEvent::PreTool, &rooted_input()),
             HookVerdict::Allow
         );
     }
@@ -837,7 +901,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            r.run(HookEvent::PreModel, &HookInput::default()),
+            r.run(HookEvent::PreModel, &rooted_input()),
             HookVerdict::Allow,
             "benign vars pass, the secret never does"
         );
@@ -868,7 +932,7 @@ mod tests {
         // exit 0 with no verdict line -> Allow (the run completed within the
         // default deadline; it must not be mistaken for a hang).
         assert_eq!(
-            r.run(HookEvent::PreTool, &HookInput::default()),
+            r.run(HookEvent::PreTool, &rooted_input()),
             HookVerdict::Allow
         );
         assert!(
@@ -907,7 +971,7 @@ mod tests {
         })
         .unwrap();
         let t0 = std::time::Instant::now();
-        match r.run(HookEvent::PreModel, &HookInput::default()) {
+        match r.run(HookEvent::PreModel, &rooted_input()) {
             HookVerdict::Deny { .. } => {}
             v => panic!("timeout must fail closed, partial allow discarded: {v:?}"),
         }
@@ -944,7 +1008,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            r2.run(HookEvent::PreTool, &HookInput::default()),
+            r2.run(HookEvent::PreTool, &rooted_input()),
             HookVerdict::Warn { .. }
         ));
     }
@@ -971,7 +1035,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        match r.run(HookEvent::PreTool, &HookInput::default()) {
+        match r.run(HookEvent::PreTool, &rooted_input()) {
             HookVerdict::Deny { reason } => assert_eq!(reason, "stop"),
             v => panic!("deny must win: {v:?}"),
         }
@@ -991,7 +1055,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        match r.run(HookEvent::PreModel, &HookInput::default()) {
+        match r.run(HookEvent::PreModel, &rooted_input()) {
             HookVerdict::Modify { metadata } => assert_eq!(metadata["note"], "hi"),
             v => panic!("expected modify: {v:?}"),
         }
@@ -1071,7 +1135,7 @@ mod tests {
             let barrier = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                reg.run_one(&specs[i], &HookInput::default())
+                reg.run_one(&specs[i], &rooted_input())
             }));
         }
         barrier.wait();
@@ -1141,7 +1205,7 @@ mod tests {
         })
         .unwrap();
         let t0 = std::time::Instant::now();
-        let v = r.run(HookEvent::PreModel, &HookInput::default());
+        let v = r.run(HookEvent::PreModel, &rooted_input());
         assert!(matches!(v, HookVerdict::Deny { .. }), "{v:?}");
         assert!(
             t0.elapsed().as_millis() < 8000,
@@ -1204,7 +1268,7 @@ mod tests {
             .into_iter()
             .find(|s| s.id == "over")
             .unwrap();
-        let v = r.run_one(&over, &HookInput::default());
+        let v = r.run_one(&over, &rooted_input());
         assert!(
             matches!(v, HookVerdict::Deny { .. }),
             "an out-of-envelope scope fails closed: {v:?}"
@@ -1233,10 +1297,7 @@ mod tests {
             .into_iter()
             .find(|s| s.id == "within")
             .unwrap();
-        assert_eq!(
-            r.run_one(&within, &HookInput::default()),
-            HookVerdict::Allow
-        );
+        assert_eq!(r.run_one(&within, &rooted_input()), HookVerdict::Allow);
         assert!(marker.exists(), "an in-envelope hook runs");
         assert_eq!(r.audit().len(), 2);
     }
@@ -1308,6 +1369,53 @@ mod tests {
              hooks and mcp must route every child through the shared \
              faktor-terminal::ProcessSupervisor.",
             offenders.join("\n  ")
+        );
+    }
+    /// P1: a hook without a workspace root is a TYPED deny before any child;
+    /// a hook runs with the SUPPLIED root even when the daemon process cwd
+    /// is elsewhere.
+    #[test]
+    fn hooks_run_in_the_supplied_workspace_root_never_the_daemon_cwd() {
+        let daemon_dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(daemon_dir.path()).unwrap();
+        let hook_root = tempfile::tempdir().unwrap();
+        let r = HookRegistry::try_new().unwrap();
+        r.register(HookSpec {
+            id: "pwd".into(),
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '{\"verdict\":\"allow\",\"metadata\":{\"cwd\":\"%s\"}}' \"$(pwd)\"".into(),
+            ],
+            events: vec![HookEvent::PreTool],
+            ..Default::default()
+        })
+        .unwrap();
+        let input = HookInput {
+            workspace_root: Some(hook_root.path().to_path_buf()),
+            ..Default::default()
+        };
+        let verdict = r.run(HookEvent::PreTool, &input);
+        std::env::set_current_dir(previous).unwrap();
+        assert!(matches!(verdict, HookVerdict::Allow), "{verdict:?}");
+        let audit = r.audit();
+        let printed = audit[0].stdout_head.clone();
+        assert!(
+            printed.contains(hook_root.path().to_str().unwrap()),
+            "the hook must observe its session workspace, got {printed:?}"
+        );
+        assert!(
+            !printed.contains(daemon_dir.path().to_str().unwrap()),
+            "the hook must never observe the daemon cwd, got {printed:?}"
+        );
+        drop(other);
+
+        let deny = r.run(HookEvent::PreTool, &HookInput::default());
+        assert!(
+            matches!(deny, HookVerdict::Deny { ref reason } if reason.contains("no workspace root")),
+            "{deny:?}"
         );
     }
 }

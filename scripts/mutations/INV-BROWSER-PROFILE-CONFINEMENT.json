@@ -1,0 +1,12 @@
+{
+  "id": "INV-BROWSER-PROFILE-CONFINEMENT",
+  "file": "crates/browser/src/profile.rs",
+  "find": "        let rel = Path::new(name).join(\"scratch\");\n        self.root\n            .create_dir_all(&rel)\n            .map_err(|e| profile_err(&format!(\"cannot create scratch for {name:?}\"), e))?;",
+  "replace": "        let rel = Path::new(name).join(\"scratch\");\n        let _ = std::fs::create_dir_all(self.root.join(&rel));",
+  "gate": "cargo test -p faktor-browser --lib symlink_swapped_profile_entries_are_refused_and_targets_untouched",
+  "expect": "FAILED",
+  "note": "Path-based create_dir_all follows the swapped symlink and writes outside the profile root.",
+  "capabilities": [
+    "browser.profile_confinement"
+  ]
+}

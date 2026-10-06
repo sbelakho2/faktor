@@ -5,5 +5,8 @@
   "replace": "pub const fn capability_intersection(\n    parent: CapabilitySet,\n    claimed: CapabilitySet,\n) -> CapabilitySet {\n    claimed\n}",
   "gate": "cargo test -p faktor-semantic --lib capability_intersection_only_reduces_and_never_grants",
   "expect": "FAILED",
-  "note": "Union lets provider-claimed capabilities widen the parent session set instead of only reducing it."
+  "note": "Union lets provider-claimed capabilities widen the parent session set instead of only reducing it.",
+  "capabilities": [
+    "semantic.capability_reduction"
+  ]
 }

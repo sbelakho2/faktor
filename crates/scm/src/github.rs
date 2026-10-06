@@ -659,21 +659,22 @@ impl GitHubApp {
         repository: &RepositoryRef,
         json: &serde_json::Value,
     ) -> Result<ScmRepository, ScmError> {
+        // Authoritative provider data: every required field must be present
+        // with the right type; a malformed payload is a typed shape error,
+        // NEVER a plausible invented default (P1: a repository on `master`
+        // must not be recorded as `main`).
         let full_name = string_field(json, "full_name")?;
-        let default_branch = string_field(json, "default_branch").unwrap_or_else(|_| "main".into());
+        let default_branch = string_field(json, "default_branch")?;
+        let private = bool_field(json, "private")?;
+        let archived = bool_field(json, "archived")?;
+        let url = string_field(json, "html_url")?;
         Ok(ScmRepository {
             reference: repository.clone(),
             full_name,
             default_branch,
-            private: json
-                .get("private")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            archived: json
-                .get("archived")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            url: string_field(json, "html_url").unwrap_or_default(),
+            private,
+            archived,
+            url,
         })
     }
 
@@ -751,6 +752,17 @@ pub(crate) fn require_permissions(token: &InstallationToken) -> Result<(), ScmEr
         }
     }
     Ok(())
+}
+
+/// A required boolean: missing or wrong-typed authoritative booleans are
+/// typed shape refusals, never `false`.
+fn bool_field(json: &serde_json::Value, key: &str) -> Result<bool, ScmError> {
+    json.get(key)
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| ScmError::Api {
+            status: 200,
+            detail: format!("response payload has no boolean field {key:?}"),
+        })
 }
 
 fn string_field(json: &serde_json::Value, key: &str) -> Result<String, ScmError> {

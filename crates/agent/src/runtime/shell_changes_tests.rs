@@ -228,11 +228,10 @@ fn read_only_shell_tool() -> Tool {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let mut writable_roots = Vec::new();
-            for rel in ["target", ".faktor/build-scratch"] {
+            for rel in ["target", ".faktor-derived/build-scratch"] {
                 let path = ws.root().join(rel);
-                if std::fs::create_dir_all(&path).is_ok() {
-                    writable_roots.push(path);
-                }
+                ws.create_dir_all_no_follow(std::path::Path::new(rel))?;
+                writable_roots.push(path);
             }
             let filesystem_isolation = if read_only {
                 faktor_terminal::FilesystemIsolation::WorkspaceReadOnly {
@@ -1137,4 +1136,161 @@ fn read_only_shell_takes_no_write_ownership() {
         false,
     );
     assert_eq!(writes.entries(), &["**".to_string()]);
+}
+
+/// P0: the read-only tool's writable-root provisioning goes through the
+/// ROOTED authority. A hostile `.faktor-derived` symlink to an outside dir
+/// must produce a typed preparation refusal BEFORE the process exists, and
+/// the daemon must never mkdir outside the workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_shell_refuses_hostile_derived_symlink_before_exec() {
+    let script = vec![
+        read_only_call("echo pwned > target/pwned.txt"),
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env_with_tool(script, read_only_shell_tool());
+    let manager = env.manager.clone();
+    let session = env.session;
+    let root = env.root.clone();
+    let outside = env.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(".faktor-derived")).unwrap();
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let _outcome = runtime
+        .run_turn(session, "hostile derived symlink", &[])
+        .await
+        .unwrap();
+    assert!(
+        !outside.join("build-scratch").exists(),
+        "the daemon must never create the scratch root outside the workspace"
+    );
+    assert!(
+        !root.join("target/pwned.txt").exists(),
+        "the command must never run after a failed preparation"
+    );
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let (rows, _truncated) = changed_rows(&handle);
+    assert!(
+        rows.is_empty(),
+        "no execution, no change accounting: {rows:?}"
+    );
+}
+
+/// P1: every path the read-only mode may write is DERIVED, non-authority
+/// state under every authority that looks at it: the shell manifest skips
+/// `.faktor-derived`, and the authority scanner (which tracks `.faktor/**`)
+/// never reports it.
+#[test]
+fn read_only_writable_roots_are_derived_in_every_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let handle =
+        WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(401), root.clone()).unwrap();
+    std::fs::create_dir_all(handle.root().join(".faktor-derived/build-scratch/nested")).unwrap();
+    std::fs::write(
+        handle
+            .root()
+            .join(".faktor-derived/build-scratch/nested/out.o"),
+        b"derived",
+    )
+    .unwrap();
+    std::fs::create_dir_all(handle.root().join(".faktor")).unwrap();
+    std::fs::write(handle.root().join(".faktor/state.json"), b"authority").unwrap();
+    let capture = capture_pre_shell(&handle, None).unwrap();
+    assert!(
+        capture
+            .manifest
+            .entries()
+            .iter()
+            .all(|entry| !entry.normalized_path.starts_with(".faktor-derived")),
+        "derived build scratch must never enter the shell manifest"
+    );
+    let authority = capture_authority_state(&handle);
+    assert!(
+        authority
+            .keys()
+            .all(|key| !key.starts_with(".faktor-derived")),
+        "derived build scratch must never be authority state: {:?}",
+        authority.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        authority.keys().any(|key| key.starts_with(".faktor/")),
+        "the real .faktor state stays authority: {:?}",
+        authority.keys().collect::<Vec<_>>()
+    );
+    drop(dir);
+}
+
+/// P1: `.git` is workspace-controlled text. Hostile gitdir/commondir claims
+/// must be refused WITHOUT any authority keys, and the obvious host paths
+/// (`/etc`, `/home`, arbitrary `..` traversals) are refused LEXICALLY before
+/// any stat/open of the claimed location.
+#[test]
+fn hostile_git_pointers_are_refused_without_authority_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    let handle =
+        WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(402), root.clone()).unwrap();
+
+    // The obvious hostile claims: refused lexically (no reads possible).
+    for raw in ["/etc", "/home", "../../../outside-etc", "/var/lib"] {
+        std::fs::write(root.join(".git"), format!("gitdir: {raw}\n")).unwrap();
+        let state = capture_authority_state(&handle);
+        assert!(
+            state.is_empty(),
+            "hostile gitdir {raw:?} must be refused with zero authority keys, got {:?}",
+            state.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Shape-valid but unbound: a foreign `worktrees/<name>` whose reciprocal
+    // `gitdir` file does not point back at THIS workspace is refused.
+    let foreign = dir.path().join("foreign/worktrees/evil");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(foreign.join("gitdir"), "/somewhere/else/.git\n").unwrap();
+    std::fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", foreign.display()),
+    )
+    .unwrap();
+    let state = capture_authority_state(&handle);
+    assert!(
+        state.is_empty(),
+        "an unbound external gitdir must never be fingerprinted: {:?}",
+        state.keys().collect::<Vec<_>>()
+    );
+
+    // Bound gitdir but a commondir traversal outside the git layout: the
+    // lexical ancestor guard refuses before any stat of `/home`.
+    let bound = dir.path().join("common/worktrees/evil");
+    std::fs::create_dir_all(&bound).unwrap();
+    std::fs::write(bound.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(bound.join("index"), b"i").unwrap();
+    std::fs::write(
+        bound.join("gitdir"),
+        format!("{}\n", root.join(".git").display()),
+    )
+    .unwrap();
+    std::fs::write(bound.join("commondir"), "/home\n").unwrap();
+    std::fs::write(root.join(".git"), format!("gitdir: {}\n", bound.display())).unwrap();
+    let state = capture_authority_state(&handle);
+    assert!(
+        state.is_empty(),
+        "a commondir traversal outside the git layout must be refused: {:?}",
+        state.keys().collect::<Vec<_>>()
+    );
+
+    // The same fixture with the REAL common dir relation (../..) is bound and
+    // fingerprinted: the guards only reject foreign layouts.
+    std::fs::write(bound.join("commondir"), "../..\n").unwrap();
+    let state = capture_authority_state(&handle);
+    assert!(
+        state.contains_key("gitdir/HEAD"),
+        "a genuinely bound worktree layout is fingerprinted: {:?}",
+        state.keys().collect::<Vec<_>>()
+    );
 }

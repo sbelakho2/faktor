@@ -1,0 +1,9 @@
+{
+  "id": "INV-HOOKS-SESSION-WORKSPACE-CWD",
+  "file": "crates/hooks/src/lib.rs",
+  "find": "            Some(root) if root.is_dir() => root.to_path_buf(),",
+  "replace": "            Some(_root) if std::path::Path::new(\"/\").is_dir() => std::path::PathBuf::from(\"/\"),",
+  "gate": "cargo test -p faktor-hooks --lib hooks_run_in_the_supplied_workspace_root_never_the_daemon_cwd",
+  "expect": "FAILED",
+  "note": "Ignoring the supplied root runs every hook in / instead of its session workspace."
+}

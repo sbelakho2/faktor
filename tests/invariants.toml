@@ -706,7 +706,7 @@ platforms = ["linux"]
 
 [[invariant]]
 id = "INV-CAPABILITY-COVERAGE"
-statement = "Every local production crate is classified in tests/invariant-coverage.json as release-critical (owned by a registered release-critical invariant AND enumerating capability rows whose unit proofs exist exactly once in the owning source tree and whose mutation is a registered release-critical invariant), covered (transitively named by registered invariants), or an explicit gap with a reason; the IDE surfaces apps/vscode and apps/jetbrains carry capability rows with the same proof discipline; a new crate, unknown owner, malformed capability id, unknown mutation, unproven unit or empty disposition fails the mechanical check, and --release fails on any remaining gap."
+statement = "Capability completeness is mechanically DISCOVERED, not self-declared: scripts/discover-capabilities.mjs enumerates native routes, builtin tools, CLI commands, provider kinds, VS Code contributions and JetBrains contributions; check-invariant-coverage requires every discovered id to carry a manifest row (proven with a DIRECT planted mutation whose gate runs that capability's oracle, delegated to a proven capability/registered invariant, or an explicit gap), rejects whole-crate covered exemptions in release mode, and fails release on any gap or unbound mutation."
 owner = "tests/invariant-coverage.json + scripts/check-invariant-coverage.mjs"
 authority = "scripts/check-invariant-coverage.mjs --check (cargo metadata + registry); wired in .woodpecker/trusted/trusted.yaml linux certificate lane"
 script_check = "node scripts/check-invariant-coverage.mjs --release"
@@ -841,6 +841,393 @@ production_wiring = "wire_dto_accepts_a_real_provider_payload_and_converts_immed
 fault = ""
 mutation_witness = "backup_roundtrip_is_restore_verified_and_rotation_is_bounded"
 mutation_command = "node scripts/mutation-run.mjs INV-CLOUD-BACKUP-RETENTION-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-READONLY-SHELL-ROOTED-PROVISIONING"
+statement = "Read-only shell provisioning creates its writable build/scratch roots through the ROOTED filesystem authority (anchored, per-component no-follow create): a symlinked final/intermediate component or a swap race is a typed Permission refusal BEFORE exec, the daemon never mkdirs outside the workspace from workspace path text, and every path the mode may write is derived non-authority state under the shell manifest and the authority scanner."
+owner = "crates/fs workspace_service create_dir_all_no_follow + crates/cli run_command read_only"
+authority = "crates/fs/src/platform/unix.rs create_dir_all_no_follow; crates/cli/src/tools.rs read_only provisioning"
+script_check = ""
+unit_test = "create_dir_all_no_follow_refuses_symlink_components_and_never_mkdirs_outside"
+production_wiring = "read_only_shell_refuses_hostile_derived_symlink_before_exec"
+fault = "read_only_writable_roots_are_derived_in_every_authority"
+mutation_witness = "create_dir_all_no_follow_refuses_symlink_components_and_never_mkdirs_outside"
+mutation_command = "node scripts/mutation-run.mjs INV-READONLY-SHELL-ROOTED-PROVISIONING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-BROWSER-DOWNLOAD-DEFAULT-DENY"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (downloads_are_denied_by_default_and_native_is_always_denied)."
+owner = "crates/browser download policy default deny"
+authority = "planted mutation scripts/mutations/INV-BROWSER-DOWNLOAD-DEFAULT-DENY.json"
+script_check = ""
+unit_test = "downloads_are_denied_by_default_and_native_is_always_denied"
+production_wiring = "downloads_are_denied_by_default_and_native_is_always_denied"
+fault = ""
+mutation_witness = "downloads_are_denied_by_default_and_native_is_always_denied"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-DOWNLOAD-DEFAULT-DENY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-DOWNLOAD-FILENAME"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (attachment_detection_and_filename_sanitization)."
+owner = "crates/browser download filename sanitization"
+authority = "planted mutation scripts/mutations/INV-BROWSER-DOWNLOAD-FILENAME.json"
+script_check = ""
+unit_test = "attachment_detection_and_filename_sanitization"
+production_wiring = "attachment_detection_and_filename_sanitization"
+fault = ""
+mutation_witness = "attachment_detection_and_filename_sanitization"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-DOWNLOAD-FILENAME"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-BROWSER-PROFILE-CONFINEMENT"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (symlink_swapped_profile_entries_are_refused_and_targets_untouched)."
+owner = "crates/browser profile anchored confinement"
+authority = "planted mutation scripts/mutations/INV-BROWSER-PROFILE-CONFINEMENT.json"
+script_check = ""
+unit_test = "symlink_swapped_profile_entries_are_refused_and_targets_untouched"
+production_wiring = "symlink_swapped_profile_entries_are_refused_and_targets_untouched"
+fault = ""
+mutation_witness = "symlink_swapped_profile_entries_are_refused_and_targets_untouched"
+mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-PROFILE-CONFINEMENT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACP-CANCEL-EXACTLY-ONCE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (cancel_request_cancels_the_matching_running_prompt_exactly_once)."
+owner = "crates/acp cancel exactly once"
+authority = "planted mutation scripts/mutations/INV-ACP-CANCEL-EXACTLY-ONCE.json"
+script_check = ""
+unit_test = "cancel_request_cancels_the_matching_running_prompt_exactly_once"
+production_wiring = "cancel_request_cancels_the_matching_running_prompt_exactly_once"
+fault = ""
+mutation_witness = "cancel_request_cancels_the_matching_running_prompt_exactly_once"
+mutation_command = "node scripts/mutation-run.mjs INV-ACP-CANCEL-EXACTLY-ONCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACP-SHUTDOWN-WRITER-ABORT"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes)."
+owner = "crates/acp shutdown writer abort"
+authority = "planted mutation scripts/mutations/INV-ACP-SHUTDOWN-WRITER-ABORT.json"
+script_check = ""
+unit_test = "shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes"
+production_wiring = "shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes"
+fault = ""
+mutation_witness = "shutdown_aborts_blocked_writer_and_leaves_no_post_shutdown_writes"
+mutation_command = "node scripts/mutation-run.mjs INV-ACP-SHUTDOWN-WRITER-ABORT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-LSP-INITIALIZE-ROOT"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (initialize_carries_real_root_and_owner)."
+owner = "crates/lsp initialize real root"
+authority = "planted mutation scripts/mutations/INV-LSP-INITIALIZE-ROOT.json"
+script_check = ""
+unit_test = "initialize_carries_real_root_and_owner"
+production_wiring = "initialize_carries_real_root_and_owner"
+fault = ""
+mutation_witness = "initialize_carries_real_root_and_owner"
+mutation_command = "node scripts/mutation-run.mjs INV-LSP-INITIALIZE-ROOT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-LSP-SHUTDOWN-EXIT-NOTIFICATION"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (shutdown_request_then_exit_notification_within_grace)."
+owner = "crates/lsp shutdown exit notification"
+authority = "planted mutation scripts/mutations/INV-LSP-SHUTDOWN-EXIT-NOTIFICATION.json"
+script_check = ""
+unit_test = "shutdown_request_then_exit_notification_within_grace"
+production_wiring = "shutdown_request_then_exit_notification_within_grace"
+fault = ""
+mutation_witness = "shutdown_request_then_exit_notification_within_grace"
+mutation_command = "node scripts/mutation-run.mjs INV-LSP-SHUTDOWN-EXIT-NOTIFICATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MCP-DELIVERY-UNKNOWN-TYPED"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (delivery_unknown_is_typed_by_code_and_not_retryable)."
+owner = "crates/mcp delivery-unknown typed"
+authority = "planted mutation scripts/mutations/INV-MCP-DELIVERY-UNKNOWN-TYPED.json"
+script_check = ""
+unit_test = "delivery_unknown_is_typed_by_code_and_not_retryable"
+production_wiring = "delivery_unknown_is_typed_by_code_and_not_retryable"
+fault = ""
+mutation_witness = "delivery_unknown_is_typed_by_code_and_not_retryable"
+mutation_command = "node scripts/mutation-run.mjs INV-MCP-DELIVERY-UNKNOWN-TYPED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MCP-CANCEL-BEFORE-WRITE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown)."
+owner = "crates/mcp cancel-before-write race"
+authority = "planted mutation scripts/mutations/INV-MCP-CANCEL-BEFORE-WRITE.json"
+script_check = ""
+unit_test = "timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown"
+production_wiring = "timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown"
+fault = ""
+mutation_witness = "timed_out_frames_are_cancelled_whole_or_flagged_delivery_unknown"
+mutation_command = "node scripts/mutation-run.mjs INV-MCP-CANCEL-BEFORE-WRITE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-RISK-SERDE-DEFAULT"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (unknown_risk_level_is_not_safe)."
+owner = "crates/semantic risk serde default"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-RISK-SERDE-DEFAULT.json"
+script_check = ""
+unit_test = "unknown_risk_level_is_not_safe"
+production_wiring = "unknown_risk_level_is_not_safe"
+fault = ""
+mutation_witness = "unknown_risk_level_is_not_safe"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-RISK-SERDE-DEFAULT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SCM-BRANCH-RECONCILE-EXACT-HEAD"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (branch_create_is_bounded_to_the_exact_head_and_reconciles_existing)."
+owner = "crates/scm branch reconcile exact head"
+authority = "planted mutation scripts/mutations/INV-SCM-BRANCH-RECONCILE-EXACT-HEAD.json"
+script_check = ""
+unit_test = "branch_create_is_bounded_to_the_exact_head_and_reconciles_existing"
+production_wiring = "branch_create_is_bounded_to_the_exact_head_and_reconciles_existing"
+fault = ""
+mutation_witness = "branch_create_is_bounded_to_the_exact_head_and_reconciles_existing"
+mutation_command = "node scripts/mutation-run.mjs INV-SCM-BRANCH-RECONCILE-EXACT-HEAD"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SCM-INSTALLATION-ID-BOUND"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (installation_ids_above_the_signed_sqlite_bound_are_refused_typed)."
+owner = "crates/scm installation id bound"
+authority = "planted mutation scripts/mutations/INV-SCM-INSTALLATION-ID-BOUND.json"
+script_check = ""
+unit_test = "installation_ids_above_the_signed_sqlite_bound_are_refused_typed"
+production_wiring = "installation_ids_above_the_signed_sqlite_bound_are_refused_typed"
+fault = ""
+mutation_witness = "installation_ids_above_the_signed_sqlite_bound_are_refused_typed"
+mutation_command = "node scripts/mutation-run.mjs INV-SCM-INSTALLATION-ID-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CLOUD-BILLING-CHECKED-OVERFLOW"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary)."
+owner = "crates/cloud billing checked overflow"
+authority = "planted mutation scripts/mutations/INV-CLOUD-BILLING-CHECKED-OVERFLOW.json"
+script_check = ""
+unit_test = "usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary"
+production_wiring = "usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary"
+fault = ""
+mutation_witness = "usage_fold_refuses_overflow_typed_and_stays_exact_below_the_boundary"
+mutation_command = "node scripts/mutation-run.mjs INV-CLOUD-BILLING-CHECKED-OVERFLOW"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CLOUD-MONEY-STRING-SERDE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (money_fields_serialize_as_quoted_decimal_strings_at_every_boundary)."
+owner = "crates/cloud money string serde"
+authority = "planted mutation scripts/mutations/INV-CLOUD-MONEY-STRING-SERDE.json"
+script_check = ""
+unit_test = "money_fields_serialize_as_quoted_decimal_strings_at_every_boundary"
+production_wiring = "money_fields_serialize_as_quoted_decimal_strings_at_every_boundary"
+fault = ""
+mutation_witness = "money_fields_serialize_as_quoted_decimal_strings_at_every_boundary"
+mutation_command = "node scripts/mutation-run.mjs INV-CLOUD-MONEY-STRING-SERDE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-COMMERCE-MPN-MATCH-EXACT"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (a_different_part_number_is_a_mismatch)."
+owner = "crates/commerce mpn exact mismatch"
+authority = "planted mutation scripts/mutations/INV-COMMERCE-MPN-MATCH-EXACT.json"
+script_check = ""
+unit_test = "a_different_part_number_is_a_mismatch"
+production_wiring = "a_different_part_number_is_a_mismatch"
+fault = ""
+mutation_witness = "a_different_part_number_is_a_mismatch"
+mutation_command = "node scripts/mutation-run.mjs INV-COMMERCE-MPN-MATCH-EXACT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-COMMERCE-ACCOUNT-SCOPE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers)."
+owner = "crates/commerce account scope"
+authority = "planted mutation scripts/mutations/INV-COMMERCE-ACCOUNT-SCOPE.json"
+script_check = ""
+unit_test = "account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers"
+production_wiring = "account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers"
+fault = ""
+mutation_witness = "account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers"
+mutation_command = "node scripts/mutation-run.mjs INV-COMMERCE-ACCOUNT-SCOPE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACQUIRE-DESTINATION-CANONICAL"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (non_canonical_destination_hosts_and_ports_are_refused)."
+owner = "crates/acquire destination canonical"
+authority = "planted mutation scripts/mutations/INV-ACQUIRE-DESTINATION-CANONICAL.json"
+script_check = ""
+unit_test = "non_canonical_destination_hosts_and_ports_are_refused"
+production_wiring = "non_canonical_destination_hosts_and_ports_are_refused"
+fault = ""
+mutation_witness = "non_canonical_destination_hosts_and_ports_are_refused"
+mutation_command = "node scripts/mutation-run.mjs INV-ACQUIRE-DESTINATION-CANONICAL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-ACQUIRE-RETRY-AFTER-DIGITS"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (hostile_retry_after_values_are_rejected_never_guessed)."
+owner = "crates/acquire retry-after digits"
+authority = "planted mutation scripts/mutations/INV-ACQUIRE-RETRY-AFTER-DIGITS.json"
+script_check = ""
+unit_test = "hostile_retry_after_values_are_rejected_never_guessed"
+production_wiring = "hostile_retry_after_values_are_rejected_never_guessed"
+fault = ""
+mutation_witness = "hostile_retry_after_values_are_rejected_never_guessed"
+mutation_command = "node scripts/mutation-run.mjs INV-ACQUIRE-RETRY-AFTER-DIGITS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CLI-DOCTOR-EXIT-CODE"
+statement = "Capability-level planted-mutation witness: removing or negating the named production guard makes its dedicated oracle test fail (doctor_on_a_fresh_dir_passes_without_creating_a_store_side_effect_first)."
+owner = "crates/cli doctor exit code"
+authority = "planted mutation scripts/mutations/INV-CLI-DOCTOR-EXIT-CODE.json"
+script_check = ""
+unit_test = "doctor_on_a_fresh_dir_passes_without_creating_a_store_side_effect_first"
+production_wiring = "doctor_on_a_fresh_dir_passes_without_creating_a_store_side_effect_first"
+fault = ""
+mutation_witness = "doctor_on_a_fresh_dir_passes_without_creating_a_store_side_effect_first"
+mutation_command = "node scripts/mutation-run.mjs INV-CLI-DOCTOR-EXIT-CODE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CAPABILITY-DISCOVERY-OMISSION"
+statement = "The proof manifest must equal the DISCOVERED product surface set: every native route, builtin tool, CLI command, provider kind, VS Code contribution and JetBrains contribution found by scripts/discover-capabilities.mjs must have a manifest row (proven, delegated or an explicit gap); adding an unproven route/tool/command turns check-invariant-coverage --check red."
+owner = "tests/invariant-coverage.json discovered rows + scripts/discover-capabilities.mjs"
+authority = "scripts/discover-capabilities.mjs + scripts/check-invariant-coverage.mjs discovery equality"
+script_check = "node scripts/check-invariant-coverage.mjs --release"
+mutation_witness = "node scripts/check-invariant-coverage.mjs selftest"
+mutation_command = "node scripts/mutation-run.mjs INV-CAPABILITY-DISCOVERY-OMISSION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-GIT-METADATA-TRUST"
+statement = "Wave-4 runtime authority: the named behavior is enforced on the production path and a planted mutation of that authority makes its dedicated oracle fail."
+owner = "crates/agent shell_changes git authority"
+authority = "planted mutation scripts/mutations/INV-GIT-METADATA-TRUST.json"
+script_check = ""
+unit_test = "hostile_git_pointers_are_refused_without_authority_keys"
+production_wiring = "linked_worktree_git_authority_transitions_are_attributed"
+fault = ""
+mutation_witness = "hostile_git_pointers_are_refused_without_authority_keys"
+mutation_command = "node scripts/mutation-run.mjs INV-GIT-METADATA-TRUST"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-POST-ADMISSION-READ-LOUD"
+statement = "Wave-4 runtime authority: the named behavior is enforced on the production path and a planted mutation of that authority makes its dedicated oracle fail."
+owner = "crates/orchestrator task_executor post-admission read"
+authority = "planted mutation scripts/mutations/INV-POST-ADMISSION-READ-LOUD.json"
+script_check = ""
+unit_test = "post_admission_read_failure_is_typed_and_recovers_exactly_once"
+production_wiring = "post_admission_read_failure_is_typed_and_recovers_exactly_once"
+fault = ""
+mutation_witness = "post_admission_read_failure_is_typed_and_recovers_exactly_once"
+mutation_command = "node scripts/mutation-run.mjs INV-POST-ADMISSION-READ-LOUD"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-HOOKS-SESSION-WORKSPACE-CWD"
+statement = "Wave-4 runtime authority: the named behavior is enforced on the production path and a planted mutation of that authority makes its dedicated oracle fail."
+owner = "crates/hooks execution cwd"
+authority = "planted mutation scripts/mutations/INV-HOOKS-SESSION-WORKSPACE-CWD.json"
+script_check = ""
+unit_test = "hooks_run_in_the_supplied_workspace_root_never_the_daemon_cwd"
+production_wiring = "hooks_run_in_the_supplied_workspace_root_never_the_daemon_cwd"
+fault = ""
+mutation_witness = "hooks_run_in_the_supplied_workspace_root_never_the_daemon_cwd"
+mutation_command = "node scripts/mutation-run.mjs INV-HOOKS-SESSION-WORKSPACE-CWD"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-DURABLE-JSON-NO-EMPTY-DEFAULT"
+statement = "Wave-4 runtime authority: the named behavior is enforced on the production path and a planted mutation of that authority makes its dedicated oracle fail."
+owner = "crates/store durable serialization"
+authority = "planted mutation scripts/mutations/INV-DURABLE-JSON-NO-EMPTY-DEFAULT.json"
+script_check = ""
+unit_test = "durable_serialization_never_silently_defaults_to_empty"
+production_wiring = "durable_serialization_never_silently_defaults_to_empty"
+fault = ""
+mutation_witness = "durable_serialization_never_silently_defaults_to_empty"
+mutation_command = "node scripts/mutation-run.mjs INV-DURABLE-JSON-NO-EMPTY-DEFAULT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-WATCHER-WORKER-LIVENESS"
+statement = "Wave-4 runtime authority: the named behavior is enforced on the production path and a planted mutation of that authority makes its dedicated oracle fail."
+owner = "crates/fs watcher worker liveness"
+authority = "planted mutation scripts/mutations/INV-WATCHER-WORKER-LIVENESS.json"
+script_check = ""
+unit_test = "a_wedged_registration_never_starves_later_workspaces"
+production_wiring = "a_wedged_registration_never_starves_later_workspaces"
+fault = ""
+mutation_witness = "a_wedged_registration_never_starves_later_workspaces"
+mutation_command = "node scripts/mutation-run.mjs INV-WATCHER-WORKER-LIVENESS"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]

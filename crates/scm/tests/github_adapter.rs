@@ -305,6 +305,7 @@ async fn repository_read_uses_etag_revalidation_and_serves_304_from_cache() {
                 "full_name": "acme/widgets",
                 "default_branch": "trunk",
                 "private": true,
+                "archived": false,
                 "html_url": "https://example.test/acme/widgets",
             }),
         )
@@ -710,7 +711,16 @@ async fn rate_limit_backoff_is_recorded_and_never_hot_loops() {
     server.push(
         "GET",
         "/repos/acme/widgets",
-        Reply::json(200, serde_json::json!({"full_name": "acme/widgets"})),
+        Reply::json(
+            200,
+            serde_json::json!({
+                "full_name": "acme/widgets",
+                "default_branch": "main",
+                "private": false,
+                "archived": false,
+                "html_url": "https://example.test/acme/widgets",
+            }),
+        ),
     );
 
     let err = app.repository(&repo).await.unwrap_err();
@@ -1060,4 +1070,34 @@ async fn remote_ref_lookup_reports_absence_without_creating() {
             .len(),
         0
     );
+}
+
+/// P1: authoritative provider fields are never invented. Missing or
+/// wrong-typed `default_branch`/`private`/`archived` are typed shape errors,
+/// so a repository on `master` can never be persisted as `main`.
+#[tokio::test]
+async fn malformed_repository_payloads_are_typed_shape_errors_never_invented_defaults() {
+    let harness = harness().await;
+    let repo = repository();
+    for payload in [
+        serde_json::json!({"full_name": "acme/widgets"}),
+        serde_json::json!({"full_name": "acme/widgets", "default_branch": 7}),
+        serde_json::json!({
+            "full_name": "acme/widgets",
+            "default_branch": "main",
+            "private": "yes",
+            "archived": false,
+            "html_url": "https://example.test/acme/widgets",
+        }),
+    ] {
+        harness
+            .server
+            .push("GET", "/repos/acme/widgets", Reply::json(200, payload));
+        let err = harness
+            .app
+            .repository(&repo)
+            .await
+            .expect_err("a malformed payload must be a typed shape error");
+        assert!(matches!(err, faktor_scm::ScmError::Api { .. }), "{err:?}");
+    }
 }

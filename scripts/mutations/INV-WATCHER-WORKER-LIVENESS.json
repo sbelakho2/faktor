@@ -1,0 +1,9 @@
+{
+  "id": "INV-WATCHER-WORKER-LIVENESS",
+  "file": "crates/fs/src/workspace_service.rs",
+  "find": "        if overdue && workers < MAX_WATCH_WORKERS {\n            let replacement = spawn_watcher_registration_worker();\n            *slot = Some(replacement.clone());\n            return replacement;\n        }",
+  "replace": "        if false && overdue && workers < MAX_WATCH_WORKERS {\n            let replacement = spawn_watcher_registration_worker();\n            *slot = Some(replacement.clone());\n            return replacement;\n        }",
+  "gate": "cargo test -p faktor-fs --lib a_wedged_registration_never_starves_later_workspaces",
+  "expect": "FAILED",
+  "note": "Disabling the overdue respawn wedges watcher service for every later workspace."
+}

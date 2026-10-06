@@ -1765,6 +1765,29 @@ mod nt {
     /// read opens fine but cannot be mutated), then a post-open check that
     /// the entry is a real directory and not a reparse point. Every later
     /// mutation opens its components relative to this handle.
+    /// Create `rel` under the anchored root, component by component:
+    /// every existing component is opened reparse-aware
+    /// (`FILE_OPEN_REPARSE_POINT`; a reparse point is refused) and a missing
+    /// component is created with the anchored `NtCreateFile` create
+    /// protocol. The daemon is never redirected by workspace path text.
+    #[cfg(windows)]
+    pub(crate) fn create_dir_all_no_follow(root: &Path, rel: &Path) -> Result<(), Error> {
+        let units = validated_relative_units(rel)?;
+        let mut handle = open_root_anchor(root)?;
+        for name in &units {
+            match windows_open_child_dir_anchored(&handle, name, rel) {
+                Ok(child) => handle = child,
+                Err(_) => match anchored_create_dir(&handle, name, rel)? {
+                    AnchoredCreateOutcome::Created(child) => handle = child,
+                    AnchoredCreateOutcome::AlreadyExists => {
+                        handle = windows_open_child_dir_anchored(&handle, name, rel)?;
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_root_anchor(root: &Path) -> Result<OwnedHandle, Error> {
         let absolute = std::path::absolute(root)
             .map_err(|e| Error::internal(format!("cannot resolve root {}: {e}", root.display())))?;

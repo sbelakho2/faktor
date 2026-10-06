@@ -216,7 +216,8 @@ pub(crate) fn derive_legacy_argv_identity(spec_json: &str, command: &str) -> (St
     {
         "[]".to_string()
     } else {
-        serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string())
+        // `Vec<String>` serialization is infallible by type.
+        serde_json::to_string(&args).expect("string-array serialization cannot fail")
     };
     (program, args_json)
 }
@@ -311,7 +312,7 @@ pub(crate) fn import_one_legacy_attempt(
     let fingerprint_json = row
         .environment_fingerprint
         .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
+        .map(|v| serde_json::to_string(v).expect("string serialization cannot fail"));
     let attempt = VerificationAttemptRow {
         session_id: SessionId::new(session_raw),
         task_id: TaskId::new(row.task_id),
@@ -467,7 +468,7 @@ pub(crate) fn import_one_legacy_attempt(
                 let job_fingerprint = job
                     .environment_fingerprint
                     .as_ref()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
+                    .map(|v| serde_json::to_string(v).expect("string serialization cannot fail"))
                     .or_else(|| fingerprint_json.clone());
                 checks.push(VerificationJobRow {
                     session_id: attempt.session_id,

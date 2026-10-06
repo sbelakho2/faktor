@@ -71,6 +71,18 @@ pub(crate) enum OpenKind {
     ReparsePoint,
 }
 
+/// Create `rel` (and missing parents) under the anchored root without
+/// following any symlink/reparse-point component (P0 sandbox provisioning).
+#[cfg(unix)]
+pub(crate) fn create_dir_all_no_follow(root: &Path, rel: &Path) -> Result<(), Error> {
+    unix::create_dir_all_no_follow(root, rel)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_dir_all_no_follow(root: &Path, rel: &Path) -> Result<(), Error> {
+    windows::create_dir_all_no_follow(root, rel)
+}
+
 #[cfg(unix)]
 pub(crate) fn open_no_follow_walk(
     root: &Path,

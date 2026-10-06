@@ -1,0 +1,12 @@
+{
+  "id": "INV-COMMERCE-MPN-MATCH-EXACT",
+  "file": "crates/commerce/src/matching.rs",
+  "find": "            signals.mpn_exact = query_part.exact_eq(&offer_mpn);\n            signals.mpn_base_equal = query_part.base_eq(&offer_mpn);",
+  "replace": "            signals.mpn_exact = !query_part.exact_eq(&offer_mpn);\n            signals.mpn_base_equal = !query_part.base_eq(&offer_mpn);",
+  "gate": "cargo test -p faktor-commerce --test matching_ranking a_different_part_number_is_a_mismatch",
+  "expect": "FAILED",
+  "note": "Negated MPN comparisons make different part numbers look like exact matches.",
+  "capabilities": [
+    "commerce.matching"
+  ]
+}

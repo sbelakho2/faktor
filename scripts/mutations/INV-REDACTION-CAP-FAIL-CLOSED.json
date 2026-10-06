@@ -4,5 +4,8 @@
   "find": "pub fn redact(text: &str, policy: &SecretPolicy) -> String {\n    let spans = collect_spans(text, policy);\n    if spans.is_empty() {\n        return text.to_string();\n    }\n    let capped = spans.len() > MAX_REDACTIONS;",
   "replace": "pub fn redact(text: &str, policy: &SecretPolicy) -> String {\n    let spans = collect_spans(text, policy);\n    if spans.is_empty() {\n        return text.to_string();\n    }\n    let capped = false;",
   "gate": "cargo test -p faktor-security --lib decoy_hits_before_the_real_secret_never_expose_it",
-  "note": "Disables the fail-closed cap: the unprocessed tail (with the real secret behind 32 decoys) is appended raw."
+  "note": "Disables the fail-closed cap: the unprocessed tail (with the real secret behind 32 decoys) is appended raw.",
+  "capabilities": [
+    "security.authority"
+  ]
 }

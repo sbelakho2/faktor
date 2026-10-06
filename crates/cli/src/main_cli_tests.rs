@@ -1037,6 +1037,7 @@ fn parsed_env_hook_registers_and_fires_on_a_real_registry() {
         faktor_hooks::HookEvent::PostTool,
         &faktor_hooks::HookInput {
             event: faktor_hooks::HookEvent::PostTool,
+            workspace_root: Some(std::env::temp_dir()),
             ..Default::default()
         },
     );

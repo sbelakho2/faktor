@@ -915,3 +915,57 @@ pub(crate) async fn wall_clock_jumps_never_move_the_admission_lease() {
     wait_turn_settled(&env, receipt.op_id.expect("in-session op id")).await;
     assert_eq!(receipt.mode, TaskRunMode::InSession);
 }
+
+/// P1: an accepted task must never silently skip its drive. A post-admission
+/// session-read failure returns a TYPED, caller-visible error while the
+/// durable run stays recovery-required: zero provider calls happen, the
+/// durable queue row exists for boot recovery, and an immediate same-key
+/// retry refuses in-flight instead of executing a second run. (Boot
+/// recovery driving exactly once is covered by the crash matrix above.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+pub(crate) async fn post_admission_read_failure_is_typed_and_recovers_exactly_once() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(&dir.path().join("e"), done_script());
+    env.executor.fail_post_admission_read_for_test();
+    let mut req = request(
+        "post-admission read failure",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    req.submission_id = Some(KEY_A.to_string());
+    let err = env
+        .executor
+        .start_task(env.parent, req.clone())
+        .expect_err("a post-admission read failure must be caller-visible");
+    assert!(matches!(err, ExecError::Internal(_)), "{err}");
+    assert!(
+        err.to_string().contains("recovery-required"),
+        "the outcome must say the run is durably recorded and recovery-required: {err}"
+    );
+    assert_eq!(
+        env.provider.count(),
+        0,
+        "no provider call happens for a run whose drive never spawned"
+    );
+    // The durable admission row itself is the recovery anchor: it exists
+    // even though the drive never spawned.
+    let digest = crate::runtime::task_executor::task_start_digest(&req).expect("digest");
+    let claim = env
+        .manager
+        .store()
+        .task_admission_peek(env.parent, KEY_A, &digest, env.manager.admission_now_ms())
+        .unwrap();
+    assert!(
+        claim.is_some(),
+        "the accepted run must have a durable admission row for recovery"
+    );
+    // The seam is one-shot; the retry replays the byte-identical durable
+    // receipt (at-most-once) and still executes zero provider calls.
+    let replay = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("the durable acceptance replays");
+    assert!(replay.op_id.is_some(), "the replay carries the durable op");
+    assert_eq!(env.provider.count(), 0, "still zero provider calls");
+}

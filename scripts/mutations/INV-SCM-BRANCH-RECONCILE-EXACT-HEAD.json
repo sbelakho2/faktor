@@ -1,0 +1,12 @@
+{
+  "id": "INV-SCM-BRANCH-RECONCILE-EXACT-HEAD",
+  "file": "crates/scm/src/github.rs",
+  "find": "        if let Some(existing) = self\n            .remote_ref_lookup(repository, &spec.branch, &spec.marker)\n            .await?\n        {\n            if existing.0 != spec.head_sha {",
+  "replace": "        if let Some(existing) = self\n            .remote_ref_lookup(repository, &spec.branch, &spec.marker)\n            .await?\n        {\n            if existing.0 == spec.head_sha {",
+  "gate": "cargo test -p faktor-scm --test github_adapter branch_create_is_bounded_to_the_exact_head_and_reconciles_existing",
+  "expect": "FAILED",
+  "note": "Negating the drift check turns a matching head into a conflict.",
+  "capabilities": [
+    "scm.branch_reconcile"
+  ]
+}

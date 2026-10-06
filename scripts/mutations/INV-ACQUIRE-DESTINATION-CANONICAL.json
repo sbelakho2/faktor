@@ -1,0 +1,12 @@
+{
+  "id": "INV-ACQUIRE-DESTINATION-CANONICAL",
+  "file": "crates/acquire/src/request.rs",
+  "find": "    let host = canonicalize_request_host(host_raw, false, None).map_err(|reason| {\n        invalid(format!(\n            \"identity host {host_raw:?} is not a canonical destination host: {reason}\"\n        ))\n    })?;",
+  "replace": "    let host = host_raw.to_string();",
+  "gate": "cargo test -p faktor-acquire --lib request::tests::non_canonical_destination_hosts_and_ports_are_refused",
+  "expect": "FAILED",
+  "note": "Bypassing destination canonicalization admits hostile host shapes.",
+  "capabilities": [
+    "acquire.destination_identity"
+  ]
+}

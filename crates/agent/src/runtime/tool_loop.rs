@@ -1056,6 +1056,8 @@ impl AgentRuntime {
                     event: faktor_hooks::HookEvent::PreTool,
                     session_id: Some(handle.id().to_string()),
                     operation_id: Some(turn_op.to_string()),
+                    // P1: the anchored session workspace, never the daemon cwd.
+                    workspace_root: root.as_deref().map(std::path::Path::to_path_buf),
                     payload: serde_json::json!({ "tool": name, "args": input }),
                     ..Default::default()
                 };

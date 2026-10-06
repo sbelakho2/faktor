@@ -1149,12 +1149,24 @@ pub fn run_command_tool() -> Tool {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let filesystem_isolation = if read_only {
+                    // P0: provisioning runs through the ROOTED filesystem
+                    // authority (anchored, no-follow component walk), never
+                    // raw create_dir_all on workspace path text: a hostile
+                    // `.faktor-derived` symlink can never redirect the
+                    // daemon's mkdir outside the workspace, and a
+                    // preparation failure is a typed refusal BEFORE exec —
+                    // infrastructure failure never masquerades as user-code
+                    // failure.
                     let mut writable_roots = Vec::new();
-                    for rel in ["target", ".faktor/build-scratch"] {
+                    for rel in ["target", ".faktor-derived/build-scratch"] {
                         let path = ws.root().join(rel);
-                        if std::fs::create_dir_all(&path).is_ok() {
-                            writable_roots.push(path);
-                        }
+                        ws.create_dir_all_no_follow(std::path::Path::new(rel))
+                            .map_err(|e| {
+                                Error::permission(format!(
+                                    "sandbox preparation failed for {rel:?}: {e}"
+                                ))
+                            })?;
+                        writable_roots.push(path);
                     }
                     faktor_terminal::FilesystemIsolation::WorkspaceReadOnly {
                         roots: vec![ws.root().to_path_buf()],

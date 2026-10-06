@@ -1,0 +1,9 @@
+{
+  "id": "INV-DURABLE-JSON-NO-EMPTY-DEFAULT",
+  "file": "crates/store/src/tasks.rs",
+  "find": "        let criteria_json = durable_json(\"task acceptance_criteria\", &t.acceptance_criteria)?;",
+  "replace": "        let criteria_json = serde_json::to_string(&t.acceptance_criteria)\n            .unwrap_or_else(|_| \"[]\".into());",
+  "gate": "cargo test -p faktor-tests-static-authority durable_serialization",
+  "expect": "FAILED",
+  "note": "Reintroducing the empty-array fallback makes a serialization failure look like missing criteria."
+}

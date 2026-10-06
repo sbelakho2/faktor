@@ -8567,4 +8567,48 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
         );
         assert!(!manifest_raw_read_offenders(&f).is_empty());
     }
+
+    /// P2: durable-write modules must never turn a serialization failure
+    /// into a plausible empty default (`[]`/`{}`/`unwrap_or_default`). A
+    /// future field or custom serializer could otherwise persist "no
+    /// criteria / no checks / no changed files" on an error. The scan is
+    /// whitespace-insensitive so multi-line fallback chains cannot hide.
+    #[test]
+    fn durable_serialization_never_silently_defaults_to_empty() {
+        let root = repo_root();
+        let modules = [
+            "crates/store/src/tasks.rs",
+            "crates/store/src/ledger.rs",
+            "crates/store/src/attachments.rs",
+            "crates/session/src/child.rs",
+            "crates/session/src/handle.rs",
+            "crates/store/src/migration.rs",
+        ];
+        let suffixes = [
+            "unwrap_or_default()",
+            "unwrap_or_else(|_|\"[]\"",
+            "unwrap_or_else(|_|\"{}\"",
+            "unwrap_or_else(|_|String::from(\"[]\")",
+        ];
+        let mut violations = Vec::new();
+        for rel in modules {
+            let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+                continue;
+            };
+            let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let mut at = 0usize;
+            while let Some(found) = compact[at..].find("serde_json::to_") {
+                let start = at + found;
+                let window = &compact[start..compact.len().min(start + 220)];
+                if suffixes.iter().any(|suffix| window.contains(suffix)) {
+                    violations.push(format!("{rel}: {window}"));
+                }
+                at = start + "serde_json::to_".len();
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "durable serialization must fail typed, never default to an empty value: {violations:#?}"
+        );
+    }
 }

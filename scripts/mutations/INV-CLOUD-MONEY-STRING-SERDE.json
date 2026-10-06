@@ -1,0 +1,12 @@
+{
+  "id": "INV-CLOUD-MONEY-STRING-SERDE",
+  "file": "crates/cloud/src/money.rs",
+  "find": "{\n    serializer.serialize_str(&value.to_string())\n}",
+  "replace": "{\n    serializer.serialize_u64(*value)\n}",
+  "gate": "cargo test -p faktor-cloud --lib money::tests::money_fields_serialize_as_quoted_decimal_strings_at_every_boundary",
+  "expect": "FAILED",
+  "note": "Serializing money as a JSON number breaks the quoted-decimal wire contract.",
+  "capabilities": [
+    "cloud.money_strings"
+  ]
+}

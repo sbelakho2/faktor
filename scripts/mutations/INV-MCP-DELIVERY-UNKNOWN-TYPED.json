@@ -1,0 +1,12 @@
+{
+  "id": "INV-MCP-DELIVERY-UNKNOWN-TYPED",
+  "file": "crates/mcp/src/lib.rs",
+  "find": "    Error::new(\n        ErrorKind::Provider {\n            code: DELIVERY_UNKNOWN_CODE.into(),\n            retryable: false,\n        },\n        DeliveryUnknown { what: what.into() }.to_string(),\n    )",
+  "replace": "    Error::new(\n        ErrorKind::Provider {\n            code: DELIVERY_UNKNOWN_CODE.into(),\n            retryable: true,\n        },\n        DeliveryUnknown { what: what.into() }.to_string(),\n    )",
+  "gate": "cargo test -p faktor-mcp --lib delivery_unknown_is_typed_by_code_and_not_retryable",
+  "expect": "FAILED",
+  "note": "Marking delivery-unknown retryable breaks the never-retryable typed contract.",
+  "capabilities": [
+    "mcp.delivery_unknown"
+  ]
+}

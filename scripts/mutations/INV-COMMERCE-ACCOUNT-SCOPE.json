@@ -1,0 +1,12 @@
+{
+  "id": "INV-COMMERCE-ACCOUNT-SCOPE",
+  "file": "crates/commerce/src/offer.rs",
+  "find": "        match &self.account_scope {\n            Some(scope) => account == Some(scope),\n            None => true,\n        }",
+  "replace": "        match &self.account_scope {\n            Some(_scope) => true,\n            None => true,\n        }",
+  "gate": "cargo test -p faktor-commerce --test quote_resolution account_pricing_requires_the_matching_scope_and_wins_at_equal_tiers",
+  "expect": "FAILED",
+  "note": "Ignoring the account scope applies account pricing to every context.",
+  "capabilities": [
+    "commerce.quote_scope"
+  ]
+}

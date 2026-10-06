@@ -1,0 +1,9 @@
+{
+  "id": "INV-GIT-METADATA-TRUST",
+  "file": "crates/agent/src/runtime/shell_changes.rs",
+  "find": "    if clean_absolute(std::path::Path::new(back.trim())) != dot {\n        return None;\n    }",
+  "replace": "    let _ = back;",
+  "gate": "cargo test -p faktor-agent --lib hostile_git_pointers_are_refused_without_authority_keys",
+  "expect": "FAILED",
+  "note": "Removing the reciprocal gitdir binding lets an unbound external worktree layout be fingerprinted."
+}

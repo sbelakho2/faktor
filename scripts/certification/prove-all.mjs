@@ -78,6 +78,7 @@ export function dirtyCheckout(root) {
 const CHECKS = [
   { name: 'invariants', command: ['node', ['scripts/check-invariants.mjs']] },
   { name: 'coverage', command: ['node', ['scripts/check-invariant-coverage.mjs', '--release']] },
+  { name: 'discovery', command: ['node', ['scripts/discover-capabilities.mjs', 'selftest']] },
   { name: 'workflow-graph', command: ['node', ['scripts/certification/check-workflow-graph.mjs', '--check']] },
   { name: 'publisher', command: ['node', ['scripts/certification/publish-status.mjs', 'selftest']] },
   { name: 'soak-sampler', command: ['python3', ['scripts/certification/soak-convergence.py', 'selftest']] },
@@ -96,6 +97,9 @@ const CHECKS = [
     ],
   })),
   { name: 'contracts-emit', command: ['node', ['scripts/contracts/emit.mjs', 'selftest']] },
+  // P2: the REAL checked-in contract digest, not merely the emitter's
+  // selftest — a stale generated contract must fail inside prove-all itself.
+  { name: 'contracts-verify', command: ['node', ['scripts/contracts/emit.mjs', 'verify', '--print-digest']] },
 ];
 
 function runChecks() {
@@ -132,6 +136,15 @@ function main() {
   }
   const before = checkoutDigest(ROOT);
   const { results, failed } = runChecks();
+  let contractDigest = null;
+  try {
+    contractDigest = execFileSync('node', ['scripts/contracts/emit.mjs', 'verify', '--print-digest'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    contractDigest = null;
+  }
   const dirtyAfter = dirtyCheckout(ROOT);
   const after = checkoutDigest(ROOT);
   const report = {
@@ -144,6 +157,7 @@ function main() {
       clean: dirtyAfter === null,
     },
     checks: results,
+    contract_digest: contractDigest,
     not_proven_here: [
       'platform certificate authentication (ci/faktor/trusted-certified-{linux,darwin,windows} signatures) — publish-status aggregate lane',
       'mutation campaign tree barrier and isolated-copy execution — check-invariants --mutations lane',

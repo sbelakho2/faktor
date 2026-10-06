@@ -1,0 +1,9 @@
+{
+  "id": "INV-CAPABILITY-DISCOVERY-OMISSION",
+  "file": "crates/server/src/api/lifecycle.rs",
+  "find": "        .route(\"/models\", get(native_models))",
+  "replace": "        .route(\"/models\", get(native_models))\n        .route(\"/ghost-probe\", get(native_models))",
+  "gate": "node scripts/check-invariant-coverage.mjs --check",
+  "expect": "FAIL",
+  "note": "Adds a native route with no proof-manifest row: the discovery-equality check must fail in --check mode, so an omitted capability can never pass certification."
+}

@@ -1,0 +1,9 @@
+{
+  "id": "INV-READONLY-SHELL-ROOTED-PROVISIONING",
+  "file": "crates/fs/src/platform/unix.rs",
+  "find": "        match openat_comp(&dir, &comp, O_DIR | libc::O_NOFOLLOW | libc::O_CLOEXEC) {\n            Ok(fd) => dir = fd,\n            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {",
+  "replace": "        match openat_comp(&dir, &comp, O_DIR | libc::O_CLOEXEC) {\n            Ok(fd) => dir = fd,\n            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {",
+  "gate": "cargo test -p faktor-fs --lib create_dir_all_no_follow",
+  "expect": "FAILED",
+  "note": "Drops O_NOFOLLOW from the rooted create walk: a symlinked component (the audit's hostile .faktor-derived link) is followed and the daemon can mkdir outside the workspace."
+}

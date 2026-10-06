@@ -329,7 +329,12 @@ pub(crate) fn scripted_provider(script: Vec<ScriptedResponse>) -> FakeProvider {
 }
 
 pub(crate) fn new_session(deps: &AgentDeps) -> SessionId {
-    let ws = deps.session.create_workspace("/w").unwrap();
+    // A REAL directory: lifecycle hooks (P1) refuse to run without an
+    // anchored session workspace, and `/w` does not exist.
+    let ws = deps
+        .session
+        .create_workspace(std::env::temp_dir().to_str().unwrap())
+        .unwrap();
     deps.session
         .create_session(ws, "test session", "fake", "m")
         .unwrap()

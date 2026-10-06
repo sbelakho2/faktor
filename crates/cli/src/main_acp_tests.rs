@@ -941,7 +941,10 @@ async fn mcp_hook_and_terminal_children_share_one_daemon_supervisor() {
     let hook_thread = std::thread::spawn(move || {
         registry.run(
             faktor_hooks::HookEvent::PreTool,
-            &faktor_hooks::HookInput::default(),
+            &faktor_hooks::HookInput {
+                workspace_root: Some(std::env::temp_dir()),
+                ..Default::default()
+            },
         )
     });
     let sup = supervisor.clone();

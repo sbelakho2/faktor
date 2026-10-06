@@ -5,5 +5,8 @@
   "replace": "                    let outranks = true;",
   "gate": "cargo test -p faktor-index --lib eviction_is_canonical_across_100_permutations_and_hash_seeds",
   "expect": "assertion|left.*right",
-  "note": "Canonical admission is replaced by unconditional eviction: the surviving file set becomes insertion-order dependent (an older straggler displaces a newer resident), so the cap no longer holds the top (modified_ms, path) set."
+  "note": "Canonical admission is replaced by unconditional eviction: the surviving file set becomes insertion-order dependent (an older straggler displaces a newer resident), so the cap no longer holds the top (modified_ms, path) set.",
+  "capabilities": [
+    "index.authority"
+  ]
 }

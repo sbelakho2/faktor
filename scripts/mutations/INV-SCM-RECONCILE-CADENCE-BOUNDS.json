@@ -5,5 +5,8 @@
   "replace": "        if self.jitter_ms < 0\n            || self.jitter_ms > MAX_RECONCILE_JITTER_MS\n        {",
   "gate": "cargo test -p faktor-scm --lib cadence_jitter_and_backoff_bounds_are_enforced",
   "expect": "FAILED",
-  "note": "Dropping the jitter<=interval bound accepts a hostile cadence policy the reconciler must refuse."
+  "note": "Dropping the jitter<=interval bound accepts a hostile cadence policy the reconciler must refuse.",
+  "capabilities": [
+    "scm.reconcile_cadence"
+  ]
 }
