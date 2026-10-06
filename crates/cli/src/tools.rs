@@ -1073,7 +1073,11 @@ pub fn run_command_tool() -> Tool {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string" }
+                "command": { "type": "string" },
+                "read_only": {
+                    "type": "boolean",
+                    "description": "Verification-style command: the kernel denies workspace writes (only build/scratch roots stay writable) and no whole-workspace change accounting is needed. Use for builds, tests, and read-only queries."
+                }
             },
             "required": ["command"]
         }),
@@ -1135,10 +1139,34 @@ pub fn run_command_tool() -> Tool {
                 // gets; daemon-owned paths outside it are denied by the
                 // kernel and surface to the command as EACCES — never as a
                 // projection that says `workspace` while the child roams.
-                let filesystem_isolation = faktor_terminal::FilesystemIsolation::for_requirement(
-                    sandbox.spawn_filesystem_requirement(),
-                    vec![ws.root().to_path_buf()],
-                );
+                // P1-8 read-only split: `read_only` commands run under
+                // KERNEL write denial — the workspace is read/execute-only
+                // and only explicit build/scratch roots are writable — so
+                // they need no whole-workspace change manifest and never
+                // consume a path-constrained ChangeBudget.
+                let read_only = args
+                    .get("read_only")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let filesystem_isolation = if read_only {
+                    let mut writable_roots = Vec::new();
+                    for rel in ["target", ".faktor/build-scratch"] {
+                        let path = ws.root().join(rel);
+                        if std::fs::create_dir_all(&path).is_ok() {
+                            writable_roots.push(path);
+                        }
+                    }
+                    faktor_terminal::FilesystemIsolation::WorkspaceReadOnly {
+                        roots: vec![ws.root().to_path_buf()],
+                        writable_roots,
+                        required: true,
+                    }
+                } else {
+                    faktor_terminal::FilesystemIsolation::for_requirement(
+                        sandbox.spawn_filesystem_requirement(),
+                        vec![ws.root().to_path_buf()],
+                    )
+                };
                 let cfg = SpawnConfig {
                     cmd: resolved.program.to_string_lossy().into_owned(),
                     args: resolved

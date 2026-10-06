@@ -22,14 +22,19 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const OUT = join(ROOT, 'target/certification/prove-all.json');
 
-/** Content hash of every tracked worktree file (committed or not). */
+/**
+ * Content hash of every tracked worktree file (committed or not), including
+ * the executable/symlink METADATA that decides what the checked-out tree can
+ * actually run: mode bits and symlink targets are part of the proof input,
+ * not merely file contents.
+ */
 export function checkoutDigest(root) {
   const files = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' })
     .split('\0')
@@ -37,18 +42,25 @@ export function checkoutDigest(root) {
     .sort();
   const hash = createHash('sha256');
   for (const file of files) {
-    let bytes;
+    hash.update(`${file}\0`);
+    let info;
     try {
-      bytes = readFileSync(join(root, file));
+      info = lstatSync(join(root, file));
     } catch {
       // A tracked file deleted from the worktree is part of the checked-out
       // state: hash the deletion marker, never skip it.
-      hash.update(`${file}\0<deleted>\0`);
+      hash.update('<deleted>\0');
       continue;
     }
-    hash.update(`${file}\0`);
-    hash.update(bytes);
-    hash.update('\0');
+    hash.update(`mode=${info.mode.toString(8)}\0`);
+    if (info.isSymbolicLink()) {
+      hash.update(`symlink=${readlinkSync(join(root, file))}\0`);
+    } else if (info.isFile()) {
+      hash.update(readFileSync(join(root, file)));
+      hash.update('\0');
+    } else {
+      hash.update(`kind=${info.isDirectory() ? 'dir' : 'other'}\0`);
+    }
   }
   return { digest: hash.digest('hex'), files: files.length };
 }
@@ -65,11 +77,24 @@ export function dirtyCheckout(root) {
 
 const CHECKS = [
   { name: 'invariants', command: ['node', ['scripts/check-invariants.mjs']] },
-  { name: 'coverage', command: ['node', ['scripts/check-invariant-coverage.mjs', '--check']] },
+  { name: 'coverage', command: ['node', ['scripts/check-invariant-coverage.mjs', '--release']] },
   { name: 'workflow-graph', command: ['node', ['scripts/certification/check-workflow-graph.mjs', '--check']] },
   { name: 'publisher', command: ['node', ['scripts/certification/publish-status.mjs', 'selftest']] },
   { name: 'soak-sampler', command: ['python3', ['scripts/certification/soak-convergence.py', 'selftest']] },
-  { name: 'visual-record', command: ['python3', ['scripts/certification/check-visual-baseline.py', 'selftest']] },
+  { name: 'visual-record-selftest', command: ['python3', ['scripts/certification/check-visual-baseline.py', 'selftest']] },
+  // P0-PROOF: the REAL committed baseline, not its checker's fixtures. A
+  // missing or unfingerprinted required platform refuses the release gate.
+  { name: 'visual-record-release', command: ['node', ['scripts/check-visual-platforms.mjs', '--release']] },
+  // Every REQUIRED platform record, including its resolved font fingerprint:
+  // the real committed baseline, never a synthetic fixture.
+  ...['linux', 'macos', 'windows'].map((platform) => ({
+    name: `visual-${platform}`,
+    command: [
+      'python3',
+      ['scripts/certification/check-visual-baseline.py', '--platform', platform,
+       '--file', 'apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json'],
+    ],
+  })),
   { name: 'contracts-emit', command: ['node', ['scripts/contracts/emit.mjs', 'selftest']] },
 ];
 
@@ -96,16 +121,28 @@ function runChecks() {
 }
 
 function main() {
-  const dirty = dirtyCheckout(ROOT);
-  if (dirty !== null) {
-    console.error(`prove-all: FAIL — the checkout is dirty (${dirty}); certifying bytes must be committed`);
+  // PROOF SANDWICH (P1-PROOF): hash the actual checkout bytes BEFORE and
+  // AFTER every sub-check and refuse unless the tree stayed byte- and
+  // metadata-identical the whole time. A sub-gate that mutates source (or
+  // flips an executable bit) can no longer be certified from stale state.
+  const dirtyBefore = dirtyCheckout(ROOT);
+  if (dirtyBefore !== null) {
+    console.error(`prove-all: FAIL — the checkout is dirty (${dirtyBefore}); certifying bytes must be committed`);
     return 1;
   }
-  const { digest, files } = checkoutDigest(ROOT);
+  const before = checkoutDigest(ROOT);
   const { results, failed } = runChecks();
+  const dirtyAfter = dirtyCheckout(ROOT);
+  const after = checkoutDigest(ROOT);
   const report = {
-    schema: 'faktor-prove-all/v1',
-    checkout: { digest: `sha256:${digest}`, files, clean: true },
+    schema: 'faktor-prove-all/v2',
+    checkout: {
+      digest_before: `sha256:${before.digest}`,
+      digest_after: `sha256:${after.digest}`,
+      stable: before.digest === after.digest && dirtyAfter === null,
+      files: before.files,
+      clean: dirtyAfter === null,
+    },
     checks: results,
     not_proven_here: [
       'platform certificate authentication (ci/faktor/trusted-certified-{linux,darwin,windows} signatures) — publish-status aggregate lane',
@@ -116,14 +153,26 @@ function main() {
   };
   mkdirSync(dirname(OUT), { recursive: true });
   writeFileSync(OUT, `${JSON.stringify(report, null, 2)}\n`);
+  if (dirtyAfter !== null) {
+    console.error(`prove-all: FAIL — the checkout became dirty during the proof (${dirtyAfter})`);
+    return 1;
+  }
+  if (before.digest !== after.digest) {
+    console.error(
+      `prove-all: FAIL — the checkout bytes changed during the proof (${before.digest} -> ${after.digest})`,
+    );
+    return 1;
+  }
   if (failed) {
     for (const result of results.filter((entry) => entry.status === 'failed')) {
       console.error(`prove-all: check ${result.name} FAILED\n${result.tail}`);
     }
-    console.error(`prove-all: FAIL (checkout sha256:${digest}, ${files} files)`);
+    console.error(`prove-all: FAIL (checkout sha256:${before.digest}, ${before.files} files)`);
     return 1;
   }
-  console.log(`prove-all: PASS (checkout sha256:${digest}, ${files} files, ${results.length} offline checks)`);
+  console.log(
+    `prove-all: PASS (checkout sha256:${before.digest} stable before and after, ${before.files} files, ${results.length} offline checks)`,
+  );
   return 0;
 }
 
@@ -157,6 +206,24 @@ function selftest() {
     // A deleted tracked file is part of the checked-out state.
     rmSync(join(dir, 'a.txt'));
     check('a deleted tracked file changes the digest', checkoutDigest(dir).digest !== edited.digest);
+    // Executable/symlink metadata is part of the proof input.
+    writeFileSync(join(dir, 'a.txt'), 'two');
+    execFileSync('git', ['add', 'a.txt'], { cwd: dir });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=selftest@example.invalid', '-c', 'user.name=selftest', 'commit', '--quiet', '-m', 'y'],
+      { cwd: dir },
+    );
+    const plain = checkoutDigest(dir).digest;
+    execFileSync('chmod', ['+x', join(dir, 'a.txt')]);
+    check('a mode-bit change changes the checkout digest', checkoutDigest(dir).digest !== plain);
+    rmSync(join(dir, 'a.txt'));
+    execFileSync('ln', ['-s', 'target.txt', join(dir, 'link.txt')]);
+    execFileSync('git', ['add', 'a.txt', 'link.txt'], { cwd: dir });
+    const withLink = checkoutDigest(dir).digest;
+    rmSync(join(dir, 'link.txt'));
+    execFileSync('ln', ['-s', 'other.txt', join(dir, 'link.txt')]);
+    check('a symlink target change changes the checkout digest', checkoutDigest(dir).digest !== withLink);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

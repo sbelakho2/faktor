@@ -18,6 +18,7 @@ tokio = { version = "1.53", features = ["time"] }
 
 [dev-dependencies]
 faktor-cas = { path = "../cas" }
+faktor-provider = { path = "../provider", features = ["test-utils"] }
 faktor-security = { path = "../security" }
 tempfile = "3"
 tokio = { version = "1.53", features = ["macros", "rt", "time"] }

@@ -36,6 +36,7 @@ pub struct OwnershipSet(Vec<String>);
 
 #[path = "path_identity.rs"]
 mod path_identity;
+mod unicode_data;
 
 impl OwnershipSet {
     pub fn new(paths: impl IntoIterator<Item = String>) -> Self {

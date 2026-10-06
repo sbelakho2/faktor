@@ -13,6 +13,44 @@ pub(crate) const EPHEMERAL_WORKSPACE_ID_BASE: u64 = 1 << 63;
 /// further registrations degrade immediately instead of allocating anything.
 const WATCH_REGISTRATION_QUEUE_DEPTH: usize = 2;
 
+/// Default preflight bound: entries examined before a root is handed to the
+/// recursive watcher backend. Above this the service degrades to fingerprint
+/// reconciliation instead of risking an unbounded recursive walk.
+pub(crate) const DEFAULT_WATCH_PREFLIGHT_ENTRIES: usize = 50_000;
+const WATCH_PREFLIGHT_MAX_DEPTH: usize = 64;
+
+/// Bounded, symlink-safe preflight walk: returns false as soon as the entry
+/// cap or depth cap is exceeded, so the caller never invokes the
+/// uninterruptible backend on a pathological tree.
+fn watch_preflight_bounded(root: &std::path::Path, max_entries: usize) -> bool {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > WATCH_PREFLIGHT_MAX_DEPTH {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > max_entries {
+                return false;
+            }
+            // `file_type` does not follow symlinks: a symlinked directory is
+            // never traversed by the preflight (and `notify` defaults are
+            // configured no-follow elsewhere).
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    true
+}
+
 /// Outcome of one bounded watcher registration (P2-FS).
 enum WatchRegistrationOutcome {
     /// Watcher attached; the handle owns it.
@@ -127,6 +165,11 @@ pub struct WorkspaceFileService {
     /// Bounded recursive-watcher registration deadline (see
     /// [`DEFAULT_WATCH_REGISTRATION_DEADLINE`]).
     watch_registration_deadline: std::time::Duration,
+    /// Bounded pre-registration tree examination cap (P1-7): a root with more
+    /// entries than this is refused WITHOUT ever handing it to the
+    /// uninterruptible `notify` backend, so one pathological workspace can
+    /// never wedge the singleton worker for every other workspace.
+    watch_preflight_entries: usize,
     /// Monotonic allocator for [`Self::open_ephemeral`] identities.
     next_ephemeral_id: AtomicU64,
 }
@@ -136,6 +179,7 @@ impl Default for WorkspaceFileService {
         Self {
             workspaces: Mutex::new(HashMap::new()),
             watch_registration_deadline: DEFAULT_WATCH_REGISTRATION_DEADLINE,
+            watch_preflight_entries: DEFAULT_WATCH_PREFLIGHT_ENTRIES,
             next_ephemeral_id: AtomicU64::new(EPHEMERAL_WORKSPACE_ID_BASE),
         }
     }
@@ -152,6 +196,16 @@ impl WorkspaceFileService {
     pub fn with_watch_registration_deadline(deadline: std::time::Duration) -> Arc<Self> {
         Arc::new(Self {
             watch_registration_deadline: deadline,
+            ..Self::default()
+        })
+    }
+
+    /// A service with an explicit watcher preflight entry cap: tests prove a
+    /// pathological root degrades WITHOUT wedging the singleton worker while
+    /// an ordinary root still attaches a real watcher.
+    pub fn with_watch_preflight_entries(entries: usize) -> Arc<Self> {
+        Arc::new(Self {
+            watch_preflight_entries: entries,
             ..Self::default()
         })
     }
@@ -247,6 +301,18 @@ impl WorkspaceFileService {
                 workspace = workspace_id.raw(),
                 root = %root.display(),
                 "workspace root is the filesystem root: recursive watch registration is unbounded; opening WITHOUT a watcher (fingerprint reconciliation only)"
+            );
+            None
+        } else if !watch_preflight_bounded(&root, self.watch_preflight_entries) {
+            // P1-7: a root beyond the preflight bound is refused HERE, before
+            // the uninterruptible recursive backend is ever asked to walk it:
+            // one pathological workspace degrades itself and cannot starve
+            // every later registration behind a wedged singleton worker.
+            tracing::warn!(
+                workspace = workspace_id.raw(),
+                root = %root.display(),
+                entries = self.watch_preflight_entries,
+                "workspace exceeds the watcher preflight entry bound; opening WITHOUT a watcher (fingerprint reconciliation only)"
             );
             None
         } else {

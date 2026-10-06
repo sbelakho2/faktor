@@ -33,6 +33,7 @@
 // release-critical entry without one already fails before this mode runs.
 
 import { createHash } from 'node:crypto';
+import { provisionSupport } from './mutation-support.mjs';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -130,23 +131,40 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Continuous barrier child: appends a violation count file on exit. */
+/**
+ * Continuous barrier child: samples the trusted checkout's METADATA every
+ * 200ms (path+size+mtime; any accidental write bumps mtime, even if the
+ * content is restored) and, when the metadata moved, re-digests the CONTENT
+ * to distinguish a real byte change from metadata-only churn. It reports
+ * both counts as JSON on exit; the parent fails closed on either. A
+ * metadata-preserving content rewrite (utimensat) is outside this sampler's
+ * contract: CI runs the campaign in a scratch copy, leaving the trusted
+ * checkout untouched, and the before/after content digests bound the window.
+ */
 function treeBarrier(args) {
   const root = resolve(args[1]);
   const baseline = args[2];
-  const out = args[3];
+  const baselineContent = args[3];
+  const out = args[4];
   let violations = 0;
+  let contentViolations = 0;
   const timer = setInterval(() => {
     try {
-      if (treeMetaDigest(root) !== baseline) violations += 1;
+      if (treeMetaDigest(root) !== baseline) {
+        violations += 1;
+        if (contentViolations === 0 && treeContentDigest(root) !== baselineContent) {
+          contentViolations += 1;
+        }
+      }
     } catch {
       violations += 1;
+      contentViolations += 1;
     }
   }, 200);
   const finish = () => {
     clearInterval(timer);
     try {
-      writeFileSync(out, String(violations));
+      writeFileSync(out, JSON.stringify({ violations, content_violations: contentViolations }));
     } catch {
       // best effort: the parent fails closed when the file is absent
     }
@@ -669,30 +687,33 @@ function main() {
     const barrierOut = join(barrierDir, 'violations');
     const hasher = spawn(
       process.execPath,
-      [fileURLToPath(import.meta.url), '--tree-barrier', root, baselineMeta, barrierOut],
+      [
+        fileURLToPath(import.meta.url),
+        '--tree-barrier',
+        root,
+        baselineMeta,
+        baselineContent,
+        barrierOut,
+      ],
       { stdio: 'ignore' },
     );
     const scratch = mkdtempSync(join(tmpdir(), 'faktor-mutation-campaign-'));
     cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
-    // Gate support trees that must not be copied (multi-GB): the built CLI
-    // the JetBrains gradle smokes execute, and the VS Code extension's
-    // installed dev dependencies the TS loader requires.
-    const cliSupport = join(root, 'target', 'debug', 'faktor-cli');
-    if (existsSync(cliSupport)) {
-      mkdirSync(join(scratch, 'target', 'debug'), { recursive: true });
-      try {
-        symlinkSync(cliSupport, join(scratch, 'target', 'debug', 'faktor-cli'));
-      } catch {
-        // A missing link makes the affected control gate fail loudly.
-      }
-    }
-    const modulesSupport = join(root, 'apps', 'vscode', 'node_modules');
-    if (existsSync(modulesSupport)) {
-      try {
-        symlinkSync(modulesSupport, join(scratch, 'apps', 'vscode', 'node_modules'));
-      } catch {
-        // As above.
-      }
+    // Snapshot the gate support trees (P2-9): the CLI is an immutable
+    // COPY and node_modules a hardlink snapshot, both content-digested into
+    // evidence — never symlinks back into the trusted checkout.
+    const support = provisionSupport(root, scratch);
+    console.log(
+      `invariants-mutations: support cli=${support.cli?.sha256 ?? 'none'} node_modules=${support.node_modules?.digest ?? 'none'} (${support.node_modules?.method ?? 'none'})`,
+    );
+    try {
+      mkdirSync(join(root, 'target', 'certification'), { recursive: true });
+      writeFileSync(
+        join(root, 'target', 'certification', 'mutation-support.json'),
+        `${JSON.stringify(support, null, 2)}\n`,
+      );
+    } catch {
+      // Evidence copy is best-effort; the console line is the record.
     }
     const mutationEnv = {
       ...process.env,
@@ -729,16 +750,25 @@ function main() {
       }
       rmSync(scratch, { recursive: true, force: true });
     }
-    let barrierViolations = null;
+    let barrierReport = null;
     if (existsSync(barrierOut)) {
-      barrierViolations = Number(readFileSync(barrierOut, 'utf8'));
+      try {
+        barrierReport = JSON.parse(readFileSync(barrierOut, 'utf8'));
+      } catch {
+        barrierReport = null;
+      }
       rmSync(barrierDir, { recursive: true, force: true });
     }
     const contentAfter = treeContentDigest(root);
     const dirtyAfter = gitCleanProblem(root);
-    if (barrierViolations === null || Number.isNaN(barrierViolations) || barrierViolations > 0) {
+    if (
+      barrierReport === null ||
+      typeof barrierReport.violations !== 'number' ||
+      barrierReport.violations > 0 ||
+      barrierReport.content_violations > 0
+    ) {
       console.error(
-        `check-invariants --mutations: FAIL — the tree barrier observed the trusted checkout change during the campaign (${barrierViolations} violation sample(s)); mutations must never touch the certifying tree`,
+        `check-invariants --mutations: FAIL — the tree barrier observed the trusted checkout change during the campaign (metadata samples=${barrierReport?.violations ?? 'unknown'}, content violations=${barrierReport?.content_violations ?? 'unknown'}); mutations must never touch the certifying tree`,
       );
       return 1;
     }

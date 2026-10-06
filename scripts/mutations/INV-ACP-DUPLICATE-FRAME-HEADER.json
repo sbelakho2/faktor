@@ -1,0 +1,9 @@
+{
+  "id": "INV-ACP-DUPLICATE-FRAME-HEADER",
+  "file": "crates/acp/src/protocol.rs",
+  "find": "            if content_length.is_some() {\n                return Err(FrameError::recoverable(\n                    \"duplicate Content-Length header\",\n                    header_end,\n                ));\n            }",
+  "replace": "            // duplicate Content-Length guard removed",
+  "gate": "cargo test -p faktor-acp --lib missing_or_duplicate_content_length_rejected",
+  "expect": "FAILED",
+  "note": "Dropping the duplicate-header refusal lets a second Content-Length silently override the first."
+}

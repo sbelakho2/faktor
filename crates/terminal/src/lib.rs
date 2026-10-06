@@ -291,6 +291,22 @@ pub enum FilesystemIsolation {
         /// Fail closed when the OS mechanism cannot be installed.
         required: bool,
     },
+    /// P1 usability/security split: OS-level confinement in which the listed
+    /// roots are READ/EXECUTE-ONLY for the whole process tree and only the
+    /// explicit build/scratch roots are writable. This is the mode for
+    /// verification-style commands (`cargo check`, `git status`, test
+    /// runners): the kernel physically denies workspace mutation, so no
+    /// whole-workspace change manifest is needed, and a path-constrained
+    /// ChangeBudget is never consumed by a read-only command.
+    WorkspaceReadOnly {
+        /// Read-/execute-only roots (the session workspace).
+        roots: Vec<PathBuf>,
+        /// Writable build/scratch roots (created by the caller inside the
+        /// workspace; everything beneath each is writable).
+        writable_roots: Vec<PathBuf>,
+        /// Fail closed when the OS mechanism cannot be installed.
+        required: bool,
+    },
 }
 
 impl FilesystemIsolation {
@@ -320,19 +336,34 @@ impl FilesystemIsolation {
             FilesystemIsolation::Inherit => "inherit",
             FilesystemIsolation::Workspace { required: true, .. } => "workspace",
             FilesystemIsolation::Workspace { .. } => "workspace_best_effort",
+            FilesystemIsolation::WorkspaceReadOnly { required: true, .. } => "workspace_read_only",
+            FilesystemIsolation::WorkspaceReadOnly { .. } => "workspace_read_only_best_effort",
         }
     }
 
     /// True when the demand is fail-closed (no silent fallback).
     pub fn is_required(&self) -> bool {
-        matches!(self, FilesystemIsolation::Workspace { required: true, .. })
+        matches!(
+            self,
+            FilesystemIsolation::Workspace { required: true, .. }
+                | FilesystemIsolation::WorkspaceReadOnly { required: true, .. }
+        )
     }
 
     /// The roots the confinement grants (empty for `Inherit`).
     pub fn roots(&self) -> &[PathBuf] {
         match self {
             FilesystemIsolation::Inherit => &[],
-            FilesystemIsolation::Workspace { roots, .. } => roots,
+            FilesystemIsolation::Workspace { roots, .. }
+            | FilesystemIsolation::WorkspaceReadOnly { roots, .. } => roots,
+        }
+    }
+
+    /// The writable build/scratch roots granted by a read-only demand.
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        match self {
+            FilesystemIsolation::WorkspaceReadOnly { writable_roots, .. } => writable_roots,
+            _ => &[],
         }
     }
 }
@@ -1724,14 +1755,34 @@ impl ProcessSupervisor {
             }
         }
         #[cfg(target_os = "linux")]
-        if let FilesystemIsolation::Workspace { roots, required } = &cfg.filesystem_isolation {
-            // SAFETY: `apply_workspace_isolation` installs the documented
-            // allocation-free Landlock pre-exec hook (post-fork, pre-exec);
-            // the rule table and its C strings are built here, in the
-            // parent, before the fork.
-            unsafe {
-                sandbox::apply_workspace_isolation(&mut cmd, roots, *required);
+        match &cfg.filesystem_isolation {
+            FilesystemIsolation::Workspace { roots, required } => {
+                // SAFETY: `apply_workspace_isolation` installs the documented
+                // allocation-free Landlock pre-exec hook (post-fork, pre-exec);
+                // the rule table and its C strings are built here, in the
+                // parent, before the fork.
+                unsafe {
+                    sandbox::apply_workspace_isolation(&mut cmd, roots, &[], false, *required);
+                }
             }
+            FilesystemIsolation::WorkspaceReadOnly {
+                roots,
+                writable_roots,
+                required,
+            } => {
+                // SAFETY: as above; the workspace roots carry read/execute
+                // rights only and the explicit build roots stay writable.
+                unsafe {
+                    sandbox::apply_workspace_isolation(
+                        &mut cmd,
+                        roots,
+                        writable_roots,
+                        true,
+                        *required,
+                    );
+                }
+            }
+            FilesystemIsolation::Inherit => {}
         }
         cmd
     }
@@ -3159,7 +3210,30 @@ pub fn workspace_spawn_confinement(
                     // `cmd` (post-fork, pre-exec); the rule table and its C
                     // strings are built here, in the parent, before the fork.
                     unsafe {
-                        sandbox::apply_workspace_isolation(cmd, &roots, required);
+                        sandbox::apply_workspace_isolation(cmd, &roots, &[], false, required);
+                    }
+                }))
+            }
+            FilesystemIsolation::WorkspaceReadOnly {
+                roots,
+                writable_roots,
+                required,
+            } => {
+                let roots = roots.clone();
+                let writable_roots = writable_roots.clone();
+                let required = *required;
+                Some(Arc::new(move |cmd: &mut std::process::Command| {
+                    // SAFETY: as above; read-only mode grants only
+                    // read/execute beneath the workspace roots and full
+                    // rights beneath the explicit build/scratch roots.
+                    unsafe {
+                        sandbox::apply_workspace_isolation(
+                            cmd,
+                            &roots,
+                            &writable_roots,
+                            true,
+                            required,
+                        );
                     }
                 }))
             }

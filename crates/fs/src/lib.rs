@@ -3458,4 +3458,38 @@ mod tests {
         assert_eq!(after.full_hash(), Some(h2));
         assert_eq!(after.bytes, b"EDITED");
     }
+
+    /// P1-7: a root beyond the preflight entry bound degrades WITHOUT the
+    /// singleton worker, while an ordinary root still attaches a real
+    /// watcher — one pathological workspace cannot starve watcher service
+    /// for every later workspace.
+    #[test]
+    fn pathological_root_degrades_but_an_ordinary_root_still_gets_a_watcher() {
+        let pathological = tempfile::tempdir().unwrap();
+        for index in 0..200 {
+            std::fs::create_dir_all(pathological.path().join(format!("d{index:03}"))).unwrap();
+        }
+        let service = WorkspaceFileService::with_watch_preflight_entries(50);
+        let big = service
+            .open(WorkspaceId::new(201), pathological.path().to_path_buf())
+            .unwrap();
+        assert!(
+            !big.watcher_attached(),
+            "a root beyond the preflight bound must degrade, never wedge the worker"
+        );
+        let ordinary = tempfile::tempdir().unwrap();
+        std::fs::write(ordinary.path().join("keep.txt"), b"x").unwrap();
+        let small = service
+            .open(WorkspaceId::new(202), ordinary.path().to_path_buf())
+            .unwrap();
+        assert!(
+            small.watcher_attached(),
+            "an ordinary workspace must still obtain a REAL watcher"
+        );
+        assert_eq!(
+            crate::workspace_service::watch_registration_worker_spawns(),
+            1,
+            "the degraded path must not spawn another worker"
+        );
+    }
 }

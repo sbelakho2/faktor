@@ -1,0 +1,9 @@
+{
+  "id": "INV-COMMERCE-BOM-BOUND",
+  "file": "crates/commerce/src/bom.rs",
+  "find": "        if items.len() > MAX_BOM_LINES {\n            return Err(RequestError::new(\n                \"items\",\n                format!(\"{} lines exceeds the maximum {MAX_BOM_LINES}\", items.len()),\n            ));\n        }",
+  "replace": "        if items.len() >= MAX_BOM_LINES {\n            return Err(RequestError::new(\n                \"items\",\n                format!(\"{} lines exceeds the maximum {MAX_BOM_LINES}\", items.len()),\n            ));\n        }",
+  "gate": "cargo test -p faktor-commerce --lib bom_is_bounded_at_500_lines",
+  "expect": "FAILED",
+  "note": "The BOM line bound is exactly MAX lines; shifting it refuses a legal 500-line request."
+}

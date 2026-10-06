@@ -1303,7 +1303,9 @@ pub(crate) async fn native_prompt(
     if let Err(e) = validate_prompt_submission_id(&req.submission_id) {
         return wire_status(e);
     }
-    let handle = match state.deps.session.get_session(sid) {
+    // The session must exist, but admission time comes from the manager's
+    // MONOTONIC clock (never this handle's wall-clock reading).
+    let _handle = match state.deps.session.get_session(sid) {
         Ok(Some(h)) => h,
         Ok(None) => return wire_status(not_found(&format!("session {sid}"))),
         Err(e) => return api_err(&e),
@@ -1328,7 +1330,8 @@ pub(crate) async fn native_prompt(
         &req.submission_id,
         &digest,
         &reservation,
-        handle.now_ms(),
+        // MONOTONIC admission time: wall-clock jumps never move the lease.
+        state.deps.session.admission_now_ms(),
     ) {
         Ok(claim) => claim,
         Err(e) => return api_err(&store_err_to_core(e)),
@@ -1347,7 +1350,7 @@ pub(crate) async fn native_prompt(
             &req.submission_id,
             &digest,
             &reservation,
-            handle.now_ms(),
+            state.deps.session.admission_now_ms(),
         ) {
             Ok(claim) => claim,
             Err(e) => return api_err(&store_err_to_core(e)),

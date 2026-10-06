@@ -554,6 +554,15 @@ fn run_probe(
         FilesystemIsolation::Workspace { required, .. } => {
             FilesystemIsolation::Workspace { roots, required }
         }
+        FilesystemIsolation::WorkspaceReadOnly {
+            writable_roots,
+            required,
+            ..
+        } => FilesystemIsolation::WorkspaceReadOnly {
+            roots,
+            writable_roots,
+            required,
+        },
         FilesystemIsolation::Inherit => FilesystemIsolation::Inherit,
     };
     let cfg = SpawnConfig {

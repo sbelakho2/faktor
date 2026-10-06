@@ -70,7 +70,24 @@ pub(crate) fn ownership_sets(
     workspace_root: Option<&std::path::Path>,
 ) -> (OwnershipSet, OwnershipSet) {
     let ownership = tool.ownership(input);
-    ownership_sets_for(tool.capability.as_ref(), ownership, workspace_root)
+    let read_only = shell_read_only(input);
+    ownership_sets_for(
+        tool.capability.as_ref(),
+        ownership,
+        workspace_root,
+        read_only,
+    )
+}
+
+/// TRUE when the tool input marks this shell execution read-only (P1-8): the
+/// spawn layer installs kernel write denial and the scheduler takes NO write
+/// ownership, so a verification command never consumes a path-constrained
+/// ChangeBudget and never serializes against workspace writers.
+pub(crate) fn shell_read_only(input: &serde_json::Value) -> bool {
+    input
+        .get("read_only")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The tool's DECLARED sets in the policy path vocabulary (the
@@ -84,7 +101,8 @@ pub(crate) fn declared_ownership_sets(
     input: &serde_json::Value,
 ) -> (OwnershipSet, OwnershipSet) {
     let ownership = tool.ownership(input);
-    ownership_sets_for(tool.capability.as_ref(), ownership, None)
+    let read_only = shell_read_only(input);
+    ownership_sets_for(tool.capability.as_ref(), ownership, None, read_only)
 }
 
 /// The P0-2 ownership rule, factored for direct testing: a generic shell
@@ -98,11 +116,21 @@ pub(crate) fn ownership_sets_for(
     capability: Option<&faktor_core::capability::Capability>,
     ownership: crate::tool::Ownership,
     workspace_root: Option<&std::path::Path>,
+    read_only: bool,
 ) -> (OwnershipSet, OwnershipSet) {
     if matches!(
         capability,
         Some(faktor_core::capability::Capability::ExecuteShell { .. })
     ) {
+        if read_only {
+            // Kernel write denial: the read-only shell owns the workspace
+            // for READS only and takes NO write ownership — it runs
+            // concurrently with writers and needs no change manifest.
+            return (
+                OwnershipSet::workspace_root(),
+                OwnershipSet::new(Vec::new()),
+            );
+        }
         return (
             OwnershipSet::workspace_root(),
             OwnershipSet::workspace_root(),
@@ -132,6 +160,7 @@ mod shell_ownership_tests {
                 writes: Vec::new(),
             },
             Some(root.path()),
+            false,
         );
         assert_eq!(
             writes.entries(),
@@ -175,6 +204,7 @@ mod shell_ownership_tests {
                 writes: vec!["src/b.rs".into()],
             },
             Some(root.path()),
+            false,
         );
         assert!(
             reads.overlaps(&OwnershipSet::new(["src/a.rs".to_string()]).canonicalized(root.path()))
@@ -1219,7 +1249,7 @@ impl AgentRuntime {
             let shell_run = matches!(
                 tool.capability,
                 Some(faktor_core::capability::Capability::ExecuteShell { .. })
-            );
+            ) && !shell_read_only(&input);
             let (reads, writes) = ownership_sets(&tool, &input, root.as_deref());
             let spec = ScheduledOp {
                 meta: op_meta.clone(),

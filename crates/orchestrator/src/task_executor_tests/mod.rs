@@ -307,7 +307,29 @@ pub(crate) fn open_env_with_shadows(
     limits: ShadowCopyLimits,
     shadowed: bool,
 ) -> Arc<Env> {
-    let manager = SessionManager::open(root.join("store"), root.join("cas"), true).unwrap();
+    open_env_with_clocks(root, scripts, limits, shadowed, None, None)
+}
+
+/// The same env with an INJECTED wall clock and admission (monotonic) clock
+/// (P1-IDEMPOTENCY tests: wall jumps must not move an admission lease).
+pub(crate) fn open_env_with_clocks(
+    root: &std::path::Path,
+    scripts: Vec<Vec<ScriptedResponse>>,
+    limits: ShadowCopyLimits,
+    shadowed: bool,
+    wall: Option<Arc<dyn faktor_core::time::Clock>>,
+    admission: Option<Arc<dyn faktor_session::AdmissionClock>>,
+) -> Arc<Env> {
+    let manager = match wall {
+        Some(clock) => {
+            SessionManager::open_with_clock(root.join("store"), root.join("cas"), true, clock)
+                .unwrap()
+        }
+        None => SessionManager::open(root.join("store"), root.join("cas"), true).unwrap(),
+    };
+    if let Some(clock) = admission {
+        manager.set_admission_clock(clock);
+    }
     let caps = ModelCapabilities {
         tools: true,
         parallel_tools: true,

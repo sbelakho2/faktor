@@ -93,6 +93,10 @@ struct ShellEnv {
 /// One real workspace + session + a runtime wired with the shell tool, the
 /// process supervisor and the CAS-backed checkpoint store.
 fn shell_env(script: Vec<ScriptedResponse>) -> ShellEnv {
+    shell_env_with_tool(script, shell_tool())
+}
+
+fn shell_env_with_tool(script: Vec<ScriptedResponse>, tool: Tool) -> ShellEnv {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("ws");
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -109,7 +113,7 @@ fn shell_env(script: Vec<ScriptedResponse>) -> ShellEnv {
         cas.clone(),
         manager.store(),
     ));
-    let deps = deps_on_manager(manager.clone(), script);
+    let deps = deps_on_manager_with_tool(manager.clone(), script, tool);
     ShellEnv {
         deps,
         dir,
@@ -124,13 +128,21 @@ fn shell_env(script: Vec<ScriptedResponse>) -> ShellEnv {
 /// The shell-attribution deps over an EXISTING manager (its CAS/store are
 /// reused verbatim, so a reopened manager sees the same durable CAS blobs).
 fn deps_on_manager(manager: Arc<SessionManager>, script: Vec<ScriptedResponse>) -> AgentDeps {
+    deps_on_manager_with_tool(manager, script, shell_tool())
+}
+
+fn deps_on_manager_with_tool(
+    manager: Arc<SessionManager>,
+    script: Vec<ScriptedResponse>,
+    tool: Tool,
+) -> AgentDeps {
     let cas = manager.cas();
     let mut registry = ProviderRegistry::new();
     registry
         .try_register(Arc::new(scripted_provider(script)))
         .unwrap();
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(shell_tool());
+    tool_registry.register(tool);
     AgentDeps {
         session: manager.clone(),
         providers: Arc::new(registry),
@@ -173,6 +185,90 @@ fn tool_call(command: &str) -> ScriptedResponse {
         name: "run_command".into(),
         input: serde_json::json!({ "command": command }),
     }
+}
+
+/// The same tool call with `read_only: true` (P1-8).
+fn read_only_call(command: &str) -> ScriptedResponse {
+    ScriptedResponse::ToolCall {
+        id: "shell-1".into(),
+        name: "run_command".into(),
+        input: serde_json::json!({ "command": command, "read_only": true }),
+    }
+}
+
+/// The read-only twin of [`shell_tool`]: mirrors the production run_command
+/// shape — kernel write denial for the workspace, writable build/scratch
+/// roots only, fail-closed Required.
+fn read_only_shell_tool() -> Tool {
+    let mut tool = shell_tool();
+    tool.input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": { "type": "string" },
+            "read_only": { "type": "boolean" }
+        },
+        "required": ["command"]
+    });
+    tool.execute = Arc::new(|ctx, args| {
+        Box::pin(async move {
+            let ws = ctx
+                .workspace
+                .clone()
+                .ok_or_else(|| Error::internal("no workspace wired"))?;
+            let supervisor = ctx
+                .supervisor
+                .clone()
+                .ok_or_else(|| Error::internal("no supervisor wired"))?;
+            let command = args
+                .get("command")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| Error::malformed("run_command requires command"))?;
+            let read_only = args
+                .get("read_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let mut writable_roots = Vec::new();
+            for rel in ["target", ".faktor/build-scratch"] {
+                let path = ws.root().join(rel);
+                if std::fs::create_dir_all(&path).is_ok() {
+                    writable_roots.push(path);
+                }
+            }
+            let filesystem_isolation = if read_only {
+                faktor_terminal::FilesystemIsolation::WorkspaceReadOnly {
+                    roots: vec![ws.root().to_path_buf()],
+                    writable_roots,
+                    required: true,
+                }
+            } else {
+                faktor_terminal::FilesystemIsolation::Inherit
+            };
+            let cfg = SpawnConfig {
+                cmd: "sh".into(),
+                args: vec!["-c".into(), command.to_string()],
+                cwd: ws.root().to_path_buf(),
+                env: EnvSpec::toolchain(),
+                owner: ProcessOwner::Session(ctx.session_id),
+                capture: true,
+                network_isolation: NetworkIsolation::Inherit,
+                filesystem_isolation,
+                ..Default::default()
+            };
+            let out = supervisor
+                .run(cfg, Duration::from_secs(30), ctx.cancellation.clone())
+                .await?;
+            Ok(ToolOutcome {
+                text: out.excerpt,
+                exit_code: out.exit_code,
+                artifact: out.artifact,
+                slice_hint: out.slice_hint,
+                effect_status: EffectStatus::Unknown,
+                postcondition: None,
+                provenance: faktor_context::compiler::ProvenanceSource::Tool,
+            })
+        })
+    });
+    tool
 }
 
 /// Every `FileChanged` payload's `changes` list of one session, as canonical
@@ -733,4 +829,312 @@ fn authority_probe_skips_derived_trees_and_never_follows_symlinks() {
         Some("symlink")
     );
     assert!(state.contains_key(".faktor/real.json"));
+}
+
+/// (P1-SHELL) A LINKED worktree's `.git` is a file; git authority lives in
+/// the resolved `gitdir` and in the shared `commondir` (refs, packed-refs).
+/// Every transition — add, reset, switch, commit, update-ref — must appear in
+/// the attributed change set.
+#[test]
+fn linked_worktree_git_authority_transitions_are_attributed() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main");
+    let ws_path = dir.path().join("wt");
+    std::fs::create_dir_all(&main).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&main, &["init", "-q", "-b", "main"]);
+    std::fs::write(main.join("seed.txt"), "seed").unwrap();
+    git(&main, &["add", "seed.txt"]);
+    git(&main, &["commit", "-q", "-m", "seed"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            ws_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ws_path.join(".git").is_file(),
+        "linked worktree has a .git file"
+    );
+
+    let handle =
+        WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(11), ws_path.clone())
+            .unwrap();
+    let before = capture_authority_state(&handle);
+    assert!(
+        before.contains_key(".git"),
+        "the .git pointer file is itself authority"
+    );
+    assert!(
+        before.contains_key("gitdir/HEAD"),
+        "{:?}",
+        before.keys().take(6).collect::<Vec<_>>()
+    );
+    assert!(before.contains_key("gitdir/index"));
+    assert!(
+        before.keys().any(|key| key.starts_with("commondir/refs/")),
+        "common refs are fingerprinted: {:?}",
+        before.keys().take(8).collect::<Vec<_>>()
+    );
+
+    // git add: the worktree index (external gitdir) changes.
+    std::fs::write(ws_path.join("a.txt"), "1").unwrap();
+    git(&ws_path, &["add", "a.txt"]);
+    let staged = capture_authority_state(&handle);
+    let changes = diff_authority(&before, &staged);
+    assert!(
+        changes.iter().any(|c| c.path == "gitdir/index"),
+        "git add must be attributed: {:?}",
+        changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+
+    // git reset: index changes again (back to HEAD's tree).
+    git(&ws_path, &["reset", "-q"]);
+    let reset = capture_authority_state(&handle);
+    let changes = diff_authority(&staged, &reset);
+    assert!(
+        changes.iter().any(|c| c.path == "gitdir/index"),
+        "{:?}",
+        changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+
+    // git switch -c: HEAD (gitdir) and a new ref (commondir) change.
+    git(&ws_path, &["switch", "-q", "-c", "feature"]);
+    let switched = capture_authority_state(&handle);
+    let changes = diff_authority(&reset, &switched);
+    assert!(
+        changes.iter().any(|c| c.path == "gitdir/HEAD"),
+        "{:?}",
+        changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|c| c.path == "commondir/refs/heads/feature"),
+        "{:?}",
+        changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+
+    // git commit: HEAD, index and the branch ref all move.
+    std::fs::write(ws_path.join("b.txt"), "2").unwrap();
+    git(&ws_path, &["add", "b.txt"]);
+    git(&ws_path, &["commit", "-q", "-m", "b"]);
+    let committed = capture_authority_state(&handle);
+    let changes = diff_authority(&switched, &committed);
+    for path in [
+        "gitdir/index",
+        "gitdir/COMMIT_EDITMSG",
+        "commondir/refs/heads/feature",
+    ] {
+        assert!(
+            changes.iter().any(|c| c.path == path),
+            "git commit must attribute {path}: {:?}",
+            changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+    }
+
+    // git update-ref: a brand-new common ref appears.
+    git(&ws_path, &["update-ref", "refs/heads/extra", "HEAD"]);
+    let refd = capture_authority_state(&handle);
+    let changes = diff_authority(&committed, &refd);
+    assert!(
+        changes
+            .iter()
+            .any(|c| c.path == "commondir/refs/heads/extra"),
+        "{:?}",
+        changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+}
+
+/// Copy a directory tree (test fixture restoration for linked worktrees).
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// (P1-SHELL) The same transitions through the REAL tool loop: a shell that
+/// stages, branches and creates a ref must attribute the external gitdir and
+/// commondir objects in the durable FileChanged accounting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linked_worktree_transitions_reach_shell_settlement() {
+    use std::process::Command;
+    let script = vec![
+        tool_call(
+            "git add src/lib.rs && git update-ref refs/heads/extra HEAD && git switch -q -c feature",
+        ),
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env(script);
+    // Turn the harness workspace into a LINKED worktree: the root must be
+    // empty for `git worktree add`, so move its contents aside and restore
+    // them after the worktree exists.
+    let staging = env.dir.path().join("staging");
+    std::fs::rename(&env.root, &staging).unwrap();
+    let main = env.dir.path().join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&main, &["init", "-q", "-b", "main"]);
+    std::fs::write(main.join("seed.txt"), "seed").unwrap();
+    git(&main, &["add", "seed.txt"]);
+    git(&main, &["commit", "-q", "-m", "seed"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            env.root.to_str().unwrap(),
+        ],
+    );
+    copy_tree(&staging, &env.root);
+
+    let manager = env.manager.clone();
+    let session = env.session;
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "git transitions through the shell", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let (rows, _truncated) = changed_rows(&handle);
+    assert!(
+        rows.iter().any(|row| row == "modified gitdir/index"),
+        "staging must be attributed: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row == "added commondir/refs/heads/extra"),
+        "update-ref must be attributed: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row == "added commondir/refs/heads/feature"),
+        "branch creation must be attributed: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row == "modified gitdir/HEAD"),
+        "HEAD move must be attributed: {rows:?}"
+    );
+}
+
+/// P1-8: a read-only shell runs under KERNEL write denial. A workspace write
+/// fails at the syscall (the file never appears), a build-root write
+/// succeeds, and the execution generates NO whole-workspace change
+/// accounting because it has no write authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_shell_has_kernel_write_denial_and_no_change_manifest() {
+    let script = vec![
+        read_only_call(
+            "echo bad > src/blocked.rs; echo ok > target/scratch.txt; echo bad > root-escape.txt; true",
+        ),
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env_with_tool(script, read_only_shell_tool());
+    let manager = env.manager.clone();
+    let session = env.session;
+    let root = env.root.clone();
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(session, "read-only verification shell", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert!(
+        !root.join("src/blocked.rs").exists(),
+        "the kernel must deny the workspace write (file must never exist)"
+    );
+    assert!(
+        !root.join("root-escape.txt").exists(),
+        "a workspace-root write is denied too"
+    );
+    assert!(
+        root.join("target/scratch.txt").exists(),
+        "the explicit build root stays writable"
+    );
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let (rows, _truncated) = changed_rows(&handle);
+    assert!(
+        rows.is_empty(),
+        "a read-only shell executes with NO change accounting: {rows:?}"
+    );
+}
+
+/// P1-8: read-only shell ownership is reads-only, so a path-constrained
+/// ChangeBudget never refuses it and writers do not serialize behind it.
+#[test]
+fn read_only_shell_takes_no_write_ownership() {
+    let (reads, writes) = ownership_sets_for(
+        Some(&Capability::ExecuteShell {
+            command: String::new(),
+        }),
+        crate::tool::Ownership {
+            reads: Vec::new(),
+            writes: Vec::new(),
+        },
+        None,
+        true,
+    );
+    assert_eq!(reads.entries(), &["**".to_string()]);
+    assert!(
+        writes.is_empty(),
+        "no write ownership for a read-only shell"
+    );
+    let (_reads, writes) = ownership_sets_for(
+        Some(&Capability::ExecuteShell {
+            command: String::new(),
+        }),
+        crate::tool::Ownership::default(),
+        None,
+        false,
+    );
+    assert_eq!(writes.entries(), &["**".to_string()]);
 }

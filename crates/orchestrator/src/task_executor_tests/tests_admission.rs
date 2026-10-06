@@ -847,3 +847,71 @@ async fn legacy_pending_row_lands_typed_conflict_and_never_re_executes() {
     assert_eq!(message_count(&env), 0, "no prompt was ever materialized");
     assert_eq!(env.provider.count(), 0);
 }
+
+/// P1-IDEMPOTENCY: within one generation, lease liveness is MONOTONIC. A wall
+/// clock jumping forward cannot expire a live claim early, a wall clock
+/// jumping backward cannot extend an abandoned one, and only the monotonic
+/// admission clock passing the lease makes the row stale/recoverable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+pub(crate) async fn wall_clock_jumps_never_move_the_admission_lease() {
+    use faktor_core::time::{Clock, TestClock};
+    use faktor_store::ADMISSION_LEASE_MS;
+
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let wall = Arc::new(TestClock::new(1_000_000));
+    let admission = Arc::new(faktor_session::TestAdmissionClock::new(10_000));
+    let env = open_env_with_clocks(
+        &dir.path().join("e"),
+        done_script(),
+        ShadowCopyLimits::default(),
+        false,
+        Some(wall.clone() as Arc<dyn Clock>),
+        Some(admission.clone() as Arc<dyn faktor_session::AdmissionClock>),
+    );
+    let mut req = request(
+        "lease vs wall clock",
+        vec![wi("a1", WorkKind::Analysis, &[])],
+        &env,
+    );
+    req.submission_id = Some(KEY_A.to_string());
+    let digest = crate::runtime::task_executor::task_start_digest(&req).expect("digest");
+    assert!(env
+        .manager
+        .store()
+        .task_admission_claim(
+            env.parent,
+            KEY_A,
+            &digest,
+            "tx-00000000000000ba",
+            env.manager.admission_now_ms()
+        )
+        .unwrap()
+        .is_fresh());
+
+    // Wall clock FORWARD far beyond the lease: the live claim stays live.
+    wall.advance(10 * ADMISSION_LEASE_MS);
+    let err = env
+        .executor
+        .start_task(env.parent, req.clone())
+        .expect_err("a wall jump forward must not expire a live lease");
+    assert!(err.to_string().contains("in flight"), "{err}");
+
+    // Wall clock BACKWARD below the claim: equally irrelevant.
+    wall.set(1);
+    let err = env
+        .executor
+        .start_task(env.parent, req.clone())
+        .expect_err("a wall jump backward must not extend or expire a lease");
+    assert!(err.to_string().contains("in flight"), "{err}");
+
+    // Only the MONOTONIC admission clock passing the deadline makes the row
+    // stale: the retry recovers the abandoned claim and starts exactly once.
+    admission.advance(ADMISSION_LEASE_MS + 1);
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("the monotonic lease expiring recovers the claim");
+    wait_turn_settled(&env, receipt.op_id.expect("in-session op id")).await;
+    assert_eq!(receipt.mode, TaskRunMode::InSession);
+}
