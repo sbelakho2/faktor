@@ -697,11 +697,11 @@ function main() {
       ],
       { stdio: 'ignore' },
     );
-    // Same filesystem as the checkout so the node_modules support snapshot can
-    // hardlink instead of copying hundreds of MB; `target/` is excluded from
-    // the tree digests and removed in the finally below.
-    mkdirSync(join(root, 'target'), { recursive: true });
-    const scratch = mkdtempSync(join(root, 'target', 'mutation-campaign-'));
+    // A SIBLING of the checkout: same filesystem (so the node_modules support
+    // snapshot hardlinks instead of copying hundreds of MB) but outside the
+    // copied tree, because a recursive copy cannot target its own
+    // subdirectory. It is removed in the finally below.
+    const scratch = mkdtempSync(join(resolve(root, '..'), '.faktor-mutation-campaign-'));
     cpSync(root, scratch, { recursive: true, filter: (source) => !excludedUnder(root, source) });
     // Snapshot the gate support trees (P2-9): the CLI is an immutable
     // COPY and node_modules a hardlink snapshot, both content-digested into
