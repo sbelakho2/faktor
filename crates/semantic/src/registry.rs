@@ -184,6 +184,14 @@ impl SemanticProviderRegistry {
         self
     }
 
+    /// TRUE when at least one EXTERNAL provider is registered (the generic
+    /// fallback is not a provider for model-visible advertising): the
+    /// semantic_query tool is only offered to the model when a real
+    /// semantic service could answer it.
+    pub fn has_external_provider(&self) -> bool {
+        !self.providers.is_empty()
+    }
+
     pub fn providers(&self) -> &[Arc<dyn SemanticProvider>] {
         &self.providers
     }

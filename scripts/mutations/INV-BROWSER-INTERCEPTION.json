@@ -3,9 +3,9 @@
   "file": "crates/browser/src/interception.rs",
   "find": "        match decide_resource(&self.destinations, url, resource_type) {\n            DestinationDecision::Allowed => InterceptionDecision::Continue,\n            DestinationDecision::Blocked { reason } => InterceptionDecision::Block { reason },\n        }",
   "replace": "        match decide_resource(&self.destinations, url, resource_type) {\n            DestinationDecision::Allowed => InterceptionDecision::Continue,\n            DestinationDecision::Blocked { .. } => InterceptionDecision::Continue,\n        }",
-  "gate": "cargo test -p faktor-browser --lib interception::tests::blocked_resource_types_are_dropped_even_on_first_party_hosts",
+  "gate": "cargo test -p faktor-browser --lib blocked_resource_types_are_dropped_even_on_first_party_hosts",
   "expect": "FAILED",
-  "note": "Continuing blocked destinations defeats resource-type and tracking interception.",
+  "note": "Continuing blocked destinations lets blocked resource types through.",
   "capabilities": [
     "browser.interception"
   ]

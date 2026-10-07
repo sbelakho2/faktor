@@ -249,8 +249,10 @@ pub struct ToolBundle {
     pub tools: Vec<ToolSpec>,
 }
 
-/// The name of the semantic escape-hatch spec Faktor exposes when the
-/// semantic-provider capability is present (see [`ToolBundle::semantic_specs`]).
+/// The name of the model-visible semantic escape hatch. It is a REAL
+/// registered tool (crates/cli semantic_query_tool) advertised only while an
+/// external semantic provider is registered — never tied to the model's
+/// embedding support.
 pub const SEMANTIC_QUERY_TOOL: &str = "semantic_query";
 
 impl ToolBundle {
@@ -259,10 +261,9 @@ impl ToolBundle {
     /// tool contributes nothing until it is activated).
     ///
     /// Selection is by registry metadata (`ResourceClass`) and declared
-    /// capabilities only — never provider names. A semantic-provider
-    /// capability (`ModelCapabilities::embeddings`) maps to AT MOST
-    /// [`SEMANTIC_BUNDLE_MAX_SPECS`] specs and is offered only to the phases
-    /// whose work is retrieval; the raw per-operation tools are never dumped.
+    /// capabilities only — never provider names, and never synthesized from
+    /// model capabilities: every advertised tool has a registered
+    /// implementation.
     pub fn for_phase(
         phase: RouterPhase,
         registry: &ToolRegistry,
@@ -278,21 +279,18 @@ impl ToolBundle {
     pub fn for_phase_with_activation(
         phase: RouterPhase,
         registry: &ToolRegistry,
-        capabilities: &ModelCapabilities,
+        _capabilities: &ModelCapabilities,
         activation: &ToolActivationSet,
     ) -> Self {
+        // The model-visible surface is exactly the REGISTERED tool set for
+        // the phase: there are no synthetic specs. `semantic_query` is a
+        // real registered tool (it can only be advertised when an external
+        // semantic provider is registered — see the runtime bundle gate).
         let mut tools: Vec<ToolSpec> = registry
             .iter()
             .filter(|tool| registry.exposure_allows(phase, tool, activation))
             .map(Tool::spec)
             .collect();
-        if phase_exposes_semantic(phase) {
-            for spec in Self::semantic_specs(capabilities) {
-                if !tools.iter().any(|t| t.name == spec.name) {
-                    tools.push(spec);
-                }
-            }
-        }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools.dedup_by(|a, b| a.name == b.name);
         Self {
@@ -300,34 +298,6 @@ impl ToolBundle {
             phase,
             tools,
         }
-    }
-
-    /// The model-visible semantic surface: one [`SEMANTIC_QUERY_TOOL`] spec
-    /// when the capabilities carry the semantic (embedding) provider, empty
-    /// otherwise. The count is capped at [`SEMANTIC_BUNDLE_MAX_SPECS`] by
-    /// construction — Faktor uses the semantic provider automatically instead
-    /// of dumping dozens of model-visible tool definitions.
-    pub fn semantic_specs(capabilities: &ModelCapabilities) -> Vec<ToolSpec> {
-        if !capabilities.embeddings {
-            return Vec::new();
-        }
-        let specs = vec![ToolSpec {
-            name: SEMANTIC_QUERY_TOOL.into(),
-            description: "Semantic (embedding-backed) workspace query served by Faktor's \
-                          semantic provider: returns ranked paths and snippets. Faktor runs \
-                          semantic retrieval itself; this is the model's explicit escape hatch."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "limit": { "type": "integer" }
-                },
-                "required": ["query"]
-            }),
-        }];
-        debug_assert!(specs.len() <= SEMANTIC_BUNDLE_MAX_SPECS);
-        specs
     }
 
     /// BLAKE3 over the canonical serialization of this bundle's tool NAMES
@@ -414,15 +384,6 @@ fn phase_allows(phase: RouterPhase, tool: &Tool) -> bool {
         // Model-only phases: no tools at all.
         RouterPhase::Compact | RouterPhase::Title | RouterPhase::Embed => false,
     }
-}
-
-/// Phases whose work is retrieval and therefore carry the compact semantic
-/// surface when the semantic-provider capability is present.
-fn phase_exposes_semantic(phase: RouterPhase) -> bool {
-    matches!(
-        phase,
-        RouterPhase::Plan | RouterPhase::Explore | RouterPhase::Retrieve
-    )
 }
 
 /// Whether a phase may carry tools at all. `Compact`/`Title`/`Embed` are
@@ -1171,7 +1132,6 @@ mod tests {
         let names = explore.tool_names();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"search"));
-        assert!(names.contains(&"semantic_query"));
         assert!(!names.contains(&"write_file"));
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"run_command"));
@@ -1192,29 +1152,41 @@ mod tests {
     }
 
     #[test]
-    fn semantic_capability_maps_to_at_most_two_specs() {
-        assert!(ToolBundle::semantic_specs(&ModelCapabilities::default()).is_empty());
-        let specs = ToolBundle::semantic_specs(&caps_semantic());
-        assert!(!specs.is_empty());
-        assert!(specs.len() <= SEMANTIC_BUNDLE_MAX_SPECS);
-
-        // A registry carrying many raw semantic MCP tools must still surface
-        // only the compact semantic escape hatch on retrieval phases.
-        let registry = phase_registry(&[
-            "read_file",
-            "search",
-            "mcp_semantic_a",
-            "mcp_semantic_b",
-            "mcp_semantic_c",
-        ]);
-        let bundle = registry.bundle_for_phase(RouterPhase::Retrieve, &caps_semantic());
-        let semantic_surface = bundle
-            .tool_names()
-            .into_iter()
-            .filter(|n| n.starts_with("semantic") || n.starts_with("mcp_semantic"))
-            .count();
-        assert!(semantic_surface <= SEMANTIC_BUNDLE_MAX_SPECS);
-        assert!(bundle.tool_names().contains(&"semantic_query"));
+    fn semantic_query_is_a_registered_tool_never_synthesized_from_capabilities() {
+        // Model capabilities NEVER synthesize a spec: a registry without the
+        // real tool advertises no semantic_query even with embeddings=true.
+        let registry = phase_registry(&["read_file", "search"]);
+        for phase in [
+            RouterPhase::Plan,
+            RouterPhase::Explore,
+            RouterPhase::Retrieve,
+        ] {
+            let bundle = registry.bundle_for_phase(phase, &caps_semantic());
+            assert!(
+                !bundle.tool_names().contains(&"semantic_query"),
+                "{phase:?}"
+            );
+        }
+        // A REGISTERED semantic_query tool (DiskRead) rides the ordinary
+        // phase policy: read phases see it, write-only phases do not.
+        let mut registry = ToolRegistry::new();
+        let mut tool = Tool {
+            name: SEMANTIC_QUERY_TOOL.into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            resource_class: ResourceClass::DiskRead,
+            capability: None,
+            recovery_hint: RecoveryHint::Idempotent,
+            path_args: Vec::new(),
+            execute: Arc::new(|_ctx, _args| Box::pin(async { Ok(ToolOutcome::default()) })),
+        };
+        tool.name = SEMANTIC_QUERY_TOOL.into();
+        registry.register(tool);
+        let explore =
+            registry.bundle_for_phase(RouterPhase::Explore, &ModelCapabilities::default());
+        assert!(explore.tool_names().contains(&"semantic_query"));
+        let embed = registry.bundle_for_phase(RouterPhase::Embed, &ModelCapabilities::default());
+        assert!(!embed.tool_names().contains(&"semantic_query"));
     }
 
     #[test]
@@ -1746,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_does_not_touch_the_semantic_surface_or_normal_tools() {
+    fn activation_does_not_touch_normal_or_lazy_tool_selection() {
         let registry = lazy_registry();
         let active = active_source_market();
         for phase in [
@@ -1757,7 +1729,6 @@ mod tests {
             let bundle =
                 registry.bundle_for_phase_with_activation(phase, &caps_semantic(), &active);
             let names = bundle.tool_names();
-            assert!(names.contains(&"semantic_query"));
             assert!(names.contains(&"source_market"));
             // The class policy still governs the normal tools.
             assert!(!names.contains(&"write_file"));

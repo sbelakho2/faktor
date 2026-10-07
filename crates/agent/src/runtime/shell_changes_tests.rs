@@ -1294,3 +1294,60 @@ fn hostile_git_pointers_are_refused_without_authority_keys() {
         state.keys().collect::<Vec<_>>()
     );
 }
+
+/// Tangerine-10: the advertised `semantic_query` tool has a REAL executable
+/// implementation on the runtime dispatch path. A registered provider answers
+/// the model's call (no unknown-tool, no synthetic spec without backing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_semantic_query_call_executes_against_the_registered_provider() {
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "sem-1".into(),
+            name: "semantic_query".into(),
+            input: serde_json::json!({ "query": "token validation" }),
+        },
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let mut env = shell_env(script);
+    let fake = Arc::new(crate::semantic_tool::FakeContextProvider::new());
+    let mut registry = faktor_semantic::SemanticProviderRegistry::new(
+        faktor_semantic::GenericSemanticFallback::default(),
+    );
+    registry.register(fake.clone());
+    env.deps.semantic = Arc::new(registry);
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(env.session, "ask tangerine", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_eq!(
+        fake.context_calls(),
+        1,
+        "the model-visible semantic tool must execute against the provider"
+    );
+}
+
+/// Without a registered provider the tool is never advertised (bundle gate),
+/// and a stale call is refused by the active-bundle membership guard instead
+/// of reaching any implementation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_only_semantic_query_is_refused_without_execution() {
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "sem-1".into(),
+            name: "semantic_query".into(),
+            input: serde_json::json!({ "query": "x" }),
+        },
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env(script);
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(env.session, "ask tangerine", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+}

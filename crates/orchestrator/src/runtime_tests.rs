@@ -95,7 +95,6 @@ impl ScriptedPacedProvider {
     fn system_of(&self, idx: usize) -> Option<String> {
         self.request_systems.lock().unwrap().get(idx).cloned()
     }
-
     /// Per-child jitter: override the per-chunk pacing of stream call `i`
     /// (random spawn-completion delays of the randomized reopen test).
     fn set_per_call_delays(&self, delays: Vec<u64>) {
@@ -2217,6 +2216,34 @@ fn blake3_hash(content: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Approve+merge that expects success (compact call sites).
+async fn merge_ok(
+    env: &Env,
+    child_id: &str,
+    cs_id: &str,
+    approved: &[PathBuf],
+    rejected: &[PathBuf],
+) -> crate::runtime::merge::MergeOutcome {
+    env.orchestrator
+        .approve_and_merge(child_id, cs_id, approved, rejected)
+        .await
+        .expect("merge succeeds")
+}
+
+/// Approve+merge that expects a typed refusal.
+async fn merge_err(
+    env: &Env,
+    child_id: &str,
+    cs_id: &str,
+    approved: &[PathBuf],
+    rejected: &[PathBuf],
+) -> crate::runtime::ExecError {
+    env.orchestrator
+        .approve_and_merge(child_id, cs_id, approved, rejected)
+        .await
+        .expect_err("merge refuses typed")
+}
+
 fn write_owner_file(env: &Env, rel: &str, content: &[u8]) {
     owner_write(env, rel, content);
 }
@@ -2247,15 +2274,14 @@ async fn merge_conflict_reports_parent_change_and_keeps_parent_bytes_intact() {
         Some(file_hash(b"v1-parent-original")),
         "the CAS expectation is the base-snapshot hash of the parent path"
     );
-    let outcome = env
-        .orchestrator
-        .approve_and_merge(
-            "child-0",
-            &cs.id(),
-            &[std::path::PathBuf::from("src/a.rs")],
-            &[],
-        )
-        .expect("merge returns (with a conflict)");
+    let outcome = merge_ok(
+        &env,
+        "child-0",
+        &cs.id(),
+        &[std::path::PathBuf::from("src/a.rs")],
+        &[],
+    )
+    .await;
     assert!(outcome.merged.is_empty(), "{outcome:?}");
     assert_eq!(outcome.conflicts.len(), 1, "{outcome:?}");
     assert_eq!(outcome.conflicts[0].0, std::path::PathBuf::from("src/a.rs"));
@@ -2298,15 +2324,14 @@ async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
         std::path::PathBuf::from("sub/../sub/a.rs"),
         std::path::PathBuf::from("SUB/A.RS"), // case-variant of a real path
     ] {
-        let err = env
-            .orchestrator
-            .approve_and_merge(
-                "child-0",
-                &cs.id(),
-                &[evil.clone(), b.clone()],
-                std::slice::from_ref(&a),
-            )
-            .unwrap_err();
+        let err = merge_err(
+            &env,
+            "child-0",
+            &cs.id(),
+            &[evil.clone(), b.clone()],
+            std::slice::from_ref(&a),
+        )
+        .await;
         assert!(
             matches!(err, ExecError::InvalidApproval(_)),
             "{evil:?} must be a typed invalid approval, got {err:?}"
@@ -2322,10 +2347,7 @@ async fn merge_approval_rejects_traversal_case_and_absolute_paths_typed() {
         );
     }
     // The valid full decision afterwards merges both files.
-    let outcome = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
-        .expect("valid approval merges");
+    let outcome = merge_ok(&env, "child-0", &cs.id(), &[a.clone(), b.clone()], &[]).await;
     assert_eq!(outcome.merged, vec![a.clone(), b.clone()]);
     assert_eq!(owner_read(&env, "sub/a.rs"), b"child-a");
     assert_eq!(owner_read(&env, "sub/b.rs"), b"child-b");
@@ -2348,10 +2370,7 @@ async fn partial_approval_is_atomic_and_rejections_are_durable_forever() {
     let b = std::path::PathBuf::from("b.rs");
     // Approving only ONE of two files without rejecting the other: an
     // explicit error and NOTHING merges (atomic decision check).
-    let err = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), std::slice::from_ref(&a), &[])
-        .unwrap_err();
+    let err = merge_err(&env, "child-0", &cs.id(), std::slice::from_ref(&a), &[]).await;
     assert!(
         matches!(err, ExecError::UndecidedPaths(_)),
         "undecided paths must error: {err:?}"
@@ -2364,30 +2383,28 @@ async fn partial_approval_is_atomic_and_rejections_are_durable_forever() {
         "no durable record after the atomic decision error"
     );
     // Full decision: approve a, durably reject b.
-    let outcome = env
-        .orchestrator
-        .approve_and_merge(
-            "child-0",
-            &cs.id(),
-            std::slice::from_ref(&a),
-            std::slice::from_ref(&b),
-        )
-        .expect("merge");
+    let outcome = merge_ok(
+        &env,
+        "child-0",
+        &cs.id(),
+        std::slice::from_ref(&a),
+        std::slice::from_ref(&b),
+    )
+    .await;
     assert_eq!(outcome.merged, vec![a.clone()]);
     assert_eq!(outcome.rejected, vec![b.clone()]);
     assert!(outcome.conflicts.is_empty());
     // The rejection is durable: a LATER decision that revises the durable
     // one (swap what was rejected into the approved set) is refused, and
     // b NEVER lands.
-    let err = env
-        .orchestrator
-        .approve_and_merge(
-            "child-0",
-            &cs.id(),
-            std::slice::from_ref(&b),
-            std::slice::from_ref(&a),
-        )
-        .unwrap_err();
+    let err = merge_err(
+        &env,
+        "child-0",
+        &cs.id(),
+        std::slice::from_ref(&b),
+        std::slice::from_ref(&a),
+    )
+    .await;
     assert!(
         matches!(err, ExecError::Conflict(_)),
         "revising the durable decision must be refused: {err:?}"
@@ -2431,10 +2448,7 @@ async fn merge_crash_after_record_before_applies_replays_complete_cas_applies() 
     let a = std::path::PathBuf::from("src/a.rs");
     let b = std::path::PathBuf::from("src/b.rs");
     // Crash right after the durable merge record, before any apply.
-    let err = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
-        .unwrap_err();
+    let err = merge_err(&env, "child-0", &cs.id(), &[a.clone(), b.clone()], &[]).await;
     assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
     assert!(!env.owner.root.join("src/a.rs").exists());
     assert!(!env.owner.root.join("src/b.rs").exists());
@@ -2446,10 +2460,7 @@ async fn merge_crash_after_record_before_applies_replays_complete_cas_applies() 
         "in-flight record is durable before applies"
     );
     // Replay with the SAME decision completes the CAS applies.
-    let outcome = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
-        .expect("replay completes");
+    let outcome = merge_ok(&env, "child-0", &cs.id(), &[a.clone(), b.clone()], &[]).await;
     assert_eq!(outcome.merged, vec![a.clone(), b.clone()]);
     assert!(outcome.conflicts.is_empty());
     assert_eq!(owner_read(&env, "src/a.rs"), b"child-a");
@@ -2459,10 +2470,7 @@ async fn merge_crash_after_record_before_applies_replays_complete_cas_applies() 
     assert_eq!(envs[0].status, merge::MergeStatus::Applied);
     assert!(envs[0].finished_ms.is_some());
     // A further replay is idempotent (all AlreadyCurrent).
-    let replay = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &[a.clone(), b.clone()], &[])
-        .expect("idempotent replay");
+    let replay = merge_ok(&env, "child-0", &cs.id(), &[a.clone(), b.clone()], &[]).await;
     assert_eq!(replay.merged.len(), 2);
     assert_eq!(owner_read(&env, "src/a.rs"), b"child-a");
 }
@@ -2488,10 +2496,7 @@ async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
         .expect("stage");
     let paths: Vec<std::path::PathBuf> = cs.files.iter().map(|f| f.path.clone()).collect();
     assert_eq!(paths.len(), 3);
-    let err = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &paths, &[])
-        .unwrap_err();
+    let err = merge_err(&env, "child-0", &cs.id(), &paths, &[]).await;
     assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
     // Deterministic staged order: the FIRST path was applied, the rest not.
     assert_eq!(owner_read(&env, "m0.rs"), b"child-m0");
@@ -2505,10 +2510,7 @@ async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
     );
     // Replay: m0 already holds the child digest -> AlreadyCurrent, m1/m2
     // apply through the CAS. Conflicting content would surface, never skip.
-    let outcome = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &paths, &[])
-        .expect("replay reconciles");
+    let outcome = merge_ok(&env, "child-0", &cs.id(), &paths, &[]).await;
     assert_eq!(outcome.merged.len(), 3, "{outcome:?}");
     assert!(outcome.conflicts.is_empty());
     assert_eq!(owner_read(&env, "m0.rs"), b"child-m0");
@@ -2519,10 +2521,7 @@ async fn merge_crash_mid_applies_replay_skips_already_applied_and_reconciles() {
     assert_eq!(envs[0].status, merge::MergeStatus::Applied);
     assert_eq!(envs[0].merged_count, 3);
     // A DIFFERENT decision on replay is refused: decisions are durable.
-    let err = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), &paths[..1], &paths[1..])
-        .unwrap_err();
+    let err = merge_err(&env, "child-0", &cs.id(), &paths[..1], &paths[1..]).await;
     assert!(matches!(err, ExecError::Conflict(_)), "{err:?}");
 }
 
@@ -2872,10 +2871,7 @@ async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
     let m0 = std::path::PathBuf::from("m0.rs");
     // Crash AFTER the durable merge record, BEFORE any apply: the parent
     // still holds the pre-state and the merge is durably in flight.
-    let err = env
-        .orchestrator
-        .approve_and_merge("child-0", &cs.id(), std::slice::from_ref(&m0), &[])
-        .unwrap_err();
+    let err = merge_err(&env, "child-0", &cs.id(), std::slice::from_ref(&m0), &[]).await;
     assert!(matches!(err, ExecError::InjectedCrashSeam(_)), "{err:?}");
     let envs = merge::merge_envelopes(&env.manager, env.parent, "run-inflight", "child-0").unwrap();
     assert!(
@@ -2897,6 +2893,7 @@ async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
     // Resume the merge (replay): now the parent holds the child version.
     env.orchestrator
         .approve_and_merge("child-0", &cs.id(), std::slice::from_ref(&m0), &[])
+        .await
         .expect("replay completes the merge");
     assert_eq!(owner_read(&env, "m0.rs"), b"child-version-v1");
     assert_eq!(
@@ -3214,15 +3211,14 @@ async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
     let a = std::path::PathBuf::from("src/a.rs");
     let keep = std::path::PathBuf::from("keep.rs");
     let drop_path = std::path::PathBuf::from("drop.rs");
-    let outcome = env
-        .orchestrator
-        .approve_and_merge(
-            "child-0",
-            &cs.id(),
-            &[a.clone(), keep.clone()],
-            std::slice::from_ref(&drop_path),
-        )
-        .expect("partial merge applies");
+    let outcome = merge_ok(
+        &env,
+        "child-0",
+        &cs.id(),
+        &[a.clone(), keep.clone()],
+        std::slice::from_ref(&drop_path),
+    )
+    .await;
     assert_eq!(outcome.merged, vec![keep.clone()]);
     assert_eq!(outcome.rejected, vec![drop_path.clone()]);
     assert_eq!(outcome.conflicts.len(), 1, "{outcome:?}");
@@ -3240,15 +3236,14 @@ async fn graph_merge_field_reflects_durable_merged_rejected_and_conflicts() {
     // Durable decisions are immutable: a DIFFERENT decision on the same
     // change set is refused loudly (replay must carry the identical
     // approved/rejected sets).
-    let err = env
-        .orchestrator
-        .approve_and_merge(
-            "child-0",
-            &cs.id(),
-            &[a.clone(), drop_path.clone()],
-            std::slice::from_ref(&keep),
-        )
-        .unwrap_err();
+    let err = merge_err(
+        &env,
+        "child-0",
+        &cs.id(),
+        &[a.clone(), drop_path.clone()],
+        std::slice::from_ref(&keep),
+    )
+    .await;
     assert!(matches!(err, ExecError::Conflict(_)), "{err:?}");
     // Manager reopen: the merge field is a pure read of the rows.
     let parent = env.parent;
@@ -4115,6 +4110,7 @@ async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript()
             operation_id: 0,
             ownership: ChildOwnership::ReadOnlyShared,
             model: "m".into(),
+            require_semantic_delta: false,
             created_ms: 1,
         })
         .unwrap();
@@ -4211,6 +4207,7 @@ fn craft_child_row(
             operation_id: 0,
             ownership: ChildOwnership::ReadOnlyShared,
             model: String::new(),
+            require_semantic_delta: false,
             created_ms: 1,
         })
         .unwrap();

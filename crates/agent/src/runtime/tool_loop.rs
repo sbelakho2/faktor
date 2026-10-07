@@ -908,6 +908,16 @@ impl AgentRuntime {
 
             let tool = match self.deps.tools.get(&name) {
                 Some(t) => t,
+                // The real semantic escape hatch (audit Tangerine-10): when a
+                // provider is registered the runtime supplies the executable
+                // implementation itself, so a model that calls the advertised
+                // tool can never hit "unknown tool". Fallback-only
+                // environments never advertise it (bundle gate below).
+                None if name == crate::tool::SEMANTIC_QUERY_TOOL
+                    && self.deps.semantic.has_external_provider() =>
+                {
+                    crate::semantic_tool::tool(self.deps.semantic.clone())
+                }
                 None => {
                     let reason = format!("unknown tool: {name}");
                     detector.record_error(&format!("unknown tool {name}"));
@@ -1763,10 +1773,30 @@ impl AgentRuntime {
         if next != load.set || (!load.found() && !next.is_empty()) {
             self.store_tool_activation(handle, &next);
         }
-        self.deps.tools.bundle_for_phase_with_activation(
+        let mut bundle = self.deps.tools.bundle_for_phase_with_activation(
             RouterPhase::Implement,
             capabilities,
             &next,
-        )
+        );
+        // Advertising gate (audit 10): semantic_query is a MODEL-VISIBLE tool
+        // only while a real EXTERNAL semantic provider is registered — never
+        // because the selected model happens to support embeddings. With
+        // only the generic fallback the surface disappears; the execute path
+        // still refuses typed if a stale call arrives.
+        if self.deps.semantic.has_external_provider() {
+            if !bundle
+                .tools
+                .iter()
+                .any(|tool| tool.name == crate::tool::SEMANTIC_QUERY_TOOL)
+            {
+                bundle.tools.push(crate::semantic_tool::spec());
+                bundle.tools.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        } else {
+            bundle
+                .tools
+                .retain(|tool| tool.name != crate::tool::SEMANTIC_QUERY_TOOL);
+        }
+        bundle
     }
 }
