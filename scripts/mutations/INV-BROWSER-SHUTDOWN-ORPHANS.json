@@ -5,7 +5,7 @@
   "replace": "        instance.launched.disarm();\n        let _ = instance.client.close().await;\n        instance.broker.shutdown().await;",
   "gate": "cargo test -p faktor-browser --lib shutdown_instance_kills_the_child_and_leaves_no_orphan",
   "expect": "FAILED",
-  "note": "Disarming instead of killing leaves an orphan child after shutdown.",
+  "note": "Disarming instead of killing leaves an idle/stop-shutdown child alive as an orphan.",
   "capabilities": [
     "browser.shutdown_orphans"
   ]

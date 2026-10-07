@@ -178,7 +178,6 @@ impl ReservationState {
             ReservationState::Uncertain => "uncertain",
         }
     }
-
     /// Parse a store status string. `None` for anything outside the frozen
     /// vocabulary (legacy `open`/`abandoned` cannot exist on a v18 store and
     /// are deliberately NOT mapped to a guessed state).
@@ -3476,6 +3475,7 @@ mod tests {
             model: String::new(),
             operation_id: 0,
             ownership: crate::child::ChildOwnership::ReadOnlyShared,
+            require_semantic_delta: false,
             created_ms: 1,
         })
         .unwrap();

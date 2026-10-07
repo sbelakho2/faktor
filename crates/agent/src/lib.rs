@@ -24,6 +24,7 @@ pub mod activation;
 pub mod credits;
 pub mod loop_detect;
 pub mod runtime;
+pub mod semantic_tool;
 pub mod stall;
 pub mod tool;
 pub mod tool_json;

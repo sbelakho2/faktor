@@ -5,7 +5,7 @@
   "replace": "    async fn abort_navigation(&self, cancel: &CancellationToken) {\n        let _ = self.stop_navigation(cancel).await;\n    }",
   "gate": "cargo test -p faktor-browser --lib lifecycle_is_stored_without_a_subscriber_and_resets_per_navigation",
   "expect": "FAILED",
-  "note": "A cancelled navigation that never closes leaves the page and its permit held.",
+  "note": "A cancelled navigation that never closes leaves the page and its admission permit held.",
   "capabilities": [
     "browser.capture_cleanup"
   ]

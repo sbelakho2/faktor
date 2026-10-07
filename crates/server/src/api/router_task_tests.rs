@@ -2459,6 +2459,7 @@ async fn native_mutating_multi_agent_task_isolated_then_explicit_integration_and
         .collect();
     let outcome = orchestrator
         .approve_and_merge(&impl_row.child_id, &cs.id(), &approved, &[])
+        .await
         .unwrap();
     assert!(
         outcome.merged.iter().any(|p| p.ends_with("candidate.txt")),

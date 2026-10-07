@@ -40,7 +40,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 
 use faktor_core::authority::{
@@ -51,10 +50,6 @@ use faktor_core::hash::FileHash;
 use faktor_core::id::{SessionId, WorkspaceId};
 use faktor_fs::tree_manifest::{CanonicalMode, TreeEntry, TreeEntryKind};
 use faktor_fs::{CasMergeResult, MAX_MERGE_FILE_BYTES};
-use faktor_semantic::{
-    SemanticCall, SemanticCapabilities, SemanticDelta, SemanticDeltaKind, SemanticDeltaRequest,
-    SemanticSelection, SemanticSnapshotId, GENERIC_FALLBACK_ID, SEMANTIC_SCHEMA_VERSION,
-};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -1609,106 +1604,6 @@ pub fn compose_child_changes(changes: &[ChangeSet]) -> Result<Vec<ComposedPathCh
 /// surface; the typed refusal summary stays short).
 pub const SEMANTIC_PREFLIGHT_MAX_CONFLICTS: usize = 8;
 
-/// Typed semantic-preflight conflicts (audit 79): a provider base→candidate
-/// delta entry that CONTRADICTS a staged change entry is a semantic
-/// conflict. Pure and fully typed — only validated entity paths and hex
-/// digests can reach the bounded reason; provider prose never does. Entity
-/// paths outside the approved set are ignored (not part of THIS merge) and
-/// non-contradictory deltas yield nothing.
-///
-/// The check is deliberately an INCONSISTENCY check, not a merge decision:
-/// it can only ever ADD a refusal (a delta whose digests contradict what is
-/// staged cannot be trusted), never clear or reshape a file-level CAS
-/// conflict.
-///
-/// HONEST HOLD-OUT: provider deltas carry whole-CONTENT hashes only, so the
-/// digest comparison applies to REGULAR entries (whose payload digest IS the
-/// content hash). A symlink entry's payload digest covers the literal target
-/// bytes — a different domain — and mode-only/symlink differences are not
-/// representable in the delta model, so those comparisons are skipped
-/// (the triple comparison in stage/compose/apply remains the authority).
-pub fn semantic_delta_conflicts(
-    cs: &ChangeSet,
-    delta: &SemanticDelta,
-    approved: &[PathBuf],
-) -> Vec<(PathBuf, String)> {
-    let approved_set: HashSet<&Path> = approved.iter().map(|p| p.as_path()).collect();
-    let mut out: Vec<(PathBuf, String)> = Vec::new();
-    for change in &delta.changes {
-        let entity_path = change.entity.path.as_str();
-        let path = PathBuf::from(entity_path);
-        if !approved_set.contains(path.as_path()) {
-            continue;
-        }
-        let Some(entry) = cs.files.iter().find(|e| e.path == path) else {
-            continue;
-        };
-        let child = entry.child_state();
-        let base = entry.base_state();
-        let reason: Option<String> = if child.is_none() {
-            if change.kind == SemanticDeltaKind::Removed {
-                None
-            } else {
-                Some(format!(
-                    "provider delta keeps content at {entity_path} but the staged candidate deletes it"
-                ))
-            }
-        } else if change.kind == SemanticDeltaKind::Removed {
-            Some(format!(
-                "provider delta removes {entity_path} but the staged candidate keeps content"
-            ))
-        } else if matches!(
-            (change.new_hash, child.as_ref().and_then(|s| s.payload_digest())),
-            (Some(provider), Some(staged)) if provider != staged
-        ) {
-            let provider = change.new_hash.map(|h| h.to_hex()).unwrap_or_default();
-            let staged = child
-                .as_ref()
-                .and_then(|s| s.payload_digest_hex())
-                .unwrap_or_default();
-            Some(format!(
-                "provider candidate hash {provider} disagrees with the staged candidate hash {staged} at {entity_path}"
-            ))
-        } else if matches!(
-            (change.old_hash, base.as_ref().and_then(|s| s.payload_digest())),
-            (Some(provider), Some(staged)) if provider != staged
-        ) {
-            let provider = change.old_hash.map(|h| h.to_hex()).unwrap_or_default();
-            let staged = base
-                .as_ref()
-                .and_then(|s| s.payload_digest_hex())
-                .unwrap_or_default();
-            Some(format!(
-                "provider composed over base hash {provider} but the staged base hash is {staged} at {entity_path}"
-            ))
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            out.push((path, truncate(&reason, 300)));
-            if out.len() >= SEMANTIC_PREFLIGHT_MAX_CONFLICTS {
-                break;
-            }
-        }
-    }
-    out
-}
-
-/// Strict single-poll adapter for the guardian provider futures (every
-/// provider call is wrapped by the semantic registry's `guard_call`; this
-/// only keeps the SYNCHRONOUS merge entry from blocking on a provider).
-/// `Pending` = the provider cannot answer without an executor — treated as
-/// unavailable, never as a stall.
-fn poll_once_ready<F: Future>(future: F) -> Option<F::Output> {
-    let mut future = std::pin::pin!(future);
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    match future.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(output) => Some(output),
-        std::task::Poll::Pending => None,
-    }
-}
-
 // ================================================================ runtime
 
 /// The child's durable goal, read TYPED (P1): a genuine missing identity
@@ -1727,6 +1622,16 @@ pub(crate) fn child_goal_typed(
         ))),
     }
 }
+
+#[cfg(test)]
+use faktor_semantic::{SemanticSnapshotId, SEMANTIC_SCHEMA_VERSION};
+
+mod merge_semantic;
+
+#[cfg(test)]
+pub(crate) use merge_semantic::SEMANTIC_MERGE_TIMEOUT_OVERRIDE_MS;
+
+pub use merge_semantic::semantic_delta_conflicts;
 
 impl OrchestratorRuntime {
     /// Locate one child durably: the live exec mirrors first (runs are
@@ -2187,106 +2092,11 @@ impl OrchestratorRuntime {
     ///   this preflight runs before the fs apply loop and only ever returns
     ///   a typed [`ExecError::SemanticConflict`] — a real CAS conflict stays
     ///   a real conflict exactly as before.
-    fn semantic_merge_preflight(
-        &self,
-        parent: SessionId,
-        run: &str,
-        cs: &ChangeSet,
-        approved: &[PathBuf],
-    ) -> Result<(), ExecError> {
-        let registry = self.agent.deps().semantic.clone();
-        let provider = match registry.select(&SemanticCapabilities::DELTA) {
-            SemanticSelection::Provider(provider) if provider.capabilities().compose_delta => {
-                provider
-            }
-            _ => return Ok(()),
-        };
-        let owner = self.plan_row(parent, run)?.owner;
-        let workspace = WorkspaceId::try_from(owner.workspace_id).map_err(|e| {
-            ExecError::Malformed(format!(
-                "run {run} plan row carries owner workspace id {}: {}",
-                owner.workspace_id, e.message
-            ))
-        })?;
-        let provider_id = provider.id();
-        let candidate_revision = format!("{}-candidate-{}", cs.id(), cs.files.len());
-        let from_snapshot = SemanticSnapshotId::derive(
-            workspace,
-            &cs.base_id,
-            &provider_id,
-            provider.version(),
-            SEMANTIC_SCHEMA_VERSION,
-        );
-        let call = match self.manager.try_next_op_id() {
-            Ok(op_id) => SemanticCall::new(
-                op_id,
-                parent,
-                workspace,
-                self.manager.now_ms(),
-                CancellationToken::new(),
-            ),
-            Err(e) => {
-                // The semantic preflight is ADDITIONAL only: an op-id
-                // allocation failure skips it loudly, exactly like a
-                // provider failure, and never fails the merge.
-                tracing::warn!(
-                    error = %e,
-                    "op-id allocation failed; semantic merge preflight skipped"
-                );
-                return Ok(());
-            }
-        };
-        let request = SemanticDeltaRequest {
-            call,
-            workspace,
-            from_snapshot,
-            from_source_revision: cs.base_id.clone(),
-            to_source_revision: candidate_revision,
-        };
-        let envelope = match poll_once_ready(registry.delta(request)) {
-            Some(Ok(envelope)) => envelope,
-            Some(Err(err)) => {
-                tracing::warn!(
-                    provider = %provider_id,
-                    "semantic merge preflight failed: {err}; the fs/CAS merge stands"
-                );
-                return Ok(());
-            }
-            None => {
-                tracing::warn!(
-                    provider = %provider_id,
-                    "semantic merge preflight provider is pending without an executor; the fs/CAS merge stands"
-                );
-                return Ok(());
-            }
-        };
-        if envelope.provider_id.as_str() == GENERIC_FALLBACK_ID || envelope.payload.degraded {
-            tracing::warn!(
-                provider = %provider_id,
-                "semantic merge preflight has no trustworthy provider data; the fs/CAS merge stands"
-            );
-            return Ok(());
-        }
-        let conflicts = semantic_delta_conflicts(cs, &envelope.payload, approved);
-        if conflicts.is_empty() {
-            return Ok(());
-        }
-        let mut summary = conflicts
-            .iter()
-            .take(3)
-            .map(|(path, detail)| format!("{}: {detail}", path.display()))
-            .collect::<Vec<_>>()
-            .join("; ");
-        if conflicts.len() > 3 {
-            summary.push_str(&format!("; (+{} more)", conflicts.len() - 3));
-        }
-        Err(ExecError::SemanticConflict(format!(
-            "provider {provider_id} reported a delta that contradicts the staged change set ({} paths): {summary}",
-            conflicts.len()
-        )))
-    }
-
-    pub fn approve_and_merge(
+    ///
+    /// Wall bound of one asynchronous merge-preflight semantic call: a real
+    /// Tangerine answers in well under this; a parked/hung provider is a
+    /// bounded failure (advisory skip or required block), never a hang.
+    pub async fn approve_and_merge(
         &self,
         child_id: &str,
         change_set_id: &str,
@@ -2405,7 +2215,8 @@ impl OrchestratorRuntime {
         // sole conflict authority). Provider absence/degradation/failure
         // keeps today's merge byte-identical (warn-only fallback).
         if existing_env.is_none() {
-            self.semantic_merge_preflight(parent, &run, &cs, &approved_v)?;
+            self.semantic_merge_preflight(parent, &run, &cs, &approved_v)
+                .await?;
         }
         // In-flight envelope + durable decision rows BEFORE any file apply.
         let now = self.manager.now_ms();
@@ -3409,13 +3220,19 @@ mod tests {
             orch.put_plan_row(&plan, &owner, &config, &[]).unwrap();
 
             // Durable child registry row: Done + isolated worktree.
+            // A REAL child session carries the durable identity (the
+            // semantic requirement flag lives there).
+            let child_session = manager
+                .create_session(child_ws, "child-0", "fake", "m")
+                .unwrap()
+                .id();
             let row = ChildRuntime {
                 child_id: "child-0".into(),
                 parent_session_id: parent.raw(),
                 run_id: "run-1".into(),
                 item_id: "impl".into(),
                 kind: WorkKind::Implementation,
-                session_id: 0,
+                session_id: child_session.raw() as u64,
                 operation_id: 0,
                 workspace_id: child_ws.raw(),
                 worktree_id: child_wt.raw(),
@@ -3476,6 +3293,23 @@ mod tests {
                 cs.files[0].child_hash,
                 Some(FileHash::from(*blake3::hash(b"v2-child").as_bytes()))
             );
+            {
+                let handle = manager.get_session(child_session).unwrap().unwrap();
+                handle
+                    .orchestrator_child_identity_put(&faktor_session::child::ChildIdentity {
+                        parent_session_id: parent,
+                        workspace_id: child_ws.raw(),
+                        worktree_id: child_wt.raw(),
+                        item_id: "impl".into(),
+                        task_goal: "child goal".into(),
+                        operation_id: 0,
+                        ownership: ChildOwnership::IsolatedWorktree,
+                        model: "m".into(),
+                        require_semantic_delta: false,
+                        created_ms: 1,
+                    })
+                    .unwrap();
+            }
             Fixture {
                 orch,
                 parent,
@@ -3586,8 +3420,8 @@ mod tests {
             std::fs::read(fixture.owner_root.join("src/a.rs")).unwrap()
         }
 
-        #[test]
-        fn fake_semantic_conflict_blocks_with_a_typed_outcome_before_any_apply() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn fake_semantic_conflict_blocks_with_a_typed_outcome_before_any_apply() {
             // The provider's delta contradicts the staged candidate hash:
             // the preflight refuses with the TYPED SemanticConflict variant
             // before any durable row or file apply; the parent is untouched.
@@ -3602,6 +3436,7 @@ mod tests {
                     &[PathBuf::from("src/a.rs")],
                     &[],
                 )
+                .await
                 .expect_err("a semantic conflict must block the merge");
             match &err {
                 ExecError::SemanticConflict(detail) => {
@@ -3619,8 +3454,8 @@ mod tests {
             );
         }
 
-        #[test]
-        fn real_cas_conflict_still_wins_over_a_provider_that_sees_no_conflict() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn real_cas_conflict_still_wins_over_a_provider_that_sees_no_conflict() {
             // The parent moved after the base snapshot AND the provider
             // reports a CONSISTENT delta (it sees no semantic conflict):
             // the real CAS conflict is reported exactly as without a
@@ -3637,6 +3472,7 @@ mod tests {
                     &[PathBuf::from("src/a.rs")],
                     &[],
                 )
+                .await
                 .expect("the merge returns with the real conflict");
             assert!(outcome.merged.is_empty(), "{outcome:?}");
             assert_eq!(outcome.conflicts.len(), 1, "{outcome:?}");
@@ -3667,6 +3503,7 @@ mod tests {
                     &[PathBuf::from("src/a.rs")],
                     &[],
                 )
+                .await
                 .unwrap();
             assert_eq!(parity.conflicts.len(), outcome.conflicts.len());
             assert_eq!(parity.conflicts[0].0, outcome.conflicts[0].0);
@@ -3676,8 +3513,8 @@ mod tests {
             assert_eq!(parity.merged, outcome.merged);
         }
 
-        #[test]
-        fn provider_absence_keeps_the_merge_byte_identical() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn provider_absence_keeps_the_merge_byte_identical() {
             // No registered provider: the merge applies exactly as before.
             let fixture = build_fixture(faktor_agent::fallback_semantic_registry());
             let outcome = fixture
@@ -3688,6 +3525,7 @@ mod tests {
                     &[PathBuf::from("src/a.rs")],
                     &[],
                 )
+                .await
                 .unwrap();
             assert_eq!(outcome.merged, vec![PathBuf::from("src/a.rs")]);
             assert!(outcome.conflicts.is_empty());
@@ -3722,9 +3560,25 @@ mod tests {
                 assert!(err.to_string().contains(field), "{err}");
             }
 
-            // The fixture's stub registry row carries session_id 0: the
-            // child result must refuse typed instead of panicking in
-            // `SessionId::new(0)`.
+            // A hostile registry row with session_id 0: the child result
+            // must refuse typed instead of panicking in `SessionId::new(0)`.
+            {
+                let mut hostile = row.clone();
+                hostile.session_id = 0;
+                let handle = fixture
+                    .orch
+                    .manager
+                    .get_session(fixture.parent)
+                    .unwrap()
+                    .unwrap();
+                handle
+                    .upsert_memory_fact(
+                        REGISTRY_ROW_KIND,
+                        "run-1/child-0",
+                        &serde_json::to_string(&hostile).unwrap(),
+                    )
+                    .unwrap();
+            }
             let err = fixture
                 .orch
                 .child_result("child-0")
@@ -3733,8 +3587,8 @@ mod tests {
             assert!(err.to_string().contains("session_id 0"), "{err}");
         }
 
-        #[test]
-        fn zero_owner_workspace_id_refuses_the_semantic_preflight_typed() {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn zero_owner_workspace_id_refuses_the_semantic_preflight_typed() {
             let fixture = build_fixture(registry_with(ScriptedDeltaProvider {
                 new_hash: Some(staged_child_hash()),
             }));
@@ -3774,9 +3628,240 @@ mod tests {
                     &fixture.cs,
                     &[PathBuf::from("src/a.rs")],
                 )
+                .await
                 .expect_err("a zero owner workspace id must refuse the preflight");
             assert!(matches!(err, ExecError::Malformed(_)), "{err:?}");
             assert!(err.to_string().contains("workspace id 0"), "{err}");
+        }
+        /// A counting delta provider: handshake/delta counters + a failure mode.
+        struct CountingDeltaProvider {
+            handshakes: std::sync::atomic::AtomicUsize,
+            deltas: std::sync::atomic::AtomicUsize,
+            mode: CountingDeltaMode,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CountingDeltaMode {
+            Empty,
+            Fail,
+            Pending,
+        }
+
+        impl faktor_semantic::SemanticProvider for CountingDeltaProvider {
+            fn id(&self) -> faktor_semantic::SemanticProviderId {
+                faktor_semantic::SemanticProviderId::parse("counting-delta").unwrap()
+            }
+
+            fn version(&self) -> u32 {
+                3
+            }
+
+            fn capabilities(&self) -> faktor_semantic::SemanticCapabilities {
+                faktor_semantic::SemanticCapabilities::DELTA.with_compose_delta(true)
+            }
+
+            fn handshake(
+                &self,
+                _cancel: faktor_core::cancellation::CancellationToken,
+            ) -> faktor_semantic::BoxFuture<
+                '_,
+                Result<faktor_semantic::SemanticProviderDescriptor, faktor_semantic::SemanticError>,
+            > {
+                self.handshakes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let descriptor = self.descriptor();
+                Box::pin(async move { descriptor.validate().map(|()| descriptor) })
+            }
+
+            fn delta(
+                &self,
+                request: faktor_semantic::SemanticDeltaRequest,
+            ) -> faktor_semantic::BoxFuture<
+                '_,
+                Result<
+                    faktor_semantic::SemanticEnvelope<faktor_semantic::SemanticDelta>,
+                    faktor_semantic::SemanticError,
+                >,
+            > {
+                self.deltas
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mode = self.mode;
+                let id = self.id();
+                let version = self.version();
+                Box::pin(async move {
+                    match mode {
+                        CountingDeltaMode::Empty => Ok(faktor_semantic::SemanticEnvelope::new(
+                            id,
+                            version,
+                            request.workspace,
+                            request.from_snapshot,
+                            1,
+                            faktor_semantic::SemanticDelta {
+                                workspace: request.workspace,
+                                from_snapshot: request.from_snapshot,
+                                to_snapshot: request.from_snapshot,
+                                changes: Vec::new(),
+                                degraded: false,
+                            },
+                        )),
+                        CountingDeltaMode::Fail => Err(faktor_semantic::SemanticError::Refused(
+                            "synthetic provider failure".into(),
+                        )),
+                        CountingDeltaMode::Pending => {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            Err(faktor_semantic::SemanticError::Refused(
+                                "pending provider woke".into(),
+                            ))
+                        }
+                    }
+                })
+            }
+        }
+
+        fn counting_registry(
+            provider: &Arc<CountingDeltaProvider>,
+        ) -> Arc<faktor_semantic::SemanticProviderRegistry> {
+            let mut registry = faktor_semantic::SemanticProviderRegistry::new(
+                faktor_semantic::GenericSemanticFallback::default(),
+            );
+            registry.register(provider.clone());
+            Arc::new(registry)
+        }
+
+        fn set_semantic_required(fixture: &Fixture, required: bool) {
+            let (_, _, child) = fixture.orch.locate_child("child-0").unwrap();
+            let session = SessionId::try_from(child.session_id).unwrap();
+            let handle = fixture.orch.manager.get_session(session).unwrap().unwrap();
+            let mut identity = handle.orchestrator_child_identity_get().unwrap().unwrap();
+            identity.require_semantic_delta = required;
+            handle.orchestrator_child_identity_put(&identity).unwrap();
+        }
+
+        /// The first-ever merge call AWAITS the descriptor handshake and really
+        /// runs the delta (the old synchronous `select` could skip a provider
+        /// that had not handshaken in some unrelated earlier operation).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn first_ever_merge_preflight_handshakes_and_runs() {
+            let provider = Arc::new(CountingDeltaProvider {
+                handshakes: std::sync::atomic::AtomicUsize::new(0),
+                deltas: std::sync::atomic::AtomicUsize::new(0),
+                mode: CountingDeltaMode::Empty,
+            });
+            let fixture = build_fixture(counting_registry(&provider));
+            let outcome = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .await
+                .expect("an empty delta merges");
+            assert_eq!(outcome.merged, vec![PathBuf::from("src/a.rs")]);
+            assert!(
+                provider
+                    .handshakes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    >= 1,
+                "the first merge call must handshake the provider"
+            );
+            assert_eq!(
+                provider.deltas.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the delta must actually run"
+            );
+        }
+
+        /// A child whose task policy REQUIRES compiler-exact verification blocks
+        /// the merge when no delta-capable provider is registered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn required_semantic_delta_blocks_without_a_provider() {
+            let mut registry = faktor_semantic::SemanticProviderRegistry::new(
+                faktor_semantic::GenericSemanticFallback::default(),
+            );
+            registry.register(Arc::new(CountingDeltaProvider {
+                handshakes: std::sync::atomic::AtomicUsize::new(0),
+                deltas: std::sync::atomic::AtomicUsize::new(0),
+                mode: CountingDeltaMode::Fail,
+            }));
+            let fixture = build_fixture(Arc::new(registry));
+            set_semantic_required(&fixture, true);
+            // No provider that can actually answer: remove the failing one by
+            // building a fallback-only fixture for the absence case.
+            let fallback_only = Arc::new(faktor_semantic::SemanticProviderRegistry::new(
+                faktor_semantic::GenericSemanticFallback::default(),
+            ));
+            let fixture = build_fixture(fallback_only);
+            set_semantic_required(&fixture, true);
+            let err = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .await
+                .expect_err("required semantic verification must block");
+            assert!(matches!(err, ExecError::SemanticRequired(_)), "{err:?}");
+            assert_eq!(parent_bytes(&fixture), b"v1-base", "nothing applied");
+        }
+
+        /// A REQUIRED preflight blocks on provider failure — it never silently
+        /// downgrades to the advisory path.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn required_semantic_delta_blocks_on_provider_failure() {
+            let provider = Arc::new(CountingDeltaProvider {
+                handshakes: std::sync::atomic::AtomicUsize::new(0),
+                deltas: std::sync::atomic::AtomicUsize::new(0),
+                mode: CountingDeltaMode::Fail,
+            });
+            let fixture = build_fixture(counting_registry(&provider));
+            set_semantic_required(&fixture, true);
+            let err = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .await
+                .expect_err("a required preflight must block on provider failure");
+            assert!(matches!(err, ExecError::SemanticRequired(_)), "{err:?}");
+            assert_eq!(provider.deltas.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// A PENDING provider is awaited (bounded); it is never treated as
+        /// absence. Required mode blocks at the bound.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn pending_semantic_provider_is_awaited_not_skipped() {
+            let provider = Arc::new(CountingDeltaProvider {
+                handshakes: std::sync::atomic::AtomicUsize::new(0),
+                deltas: std::sync::atomic::AtomicUsize::new(0),
+                mode: CountingDeltaMode::Pending,
+            });
+            let fixture = build_fixture(counting_registry(&provider));
+            set_semantic_required(&fixture, true);
+            SEMANTIC_MERGE_TIMEOUT_OVERRIDE_MS.store(150, std::sync::atomic::Ordering::SeqCst);
+            let err = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .await
+                .expect_err("a pending required provider must block at the bound");
+            SEMANTIC_MERGE_TIMEOUT_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(err, ExecError::SemanticRequired(_)), "{err:?}");
+            assert_eq!(
+                provider.deltas.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the provider was actually called and awaited"
+            );
         }
     }
 }
@@ -3819,6 +3904,7 @@ mod goal_typed_tests {
             operation_id: 0,
             ownership: ChildOwnership::ReadOnlyShared,
             model: "m".into(),
+            require_semantic_delta: false,
             created_ms: 1,
         };
         handle.orchestrator_child_identity_put(&identity).unwrap();

@@ -907,6 +907,7 @@ impl SessionManager {
             operation_id: 0,
             ownership,
             model: String::new(),
+            require_semantic_delta: false,
             created_ms: self.now_ms(),
         };
         child.orchestrator_child_identity_put(&id)?;

@@ -96,6 +96,10 @@ pub struct ChildIdentity {
     /// The effective model the daemon should select for this child
     /// (empty = session default).
     pub model: String,
+    /// Task policy (audit Tangerine-11): when true, merging this child's
+    /// change set REQUIRES a compiler-exact semantic delta; absence blocks
+    /// the merge (`SemanticRequired`) instead of downgrading to advisory.
+    pub require_semantic_delta: bool,
     pub created_ms: i64,
 }
 
@@ -110,6 +114,7 @@ impl Default for ChildIdentity {
             operation_id: 0,
             ownership: ChildOwnership::ReadOnlyShared,
             model: String::new(),
+            require_semantic_delta: false,
             created_ms: 0,
         }
     }
@@ -839,6 +844,7 @@ mod tests {
                 operation_id: 42,
                 ownership: ChildOwnership::IsolatedWorktree,
                 model: "m2".into(),
+                require_semantic_delta: false,
                 created_ms: 1,
             };
             s.orchestrator_child_identity_put(&id).unwrap();

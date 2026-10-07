@@ -188,11 +188,13 @@ pub enum ExecError {
     #[error("invalid merge approval: {0}")]
     InvalidApproval(String),
     /// The OPTIONAL semantic merge preflight (audit 79) refused a merge: the
-    /// provider's base→candidate delta contradicts the staged digests. It is
-    /// an ADDITIONAL typed refusal only — a real CAS/file conflict is never
-    /// overridden by it (and never resolved by provider data).
+    /// provider delta contradicts the staged digests. An ADDITIONAL typed
+    /// refusal only — a real CAS/file conflict is never overridden by it.
     #[error("semantic merge conflict: {0}")]
     SemanticConflict(String),
+    /// Required compiler-exact semantic merge verification is unavailable.
+    #[error("semantic merge verification required but unavailable: {0}")]
+    SemanticRequired(String),
     #[error("merge decision incomplete: {0}")]
     UndecidedPaths(String),
     /// An isolated child's staged change set could not be integrated into
@@ -245,7 +247,6 @@ impl ExecError {
             message: e.to_string(),
         }
     }
-
     /// Map a faktor-fs layer error of a merge/snapshot/copy operation onto
     /// the typed orchestrator error space (typed mapping — the merge never
     /// swallows an fs failure).
@@ -263,7 +264,6 @@ impl ExecError {
             other => ExecError::Internal(format!("{what}: {:?}: {}", other, e.message)),
         }
     }
-
     /// Prefix a shadow-service error with its context, keeping the typed
     /// variant (P0-48 wiring: a refused shadow begin stays typed so callers
     /// distinguish Oversized copies, live-shadow conflicts, and vanished

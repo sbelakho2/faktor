@@ -1,0 +1,9 @@
+{
+  "id": "INV-MERGE-SEMANTIC-AWAITED",
+  "file": "crates/orchestrator/src/merge.rs",
+  "find": "        if envelope.provider_id.as_str() == GENERIC_FALLBACK_ID || envelope.payload.degraded {\n            if required {\n                return Err(ExecError::SemanticRequired(format!(",
+  "replace": "        if envelope.provider_id.as_str() == GENERIC_FALLBACK_ID || envelope.payload.degraded {\n            if false {\n                return Err(ExecError::SemanticRequired(format!(",
+  "gate": "cargo test -p faktor-orchestrator --lib required_semantic_delta_blocks_on_provider_failure",
+  "expect": "FAILED",
+  "note": "Downgrading a required preflight whose provider degraded to fallback data to the advisory path silently skips real semantic verification."
+}

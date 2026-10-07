@@ -5,7 +5,7 @@
   "replace": "        launched.disarm();\n        broker.shutdown().await;\n        if let Some(incognito) = incognito {\n            incognito.remove();\n        }",
   "gate": "cargo test -p faktor-browser --lib rollback_launch_kills_the_spawned_child",
   "expect": "FAILED",
-  "note": "Disarming instead of killing lets the spawned child survive a rollback.",
+  "note": "Disarming instead of killing lets the spawned child survive the launch rollback.",
   "capabilities": [
     "browser.launch_rollback"
   ]

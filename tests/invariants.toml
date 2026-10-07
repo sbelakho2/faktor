@@ -1516,3 +1516,34 @@ mutation_command = "node scripts/mutation-run.mjs INV-BROWSER-CAPTURE-CLEANUP"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]
+
+
+[[invariant]]
+id = "INV-SEMANTIC-QUERY-REAL-TOOL"
+statement = "Tangerine integration authority: the named production behavior is enforced and a planted mutation makes its dedicated oracle fail."
+owner = "crates/agent semantic_tool dispatch"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-QUERY-REAL-TOOL.json"
+script_check = ""
+unit_test = "a_model_semantic_query_call_executes_against_the_registered_provider"
+production_wiring = "a_registered_provider_answers_and_fallback_only_refuses_typed"
+fault = ""
+mutation_witness = "a_model_semantic_query_call_executes_against_the_registered_provider"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-QUERY-REAL-TOOL"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MERGE-SEMANTIC-AWAITED"
+statement = "Tangerine integration authority: the named production behavior is enforced and a planted mutation makes its dedicated oracle fail."
+owner = "crates/orchestrator semantic merge preflight"
+authority = "planted mutation scripts/mutations/INV-MERGE-SEMANTIC-AWAITED.json"
+script_check = ""
+unit_test = "required_semantic_delta_blocks_on_provider_failure"
+production_wiring = "first_ever_merge_preflight_handshakes_and_runs"
+fault = ""
+mutation_witness = "required_semantic_delta_blocks_on_provider_failure"
+mutation_command = "node scripts/mutation-run.mjs INV-MERGE-SEMANTIC-AWAITED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
