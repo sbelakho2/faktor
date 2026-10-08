@@ -8,6 +8,25 @@ use super::*;
 /// excerpt.
 pub(crate) const TOOL_OUTPUT_EVIDENCE_MIN_BYTES: usize = 8 * 1024;
 
+/// The TASK/CHILD capability budget leg of the tool gate (audits Tangerine-9
+/// / P0-SEC): the orchestrated child's durable effective parent∩task∩child
+/// permission set. `Ok(None)` means a root/unaffiliated session, which the
+/// leg does not narrow; an UNREADABLE row is returned as an empty budget
+/// plus a typed reason so the caller fails closed — it is NEVER interpreted
+/// as unrestricted authority.
+pub(crate) fn task_capability_budget(
+    handle: &faktor_session::SessionHandle,
+) -> (faktor_core::CapabilitySet, Option<String>) {
+    match handle.orchestrator_child_identity_get() {
+        Ok(Some(identity)) => (identity.permissions, None),
+        Ok(None) => (faktor_core::CapabilitySet::ALL, None),
+        Err(e) => (
+            faktor_core::CapabilitySet::EMPTY,
+            Some(format!("task capability budget unreadable: {e}")),
+        ),
+    }
+}
+
 /// Artifact storage handed to tools (bounded writes to the CAS). The REAL
 /// sink carries the daemon's configured-secret registry (the SAME instance
 /// the egress scan uses), and every stored byte buffer is exact-redacted
@@ -909,12 +928,16 @@ impl AgentRuntime {
             let tool = match self.deps.tools.get(&name) {
                 Some(t) => t,
                 // The real semantic escape hatch (audit Tangerine-10): when a
-                // provider is registered the runtime supplies the executable
-                // implementation itself, so a model that calls the advertised
-                // tool can never hit "unknown tool". Fallback-only
-                // environments never advertise it (bundle gate below).
+                // provider that can actually serve CONTEXT is ready the
+                // runtime supplies the executable implementation itself, so a
+                // model that calls the advertised tool can never hit "unknown
+                // tool". Registration alone is not readiness (audit P1-UX):
+                // the SAME gate as the bundle below decides.
                 None if name == crate::tool::SEMANTIC_QUERY_TOOL
-                    && self.deps.semantic.has_external_provider() =>
+                    && self
+                        .deps
+                        .semantic
+                        .has_external_provider_for(SemanticOp::Context) =>
                 {
                     crate::semantic_tool::tool(self.deps.semantic.clone())
                 }
@@ -1022,26 +1045,24 @@ impl AgentRuntime {
             // The TASK/CHILD capability budget is a durable leg (audit
             // Tangerine-9): an orchestrated child's effective parent∩task∩
             // child permission set rides its identity, never
-            // `CapabilitySet::ALL`.
-            let task_caps = handle
-                .orchestrator_child_identity_get()
-                .ok()
-                .flatten()
-                .map(|identity| identity.permissions)
-                .unwrap_or(faktor_core::CapabilitySet::ALL);
+            // `CapabilitySet::ALL`; an unreadable row fails closed (P0-SEC).
+            let (task_caps, budget_error) = task_capability_budget(handle);
             let restrictions = semantic
                 .map(|state| state.restrictions)
                 .unwrap_or(faktor_core::CapabilitySet::ALL);
             if restrictions != faktor_core::CapabilitySet::ALL
                 || task_caps != faktor_core::CapabilitySet::ALL
+                || budget_error.is_some()
             {
                 let envelope = sandbox_capability_envelope(
                     self.deps.sandbox.as_deref().map(|engine| engine.policy()),
                 );
                 let effective = effective_capabilities(envelope, task_caps, restrictions);
                 let kind = capability_kind_of(&capability);
-                if !effective.contains(kind) {
-                    let reason = if !task_caps.contains(kind) {
+                if budget_error.is_some() || !effective.contains(kind) {
+                    let reason = if let Some(error) = &budget_error {
+                        format!("{error}; refusing the tool")
+                    } else if !task_caps.contains(kind) {
                         format!(
                             "task capability budget denies capability '{}'",
                             kind.as_str()
@@ -1792,12 +1813,18 @@ impl AgentRuntime {
             capabilities,
             &next,
         );
-        // Advertising gate (audit 10): semantic_query is a MODEL-VISIBLE tool
-        // only while a real EXTERNAL semantic provider is registered — never
-        // because the selected model happens to support embeddings. With
-        // only the generic fallback the surface disappears; the execute path
+        // Advertising gate (audits 10 / P1-UX): semantic_query is a
+        // MODEL-VISIBLE tool only while a real EXTERNAL provider can actually
+        // serve CONTEXT with a VALIDATED descriptor — never because the
+        // selected model happens to support embeddings, and never on bare
+        // registration. With only the generic fallback (or a provider that
+        // cannot answer context) the surface disappears; the execute path
         // still refuses typed if a stale call arrives.
-        if self.deps.semantic.has_external_provider() {
+        if self
+            .deps
+            .semantic
+            .has_external_provider_for(SemanticOp::Context)
+        {
             if !bundle
                 .tools
                 .iter()

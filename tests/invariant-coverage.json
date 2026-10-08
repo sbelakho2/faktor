@@ -1179,508 +1179,508 @@
   },
   "native.get.capabilities": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.capabilities is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.capabilities is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.models": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.models is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.models is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.agents": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.agents is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.agents is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.approvals": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.approvals is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.approvals is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.artifacts": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.artifacts is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.artifacts is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.audit": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.audit is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.audit is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.deletion-jobs": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.deletion-jobs is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.deletion-jobs is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.deletion-jobs.id": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.deletion-jobs.id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.deletion-jobs.id is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.settings": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.settings is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.settings is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.status": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.status is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.status is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.enterprise.tombstones.scope-key": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.enterprise.tombstones.scope-key is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.enterprise.tombstones.scope-key is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.entitlements": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.entitlements is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.entitlements is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.events": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.events is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.events is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.evidence.id": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.evidence.id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.evidence.id is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.health": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.health is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.health is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.identity": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.identity is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.identity is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.index.coverage": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.index.coverage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.index.coverage is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.jobs.id": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.jobs.id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.jobs.id is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.messages": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.messages is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.messages is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.orchestrator.graph": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.orchestrator.graph is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.orchestrator.graph is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.orgs": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.orgs is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.orgs is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.orgs.id.members": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.orgs.id.members is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.orgs.id.members is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.permissions": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.permissions is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.permissions is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.providers": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.providers is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.providers is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.ready": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.ready is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.ready is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.repositories": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.repositories is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.repositories is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.semantic.capabilities": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.semantic.capabilities is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.semantic.capabilities is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.semantic.status": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.semantic.status is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.semantic.status is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.agents": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.agents is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.agents is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.attachments.blob.digest": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.attachments.blob.digest is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.attachments.blob.digest is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.attachments.blob.digest.bytes": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.attachments.blob.digest.bytes is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.attachments.blob.digest.bytes is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.attachments.ref.ref-id": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.attachments.ref.ref-id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.attachments.ref.ref-id is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.attachments.ref.ref-id.bytes": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.attachments.ref.ref-id.bytes is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.attachments.ref.ref-id.bytes is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.board": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.board is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.board is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.checkpoints": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.checkpoints is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.checkpoints is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.events": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.events is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.events is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.task-runs": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.task-runs is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.task-runs is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.task-runs.run-id": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.task-runs.run-id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.task-runs.run-id is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.tasks": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.tasks is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.tasks is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.tasks.task-id.verification": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.tasks.task-id.verification is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.tasks.task-id.verification is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.terminal": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.terminal is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.terminal is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.terminal.events": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.terminal.events is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.terminal.events is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.terminals.terminal-id.output": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.terminals.terminal-id.output is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.terminals.terminal-id.output is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.tournament.tournament-id": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.tournament.tournament-id is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.tournament.tournament-id is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.tournaments": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.tournaments is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.tournaments is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.turns": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.turns is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.turns is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.usage": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.usage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.usage is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.session.id.verification": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.session.id.verification is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.session.id.verification is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.sessions": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.sessions is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.sessions is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.tasks.id.completion-steps": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.tasks.id.completion-steps is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.tasks.id.completion-steps is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.tasks.id.proof": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.tasks.id.proof is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.tasks.id.proof is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.terminals": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.terminals is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.terminals is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.updater.status": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.updater.status is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.updater.status is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.usage": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.usage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.usage is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.workers": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.native.workers is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.workers is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.session.id.projection": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.get.session.id.projection is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.session.id.projection is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.budget": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.budget is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.budget is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.cancel": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.cancel is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.cancel is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.model": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.model is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.model is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.pause": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.pause is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.pause is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.resume": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.resume is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.resume is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.retry": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.retry is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.retry is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.agents.child-id.steer": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.agents.child-id.steer is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.agents.child-id.steer is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.approvals.id.decide": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.approvals.id.decide is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.approvals.id.decide is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.credits.grant": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.credits.grant is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.credits.grant is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.enterprise.artifacts.id.eligible": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.enterprise.artifacts.id.eligible is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.enterprise.artifacts.id.eligible is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.enterprise.deletion-jobs.id.advance": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.enterprise.deletion-jobs.id.advance is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.enterprise.deletion-jobs.id.advance is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.enterprise.effective-config": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.enterprise.effective-config is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.enterprise.effective-config is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.enterprise.retention.gc": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.enterprise.retention.gc is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.enterprise.retention.gc is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.evidence.id.retrieve": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.evidence.id.retrieve is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.evidence.id.retrieve is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.invitations.accept": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.invitations.accept is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.invitations.accept is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.jobs.claim": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.jobs.claim is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.jobs.claim is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.jobs.id.result": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.jobs.id.result is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.jobs.id.result is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.permission.reply": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.permission.reply is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.permission.reply is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.scm.webhook": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.scm.webhook is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.scm.webhook is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.abort": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.abort is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.abort is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.agents.child.presentation": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.agents.child.presentation is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.agents.child.presentation is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.attachments": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.attachments is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.attachments is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.prompt": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.prompt is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.prompt is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.task-runs.run-id.cancel": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.task-runs.run-id.cancel is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.task-runs.run-id.cancel is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.terminal": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.terminal is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.terminal is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.terminals.terminal-id.input": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.terminals.terminal-id.input is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.terminals.terminal-id.input is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.terminals.terminal-id.kill": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.terminals.terminal-id.kill is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.terminals.terminal-id.kill is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.terminals.terminal-id.reconcile": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.terminals.terminal-id.reconcile is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.terminals.terminal-id.reconcile is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.terminals.terminal-id.resize": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.terminals.terminal-id.resize is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.terminals.terminal-id.resize is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.tournament": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.tournament is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.tournament is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.tournaments.tournament-id.abort": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.tournaments.tournament-id.abort is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.tournaments.tournament-id.abort is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.session.id.tournaments.tournament-id.decide": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.session.id.tournaments.tournament-id.decide is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.tournaments.tournament-id.decide is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.sso.callback": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.sso.callback is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.sso.callback is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.sso.logout": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.sso.logout is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.sso.logout is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.sso.start": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.sso.start is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.sso.start is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.updater.apply": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.updater.apply is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.updater.apply is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.updater.check": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.updater.check is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.updater.check is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.updater.downgrade": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.updater.downgrade is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.updater.downgrade is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.updater.rollback": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.updater.rollback is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.updater.rollback is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.updater.stage": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.updater.stage is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.updater.stage is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.workers.id.heartbeat": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.workers.id.heartbeat is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.workers.id.heartbeat is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.workers.id.revoke": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.workers.id.revoke is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.workers.id.revoke is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.workers.register": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.workers.register is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.workers.register is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.post.native.workers.tokens": {
    "class": "delegated",
-   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
-   "reason": "native.post.native.workers.tokens is discovered on a real native surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.workers.tokens is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "provider.anthropic": {
    "class": "delegated",
@@ -1816,6 +1816,276 @@
    "class": "delegated",
    "delegate": "INV-CLIENT-ROUTE-CONTRACT",
    "reason": "vscode.view.faktor is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "cli.commerce.clear-cache": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.commerce.clear-cache is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.commerce.doctor": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.commerce.doctor is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.commerce.login": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.commerce.login is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.commerce.logout": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.commerce.logout is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.commerce.status": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.commerce.status is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.artifact": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.artifact is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.artifact.eligible": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.artifact.eligible is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.artifact.list": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.artifact.list is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.artifact.register": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.artifact.register is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.audit": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.audit is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.config": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.config is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.deletion": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.deletion is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.deletion.advance": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.deletion.advance is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.deletion.show": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.deletion.show is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.deletion.start": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.deletion.start is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.gc": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.gc is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.settings": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.settings is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.enterprise.status": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.enterprise.status is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.abort": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.abort is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.activate": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.activate is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.apply": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.apply is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.check": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.check is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.downgrade": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.downgrade is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.finalize": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.finalize is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.recover": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.recover is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.rollback": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.rollback is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.stage": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.stage is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.updater.status": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.updater.status is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "cli.worker.run": {
+   "class": "delegated",
+   "delegate": "INV-CLI-DOCTOR-EXIT-CODE",
+   "reason": "cli.worker.run is discovered on a real cli surface; its implementation authority is centrally mutation-tested by INV-CLI-DOCTOR-EXIT-CODE."
+  },
+  "native.post.native.approvals": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.approvals is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.post.native.enterprise.artifacts": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.enterprise.artifacts is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.post.native.enterprise.deletion-jobs": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.enterprise.deletion-jobs is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.post.native.orgs": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.orgs is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.post.native.orgs.id.members": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.orgs.id.members is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.post.native.session.id.board": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.board is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.post.native.session.id.task-runs": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.post.native.session.id.task-runs is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.put.native.enterprise.settings": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.put.native.enterprise.settings is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "vscode.configuration.faktor": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.auto-start": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.auto-start is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.binary-path": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.binary-path is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.budget-cost-micro": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.budget-cost-micro is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.budget-tokens": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.budget-tokens is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.control-plane-auth-session": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.control-plane-auth-session is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.control-plane-endpoint": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.control-plane-endpoint is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.control-plane-organization": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.control-plane-organization is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.control-token": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.control-token is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.data-dir": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.data-dir is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.default-model": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.default-model is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.default-provider": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.default-provider is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.extra-args": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.extra-args is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.install-root": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.install-root is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.mutation-mode": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.mutation-mode is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor.startup-timeout-ms": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor.startup-timeout-ms is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.view.faktor.chat": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.view.faktor.chat is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
   }
  }
 }

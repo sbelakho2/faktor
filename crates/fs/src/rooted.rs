@@ -192,6 +192,30 @@ impl RootedDir {
         &self.root
     }
 
+    /// The ANCHORED identity `(device, inode)` of this root, read from the
+    /// retained descriptor (never a pathname re-resolution) on unix; `None`
+    /// where the platform exposes no comparable identity. Callers use it to
+    /// prove that a pathname later re-resolved by a foreign backend still
+    /// names this directory (audit P2-FS).
+    pub fn anchored_identity(&self) -> Option<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            // SAFETY: `libc::stat` is plain-old-data; an all-zero bit pattern
+            // is a valid initial value.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `fd` is a live descriptor owned by this RootedDir and
+            // `st` is a valid stat buffer.
+            if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) } != 0 {
+                return None;
+            }
+            Some((st.st_dev as u64, st.st_ino as u64))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// Lexical join for consumers that need a printable/absolute location
     /// (e.g. Chromium's `--user-data-dir`). Containment of the joined path is
     /// the caller's concern; every *file operation* must go through this
@@ -673,6 +697,24 @@ use faktor_core::error::ErrorKind;
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn canonicalize_rooted(root: &Path, rel: &Path) -> Result<PathBuf, Error> {
     Ok(root.join(rel))
+}
+
+/// Identity `(device, inode)` of the entry AT `path`, without following a
+/// final symlink (unix); `None` where unavailable. Compared against
+/// [`RootedDir::anchored_identity`] to detect a root pathname swapped under a
+/// foreign backend (audit P2-FS).
+pub(crate) fn path_identity_no_follow(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Split a caller path into validated relative components. `..`, absolute

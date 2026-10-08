@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-QUERY-READY",
+  "file": "crates/semantic/src/registry.rs",
+  "find": "            provider\n                .validated_descriptor()\n                .is_some_and(|descriptor| descriptor.covers_validated(required))",
+  "replace": "            provider\n                .validated_descriptor()\n                .is_some_and(|descriptor| descriptor.covers_validated(required))\n                || true",
+  "gate": "cargo test -p faktor-agent --lib semantic_query_is_not_advertised_without_a_context_capable_provider",
+  "expect": "FAILED",
+  "note": "Advertising semantic_query on registration alone (or an unrelated capability) exposes a tool no ready provider can answer."
+}

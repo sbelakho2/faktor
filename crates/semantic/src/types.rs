@@ -702,7 +702,7 @@ pub enum SemanticFidelity {
 
 /// How much of the semantic truth a response covers (audit Tangerine-4):
 /// boolean availability alone is not completeness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticCompleteness {
     Unknown,
@@ -732,11 +732,13 @@ pub struct SemanticProviderDescriptor {
     /// The envelope schema version this provider actually speaks.
     pub schema_version: u32,
     pub capabilities: SemanticCapabilities,
-    /// Declared evidence fidelity (absent = the external-provider contract:
-    /// compiler-exact).
+    /// Declared evidence fidelity (absent = NO declared trust, audit
+    /// P1-SEMANTIC: providers must claim compiler-exact explicitly to be
+    /// trusted with compiler-exact obligations).
     #[serde(default)]
     pub fidelity: Option<SemanticFidelity>,
-    /// Declared completeness (absent = conservative-complete).
+    /// Declared completeness (absent = `Unknown`, never conservative-
+    /// complete by default).
     #[serde(default)]
     pub completeness: Option<SemanticCompleteness>,
 }
@@ -814,6 +816,12 @@ pub struct SemanticCall {
     /// absent or failing provider is then a typed error, never a silent
     /// degradation to the generic fallback (ordinary consults keep `false`).
     pub require_provider: bool,
+    /// When set, dispatch may only be served by this provider (audit
+    /// P1-SEMANTIC): a caller that derived snapshot/view identity from a
+    /// SELECTED provider must not have another provider serve the call
+    /// through registry fail-over — the identity would describe the wrong
+    /// provider. `None` keeps normal fail-over.
+    pub provider_pin: Option<SemanticProviderId>,
 }
 
 impl SemanticCall {
@@ -834,6 +842,7 @@ impl SemanticCall {
             retry: RetryPolicy::default(),
             recovery: RecoveryStrategy::None,
             require_provider: false,
+            provider_pin: None,
         }
     }
 
@@ -842,6 +851,15 @@ impl SemanticCall {
     /// [`SemanticError::ProviderRequired`]).
     pub fn requiring_provider(mut self) -> Self {
         self.require_provider = true;
+        self
+    }
+
+    /// Pin dispatch to one provider (audit P1-SEMANTIC): the request identity
+    /// derived from that provider can never be answered by a fail-over
+    /// provider, and the pinned provider failing is a typed absence, never a
+    /// silent substitution.
+    pub fn pinned_to(mut self, provider: SemanticProviderId) -> Self {
+        self.provider_pin = Some(provider);
         self
     }
 
@@ -1466,20 +1484,19 @@ pub trait SemanticProvider: Send + Sync {
         descriptor.validate().ok().map(|()| descriptor)
     }
 
-    /// The provider's declared evidence fidelity (descriptor override or the
-    /// external-provider compiler-exact contract).
+    /// The provider's DECLARED evidence fidelity (audit P1-SEMANTIC): an
+    /// absent declaration is `None` (no trust), never the strongest level —
+    /// trust is claimed explicitly, never inherited from silence.
     fn fidelity(&self) -> SemanticFidelity {
-        self.descriptor()
-            .fidelity
-            .unwrap_or(SemanticFidelity::CompilerExact)
+        self.descriptor().fidelity.unwrap_or(SemanticFidelity::None)
     }
 
-    /// The provider's declared completeness (descriptor override or the
-    /// conservative-complete provider contract).
+    /// The provider's DECLARED completeness (audit P1-SEMANTIC): an absent
+    /// declaration is `Unknown`, never conservative-complete.
     fn completeness(&self) -> SemanticCompleteness {
         self.descriptor()
             .completeness
-            .unwrap_or(SemanticCompleteness::ConservativeComplete)
+            .unwrap_or(SemanticCompleteness::Unknown)
     }
 
     /// Identity of the transport this provider executes through (endpoint,

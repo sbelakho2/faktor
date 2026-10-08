@@ -49,29 +49,49 @@ impl OrchestratorRuntime {
     }
 
     /// TRUE when the merging child's durable identity requires compiler-exact
-    /// semantic verification (task policy). An unreadable/missing identity
-    /// row defaults to ADVISORY with a loud warning — the requirement flag
-    /// itself is policy, and only an explicit `true` blocks.
-    fn semantic_merge_required(&self, cs: &ChangeSet) -> bool {
-        let Ok((_parent, _run, child)) = self.locate_child(&cs.child_id) else {
-            return false;
-        };
-        let Ok(child_session) = SessionId::try_from(child.session_id) else {
-            return false;
-        };
-        let Ok(Some(handle)) = self.manager.get_session(child_session) else {
-            return false;
-        };
+    /// semantic verification (task policy). ANY failure to read that durable
+    /// policy — locate failure, missing session, missing or corrupt identity
+    /// row, store error — is a typed refusal (audit P0-POLICY): an unreadable
+    /// policy is NEVER silently downgraded to advisory. Only an identity row
+    /// that is present and decodes cleanly may answer `false`.
+    fn semantic_merge_required(&self, cs: &ChangeSet) -> Result<bool, ExecError> {
+        let (_parent, _run, child) = self.locate_child(&cs.child_id).map_err(|e| {
+            ExecError::SemanticRequired(format!(
+                "the semantic merge policy for child {} is unreadable: {e}",
+                cs.child_id
+            ))
+        })?;
+        let child_session = SessionId::try_from(child.session_id).map_err(|e| {
+            ExecError::SemanticRequired(format!(
+                "child {} carries session id {} in the semantic merge policy: {}",
+                cs.child_id, child.session_id, e.message
+            ))
+        })?;
+        let handle = self
+            .manager
+            .get_session(child_session)
+            .map_err(|e| {
+                ExecError::SemanticRequired(format!(
+                    "child {} session read failed while reading the semantic merge policy: {e}",
+                    cs.child_id
+                ))
+            })?
+            .ok_or_else(|| {
+                ExecError::SemanticRequired(format!(
+                    "child {} names session {} which does not exist; the semantic merge policy is unreadable",
+                    cs.child_id, child_session
+                ))
+            })?;
         match handle.orchestrator_child_identity_get() {
-            Ok(Some(identity)) => identity.require_semantic_delta,
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(
-                    child = %cs.child_id,
-                    "child identity read failed during merge preflight ({e}); treating the semantic requirement as advisory"
-                );
-                false
-            }
+            Ok(Some(identity)) => Ok(identity.require_semantic_delta),
+            Ok(None) => Err(ExecError::SemanticRequired(format!(
+                "child {} has no durable identity row; the semantic merge policy is unreadable and is never treated as advisory",
+                cs.child_id
+            ))),
+            Err(e) => Err(ExecError::SemanticRequired(format!(
+                "child {} identity read failed while reading the semantic merge policy ({e}); refusing to treat the requirement as advisory",
+                cs.child_id
+            ))),
         }
     }
 
@@ -82,7 +102,7 @@ impl OrchestratorRuntime {
         cs: &ChangeSet,
         approved: &[PathBuf],
     ) -> Result<(), ExecError> {
-        let required = self.semantic_merge_required(cs);
+        let required = self.semantic_merge_required(cs)?;
         let registry = self.agent.deps().semantic.clone();
         // The handshake is AWAITED before selection: a real asynchronous
         // provider is never silently skipped because an unrelated earlier
@@ -104,6 +124,20 @@ impl OrchestratorRuntime {
                         "run {run} requires compiler-exact semantic verification but provider {} declares fidelity {:?}",
                         provider.id(),
                         provider.fidelity()
+                    )));
+                }
+                // Completeness is part of the trust claim (audit
+                // P1-SEMANTIC): a provider that cannot state its coverage as
+                // at least conservative-complete must not satisfy a REQUIRED
+                // merge preflight.
+                if required
+                    && provider.completeness()
+                        < faktor_semantic::SemanticCompleteness::ConservativeComplete
+                {
+                    return Err(ExecError::SemanticRequired(format!(
+                        "run {run} requires conservative-complete semantic verification but provider {} declares completeness {:?}",
+                        provider.id(),
+                        provider.completeness()
                     )));
                 }
                 provider
@@ -150,7 +184,11 @@ impl OrchestratorRuntime {
                 workspace,
                 self.manager.now_ms(),
                 cancel.child(),
-            ),
+            )
+            // The view identity above was derived from THIS provider (audit
+            // P1-SEMANTIC): pin dispatch so a fail-over provider can never
+            // answer a call whose identity describes the selected one.
+            .pinned_to(provider_id.clone()),
             Err(e) => {
                 if required {
                     return Err(ExecError::SemanticRequired(format!(
@@ -166,37 +204,43 @@ impl OrchestratorRuntime {
         };
         // Snapshot-ensure (when the provider can): both the base and the
         // staged candidate must be resolvable snapshots before a delta
-        // between them can mean anything.
+        // between them can mean anything. The ensure goes through the
+        // REGISTRY (audit P1-SEMANTIC): envelope identity/provider/payload
+        // validation applies exactly like any other dispatch, never a raw
+        // provider call that bypasses it.
         if provider.capabilities().supports(SemanticOp::Snapshot) {
             for revision in [cs.base_id.clone(), candidate_revision.clone()] {
-                let ensure = provider.snapshot(SemanticSnapshotRequest {
+                let ensure = registry.snapshot(SemanticSnapshotRequest {
                     call: call.clone(),
                     workspace,
                     source_revision: revision.clone(),
                 });
-                match tokio::time::timeout(Self::merge_preflight_timeout(), ensure).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) if required => {
-                        return Err(ExecError::SemanticRequired(format!(
-                            "provider {provider_id} could not ensure snapshot {revision:?}: {err}"
-                        )));
+                let served = match tokio::time::timeout(Self::merge_preflight_timeout(), ensure)
+                    .await
+                {
+                    Ok(Ok(envelope)) if envelope.provider_id.as_str() != GENERIC_FALLBACK_ID => {
+                        Ok(())
                     }
-                    Ok(Err(err)) => {
+                    Ok(Ok(envelope)) => Err(format!(
+                        "provider {} degraded the snapshot ensure for {revision:?}",
+                        envelope.provider_id
+                    )),
+                    Ok(Err(err)) => Err(format!(
+                        "provider {provider_id} could not ensure snapshot {revision:?}: {err}"
+                    )),
+                    Err(_) => Err(format!(
+                        "provider {provider_id} timed out ensuring snapshot {revision:?}"
+                    )),
+                };
+                match served {
+                    Ok(()) => {}
+                    Err(detail) if required => {
+                        return Err(ExecError::SemanticRequired(detail));
+                    }
+                    Err(detail) => {
                         tracing::warn!(
                             provider = %provider_id,
-                            "advisory semantic merge preflight could not ensure snapshot {revision:?}: {err}; the fs/CAS merge stands"
-                        );
-                        return Ok(());
-                    }
-                    Err(_) if required => {
-                        return Err(ExecError::SemanticRequired(format!(
-                            "provider {provider_id} timed out ensuring snapshot {revision:?}"
-                        )));
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            provider = %provider_id,
-                            "advisory semantic merge preflight timed out ensuring snapshot {revision:?}; the fs/CAS merge stands"
+                            "advisory semantic merge preflight: {detail}; the fs/CAS merge stands"
                         );
                         return Ok(());
                     }

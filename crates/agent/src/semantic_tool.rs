@@ -50,6 +50,24 @@ pub fn spec() -> ToolSpec {
     }
 }
 
+/// The live semantic revision of a workspace root (audit P1-SEMANTIC): the
+/// CONTENT identity (`tm1:<hex>`, the ONE tree identity shared with run
+/// bases/candidates/proofs) of the source tree the session actually runs in.
+/// It is never `session:<id>` — an internal handle with no relation to
+/// program content. An unreadable/oversized tree yields the shared honest
+/// `snapshot-unavailable` marker, never a fabricated revision that could
+/// masquerade as content identity.
+pub(crate) fn semantic_source_revision(root: Option<&std::path::Path>) -> String {
+    match root {
+        Some(root) => faktor_fs::tree_manifest::tree_manifest_digest(
+            root,
+            faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+        )
+        .unwrap_or_else(|_| "snapshot-unavailable".into()),
+        None => "snapshot-unavailable".into(),
+    }
+}
+
 fn unavailable(detail: &str) -> Error {
     Error::new(
         ErrorKind::Provider {
@@ -153,7 +171,9 @@ pub fn tool(registry: Arc<SemanticProviderRegistry>) -> Arc<Tool> {
                 let provider_id = provider.id().clone();
                 let provider_version = provider.version();
                 let workspace = ctx.identity.workspace_id;
-                let revision = format!("session:{}", ctx.session_id.raw());
+                // The live revision is the workspace CONTENT identity (audit
+                // P1-SEMANTIC), never the session id.
+                let revision = semantic_source_revision(ctx.workspace.as_ref().map(|ws| ws.root()));
                 let snapshot_id = SemanticSnapshotId::derive(
                     workspace,
                     &revision,
@@ -168,7 +188,10 @@ pub fn tool(registry: Arc<SemanticProviderRegistry>) -> Arc<Tool> {
                         workspace,
                         SystemClock.now_ms(),
                         ctx.cancellation.child(),
-                    ),
+                    )
+                    // The identity above was derived from THIS provider:
+                    // pin dispatch against fail-over substitution.
+                    .pinned_to(provider_id.clone()),
                     workspace,
                     source_revision: revision,
                     snapshot_id,
@@ -379,5 +402,21 @@ mod tests {
         let spec = spec();
         assert_eq!(spec.name, SEMANTIC_QUERY_TOOL);
         assert_eq!(spec.input_schema["required"], serde_json::json!(["query"]));
+    }
+
+    /// P1-SEMANTIC: the live semantic revision is a CONTENT identity that
+    /// moves when the source tree changes, and an unavailable root is the
+    /// shared honest marker — never a session handle.
+    #[test]
+    fn live_semantic_revision_is_content_derived_never_a_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let first = semantic_source_revision(Some(dir.path()));
+        assert!(first.starts_with("tm1:"), "{first}");
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() -> u32 { 1 }\n").unwrap();
+        let second = semantic_source_revision(Some(dir.path()));
+        assert!(second.starts_with("tm1:"), "{second}");
+        assert_ne!(first, second, "content changes must move the revision");
+        assert_eq!(semantic_source_revision(None), "snapshot-unavailable");
     }
 }

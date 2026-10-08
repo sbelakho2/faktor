@@ -19,36 +19,29 @@ const WATCH_REGISTRATION_QUEUE_DEPTH: usize = 2;
 pub(crate) const DEFAULT_WATCH_PREFLIGHT_ENTRIES: usize = 50_000;
 const WATCH_PREFLIGHT_MAX_DEPTH: usize = 64;
 
-/// Bounded, symlink-safe preflight walk: returns false as soon as the entry
-/// cap or depth cap is exceeded, so the caller never invokes the
+/// Bounded, symlink-safe preflight walk through the ANCHORED root (audit
+/// P2-FS): every descent opens the child relative to the already-open parent
+/// with no-follow semantics, so no pathname is re-resolved between the check
+/// and the descent — a symlink swapped in mid-walk is refused typed and can
+/// never redirect the preflight out of the root. Returns false as soon as
+/// the entry/depth cap is exceeded, so the caller never invokes the
 /// uninterruptible backend on a pathological tree.
-fn watch_preflight_bounded(root: &std::path::Path, max_entries: usize) -> bool {
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    let mut seen = 0usize;
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > WATCH_PREFLIGHT_MAX_DEPTH {
-            return false;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            seen += 1;
-            if seen > max_entries {
-                return false;
-            }
-            // `file_type` does not follow symlinks: a symlinked directory is
-            // never traversed by the preflight (and `notify` defaults are
-            // configured no-follow elsewhere).
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push((entry.path(), depth + 1));
-            }
-        }
-    }
-    true
+fn watch_preflight_bounded(rooted: &RootedDir, max_entries: usize) -> bool {
+    let mut budget = crate::rooted::WalkBudget::new(
+        max_entries,
+        max_entries,
+        WATCH_PREFLIGHT_MAX_DEPTH,
+        u64::MAX,
+        0,
+    );
+    rooted
+        .walk_bounded(
+            std::path::Path::new("."),
+            &mut budget,
+            &[],
+            &mut |_entry, _depth, _budget| Ok(crate::rooted::WalkStep::Continue),
+        )
+        .is_ok()
 }
 
 /// Outcome of one bounded watcher registration (P2-FS).
@@ -86,13 +79,18 @@ static WATCH_WORKER_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::
 static WATCH_WORKER_BUSY_SINCE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(test)]
-static WATCH_REGISTRATION_WORKER_SPAWNS: std::sync::atomic::AtomicUsize =
+/// Total watcher-registration worker GENERATIONS spawned since process
+/// start (audit P1-FS). This is the PRODUCTION cap accounting: a generation
+/// wedged inside `notify`'s uninterruptible recursive `watch()` can never be
+/// reaped, so respawns must be counted for real. Previously only test builds
+/// counted; release builds hardcoded `1`, so every overdue registration
+/// leaked another permanently blocked thread.
+static WATCH_REGISTRATION_WORKER_GENERATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(crate) fn watch_registration_worker_spawns() -> usize {
-    WATCH_REGISTRATION_WORKER_SPAWNS.load(std::sync::atomic::Ordering::SeqCst)
+    WATCH_REGISTRATION_WORKER_GENERATIONS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// After this long inside one uninterruptible `watch()` call the worker is
@@ -132,8 +130,7 @@ fn watch_worker_overdue_ms() -> u64 {
 fn spawn_watcher_registration_worker() -> std::sync::mpsc::SyncSender<WatchRegistrationRequest> {
     let (tx, rx) =
         std::sync::mpsc::sync_channel::<WatchRegistrationRequest>(WATCH_REGISTRATION_QUEUE_DEPTH);
-    #[cfg(test)]
-    WATCH_REGISTRATION_WORKER_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    WATCH_REGISTRATION_WORKER_GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _ = std::thread::Builder::new()
         .name("faktor-watch-registration".into())
         .spawn(move || {
@@ -197,19 +194,12 @@ fn watcher_registration_queue() -> std::sync::mpsc::SyncSender<WatchRegistration
         let busy_since = WATCH_WORKER_BUSY_SINCE_MS.load(std::sync::atomic::Ordering::SeqCst);
         let overdue = busy_since > 0
             && watch_worker_now_ms().saturating_sub(busy_since) >= watch_worker_overdue_ms();
-        let workers = {
-            #[cfg(test)]
-            {
-                WATCH_REGISTRATION_WORKER_SPAWNS.load(std::sync::atomic::Ordering::SeqCst)
-            }
-            #[cfg(not(test))]
-            {
-                // Production tracks its generations in the same slot: a
-                // respawn replaces the sender, so the cap is enforced by
-                // construction below.
-                1usize
-            }
-        };
+        // Real generation accounting in EVERY build (audit P1-FS): a
+        // wedged generation is unreapable, so once MAX_WATCH_WORKERS
+        // generations exist, later registrations DEGRADE through the
+        // bounded queue instead of leaking another blocked thread.
+        let workers =
+            WATCH_REGISTRATION_WORKER_GENERATIONS.load(std::sync::atomic::Ordering::SeqCst);
         if overdue && workers < MAX_WATCH_WORKERS {
             let replacement = spawn_watcher_registration_worker();
             *slot = Some(replacement.clone());
@@ -396,9 +386,18 @@ impl WorkspaceFileService {
                     }
                 }
             },
-            notify::Config::default(),
+            // P2-FS: the recursive backend must not FOLLOW symlinks. The
+            // preflight refused to traverse them; without this the backend's
+            // own walk would follow a symlinked directory out of the root
+            // and defeat both the entry bound and the containment claim.
+            notify::Config::default().with_follow_symlinks(false),
         )
         .map_err(|e| Error::internal(format!("watcher: {e}")))?;
+        // The anchored root is opened BEFORE any observation (audit P2-FS):
+        // the preflight below walks it fd-relative, and after registration we
+        // can prove the pathname the backend re-resolved still names THIS
+        // directory.
+        let rooted = Arc::new(RootedDir::open(&root)?);
         // The filesystem root can never be walked to completion: refuse the
         // recursive registration up front (explicit degradation) instead of
         // paying the deadline and leaking a walker thread over `/proc`,
@@ -410,7 +409,7 @@ impl WorkspaceFileService {
                 "workspace root is the filesystem root: recursive watch registration is unbounded; opening WITHOUT a watcher (fingerprint reconciliation only)"
             );
             None
-        } else if !watch_preflight_bounded(&root, self.watch_preflight_entries) {
+        } else if !watch_preflight_bounded(&rooted, self.watch_preflight_entries) {
             // P1-7: a root beyond the preflight bound is refused HERE, before
             // the uninterruptible recursive backend is ever asked to walk it:
             // one pathological workspace degrades itself and cannot starve
@@ -446,7 +445,24 @@ impl WorkspaceFileService {
                 }
             }
         };
-        let rooted = Arc::new(RootedDir::open(&root)?);
+        // P2-FS: prove the pathname the watcher backend re-resolved still
+        // names the anchored directory we validated; a root swapped between
+        // the anchored open/preflight and the backend's own resolution is
+        // refused instead of silently watching a different tree. Platforms
+        // without a comparable identity report `None` and skip the check.
+        if watcher.is_some() {
+            if let (Some(anchored), Some(current)) = (
+                rooted.anchored_identity(),
+                crate::rooted::path_identity_no_follow(&root),
+            ) {
+                if anchored != current {
+                    return Err(Error::permission(format!(
+                        "workspace root {} was replaced between watcher preflight and registration",
+                        root.display()
+                    )));
+                }
+            }
+        }
         Ok(WorkspaceHandle {
             workspace_id,
             root,

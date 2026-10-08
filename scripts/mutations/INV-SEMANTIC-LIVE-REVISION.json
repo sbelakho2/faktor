@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-LIVE-REVISION",
+  "file": "crates/agent/src/semantic_tool.rs",
+  "find": "pub(crate) fn semantic_source_revision(root: Option<&std::path::Path>) -> String {\n    match root {\n        Some(root) => faktor_fs::tree_manifest::tree_manifest_digest(\n            root,\n            faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,\n        )\n        .unwrap_or_else(|_| \"snapshot-unavailable\".into()),\n        None => \"snapshot-unavailable\".into(),\n    }\n}",
+  "replace": "pub(crate) fn semantic_source_revision(root: Option<&std::path::Path>) -> String {\n    let _ = root;\n    \"session:0\".to_string()\n}",
+  "gate": "cargo test -p faktor-agent --lib live_semantic_revision_is_content_derived_never_a_session_id",
+  "expect": "FAILED",
+  "note": "Falling back to a session-handle revision makes the semantic view identity unrelated to workspace content."
+}

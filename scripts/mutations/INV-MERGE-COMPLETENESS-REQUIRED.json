@@ -1,0 +1,9 @@
+{
+  "id": "INV-MERGE-COMPLETENESS-REQUIRED",
+  "file": "crates/orchestrator/src/merge_semantic.rs",
+  "find": "                if required\n                    && provider.completeness()\n                        < faktor_semantic::SemanticCompleteness::ConservativeComplete\n                {",
+  "replace": "                if false\n                    && provider.completeness()\n                        < faktor_semantic::SemanticCompleteness::ConservativeComplete\n                {",
+  "gate": "cargo test -p faktor-orchestrator --lib required_semantic_delta_rejects_sub_conservative_completeness",
+  "expect": "FAILED",
+  "note": "Dropping the completeness requirement lets a partial-coverage provider satisfy a required merge obligation."
+}

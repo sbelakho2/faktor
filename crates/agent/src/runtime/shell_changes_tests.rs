@@ -1329,6 +1329,42 @@ async fn a_model_semantic_query_call_executes_against_the_registered_provider() 
     );
 }
 
+/// P1-UX: registration alone must not advertise `semantic_query`. A provider
+/// that cannot serve CONTEXT with a validated descriptor leaves the surface
+/// closed, and a stale call is refused as an unknown tool before execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_query_is_not_advertised_without_a_context_capable_provider() {
+    use crate::runtime::tests::assert_refusal_answered;
+    let script = vec![
+        ScriptedResponse::ToolCall {
+            id: "sem-1".into(),
+            name: "semantic_query".into(),
+            input: serde_json::json!({ "query": "x" }),
+        },
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let mut env = shell_env(script);
+    env.deps.semantic = super::fixtures_tests::semantic_registry_with(
+        super::fixtures_tests::FakeSemanticProvider::affected(vec!["src/a.rs".into()]),
+    );
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(env.session, "ask tangerine", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert_refusal_answered(
+        &runtime,
+        env.session,
+        "sem-1",
+        "unknown_tool",
+        "unknown tool: semantic_query",
+        &executions,
+    );
+}
+
 /// Without a registered provider the tool is never advertised (bundle gate),
 /// and a stale call is refused by the active-bundle membership guard instead
 /// of reaching any implementation.
@@ -1390,5 +1426,28 @@ async fn task_capability_budget_denies_a_tool_class_before_execution() {
     assert!(
         !root.join("src/budget-denied.txt").exists(),
         "the task budget must deny the shell tool before execution"
+    );
+}
+
+/// P0-SEC: an UNREADABLE durable capability budget (corrupt identity row or
+/// store failure) is surfaced as an EMPTY budget plus a typed reason — the
+/// tool gate fails closed and never falls back to `CapabilitySet::ALL`.
+#[test]
+fn unreadable_task_capability_budget_is_empty_never_all() {
+    let env = shell_env(vec![ScriptedResponse::End]);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    handle
+        .upsert_memory_fact("orchestrator", "identity", "{{ not json")
+        .unwrap();
+    let (caps, error) = super::task_capability_budget(&handle);
+    assert!(
+        caps.is_empty(),
+        "an unreadable budget must not grant ANY capability class"
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("task capability budget unreadable")),
+        "the refusal must be typed and loud: {error:?}"
     );
 }

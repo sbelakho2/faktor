@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-TRUST-DECLARED",
+  "file": "crates/semantic/src/types.rs",
+  "find": "    fn fidelity(&self) -> SemanticFidelity {\n        self.descriptor().fidelity.unwrap_or(SemanticFidelity::None)\n    }\n\n    /// The provider's DECLARED completeness (audit P1-SEMANTIC): an absent\n    /// declaration is `Unknown`, never conservative-complete.\n    fn completeness(&self) -> SemanticCompleteness {\n        self.descriptor()\n            .completeness\n            .unwrap_or(SemanticCompleteness::Unknown)\n    }",
+  "replace": "    fn fidelity(&self) -> SemanticFidelity {\n        self.descriptor()\n            .fidelity\n            .unwrap_or(SemanticFidelity::CompilerExact)\n    }\n\n    fn completeness(&self) -> SemanticCompleteness {\n        self.descriptor()\n            .completeness\n            .unwrap_or(SemanticCompleteness::ConservativeComplete)\n    }",
+  "gate": "cargo test -p faktor-orchestrator --lib required_semantic_delta_blocks_an_undeclared_provider",
+  "expect": "FAILED",
+  "note": "Defaulting missing fidelity/completeness to the strongest trust level lets silent providers satisfy compiler-exact obligations."
+}

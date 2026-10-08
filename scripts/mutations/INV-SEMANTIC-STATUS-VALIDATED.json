@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-STATUS-VALIDATED",
+  "file": "crates/server/src/native/semantic.rs",
+  "find": "    match provider.validated_descriptor() {",
+  "replace": "    match Some(provider.descriptor()) {",
+  "gate": "cargo test -p faktor-server --lib unvalidated_provider_claims_never_reach_the_status_surfaces",
+  "expect": "FAILED",
+  "note": "Reporting a provider descriptor without validation repeats unvalidated capability claims as readiness."
+}

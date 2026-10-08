@@ -40,13 +40,28 @@ export function discover(root = ROOT) {
     sources[normalized] = source;
   };
 
-  // 1. Native HTTP routes: `.route("PATH", method(handler))`.
-  const lifecycle = read(root, 'crates/server/src/api/lifecycle.rs');
-  for (const match of lifecycle.matchAll(
-    /\.route\(\s*"([^"]+)"\s*,\s*(get|post|put|patch|delete)\(/g,
-  )) {
-    const path = match[1].replace(/^\//, '').replace(/[/{}]/g, '.').replace(/\.+/g, '.');
-    add('native-route', `native.${match[2]}.${path.replace(/\.$/, '')}`);
+  // 1. Native HTTP routes: `.route("PATH", method(handler)…)*` in EVERY
+  //    production server source. EVERY method of a chain is a real endpoint
+  //    (audit P0-PROOF): the old first-method-only regex silently omitted
+  //    the POST/PUT half of `get(...).post(...)` routes, and routes
+  //    registered only in worker_plane.rs were invisible because only
+  //    lifecycle.rs was read.
+  for (const file of [
+    'crates/server/src/api/lifecycle.rs',
+    'crates/server/src/worker_plane.rs',
+  ]) {
+    const text = read(root, file);
+    for (const match of text.matchAll(/\.route\s*\(/g)) {
+      const open = match.index + match[0].length - 1;
+      const body = balancedBody(text, open, '(', ')');
+      if (body === null) continue;
+      const pathMatch = /^\s*"([^"]+)"/.exec(body);
+      if (!pathMatch) continue;
+      const path = pathMatch[1].replace(/^\//, '').replace(/[/{}]/g, '.').replace(/\.+/g, '.');
+      for (const method of body.matchAll(/\b(get|post|put|patch|delete)\s*\(/g)) {
+        add('native-route', `native.${method[1]}.${path.replace(/\.$/, '')}`);
+      }
+    }
   }
 
   // 2. Builtin model tools actually registered by the daemon.
@@ -87,11 +102,29 @@ export function discover(root = ROOT) {
     for (const command of contributes.commands ?? []) {
       if (typeof command?.command === 'string') add('vscode-command', `vscode.command.${command.command}`);
     }
-    for (const view of Object.keys(contributes.views ?? {})) {
-      add('vscode-view-container', `vscode.view.${view}`);
+    // REAL view ids, not only the container (audit P0-PROOF): `views` maps a
+    // container key to view descriptors whose `id` is the exposed surface.
+    for (const [container, views] of Object.entries(contributes.views ?? {})) {
+      add('vscode-view-container', `vscode.view.${container}`);
+      for (const view of views ?? []) {
+        if (typeof view?.id === 'string') add('vscode-view', `vscode.view.${view.id}`);
+      }
     }
-    for (const config of Object.keys(contributes.configuration ?? {})) {
-      add('vscode-configuration', `vscode.configuration.${config.trim() || 'root'}`.replace(/\s+/g, '-'));
+    // REAL settings, not the object bag keys (`title`/`properties`): every
+    // `configuration` section's `title` and every `properties` key is an
+    // exposed surface (the manifest may carry one section object or a list).
+    const configuration = contributes.configuration ?? {};
+    const sections = Array.isArray(configuration) ? configuration : [configuration];
+    for (const section of sections) {
+      if (typeof section?.title === 'string' && section.title.trim()) {
+        add(
+          'vscode-configuration',
+          `vscode.configuration.${section.title.trim()}`.replace(/\s+/g, '-'),
+        );
+      }
+      for (const key of Object.keys(section?.properties ?? {})) {
+        add('vscode-configuration', `vscode.configuration.${key}`);
+      }
     }
     for (const menu of Object.keys(contributes.menus ?? {})) {
       add('vscode-menu', `vscode.menu.${menu}`);
@@ -115,32 +148,109 @@ function read(root, rel) {
   return existsSync(path) ? readFileSync(path, 'utf8') : '';
 }
 
-/** Real CLI command tree: built binary first, clap enum fallback. */
-export function discoverCliCommands(root = ROOT) {
-  const binary = join(root, 'target', 'debug', 'faktor-cli');
-  if (existsSync(binary)) {
-    try {
-      const help = execFileSync(binary, ['--help'], { encoding: 'utf8', timeout: 15_000 });
-      const commandsBlock = /Commands:\n([\s\S]*?)(?:\n\n|$)/.exec(help);
-      if (commandsBlock) {
-        const commands = commandsBlock[1]
-          .split('\n')
-          .map((line) => /^\s{2}([a-z][a-z0-9-]*)\s/.exec(line))
-          .filter(Boolean)
-          .map((match) => match[1]);
-        if (commands.length > 0) return [...new Set(commands)].sort();
-      }
-    } catch {
-      // fall through to the source scan
+/**
+ * Body between the balanced pair opened at `openIndex`, skipping quoted
+ * strings. Returns null when unbalanced. Used for `.route(...)` argument
+ * lists and `enum { … }` blocks so scanning never stops at a nested call or
+ * a `)` inside a handler expression.
+ */
+function balancedBody(text, openIndex, open, close) {
+  if (text[openIndex] !== open) return null;
+  let depth = 0;
+  let quote = null;
+  for (let i = openIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "'") {
+      // A Rust CHAR literal (`'{'`); an apostrophe in a doc comment is not a
+      // quote and must not swallow the rest of the file.
+      const literal = /^'(?:\\.|[^'\\])'/.exec(text.slice(i, i + 8));
+      if (literal) i += literal[0].length - 1;
+      continue;
+    }
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return text.slice(openIndex + 1, i);
     }
   }
-  const main = read(root, 'crates/cli/src/main.rs');
-  const enumAt = main.indexOf('enum Commands');
-  if (enumAt === -1) return [];
-  const body = main.slice(enumAt, main.indexOf('\n}', enumAt));
-  return [...new Set([...body.matchAll(/^\s{4}([A-Z][A-Za-z0-9]*)\s*[({]/gm)].map((m) =>
-    m[1].replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase(),
-  ))].sort();
+  return null;
+}
+
+function kebab(name) {
+  return name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+}
+
+/**
+ * Parse `enum <Name> { … }` blocks into `Map<enumName, variantName[]>`.
+ * Variants are the lines whose first token starts uppercase (fields start
+ * lowercase); doc comments and attributes are skipped.
+ */
+function parseEnums(text) {
+  const enums = new Map();
+  for (const match of text.matchAll(/\benum\s+([A-Z][A-Za-z0-9]*)\s*\{/g)) {
+    const open = match.index + match[0].length - 1;
+    const body = balancedBody(text, open, '{', '}');
+    if (body === null) continue;
+    const variants = [];
+    for (const line of body.split('\n')) {
+      const variant = /^\s*([A-Z][A-Za-z0-9]*)\s*(?:[({,]|$)/u.exec(line);
+      if (variant) {
+        // Keep the variant line's remainder too: a tuple variant names its
+        // subcommand enum ON the same line (`Artifact(EnterpriseArtifactAction)`).
+        variants.push({
+          name: variant[1],
+          text: `${line.slice(line.indexOf(variant[1]) + variant[1].length)}\n`,
+        });
+      } else if (variants.length > 0) {
+        variants[variants.length - 1].text += `${line}\n`;
+      }
+    }
+    enums.set(match[1], variants);
+  }
+  return enums;
+}
+
+/**
+ * The REAL clap command tree, parsed statically (audit P0-PROOF): the old
+ * fallback searched for a non-existent `enum Commands` and the built-binary
+ * path depended on an untracked target/debug artifact (the certifying lane
+ * builds release and is node-only). Static enum parsing is hermetic, matches
+ * clap's kebab rename (no `#[command(name=…)]` overrides exist) and also
+ * discovers the SUBCOMMAND enums the help output never lists.
+ */
+export function discoverCliCommands(root = ROOT) {
+  if (!read(root, 'crates/cli/src/main.rs')) return [];
+  const enums = parseEnums(read(root, 'crates/cli/src/main.rs'));
+  const top = enums.get('Command');
+  if (!top) return [];
+  const out = new Set();
+  const visited = new Set();
+  const expand = (prefix, variants, depth) => {
+    if (depth > 4 || visited.has(prefix)) return;
+    visited.add(prefix);
+    for (const variant of variants) {
+      const name = `${prefix}${kebab(variant.name)}`;
+      out.add(name);
+      // A payload naming another enum declared in the same file is a real
+      // subcommand level (`commerce doctor`, `enterprise artifacts audit`).
+      for (const reference of variant.text.matchAll(/[:(\s]([A-Z][A-Za-z0-9]*)/g)) {
+        const sub = enums.get(reference[1]);
+        if (!sub) continue;
+        expand(`${name}.`, sub, depth + 1);
+      }
+    }
+  };
+  expand('', top, 0);
+  return [...out].sort();
 }
 
 function main() {
@@ -177,11 +287,13 @@ function selftest() {
   check('JetBrains tool windows are discovered', discovered.ids.some((id) => id.startsWith('jetbrains.toolwindow.')));
   // Omission witness: a fixture tree containing an extra route is detected
   // by the same scanner the checker uses.
-  const routeLine = '.route("/ghost-probe", get(native_models))';
-  check(
-    'the route scanner sees a newly added route',
-    [...routeLine.matchAll(/\.route\(\s*"([^"]+)"\s*,\s*(get|post|put|patch|delete)\(/g)].length === 1,
-  );
+  // A chained route must expose EVERY method: the old first-method-only
+  // scan saw only `get` here.
+  const fixture = '.route("/ghost-probe", get(native_models).post(native_models))';
+  const parsed = balancedBody(fixture, fixture.indexOf('('), '(', ')');
+  const methods = [...parsed.matchAll(/\b(get|post|put|patch|delete)\s*\(/g)].map((m) => m[1]);
+  check('the route scanner sees every method of a chained route', methods.join(',') === 'get,post');
+  check('the CLI scanner parses the real command tree', discoverCliCommands(ROOT).includes('doctor'));
   if (failures > 0) {
     console.error(`discover-capabilities selftest: FAIL (${failures})`);
     process.exit(1);

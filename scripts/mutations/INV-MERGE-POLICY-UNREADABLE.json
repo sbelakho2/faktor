@@ -1,0 +1,9 @@
+{
+  "id": "INV-MERGE-POLICY-UNREADABLE",
+  "file": "crates/orchestrator/src/merge_semantic.rs",
+  "find": "            Err(e) => Err(ExecError::SemanticRequired(format!(\n                \"child {} identity read failed while reading the semantic merge policy ({e}); refusing to treat the requirement as advisory\",\n                cs.child_id\n            ))),",
+  "replace": "            Err(_) => Ok(false),",
+  "gate": "cargo test -p faktor-orchestrator --lib unreadable_child_policy_blocks_a_fresh_merge",
+  "expect": "FAILED",
+  "note": "Downgrading an unreadable durable merge policy to advisory lets an unknown requirement merge without semantic verification."
+}
