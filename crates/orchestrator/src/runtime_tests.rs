@@ -44,7 +44,6 @@ impl PermissionRequester for AlwaysAllow {
         Box::pin(async { Ok(PermissionDecision::Allow) })
     }
 }
-
 /// Chunk-paced scripted provider: serves one script per stream call
 /// (extra calls end immediately), records every request's model + system
 /// text, counts calls, and paces chunks so tests can steer mid-iteration.
@@ -161,7 +160,6 @@ fn futures_stream_paced(
     });
     Box::pin(stream)
 }
-
 /// A single real agent test environment: manager + runtime + paced provider.
 /// The store root is owned by the CALLER (a `TempDir` the test keeps alive)
 /// so a "daemon restart" test can drop the environment and reopen the SAME
@@ -210,7 +208,6 @@ fn caps_tools() -> ModelCapabilities {
         ..Default::default()
     }
 }
-
 /// A write tool for the overlay-concurrency test: it writes `out.rs` under a
 /// directory named after the SESSION ROOT's basename (the child id), so two
 /// concurrent children can run the IDENTICAL script and still write
@@ -252,7 +249,6 @@ fn owned_root_write_tool() -> Tool {
         }),
     }
 }
-
 /// A workspace-writing tool (the shape the daemon's write_file has): it
 /// writes through the session's resolved workspace, so it observes exactly
 /// where a child runs (owner checkout vs isolated candidate root).
@@ -418,7 +414,6 @@ fn path_item(id: &str, kind: WorkKind, deps: &[&str], paths: &[&str]) -> WorkIte
     item.depends_on = deps.iter().map(|d| d.to_string()).collect();
     item
 }
-
 /// A LEGACY plan-global plan: the conversion runs exactly ONCE here, as the
 /// DTO/persistence boundary does — the runtime only ever sees items.
 fn plan(ownership: OwnershipModel, items: Vec<WorkItem>) -> TaskPlan {
@@ -431,7 +426,6 @@ fn plan(ownership: OwnershipModel, items: Vec<WorkItem>) -> TaskPlan {
         work_items,
     }
 }
-
 /// A plan with NO conversion applied — the items carry exactly the
 /// ownership they were constructed with (the runtime's only input).
 fn raw_plan(items: Vec<WorkItem>) -> TaskPlan {
@@ -447,11 +441,7 @@ fn base_config(env: &Env, run_id: &str) -> ExecConfig {
     ExecConfig {
         run_id: run_id.to_string(),
         ceilings: Ceilings::default(),
-        parent_caps: CapabilitySet::from_grants(vec![CapabilityGrant::new(
-            LatticeCap::WriteWorkspace,
-            ScopePattern::new("*").unwrap(),
-        )])
-        .unwrap(),
+        parent_caps: crate::caps::all_lattice(),
         provider: "fake".to_string(),
         default_model: "m".to_string(),
         isolated_root: env.isolated_root.clone(),
@@ -469,8 +459,11 @@ fn read_caps() -> CapabilitySet {
 
 fn spec(item_id: &str) -> ChildSpec {
     let mut s = ChildSpec::new(item_id);
-    s.child_caps = read_caps();
-    s.task_caps = read_caps();
+    // The generic spec uses the production default for a read-only item
+    // (Read + Execute); the dedicated reduction tests build narrow specs.
+    let caps = crate::runtime::task_executor::child_caps(WorkKind::Analysis);
+    s.task_caps = caps.clone();
+    s.child_caps = caps;
     s
 }
 
@@ -498,7 +491,6 @@ fn roundtrip_script() -> Vec<Vec<ScriptedResponse>> {
 fn empty_script() -> Vec<Vec<ScriptedResponse>> {
     vec![vec![ScriptedResponse::End]]
 }
-
 /// Run execute_task to completion inside a timeout (drive crashes hang
 /// otherwise).
 async fn run_exec(
@@ -517,7 +509,6 @@ async fn run_exec(
 }
 
 // ------------------------------------------------------------------- tests
-
 /// Heavy file/CAS/process tests are serialized on the ONE crate-wide guard
 /// (`crate::test_support::HEAVY_SUITE`, shared with `task_executor_tests`):
 /// under intra-binary parallelism their store+DbActor+fsync + CAS-file
@@ -1497,6 +1488,10 @@ fn write_caps() -> CapabilitySet {
     use crate::caps::{CapabilityGrant, LatticeCap, ScopePattern};
     CapabilitySet::from_grants([
         CapabilityGrant::new(
+            LatticeCap::ExecuteShell,
+            ScopePattern::new(ScopePattern::WILDCARD).unwrap(),
+        ),
+        CapabilityGrant::new(
             LatticeCap::ReadWorkspace,
             ScopePattern::new(ScopePattern::WILDCARD).unwrap(),
         ),
@@ -2164,7 +2159,6 @@ fn isolated_plan() -> TaskPlan {
         vec![wi("impl", WorkKind::Implementation, &[])],
     )
 }
-
 /// Run an isolated Implementation plan to terminal success (the child
 /// drives with the empty script: no tools, instant Done).
 async fn run_isolated_done(env: &Arc<Env>, run_id: &str) -> PlanOutcome {
@@ -2215,7 +2209,6 @@ fn blake3_hash(content: &[u8]) -> [u8; 32] {
     out.copy_from_slice(h.as_bytes());
     out
 }
-
 /// Approve+merge that expects success (compact call sites).
 async fn merge_ok(
     env: &Env,
@@ -2229,7 +2222,6 @@ async fn merge_ok(
         .await
         .expect("merge succeeds")
 }
-
 /// Approve+merge that expects a typed refusal.
 async fn merge_err(
     env: &Env,
@@ -2924,7 +2916,6 @@ async fn reviewer_spawn_during_an_inflight_merge_sees_only_whole_states() {
 // single durable operation graph (read-model over plan/registry/control/
 // merge rows), and audit 97: immutable env-snapshot binding at spawn with
 // NO hidden-state bleed into children.
-
 /// Raw durable rows of the env kinds under a session (bounded page walk;
 /// sorted for byte comparison). `None` = all env rows of the session.
 fn env_rows_of(env: &Env, prefix: Option<&str>) -> Vec<(String, String, String)> {
@@ -2950,7 +2941,6 @@ fn env_rows_of(env: &Env, prefix: Option<&str>) -> Vec<(String, String, String)>
     out.sort();
     out
 }
-
 /// Snapshot HEADER rows only (hex-ish keys without `/cNNN` chunk rows).
 fn env_snapshot_headers(env: &Env, run: &str) -> Vec<String> {
     env_rows_of(env, Some(run))
@@ -2959,7 +2949,6 @@ fn env_snapshot_headers(env: &Env, run: &str) -> Vec<String> {
         .map(|(_, key, _)| key)
         .collect()
 }
-
 /// Content-header rows only (hex keys without chunk rows): the dedupe unit.
 fn env_content_headers(env: &Env) -> Vec<String> {
     env_rows_of(env, None)
@@ -3459,7 +3448,6 @@ async fn graph_hostile_assignment_rows_are_typed_errors_never_silent_skips() {
         "tampered assignment must be a typed Conflict: {err:?}"
     );
 }
-
 /// Deterministic LCG for the randomized reopen test (fixed seed: the exact
 /// 100-iteration sequence reproduces on every run).
 fn lcg_next(state: &mut u64) -> u64 {
@@ -3468,7 +3456,6 @@ fn lcg_next(state: &mut u64) -> u64 {
         .wrapping_add(1442695040888963407);
     *state >> 33
 }
-
 /// Wave A3 equality helper: two graphs are equal up to TIMESTAMPS ONLY
 /// (steering applied_ms). Identity, order, states, budget, capabilities,
 /// plan linkage and every non-timestamp field must match exactly.
@@ -3763,7 +3750,6 @@ async fn env_snapshot_pins_spawn_rules_across_parent_change_reopen_and_compactio
     assert_eq!(pinned_after.epoch(), pinned.epoch());
     assert_eq!(binding, rows2[0].env_snapshot_id.clone().unwrap());
 }
-
 /// env_rows_of against a manager that is NOT the Env's own (reopen).
 fn env_rows_of_env2(env: &Env, parent: SessionId, prefix: &str) -> Vec<(String, String, String)> {
     env_rows_of_env2_opt(env, parent, Some(prefix))
@@ -4070,7 +4056,6 @@ async fn bound_child_refuses_live_fallback_when_binding_or_rows_are_gone_or_tamp
         "the live V2 file is never served instead: {err:?}"
     );
 }
-
 /// Typed child handoff (audit): the parent-facing handoff of a finished
 /// child is built from durable rows only — facts/findings/decisions/changed
 /// files plus scoped refs — bounded to the configured budget. A child whose
@@ -4111,6 +4096,7 @@ async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript()
             ownership: ChildOwnership::ReadOnlyShared,
             model: "m".into(),
             require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
             created_ms: 1,
         })
         .unwrap();
@@ -4172,7 +4158,6 @@ async fn typed_child_handoff_is_bounded_and_never_inlines_the_child_transcript()
 
 // ------------------------------------------------- child-lifecycle truth
 // (projection, durable blockers, steer guards)
-
 /// Craft one durable registry row over a REAL child session (adversarial
 /// crash residue: a row that names a live session, an item, and a state
 /// that admission alone could not have produced).
@@ -4208,6 +4193,7 @@ fn craft_child_row(
             ownership: ChildOwnership::ReadOnlyShared,
             model: String::new(),
             require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
             created_ms: 1,
         })
         .unwrap();
@@ -4889,7 +4875,6 @@ async fn child_projection_derives_budget_and_phase_across_reopen() {
     assert_eq!(rows[0].budget_max_tokens, Some(777));
     assert_eq!(rows[0].execution_phase, ExecutionPhase::Coding);
 }
-
 /// P1 child specs: binary attachments are a typed field SEPARATE from the
 /// workspace-relative `files`, are validated structurally (count/mime/
 /// filename/size; model-aware image delivery is validated at the server
@@ -4946,7 +4931,6 @@ fn child_spec_attachments_are_separate_from_paths_and_decode_on_reattach() {
         Err(ExecError::Oversized(_))
     ));
 }
-
 /// The run-mirror lock is a projection of the durable rows: a poisoned guard
 /// (a panicking writer) must be recovered by the next read path instead of
 /// wedging child execution, and the poison flag must be cleared.
@@ -5253,4 +5237,23 @@ async fn corrupt_registry_row_identity_ids_are_typed_refusals_never_panics() {
         .operation_graph_run(env.parent, "run-corrupt")
         .expect_err("a zero session id must refuse graph assembly");
     assert!(matches!(err, GraphError::Malformed(_)), "{err:?}");
+}
+
+/// Tangerine-9: a spawned child's identity carries its durable class-level
+/// capability budget (the projection of its effective grants), so the agent
+/// tool gate enforces parent ∩ task ∩ child without any `ALL` placeholder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_child_identity_carries_the_durable_capability_budget() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    run_isolated_done(&env, "run-budget").await;
+    let (_, _, child) = env.orchestrator.locate_child("child-0").unwrap();
+    let session = SessionId::try_from(child.session_id).unwrap();
+    let handle = env.manager.get_session(session).unwrap().unwrap();
+    let identity = handle.orchestrator_child_identity_get().unwrap().unwrap();
+    assert_eq!(
+        identity.permissions,
+        crate::caps::class_projection(&child.permissions)
+    );
 }

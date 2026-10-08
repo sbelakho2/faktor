@@ -498,7 +498,10 @@ pub(crate) fn request(goal: &str, items: Vec<WorkItem>, env: &Env) -> TaskRunReq
     TaskRunRequest {
         goal: goal.to_string(),
         work_items: items,
-        parent_caps: read_caps(),
+        // The run's policy record: every class (narrower authority is
+        // declared per item); the task-policy tests build their own narrow
+        // requests when they exercise reduction.
+        parent_caps: crate::caps::all_lattice(),
         isolated_root: env.isolated_root.clone(),
         ..Default::default()
     }

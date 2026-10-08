@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-FIDELITY-TRUTH",
+  "file": "crates/semantic/src/fallback.rs",
+  "find": "        SemanticCapabilities::CONTEXT\n            .union(SemanticCapabilities::DELTA)\n            .union(SemanticCapabilities::AFFECTED)\n            .union(SemanticCapabilities::EXPLAIN)",
+  "replace": "        SemanticCapabilities::ALL",
+  "gate": "cargo test -p faktor-semantic --lib operation_status_distinguishes_fallback_from_a_registered_provider",
+  "expect": "FAILED",
+  "note": "Claiming ALL again makes the fallback look like Tangerine (verify/snapshot available), which the truthful status test catches."
+}

@@ -71,15 +71,15 @@ pub use registry::{guard_call, GuardedCall, SemanticProviderRegistry, SemanticSe
 pub use risk::{capability_intersection, RiskPolicy};
 pub use types::{
     AffectedRequest, AffectedSet, BoxFuture, RiskLevel, SemanticCall, SemanticCapabilities,
-    SemanticCheck, SemanticContextItem, SemanticContextPack, SemanticContextRequest, SemanticDelta,
-    SemanticDeltaChange, SemanticDeltaKind, SemanticDeltaRequest, SemanticEntityId,
-    SemanticEntityRef, SemanticEnvelope, SemanticError, SemanticExpectation,
-    SemanticExplainRequest, SemanticExplanation, SemanticOp, SemanticPayload, SemanticProvider,
-    SemanticProviderDescriptor, SemanticProviderId, SemanticResponseCaps, SemanticRisk,
-    SemanticSnapshot, SemanticSnapshotId, SemanticSnapshotRequest, SemanticVerification,
-    SemanticVerifyRequest, WorkspacePath, DEFAULT_MAX_PAYLOAD_BYTES, MAX_ENTITY_ID_BYTES,
-    MAX_ENTITY_REFS, MAX_PATH_BYTES, MAX_PROVIDER_ID_BYTES, MAX_QUERY_BYTES,
-    SEMANTIC_SCHEMA_VERSION,
+    SemanticCheck, SemanticCompleteness, SemanticContextItem, SemanticContextPack,
+    SemanticContextRequest, SemanticDelta, SemanticDeltaChange, SemanticDeltaKind,
+    SemanticDeltaRequest, SemanticEntityId, SemanticEntityRef, SemanticEnvelope, SemanticError,
+    SemanticExpectation, SemanticExplainRequest, SemanticExplanation, SemanticFidelity, SemanticOp,
+    SemanticOperationStatus, SemanticPayload, SemanticProvider, SemanticProviderDescriptor,
+    SemanticProviderId, SemanticResponseCaps, SemanticRisk, SemanticSnapshot, SemanticSnapshotId,
+    SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest, WorkspacePath,
+    DEFAULT_MAX_PAYLOAD_BYTES, MAX_ENTITY_ID_BYTES, MAX_ENTITY_REFS, MAX_PATH_BYTES,
+    MAX_PROVIDER_ID_BYTES, MAX_QUERY_BYTES, SEMANTIC_SCHEMA_VERSION,
 };
 
 #[cfg(test)]

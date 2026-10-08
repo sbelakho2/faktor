@@ -1351,3 +1351,44 @@ async fn fallback_only_semantic_query_is_refused_without_execution() {
         .unwrap();
     assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
 }
+
+/// Tangerine-9: the durable TASK capability budget (child identity) is the
+/// task-policy leg of the tool gate. A budget without the shell class refuses
+/// the tool BEFORE execution, journaled as a capability denial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_capability_budget_denies_a_tool_class_before_execution() {
+    use faktor_core::CapabilityKind;
+    let script = vec![
+        tool_call("echo pwned > src/budget-denied.txt"),
+        ScriptedResponse::Text("done".into()),
+        ScriptedResponse::End,
+    ];
+    let env = shell_env(script);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let ws = env
+        .manager
+        .create_workspace(std::env::temp_dir().to_str().unwrap())
+        .unwrap();
+    let parent = env
+        .manager
+        .create_session(ws, "budget-parent", "fake", "m")
+        .unwrap()
+        .id();
+    let identity = faktor_session::child::ChildIdentity {
+        parent_session_id: parent,
+        permissions: faktor_core::CapabilitySet::of(CapabilityKind::Read),
+        ..Default::default()
+    };
+    handle.orchestrator_child_identity_put(&identity).unwrap();
+    let root = env.root.clone();
+    let runtime = AgentRuntime::new(env.deps).unwrap();
+    let outcome = runtime
+        .run_turn(env.session, "budget gating", &[])
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    assert!(
+        !root.join("src/budget-denied.txt").exists(),
+        "the task budget must deny the shell tool before execution"
+    );
+}

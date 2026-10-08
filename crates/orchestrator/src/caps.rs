@@ -45,6 +45,61 @@ impl fmt::Display for LatticeCap {
     }
 }
 
+/// Project one grant set onto the CLASS-LEVEL capability model the agent's
+/// tool gate enforces (audit Tangerine-9): the durable child budget carries
+/// exactly the classes its effective grants permit.
+pub fn class_projection(grants: &CapabilitySet) -> faktor_core::CapabilitySet {
+    use faktor_core::CapabilityKind;
+    let mut kinds = Vec::new();
+    for grant in grants.iter() {
+        kinds.push(match grant.cap {
+            LatticeCap::ReadWorkspace | LatticeCap::ReadExternal => CapabilityKind::Read,
+            LatticeCap::WriteWorkspace | LatticeCap::WriteExternal => CapabilityKind::Write,
+            LatticeCap::ExecuteShell => CapabilityKind::Execute,
+            LatticeCap::Network => CapabilityKind::Network,
+            LatticeCap::Mcp => CapabilityKind::Mcp,
+            LatticeCap::Git => CapabilityKind::Git,
+        });
+    }
+    faktor_core::CapabilitySet::from_kinds(&kinds)
+}
+
+/// Every lattice capability granted over the widest scope: the policy
+/// default for runs that record no narrower grant set (the pre-audit
+/// effective authority, now made explicit and durable).
+pub fn all_lattice() -> CapabilitySet {
+    CapabilitySet::from_grants(
+        [
+            LatticeCap::ReadWorkspace,
+            LatticeCap::WriteWorkspace,
+            LatticeCap::ReadExternal,
+            LatticeCap::WriteExternal,
+            LatticeCap::ExecuteShell,
+            LatticeCap::Network,
+            LatticeCap::Mcp,
+            LatticeCap::Git,
+        ]
+        .into_iter()
+        .map(|cap| CapabilityGrant::new(cap, ScopePattern::new("*").expect("wildcard"))),
+    )
+    .expect("wildcard grants are sane")
+}
+
+/// Persist a child's class-projected capability budget on its durable
+/// identity (audit Tangerine-9). A missing identity (root session) is legal.
+pub fn persist_child_budget(
+    session: &faktor_session::SessionHandle,
+    grants: &CapabilitySet,
+) -> Result<(), String> {
+    if let Ok(Some(mut identity)) = session.orchestrator_child_identity_get() {
+        identity.permissions = class_projection(grants);
+        session
+            .orchestrator_child_identity_put(&identity)
+            .map_err(|e| format!("child identity permission persist failed: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Maximum number of grants in one set (bounded everything).
 pub const MAX_GRANTS_PER_SET: usize = 16;
 /// Maximum scope pattern length (characters).
@@ -432,5 +487,26 @@ mod tests {
         let b: CapabilitySet = serde_json::from_str(&json).unwrap();
         assert_eq!(a, b);
         assert_eq!(b.iter().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod class_projection_tests {
+    use super::*;
+
+    /// The grant→class projection carried by a durable child budget.
+    #[test]
+    fn class_projection_maps_every_lattice_cap() {
+        let grants = CapabilitySet::from_grants(vec![
+            CapabilityGrant::new(LatticeCap::ReadWorkspace, ScopePattern::new("*").unwrap()),
+            CapabilityGrant::new(LatticeCap::ExecuteShell, ScopePattern::new("*").unwrap()),
+        ])
+        .unwrap();
+        let classes = class_projection(&grants);
+        assert!(classes.contains(faktor_core::CapabilityKind::Read));
+        assert!(classes.contains(faktor_core::CapabilityKind::Execute));
+        assert!(!classes.contains(faktor_core::CapabilityKind::Write));
+        assert!(!classes.contains(faktor_core::CapabilityKind::Network));
+        assert!(class_projection(&CapabilitySet::new()).is_empty());
     }
 }

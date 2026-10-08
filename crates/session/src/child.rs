@@ -77,6 +77,12 @@ pub enum ChildOwnership {
     IsolatedWorktree,
 }
 
+/// Serde default for [`ChildIdentity::permissions`]: a legacy row (no
+/// budget field) keeps the full pre-audit authority.
+fn default_all_capabilities() -> faktor_core::CapabilitySet {
+    faktor_core::CapabilitySet::ALL
+}
+
 /// The durable identity of one child session, stored in the child's own row
 /// space (written once at creation, extended after the first submit).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +106,11 @@ pub struct ChildIdentity {
     /// change set REQUIRES a compiler-exact semantic delta; absence blocks
     /// the merge (`SemanticRequired`) instead of downgrading to advisory.
     pub require_semantic_delta: bool,
+    /// Durable task capability budget (audit Tangerine-9): the child's
+    /// effective parent ∩ task ∩ child permission set. The agent's tool gate
+    /// intersects it as the task-policy leg — legacy rows default to ALL.
+    #[serde(default = "default_all_capabilities")]
+    pub permissions: faktor_core::CapabilitySet,
     pub created_ms: i64,
 }
 
@@ -115,6 +126,7 @@ impl Default for ChildIdentity {
             ownership: ChildOwnership::ReadOnlyShared,
             model: String::new(),
             require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
             created_ms: 0,
         }
     }
@@ -845,6 +857,7 @@ mod tests {
                 ownership: ChildOwnership::IsolatedWorktree,
                 model: "m2".into(),
                 require_semantic_delta: false,
+                permissions: faktor_core::CapabilitySet::ALL,
                 created_ms: 1,
             };
             s.orchestrator_child_identity_put(&id).unwrap();

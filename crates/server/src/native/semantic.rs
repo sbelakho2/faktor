@@ -17,7 +17,7 @@
 //! no endpoints, credentials, model names or other implementation data.
 
 use faktor_semantic::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
-use faktor_semantic::registry::SemanticProviderRegistry;
+use faktor_semantic::registry::{fallback_operation_status, SemanticProviderRegistry};
 use faktor_semantic::types::{SemanticCapabilities, SemanticOp, SemanticProvider};
 
 use super::*;
@@ -98,6 +98,24 @@ fn status_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value
                 .capabilities()
                 .supports(SemanticOp::Snapshot)
         });
+    // Per-operation fidelity/completeness/source (audit Tangerine-4): a bare
+    // boolean could not distinguish heuristic fallback from compiler-exact
+    // Tangerine; consumers branch on these fields instead.
+    let mut operations = serde_json::Map::new();
+    for op in SemanticOp::ALL {
+        let status = registry
+            .map(|registry| registry.operation_status(op))
+            .unwrap_or_else(|| fallback_operation_status(op));
+        operations.insert(
+            op_slug(op).to_string(),
+            serde_json::json!({
+                "available": status.available,
+                "fidelity": status.fidelity,
+                "completeness": status.completeness,
+                "source": status.source,
+            }),
+        );
+    }
     serde_json::json!({
         "configured": registry.is_some(),
         "providerCount": providers.len(),
@@ -107,7 +125,20 @@ fn status_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value
             "providers": snapshot_providers,
             "fallback": fallback_snapshot,
         },
+        "operations": operations,
     })
+}
+
+/// Stable wire slug for one semantic operation.
+fn op_slug(op: SemanticOp) -> &'static str {
+    match op {
+        SemanticOp::Snapshot => "snapshot",
+        SemanticOp::Context => "context",
+        SemanticOp::Delta => "delta",
+        SemanticOp::Affected => "affected",
+        SemanticOp::Verify => "verify",
+        SemanticOp::Explain => "explain",
+    }
 }
 
 /// The capability matrix JSON over the same registry view.
@@ -275,7 +306,13 @@ mod tests {
         assert_eq!(body["providerCount"], 0);
         assert!(body["providers"].as_array().unwrap().is_empty());
         assert_eq!(body["fallback"]["id"], GENERIC_FALLBACK_ID);
-        assert!(body["snapshotState"]["fallback"].as_bool().unwrap());
+        // TRUTHFUL fallback (audit Tangerine-4): no snapshot/verify claims.
+        assert!(!body["snapshotState"]["fallback"].as_bool().unwrap());
+        assert_eq!(body["operations"]["context"]["available"], true);
+        assert_eq!(body["operations"]["context"]["fidelity"], "heuristic");
+        assert_eq!(body["operations"]["context"]["completeness"], "partial");
+        assert_eq!(body["operations"]["verify"]["available"], false);
+        assert_eq!(body["operations"]["snapshot"]["available"], false);
         let caps = capabilities_report_json(None);
         assert_eq!(caps["configured"], false);
         assert_eq!(caps["union"]["operations"]["explain"], true);

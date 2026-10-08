@@ -1019,43 +1019,57 @@ impl AgentRuntime {
             // ExecutingTool, so the denial journal is state-legal. Runs only
             // when the provider actually restricts a class (restrictions ==
             // ALL keeps today's sandbox/permission flow byte-identically).
-            if let Some(state) = semantic {
-                if state.restrictions != faktor_core::CapabilitySet::ALL {
-                    let envelope = sandbox_capability_envelope(
-                        self.deps.sandbox.as_deref().map(|engine| engine.policy()),
-                    );
-                    let effective = effective_capabilities(
-                        envelope,
-                        faktor_core::CapabilitySet::ALL,
-                        state.restrictions,
-                    );
-                    let kind = capability_kind_of(&capability);
-                    if !effective.contains(kind) {
-                        let reason = if !state.restrictions.contains(kind) {
-                            format!(
-                                "semantic restriction removed capability '{}'",
-                                kind.as_str()
-                            )
-                        } else {
-                            format!("sandbox envelope denies capability '{}'", kind.as_str())
-                        };
-                        tracing::warn!(tool = %name, "capability gate denied the tool: {reason}");
-                        handle
-                            .append_journal_event(
-                                faktor_core::event::EventKind::PermissionDenied,
-                                AgentState::ExecutingTool,
-                                Some(turn_op),
-                                Some(serde_json::json!({ "tool": name, "reason": reason })),
-                            )
-                            .await?;
-                        denied.push(DeniedToolCall {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            kind: ToolDenialKind::CapabilityRefused,
-                            reason: format!("tool {name} denied: {reason}"),
-                        });
-                        continue;
-                    }
+            // The TASK/CHILD capability budget is a durable leg (audit
+            // Tangerine-9): an orchestrated child's effective parent∩task∩
+            // child permission set rides its identity, never
+            // `CapabilitySet::ALL`.
+            let task_caps = handle
+                .orchestrator_child_identity_get()
+                .ok()
+                .flatten()
+                .map(|identity| identity.permissions)
+                .unwrap_or(faktor_core::CapabilitySet::ALL);
+            let restrictions = semantic
+                .map(|state| state.restrictions)
+                .unwrap_or(faktor_core::CapabilitySet::ALL);
+            if restrictions != faktor_core::CapabilitySet::ALL
+                || task_caps != faktor_core::CapabilitySet::ALL
+            {
+                let envelope = sandbox_capability_envelope(
+                    self.deps.sandbox.as_deref().map(|engine| engine.policy()),
+                );
+                let effective = effective_capabilities(envelope, task_caps, restrictions);
+                let kind = capability_kind_of(&capability);
+                if !effective.contains(kind) {
+                    let reason = if !task_caps.contains(kind) {
+                        format!(
+                            "task capability budget denies capability '{}'",
+                            kind.as_str()
+                        )
+                    } else if !restrictions.contains(kind) {
+                        format!(
+                            "semantic restriction removed capability '{}'",
+                            kind.as_str()
+                        )
+                    } else {
+                        format!("sandbox envelope denies capability '{}'", kind.as_str())
+                    };
+                    tracing::warn!(tool = %name, "capability gate denied the tool: {reason}");
+                    handle
+                        .append_journal_event(
+                            faktor_core::event::EventKind::PermissionDenied,
+                            AgentState::ExecutingTool,
+                            Some(turn_op),
+                            Some(serde_json::json!({ "tool": name, "reason": reason })),
+                        )
+                        .await?;
+                    denied.push(DeniedToolCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        kind: ToolDenialKind::CapabilityRefused,
+                        reason: format!("tool {name} denied: {reason}"),
+                    });
+                    continue;
                 }
             }
             // Lifecycle hook gate (audit): PreTool hooks may deny the call

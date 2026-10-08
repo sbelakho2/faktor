@@ -908,6 +908,7 @@ impl SessionManager {
             ownership,
             model: String::new(),
             require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
             created_ms: self.now_ms(),
         };
         child.orchestrator_child_identity_put(&id)?;

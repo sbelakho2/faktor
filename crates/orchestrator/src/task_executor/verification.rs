@@ -125,14 +125,22 @@ pub(crate) fn tournament_exec_error(e: crate::tournament::TournamentError) -> Ex
 }
 
 /// The default effective capability grant of one work item's child:
-/// read-only items read the workspace; mutating items read + write it
-/// (the permission requester still gates every actual tool call — these
-/// sets are the orchestrator's typed policy record).
+/// read-only items read the workspace and may run bounded process
+/// verification (Read + Execute); mutating items also write it (the loud
+/// spawn check refuses Write on a `NoWrites` item). Narrower policies are
+/// declared per item on top of this default, and the sandbox, semantic
+/// restrictions and permission requester still gate every actual tool call.
 pub fn child_caps(kind: WorkKind) -> CapabilitySet {
-    let mut grants = vec![CapabilityGrant::new(
-        LatticeCap::ReadWorkspace,
-        ScopePattern::new(ScopePattern::WILDCARD).expect("wildcard pattern"),
-    )];
+    let mut grants = vec![
+        CapabilityGrant::new(
+            LatticeCap::ReadWorkspace,
+            ScopePattern::new(ScopePattern::WILDCARD).expect("wildcard pattern"),
+        ),
+        CapabilityGrant::new(
+            LatticeCap::ExecuteShell,
+            ScopePattern::new(ScopePattern::WILDCARD).expect("wildcard pattern"),
+        ),
+    ];
     if kind.is_mutating() {
         grants.push(CapabilityGrant::new(
             LatticeCap::WriteWorkspace,

@@ -409,7 +409,7 @@ pub(crate) async fn cancel_in_session_run_mid_drive_aborts_discards_and_refuses_
             TaskRunRequest {
                 goal: "cancellable shadowed implementation".into(),
                 work_items: vec![wi("impl", WorkKind::Implementation, &[])],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: dir.path().join("isolated"),
                 ..Default::default()
             },
@@ -530,7 +530,7 @@ pub(crate) async fn cancel_orchestrated_run_fans_cancel_to_live_children_only() 
                     wi("a", WorkKind::Analysis, &[]),
                     wi("b", WorkKind::Analysis, &[]),
                 ],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: isolated.clone(),
                 ..Default::default()
             },
@@ -1267,7 +1267,7 @@ pub(crate) async fn crashed_orchestrated_run_reattaches_files_from_durable_plan_
             env.parent,
             &receipt.run_id,
             crate::runtime::Ceilings::default(),
-            read_caps(),
+            crate::caps::all_lattice(),
             None,
         )
         .expect("resume accepted");
@@ -1837,7 +1837,7 @@ pub(crate) fn start_two_child_run(env: &Arc<RealToolEnv>, goal: &str) -> String 
                 goal: goal.to_string(),
                 work_items: two_isolated_items(),
                 criteria: vec![typed_land_criterion()],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: env.isolated_root.clone(),
                 ..Default::default()
             },
@@ -1976,7 +1976,7 @@ pub(crate) fn start_paths_run(env: &Arc<RealToolEnv>, goal: &str, paths: &[&str]
                 ],
                 auto_items: vec!["prep".to_string()],
                 criteria: vec![typed_land_criterion()],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: env.isolated_root.clone(),
                 ..Default::default()
             },
@@ -2188,7 +2188,7 @@ pub(crate) fn start_no_op_run(
                 goal: goal.to_string(),
                 work_items: two_isolated_items(),
                 criteria: vec![typed_reviewer_criterion("review-0")],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: env.isolated_root.clone(),
                 no_op_disposition: Some(disposition),
                 ..Default::default()
@@ -2377,7 +2377,7 @@ pub(crate) async fn aggregate_goal_criterion_is_reviewer_certified_over_the_cand
                 goal: "aggregate the goal".to_string(),
                 work_items: two_isolated_items(),
                 criteria: vec![typed_land_criterion(), typed_aggregate_goal_criterion()],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: env.isolated_root.clone(),
                 ..Default::default()
             },
@@ -3120,7 +3120,7 @@ pub(crate) fn start_two_child_run_with_criteria(
                 goal: goal.to_string(),
                 work_items: two_isolated_items(),
                 criteria,
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: env.isolated_root.clone(),
                 completion_contract: Some(faktor_core::completion::CompletionContract {
                     include_commit: true,
@@ -3594,7 +3594,7 @@ pub(crate) async fn crash_after_run_base_recorded_restarts_cleanly() {
                 goal: "base crash".to_string(),
                 work_items: two_isolated_items(),
                 criteria: vec![typed_land_criterion()],
-                parent_caps: read_caps(),
+                parent_caps: crate::caps::all_lattice(),
                 isolated_root: env.isolated_root.clone(),
                 ..Default::default()
             },

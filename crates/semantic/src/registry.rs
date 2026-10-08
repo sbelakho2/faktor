@@ -31,15 +31,16 @@ use std::task::{Context, Poll};
 
 use faktor_core::{CancellationToken, Clock, Deadline, SystemClock, WorkspaceId};
 
-use crate::fallback::GenericSemanticFallback;
+use crate::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
 use crate::health::{ProviderHealthKey, SemanticHealthTracker};
 use crate::types::{
-    AffectedRequest, AffectedSet, BoxFuture, SemanticCall, SemanticCapabilities,
-    SemanticContextPack, SemanticContextRequest, SemanticDelta, SemanticDeltaRequest,
-    SemanticEnvelope, SemanticError, SemanticExpectation, SemanticExplainRequest,
-    SemanticExplanation, SemanticOp, SemanticPayload, SemanticProvider, SemanticProviderDescriptor,
+    AffectedRequest, AffectedSet, BoxFuture, EnvelopeIdentity, SemanticCall, SemanticCapabilities,
+    SemanticCompleteness, SemanticContextPack, SemanticContextRequest, SemanticDelta,
+    SemanticDeltaRequest, SemanticEnvelope, SemanticError, SemanticExpectation,
+    SemanticExplainRequest, SemanticExplanation, SemanticFidelity, SemanticOp,
+    SemanticOperationStatus, SemanticPayload, SemanticProvider, SemanticProviderDescriptor,
     SemanticProviderId, SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotId,
-    SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest,
+    SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest, SEMANTIC_SCHEMA_VERSION,
 };
 
 /// The provider chosen for one operation.
@@ -135,6 +136,23 @@ enum DispatchOutcome<T> {
 
 /// Registry of semantic providers plus the always-available generic
 /// fallback.
+/// The generic fallback's honest per-operation status (audit Tangerine-4).
+pub fn fallback_operation_status(op: SemanticOp) -> SemanticOperationStatus {
+    let fallback = GenericSemanticFallback::default();
+    SemanticOperationStatus {
+        available: fallback.capabilities().supports(op),
+        fidelity: SemanticFidelity::Heuristic,
+        completeness: match op {
+            // Degraded packs are bounded slices of the index/metadata, so
+            // they are PARTIAL; delta/affected are approximations whose
+            // coverage is genuinely unknown.
+            SemanticOp::Context | SemanticOp::Explain => SemanticCompleteness::Partial,
+            _ => SemanticCompleteness::Unknown,
+        },
+        source: GENERIC_FALLBACK_ID.to_string(),
+    }
+}
+
 pub struct SemanticProviderRegistry {
     providers: Vec<Arc<dyn SemanticProvider>>,
     /// Handshake-validated descriptors, parallel to `providers`. Only a
@@ -182,6 +200,34 @@ impl SemanticProviderRegistry {
     pub fn with_response_caps(mut self, caps: SemanticResponseCaps) -> Self {
         self.response_caps = caps;
         self
+    }
+
+    /// The per-operation status (audit Tangerine-4) over the SAME selection
+    /// rules consumers use: a registered provider whose VALIDATED descriptor
+    /// covers the operation reports its declared fidelity/completeness;
+    /// otherwise the generic fallback reports its honest degradation.
+    pub fn operation_status(&self, op: SemanticOp) -> SemanticOperationStatus {
+        for (index, provider) in self.providers.iter().enumerate() {
+            let Some(descriptor) = self.cached_descriptor(index) else {
+                continue;
+            };
+            if descriptor
+                .capabilities
+                .covers(SemanticCapabilities::for_op(op))
+            {
+                return SemanticOperationStatus {
+                    available: true,
+                    fidelity: descriptor
+                        .fidelity
+                        .unwrap_or(SemanticFidelity::CompilerExact),
+                    completeness: descriptor
+                        .completeness
+                        .unwrap_or(SemanticCompleteness::ConservativeComplete),
+                    source: provider.id().as_str().to_string(),
+                };
+            }
+        }
+        fallback_operation_status(op)
     }
 
     /// TRUE when at least one EXTERNAL provider is registered (the generic
@@ -364,7 +410,7 @@ impl SemanticProviderRegistry {
     /// cancellation/deadline is terminal. Validation failures (wrong
     /// identity/workspace/snapshot, malformed payload) are recoverable
     /// provider faults, never accepted data.
-    async fn dispatch<T, F, V>(
+    async fn dispatch<T: EnvelopeIdentity, F, V>(
         &self,
         op: SemanticOp,
         required: SemanticCapabilities,
@@ -401,7 +447,9 @@ impl SemanticProviderRegistry {
                 invoke(provider.as_ref()),
             );
             match attempt.await {
-                Ok(value) => match validate(&provider_id, &value) {
+                Ok(value) => match validate(&provider_id, &value).and_then(|()| {
+                    value.validate_payload_identity(provider.as_ref(), SEMANTIC_SCHEMA_VERSION)
+                }) {
                     Ok(()) => {
                         let latency_ms = self
                             .clock
@@ -726,7 +774,10 @@ impl SemanticProviderRegistry {
 mod tests {
     use super::*;
     use crate::test_support::{block_on, call, entity, provider_id, snapshot};
-    use crate::types::{SemanticContextPack, SemanticOp, SEMANTIC_SCHEMA_VERSION};
+    use crate::types::{
+        SemanticContextPack, SemanticEntityId, SemanticEntityRef, SemanticOp, WorkspacePath,
+        SEMANTIC_SCHEMA_VERSION,
+    };
     use faktor_core::{TestClock, WorkspaceId};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Waker;
@@ -1013,8 +1064,111 @@ mod tests {
             question: "why".to_string(),
         }))
         .is_ok());
-        for op in SemanticOp::ALL {
-            assert!(registry.fallback().capabilities().supports(op));
+        // TRUTHFUL capability set (audit Tangerine-4): the fallback serves
+        // degraded heuristic context/delta/affected/explain data and does NOT
+        // claim snapshot or verification.
+        for op in [
+            SemanticOp::Context,
+            SemanticOp::Delta,
+            SemanticOp::Affected,
+            SemanticOp::Explain,
+        ] {
+            assert!(registry.fallback().capabilities().supports(op), "{op:?}");
+        }
+        for op in [SemanticOp::Snapshot, SemanticOp::Verify] {
+            assert!(
+                !registry.fallback().capabilities().supports(op),
+                "the fallback must not claim {op:?}"
+            );
+        }
+    }
+
+    /// Audit Tangerine-4: per-operation status carries fidelity and
+    /// completeness; the fallback is heuristic/partial, never Tangerine.
+    #[test]
+    fn operation_status_distinguishes_fallback_from_a_registered_provider() {
+        let registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        let context = registry.operation_status(SemanticOp::Context);
+        assert!(context.available);
+        assert_eq!(context.fidelity, SemanticFidelity::Heuristic);
+        assert_eq!(context.completeness, SemanticCompleteness::Partial);
+        assert_eq!(context.source, GENERIC_FALLBACK_ID);
+        let verify = registry.operation_status(SemanticOp::Verify);
+        assert!(!verify.available, "fallback cannot verify");
+        // The minimum-fidelity table (audit Tangerine-3/4).
+        assert_eq!(
+            SemanticOp::Context.minimum_fidelity(),
+            SemanticFidelity::Heuristic
+        );
+        assert_eq!(
+            SemanticOp::Affected.minimum_fidelity(),
+            SemanticFidelity::Structural
+        );
+        assert_eq!(
+            SemanticOp::Delta.minimum_fidelity(),
+            SemanticFidelity::CompilerExact
+        );
+        assert_eq!(
+            SemanticOp::Verify.minimum_fidelity(),
+            SemanticFidelity::Proof
+        );
+    }
+
+    /// A REGISTERED provider's status is compiler-exact by contract unless
+    /// its descriptor declares otherwise, and a declared fidelity overrides.
+    #[test]
+    fn provider_status_reports_declared_or_contract_fidelity() {
+        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        let provider = Arc::new(ScriptedProvider::new(
+            "fidelity-probe",
+            SemanticCapabilities::CONTEXT,
+            ScriptedBehavior::Ready,
+        ));
+        registry.register(provider);
+        assert!(block_on(registry.fetch_descriptors(
+            SemanticOp::Context,
+            &CancellationToken::new(),
+            None
+        ))
+        .is_ok());
+        let status = registry.operation_status(SemanticOp::Context);
+        assert!(status.available);
+        assert_eq!(status.fidelity, SemanticFidelity::CompilerExact);
+        assert_eq!(
+            status.completeness,
+            SemanticCompleteness::ConservativeComplete
+        );
+        assert_eq!(status.source, "fidelity-probe");
+    }
+
+    /// Tangerine-2 production wiring: the registry dispatch path ITSELF
+    /// refuses a provider response whose entity refs carry Faktor-heuristic
+    /// (path-derived) origins. Stable provider identities must originate in
+    /// the provider; Faktor never synthesizes them into accepted evidence.
+    #[test]
+    fn registry_dispatch_refuses_heuristic_origin_entity_refs() {
+        let provider = Arc::new(ScriptedProvider::new(
+            "heuristic-impostor",
+            SemanticCapabilities::AFFECTED,
+            ScriptedBehavior::HeuristicRefs,
+        ));
+        let registry = registry_with(Arc::new(TestClock::new(1_000)), vec![provider]);
+        let workspace = WorkspaceId::new(1);
+        let mut call = call();
+        call.require_provider = true;
+        let err = block_on(registry.affected(AffectedRequest {
+            call,
+            workspace,
+            snapshot_id: snapshot(workspace, "rev-1"),
+            changed: vec![entity("src/a.rs", "a")],
+            max_depth: 1,
+        }))
+        .expect_err("heuristic-origin refs must be refused typed");
+        match err {
+            SemanticError::InvalidEntityRef(detail) => {
+                assert!(detail.contains("heuristic"), "{detail}")
+            }
+            other => panic!("expected InvalidEntityRef, got {other:?}"),
         }
     }
 
@@ -1045,6 +1199,10 @@ mod tests {
         Deadline,
         /// Handshake refuses a schema this build does not speak.
         HandshakeRefused,
+        /// An affected response whose entity refs are Faktor-HEURISTIC
+        /// (path-derived): provider responses must never present them
+        /// (audit Tangerine-2).
+        HeuristicRefs,
     }
 
     struct ScriptedProvider {
@@ -1149,6 +1307,42 @@ mod tests {
             })
         }
 
+        fn affected(
+            &self,
+            request: AffectedRequest,
+        ) -> BoxFuture<'_, Result<SemanticEnvelope<AffectedSet>, SemanticError>> {
+            let id = self.id.clone();
+            let workspace = request.workspace;
+            let snapshot_id = request.snapshot_id;
+            let behavior = self.behavior.clone();
+            Box::pin(async move {
+                match behavior {
+                    ScriptedBehavior::HeuristicRefs => {
+                        let payload = AffectedSet {
+                            affected: vec![SemanticEntityRef::heuristic(
+                                workspace,
+                                WorkspacePath::parse("src/a.rs").expect("test path"),
+                                SemanticEntityId::parse("path:src/a.rs").expect("test id"),
+                            )],
+                            tests: vec![],
+                            degraded: false,
+                        };
+                        Ok(SemanticEnvelope::new(
+                            id,
+                            1,
+                            workspace,
+                            snapshot_id,
+                            7,
+                            payload,
+                        ))
+                    }
+                    _ => Err(SemanticError::Refused(
+                        "scripted provider is not scripted for affected".to_string(),
+                    )),
+                }
+            })
+        }
+
         fn verify(
             &self,
             request: SemanticVerifyRequest,
@@ -1201,6 +1395,9 @@ mod tests {
                         provider: id.to_string(),
                     }),
                     ScriptedBehavior::HandshakeRefused => unreachable!("handshake gated"),
+                    ScriptedBehavior::HeuristicRefs => {
+                        unreachable!("affected-only script")
+                    }
                 }
             })
         }
