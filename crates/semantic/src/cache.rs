@@ -93,6 +93,7 @@ impl SemanticCacheEntryKey {
 
 /// A cached provider object.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // the snapshot variant carries the full program manifest by design
 pub enum SemanticCached {
     Snapshot(SemanticEnvelope<SemanticSnapshot>),
     Context(SemanticEnvelope<SemanticContextPack>),
@@ -350,7 +351,7 @@ impl<P: SemanticProvider> SemanticProvider for SemanticCachedProvider<P> {
     ) -> BoxFuture<'_, Result<SemanticEnvelope<SemanticSnapshot>, SemanticError>> {
         let key = self.snapshot_key(&request);
         if let Some(SemanticCached::Snapshot(envelope)) = self.cache.lock().unwrap().get(&key) {
-            return Box::pin(std::future::ready(Ok(envelope)));
+            return Box::pin(std::future::ready(Ok(envelope.clone())));
         }
         Box::pin(async move {
             let result = self.inner.snapshot(request).await;
@@ -451,6 +452,7 @@ mod tests {
                 snapshot(request.workspace, &request.source_revision),
                 5,
                 SemanticSnapshot {
+                    program_manifest: None,
                     source_revision: request.source_revision,
                     tree_hash,
                     entity_count: 3,

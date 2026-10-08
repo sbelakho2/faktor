@@ -104,7 +104,6 @@ use tokio::task::JoinError;
 
 use crate::manager::SessionManager;
 use crate::SessionError;
-
 /// Bound on the routing decision JSON stored on a reservation row
 /// (bounded everything: an audit string is never stored unbounded).
 pub const MAX_ROUTE_DECISION_JSON_BYTES: usize = 8192;
@@ -3476,6 +3475,7 @@ mod tests {
             operation_id: 0,
             ownership: crate::child::ChildOwnership::ReadOnlyShared,
             require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
             created_ms: 1,
         })
         .unwrap();

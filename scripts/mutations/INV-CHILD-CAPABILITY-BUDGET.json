@@ -1,0 +1,9 @@
+{
+  "id": "INV-CHILD-CAPABILITY-BUDGET",
+  "file": "crates/agent/src/runtime/tool_loop.rs",
+  "find": "            let task_caps = handle\n                .orchestrator_child_identity_get()\n                .ok()\n                .flatten()\n                .map(|identity| identity.permissions)\n                .unwrap_or(faktor_core::CapabilitySet::ALL);",
+  "replace": "            let task_caps = faktor_core::CapabilitySet::ALL;",
+  "gate": "cargo test -p faktor-agent --lib task_capability_budget_denies_a_tool_class_before_execution",
+  "expect": "FAILED",
+  "note": "Restoring the ALL placeholder makes the task-policy leg meaningless: a budgeted child could run any tool class."
+}

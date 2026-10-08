@@ -67,7 +67,6 @@ pub mod ceilings {
     /// Default ceiling on concurrently active mutating children (2-4).
     pub const DEFAULT_MAX_MUTATING_ACTIVE: usize = 2;
 }
-
 /// Registry/plan row kinds in the parent session's durable fact space.
 pub const REGISTRY_ROW_KIND: &str = "orchestrator_registry";
 pub const PLAN_ROW_KIND: &str = "orchestrator_plan";
@@ -83,7 +82,6 @@ pub const MAX_RUN_ID_CHARS: usize = 64;
 /// One child drive may hold the turn at most this long at the op level
 /// (the agent's own per-turn slice budget is the tighter bound).
 pub const CHILD_OP_DEADLINE_MS: i64 = 2 * 60 * 60 * 1000;
-
 /// Configurable concurrency ceilings of one execution (audit 24).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -453,8 +451,7 @@ pub struct ChildRuntime {
     /// effective(child) = parent ∩ task_policy ∩ child_policy.
     pub permissions: CapabilitySet,
     pub model_policy: ModelPolicy,
-    /// Durable blocker truth: set when `state == Blocked`, cleared by any
-    /// transition back to `Running`. Old rows decode with `None` fields
+    /// Durable blocker truth set while `state == Blocked`; cleared on resume. Old rows decode with `None` fields
     /// (field-level serde defaults; v23 adds the typed store projection).
     #[serde(default)]
     pub blocker_kind: Option<String>,
@@ -3167,6 +3164,9 @@ impl OrchestratorRuntime {
             )
             .map_err(|e| ExecError::Internal(format!("create_child_session: {e}")))?;
         row.session_id = session.id().raw();
+        // Durable task capability budget (Tangerine-9) rides the child identity.
+        crate::caps::persist_child_budget(&session, &row.permissions)
+            .map_err(ExecError::Internal)?;
         // (audits 7/8/21/22 isolation) A `Paths`-owned child's declared path
         // set is its write ALLOWLIST at the tool boundary: the durable
         // change budget the agent's edit gate already enforces for DiskWrite

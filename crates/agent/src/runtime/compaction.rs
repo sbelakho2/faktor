@@ -81,7 +81,7 @@ pub(crate) async fn semantic_turn_consult(
         .filter_map(|path| {
             let path = WorkspacePath::parse(path).ok()?;
             let entity_id = semantic_entity_id_for(path.as_str())?;
-            Some(SemanticEntityRef::new(workspace, path, entity_id))
+            Some(SemanticEntityRef::heuristic(workspace, path, entity_id))
         })
         .collect();
     // The consult is best-effort observability: an op-id allocation failure

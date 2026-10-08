@@ -1,0 +1,9 @@
+{
+  "id": "INV-PROGRAM-SNAPSHOT-IDENTITY",
+  "file": "crates/semantic/src/types.rs",
+  "find": "        field(\"source_content\", self.source_content.as_deref());\n",
+  "replace": "        // (source_content intentionally omitted from the digest)\n",
+  "gate": "cargo test -p faktor-semantic --lib program_snapshot_digest_binds_every_component",
+  "expect": "FAILED",
+  "note": "Dropping the source-content component makes two different source trees share a program snapshot id."
+}

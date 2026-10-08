@@ -1547,3 +1547,78 @@ mutation_command = "node scripts/mutation-run.mjs INV-MERGE-SEMANTIC-AWAITED"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-FIDELITY-TRUTH"
+statement = "Semantic evidence fidelity (audit Tangerine-3/4): every operation reports available/fidelity/completeness/source truthfully, and authoritative consumers require the documented minimum fidelity."
+owner = "crates/semantic registry/fallback fidelity"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-FIDELITY-TRUTH.json"
+script_check = ""
+unit_test = "operation_status_distinguishes_fallback_from_a_registered_provider"
+production_wiring = "provider_status_reports_declared_or_contract_fidelity"
+fault = ""
+mutation_witness = "operation_status_distinguishes_fallback_from_a_registered_provider"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-FIDELITY-TRUTH"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MERGE-SEMANTIC-FIDELITY-REQUIRED"
+statement = "Semantic evidence fidelity (audit Tangerine-3/4): every operation reports available/fidelity/completeness/source truthfully, and authoritative consumers require the documented minimum fidelity."
+owner = "crates/orchestrator merge preflight fidelity gate"
+authority = "planted mutation scripts/mutations/INV-MERGE-SEMANTIC-FIDELITY-REQUIRED.json"
+script_check = ""
+unit_test = "required_semantic_delta_rejects_sub_compiler_fidelity"
+production_wiring = "required_semantic_delta_blocks_on_provider_failure"
+fault = ""
+mutation_witness = "required_semantic_delta_rejects_sub_compiler_fidelity"
+mutation_command = "node scripts/mutation-run.mjs INV-MERGE-SEMANTIC-FIDELITY-REQUIRED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-PROGRAM-SNAPSHOT-IDENTITY"
+statement = "A program snapshot id binds source content, dependency graph, target triple, feature configuration, toolchain, semantic schema, provider identity and every semantic graph root (symbols/types/calls/effects/capabilities/ownership/contracts/MIR/tests/public API): any component change moves the id, and a provider-supplied manifest must match the answering provider and schema."
+owner = "crates/semantic types ProgramSnapshotManifest"
+authority = "planted mutation scripts/mutations/INV-PROGRAM-SNAPSHOT-IDENTITY.json"
+script_check = ""
+unit_test = "program_snapshot_digest_binds_every_component"
+production_wiring = "program_manifest_identity_must_match_the_answering_provider"
+fault = "snapshot_payload_round_trips_manifest_through_serde"
+mutation_witness = "program_snapshot_digest_binds_every_component"
+mutation_command = "node scripts/mutation-run.mjs INV-PROGRAM-SNAPSHOT-IDENTITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-CHILD-CAPABILITY-BUDGET"
+statement = "A spawned child's durable identity carries its class-projected capability budget, and the agent tool gate refuses a tool whose class the task budget denies before any execution."
+owner = "crates/agent tool gate task-policy leg"
+authority = "planted mutation scripts/mutations/INV-CHILD-CAPABILITY-BUDGET.json"
+script_check = ""
+unit_test = "task_capability_budget_denies_a_tool_class_before_execution"
+production_wiring = "spawned_child_identity_carries_the_durable_capability_budget"
+fault = ""
+mutation_witness = "task_capability_budget_denies_a_tool_class_before_execution"
+mutation_command = "node scripts/mutation-run.mjs INV-CHILD-CAPABILITY-BUDGET"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-ENTITY-ORIGIN"
+statement = "Provider-origin semantic entity ids are enforced on the wire: Faktor's path-derived refs are explicitly heuristic, and registry dispatch refuses any provider response carrying them."
+owner = "crates/semantic entity origin"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-ENTITY-ORIGIN.json"
+script_check = ""
+unit_test = "heuristic_origin_marked_and_provider_responses_refuse_it"
+production_wiring = "registry_dispatch_refuses_heuristic_origin_entity_refs"
+fault = ""
+mutation_witness = "heuristic_origin_marked_and_provider_responses_refuse_it"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-ENTITY-ORIGIN"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]

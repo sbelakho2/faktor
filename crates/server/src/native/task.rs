@@ -228,12 +228,11 @@ pub(crate) struct NativeTaskRunWorkItem {
 /// the permission requester; this is the run's typed policy record, never
 /// a permission grant.
 pub(crate) fn native_run_parent_caps() -> faktor_orchestrator::caps::CapabilitySet {
-    use faktor_orchestrator::caps::{CapabilityGrant, LatticeCap, ScopePattern};
-    faktor_orchestrator::caps::CapabilitySet::from_grants(vec![CapabilityGrant::new(
-        LatticeCap::ReadWorkspace,
-        ScopePattern::new("*").expect("wildcard pattern"),
-    )])
-    .expect("wildcard grant is sane")
+    // The run's typed policy record: every lattice class over the widest
+    // scope. Narrowing happens through task/child specs, the sandbox
+    // envelope, semantic restrictions and the tool permission requester —
+    // this default only makes the previously-implicit authority explicit.
+    faktor_orchestrator::caps::all_lattice()
 }
 
 /// True when a task-start body must be refused with a typed 400 because a

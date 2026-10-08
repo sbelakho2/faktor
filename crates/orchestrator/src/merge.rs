@@ -3306,6 +3306,7 @@ mod tests {
                         ownership: ChildOwnership::IsolatedWorktree,
                         model: "m".into(),
                         require_semantic_delta: false,
+                        permissions: faktor_core::CapabilitySet::ALL,
                         created_ms: 1,
                     })
                     .unwrap();
@@ -3638,6 +3639,7 @@ mod tests {
             handshakes: std::sync::atomic::AtomicUsize,
             deltas: std::sync::atomic::AtomicUsize,
             mode: CountingDeltaMode,
+            fidelity: faktor_semantic::SemanticFidelity,
         }
 
         #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3658,6 +3660,10 @@ mod tests {
 
             fn capabilities(&self) -> faktor_semantic::SemanticCapabilities {
                 faktor_semantic::SemanticCapabilities::DELTA.with_compose_delta(true)
+            }
+
+            fn fidelity(&self) -> faktor_semantic::SemanticFidelity {
+                self.fidelity
             }
 
             fn handshake(
@@ -3746,6 +3752,7 @@ mod tests {
                 handshakes: std::sync::atomic::AtomicUsize::new(0),
                 deltas: std::sync::atomic::AtomicUsize::new(0),
                 mode: CountingDeltaMode::Empty,
+                fidelity: faktor_semantic::SemanticFidelity::CompilerExact,
             });
             let fixture = build_fixture(counting_registry(&provider));
             let outcome = fixture
@@ -3784,6 +3791,7 @@ mod tests {
                 handshakes: std::sync::atomic::AtomicUsize::new(0),
                 deltas: std::sync::atomic::AtomicUsize::new(0),
                 mode: CountingDeltaMode::Fail,
+                fidelity: faktor_semantic::SemanticFidelity::CompilerExact,
             }));
             let fixture = build_fixture(Arc::new(registry));
             set_semantic_required(&fixture, true);
@@ -3816,6 +3824,7 @@ mod tests {
                 handshakes: std::sync::atomic::AtomicUsize::new(0),
                 deltas: std::sync::atomic::AtomicUsize::new(0),
                 mode: CountingDeltaMode::Fail,
+                fidelity: faktor_semantic::SemanticFidelity::CompilerExact,
             });
             let fixture = build_fixture(counting_registry(&provider));
             set_semantic_required(&fixture, true);
@@ -3833,6 +3842,37 @@ mod tests {
             assert_eq!(provider.deltas.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
+        /// A required preflight rejects a provider that declares sub-compiler
+        /// fidelity (audit Tangerine-3/4) BEFORE running any delta.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn required_semantic_delta_rejects_sub_compiler_fidelity() {
+            let provider = Arc::new(CountingDeltaProvider {
+                handshakes: std::sync::atomic::AtomicUsize::new(0),
+                deltas: std::sync::atomic::AtomicUsize::new(0),
+                mode: CountingDeltaMode::Empty,
+                fidelity: faktor_semantic::SemanticFidelity::Structural,
+            });
+            let fixture = build_fixture(counting_registry(&provider));
+            set_semantic_required(&fixture, true);
+            let err = fixture
+                .orch
+                .approve_and_merge(
+                    "child-0",
+                    &fixture.cs.id(),
+                    &[PathBuf::from("src/a.rs")],
+                    &[],
+                )
+                .await
+                .expect_err("sub-compiler fidelity cannot satisfy a required preflight");
+            assert!(matches!(err, ExecError::SemanticRequired(_)), "{err:?}");
+            assert_eq!(
+                provider.deltas.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no delta may run under sub-compiler fidelity"
+            );
+            assert_eq!(parent_bytes(&fixture), b"v1-base", "nothing applied");
+        }
+
         /// A PENDING provider is awaited (bounded); it is never treated as
         /// absence. Required mode blocks at the bound.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3841,6 +3881,7 @@ mod tests {
                 handshakes: std::sync::atomic::AtomicUsize::new(0),
                 deltas: std::sync::atomic::AtomicUsize::new(0),
                 mode: CountingDeltaMode::Pending,
+                fidelity: faktor_semantic::SemanticFidelity::CompilerExact,
             });
             let fixture = build_fixture(counting_registry(&provider));
             set_semantic_required(&fixture, true);
@@ -3905,6 +3946,7 @@ mod goal_typed_tests {
             ownership: ChildOwnership::ReadOnlyShared,
             model: "m".into(),
             require_semantic_delta: false,
+            permissions: faktor_core::CapabilitySet::ALL,
             created_ms: 1,
         };
         handle.orchestrator_child_identity_put(&identity).unwrap();

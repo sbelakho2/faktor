@@ -282,7 +282,11 @@ pub(crate) fn bounded_turn_wait(
 pub(crate) const SEMANTIC_CONSULT_MAX_WAIT: Duration = Duration::from_millis(2000);
 
 /// Byte bound of one rendered semantic evidence block (DATA).
-pub(crate) const SEMANTIC_EVIDENCE_MAX_CHARS: usize = 4 * 1024;
+/// Body budget of one rendered `[evidence:data]` block: sized so the WHOLE
+/// block (both markers + newlines) stays inside the 2048-byte persisted
+/// snippet bound, so truncation can never strip the closing marker and turn
+/// provider DATA into an unterminated envelope.
+pub(crate) const SEMANTIC_EVIDENCE_MAX_CHARS: usize = 2000;
 
 /// The review-phase quality floor a High/Unknown semantic risk escalates to
 /// (audits 54/118/119); the ordinary review floor is 60.

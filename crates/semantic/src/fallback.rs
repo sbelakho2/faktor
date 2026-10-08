@@ -198,7 +198,23 @@ impl SemanticProvider for GenericSemanticFallback {
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
-        SemanticCapabilities::ALL
+        // TRUTHFUL (audit Tangerine-4): the generic fallback serves degraded
+        // heuristic context/delta/affected/explain data. It does NOT claim
+        // snapshot (no compiler database), constrained edits, or verify
+        // (there is no proof obligation machinery here) — claiming ALL made
+        // fallback look like Tangerine.
+        SemanticCapabilities::CONTEXT
+            .union(SemanticCapabilities::DELTA)
+            .union(SemanticCapabilities::AFFECTED)
+            .union(SemanticCapabilities::EXPLAIN)
+    }
+
+    fn fidelity(&self) -> crate::types::SemanticFidelity {
+        crate::types::SemanticFidelity::Heuristic
+    }
+
+    fn completeness(&self) -> crate::types::SemanticCompleteness {
+        crate::types::SemanticCompleteness::Partial
     }
 
     fn snapshot(
@@ -222,6 +238,7 @@ impl SemanticProvider for GenericSemanticFallback {
             SemanticEnvelope::<SemanticSnapshot>::SCHEMA_VERSION,
         );
         let payload = SemanticSnapshot {
+            program_manifest: None,
             source_revision: revision.clone(),
             tree_hash: revision_tree_hash(request.workspace, &revision),
             entity_count,

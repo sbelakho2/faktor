@@ -93,6 +93,19 @@ impl OrchestratorRuntime {
             .await;
         let provider = match selection {
             SemanticSelection::Provider(provider) if provider.capabilities().compose_delta => {
+                // Fidelity requirement (audit Tangerine-3/4): a REQUIRED
+                // merge verification only trusts compiler-exact (or proof)
+                // evidence; a declared structural/heuristic provider blocks
+                // instead of pretending.
+                if required
+                    && provider.fidelity() < faktor_semantic::SemanticFidelity::CompilerExact
+                {
+                    return Err(ExecError::SemanticRequired(format!(
+                        "run {run} requires compiler-exact semantic verification but provider {} declares fidelity {:?}",
+                        provider.id(),
+                        provider.fidelity()
+                    )));
+                }
                 provider
             }
             _ if required => {

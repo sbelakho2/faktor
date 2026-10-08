@@ -438,6 +438,19 @@ impl<'de> Deserialize<'de> for SemanticEntityId {
     }
 }
 
+/// Where an entity id ORIGINATES (audit Tangerine-2): provider-resolved ids
+/// are stable compiler identities; Faktor's path-derived ids are explicitly
+/// marked HEURISTIC and are never presented as Tangerine identities.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEntityOrigin {
+    #[default]
+    Provider,
+    Heuristic,
+}
+
 /// One entity in one workspace. Cross-workspace refs are rejected by
 /// [`SemanticEntityRef::validate_for`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -445,6 +458,9 @@ pub struct SemanticEntityRef {
     pub workspace: WorkspaceId,
     pub path: WorkspacePath,
     pub entity_id: SemanticEntityId,
+    /// Provider-resolved (default, wire-compatible) or Faktor heuristic.
+    #[serde(default)]
+    pub origin: SemanticEntityOrigin,
 }
 
 impl SemanticEntityRef {
@@ -453,6 +469,22 @@ impl SemanticEntityRef {
             workspace,
             path,
             entity_id,
+            origin: SemanticEntityOrigin::Provider,
+        }
+    }
+
+    /// A Faktor-side PATH-DERIVED ref (audit Tangerine-2): fine for
+    /// heuristic consult requests, never accepted from a provider response.
+    pub fn heuristic(
+        workspace: WorkspaceId,
+        path: WorkspacePath,
+        entity_id: SemanticEntityId,
+    ) -> Self {
+        Self {
+            workspace,
+            path,
+            entity_id,
+            origin: SemanticEntityOrigin::Heuristic,
         }
     }
 
@@ -491,6 +523,20 @@ impl SemanticOp {
         SemanticOp::Verify,
         SemanticOp::Explain,
     ];
+
+    /// The fidelity a consumer must REQUIRE before trusting this operation
+    /// for an authoritative decision (audit Tangerine-3/4 table): context
+    /// may be heuristic; affected analysis wants at least parsed structure;
+    /// snapshots and deltas are compiler-exact claims; verification
+    /// (contract satisfaction) demands explicit proof.
+    pub const fn minimum_fidelity(self) -> SemanticFidelity {
+        match self {
+            SemanticOp::Context | SemanticOp::Explain => SemanticFidelity::Heuristic,
+            SemanticOp::Affected => SemanticFidelity::Structural,
+            SemanticOp::Snapshot | SemanticOp::Delta => SemanticFidelity::CompilerExact,
+            SemanticOp::Verify => SemanticFidelity::Proof,
+        }
+    }
 
     pub const fn bit(self) -> u32 {
         match self {
@@ -576,6 +622,16 @@ impl SemanticCapabilities {
         }
     }
 
+    /// The minimal required-capability value for one operation (selection
+    /// comparison only).
+    pub const fn for_op(op: SemanticOp) -> Self {
+        Self {
+            ops: op.bit(),
+            compose_delta: false,
+            constrained_edit: false,
+        }
+    }
+
     pub const fn supports(self, op: SemanticOp) -> bool {
         self.ops & op.bit() != 0
     }
@@ -629,6 +685,42 @@ impl Default for SemanticCapabilities {
     }
 }
 
+/// Semantic evidence FIDELITY (audit Tangerine-3/4): how close an answer is
+/// to the program's actual compiler semantics. Ordered from nothing through
+/// filename heuristics and parsed structure up to compiler-exact and an
+/// explicit proof obligation. `fallback` never impersonates Tangerine:
+/// every response and status carries its real fidelity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticFidelity {
+    None,
+    Heuristic,
+    Structural,
+    CompilerExact,
+    Proof,
+}
+
+/// How much of the semantic truth a response covers (audit Tangerine-4):
+/// boolean availability alone is not completeness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCompleteness {
+    Unknown,
+    Partial,
+    ConservativeComplete,
+    Complete,
+}
+
+/// Per-operation status (audit Tangerine-4): consumers branch on fidelity and
+/// completeness, never on a bare `available` boolean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticOperationStatus {
+    pub available: bool,
+    pub fidelity: SemanticFidelity,
+    pub completeness: SemanticCompleteness,
+    pub source: String,
+}
+
 /// The identity + capability truth one provider stands behind. A descriptor
 /// is only usable after [`SemanticProviderDescriptor::validate`] accepts it:
 /// runtime selection reads a VALIDATED descriptor, never an unvalidated
@@ -640,6 +732,13 @@ pub struct SemanticProviderDescriptor {
     /// The envelope schema version this provider actually speaks.
     pub schema_version: u32,
     pub capabilities: SemanticCapabilities,
+    /// Declared evidence fidelity (absent = the external-provider contract:
+    /// compiler-exact).
+    #[serde(default)]
+    pub fidelity: Option<SemanticFidelity>,
+    /// Declared completeness (absent = conservative-complete).
+    #[serde(default)]
+    pub completeness: Option<SemanticCompleteness>,
 }
 
 impl SemanticProviderDescriptor {
@@ -654,6 +753,8 @@ impl SemanticProviderDescriptor {
             version,
             schema_version,
             capabilities,
+            fidelity: None,
+            completeness: None,
         }
     }
 
@@ -666,6 +767,8 @@ impl SemanticProviderDescriptor {
             version,
             schema_version: SEMANTIC_SCHEMA_VERSION,
             capabilities: SemanticCapabilities::NONE,
+            fidelity: None,
+            completeness: None,
         }
     }
 
@@ -844,6 +947,18 @@ pub trait SemanticPayload: Serialize {
         Vec::new()
     }
 
+    /// Payload-level IDENTITY validation against the answering provider and
+    /// the envelope schema. Program snapshots bind compiler/provider
+    /// identity here (audit Tangerine-1); other payloads are identity-free.
+    fn validate_identity(
+        &self,
+        provider: &dyn SemanticProvider,
+        schema_version: u32,
+    ) -> Result<(), SemanticError> {
+        let _ = (provider, schema_version);
+        Ok(())
+    }
+
     /// Serialized size of the payload, used to enforce response caps.
     fn byte_len(&self) -> Result<usize, SemanticError> {
         serde_json::to_vec(self)
@@ -859,9 +974,52 @@ pub struct SemanticSnapshot {
     pub tree_hash: FileHash,
     pub entity_count: u64,
     pub created_ms: i64,
+    /// The real program snapshot manifest, when the provider can produce
+    /// one: its [`ProgramSnapshotManifest::digest`] is the PROGRAM identity
+    /// (audit Tangerine-1). Absent = the response only carries the view key.
+    #[serde(default)]
+    pub program_manifest: Option<ProgramSnapshotManifest>,
 }
 
-impl SemanticPayload for SemanticSnapshot {}
+impl SemanticSnapshot {
+    /// The program snapshot identity when the provider supplied a manifest.
+    pub fn program_id(&self) -> Option<ProgramSnapshotId> {
+        self.program_manifest
+            .as_ref()
+            .map(ProgramSnapshotManifest::digest)
+    }
+}
+
+impl SemanticPayload for SemanticSnapshot {
+    fn validate_identity(
+        &self,
+        provider: &dyn SemanticProvider,
+        schema_version: u32,
+    ) -> Result<(), SemanticError> {
+        let Some(manifest) = &self.program_manifest else {
+            return Ok(());
+        };
+        let actual = SemanticProviderId::parse(&manifest.provider_id).map_err(|_| {
+            SemanticError::Malformed(format!(
+                "program snapshot manifest carries an invalid provider id {:?}",
+                manifest.provider_id
+            ))
+        })?;
+        if actual != provider.id() || manifest.provider_version != provider.version() {
+            return Err(SemanticError::ProviderMismatch {
+                expected: provider.id(),
+                actual,
+            });
+        }
+        if manifest.semantic_schema != schema_version {
+            return Err(SemanticError::UnsupportedSchema {
+                supported: schema_version,
+                got: manifest.semantic_schema,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// One retrieved context item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -904,6 +1062,93 @@ pub struct SemanticDeltaChange {
     pub kind: SemanticDeltaKind,
     pub old_hash: Option<FileHash>,
     pub new_hash: Option<FileHash>,
+}
+
+/// The durable PROGRAM SNAPSHOT manifest (audit Tangerine-1): a real
+/// program snapshot binds compiler-semantic identity, not just a cache/view
+/// key. Not every field is serialized into every response — they all
+/// contribute to the canonical digest that IS the program snapshot id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProgramSnapshotManifest {
+    /// CAS/merkle root of the source tree content.
+    pub source_content: Option<String>,
+    pub dependency_graph: Option<String>,
+    pub target_triple: Option<String>,
+    pub feature_configuration: Option<String>,
+    /// Compiler/toolchain version string.
+    pub toolchain: Option<String>,
+    /// The semantic schema this manifest was produced under.
+    pub semantic_schema: u32,
+    pub provider_id: String,
+    pub provider_version: u32,
+    pub symbols_root: Option<String>,
+    pub types_root: Option<String>,
+    pub calls_root: Option<String>,
+    pub effects_root: Option<String>,
+    pub capabilities_root: Option<String>,
+    pub ownership_root: Option<String>,
+    pub contracts_root: Option<String>,
+    pub mir_root: Option<String>,
+    pub tests_root: Option<String>,
+    pub public_api_root: Option<String>,
+}
+
+impl ProgramSnapshotManifest {
+    /// The PROGRAM snapshot id: a domain-separated BLAKE3 digest over every
+    /// manifest component in a fixed order. `None` and `Some("")` are
+    /// distinct on purpose (absence of a graph root is part of the identity).
+    pub fn digest(&self) -> ProgramSnapshotId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faktor-program-snapshot/v1\0");
+        let mut field = |name: &str, value: Option<&str>| {
+            hasher.update(name.as_bytes());
+            hasher.update(b"=");
+            if let Some(text) = value {
+                hasher.update(b"some:");
+                hasher.update(text.as_bytes());
+            } else {
+                hasher.update(b"none");
+            }
+            hasher.update(b"\0");
+        };
+        field("source_content", self.source_content.as_deref());
+        field("dependency_graph", self.dependency_graph.as_deref());
+        field("target_triple", self.target_triple.as_deref());
+        field(
+            "feature_configuration",
+            self.feature_configuration.as_deref(),
+        );
+        field("toolchain", self.toolchain.as_deref());
+        field("semantic_schema", Some(&self.semantic_schema.to_string()));
+        field("provider_id", Some(&self.provider_id));
+        field("provider_version", Some(&self.provider_version.to_string()));
+        field("symbols_root", self.symbols_root.as_deref());
+        field("types_root", self.types_root.as_deref());
+        field("calls_root", self.calls_root.as_deref());
+        field("effects_root", self.effects_root.as_deref());
+        field("capabilities_root", self.capabilities_root.as_deref());
+        field("ownership_root", self.ownership_root.as_deref());
+        field("contracts_root", self.contracts_root.as_deref());
+        field("mir_root", self.mir_root.as_deref());
+        field("tests_root", self.tests_root.as_deref());
+        field("public_api_root", self.public_api_root.as_deref());
+        ProgramSnapshotId(SemanticSnapshotId::from_file_hash(FileHash::from(
+            *hasher.finalize().as_bytes(),
+        )))
+    }
+}
+
+/// The identity of a PROGRAM snapshot (distinct from [`SemanticSnapshotId`],
+/// which is the cheaper cache/view key derived from workspace+revision+
+/// provider metadata).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProgramSnapshotId(pub SemanticSnapshotId);
+
+impl ProgramSnapshotId {
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
 }
 
 /// Delta payload.
@@ -1074,6 +1319,26 @@ impl<T> SemanticEnvelope<T> {
     }
 }
 
+/// Envelope-level payload identity validation (program snapshots bind
+/// provider/schema identity; other payloads are identity-free).
+pub trait EnvelopeIdentity {
+    fn validate_payload_identity(
+        &self,
+        provider: &dyn SemanticProvider,
+        schema_version: u32,
+    ) -> Result<(), SemanticError>;
+}
+
+impl<T: SemanticPayload> EnvelopeIdentity for SemanticEnvelope<T> {
+    fn validate_payload_identity(
+        &self,
+        provider: &dyn SemanticProvider,
+        schema_version: u32,
+    ) -> Result<(), SemanticError> {
+        self.payload.validate_identity(provider, schema_version)
+    }
+}
+
 impl<T: SemanticPayload> SemanticEnvelope<T> {
     /// Provider identity check: a response must come from the provider that
     /// was called — a different id is a typed refusal, never accepted data.
@@ -1128,6 +1393,12 @@ impl<T: SemanticPayload> SemanticEnvelope<T> {
         }
         let mut seen = BTreeSet::new();
         for entity_ref in refs {
+            if entity_ref.origin == SemanticEntityOrigin::Heuristic {
+                return Err(SemanticError::InvalidEntityRef(format!(
+                    "entity {} is Faktor-heuristic (path-derived); provider responses must carry provider-origin ids",
+                    entity_ref.entity_id
+                )));
+            }
             entity_ref.validate_for(expected.workspace)?;
             if !seen.insert(entity_ref.entity_id.clone()) {
                 return Err(SemanticError::DuplicateEntity(
@@ -1193,6 +1464,22 @@ pub trait SemanticProvider: Send + Sync {
     fn validated_descriptor(&self) -> Option<SemanticProviderDescriptor> {
         let descriptor = self.descriptor();
         descriptor.validate().ok().map(|()| descriptor)
+    }
+
+    /// The provider's declared evidence fidelity (descriptor override or the
+    /// external-provider compiler-exact contract).
+    fn fidelity(&self) -> SemanticFidelity {
+        self.descriptor()
+            .fidelity
+            .unwrap_or(SemanticFidelity::CompilerExact)
+    }
+
+    /// The provider's declared completeness (descriptor override or the
+    /// conservative-complete provider contract).
+    fn completeness(&self) -> SemanticCompleteness {
+        self.descriptor()
+            .completeness
+            .unwrap_or(SemanticCompleteness::ConservativeComplete)
     }
 
     /// Identity of the transport this provider executes through (endpoint,
@@ -1642,5 +1929,257 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&RiskLevel::Safe).unwrap(), "\"safe\"");
         assert!(serde_json::from_str::<RiskLevel>("\"Unknown\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod program_snapshot_tests {
+    use super::*;
+
+    struct Probe {
+        id: SemanticProviderId,
+        version: u32,
+    }
+
+    impl SemanticProvider for Probe {
+        fn id(&self) -> SemanticProviderId {
+            self.id.clone()
+        }
+        fn version(&self) -> u32 {
+            self.version
+        }
+        fn capabilities(&self) -> SemanticCapabilities {
+            SemanticCapabilities::NONE
+        }
+    }
+
+    fn full_manifest() -> ProgramSnapshotManifest {
+        ProgramSnapshotManifest {
+            source_content: Some("src-root-1".into()),
+            dependency_graph: Some("deps-root-1".into()),
+            target_triple: Some("x86_64-unknown-linux-gnu".into()),
+            feature_configuration: Some("default".into()),
+            toolchain: Some("rustc 1.98.0".into()),
+            semantic_schema: SEMANTIC_SCHEMA_VERSION,
+            provider_id: "tangerine".into(),
+            provider_version: 7,
+            symbols_root: Some("sym-root".into()),
+            types_root: Some("type-root".into()),
+            calls_root: Some("call-root".into()),
+            effects_root: Some("effect-root".into()),
+            capabilities_root: Some("cap-root".into()),
+            ownership_root: Some("own-root".into()),
+            contracts_root: Some("contract-root".into()),
+            mir_root: Some("mir-root".into()),
+            tests_root: Some("test-root".into()),
+            public_api_root: Some("api-root".into()),
+        }
+    }
+
+    /// Audit Tangerine-1: the program snapshot id binds EVERY component —
+    /// no source/toolchain/graph-root change may leave the id untouched.
+    #[test]
+    fn program_snapshot_digest_binds_every_component() {
+        let base = full_manifest();
+        assert_eq!(base.digest(), full_manifest().digest());
+        type ManifestMutation = (&'static str, Box<dyn Fn(&mut ProgramSnapshotManifest)>);
+        let mutations: Vec<ManifestMutation> = vec![
+            (
+                "source_content",
+                Box::new(|m| m.source_content = Some("other".into())),
+            ),
+            (
+                "dependency_graph",
+                Box::new(|m| m.dependency_graph = Some("other".into())),
+            ),
+            (
+                "target_triple",
+                Box::new(|m| m.target_triple = Some("other".into())),
+            ),
+            (
+                "feature_configuration",
+                Box::new(|m| m.feature_configuration = Some("other".into())),
+            ),
+            (
+                "toolchain",
+                Box::new(|m| m.toolchain = Some("other".into())),
+            ),
+            ("semantic_schema", Box::new(|m| m.semantic_schema += 1)),
+            ("provider_id", Box::new(|m| m.provider_id = "other".into())),
+            ("provider_version", Box::new(|m| m.provider_version += 1)),
+            (
+                "symbols_root",
+                Box::new(|m| m.symbols_root = Some("other".into())),
+            ),
+            (
+                "types_root",
+                Box::new(|m| m.types_root = Some("other".into())),
+            ),
+            (
+                "calls_root",
+                Box::new(|m| m.calls_root = Some("other".into())),
+            ),
+            (
+                "effects_root",
+                Box::new(|m| m.effects_root = Some("other".into())),
+            ),
+            (
+                "capabilities_root",
+                Box::new(|m| m.capabilities_root = Some("other".into())),
+            ),
+            (
+                "ownership_root",
+                Box::new(|m| m.ownership_root = Some("other".into())),
+            ),
+            (
+                "contracts_root",
+                Box::new(|m| m.contracts_root = Some("other".into())),
+            ),
+            ("mir_root", Box::new(|m| m.mir_root = Some("other".into()))),
+            (
+                "tests_root",
+                Box::new(|m| m.tests_root = Some("other".into())),
+            ),
+            (
+                "public_api_root",
+                Box::new(|m| m.public_api_root = Some("other".into())),
+            ),
+            ("absent-vs-empty root", Box::new(|m| m.tests_root = None)),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                base.digest(),
+                changed.digest(),
+                "mutating {name} must move the program snapshot id"
+            );
+        }
+        // The digest survives the wire (serde round-trip).
+        let json = serde_json::to_string(&base).unwrap();
+        let decoded: ProgramSnapshotManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.digest(), base.digest());
+    }
+
+    #[test]
+    fn snapshot_program_id_is_the_manifest_digest_and_absent_without_one() {
+        let bare = SemanticSnapshot {
+            source_revision: "rev".into(),
+            tree_hash: FileHash::from([1u8; 32]),
+            entity_count: 3,
+            created_ms: 1,
+            program_manifest: None,
+        };
+        assert!(bare.program_id().is_none());
+        let with_manifest = SemanticSnapshot {
+            program_manifest: Some(full_manifest()),
+            ..bare.clone()
+        };
+        assert_eq!(with_manifest.program_id(), Some(full_manifest().digest()));
+    }
+
+    #[test]
+    fn program_manifest_identity_must_match_the_answering_provider() {
+        let matching = Probe {
+            id: SemanticProviderId::parse("tangerine").unwrap(),
+            version: 7,
+        };
+        let snapshot = SemanticSnapshot {
+            source_revision: "rev".into(),
+            tree_hash: FileHash::from([2u8; 32]),
+            entity_count: 1,
+            created_ms: 1,
+            program_manifest: Some(full_manifest()),
+        };
+        assert!(snapshot
+            .validate_identity(&matching, SEMANTIC_SCHEMA_VERSION)
+            .is_ok());
+        let other = Probe {
+            id: SemanticProviderId::parse("impostor").unwrap(),
+            version: 7,
+        };
+        assert!(matches!(
+            snapshot.validate_identity(&other, SEMANTIC_SCHEMA_VERSION),
+            Err(SemanticError::ProviderMismatch { .. })
+        ));
+        let wrong_schema = Probe {
+            id: SemanticProviderId::parse("tangerine").unwrap(),
+            version: 7,
+        };
+        assert!(matches!(
+            snapshot.validate_identity(&wrong_schema, SEMANTIC_SCHEMA_VERSION + 1),
+            Err(SemanticError::UnsupportedSchema { .. })
+        ));
+        let mut malformed = full_manifest();
+        malformed.provider_id = "Not A Provider Id!".into();
+        let snapshot = SemanticSnapshot {
+            program_manifest: Some(malformed),
+            ..snapshot
+        };
+        assert!(matches!(
+            snapshot.validate_identity(&matching, SEMANTIC_SCHEMA_VERSION),
+            Err(SemanticError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_payload_round_trips_manifest_through_serde() {
+        let snapshot = SemanticSnapshot {
+            source_revision: "rev".into(),
+            tree_hash: FileHash::from([3u8; 32]),
+            entity_count: 2,
+            created_ms: 1,
+            program_manifest: Some(full_manifest()),
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let decoded: SemanticSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.program_id(), snapshot.program_id());
+    }
+}
+
+#[cfg(test)]
+mod entity_origin_tests {
+    use super::*;
+
+    /// Audit Tangerine-2: Faktor-derived ids are explicitly HEURISTIC, the
+    /// wire default is provider-origin, and provider responses carrying a
+    /// path-derived id are refused outright.
+    #[test]
+    fn heuristic_origin_marked_and_provider_responses_refuse_it() {
+        let ws = WorkspaceId::new(1);
+        let path = WorkspacePath::parse("src/a.rs").unwrap();
+        let id = SemanticEntityId::parse("path:src/a.rs").unwrap();
+        let heuristic = SemanticEntityRef::heuristic(ws, path.clone(), id.clone());
+        assert_eq!(heuristic.origin, SemanticEntityOrigin::Heuristic);
+        let round_trip = SemanticEntityRef::new(ws, path.clone(), id.clone());
+        let decoded: SemanticEntityRef =
+            serde_json::from_str(&serde_json::to_string(&round_trip).unwrap()).unwrap();
+        assert_eq!(decoded.origin, SemanticEntityOrigin::Provider);
+        assert_eq!(round_trip.origin, SemanticEntityOrigin::Provider);
+
+        let envelope = SemanticEnvelope::new(
+            SemanticProviderId::parse("tangerine").unwrap(),
+            7,
+            ws,
+            SemanticSnapshotId::from_file_hash(FileHash::from([4u8; 32])),
+            1,
+            SemanticContextPack {
+                items: vec![SemanticContextItem {
+                    entity: heuristic,
+                    relevance_bps: 100,
+                    excerpt: "x".into(),
+                }],
+                truncated: false,
+                total_bytes: 1,
+                degraded: false,
+            },
+        );
+        let expectation = SemanticExpectation::new(ws, envelope.snapshot_id);
+        match envelope.validate(&expectation, &SemanticResponseCaps::default()) {
+            Err(SemanticError::InvalidEntityRef(detail)) => {
+                assert!(detail.contains("heuristic"), "{detail}");
+            }
+            other => panic!("expected InvalidEntityRef, got {other:?}"),
+        }
     }
 }
