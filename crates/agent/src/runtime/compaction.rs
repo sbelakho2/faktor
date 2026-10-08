@@ -68,7 +68,15 @@ pub(crate) async fn semantic_turn_consult(
         return Some(SemanticTurnState::unknown(provider_id.to_string()));
     };
     let workspace = row.workspace_id;
-    let revision = format!("session:{}", handle.id().raw());
+    // The live revision is the workspace CONTENT identity (audit
+    // P1-SEMANTIC), resolved through the session's shadow-aware root — the
+    // session id is an internal handle with no relation to program content.
+    let workspace_root = deps
+        .session
+        .resolve_workspace_root(handle.id())
+        .ok()
+        .flatten();
+    let revision = crate::semantic_tool::semantic_source_revision(workspace_root.as_deref());
     let snapshot_id = SemanticSnapshotId::derive(
         workspace,
         &revision,
@@ -103,7 +111,11 @@ pub(crate) async fn semantic_turn_consult(
         workspace,
         deps.clock.now_ms(),
         cancel.child(),
-    );
+    )
+    // The view identity above was derived from THIS provider (audit
+    // P1-SEMANTIC): pin dispatch so a fail-over provider can never answer a
+    // request whose identity describes the selected one.
+    .pinned_to(provider_id.clone());
     let request = AffectedRequest {
         call,
         workspace,

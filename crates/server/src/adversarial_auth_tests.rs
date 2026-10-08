@@ -542,6 +542,173 @@ async fn every_route_class_rejects_missing_and_malformed_credentials() {
     wait_until_server_dead(&handle).await;
 }
 
+/// Every route the PRODUCTION sources register (`api/lifecycle.rs` +
+/// `worker_plane.rs`), with EVERY method of a chain. Parsed from the same
+/// files the runtime compiles, so a newly added route method cannot hide
+/// behind a hand-maintained list.
+fn registered_route_classes() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for source in [
+        include_str!("api/lifecycle.rs"),
+        include_str!("worker_plane.rs"),
+    ] {
+        for (path, methods) in parse_route_registrations(source) {
+            for method in methods {
+                out.push((method, path.clone()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Parse `.route("<path>", <method>(handler)[.<method>(handler)]*)` pairs.
+/// Quoted strings are skipped while balancing parentheses; path parameters
+/// are instantiated as `1` so the real served router matches the route.
+fn parse_route_registrations(source: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(at) = source[search..].find(".route") {
+        let start = search + at;
+        search = start + ".route".len();
+        let Some(open_rel) = source[search..].find('(') else {
+            break;
+        };
+        let open = search + open_rel;
+        let Some(body) = balanced_body(source, open) else {
+            continue;
+        };
+        let Some(path) = first_quoted(body) else {
+            continue;
+        };
+        let methods = ["get", "post", "put", "patch", "delete"]
+            .into_iter()
+            .filter(|name| {
+                let needle = format!("{name}(");
+                body.match_indices(&needle).any(|(idx, _)| {
+                    idx == 0
+                        || (!body.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                            && body.as_bytes()[idx - 1] != b'_')
+                })
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        out.push((instantiate_route_path(&path), methods));
+    }
+    out
+}
+
+fn balanced_body(source: &str, open: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, byte) in bytes.iter().enumerate().skip(open) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[open + 1..idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn first_quoted(body: &str) -> Option<String> {
+    let start = body.find('"')? + 1;
+    let end = body[start..].find('"')? + start;
+    Some(body[start..end].to_string())
+}
+
+fn instantiate_route_path(path: &str) -> String {
+    let mut out = String::new();
+    let mut in_param = false;
+    for ch in path.chars() {
+        match ch {
+            '{' => in_param = true,
+            '}' if in_param => {
+                in_param = false;
+                out.push('1');
+            }
+            _ if !in_param => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// P1-PROOF: the route contract is BEHAVIORAL, not a string comparison.
+/// Every registered route method of the production router sources is driven
+/// over a real served socket with no credentials and must be refused by the
+/// auth layer (the webhook is signature-authenticated and refuses typed as
+/// disabled). A route added without auth fails this test.
+#[tokio::test]
+async fn every_registered_route_rejects_missing_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let deps = Arc::new(test_deps(dir.path()));
+    let handle = serve_arc(deps, 0).await.unwrap();
+    let base = format!("http://{}", handle.addr);
+    let client = reqwest::Client::new();
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for (method, path) in registered_route_classes() {
+        let url = format!("{base}{path}");
+        let request = match method.as_str() {
+            "get" => client.get(url.clone()),
+            "delete" => client.delete(url.clone()),
+            "post" => client.post(url.clone()).json(&serde_json::json!({})),
+            "put" => client.put(url.clone()).json(&serde_json::json!({})),
+            "patch" => client.patch(url.clone()).json(&serde_json::json!({})),
+            _ => continue,
+        };
+        let status = request.send().await.unwrap().status().as_u16();
+        checked += 1;
+        // The worker plane is registration-token authenticated with a strict
+        // DTO: an anonymous, shape-less call is refused typed (400/409)
+        // before or at the token check — NEVER 2xx. The SCM webhook is
+        // signature-authenticated and typed 409 while unwired.
+        let expected: &[u16] = if path == "/native/scm/webhook" {
+            &[409]
+        } else if path.starts_with("/native/workers/") || path.starts_with("/native/jobs/") {
+            &[400, 401, 403, 409]
+        } else {
+            &[401]
+        };
+        if !expected.contains(&status) {
+            failures.push(format!("{method} {path}: {status} (want {expected:?})"));
+        }
+    }
+    assert!(
+        checked >= 80,
+        "the router sources must yield the full route surface, saw {checked}"
+    );
+    assert!(
+        failures.is_empty(),
+        "unauthenticated route methods must be refused: {failures:?}"
+    );
+    handle.request_shutdown();
+    wait_until_server_dead(&handle).await;
+}
+
 #[tokio::test]
 async fn all_three_credential_forms_authenticate_every_route_class() {
     let dir = tempfile::tempdir().unwrap();

@@ -217,12 +217,11 @@ impl SemanticProviderRegistry {
             {
                 return SemanticOperationStatus {
                     available: true,
-                    fidelity: descriptor
-                        .fidelity
-                        .unwrap_or(SemanticFidelity::CompilerExact),
+                    // Absent declarations are UNTRUSTED (audit P1-SEMANTIC).
+                    fidelity: descriptor.fidelity.unwrap_or(SemanticFidelity::None),
                     completeness: descriptor
                         .completeness
-                        .unwrap_or(SemanticCompleteness::ConservativeComplete),
+                        .unwrap_or(SemanticCompleteness::Unknown),
                     source: provider.id().as_str().to_string(),
                 };
             }
@@ -236,6 +235,21 @@ impl SemanticProviderRegistry {
     /// semantic service could answer it.
     pub fn has_external_provider(&self) -> bool {
         !self.providers.is_empty()
+    }
+
+    /// TRUE when at least one registered EXTERNAL provider currently stands
+    /// behind a VALIDATED descriptor covering `op` (audit P1-UX): model
+    /// surfaces are advertised on real readiness, never on registration
+    /// alone — a provider that cannot serve the surface must not cause it to
+    /// appear. In-process providers validate immediately; an external
+    /// provider counts only after its handshake.
+    pub fn has_external_provider_for(&self, op: SemanticOp) -> bool {
+        let required = SemanticCapabilities::for_op(op);
+        self.providers.iter().any(|provider| {
+            provider
+                .validated_descriptor()
+                .is_some_and(|descriptor| descriptor.covers_validated(required))
+        })
     }
 
     pub fn providers(&self) -> &[Arc<dyn SemanticProvider>] {
@@ -384,10 +398,19 @@ impl SemanticProviderRegistry {
         &self,
         required: &SemanticCapabilities,
         op: SemanticOp,
+        call: &SemanticCall,
     ) -> Vec<Arc<dyn SemanticProvider>> {
         let now = self.clock.now_ms();
         let mut candidates = Vec::new();
         for (index, provider) in self.providers.iter().enumerate() {
+            // A pinned call is served ONLY by the pinned provider (audit
+            // P1-SEMANTIC): identity derived from that provider must never be
+            // answered by a fail-over substitute.
+            if let Some(pin) = &call.provider_pin {
+                if provider.id() != *pin {
+                    continue;
+                }
+            }
             let Some(descriptor) = self.cached_descriptor(index) else {
                 continue;
             };
@@ -428,7 +451,7 @@ impl SemanticProviderRegistry {
         {
             return DispatchOutcome::CallerTerminal(err);
         }
-        let candidates = self.compatible(&required, op);
+        let candidates = self.compatible(&required, op, call);
         if candidates.is_empty() {
             return DispatchOutcome::NoCandidate;
         }
@@ -1114,10 +1137,11 @@ mod tests {
         );
     }
 
-    /// A REGISTERED provider's status is compiler-exact by contract unless
-    /// its descriptor declares otherwise, and a declared fidelity overrides.
+    /// P1-SEMANTIC: an ABSENT fidelity/completeness declaration is UNTRUSTED
+    /// (`None`/`Unknown`) — trust is claimed explicitly, never inherited
+    /// from silence — and a declared level is reported verbatim.
     #[test]
-    fn provider_status_reports_declared_or_contract_fidelity() {
+    fn provider_status_reports_declared_or_untrusted_fidelity() {
         let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
         let provider = Arc::new(ScriptedProvider::new(
             "fidelity-probe",
@@ -1133,12 +1157,35 @@ mod tests {
         .is_ok());
         let status = registry.operation_status(SemanticOp::Context);
         assert!(status.available);
+        assert_eq!(status.fidelity, SemanticFidelity::None);
+        assert_eq!(status.completeness, SemanticCompleteness::Unknown);
+        assert_eq!(status.source, "fidelity-probe");
+
+        // A declared level is reported as declared.
+        let mut declared = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        declared.register(Arc::new(
+            ScriptedProvider::new(
+                "declared-probe",
+                SemanticCapabilities::CONTEXT,
+                ScriptedBehavior::Ready,
+            )
+            .declaring(
+                SemanticFidelity::CompilerExact,
+                SemanticCompleteness::ConservativeComplete,
+            ),
+        ));
+        assert!(block_on(declared.fetch_descriptors(
+            SemanticOp::Context,
+            &CancellationToken::new(),
+            None
+        ))
+        .is_ok());
+        let status = declared.operation_status(SemanticOp::Context);
         assert_eq!(status.fidelity, SemanticFidelity::CompilerExact);
         assert_eq!(
             status.completeness,
             SemanticCompleteness::ConservativeComplete
         );
-        assert_eq!(status.source, "fidelity-probe");
     }
 
     /// Tangerine-2 production wiring: the registry dispatch path ITSELF
@@ -1172,6 +1219,45 @@ mod tests {
         }
     }
 
+    /// P1-SEMANTIC: a PINNED call is served only by the pinned provider — a
+    /// healthy fail-over candidate must never answer a call whose identity
+    /// (snapshot/view) was derived from the selected provider.
+    #[test]
+    fn pinned_call_never_fails_over() {
+        let pinned = Arc::new(ScriptedProvider::new(
+            "pinned",
+            SemanticCapabilities::AFFECTED,
+            ScriptedBehavior::Refused,
+        ));
+        let healthy = Arc::new(ScriptedProvider::new(
+            "healthy",
+            SemanticCapabilities::AFFECTED,
+            ScriptedBehavior::Ready,
+        ));
+        let registry = registry_with(
+            Arc::new(TestClock::new(1_000)),
+            vec![pinned.clone(), healthy.clone()],
+        );
+        let workspace = WorkspaceId::new(1);
+        let mut call = call();
+        call.require_provider = true;
+        call.provider_pin = Some(provider_id("pinned"));
+        let err = block_on(registry.affected(AffectedRequest {
+            call,
+            workspace,
+            snapshot_id: snapshot(workspace, "rev-1"),
+            changed: vec![entity("src/a.rs", "a")],
+            max_depth: 1,
+        }))
+        .expect_err("the pinned provider failing must not fail over");
+        assert!(matches!(err, SemanticError::Refused(_)), "{err:?}");
+        assert_eq!(
+            healthy.calls.load(Ordering::SeqCst),
+            0,
+            "the fail-over candidate must never be invoked for a pinned call"
+        );
+    }
+
     // ------------------------------------------------------------------
     // multi-provider failover + capability truth (audit 48-54/58/59)
     // ------------------------------------------------------------------
@@ -1199,6 +1285,8 @@ mod tests {
         Deadline,
         /// Handshake refuses a schema this build does not speak.
         HandshakeRefused,
+        /// Data operations refuse recoverably.
+        Refused,
         /// An affected response whose entity refs are Faktor-HEURISTIC
         /// (path-derived): provider responses must never present them
         /// (audit Tangerine-2).
@@ -1213,6 +1301,8 @@ mod tests {
         handshakes: Arc<AtomicUsize>,
         clock: Option<Arc<TestClock>>,
         advance_ms: i64,
+        fidelity_declared: Option<SemanticFidelity>,
+        completeness_declared: Option<SemanticCompleteness>,
     }
 
     impl ScriptedProvider {
@@ -1225,11 +1315,23 @@ mod tests {
                 handshakes: Arc::new(AtomicUsize::new(0)),
                 clock: None,
                 advance_ms: 0,
+                fidelity_declared: None,
+                completeness_declared: None,
             }
         }
 
         fn ready(id: &str, caps: SemanticCapabilities) -> Self {
             Self::new(id, caps, ScriptedBehavior::Ready)
+        }
+
+        fn declaring(
+            mut self,
+            fidelity: SemanticFidelity,
+            completeness: SemanticCompleteness,
+        ) -> Self {
+            self.fidelity_declared = Some(fidelity);
+            self.completeness_declared = Some(completeness);
+            self
         }
 
         fn advancing(mut self, clock: Arc<TestClock>, advance_ms: i64) -> Self {
@@ -1278,6 +1380,18 @@ mod tests {
             self.caps
         }
 
+        fn descriptor(&self) -> SemanticProviderDescriptor {
+            let mut descriptor = SemanticProviderDescriptor::new(
+                self.id.clone(),
+                1,
+                SEMANTIC_SCHEMA_VERSION,
+                self.caps,
+            );
+            descriptor.fidelity = self.fidelity_declared;
+            descriptor.completeness = self.completeness_declared;
+            descriptor
+        }
+
         fn validated_descriptor(&self) -> Option<SemanticProviderDescriptor> {
             if matches!(self.behavior, ScriptedBehavior::HandshakeRefused) {
                 return None;
@@ -1300,8 +1414,13 @@ mod tests {
                         got: SEMANTIC_SCHEMA_VERSION + 1,
                     });
                 }
-                let descriptor =
-                    SemanticProviderDescriptor::new(id, 1, SEMANTIC_SCHEMA_VERSION, self.caps);
+                let descriptor = self.descriptor();
+                if descriptor.id != id {
+                    return Err(SemanticError::ProviderMismatch {
+                        expected: id,
+                        actual: descriptor.id,
+                    });
+                }
                 descriptor.validate()?;
                 Ok(descriptor)
             })
@@ -1317,6 +1436,18 @@ mod tests {
             let behavior = self.behavior.clone();
             Box::pin(async move {
                 match behavior {
+                    ScriptedBehavior::Ready => Ok(SemanticEnvelope::new(
+                        id,
+                        1,
+                        workspace,
+                        snapshot_id,
+                        7,
+                        AffectedSet {
+                            affected: vec![],
+                            tests: vec![],
+                            degraded: false,
+                        },
+                    )),
                     ScriptedBehavior::HeuristicRefs => {
                         let payload = AffectedSet {
                             affected: vec![SemanticEntityRef::heuristic(
@@ -1336,6 +1467,9 @@ mod tests {
                             payload,
                         ))
                     }
+                    ScriptedBehavior::Refused => Err(SemanticError::Refused(
+                        "scripted provider refused".to_string(),
+                    )),
                     _ => Err(SemanticError::Refused(
                         "scripted provider is not scripted for affected".to_string(),
                     )),
@@ -1398,6 +1532,9 @@ mod tests {
                     ScriptedBehavior::HeuristicRefs => {
                         unreachable!("affected-only script")
                     }
+                    ScriptedBehavior::Refused => Err(SemanticError::Refused(
+                        "scripted provider refused".to_string(),
+                    )),
                 }
             })
         }

@@ -1,0 +1,9 @@
+{
+  "id": "INV-NETWORK-POLICY-STRICT",
+  "file": "crates/core/src/capability.rs",
+  "find": "            NetworkPolicy::AllowProviders { endpoints } => endpoints\n                .iter()\n                .any(|rule| authority_allows(rule, destination)),",
+  "replace": "            NetworkPolicy::AllowProviders { endpoints } => endpoints\n                .iter()\n                .any(|rule| destination.starts_with(rule)),",
+  "gate": "cargo test -p faktor-core --lib network_policy_matrix",
+  "expect": "FAILED",
+  "note": "Restoring prefix matching admits attacker-controlled hostname continuations (api.example.com.evil)."
+}

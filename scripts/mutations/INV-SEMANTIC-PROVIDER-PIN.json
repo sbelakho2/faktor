@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-PROVIDER-PIN",
+  "file": "crates/semantic/src/registry.rs",
+  "find": "            if let Some(pin) = &call.provider_pin {\n                if provider.id() != *pin {\n                    continue;\n                }\n            }",
+  "replace": "            if let Some(pin) = &call.provider_pin {\n                let _ = pin;\n            }",
+  "gate": "cargo test -p faktor-semantic --lib pinned_call_never_fails_over",
+  "expect": "FAILED",
+  "note": "Dropping the pin lets a fail-over provider answer a call whose snapshot identity was derived from the selected provider."
+}

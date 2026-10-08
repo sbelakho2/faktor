@@ -251,11 +251,24 @@ pub(crate) fn review_fetch_changed_files(
     ws: &faktor_fs::WorkspaceHandle,
     changed: &[String],
 ) -> (Vec<ReviewFetchedFile>, Option<String>) {
-    let rows = deps
-        .snapshots
-        .as_ref()
-        .and_then(|s| s.checkpoints(handle.id()).ok())
-        .unwrap_or_default();
+    // P2-VERIFY: a checkpoint-store READ FAILURE refuses the review (the
+    // diff base would silently degrade to "before unknown"); only an absent
+    // store is the legitimate empty case.
+    let rows = match deps.snapshots.as_ref() {
+        None => Vec::new(),
+        Some(snapshots) => match snapshots.checkpoints(handle.id()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "checkpoint rows of session {} are unreadable ({e}); the review diff base cannot be established",
+                        handle.id()
+                    )),
+                )
+            }
+        },
+    };
     let cas = deps.cas.as_ref();
     let mut out: Vec<ReviewFetchedFile> = Vec::new();
     for path in changed
@@ -2243,10 +2256,12 @@ impl AgentRuntime {
             .open_ephemeral(root.to_path_buf())
             .map_err(|e| format!("integration root could not be opened: {e}"))?;
         let candidate_snapshot = root_snapshot_best_effort(&ws);
+        // P2-VERIFY: the goal is an INPUT of the review/verification; an
+        // unreadable task row must refuse the verification, never feed an
+        // empty goal into a passing verdict.
         let goal = handle
             .get_task(row.task_id)
-            .ok()
-            .flatten()
+            .map_err(|e| format!("task row of the integrated root is unreadable: {e}"))?
             .map(|t| t.goal)
             .unwrap_or_default();
         // An EMPTY aggregate change set derives no checks: the ONLY objective
@@ -2488,10 +2503,11 @@ impl AgentRuntime {
             .open(row.workspace_id, root.to_path_buf())
             .map_err(|e| format!("integration root could not be opened: {e}"))?;
         let candidate_snapshot = root_snapshot_best_effort(&ws);
+        // P2-VERIFY: same rule as the fresh path — the task row is a review
+        // input, and a read failure refuses the attempt.
         let goal = handle
             .get_task(task_id)
-            .ok()
-            .flatten()
+            .map_err(|e| format!("task row of the integrated root is unreadable: {e}"))?
             .map(|t| t.goal)
             .unwrap_or_default();
         if changed.is_empty() {
@@ -3359,18 +3375,16 @@ impl AgentRuntime {
         // candidate snapshot, integration sources, changed files, ordered
         // checks, verifier/tool versions, env projection, instruction epoch,
         // criteria ids+bindings, reviewer/evidence digests).
-        let integration = handle
-            .ledger_integration_record_for_task(task_id.raw())
-            .ok()
-            .flatten();
+        // P2-VERIFY: these reads feed the proof-basis digest that authorizes
+        // REUSE. A store failure must refuse the basis (never silently fold
+        // in an empty integration/criteria set and then reuse a weaker key).
+        let integration = handle.ledger_integration_record_for_task(task_id.raw())?;
         let candidate_snapshot = workspace
             .map(root_snapshot_best_effort)
             .unwrap_or_else(|| "snapshot-unavailable".into());
         let changed_files_digest = changed_files_fold(changed_files);
         let criteria: Vec<ProofBasisCriterion> = handle
-            .get_task(task_id)
-            .ok()
-            .flatten()
+            .get_task(task_id)?
             .map(|task| task.criteria())
             .unwrap_or_default()
             .into_iter()
@@ -3468,13 +3482,14 @@ impl AgentRuntime {
         gate: Option<CompletionGate>,
     ) -> faktor_core::Result<Option<CompletionGate>> {
         let _ = ledger;
-        let fact = handle.memory_facts().ok().and_then(|facts| {
-            facts
-                .iter()
-                .find(|(k, key, _)| k == "criteria" && key == "0")
-                .map(|(_, _, v)| v.clone())
-        });
-        let row = self.session_task(handle);
+        // P2-VERIFY: both reads gate a completion claim; a store failure is
+        // a typed refusal, never "the row was not seeded yet".
+        let fact = handle
+            .memory_facts()?
+            .into_iter()
+            .find(|(k, key, _)| k == "criteria" && key == "0")
+            .map(|(_, _, v)| v);
+        let row = self.session_task(handle)?;
         let row_criteria = row.map(|t| t.acceptance_criteria).unwrap_or_default();
         let (Some(fact), false) = (fact, row_criteria.is_empty()) else {
             // One side not yet seeded is the ordinary pre-derivation state

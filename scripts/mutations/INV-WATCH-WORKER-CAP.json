@@ -1,0 +1,9 @@
+{
+  "id": "INV-WATCH-WORKER-CAP",
+  "file": "crates/fs/src/workspace_service.rs",
+  "find": "        let workers =\n            WATCH_REGISTRATION_WORKER_GENERATIONS.load(std::sync::atomic::Ordering::SeqCst);\n        if overdue && workers < MAX_WATCH_WORKERS {",
+  "replace": "        let workers = 1usize;\n        if overdue && workers < MAX_WATCH_WORKERS {",
+  "gate": "cargo test -p faktor-fs --lib a_wedged_registration_never_starves_later_workspaces",
+  "expect": "FAILED",
+  "note": "Hardcoding one generation in the cap accounting (the retired production bug) lets every overdue registration leak another blocked worker thread."
+}

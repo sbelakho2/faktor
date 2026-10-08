@@ -3639,4 +3639,32 @@ mod tests {
         crate::workspace_service::set_watch_worker_overdue_for_test(0);
         crate::workspace_service::reset_watch_worker_for_test();
     }
+
+    /// P2-FS: the anchored root identity proves the pathname the watcher
+    /// backend re-resolves still names the preflighted directory; a root
+    /// swapped for a different directory is detected instead of silently
+    /// watched.
+    #[cfg(unix)]
+    #[test]
+    fn anchored_root_identity_detects_a_swapped_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        let rooted = RootedDir::open(&root).unwrap();
+        let anchored = rooted.anchored_identity().expect("unix identity");
+        assert_eq!(
+            anchored,
+            crate::rooted::path_identity_no_follow(&root).unwrap()
+        );
+        // The path is swapped for a DIFFERENT directory: the anchored fd
+        // still names the original, so the comparison refuses.
+        std::fs::rename(&root, dir.path().join("root-old")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert_ne!(
+            anchored,
+            crate::rooted::path_identity_no_follow(&root).unwrap(),
+            "the swapped path must not compare equal to the anchored root"
+        );
+    }
 }

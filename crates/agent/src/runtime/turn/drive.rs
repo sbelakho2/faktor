@@ -2732,7 +2732,7 @@ impl AgentRuntime {
             appended = true;
         }
         if view.head.criteria.is_empty() {
-            if let Some(task) = self.session_task(handle) {
+            if let Some(task) = self.session_task(handle)? {
                 if !task.acceptance_criteria.is_empty() {
                     let canonical = criteria_canonical_text(&task.acceptance_criteria);
                     if handle

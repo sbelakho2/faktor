@@ -782,7 +782,7 @@ impl AgentRuntime {
                     session = %handle.id(),
                     "task ledger unreadable while rebuilding verification results; deriving criteria from the durable task row: {e}"
                 );
-                self.session_task(handle)
+                self.session_task_best_effort(handle)
                     .map(|task| task.goal)
                     .unwrap_or_default()
             }
@@ -993,7 +993,7 @@ impl AgentRuntime {
                 );
             }
         }
-        if let Some(task) = self.session_task(handle) {
+        if let Some(task) = self.session_task_best_effort(handle) {
             if ledger.goal.is_empty() {
                 ledger.goal = truncate(&task.goal, 4096);
             }
@@ -1019,17 +1019,42 @@ impl AgentRuntime {
     /// The session's CURRENT durable task row: the row whose `task_id`
     /// equals the session's adopted task identity when present, otherwise
     /// the oldest row (a session that adopted no worktree identity keeps
-    /// task id 1 and one row).
-    pub(crate) fn session_task(&self, handle: &faktor_session::SessionHandle) -> Option<Task> {
-        let mut tasks = handle.list_tasks().unwrap_or_default();
+    /// task id 1 and one row). FALLIBLE (audit P2-VERIFY): a store read
+    /// failure is never collapsed into "no task row" — callers that gate on
+    /// the row must refuse, not proceed as if the row were absent.
+    pub(crate) fn session_task(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<Option<Task>> {
+        let mut tasks = handle.list_tasks()?;
         if tasks.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let preferred = handle.task_id().ok();
-        if let Some(pos) = tasks.iter().position(|t| Some(t.task_id) == preferred) {
-            return Some(tasks.remove(pos));
+        let preferred = handle.task_id()?;
+        if let Some(pos) = tasks.iter().position(|t| t.task_id == preferred) {
+            return Ok(Some(tasks.remove(pos)));
         }
-        Some(tasks.remove(0))
+        Ok(Some(tasks.remove(0)))
+    }
+
+    /// Best-effort variant for INFALLIBLE rebuild/verdict paths whose
+    /// contract is to degrade loudly instead of aborting: a read failure
+    /// logs and yields `None`. NEVER used for a gate decision.
+    pub(crate) fn session_task_best_effort(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Option<Task> {
+        match self.session_task(handle) {
+            Ok(task) => task,
+            Err(e) => {
+                tracing::warn!(
+                    session = %handle.id(),
+                    error = %e,
+                    "task row read failed on an infallible rebuild path; continuing without it (never a gate decision)"
+                );
+                None
+            }
+        }
     }
 
     /// Drive-start Task integration (audit 25): restore the typed row into
@@ -1042,7 +1067,7 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         ledger: &TaskLedger,
     ) -> faktor_core::Result<()> {
-        let task = match self.session_task(handle) {
+        let task = match self.session_task(handle)? {
             Some(t) => t,
             None => {
                 // First sighting: create from the durable goal so every
@@ -1160,7 +1185,7 @@ impl AgentRuntime {
         ledger: &TaskLedger,
         criteria: Option<&[String]>,
     ) -> faktor_core::Result<Option<Task>> {
-        let mut task = match self.session_task(handle) {
+        let mut task = match self.session_task(handle)? {
             Some(t) => t,
             None => {
                 let task_id = handle.task_id()?;
@@ -1326,7 +1351,7 @@ impl AgentRuntime {
         let Some(gate) = gate else {
             return Ok(None); // no completion claim this turn: nothing to drive
         };
-        let Some(task) = self.session_task(handle) else {
+        let Some(task) = self.session_task(handle)? else {
             return Ok(None); // no row (content sync created none): nothing to drive
         };
         let task_id = task.task_id;

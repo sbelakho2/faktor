@@ -651,21 +651,38 @@ impl TaskExecutor {
                 // durable tool ledger still says `applied`, so discarding the
                 // shadow silently destroyed them (a later doctor showed a
                 // clean tree). Retain and surface a typed obligation.
-                let unintegrated = handle
-                    .memory_facts()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|(kind, key, _)| kind == "verification" && key.contains("root:"))
-                    .any(|(_, _, value)| {
-                        serde_json::from_str::<serde_json::Value>(value.as_str())
-                            .ok()
-                            .and_then(|v| {
-                                v.get("changed")
-                                    .and_then(|c| c.as_array())
-                                    .map(|a| !a.is_empty())
-                            })
-                            .unwrap_or(false)
-                    });
+                // P2-VERIFY: this read gates a DISCARD. A store failure or a
+                // corrupt observation row is a typed refusal — never "no
+                // unintegrated changes" (which silently destroyed applied
+                // writes).
+                let facts = handle.memory_facts().map_err(|e| {
+                    ExecError::from(classify_session_read(
+                        "memory facts of the interrupted shadow run",
+                        e,
+                    ))
+                })?;
+                let mut unintegrated = false;
+                for (kind, key, value) in &facts {
+                    if kind != "verification" || !key.contains("root:") {
+                        continue;
+                    }
+                    let parsed =
+                        serde_json::from_str::<serde_json::Value>(value).map_err(|e| {
+                            ExecError::Malformed(format!(
+                                "verification observation {kind}/{key} of shadow {} is undecodable ({e}); refusing to discard the shadow",
+                                row.shadow_id
+                            ))
+                        })?;
+                    let changed = parsed
+                        .get("changed")
+                        .and_then(|c| c.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false);
+                    if changed {
+                        unintegrated = true;
+                        break;
+                    }
+                }
                 if unintegrated {
                     return Err(ExecError::Conflict(format!(
                         "session {parent} carries applied-but-unintegrated changes in shadow {}; re-run settlement or explicitly discard the shadow before a new run",

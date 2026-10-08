@@ -1,7 +1,7 @@
 {
   "id": "INV-SEMANTIC-QUERY-REAL-TOOL",
   "file": "crates/agent/src/runtime/tool_loop.rs",
-  "find": "                None if name == crate::tool::SEMANTIC_QUERY_TOOL\n                    && self.deps.semantic.has_external_provider() =>\n                {\n                    crate::semantic_tool::tool(self.deps.semantic.clone())\n                }",
+  "find": "                None if name == crate::tool::SEMANTIC_QUERY_TOOL\n                    && self\n                        .deps\n                        .semantic\n                        .has_external_provider_for(SemanticOp::Context) =>\n                {\n                    crate::semantic_tool::tool(self.deps.semantic.clone())\n                }",
   "replace": "                None if false => {\n                    crate::semantic_tool::tool(self.deps.semantic.clone())\n                }",
   "gate": "cargo test -p faktor-agent --lib a_model_semantic_query_call_executes_against_the_registered_provider",
   "expect": "FAILED",

@@ -1,0 +1,9 @@
+{
+  "id": "INV-NATIVE-ROUTE-BEHAVIOR",
+  "file": "crates/server/src/native/mod.rs",
+  "find": "    if check_password(password, authorization, x_faktor_server_password)\n        || check_bearer(&state.deps.auth_token, authorization)\n    {",
+  "replace": "    if true {\n",
+  "gate": "cargo test -p faktor-server --lib every_registered_route_rejects_missing_credentials",
+  "expect": "FAILED",
+  "note": "Disabling the shared auth gate lets unauthenticated calls reach every registered route method; the source-parsed behavioral route test must fail."
+}

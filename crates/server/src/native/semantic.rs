@@ -18,7 +18,9 @@
 
 use faktor_semantic::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
 use faktor_semantic::registry::{fallback_operation_status, SemanticProviderRegistry};
-use faktor_semantic::types::{SemanticCapabilities, SemanticOp, SemanticProvider};
+use faktor_semantic::types::{
+    SemanticCapabilities, SemanticCompleteness, SemanticFidelity, SemanticOp, SemanticProvider,
+};
 
 use super::*;
 
@@ -39,13 +41,31 @@ fn capabilities_json(caps: SemanticCapabilities) -> serde_json::Value {
 }
 
 /// One provider's public introspection shape. Deliberately narrow: id +
-/// version + capabilities, nothing else.
+/// version + declared truth, nothing else. A provider with no VALIDATED
+/// descriptor reports NO capabilities (audit P1-OBS): selection never trusts
+/// an unvalidated claim, and neither may this surface — the claim would be
+/// indistinguishable from readiness.
 fn provider_json(provider: &dyn SemanticProvider) -> serde_json::Value {
-    serde_json::json!({
-        "id": provider.id().as_str(),
-        "version": provider.version(),
-        "capabilities": capabilities_json(provider.capabilities()),
-    })
+    match provider.validated_descriptor() {
+        Some(descriptor) => serde_json::json!({
+            "id": descriptor.id.as_str(),
+            "version": descriptor.version,
+            "validated": true,
+            "fidelity": descriptor.fidelity.unwrap_or(SemanticFidelity::None),
+            "completeness": descriptor
+                .completeness
+                .unwrap_or(SemanticCompleteness::Unknown),
+            "capabilities": capabilities_json(descriptor.capabilities),
+        }),
+        None => serde_json::json!({
+            "id": provider.id().as_str(),
+            "version": provider.version(),
+            "validated": false,
+            "fidelity": SemanticFidelity::None,
+            "completeness": SemanticCompleteness::Unknown,
+            "capabilities": capabilities_json(SemanticCapabilities::NONE),
+        }),
+    }
 }
 
 /// The fallback shape WITHOUT constructing a registry: the generic
@@ -73,12 +93,17 @@ fn status_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // VALIDATED descriptors only (audit P1-OBS): an unvalidated claim never
+    // appears as snapshot readiness.
     let snapshot_providers = registry
         .map(|registry| {
             registry
                 .providers()
                 .iter()
-                .filter(|p| p.capabilities().supports(SemanticOp::Snapshot))
+                .filter(|p| {
+                    p.validated_descriptor()
+                        .is_some_and(|d| d.capabilities.supports(SemanticOp::Snapshot))
+                })
                 .map(|p| p.id().as_str().to_string())
                 .collect::<Vec<_>>()
         })
@@ -155,14 +180,23 @@ fn capabilities_report_json(registry: Option<&SemanticProviderRegistry>) -> serd
     let fallback_caps = registry
         .map(|registry| registry.fallback().capabilities())
         .unwrap_or_else(|| GenericSemanticFallback::default().capabilities());
+    // VALIDATED descriptors only (audit P1-OBS): the union reports what the
+    // registry can actually select, never a provider's unvalidated claim.
+    let validated_caps = |registry: &SemanticProviderRegistry| {
+        registry
+            .providers()
+            .iter()
+            .filter_map(|p| p.validated_descriptor())
+            .map(|d| d.capabilities)
+            .collect::<Vec<_>>()
+    };
     let mut union = serde_json::Map::new();
     for op in SemanticOp::ALL {
         let supported = registry
             .map(|registry| {
-                registry
-                    .providers()
+                validated_caps(registry)
                     .iter()
-                    .any(|p| p.capabilities().supports(op))
+                    .any(|caps| caps.supports(op))
             })
             .unwrap_or(false)
             || fallback_caps.supports(op);
@@ -170,19 +204,17 @@ fn capabilities_report_json(registry: Option<&SemanticProviderRegistry>) -> serd
     }
     let compose_delta = registry
         .map(|registry| {
-            registry
-                .providers()
+            validated_caps(registry)
                 .iter()
-                .any(|p| p.capabilities().compose_delta)
+                .any(|caps| caps.compose_delta)
         })
         .unwrap_or(false)
         || fallback_caps.compose_delta;
     let constrained_edit = registry
         .map(|registry| {
-            registry
-                .providers()
+            validated_caps(registry)
                 .iter()
-                .any(|p| p.capabilities().constrained_edit)
+                .any(|caps| caps.constrained_edit)
         })
         .unwrap_or(false)
         || fallback_caps.constrained_edit;
@@ -272,6 +304,31 @@ mod tests {
         registry
     }
 
+    /// A provider that CLAIMS every capability but has no validated
+    /// descriptor (audit P1-OBS): the introspection surfaces must report the
+    /// claim as untrusted, never repeat it.
+    struct UnvalidatedClaimProvider;
+
+    impl SemanticProvider for UnvalidatedClaimProvider {
+        fn id(&self) -> SemanticProviderId {
+            SemanticProviderId::parse("lying.provider").unwrap()
+        }
+
+        fn version(&self) -> u32 {
+            9
+        }
+
+        fn capabilities(&self) -> SemanticCapabilities {
+            SemanticCapabilities::ALL
+        }
+
+        fn validated_descriptor(
+            &self,
+        ) -> Option<faktor_semantic::types::SemanticProviderDescriptor> {
+            None
+        }
+    }
+
     #[test]
     fn status_serves_exactly_the_wired_registry() {
         // A registry view passed in IS the served one: every provider of the
@@ -316,6 +373,45 @@ mod tests {
         let caps = capabilities_report_json(None);
         assert_eq!(caps["configured"], false);
         assert_eq!(caps["union"]["operations"]["explain"], true);
+    }
+
+    /// P1-OBS: an unvalidated provider's capability CLAIM never reaches the
+    /// status or capability surfaces; only validated truth drives them.
+    #[test]
+    fn unvalidated_provider_claims_never_reach_the_status_surfaces() {
+        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        registry.register(Arc::new(UnvalidatedClaimProvider));
+        let body = status_json(Some(&registry));
+        assert_eq!(body["providerCount"], 1);
+        assert_eq!(body["providers"][0]["validated"], false);
+        assert_eq!(
+            body["providers"][0]["capabilities"]["operations"]["context"],
+            false
+        );
+        assert_eq!(
+            body["providers"][0]["capabilities"]["operations"]["snapshot"],
+            false
+        );
+        assert!(
+            body["snapshotState"]["providers"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an unvalidated snapshot claim is not readiness"
+        );
+        assert_eq!(body["operations"]["snapshot"]["available"], false);
+        assert_eq!(
+            body["operations"]["snapshot"]["source"],
+            GENERIC_FALLBACK_ID
+        );
+        let caps = capabilities_report_json(Some(&registry));
+        assert_eq!(caps["union"]["operations"]["snapshot"], false);
+        assert_eq!(caps["union"]["composeDelta"], false);
+        assert_eq!(caps["union"]["constrainedEdit"], false);
+        assert_eq!(
+            caps["union"]["operations"]["context"], true,
+            "the fallback's truthful context service remains in the union"
+        );
     }
 
     #[test]

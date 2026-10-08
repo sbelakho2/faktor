@@ -1555,7 +1555,7 @@ owner = "crates/semantic registry/fallback fidelity"
 authority = "planted mutation scripts/mutations/INV-SEMANTIC-FIDELITY-TRUTH.json"
 script_check = ""
 unit_test = "operation_status_distinguishes_fallback_from_a_registered_provider"
-production_wiring = "provider_status_reports_declared_or_contract_fidelity"
+production_wiring = "provider_status_reports_declared_or_untrusted_fidelity"
 fault = ""
 mutation_witness = "operation_status_distinguishes_fallback_from_a_registered_provider"
 mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-FIDELITY-TRUTH"
@@ -1622,3 +1622,168 @@ mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-ENTITY-ORIGIN"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]
+
+[[invariant]]
+id = "INV-NATIVE-ROUTE-BEHAVIOR"
+statement = "Every route method the production router sources register — chained methods included — is refused over a real served socket when unauthenticated."
+owner = "crates/server route auth boundary"
+authority = "planted mutation scripts/mutations/INV-NATIVE-ROUTE-BEHAVIOR.json"
+script_check = ""
+unit_test = "every_registered_route_rejects_missing_credentials"
+production_wiring = "every_route_class_rejects_missing_and_malformed_credentials"
+fault = ""
+mutation_witness = "every_registered_route_rejects_missing_credentials"
+mutation_command = "node scripts/mutation-run.mjs INV-NATIVE-ROUTE-BEHAVIOR"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-MERGE-POLICY-UNREADABLE"
+statement = "An unreadable durable child merge policy (missing or corrupt identity row, session/store read failure) blocks a fresh merge typed; it is never downgraded to advisory."
+owner = "crates/orchestrator semantic merge preflight"
+authority = "planted mutation scripts/mutations/INV-MERGE-POLICY-UNREADABLE.json"
+script_check = ""
+unit_test = "unreadable_child_policy_blocks_a_fresh_merge"
+production_wiring = "required_semantic_delta_rejects_sub_compiler_fidelity"
+fault = ""
+mutation_witness = "unreadable_child_policy_blocks_a_fresh_merge"
+mutation_command = "node scripts/mutation-run.mjs INV-MERGE-POLICY-UNREADABLE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-MERGE-COMPLETENESS-REQUIRED"
+statement = "A required semantic merge preflight rejects a provider whose declared completeness is below conservative-complete before any delta runs."
+owner = "crates/orchestrator semantic merge preflight"
+authority = "planted mutation scripts/mutations/INV-MERGE-COMPLETENESS-REQUIRED.json"
+script_check = ""
+unit_test = "required_semantic_delta_rejects_sub_conservative_completeness"
+production_wiring = "first_ever_merge_preflight_handshakes_and_runs"
+fault = ""
+mutation_witness = "required_semantic_delta_rejects_sub_conservative_completeness"
+mutation_command = "node scripts/mutation-run.mjs INV-MERGE-COMPLETENESS-REQUIRED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-TRUST-DECLARED"
+statement = "Missing provider fidelity/completeness declarations are untrusted (none/unknown), never the strongest trust level; required obligations refuse silent providers."
+owner = "crates/semantic provider descriptor defaults"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-TRUST-DECLARED.json"
+script_check = ""
+unit_test = "provider_status_reports_declared_or_untrusted_fidelity"
+production_wiring = "required_semantic_delta_blocks_an_undeclared_provider"
+fault = ""
+mutation_witness = "provider_status_reports_declared_or_untrusted_fidelity"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-TRUST-DECLARED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-PROVIDER-PIN"
+statement = "A pinned semantic call is served only by the pinned provider; registry dispatch never fails over a call whose identity was derived from the selected provider."
+owner = "crates/semantic registry dispatch"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-PROVIDER-PIN.json"
+script_check = ""
+unit_test = "pinned_call_never_fails_over"
+production_wiring = "first_ever_merge_preflight_handshakes_and_runs"
+fault = ""
+mutation_witness = "pinned_call_never_fails_over"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-PROVIDER-PIN"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-LIVE-REVISION"
+statement = "The live semantic revision is the workspace content identity (tm1 digest), never a session handle; an unavailable tree yields the honest snapshot-unavailable marker."
+owner = "crates/agent semantic revision"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-LIVE-REVISION.json"
+script_check = ""
+unit_test = "live_semantic_revision_is_content_derived_never_a_session_id"
+production_wiring = "a_model_semantic_query_call_executes_against_the_registered_provider"
+fault = ""
+mutation_witness = "live_semantic_revision_is_content_derived_never_a_session_id"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-LIVE-REVISION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-QUERY-READY"
+statement = "semantic_query is advertised only while a validated external provider can serve CONTEXT; registration alone or an unrelated capability never exposes it."
+owner = "crates/agent semantic_query advertising"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-QUERY-READY.json"
+script_check = ""
+unit_test = "semantic_query_is_not_advertised_without_a_context_capable_provider"
+production_wiring = "a_model_semantic_query_call_executes_against_the_registered_provider"
+fault = ""
+mutation_witness = "semantic_query_is_not_advertised_without_a_context_capable_provider"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-QUERY-READY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-STATUS-VALIDATED"
+statement = "Semantic status and capability surfaces report only validated provider descriptors; unvalidated capability claims never appear as readiness."
+owner = "crates/server semantic status surfaces"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-STATUS-VALIDATED.json"
+script_check = ""
+unit_test = "unvalidated_provider_claims_never_reach_the_status_surfaces"
+production_wiring = "status_serves_exactly_the_wired_registry"
+fault = ""
+mutation_witness = "unvalidated_provider_claims_never_reach_the_status_surfaces"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-STATUS-VALIDATED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-WATCH-WORKER-CAP"
+statement = "Watcher registration worker generations are counted in every build; once MAX_WATCH_WORKERS generations exist, overdue registrations degrade instead of leaking another blocked thread."
+owner = "crates/fs watcher registration"
+authority = "planted mutation scripts/mutations/INV-WATCH-WORKER-CAP.json"
+script_check = ""
+unit_test = "a_wedged_registration_never_starves_later_workspaces"
+production_wiring = "watcher_registration_uses_exactly_one_worker_thread"
+fault = ""
+mutation_witness = "a_wedged_registration_never_starves_later_workspaces"
+mutation_command = "node scripts/mutation-run.mjs INV-WATCH-WORKER-CAP"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WATCH-ROOT-ANCHORED"
+statement = "The watcher root is preflighted through the anchored directory handle with no symlink following, and a pathname swapped before backend registration is detected by identity."
+owner = "crates/fs watcher preflight"
+authority = "planted mutation scripts/mutations/INV-WATCH-ROOT-ANCHORED.json"
+script_check = ""
+unit_test = "anchored_root_identity_detects_a_swapped_path"
+production_wiring = "pathological_root_degrades_but_an_ordinary_root_still_gets_a_watcher"
+fault = ""
+mutation_witness = "anchored_root_identity_detects_a_swapped_path"
+mutation_command = "node scripts/mutation-run.mjs INV-WATCH-ROOT-ANCHORED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-NETWORK-POLICY-STRICT"
+statement = "NetworkPolicy matching is anchored on scheme, host and port (and a path segment boundary when specified); unparseable or continuation-extended destinations are denied."
+owner = "crates/core NetworkPolicy"
+authority = "planted mutation scripts/mutations/INV-NETWORK-POLICY-STRICT.json"
+script_check = ""
+unit_test = "network_policy_matrix"
+production_wiring = "core_resource_gauge_and_capability_sets"
+fault = ""
+mutation_witness = "network_policy_matrix"
+mutation_command = "node scripts/mutation-run.mjs INV-NETWORK-POLICY-STRICT"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
