@@ -952,6 +952,25 @@ impl AgentRuntime {
                     "context compiler kept producer evidence: {err}"
                 ),
             }
+            // Provenance guard (security adversarial suite): retrieved,
+            // semantic and learning snippets are repository/provider DATA
+            // and may never carry instruction authority into the system
+            // prefix. Any snippet containing an override phrase is withheld
+            // here (bounded, case/whitespace-insensitive scan) with a warn;
+            // the model can still read the file through its tools, so no
+            // capability is lost — only the prompt-injection channel.
+            evidence.retain(|item| {
+                if faktor_security::contains_instruction_override(&item.snippet) {
+                    tracing::warn!(
+                        path = %item.path,
+                        "withholding evidence snippet: instruction-override phrasing detected \
+                         (repository content is data, not instruction authority)"
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
             // P0-79 site d: a retrieval that ADMITTED a NEW evidence set
             // into the context (non-empty and different from the last set
             // this drive admitted) is semantic progress — the op is

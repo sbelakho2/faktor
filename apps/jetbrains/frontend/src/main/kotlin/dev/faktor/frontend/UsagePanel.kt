@@ -20,9 +20,7 @@ import dev.faktor.shared.NativeInFlightTxn
 import dev.faktor.shared.NativeUsageBuckets
 import java.awt.BorderLayout
 import java.math.BigInteger
-import javax.swing.BorderFactory
 import javax.swing.JPanel
-import javax.swing.JScrollPane
 
 /** The exact limit names the daemon's plan config uses. */
 const val USAGE_LIMIT_MAX_TOKENS = "max_tokens_per_period"
@@ -348,21 +346,13 @@ class UsagePanel : JPanel(BorderLayout()) {
     init {
         val linesBody = JPanel(BorderLayout())
         linesBody.isOpaque = false
-        linesBody.add(JScrollPane(linesArea), BorderLayout.CENTER)
+        linesBody.add(insetScroll(linesArea), BorderLayout.CENTER)
         val body = pageColumn()
         body.add(card("Billing detail", linesBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(actionRow(previousButton, nextButton, grantButton))
-        statusLabel.font = sectionTitleFont()
-        val statusRow = JPanel(BorderLayout())
-        statusRow.isOpaque = true
-        statusRow.background = panelSurface()
-        statusRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, 0, Spacing.M
-        )
-        statusRow.add(statusLabel, BorderLayout.CENTER)
-        add(statusRow, BorderLayout.NORTH)
-        add(body, BorderLayout.CENTER)
+        add(panelHeader(statusLabel), BorderLayout.NORTH)
+        add(pageScroll(body), BorderLayout.CENTER)
 
         previousButton.addActionListener { listener?.onPreviousPage() }
         nextButton.addActionListener { listener?.onNextPage() }

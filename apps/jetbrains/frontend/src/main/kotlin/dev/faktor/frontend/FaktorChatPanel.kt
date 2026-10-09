@@ -160,12 +160,19 @@ class FaktorChatPanel(
 
     // Task-mode completion contract controls: shown ONLY in the Task tab
     // (the chat composer never carries a contract). The submitted contract is
-    // tracked so the tree can report durable step provenance.
-    internal val completionCommit = JCheckBox("Commit when verified")
+    // tracked so the tree can report durable step provenance. The labels stay
+    // one word so they never clip at 240px; the tooltip carries the nuance.
+    internal val completionCommit = JCheckBox("Commit").apply {
+        toolTipText = "Commit the change set once the run is verified"
+    }
 
-    internal val completionPush = JCheckBox("Push")
+    internal val completionPush = JCheckBox("Push").apply {
+        toolTipText = "Push the committed head to its remote"
+    }
 
-    internal val completionPr = JCheckBox("Create PR")
+    internal val completionPr = JCheckBox("Create PR").apply {
+        toolTipText = "Open a pull request for the committed head"
+    }
 
     private var submittedCompletion: NativeCompletionContract? = null
 
@@ -231,16 +238,16 @@ class FaktorChatPanel(
     private val billingPrevCursors = ArrayList<String>()
 
     /** The inspector root: 3 top-level cluster destinations (Work/Inspect/History). */
-    private val tabs = JTabbedPane()
+    private val tabs = FaktorTabbedPane()
 
     /** Work cluster: the task composer, the agent roster and the terminals. */
-    private val workTabs = JTabbedPane()
+    private val workTabs = FaktorTabbedPane()
 
     /** Inspect cluster: the task tree, evidence, tournaments and permissions. */
-    private val inspectTabs = JTabbedPane()
+    private val inspectTabs = FaktorTabbedPane()
 
     /** History cluster: durable sessions, board, usage and diagnostics (Settings/Status). */
-    private val historyTabs = JTabbedPane()
+    private val historyTabs = FaktorTabbedPane()
 
     /**
      * The inspector is a COLLAPSIBLE secondary plane: the tool window defaults
@@ -249,7 +256,7 @@ class FaktorChatPanel(
      * no fixed 430x600 minimum/preferred size forcing the chat out of narrow
      * layouts.
      */
-    private val inspectorToggle = JToggleButton("Inspector", false)
+    private val inspectorToggle: JToggleButton = FaktorToggleButton("Inspector")
 
     private val chatPlane = JPanel(BorderLayout())
 
@@ -313,9 +320,13 @@ class FaktorChatPanel(
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.S, Spacing.XS))
         toolbar.isOpaque = true
         toolbar.background = panelSurface()
-        toolbar.border = BorderFactory.createEmptyBorder(
-            Spacing.XS, Spacing.M, Spacing.XS, Spacing.M
+        // One hairline under the toolbar plus the Faktor pixel mark as the
+        // tool window's stable identity; every control stays platform-rendered.
+        toolbar.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, FaktorTheme.separator()),
+            BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
         )
+        toolbar.add(FaktorMark())
         toolbar.add(startButton)
         toolbar.add(stopButton)
         toolbar.add(newSessionButton)
@@ -330,7 +341,7 @@ class FaktorChatPanel(
         val chat = chatPlane
         val transcriptBody = JPanel(BorderLayout())
         transcriptBody.isOpaque = false
-        transcriptBody.add(JScrollPane(transcript), BorderLayout.CENTER)
+        transcriptBody.add(insetScroll(transcript), BorderLayout.CENTER)
         chat.add(card("Transcript", transcriptBody), BorderLayout.CENTER)
         val buttons = actionRow(abortButton, sendButton)
         val inputRow = JPanel(BorderLayout(0, Spacing.S))
@@ -338,7 +349,7 @@ class FaktorChatPanel(
         inputRow.border = BorderFactory.createEmptyBorder(
             Spacing.S, Spacing.M, Spacing.M, Spacing.M
         )
-        inputRow.add(JScrollPane(input), BorderLayout.CENTER)
+        inputRow.add(focusAccentScroll(input), BorderLayout.CENTER)
         inputRow.add(buttons, BorderLayout.SOUTH)
         chat.add(inputRow, BorderLayout.SOUTH)
 
@@ -477,10 +488,11 @@ class FaktorChatPanel(
 
     private fun buildTaskTab(): JScrollPane {
         val startBody = pageColumn(gap = Spacing.S, padding = 0)
+        criteriaField.toolTipText = "Optional: acceptance criteria, comma separated"
         startBody.add(
             FormGrid()
                 .row("Goal", goalField)
-                .row("Criteria (comma separated, optional)", criteriaField)
+                .row("Criteria (comma separated)", criteriaField)
                 .build()
         )
         val contractBox = JPanel(GridLayout(3, 1, Spacing.XS, Spacing.XS))
@@ -498,11 +510,11 @@ class FaktorChatPanel(
         runsBody.add(vSpace(Spacing.XS))
         taskArea.isEditable = false
         taskArea.font = uiPanelFont()
-        runsBody.add(JScrollPane(taskArea))
+        runsBody.add(insetScroll(taskArea))
         runsBody.add(actionRow(cancelRunButton))
         val page = pageColumn()
         page.add(card("Start task", startBody))
-        page.add(vSpace(Spacing.S))
+        page.add(vSpace(Spacing.M))
         page.add(card("Task runs", runsBody))
         // The page column IS the scroll view (it tracks the viewport width),
         // so a 240px tool window reflows instead of showing a horizontal
@@ -511,7 +523,9 @@ class FaktorChatPanel(
     }
 
     private fun buildTaskTreeTab(): JPanel {
-        val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, treePanel, JScrollPane(blockersPanel))
+        // Both panes carry their own page scroll (their bodies are bounded),
+        // so the split hosts them directly — no double scroll surface.
+        val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, treePanel, blockersPanel)
         split.resizeWeight = 0.62
         split.isContinuousLayout = true
         val panel = JPanel(BorderLayout())

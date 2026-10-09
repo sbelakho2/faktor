@@ -262,6 +262,19 @@ mod tests {
                             // invariant).
                             text.push_str(&format!("image_data {mime} {} bytes\n", data.len()));
                         }
+                        faktor_provider::ContentKind::FileData {
+                            mime,
+                            filename,
+                            data,
+                        } => {
+                            // Same rule for file attachments: labels + size,
+                            // never the bytes.
+                            text.push_str(&format!(
+                                "file_data {mime} {} {} bytes\n",
+                                filename.as_deref().unwrap_or("-"),
+                                data.len()
+                            ));
+                        }
                     }
                 }
             }
@@ -386,7 +399,8 @@ mod tests {
         );
         assert!(
             !system_b.contains("Ignore previous instructions"),
-            "repo knowledge never auto-injects file CONTENT into the system prefix"
+            "repo knowledge never auto-injects file CONTENT into the system prefix; got: {}",
+            &system_b[..system_b.len().min(800)]
         );
         assert_eq!(
             tools_b.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -416,12 +430,27 @@ mod tests {
             kind == "tool_call" && data.get("name").and_then(|n| n.as_str()) == Some("run_command")
         });
         assert!(unknown_call, "the model's run_command call is durable");
-        assert!(
-            !parts.iter().any(|(kind, data)| {
+        // Current contract: an unknown tool IS answered exactly once with a
+        // TYPED refusal so the model can continue — the security property is
+        // that nothing executes and the answer is the typed unknown-tool
+        // result, not that the row is absent (pre-refusal-design assertion).
+        let answers: Vec<&serde_json::Value> = parts
+            .iter()
+            .filter(|(kind, data)| {
                 kind == "tool_result"
                     && data.get("tool_call_id").and_then(|i| i.as_str()) == Some("c2")
-            }),
-            "the unknown run_command call must never be answered by a tool result"
+            })
+            .map(|(_, data)| data)
+            .collect();
+        assert_eq!(
+            answers.len(),
+            1,
+            "the unknown call is answered exactly once"
+        );
+        let rendered = serde_json::to_string(answers[0]).unwrap();
+        assert!(
+            rendered.contains("unknown_tool"),
+            "the answer is the typed unknown-tool refusal: {rendered}"
         );
     }
 
@@ -505,12 +534,27 @@ mod tests {
             "secret detected in tool input (github_token)"
         );
         let parts = parts_of(&manager, sid);
-        assert!(
-            !parts.iter().any(|(kind, data)| {
+        // Current contract: a DENIED call is answered with the typed denial
+        // (the model must be able to continue), so the security invariant is
+        // that the durable answer exists exactly once and never contains a
+        // byte of the secret — not that the row is absent.
+        let answers: Vec<&serde_json::Value> = parts
+            .iter()
+            .filter(|(kind, data)| {
                 kind == "tool_result"
                     && data.get("tool_call_id").and_then(|i| i.as_str()) == Some("w1")
-            }),
-            "a denied call must never produce a durable tool result"
+            })
+            .map(|(_, data)| data)
+            .collect();
+        assert_eq!(answers.len(), 1, "the denied call is answered exactly once");
+        let rendered = serde_json::to_string(answers[0]).unwrap();
+        assert!(
+            !rendered.contains(token),
+            "the durable denial never carries the secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("secret_detected") || rendered.contains("denied"),
+            "the answer is the typed secret-gate refusal: {rendered}"
         );
     }
 
@@ -596,9 +640,12 @@ mod tests {
             "v1: never touch the prod vault\n",
         )
         .unwrap();
-        let mut rules = Instructions::load(dir.path());
+        let mut rules = Instructions::load(dir.path()).expect("valid instructions tree");
         let e0 = rules.epoch();
-        assert!(!rules.reload_if_changed(), "nothing changed: no epoch flip");
+        assert!(
+            !rules.reload_if_changed().expect("reload is answerable"),
+            "nothing changed: no epoch flip"
+        );
         assert_eq!(rules.epoch(), e0);
         std::fs::write(
             dir.path().join("AGENTS.md"),
@@ -606,7 +653,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            rules.reload_if_changed(),
+            rules.reload_if_changed().expect("reload is answerable"),
             "a mid-task rule rewrite must flip the epoch"
         );
         assert_ne!(rules.epoch(), e0, "the epoch must change on rule content");
@@ -621,28 +668,24 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !rules.reload_if_changed(),
+            !rules.reload_if_changed().expect("reload is answerable"),
             "a byte-identical rewrite is not a new instruction epoch"
         );
     }
 
     // ====================================================================
-    // 5. SECRET SCAN BOUNDED + REDACTION EXACT (unit)
+    // 5. SECRET SCAN COMPLETE + REDACTION EXACT (unit)
     // ====================================================================
 
-    /// Gate: scanning never reads past `policy.max_scan_bytes` (256 KiB).
-    /// In a 1 MiB blob a github token at byte 10_000 is caught and its
-    /// redaction leaves every byte outside the hit identical; the SAME
-    /// token planted at byte 500_000 — past the documented window — is
-    /// invisible and redaction returns the input byte-for-byte.
+    /// Gate: the legacy 256 KiB PREFIX cap is gone (its suffix-blindness
+    /// reported `Clean` for a token past the window); the whole text is
+    /// scanned. In a 1 MiB blob a github token at byte 10_000 AND the same
+    /// token at byte 500_000 are each caught, and redaction leaves every
+    /// byte outside the hit identical.
     #[tokio::test]
-    async fn secret_scan_bounded_and_redaction_exact() {
+    async fn secret_scan_is_complete_and_redaction_exact() {
         let token = "ghp_0123456789abcdefghijklmnopqrstuv";
         let policy = SecretPolicy::default();
-        assert!(
-            policy.max_scan_bytes < 500_000,
-            "the deep-plant case must sit beyond the policy's documented scan window"
-        );
         let total = 1024 * 1024;
 
         // The token is followed by '!' — outside [A-Za-z0-9] — so the
@@ -686,17 +729,32 @@ mod tests {
             let mut t = String::with_capacity(total);
             t.push_str(&"a".repeat(500_000));
             t.push_str(token);
-            t.push_str(&"a".repeat(total - 500_000 - token.len()));
+            // Same '!' terminator as the shallow case: without it the token
+            // would extend into the trailing run and the (correct) redaction
+            // would consume the whole run.
+            t.push('!');
+            t.push_str(&"a".repeat(total - 500_000 - token.len() - 1));
             t
         };
-        assert!(
-            scan_secrets(&beyond, &policy).is_empty(),
-            "a secret planted past the 256 KiB window is invisible (documented bound)"
+        let hits = scan_secrets(&beyond, &policy);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a secret planted past the legacy 256 KiB prefix cap is STILL caught"
+        );
+        assert_eq!(hits[0].offset, 500_000);
+        assert_eq!(hits[0].kind, "github_token");
+        let out = redact(&beyond, &policy);
+        assert!(!out.contains(token), "the deep-planted secret is redacted");
+        assert_eq!(
+            out.len(),
+            total - token.len() + "<redacted:github_token>".len(),
+            "only the deep hit span itself is replaced"
         );
         assert_eq!(
-            redact(&beyond, &policy),
-            beyond,
-            "no hit means byte-for-byte passthrough"
+            &out.as_bytes()[..500_000],
+            &beyond.as_bytes()[..500_000],
+            "bytes before the deep hit survive redaction exactly"
         );
     }
 

@@ -4,42 +4,85 @@
 // every setter receives an already-computed full line from FaktorChatPanel's
 // refreshers (`daemon: ...`, `state: ...`), so the panel never derives state
 // of its own and the same component renders in the IDE tool window and the
-// offscreen host matrix.
+// offscreen host matrix. Each line renders as a muted key column plus a
+// width-aware value column, so the readout scans as a definition list.
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativeProjection
 import java.awt.BorderLayout
+import java.awt.Dimension
+import javax.swing.JLabel
 import javax.swing.JPanel
 
 class StatusPanel : JPanel(BorderLayout()) {
 
-    private val daemonLabel = WrappedLabel("daemon: stopped")
+    /** One `key:` / value row of the readout, aligned across the card. */
+    private class StatusRow : JPanel(BorderLayout(Spacing.S, 0)) {
+        val key = JLabel(" ")
+        val value = WrappedLabel(" ")
 
-    private val streamLabel = WrappedLabel("stream: off")
+        init {
+            isOpaque = false
+            key.font = uiPanelFont()
+            key.foreground = mutedForeground()
+            key.verticalAlignment = javax.swing.SwingConstants.TOP
+            value.font = uiPanelFont()
+            value.foreground = textForeground()
+            add(key, BorderLayout.WEST)
+            add(value, BorderLayout.CENTER)
+        }
 
-    private val stateLabel = WrappedLabel("state: -")
+        fun apply(text: String) {
+            val separator = text.indexOf(": ")
+            if (separator <= 0) {
+                key.text = ""
+                value.fullText = text
+            } else {
+                key.text = text.substring(0, separator) + ":"
+                value.fullText = text.substring(separator + 2)
+            }
+        }
+    }
 
-    private val modelLabel = WrappedLabel("model: -")
+    private val daemonRow = StatusRow().apply { apply("daemon: stopped") }
 
-    private val toolLabel = WrappedLabel("active tool: -")
+    private val streamRow = StatusRow().apply { apply("stream: off") }
 
-    private val queuedLabel = WrappedLabel("queued: 0")
+    private val stateRow = StatusRow().apply { apply("state: -") }
 
-    private val usageLabel = WrappedLabel("usage: -")
+    private val modelRow = StatusRow().apply { apply("model: -") }
 
-    private val verificationLabel = WrappedLabel("verification: -")
+    private val toolRow = StatusRow().apply { apply("active tool: -") }
 
-    private val filesLabel = WrappedLabel("files changed: 0")
+    private val queuedRow = StatusRow().apply { apply("queued: 0") }
 
-    private val indexLabel = WrappedLabel("index: -")
+    private val usageRow = StatusRow().apply { apply("usage: -") }
+
+    private val verificationRow = StatusRow().apply { apply("verification: -") }
+
+    private val filesRow = StatusRow().apply { apply("files changed: 0") }
+
+    private val indexRow = StatusRow().apply { apply("index: -") }
+
+    private val rows = listOf(
+        daemonRow, streamRow, stateRow, modelRow, toolRow,
+        queuedRow, usageRow, verificationRow, filesRow, indexRow
+    )
 
     init {
-        val statusBody = pageColumn(gap = Spacing.XS, padding = 0)
-        for (label in listOf(
-            daemonLabel, streamLabel, stateLabel, modelLabel, toolLabel,
-            queuedLabel, usageLabel, verificationLabel, filesLabel, indexLabel
-        )) {
-            statusBody.add(label)
+        // One key column width across every row: the value texts start on the
+        // same x, so the readout reads as a deliberate grid instead of ragged
+        // "key: value" prose.
+        var keyWidth = 0
+        for (row in rows) {
+            keyWidth = Math.max(keyWidth, row.key.preferredSize.width)
+        }
+        val statusBody = pageColumn(gap = 6, padding = 0)
+        for ((index, row) in rows.withIndex()) {
+            if (index > 0) statusBody.add(vSpace(6))
+            row.key.preferredSize = Dimension(keyWidth, row.key.preferredSize.height)
+            row.key.minimumSize = row.key.preferredSize
+            statusBody.add(row)
         }
         val page = pageColumn()
         page.add(card("Session status", statusBody))
@@ -47,59 +90,60 @@ class StatusPanel : JPanel(BorderLayout()) {
     }
 
     fun setDaemon(text: String) {
-        daemonLabel.text = text
+        daemonRow.apply(text)
     }
 
     fun setStream(text: String) {
-        streamLabel.text = text
+        streamRow.apply(text)
     }
 
     fun setState(text: String) {
-        stateLabel.text = text
+        stateRow.apply(text)
     }
 
     fun setModel(text: String) {
-        modelLabel.text = text
+        modelRow.apply(text)
     }
 
     fun setTool(text: String) {
-        toolLabel.text = text
+        toolRow.apply(text)
     }
 
     fun setQueued(text: String) {
-        queuedLabel.text = text
+        queuedRow.apply(text)
     }
 
     fun setFiles(text: String) {
-        filesLabel.text = text
+        filesRow.apply(text)
     }
 
     fun setUsage(text: String) {
-        usageLabel.text = text
+        usageRow.apply(text)
     }
 
     fun setVerification(text: String) {
-        verificationLabel.text = text
+        verificationRow.apply(text)
     }
 
     /** Durable index coverage (audits 5/6): a PARTIAL/capped round is named. */
     fun setIndex(text: String) {
-        indexLabel.text = text
+        indexRow.apply(text)
     }
 
     /** Applies one durable projection row set to the status column. */
     fun applyProjection(projection: NativeProjection) {
-        stateLabel.text = "state: ${projection.machine} (${projection.label})"
+        stateRow.apply("state: ${projection.machine} (${projection.label})")
         val active = projection.activeModel
-        modelLabel.text = if (active == null) {
+        val model = if (active == null) {
             "model: ${projection.provider}/${projection.model}"
         } else {
             "model: ${active.provider}/${active.model}" +
                 (if (active.variant == null) "" else " (${active.variant})")
         }
+        modelRow.apply(model)
         val tool = projection.activeTool
-        toolLabel.text = if (tool == null) "active tool: -" else "active tool: ${tool.tool} [${tool.status}]"
-        queuedLabel.text = "queued: ${projection.queued}"
-        filesLabel.text = "files changed: ${projection.filesChanged.size}"
+        toolRow.apply(if (tool == null) "active tool: -" else "active tool: ${tool.tool} [${tool.status}]")
+        queuedRow.apply("queued: ${projection.queued}")
+        filesRow.apply("files changed: ${projection.filesChanged.size}")
     }
 }

@@ -1948,6 +1948,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "faktor-tests-security"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-agent",
+ "faktor-cas",
+ "faktor-context",
+ "faktor-core",
+ "faktor-fs",
+ "faktor-instructions",
+ "faktor-provider",
+ "faktor-security",
+ "faktor-session",
+ "faktor-store",
+ "faktor-verify",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "faktor-tests-soak"
 version = "0.1.0"
 dependencies = [

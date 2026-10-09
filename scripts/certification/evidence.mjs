@@ -1385,6 +1385,10 @@ function runSelftest() {
         status: 'passed',
         commit,
         tree,
+        // Every marker written by lane-marker.sh records the clean-checkout
+        // fact; verify-markers refuses a marker without it (P0-CERT). The
+        // fixture carries the same contract.
+        clean: true,
         runner: { os: 'linux', arch: 'amd64', ci: 'woodpecker', run_id: runId },
         started_at: '2026-01-01T00:00:00Z',
         finished_at: '2026-01-01T00:01:00Z',
@@ -2165,6 +2169,9 @@ function runSelftest() {
         status: 'passed',
         commit,
         tree,
+        // Same clean-checkout contract as the lane-marker.sh writers (see the
+        // linux/darwin fixture above).
+        clean: true,
         runner: { os: 'windows', arch: 'amd64', ci: 'woodpecker', run_id: runId },
         started_at: '2026-01-01T00:00:00Z',
         finished_at: '2026-01-01T00:01:00Z',

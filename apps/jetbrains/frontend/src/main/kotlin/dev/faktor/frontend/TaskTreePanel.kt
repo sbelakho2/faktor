@@ -61,12 +61,20 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     private val completionLabel = WrappedLabel("not loaded")
 
     private val treeModel = DefaultTreeModel(
-        DefaultMutableTreeNode(TaskTreeNode.Plain("no task data", "placeholder"))
+        DefaultMutableTreeNode(
+            TaskTreeNode.Plain(
+                "No task data yet. Start a task to populate the tree.",
+                "placeholder"
+            )
+        )
     )
 
     private val tree = JTree(treeModel)
 
-    private val treeScroll = JScrollPane(tree)
+    private val treeScroll = insetScroll(tree)
+
+    /** The row under the pointer (rollover is renderer-only, never state). */
+    private var hoverRow = -1
 
     /** One detail region for the selected node (no nested dead split pane). */
     private val detailArea = compactArea(3).apply {
@@ -74,7 +82,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         preferredSize = Dimension(200, 116)
     }
 
-    private val detailScroll = JScrollPane(detailArea)
+    private val detailScroll = insetScroll(detailArea)
 
     private var listener: Listener? = null
 
@@ -93,8 +101,30 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     init {
         tree.isRootVisible = true
         tree.showsRootHandles = true
-        tree.rowHeight = Math.max(tree.rowHeight, tree.getFontMetrics(uiPanelFont()).height + 10)
+        tree.rowHeight = Math.max(24, tree.getFontMetrics(uiPanelFont()).height + 10)
         tree.cellRenderer = TaskTreeRenderer()
+        tree.addMouseMotionListener(
+            object : java.awt.event.MouseMotionAdapter() {
+                override fun mouseMoved(e: java.awt.event.MouseEvent?) {
+                    val point = e?.point ?: return
+                    val row = tree.getRowForLocation(point.x, point.y)
+                    if (row != hoverRow) {
+                        hoverRow = row
+                        tree.repaint()
+                    }
+                }
+            }
+        )
+        tree.addMouseListener(
+            object : java.awt.event.MouseAdapter() {
+                override fun mouseExited(e: java.awt.event.MouseEvent?) {
+                    if (hoverRow != -1) {
+                        hoverRow = -1
+                        tree.repaint()
+                    }
+                }
+            }
+        )
         treeScroll.horizontalScrollBarPolicy =
             javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
         tree.addTreeSelectionListener { event: TreeSelectionEvent ->
@@ -117,8 +147,8 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             .row("Spend", spendLabel)
             .build()
 
-        val top = JPanel(BorderLayout(0, Spacing.S))
-        top.border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.S, Spacing.S, Spacing.S)
+        val top = JPanel(BorderLayout(0, Spacing.M))
+        top.border = BorderFactory.createEmptyBorder(Spacing.M, Spacing.M, Spacing.M, Spacing.M)
         top.isOpaque = true
         top.background = panelSurface()
         top.add(card("Task", summary), BorderLayout.NORTH)
@@ -331,7 +361,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     private fun updateDetail() {
         val node = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode
         detailArea.text = if (node == null) {
-            "select a node to inspect its details"
+            "Select a node to inspect its details."
         } else {
             detailText(node)
         }
@@ -734,6 +764,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                 val component = super.getTreeCellRendererComponent(
                     tree, value, selected, expanded, leaf, row, hasFocus
                 )
+                if (!selected && row == hoverRow) {
+                    background = FaktorTheme.hover()
+                }
                 val proof = payload.row
                 val full = criterionLabel(proof)
                 text = bound(full, 300)
@@ -754,7 +787,11 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                     panel.add(label, BorderLayout.CENTER)
                 }
                 sprite?.setState(child.state)
-                panel.background = if (selected) backgroundSelectionColor else backgroundNonSelectionColor
+                panel.background = when {
+                    selected -> backgroundSelectionColor
+                    row == hoverRow -> FaktorTheme.hover()
+                    else -> backgroundNonSelectionColor
+                }
                 panel.isOpaque = true
                 // Background children are dimmed (gray + italic); presentation
                 // never changes the child's state badge or controls.
@@ -777,6 +814,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             ).also {
                 font = uiPanelFont()
                 toolTipText = null
+                if (!selected && row == hoverRow) {
+                    background = FaktorTheme.hover()
+                }
                 if (payload is TaskTreeNode) {
                     val full = nodeLabel(payload)
                     text = bound(full, 300)

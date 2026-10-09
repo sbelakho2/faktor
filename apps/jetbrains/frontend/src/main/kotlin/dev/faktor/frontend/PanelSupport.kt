@@ -8,25 +8,40 @@
 // IDE themes and HiDPI/zoom settings instead of a hardcoded palette.
 package dev.faktor.frontend
 
+import java.awt.BasicStroke
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Component
 import java.awt.Dimension
 import java.awt.Font
+import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.Insets
+import java.awt.RenderingHints
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
+import java.awt.event.FocusAdapter
+import java.awt.event.FocusEvent
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
+import java.awt.event.MouseMotionAdapter
 import java.awt.font.FontRenderContext
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JLabel
+import javax.swing.JList
 import javax.swing.JPanel
+import javax.swing.JTabbedPane
+import javax.swing.JTable
 import javax.swing.JTextArea
+import javax.swing.JToggleButton
 import javax.swing.UIManager
+import javax.swing.border.AbstractBorder
+import javax.swing.text.JTextComponent
 
 /** The shared 4/8/12/16 spacing scale (px at 100% IDE zoom). */
 internal object Spacing {
@@ -34,6 +49,121 @@ internal object Spacing {
     const val S = 8
     const val M = 12
     const val L = 16
+}
+
+/** The shared corner radii: cards read as one system at 8px. */
+internal object Radii {
+    const val CARD = 8
+    const val CONTROL = 6
+    const val CHIP = 10
+}
+
+/**
+ * The Faktor accent. ONE restrained identity hue — a deep engineering teal,
+ * deliberately distinct from IntelliJ blue and from generic assistant
+ * palettes — used only for primary actions, selected states, focus rings and
+ * the active cluster tab underline. Everything else stays platform-native. A
+ * theme that registers `Faktor.accent` in UIManager overrides the fixed hue;
+ * otherwise the fixed teal is tone-adjusted for the active light/dark surface.
+ */
+internal object FaktorTheme {
+
+    /** The live accent (deep teal `#0C737D` light / `#2FB8AB` dark by default). */
+    fun accent(): Color = UIManager.getColor("Faktor.accent") ?: if (isDarkSurface()) {
+        Color(0x2F, 0xB8, 0xAB)
+    } else {
+        Color(0x0C, 0x73, 0x7D)
+    }
+
+    /** The accent under the pointer (perceptibly lifted, never a flash). */
+    fun accentHover(): Color = towardContrast(accent(), 0.12f)
+
+    /** The accent while pressed (deeper than hover). */
+    fun accentPressed(): Color = towardContrast(accent(), 0.26f)
+
+    /** Legible text on an accent fill (near-black on bright teal, else white). */
+    fun onAccent(): Color = if (luminance(accent()) > 0.45) {
+        Color(0x0B, 0x14, 0x13)
+    } else {
+        Color.WHITE
+    }
+
+    /** A 0..1 accent tint over the panel surface (selected fills, focus halos). */
+    fun accentTint(strength: Float): Color = mix(panelSurface(), accent(), strength)
+
+    /** The subtle rollover background for rows and secondary controls. */
+    fun hover(): Color = mix(
+        panelSurface(),
+        textForeground(),
+        if (isDarkSurface()) 0.10f else 0.055f
+    )
+
+    /** The pressed background for secondary controls. */
+    fun pressed(): Color = mix(
+        panelSurface(),
+        textForeground(),
+        if (isDarkSurface()) 0.18f else 0.10f
+    )
+
+    /** The slightly raised card surface (never a hardcoded palette entry). */
+    fun cardSurface(): Color = mix(
+        panelSurface(),
+        textForeground(),
+        if (isDarkSurface()) 0.045f else 0.018f
+    )
+
+    /** The hairline separating a header row from its body. */
+    fun separator(): Color = mix(cardBorderColor(), panelSurface(), 0.35f)
+
+    /** The hairline of an inset scroll surface nested inside a card. */
+    fun insetBorder(): Color = mix(cardBorderColor(), cardSurface(), 0.45f)
+
+    private fun towardContrast(base: Color, amount: Float): Color =
+        if (isDarkSurface()) mix(base, Color.WHITE, amount) else mix(base, Color.BLACK, amount)
+}
+
+/**
+ * One rounded 1px outline (optionally filled) on the shared radius scale.
+ * Resolves its colors at construction from the active theme tokens; painted
+ * with antialiasing so cards and chips read deliberate at every IDE zoom.
+ */
+internal class FaktorRoundedBorder(
+    private val lineColor: Color,
+    private val radius: Int = Radii.CARD,
+    private val thickness: Int = 1,
+    private val fill: Color? = null,
+    private val padding: Insets = Insets(0, 0, 0, 0)
+) : AbstractBorder() {
+
+    override fun getBorderInsets(c: Component?): Insets =
+        Insets(padding.top, padding.left, padding.bottom, padding.right)
+
+    override fun getBorderInsets(c: Component?, insets: Insets): Insets {
+        insets.set(padding.top, padding.left, padding.bottom, padding.right)
+        return insets
+    }
+
+    override fun isBorderOpaque(): Boolean = false
+
+    override fun paintBorder(c: Component?, g: Graphics, x: Int, y: Int, w: Int, h: Int) {
+        val g2 = g.create() as Graphics2D
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            val arc = radius * 2
+            val fillColor = fill
+            if (fillColor != null) {
+                g2.color = fillColor
+                g2.fillRoundRect(x, y, w - 1, h - 1, arc, arc)
+            }
+            if (thickness > 0) {
+                g2.color = lineColor
+                g2.stroke = BasicStroke(thickness.toFloat())
+                g2.drawRoundRect(x, y, w - 1, h - 1, arc, arc)
+            }
+        } finally {
+            g2.dispose()
+        }
+    }
 }
 
 /** One vertical gap in a BoxLayout column (the shared spacing scale). */
@@ -417,7 +547,7 @@ internal open class ScrollableColumn : JPanel(), javax.swing.Scrollable {
  * "Verification" into "Verifi catio n" at wide widths). Long unbroken words
  * simply overflow into the (empty) gap before the field.
  */
-internal class FixedWrapLabel(text: String, private val wrapWidth: Int = Spacing.L * 6) : JLabel() {
+internal class FixedWrapLabel(text: String, private val wrapWidth: Int = Spacing.L * 8) : JLabel() {
     init {
         font = uiPanelFont()
         foreground = mutedForeground()
@@ -465,10 +595,11 @@ internal fun pageColumn(gap: Int = Spacing.S, padding: Int = Spacing.M): JPanel 
 }
 
 /**
- * The card factory: one bordered surface matching the panel background, with
- * an optional normal-case semibold header and 6px inner padding. The 1px
- * rounded outline uses the theme's border token (never raw RGB), so cards
- * read as one product under light, dark and high-contrast themes.
+ * The card factory: one raised 8px-radius surface with an optional
+ * normal-case semibold header and 12px inner padding. The rounded fill and
+ * the 1px hairline outline are painted from live theme tokens (never raw
+ * RGB), so cards read as one product under light, dark and high-contrast
+ * themes. The panel itself is non-opaque; the shared border owns the shape.
  */
 internal fun card(
     title: String?,
@@ -477,12 +608,14 @@ internal fun card(
     vgap: Int = if (title == null) 0 else Spacing.S
 ): JPanel {
     val panel = JPanel(BorderLayout(hgap, vgap))
-    panel.isOpaque = true
-    panel.background = panelSurface()
+    panel.isOpaque = false
+    panel.background = FaktorTheme.cardSurface()
     panel.alignmentX = Component.LEFT_ALIGNMENT
-    panel.border = BorderFactory.createCompoundBorder(
-        BorderFactory.createLineBorder(cardBorderColor(), 1, true),
-        BorderFactory.createEmptyBorder(6, Spacing.S, 6, Spacing.S)
+    panel.border = FaktorRoundedBorder(
+        lineColor = cardBorderColor(),
+        radius = Radii.CARD,
+        fill = FaktorTheme.cardSurface(),
+        padding = Insets(Spacing.M, Spacing.M, Spacing.M, Spacing.M)
     )
     if (title != null) {
         // Width-aware: a long card title wraps at 240px instead of being
@@ -560,41 +693,202 @@ internal fun semanticForeground(state: SemanticState): Color {
 }
 
 /**
- * A status chip: the state word plus a subtle rounded outline in the theme's
- * semantic tone. The text carries the state; the color only re-enforces it.
+ * A status chip: the state word plus a subtle rounded pill in the theme's
+ * semantic tone, on a faint tone-tinted fill. The text carries the state; the
+ * color only re-enforces it.
  */
 internal fun statusChip(text: String, state: SemanticState): JLabel {
     val tone = semanticForeground(state)
     return JLabel(text).apply {
         font = sectionTitleFont()
         foreground = tone
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(tone, 1, true),
-            BorderFactory.createEmptyBorder(0, Spacing.XS + 2, 0, Spacing.XS + 2)
-        )
         isOpaque = false
+        border = FaktorRoundedBorder(
+            lineColor = tone,
+            radius = Radii.CHIP,
+            fill = mix(panelSurface(), tone, 0.10f),
+            padding = Insets(1, Spacing.S, 1, Spacing.S)
+        )
     }
 }
 
 /**
- * A consistently sized action: the shared UI font, 4/12px padding and the
- * platform button rendering (IntelliJ's round-rect client property is inert
- * under plain Swing). [primary] marks the one affirmative action of a card
- * with the semibold face, so the emphasis survives every LAF.
+ * A consistently sized themed action: rounded fill with a real rollover and
+ * pressed state, the shared UI font, and a 28px primary / 24px secondary
+ * height floor that still grows with IDE zoom (the height derives from the
+ * resolved font metrics). [primary] actions carry the one accent hue of the
+ * product; secondary actions stay surface-toned with a hairline outline, so
+ * emphasis is unambiguous. Destructive actions stay secondary by call site.
  */
-internal fun actionButton(text: String, primary: Boolean = false): JButton {
-    val button = JButton(text)
-    button.font = if (primary) sectionTitleFont() else uiPanelFont()
-    button.margin = Insets(4, Spacing.M, 4, Spacing.M)
-    button.putClientProperty("JButton.buttonType", "roundRect")
-    return button
+internal class FaktorButton(text: String, private val primary: Boolean = false) : JButton(text) {
+
+    init {
+        isFocusPainted = false
+        isBorderPainted = false
+        isContentAreaFilled = false
+        isOpaque = false
+        isRolloverEnabled = true
+        font = if (primary) sectionTitleFont() else uiPanelFont()
+        border = BorderFactory.createEmptyBorder(verticalPad(), horizontalPad(), verticalPad(), horizontalPad())
+    }
+
+    private fun verticalPad(): Int = if (primary) 6 else 4
+
+    private fun horizontalPad(): Int = if (primary) 14 else 10
+
+    private fun heightFloor(): Int = if (primary) 28 else 24
+
+    override fun getPreferredSize(): Dimension {
+        val base = super.getPreferredSize()
+        return Dimension(base.width, Math.max(heightFloor(), base.height))
+    }
+
+    override fun paintComponent(g: Graphics) {
+        val g2 = g.create() as Graphics2D
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            val arc = Radii.CONTROL * 2
+            val w = width
+            val h = height
+            val fill: Color
+            val outline: Color?
+            when {
+                !isEnabled -> {
+                    fill = panelSurface()
+                    outline = mix(cardBorderColor(), panelSurface(), 0.4f)
+                }
+                primary -> {
+                    fill = when {
+                        model.isPressed -> FaktorTheme.accentPressed()
+                        model.isRollover -> FaktorTheme.accentHover()
+                        else -> FaktorTheme.accent()
+                    }
+                    outline = null
+                }
+                else -> {
+                    fill = when {
+                        model.isPressed -> FaktorTheme.pressed()
+                        model.isRollover -> FaktorTheme.hover()
+                        else -> panelSurface()
+                    }
+                    outline = cardBorderColor()
+                }
+            }
+            g2.color = fill
+            g2.fillRoundRect(0, 0, w - 1, h - 1, arc, arc)
+            if (outline != null) {
+                g2.color = outline
+                g2.drawRoundRect(0, 0, w - 1, h - 1, arc, arc)
+            }
+            if (isEnabled && (hasFocus() || isFocusOwner)) {
+                g2.color = FaktorTheme.accent()
+                g2.stroke = BasicStroke(1.4f)
+                g2.drawRoundRect(1, 1, w - 3, h - 3, arc, arc)
+            }
+        } finally {
+            g2.dispose()
+        }
+        val previous = foreground
+        foreground = when {
+            !isEnabled -> mutedForeground()
+            primary -> FaktorTheme.onAccent()
+            else -> textForeground()
+        }
+        try {
+            super.paintComponent(g)
+        } finally {
+            foreground = previous
+        }
+    }
 }
 
-/** The affirmative action of a card (bold, default-button emphasis). */
-internal fun primaryButton(text: String): JButton = actionButton(text, primary = true)
+/** A themed toggle (the inspector switch): selected state carries the accent. */
+internal class FaktorToggleButton(text: String) : JToggleButton(text) {
 
-/** A supporting action (normal weight, never competing with the primary). */
-internal fun secondaryButton(text: String): JButton = actionButton(text, primary = false)
+    init {
+        isFocusPainted = false
+        isBorderPainted = false
+        isContentAreaFilled = false
+        isOpaque = false
+        isRolloverEnabled = true
+        font = uiPanelFont()
+        border = BorderFactory.createEmptyBorder(4, 10, 4, 10)
+    }
+
+    override fun getPreferredSize(): Dimension {
+        val base = super.getPreferredSize()
+        return Dimension(base.width, Math.max(24, base.height))
+    }
+
+    override fun paintComponent(g: Graphics) {
+        val g2 = g.create() as Graphics2D
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            val arc = Radii.CONTROL * 2
+            val w = width
+            val h = height
+            val fill: Color
+            val outline: Color
+            when {
+                !isEnabled -> {
+                    fill = panelSurface()
+                    outline = mix(cardBorderColor(), panelSurface(), 0.4f)
+                }
+                isSelected -> {
+                    fill = FaktorTheme.accentTint(0.18f)
+                    outline = FaktorTheme.accent()
+                }
+                model.isPressed -> {
+                    fill = FaktorTheme.pressed()
+                    outline = cardBorderColor()
+                }
+                model.isRollover -> {
+                    fill = FaktorTheme.hover()
+                    outline = cardBorderColor()
+                }
+                else -> {
+                    fill = panelSurface()
+                    outline = cardBorderColor()
+                }
+            }
+            g2.color = fill
+            g2.fillRoundRect(0, 0, w - 1, h - 1, arc, arc)
+            g2.color = outline
+            g2.drawRoundRect(0, 0, w - 1, h - 1, arc, arc)
+            if (isEnabled && (hasFocus() || isFocusOwner)) {
+                g2.color = FaktorTheme.accent()
+                g2.stroke = BasicStroke(1.4f)
+                g2.drawRoundRect(1, 1, w - 3, h - 3, arc, arc)
+            }
+        } finally {
+            g2.dispose()
+        }
+        val previous = foreground
+        foreground = when {
+            !isEnabled -> mutedForeground()
+            isSelected -> FaktorTheme.accent()
+            else -> textForeground()
+        }
+        try {
+            super.paintComponent(g)
+        } finally {
+            foreground = previous
+        }
+    }
+}
+
+/** The affirmative action of a card (accent fill, 28px minimum height). */
+internal fun primaryButton(text: String): JButton = FaktorButton(text, primary = true)
+
+/** A supporting action (surface fill, hairline outline, 24px minimum height). */
+internal fun secondaryButton(text: String): JButton = FaktorButton(text, primary = false)
+
+/**
+ * Kept for call sites that only need the shared font/margin conventions; the
+ * themed [FaktorButton] is the concrete class in every panel.
+ */
+internal fun actionButton(text: String, primary: Boolean = false): JButton =
+    FaktorButton(text, primary = primary)
 
 /**
  * A compact two-column form grid: muted field labels in the west column,
@@ -709,28 +1003,199 @@ private class ActionRowPanel : JPanel() {
 }
 
 /**
- * A scroll pane for a bare table. `JScrollPane` only auto-installs the
- * column header from `JTable.addNotify()`, which never runs for an offscreen
- * render; installing it explicitly keeps the header visible in every host
- * (screenshots, tests and the IDE tool window alike).
+ * The inset scroll surface nested inside a card: the card outline is the only
+ * frame, so the inner viewport gets one rounded hairline (no double square
+ * border) and the viewport keeps its own surface through the rounded corners.
+ * Rows carry their full text in a tooltip instead of forcing sideways panning
+ * at 240px (no horizontal scrollbar).
  */
-internal fun tableScroll(table: javax.swing.JTable): javax.swing.JScrollPane {
-    val scroll = javax.swing.JScrollPane(table)
+internal fun insetScroll(view: Component): javax.swing.JScrollPane =
+    javax.swing.JScrollPane(view).apply {
+        isOpaque = false
+        border = FaktorRoundedBorder(FaktorTheme.insetBorder(), radius = Radii.CONTROL)
+        verticalScrollBar.unitIncrement = Spacing.L
+        horizontalScrollBarPolicy = javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+    }
+
+/**
+ * An inset scroll for a bare table that also installs the column header
+ * explicitly (offscreen renders never run `JTable.addNotify`).
+ */
+internal fun insetTableScroll(table: javax.swing.JTable): javax.swing.JScrollPane {
+    val scroll = insetScroll(table)
     val header = table.tableHeader
     if (header != null) scroll.setColumnHeaderView(header)
-    scroll.verticalScrollBar.unitIncrement = Spacing.L
     return scroll
 }
 
 /**
- * A scroll pane that never shows a horizontal scrollbar: list rows carry
- * their full text in a tooltip instead of forcing sideways panning at 240px.
+ * The chat input surface: one rounded hairline that turns into the accent
+ * focus ring while the text component owns focus (keyboard affordance).
  */
-internal fun noHorizontalScroll(view: Component): javax.swing.JScrollPane =
-    javax.swing.JScrollPane(view).apply {
-        horizontalScrollBarPolicy = javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
-        verticalScrollBar.unitIncrement = Spacing.L
+internal fun focusAccentScroll(view: JTextComponent): javax.swing.JScrollPane {
+    val scroll = javax.swing.JScrollPane(view)
+    scroll.isOpaque = false
+    scroll.border = FaktorRoundedBorder(FaktorTheme.insetBorder(), radius = Radii.CONTROL)
+    scroll.verticalScrollBar.unitIncrement = Spacing.L
+    view.addFocusListener(
+        object : FocusAdapter() {
+            override fun focusGained(e: FocusEvent?) {
+                scroll.border = FaktorRoundedBorder(FaktorTheme.accent(), radius = Radii.CONTROL)
+            }
+
+            override fun focusLost(e: FocusEvent?) {
+                scroll.border = FaktorRoundedBorder(FaktorTheme.insetBorder(), radius = Radii.CONTROL)
+            }
+        }
+    )
+    return scroll
+}
+
+/**
+ * The header strip of a panel: the sentence-case semibold readout over a
+ * hairline separator, on the shared 12px gutter. The caller keeps the label
+ * (it is width-aware and updated in place).
+ */
+internal fun panelHeader(label: JLabel): JPanel {
+    label.font = sectionTitleFont()
+    label.foreground = textForeground()
+    val row = JPanel(BorderLayout())
+    row.isOpaque = true
+    row.background = panelSurface()
+    row.border = BorderFactory.createCompoundBorder(
+        BorderFactory.createMatteBorder(0, 0, 1, 0, FaktorTheme.separator()),
+        BorderFactory.createEmptyBorder(Spacing.S + 2, Spacing.M, Spacing.S, Spacing.M)
+    )
+    row.add(label, BorderLayout.CENTER)
+    return row
+}
+
+/**
+ * The cluster tab strip: the platform tab rendering plus ONE Faktor cue — a
+ * 2px accent underline under the active tab. Nothing else about the LAF tabs
+ * is overridden, so IDE themes keep their native tab shapes.
+ */
+internal class FaktorTabbedPane : JTabbedPane() {
+
+    override fun paintComponent(g: Graphics) {
+        super.paintComponent(g)
+        val index = selectedIndex
+        if (index < 0) return
+        val bounds = getBoundsAt(index) ?: return
+        if (bounds.height <= 4) return
+        val g2 = g.create() as Graphics2D
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            g2.color = FaktorTheme.accent()
+            val inset = 4
+            val width = (bounds.width - inset * 2).coerceAtLeast(2)
+            g2.fillRoundRect(
+                bounds.x + inset,
+                bounds.y + bounds.height - 3,
+                width,
+                2,
+                2,
+                2
+            )
+        } finally {
+            g2.dispose()
+        }
     }
+}
+
+/**
+ * The shared list-row rhythm and hover tracking: a 24px minimum row height
+ * (recomputed when IDE zoom changes the list font) and one rollover
+ * background for the row under the pointer, so every list reads as the same
+ * control. Selection keeps the platform selection colors untouched.
+ */
+internal object RowRhythm {
+
+    private const val HOVER_KEY = "faktor.hoverRowIndex"
+
+    /** Applies the row rhythm and the rollover tracker to one list. */
+    fun install(list: JList<*>) {
+        applyHeight(list)
+        list.addPropertyChangeListener("font") { applyHeight(list) }
+        list.addMouseMotionListener(
+            object : MouseMotionAdapter() {
+                override fun mouseMoved(e: MouseEvent?) {
+                    val point = e?.point ?: return
+                    val index = list.locationToIndex(point)
+                    val bounds = list.getCellBounds(index, index)
+                    val inside = bounds != null && bounds.contains(point)
+                    setHovered(list, if (inside) index else -1)
+                }
+            }
+        )
+        list.addMouseListener(
+            object : MouseAdapter() {
+                override fun mouseExited(e: MouseEvent?) {
+                    setHovered(list, -1)
+                }
+            }
+        )
+    }
+
+    /** The rollover background of [index], or null when it is not hovered. */
+    fun hoverBackground(list: JList<*>?, index: Int): Color? {
+        if (list == null || index < 0) return null
+        val hovered = list.getClientProperty(HOVER_KEY) as? Int ?: -1
+        return if (hovered == index) FaktorTheme.hover() else null
+    }
+
+    private fun applyHeight(list: JList<*>) {
+        val metrics = list.getFontMetrics(list.font ?: uiPanelFont())
+        list.fixedCellHeight = Math.max(24, metrics.height + 8)
+    }
+
+    private fun setHovered(list: JList<*>, index: Int) {
+        val current = list.getClientProperty(HOVER_KEY) as? Int ?: -1
+        if (current == index) return
+        list.putClientProperty(HOVER_KEY, index)
+        list.repaint()
+    }
+}
+
+/**
+ * The table twin of [RowRhythm]: one 24px minimum row height and the same
+ * rollover tracking, so a candidates table breathes like every Faktor list.
+ */
+internal object TableRhythm {
+
+    private const val HOVER_KEY = "faktor.hoverTableRow"
+
+    fun install(table: javax.swing.JTable) {
+        val metrics = table.getFontMetrics(table.font ?: uiPanelFont())
+        table.rowHeight = Math.max(24, metrics.height + 8)
+        table.addMouseMotionListener(
+            object : MouseMotionAdapter() {
+                override fun mouseMoved(e: MouseEvent?) {
+                    val point = e?.point ?: return
+                    val row = table.rowAtPoint(point)
+                    setHovered(table, row)
+                }
+            }
+        )
+        table.addMouseListener(
+            object : MouseAdapter() {
+                override fun mouseExited(e: MouseEvent?) {
+                    setHovered(table, -1)
+                }
+            }
+        )
+    }
+
+    fun isHovered(table: JTable, row: Int): Boolean =
+        row >= 0 && (table.getClientProperty(HOVER_KEY) as? Int ?: -1) == row
+
+    private fun setHovered(table: javax.swing.JTable, row: Int) {
+        val current = table.getClientProperty(HOVER_KEY) as? Int ?: -1
+        if (current == row) return
+        table.putClientProperty(HOVER_KEY, row)
+        table.repaint()
+    }
+}
 
 /**
  * take(max) that never splits a surrogate pair at the cut.

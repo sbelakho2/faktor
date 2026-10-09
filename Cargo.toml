@@ -68,6 +68,7 @@ members = [
     "tests/router-properties",
     "tests/acp-official",
     "tests/production-wiring",
+    "tests/security",
 ]
 
 [workspace.package]

@@ -13,7 +13,6 @@ import javax.swing.DefaultListModel
 import javax.swing.JComboBox
 import javax.swing.JList
 import javax.swing.JPanel
-import javax.swing.JScrollPane
 import javax.swing.JTextField
 import javax.swing.ListSelectionModel
 
@@ -53,12 +52,14 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
     init {
         maxHitsField.text = "50"
         evidenceList.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        RowRhythm.install(evidenceList)
         evidenceList.cellRenderer = EvidenceCellRenderer()
         evidenceList.addListSelectionListener {
             val ref = evidenceList.selectedValue ?: return@addListSelectionListener
             output.text = "selected ${describe(ref)} - press Retrieve (evidence refs from the tree retrieve instantly)"
         }
         messagesList.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        RowRhythm.install(messagesList)
         messagesList.cellRenderer = MessageCellRenderer()
         messagesList.addListSelectionListener {
             val message = messagesList.selectedValue ?: return@addListSelectionListener
@@ -101,7 +102,7 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
 
         val evidenceBody = JPanel(BorderLayout(0, Spacing.S))
         evidenceBody.isOpaque = false
-        evidenceBody.add(noHorizontalScroll(evidenceList), BorderLayout.CENTER)
+        evidenceBody.add(insetScroll(evidenceList), BorderLayout.CENTER)
         evidenceBody.add(actionBody, BorderLayout.SOUTH)
 
         val messagesBody = JPanel(BorderLayout(0, Spacing.XS))
@@ -110,16 +111,16 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
             wrappedMutedLabel("Select a message to jump the main transcript to it."),
             BorderLayout.NORTH
         )
-        messagesBody.add(noHorizontalScroll(messagesList), BorderLayout.CENTER)
+        messagesBody.add(insetScroll(messagesList), BorderLayout.CENTER)
 
         val body = pageColumn()
         body.add(card("Evidence", evidenceBody))
-        body.add(vSpace(Spacing.S))
-        body.add(card("Compact representation", JScrollPane(output)))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
+        body.add(card("Compact representation", insetScroll(output)))
+        body.add(vSpace(Spacing.M))
         body.add(card("Messages", messagesBody))
-        body.add(vSpace(Spacing.S))
-        body.add(card("Transcript slice", JScrollPane(transcriptArea)))
+        body.add(vSpace(Spacing.M))
+        body.add(card("Transcript slice", insetScroll(transcriptArea)))
         add(pageScroll(body), BorderLayout.CENTER)
         updateSelectorFields()
     }
@@ -302,7 +303,11 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
             } else {
                 "evidence:${ref.id} ${bound(ref.label, 100)}"
             }
-            return super.getListCellRendererComponent(list, text, index, selected, focus)
+            val component = super.getListCellRendererComponent(list, text, index, selected, focus)
+            if (!selected) {
+                RowRhythm.hoverBackground(list, index)?.let { component.background = it }
+            }
+            return component
         }
     }
 
@@ -320,7 +325,11 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
             } else {
                 "#${message.seq} ${message.role}: ${bound(message.text, 100)}"
             }
-            return super.getListCellRendererComponent(list, text, index, selected, focus)
+            val component = super.getListCellRendererComponent(list, text, index, selected, focus)
+            if (!selected) {
+                RowRhythm.hoverBackground(list, index)?.let { component.background = it }
+            }
+            return component
         }
     }
 }

@@ -8,12 +8,10 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.NativePermissionEntry
 import java.awt.BorderLayout
-import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
-import javax.swing.JScrollPane
 import javax.swing.ListSelectionModel
 
 class PermissionsPanel : JPanel(BorderLayout()) {
@@ -49,6 +47,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
 
     init {
         list.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        RowRhythm.install(list)
         // One bounded row label (#id capability — detail), never the raw DTO
         // toString ("NativePermissionEntry(id=7, ...").
         list.cellRenderer = object : javax.swing.DefaultListCellRenderer() {
@@ -60,6 +59,9 @@ class PermissionsPanel : JPanel(BorderLayout()) {
                 focus: Boolean
             ): java.awt.Component {
                 super.getListCellRendererComponent(listComponent, value, index, selected, focus)
+                if (!selected) {
+                    RowRhythm.hoverBackground(listComponent, index)?.let { background = it }
+                }
                 val permission = value as? NativePermissionEntry ?: return this
                 text = "#${permission.id} ${permission.capability} — " +
                     bound(permission.detail, 120)
@@ -73,24 +75,16 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         refreshButton.addActionListener { listener?.onRefresh() }
         val detailBody = JPanel(BorderLayout(0, Spacing.S))
         detailBody.isOpaque = false
-        detailBody.add(JScrollPane(detail), BorderLayout.CENTER)
+        detailBody.add(insetScroll(detail), BorderLayout.CENTER)
         detailBody.add(
             actionRow(allowButton, denyButton, refreshButton),
             BorderLayout.SOUTH
         )
         val body = pageColumn()
-        body.add(card("Pending requests", JScrollPane(list)))
-        body.add(vSpace(Spacing.S))
+        body.add(card("Pending requests", insetScroll(list)))
+        body.add(vSpace(Spacing.M))
         body.add(card("Request detail", detailBody))
-        header.font = sectionTitleFont()
-        val headerRow = JPanel(BorderLayout())
-        headerRow.isOpaque = true
-        headerRow.background = panelSurface()
-        headerRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, 0, Spacing.M
-        )
-        headerRow.add(header, BorderLayout.CENTER)
-        add(headerRow, BorderLayout.NORTH)
+        add(panelHeader(header), BorderLayout.NORTH)
         add(pageScroll(body), BorderLayout.CENTER)
         updateButtons()
     }
@@ -117,7 +111,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         } else if (model.size() > 0) {
             list.selectedIndex = 0
         } else {
-            detail.text = "no pending permission requests"
+            detail.text = "No pending permission requests. New requests appear here for review."
         }
         updateButtons()
     }
@@ -182,7 +176,11 @@ class PermissionsPanel : JPanel(BorderLayout()) {
     private fun applySelection() {
         val permission = list.selectedValue
         if (permission == null) {
-            detail.text = if (model.size() == 0) "no pending permission requests" else "select a request"
+            detail.text = if (model.size() == 0) {
+                "No pending permission requests. New requests appear here for review."
+            } else {
+                "Select a request to inspect its detail."
+            }
         } else {
             detail.text = "#${permission.id}\nsession: ${permission.sessionId}" +
                 "\ncapability: ${permission.capability}\ndetail: ${bound(permission.detail, 240)}"

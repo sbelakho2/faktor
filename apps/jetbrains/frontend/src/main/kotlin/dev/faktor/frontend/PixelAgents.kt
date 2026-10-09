@@ -274,6 +274,45 @@ object PixelAgents {
 }
 
 /**
+ * The static Faktor identity mark: the deterministic avatar of the fixed
+ * `faktor` id drawn at its settled frame with no state overlays and no timer.
+ * Used sparingly (chat toolbar, empty states) as brand presence; status is
+ * always carried by text and the live [PixelSprite] rows, never by this mark.
+ */
+class FaktorMark(private val size: Int = 18) : JComponent() {
+
+    private val avatar = PixelAgents.avatar("faktor")
+
+    init {
+        preferredSize = Dimension(size, size)
+        minimumSize = Dimension(size, size)
+        toolTipText = "Faktor"
+        isOpaque = false
+    }
+
+    override fun paintComponent(g: Graphics) {
+        val g2 = g.create() as Graphics2D
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            val cell = Math.max(2, size / 6)
+            val grid = cell * 5
+            val originX = (size - grid) / 2
+            val originY = (size - grid) / 2
+            for (y in 0 until 5) {
+                for (x in 0 until 5) {
+                    if (avatar.pixels[y * 5 + x] == 0) continue
+                    val eyes = y == 1 && (x == 1 || x == 3)
+                    g2.color = if (eyes) avatar.accent else avatar.color
+                    g2.fillRect(originX + x * cell, originY + y * cell, cell, cell)
+                }
+            }
+        } finally {
+            g2.dispose()
+        }
+    }
+}
+
+/**
  * A live sprite component for one child. The timer runs only while the
  * component is displayed AND the state is still animating; terminal states
  * settle after their bounded transition (Done/Failed) or immediately

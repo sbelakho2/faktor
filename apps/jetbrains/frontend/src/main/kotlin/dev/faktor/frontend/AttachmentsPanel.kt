@@ -27,7 +27,6 @@ import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.asciiLowerCase
 import java.awt.BorderLayout
 import java.awt.Dimension
-import java.awt.FlowLayout
 import java.awt.GraphicsEnvironment
 import java.awt.Image
 import java.awt.Toolkit
@@ -46,7 +45,6 @@ import java.util.Base64
 import javax.imageio.ImageIO
 import javax.swing.AbstractAction
 import javax.swing.DefaultListModel
-import javax.swing.JButton
 import javax.swing.JFileChooser
 import javax.swing.JComponent
 import javax.swing.JList
@@ -759,13 +757,13 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
 
     private val binaryScroll = JScrollPane(binaryList)
 
-    private val addButton = JButton("Add files...")
+    private val addButton = secondaryButton("Add files...")
 
-    private val pasteButton = JButton("Paste image")
+    private val pasteButton = secondaryButton("Paste image")
 
-    private val removeButton = JButton("Remove")
+    private val removeButton = secondaryButton("Remove")
 
-    private val clearButton = JButton("Clear")
+    private val clearButton = secondaryButton("Clear")
 
     /** One-line notice sink for the host transcript (optional in tests). */
     var onNotice: ((String) -> Unit)? = null
@@ -773,6 +771,9 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
     init {
         list.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
         list.toolTipText = "drop files here to attach them to the task"
+        // The empty drop zone stays a drop zone: a 4-row floor instead of the
+        // list consuming every spare pixel of the composer.
+        list.visibleRowCount = 4
         refusalList.selectionMode = ListSelectionModel.MULTIPLE_INTERVAL_SELECTION
         refusalList.toolTipText = "refused attachments (outside the session workspace)"
         refusalScroll.preferredSize = Dimension(0, 48)
@@ -785,11 +786,7 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
         list.transferHandler = handler
         binaryList.transferHandler = handler
 
-        val buttons = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        buttons.add(addButton)
-        buttons.add(pasteButton)
-        buttons.add(removeButton)
-        buttons.add(clearButton)
+        val buttons = actionRow(addButton, pasteButton, removeButton, clearButton)
 
         addButton.addActionListener { chooseFiles() }
         pasteButton.addActionListener { requestPasteFromClipboard() }
@@ -809,7 +806,8 @@ class AttachmentsPanel(private val workspaceRoot: Path? = null) : JPanel(BorderL
         bindPaste(this)
 
         val body = JPanel(BorderLayout(0, 2))
-        body.add(JScrollPane(list), BorderLayout.CENTER)
+        body.isOpaque = false
+        body.add(insetScroll(list), BorderLayout.CENTER)
         val south = JPanel(BorderLayout())
         south.add(refusalScroll, BorderLayout.NORTH)
         south.add(binaryScroll, BorderLayout.CENTER)

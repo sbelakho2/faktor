@@ -19,7 +19,6 @@ import dev.faktor.shared.NativeTerminalEventPage
 import dev.faktor.shared.NativeTerminalOutput
 import dev.faktor.shared.NativeTerminalPage
 import java.awt.BorderLayout
-import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JCheckBox
@@ -99,6 +98,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
     init {
         terminalsList.selectionMode = ListSelectionModel.SINGLE_SELECTION
         terminalsList.visibleRowCount = 4
+        RowRhythm.install(terminalsList)
         terminalsList.cellRenderer = TerminalCellRenderer()
         terminalsList.addListSelectionListener { updateButtons() }
         spawnButton.addActionListener { submitSpawn() }
@@ -115,16 +115,17 @@ class TerminalPanel : JPanel(BorderLayout()) {
         // fields filling east, on the shared 4/8px spacing scale.
         val spawnForm = FormGrid()
             .row("Program", commandField)
-            .row("Working directory (optional)", cwdField)
+            .row("Working dir (optional)", cwdField)
             .build()
+        cwdField.toolTipText = "Working directory the terminal starts in (daemon-relative when empty)"
         val argsHint = wrappedMutedLabel(
             "Arguments — one per line; spaces inside a line stay one argument"
         )
-        val argsScroll = JScrollPane(argsArea)
+        val argsScroll = insetScroll(argsArea)
         val shellRow = JPanel(BorderLayout(Spacing.S, 0))
         shellRow.isOpaque = false
         shellRow.add(shellModeCheck, BorderLayout.WEST)
-        shellRow.add(JScrollPane(shellArea), BorderLayout.CENTER)
+        shellRow.add(insetScroll(shellArea), BorderLayout.CENTER)
         val spawnBody = pageColumn(gap = Spacing.S, padding = 0)
         spawnBody.add(spawnForm)
         spawnBody.add(argsHint)
@@ -135,9 +136,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
         spawnBody.add(vSpace(Spacing.XS))
         spawnBody.add(actionRow(spawnButton, refreshButton))
 
-        val terminalsScroll = JScrollPane(terminalsList)
-        terminalsScroll.horizontalScrollBarPolicy =
-            javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+        val terminalsScroll = insetScroll(terminalsList)
         val terminalsBody = JPanel(BorderLayout(0, Spacing.S))
         terminalsBody.isOpaque = false
         terminalsBody.add(terminalsScroll, BorderLayout.CENTER)
@@ -145,12 +144,12 @@ class TerminalPanel : JPanel(BorderLayout()) {
 
         val eventsBody = JPanel(BorderLayout(0, Spacing.S))
         eventsBody.isOpaque = false
-        eventsBody.add(JScrollPane(eventsArea), BorderLayout.CENTER)
+        eventsBody.add(insetScroll(eventsArea), BorderLayout.CENTER)
         eventsBody.add(actionRow(moreEventsButton), BorderLayout.SOUTH)
 
         val outputBody = JPanel(BorderLayout(0, Spacing.S))
         outputBody.isOpaque = false
-        outputBody.add(JScrollPane(outputArea), BorderLayout.CENTER)
+        outputBody.add(insetScroll(outputArea), BorderLayout.CENTER)
         outputBody.add(actionRow(moreOutputButton), BorderLayout.SOUTH)
 
         // BoxLayout Y keeps every card's own preferred height; the whole
@@ -158,23 +157,15 @@ class TerminalPanel : JPanel(BorderLayout()) {
         // structured argv editor down to zero.
         val body = pageColumn()
         body.add(card("Session terminals", terminalsBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Spawn terminal", spawnBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Lifetime events", eventsBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Output snapshot", outputBody))
         val bodyScroll = JScrollPane(body)
         bodyScroll.verticalScrollBar.unitIncrement = 16
-        header.font = sectionTitleFont()
-        val headerRow = JPanel(BorderLayout())
-        headerRow.isOpaque = true
-        headerRow.background = panelSurface()
-        headerRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, 0, Spacing.M
-        )
-        headerRow.add(header, BorderLayout.CENTER)
-        add(headerRow, BorderLayout.NORTH)
+        add(panelHeader(header), BorderLayout.NORTH)
         add(bodyScroll, BorderLayout.CENTER)
         updateComposerMode()
         updateButtons()
@@ -201,7 +192,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
             terminalsList.selectedIndex = 0
         }
         eventsArea.text = if (page.note.isEmpty()) {
-            "no session-owned terminals"
+            "No session-owned terminals. Spawn one below to run commands on it."
         } else {
             "unowned daemon-level rows: ${page.unowned}\n${page.note}"
         }
@@ -213,7 +204,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
         eventsCursor = page.nextCursor
         eventsHasMore = page.hasMore
         if (page.events.isEmpty()) {
-            eventsArea.text = "no lifetime events (session ${page.sessionId})"
+            eventsArea.text = "No lifetime events yet for session ${page.sessionId}."
         } else {
             eventsArea.text = renderEvents(page.events)
         }
@@ -275,7 +266,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
     private fun renderOutput() {
         val output = lastOutput
         if (output == null) {
-            outputArea.text = ""
+            outputArea.text = "Select a terminal and load its output snapshot."
             moreOutputButton.isEnabled = false
             return
         }
@@ -343,6 +334,9 @@ class TerminalPanel : JPanel(BorderLayout()) {
             focus: Boolean
         ): java.awt.Component {
             super.getListCellRendererComponent(list, value, index, selected, focus)
+            if (!selected) {
+                RowRhythm.hoverBackground(list, index)?.let { background = it }
+            }
             val terminal = value as? NativeTerminal ?: return this
             text = rowLabel(terminal)
             return this

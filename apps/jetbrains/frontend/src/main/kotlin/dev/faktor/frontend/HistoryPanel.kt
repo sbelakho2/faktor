@@ -8,12 +8,10 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.NativeSessionSummary
 import java.awt.BorderLayout
-import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
-import javax.swing.JScrollPane
 import javax.swing.ListSelectionModel
 
 class HistoryPanel : JPanel(BorderLayout()) {
@@ -56,6 +54,7 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     init {
         list.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        RowRhythm.install(list)
         list.addListSelectionListener { updateButtons() }
         openButton.addActionListener {
             val session = list.selectedValue
@@ -66,7 +65,7 @@ class HistoryPanel : JPanel(BorderLayout()) {
         refreshButton.addActionListener { listener?.onRefresh() }
         val sessionsBody = JPanel(BorderLayout(0, Spacing.S))
         sessionsBody.isOpaque = false
-        sessionsBody.add(JScrollPane(list), BorderLayout.CENTER)
+        sessionsBody.add(insetScroll(list), BorderLayout.CENTER)
         sessionsBody.add(actionRow(openButton, refreshButton), BorderLayout.SOUTH)
         daemonLabel.font = uiPanelFont()
         streamLabel.font = uiPanelFont()
@@ -79,17 +78,9 @@ class HistoryPanel : JPanel(BorderLayout()) {
         connectionBody.add(actionRow(reconnectButton, restartButton))
         val body = pageColumn()
         body.add(card("Sessions", sessionsBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Connection", connectionBody))
-        status.font = sectionTitleFont()
-        val statusRow = JPanel(BorderLayout())
-        statusRow.isOpaque = true
-        statusRow.background = panelSurface()
-        statusRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, 0, Spacing.M
-        )
-        statusRow.add(status, BorderLayout.CENTER)
-        add(statusRow, BorderLayout.NORTH)
+        add(panelHeader(status), BorderLayout.NORTH)
         add(pageScroll(body), BorderLayout.CENTER)
         updateButtons()
     }
@@ -159,8 +150,12 @@ class HistoryPanel : JPanel(BorderLayout()) {
             focus: Boolean
         ): java.awt.Component {
             super.getListCellRendererComponent(list, value, index, selected, focus)
+            if (!selected) {
+                RowRhythm.hoverBackground(list, index)?.let { background = it }
+            }
             val session = value as? NativeSessionSummary ?: return this
             text = sessionLabel(session)
+            toolTipText = sessionLabel(session)
             return this
         }
     }

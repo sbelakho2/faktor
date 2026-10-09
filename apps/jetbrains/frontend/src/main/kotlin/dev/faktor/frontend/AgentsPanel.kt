@@ -15,7 +15,6 @@ import javax.swing.JComboBox
 import javax.swing.JMenuItem
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
-import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.SwingUtilities
 
@@ -128,10 +127,10 @@ class AgentsPanel : JPanel(BorderLayout()) {
         agentsArea.wrapStyleWord = true
         agentsArea.font = uiPanelFont()
         val outputBody = pageColumn(gap = Spacing.XS, padding = 0)
-        outputBody.add(JScrollPane(agentsArea))
+        outputBody.add(insetScroll(agentsArea))
         val page = pageColumn()
         page.add(card("Agent controls", controlsBody))
-        page.add(vSpace(Spacing.S))
+        page.add(vSpace(Spacing.M))
         page.add(card("Agent detail", outputBody))
         add(pageScroll(page), BorderLayout.CENTER)
         syncAgentControls()
@@ -189,7 +188,7 @@ class AgentsPanel : JPanel(BorderLayout()) {
         for (agent in agents) agentsModel.addElement(agent)
         if (selectedId != null) selectAgent(selectedId)
         agentsArea.text = if (agents.isEmpty()) {
-            "no background agents"
+            "No background agents yet. Children appear here while a task runs."
         } else {
             val sb = StringBuilder()
             for (agent in agents) {
@@ -206,7 +205,7 @@ class AgentsPanel : JPanel(BorderLayout()) {
 
     /** The agent-control dispatch runs only when a row is selected. */
     private fun agentButton(label: String, control: (NativeAgent) -> Unit): JButton {
-        val button = JButton(label)
+        val button = secondaryButton(label)
         agentControlButtons[label] = button
         button.addActionListener {
             val agent = agentsCombo.selectedItem as? NativeAgent
