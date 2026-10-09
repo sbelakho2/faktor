@@ -55,11 +55,36 @@ object JetBrainsHostMatrixSmoke {
     private val THEMES = arrayOf("light", "dark", "high-contrast")
 
     private var failures = 0
+
     private val checks = ArrayList<HostCheck>()
+
+    /** Fresh Task-composer hosts created for the matrix; shut down at the end. */
+    private val taskPanels = ArrayList<FaktorChatPanel>()
 
     private data class HostCheck(val name: String, val status: String, val evidence: String)
 
+    /**
+     * The real Task composer tab (Work cluster), on a fresh FaktorChatPanel:
+     * zoom checks mutate fonts, so the panel must never be shared across
+     * checks. The host has no daemon; it renders the empty composer state.
+     */
+    private fun freshTaskComposerPane(): JComponent {
+        val service = FaktorFrontendService(
+            java.nio.file.Paths.get("unused-binary"),
+            Files.createTempDirectory("faktor-host-matrix-task-")
+        )
+        val panel = FaktorChatPanel(service)
+        taskPanels.add(panel)
+        // A themed surface root: the raw JScrollPane keeps its LAF background,
+        // which would fail the high-contrast background assertion.
+        val host = javax.swing.JPanel(java.awt.BorderLayout())
+        host.background = panelSurface()
+        host.add(panel.taskComposerPaneForTest(), java.awt.BorderLayout.CENTER)
+        return host
+    }
+
     private val panelFactories: List<Pair<String, () -> JComponent>> = listOf(
+        "task" to { freshTaskComposerPane() },
         "task-tree" to { cannedTaskTreePanel() },
         "blockers" to { cannedBlockersPanel() },
         "tournament" to { cannedTournamentPanel() },
@@ -67,6 +92,9 @@ object JetBrainsHostMatrixSmoke {
         "terminal" to { cannedTerminalPanel() },
         "evidence" to { cannedEvidencePanel() },
         "board" to { cannedBoardPanel() },
+        "agents" to { cannedAgentsPanel() },
+        "status" to { cannedStatusPanel() },
+        "usage" to { cannedUsagePanel() },
         "settings" to { cannedSettingsPanel() },
         "history" to { cannedHistoryPanel() }
     )
@@ -150,6 +178,13 @@ object JetBrainsHostMatrixSmoke {
                     extracted.deleteRecursively()
                 } catch (ignored: Exception) {
                     // best-effort cleanup only; the artifact records the ZIP hash
+                }
+            }
+            for (panel in taskPanels) {
+                try {
+                    panel.shutdown()
+                } catch (ignored: Exception) {
+                    // the rendered state is already captured
                 }
             }
         }
@@ -313,12 +348,19 @@ object JetBrainsHostMatrixSmoke {
         val dir = File(ParityPath.repoRoot(), SCREENSHOT_DIR)
         dir.mkdirs()
         val affected = listOf(
+            "task" to { freshTaskComposerPane() },
             "task-tree" to { cannedTaskTreePanel() },
             "blockers" to { cannedBlockersPanel() },
             "tournament" to { cannedTournamentPanel() },
+            "permissions" to { cannedPermissionsPanel() },
             "terminal" to { cannedTerminalPanel() },
             "evidence" to { cannedEvidencePanel() },
-            "board" to { cannedBoardPanel() }
+            "board" to { cannedBoardPanel() },
+            "agents" to { cannedAgentsPanel() },
+            "status" to { cannedStatusPanel() },
+            "usage" to { cannedUsagePanel() },
+            "settings" to { cannedSettingsPanel() },
+            "history" to { cannedHistoryPanel() }
         )
         for ((name, factory) in affected) {
             for (width in WIDTHS) {

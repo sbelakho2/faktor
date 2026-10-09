@@ -90,7 +90,7 @@ class HistoryPanel : JPanel(BorderLayout()) {
         )
         statusRow.add(status, BorderLayout.CENTER)
         add(statusRow, BorderLayout.NORTH)
-        add(body, BorderLayout.CENTER)
+        add(pageScroll(body), BorderLayout.CENTER)
         updateButtons()
     }
 

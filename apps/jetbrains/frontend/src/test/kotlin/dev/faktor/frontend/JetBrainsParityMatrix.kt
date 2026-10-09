@@ -28,9 +28,12 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.JsonCodec
 import dev.faktor.shared.JsonValue
+import dev.faktor.shared.NativeBillingTaskUsage
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeCreditBalance
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeRequests
+import dev.faktor.shared.NativeUsageBuckets
 import dev.faktor.shared.asciiLowerCase
 import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeBoardPage
@@ -53,6 +56,7 @@ import java.awt.Font
 import java.awt.font.FontRenderContext
 import java.awt.image.BufferedImage
 import java.io.File
+import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.LinkedHashMap
 
@@ -292,18 +296,32 @@ internal object ParityMatrix {
         }
     }
 
-    /** Release-claim coverage: the required platforms are certified only by
-     * their OWN non-empty records in the baseline file. */
+    /** Release-claim coverage: a required platform is certified only by its
+     * OWN non-empty record whose environment carries the RESOLVED font
+     * fingerprint and names that platform. A legacy record without the
+     * fingerprint (e.g. `mac-os-x-aarch64-jvm17`) is NOT certifiable
+     * evidence and must read `not_certified` — release proof is red until a
+     * real platform host accepts it (audit 23 / closure). */
     internal fun visualCoverageOf(baseline: VisualBaseline?): Map<String, String> {
         val out = LinkedHashMap<String, String>()
         for (platform in REQUIRED_VISUAL_PLATFORMS) {
             val record = baseline?.platforms?.get(platform)
             val certified = record != null &&
                 record.digests.isNotEmpty() &&
-                record.digests.values.all { it.isNotEmpty() }
+                record.digests.values.all { it.isNotEmpty() } &&
+                hasFontFingerprint(record.environment) &&
+                environmentPlatform(record.environment) == platform
             out[platform] = if (certified) "certified" else "not_certified"
         }
         return out
+    }
+
+    /** The release platform an environment string names, or `unknown`. */
+    private fun environmentPlatform(environment: String): String = when {
+        environment.startsWith("linux-") -> "linux"
+        environment.startsWith("mac-os") -> "macos"
+        environment.startsWith("windows-") -> "windows"
+        else -> "unknown"
     }
 
     /**
@@ -321,12 +339,18 @@ internal object ParityMatrix {
             out.append("{\"schema\": \"$VISUAL_BASELINE_SCHEMA\",")
             out.append("\"requiredPlatforms\": [\"linux\",\"macos\",\"windows\"],")
             out.append("\"platforms\": {")
-            out.append("\"linux\": {\"environment\": \"linux-amd64-jvm17\", \"digests\": {")
+            out.append(
+                "\"linux\": {\"environment\": \"linux-amd64-jvm17-fbeefbeef123\", \"digests\": {"
+            )
             out.append("\"task-tree\": \"aa\", \"settings\": \"bb\"}},")
-            out.append("\"macos\": {\"environment\": \"mac-os-x-aarch64-jvm17\", \"digests\": {")
+            out.append(
+                "\"macos\": {\"environment\": \"mac-os-x-aarch64-jvm17-fcafecafe123\", \"digests\": {"
+            )
             out.append("\"task-tree\": \"cc\", \"settings\": \"dd\"}}")
             if (windows) {
-                out.append(",\"windows\": {\"environment\": \"windows-amd64-jvm17\", \"digests\": {")
+                out.append(
+                    ",\"windows\": {\"environment\": \"windows-amd64-jvm17-fdeadbeef123\", \"digests\": {"
+                )
                 out.append("\"task-tree\": \"ee\", \"settings\": \"ff\"}}")
             }
             out.append("}}")
@@ -397,12 +421,37 @@ internal object ParityMatrix {
             visualCoverageOf(complete).values.all { it == "certified" },
             "self-test: complete coverage must be certified"
         )
+        // A legacy record without the RESOLVED font fingerprint is not
+        // certifiable evidence even with non-empty digests.
+        val unresolvedText = baselineText(windows = true)
+            .replace("-fbeefbeef123", "")
+            .replace("-fcafecafe123", "")
+            .replace("-fdeadbeef123", "")
+        val unresolved = parseVisualBaseline(JsonCodec.parse(unresolvedText))
+            ?: fail("self-test: unresolved-font baseline must parse")
+        assertTrue(
+            visualCoverageOf(unresolved).values.all { it == "not_certified" },
+            "self-test: an unresolved-font record must not certify a platform"
+        )
+        // A record whose environment names another platform is never that
+        // platform's evidence.
+        val mislabeled = parseVisualBaseline(
+            JsonCodec.parse(
+                baselineText(windows = true)
+                    .replace("mac-os-x-aarch64-jvm17-fcafecafe123", "linux-amd64-jvm17-fcafecafe123")
+            )
+        ) ?: fail("self-test: mislabeled baseline must parse")
+        assertEquals(
+            "not_certified",
+            visualCoverageOf(mislabeled)["macos"],
+            "self-test: a foreign environment must not certify macos"
+        )
         // Font/environment attribution: a record whose environment carries a
         // fingerprint that does not match this host reports not_certified for
         // mismatching rows (never a false code drift), while a matching
         // digest under that environment still passes.
         val foreignEnvironment = baselineText(windows = true)
-            .replace("linux-amd64-jvm17", "linux-amd64-jvm17-fdeadbeef1234")
+            .replace("linux-amd64-jvm17-fbeefbeef123", "linux-amd64-jvm17-fdeadbeef1234")
         val fingerprinted = parseVisualBaseline(JsonCodec.parse(foreignEnvironment))
             ?: fail("self-test: fingerprinted v3 baseline must parse")
         val environmentMismatch = applyVisualEnvironmentPolicy(
@@ -425,10 +474,10 @@ internal object ParityMatrix {
         // A legacy record without a fingerprint keeps the drift comparison.
         val legacyMismatch = applyVisualEnvironmentPolicy(
             "linux",
-            complete,
+            unresolved,
             visualResultsFor(
                 "linux",
-                complete,
+                unresolved,
                 mapOf("task-tree" to "aa", "settings" to "zz")
             )
         )
@@ -1492,6 +1541,94 @@ internal fun cannedHistoryPanel(): HistoryPanel {
     panel.update(parseNativeSessionList(PARITY_SESSIONS_JSON), "7")
     panel.select(1)
     panel.setConnection("attached port 9 version fake-1", "open", 42L, "7")
+    return panel
+}
+
+/** A populated agent roster with the served ownership/model/budget fields. */
+internal fun cannedAgentsPanel(): AgentsPanel {
+    val panel = AgentsPanel()
+    panel.update(parseNativeAgents(PARITY_AGENTS_JSON))
+    return panel
+}
+
+/** A representative session/task status readout (full text lines). */
+internal fun cannedStatusPanel(): StatusPanel {
+    val panel = StatusPanel()
+    panel.setDaemon("daemon: attached port 9 version fake-1")
+    panel.setStream("stream: open at cursor 42")
+    panel.setState("state: awaiting_permission (blocked on shell approval)")
+    panel.setModel("model: alpha/m (reasoning)")
+    panel.setTool("active tool: bash [running]")
+    panel.setQueued("queued: 2")
+    panel.setUsage("usage: sessions=2 tokens=4200 taskCostMicro=1234567")
+    panel.setVerification("verification: owed=1 failed=1")
+    panel.setFiles("files changed: 3")
+    panel.setIndex("index: partial generation 7 (capped fingerprint round)")
+    return panel
+}
+
+/** A populated usage page: active subscription, quotas, credits and tasks. */
+internal fun cannedUsagePanel(): UsagePanel {
+    val panel = UsagePanel()
+    val totals = NativeUsageBuckets(
+        inputTokens = 1200,
+        outputTokens = 800,
+        cacheReadTokens = 150,
+        cacheWriteTokens = 50,
+        reasoningTokens = 25,
+        providerCostMicro = BigInteger("4200000"),
+        managedCostMicro = BigInteger("1234567"),
+        byokCostMicro = BigInteger("90000"),
+        events = 17,
+        correctedEvents = 1
+    )
+    panel.setModel(
+        UsagePanelModel(
+            state = "ok",
+            reason = null,
+            organization = "acme",
+            planId = "pro",
+            planFound = true,
+            subscription = "active",
+            subscriptionStatus = "active",
+            subscriptionExpiresMs = 1_900_000_000_000L,
+            subscriptionActive = true,
+            totals = totals,
+            tasks = listOf(NativeBillingTaskUsage(taskId = 3, runId = "run-9", totals = totals)),
+            credits = NativeCreditBalance(
+                grantedMicro = BigInteger("10000000"),
+                consumedMicro = BigInteger("250000"),
+                refundedMicro = BigInteger.ZERO,
+                heldMicro = BigInteger("1000"),
+                pendingConsumes = 1
+            ),
+            quotas = listOf(
+                UsageQuotaRow(
+                    limit = USAGE_LIMIT_MAX_TOKENS,
+                    value = BigInteger("100000"),
+                    observed = BigInteger("2200"),
+                    exceeded = false,
+                    kind = "ceiling",
+                    reason = null
+                ),
+                UsageQuotaRow(
+                    limit = USAGE_LIMIT_MANAGED_SPEND,
+                    value = BigInteger("1000000"),
+                    observed = BigInteger("1234567"),
+                    exceeded = true,
+                    kind = "ceiling",
+                    reason = null
+                )
+            ),
+            inFlight = emptyList(),
+            cursor = null,
+            nextCursor = "cursor-2",
+            itemCount = 50,
+            hasPrev = false,
+            canGrantCredits = true,
+            grantDisabledReason = null
+        )
+    )
     return panel
 }
 

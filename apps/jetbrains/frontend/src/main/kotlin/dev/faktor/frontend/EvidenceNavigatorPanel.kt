@@ -97,7 +97,7 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
         body.add(card("Messages", messagesBody))
         body.add(vSpace(Spacing.S))
         body.add(card("Transcript slice", JScrollPane(transcriptArea)))
-        add(body, BorderLayout.CENTER)
+        add(pageScroll(body), BorderLayout.CENTER)
         updateSelectorFields()
     }
 
