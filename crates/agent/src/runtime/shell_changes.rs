@@ -50,7 +50,7 @@ use faktor_cas::Cas;
 use faktor_core::hash::FileHash;
 use faktor_core::id::OpId;
 use faktor_core::op::EffectStatus;
-use faktor_fs::rooted::WalkBudget;
+use faktor_fs::rooted::{RootedDir, RootedEntryKind, WalkBudget};
 use faktor_fs::tree_manifest::{
     tree_manifest_with_skip_budgeted, TreeEntryKind, TreeManifest, MAX_TREE_MANIFEST_DEPTH,
 };
@@ -390,12 +390,30 @@ impl ShellManifestCapture {
 /// `<root>/.git` as a FILE pointing at `<common>/worktrees/<name>`, with the
 /// refs and packed-refs living in the COMMON dir. Authority transitions
 /// (git add/reset/checkout/commit/update-ref) mutate those external files,
-/// so they are fingerprinted by absolute path with stable `gitdir/` and
-/// `commondir/` labels that never leak an absolute path into durable state.
+/// so they are fingerprinted with stable `gitdir/` and `commondir/` labels
+/// that never leak an absolute path into durable state.
+///
+/// ANCHORED (audit P1): the git dir and the optional separate common dir are
+/// opened ONCE as [`RootedDir`] handles; every later probe and walk is
+/// fd-relative through those handles, so a child swapping the tree between
+/// the binding checks and the hashes can never redirect authority discovery.
 struct GitAuthority {
-    git_dir: std::path::PathBuf,
-    common_dir: std::path::PathBuf,
+    git: RootedDir,
+    common: Option<RootedDir>,
     in_workspace: bool,
+}
+
+impl GitAuthority {
+    fn common(&self) -> &RootedDir {
+        self.common.as_ref().unwrap_or(&self.git)
+    }
+}
+
+/// Bounded rooted text read (no-follow): the pointer files (`gitdir`,
+/// `commondir`) are read through the anchored handle, never by pathname.
+fn read_rooted_text(root: &RootedDir, rel: &std::path::Path) -> Option<String> {
+    let data = root.read(rel, SHELL_AUTHORITY_FILE_READ_BYTES).ok()?;
+    String::from_utf8(data.bytes).ok()
 }
 
 /// Lexically clean an absolute path (fold `.`/`..`; no filesystem access).
@@ -418,7 +436,8 @@ fn clean_absolute(path: &std::path::Path) -> std::path::PathBuf {
 /// workspace (P1: .git is hostile workspace-controlled text):
 ///
 /// * the pointer files (`<root>/.git`, `<gitdir>/gitdir`,
-///   `<gitdir>/commondir`) must be regular non-symlink files;
+///   `<gitdir>/commondir`) must be regular non-symlink files, read through
+///   the anchored workspace handle;
 /// * a linked-worktree gitdir must RECIPROCALLY point back at this
 ///   workspace's `.git` file (Git writes exactly that binding), so a hostile
 ///   `gitdir: /etc` or `gitdir: ../../../outside` is refused WITHOUT any
@@ -427,22 +446,28 @@ fn clean_absolute(path: &std::path::Path) -> std::path::PathBuf {
 ///   (`<common>/worktrees/<name>` == gitdir) or equal to the gitdir.
 ///
 /// Any validation failure returns `None`: no external path is ever opened,
-/// statted or hashed on the strength of workspace path text.
-fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
+/// statted or hashed on the strength of workspace path text. Each accepted
+/// directory is then opened ONCE as an anchored handle for all later probes.
+fn resolve_git_authority(ws: &WorkspaceHandle) -> Option<GitAuthority> {
+    let root = ws.root();
+    let anchored = ws.rooted();
     let dot = root.join(".git");
-    let meta = std::fs::symlink_metadata(&dot).ok()?;
-    if meta.is_dir() {
+    let meta = anchored
+        .entry_meta(std::path::Path::new(".git"))
+        .ok()
+        .flatten()?;
+    if meta.kind == RootedEntryKind::Directory {
         return Some(GitAuthority {
-            git_dir: dot.clone(),
-            common_dir: dot,
+            git: RootedDir::open(&dot).ok()?,
+            common: None,
             in_workspace: true,
         });
     }
-    if !meta.is_file() {
+    if meta.kind != RootedEntryKind::File {
         return None;
     }
     // `<root>/.git` is a file: `gitdir: <path>` (absolute or workspace-relative).
-    let text = std::fs::read_to_string(&dot).ok()?;
+    let text = read_rooted_text(anchored, std::path::Path::new(".git"))?;
     let raw = text
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("gitdir:"))?
@@ -470,26 +495,24 @@ fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
         return None;
     }
     // (a) The gitdir must be a REAL directory (a symlinked claim is refused
-    //     before any probe), and (b) it must carry Git's reciprocal binding
-    //     back to THIS workspace's .git pointer file.
-    let git_meta = std::fs::symlink_metadata(&git_dir).ok()?;
-    if !git_meta.is_dir() {
-        return None;
-    }
-    let back = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
-    let back_meta = std::fs::symlink_metadata(git_dir.join("gitdir")).ok()?;
-    if !back_meta.is_file() {
-        return None;
-    }
+    //     by the anchored open), and (b) it must carry Git's reciprocal
+    //     binding back to THIS workspace's .git pointer file (read through
+    //     the anchored handle, never by pathname).
+    let git = RootedDir::open(&git_dir).ok()?;
+    let back = read_rooted_text(&git, std::path::Path::new("gitdir"))?;
     if clean_absolute(std::path::Path::new(back.trim())) != dot {
         return None;
     }
     // (c) commondir (optional): a regular file whose resolved target is a
     //     real directory and either the gitdir itself or the real common
     //     ancestor of this worktree's path (`<common>/worktrees/<name>`).
-    let common_dir = match std::fs::symlink_metadata(git_dir.join("commondir")) {
-        Ok(meta) if meta.is_file() => {
-            let common = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common = match git
+        .entry_meta(std::path::Path::new("commondir"))
+        .ok()
+        .flatten()
+    {
+        Some(meta) if meta.kind == RootedEntryKind::File => {
+            let common = read_rooted_text(&git, std::path::Path::new("commondir"))?;
             let raw = common.trim();
             let resolved = {
                 let joined = git_dir.join(raw);
@@ -507,174 +530,98 @@ fn resolve_git_authority(root: &std::path::Path) -> Option<GitAuthority> {
             if resolved != git_dir && !git_dir.starts_with(&resolved) {
                 return None;
             }
-            let common_meta = std::fs::symlink_metadata(&resolved).ok()?;
-            if !common_meta.is_dir() {
-                return None;
-            }
             if resolved != git_dir {
                 let worktree_name = git_dir.file_name()?;
                 let expected = resolved.join("worktrees").join(worktree_name);
                 if clean_absolute(&expected) != git_dir {
                     return None;
                 }
+                Some(RootedDir::open(&resolved).ok()?)
+            } else {
+                None
             }
-            resolved
         }
-        Ok(_) => return None,
-        Err(_) => git_dir.clone(),
+        Some(_) => return None,
+        None => None,
     };
     Some(GitAuthority {
-        git_dir,
-        common_dir,
+        git,
+        common,
         in_workspace: false,
     })
 }
 
-/// Probe ONE authority file by absolute path (bounded read). `None` means the
-/// path does not exist as a file.
-fn authority_probe_abs(abs: &std::path::Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(abs).ok()?;
-    if meta.file_type().is_symlink() {
-        return Some("symlink".into());
-    }
-    if !meta.is_file() {
-        return None;
-    }
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(abs) else {
-        return Some("unreadable".into());
-    };
-    let mut bytes = Vec::new();
-    if file
-        .by_ref()
-        .take(SHELL_AUTHORITY_FILE_READ_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return Some("unreadable".into());
-    }
-    let truncated = bytes.len() > SHELL_AUTHORITY_FILE_READ_BYTES;
-    if truncated {
-        bytes.truncate(SHELL_AUTHORITY_FILE_READ_BYTES);
-    }
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    Some(if truncated {
-        format!("slice:{hash}")
-    } else {
-        hash
-    })
-}
-
-/// Probe ONE workspace-relative authority file through the rooted handle
-/// (used for `.faktor` state; Git authority is probed by absolute path).
-fn authority_probe_file(ws: &WorkspaceHandle, rel: &str) -> Option<String> {
-    let abs = ws.root().join(rel);
-    let meta = std::fs::symlink_metadata(&abs).ok()?;
-    if meta.file_type().is_symlink() {
-        return Some("symlink".into());
-    }
-    if !meta.is_file() {
-        return None;
-    }
-    match ws.read(std::path::Path::new(rel), SHELL_AUTHORITY_FILE_READ_BYTES) {
-        Ok(data) => Some(match &data.digest {
-            faktor_fs::ContentDigest::Full(hash) => hash.to_hex(),
-            faktor_fs::ContentDigest::Slice { hash, .. } => format!("slice:{}", hash.to_hex()),
-        }),
-        Err(_) => Some("unreadable".into()),
+/// Probe ONE authority file through an ANCHORED handle: kind from
+/// fd-relative metadata, digest from the bounded no-follow read. The labels
+/// (`symlink` / `unreadable` / `slice:<hex>`) are unchanged from the
+/// historical absolute-path probe; only the resolution is anchored.
+fn authority_probe_rooted(root: &RootedDir, rel: &std::path::Path) -> Option<String> {
+    let meta = root.entry_meta(rel).ok().flatten()?;
+    match meta.kind {
+        RootedEntryKind::Symlink => Some("symlink".into()),
+        RootedEntryKind::File => match root.read(rel, SHELL_AUTHORITY_FILE_READ_BYTES) {
+            Ok(data) => Some(match &data.digest {
+                faktor_fs::ContentDigest::Full(hash) => hash.to_hex(),
+                faktor_fs::ContentDigest::Slice { hash, .. } => format!("slice:{}", hash.to_hex()),
+            }),
+            Err(_) => Some("unreadable".into()),
+        },
+        _ => None,
     }
 }
 
-/// Probe the workspace-relative `.faktor` tree through the rooted handle
-/// (sorted, symlink-aware, depth- and entry-bounded).
-fn authority_probe_dir(
-    ws: &WorkspaceHandle,
-    rel: &str,
+/// Bounded, symlink-aware recursive walk of one ANCHORED authority subtree
+/// (audit P1): every listing and child inspection is fd-relative through
+/// `root`, so no pathname is re-resolved mid-walk and a rename/symlink swap
+/// cannot redirect discovery. `label_base` prefixes the emitted keys; `None`
+/// keeps the caller's relative path (the `.faktor` convention). The
+/// entry/depth budget semantics are unchanged.
+fn authority_probe_rooted_dir(
+    root: &RootedDir,
+    base_rel: &std::path::Path,
+    label_base: Option<&str>,
     out: &mut BTreeMap<String, String>,
     budget: &mut usize,
 ) {
-    let root = ws.root().join(rel);
-    let Ok(meta) = std::fs::symlink_metadata(&root) else {
-        return;
-    };
-    if !meta.is_dir() {
-        return;
+    match root.entry_meta(base_rel).ok().flatten() {
+        Some(meta) if meta.kind == RootedEntryKind::Directory => {}
+        _ => return,
     }
-    let mut stack = vec![(std::path::PathBuf::from(rel), 0usize)];
+    let mut stack = vec![(base_rel.to_path_buf(), 0usize)];
     while let Some((dir_rel, depth)) = stack.pop() {
         if *budget == 0 || depth > 8 {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(ws.root().join(&dir_rel)) else {
+        let Ok(listing) = root.list_entries(&dir_rel, SHELL_AUTHORITY_DIR_ENTRIES) else {
             continue;
         };
-        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
-        names.sort_by_key(|entry| entry.file_name());
-        for entry in names.into_iter().take(SHELL_AUTHORITY_DIR_ENTRIES) {
+        let mut entries = listing.entries;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
             if *budget == 0 {
                 break;
             }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+            let child_rel = dir_rel.join(&entry.name);
+            let relative = child_rel.strip_prefix(base_rel).unwrap_or(&child_rel);
+            let key = match label_base {
+                None => child_rel.to_string_lossy().replace('\\', "/"),
+                Some(base) => format!("{base}/{}", relative.to_string_lossy().replace('\\', "/")),
             };
-            let child_rel = dir_rel.join(entry.file_name());
-            let child = child_rel.to_string_lossy().replace('\\', "/");
-            if child.len() > SHELL_AUTHORITY_PATH_MAX_BYTES {
+            if key.len() > SHELL_AUTHORITY_PATH_MAX_BYTES {
                 continue;
             }
             *budget -= 1;
-            if file_type.is_dir() {
-                stack.push((child_rel, depth + 1));
-            } else if file_type.is_file() {
-                if let Some(hash) = authority_probe_file(ws, &child) {
-                    out.insert(child, hash);
+            match entry.kind {
+                RootedEntryKind::Directory => stack.push((child_rel, depth + 1)),
+                RootedEntryKind::File => {
+                    if let Some(hash) = authority_probe_rooted(root, &child_rel) {
+                        out.insert(key, hash);
+                    }
                 }
-            } else if file_type.is_symlink() {
-                out.insert(child, "symlink".into());
-            }
-        }
-    }
-}
-
-/// Bounded recursive walk of an ABSOLUTE authority subtree (refs/** of a
-/// linked worktree's common dir), labels prefixed by `label`.
-fn authority_probe_abs_dir(
-    dir: &std::path::Path,
-    label: &str,
-    out: &mut BTreeMap<String, String>,
-    budget: &mut usize,
-) {
-    let mut stack = vec![(dir.to_path_buf(), 0usize, String::from(label))];
-    while let Some((path, depth, prefix)) = stack.pop() {
-        if *budget == 0 || depth > 8 {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
-        };
-        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
-        names.sort_by_key(|entry| entry.file_name());
-        for entry in names.into_iter().take(SHELL_AUTHORITY_DIR_ENTRIES) {
-            if *budget == 0 {
-                break;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let child_label = format!("{prefix}/{name}");
-            if child_label.len() > SHELL_AUTHORITY_PATH_MAX_BYTES {
-                continue;
-            }
-            *budget -= 1;
-            if file_type.is_dir() {
-                stack.push((entry.path(), depth + 1, child_label));
-            } else if file_type.is_file() {
-                if let Some(hash) = authority_probe_abs(&entry.path()) {
-                    out.insert(child_label, hash);
+                RootedEntryKind::Symlink => {
+                    out.insert(key, "symlink".into());
                 }
-            } else if file_type.is_symlink() {
-                out.insert(child_label, "symlink".into());
+                RootedEntryKind::Other => {}
             }
         }
     }
@@ -688,12 +635,12 @@ fn authority_probe_abs_dir(
 pub(crate) fn capture_authority_state(ws: &WorkspaceHandle) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut budget = SHELL_AUTHORITY_MAX_ENTRIES;
-    let root = ws.root();
-    if let Some(git) = resolve_git_authority(root) {
+    let anchored = ws.rooted();
+    if let Some(git) = resolve_git_authority(ws) {
         let git_label = if git.in_workspace { ".git" } else { "gitdir" };
         // The `.git` pointer file itself (worktree identity) when it is a file.
         if !git.in_workspace {
-            if let Some(hash) = authority_probe_abs(&root.join(".git")) {
+            if let Some(hash) = authority_probe_rooted(anchored, std::path::Path::new(".git")) {
                 out.insert(".git".to_string(), hash);
             }
         }
@@ -702,69 +649,90 @@ pub(crate) fn capture_authority_state(ws: &WorkspaceHandle) -> BTreeMap<String, 
                 break;
             }
             budget -= 1;
-            let path = git.git_dir.join(leaf);
-            if let Some(hash) = authority_probe_abs(&path) {
+            if let Some(hash) = authority_probe_rooted(&git.git, std::path::Path::new(leaf)) {
                 out.insert(format!("{git_label}/{leaf}"), hash);
             }
-            if git.common_dir != git.git_dir {
+            if git.common.is_some() {
                 if budget == 0 {
                     break;
                 }
                 budget -= 1;
-                if let Some(hash) = authority_probe_abs(&git.common_dir.join(leaf)) {
+                if let Some(hash) = authority_probe_rooted(git.common(), std::path::Path::new(leaf))
+                {
                     out.insert(format!("commondir/{leaf}"), hash);
                 }
             }
         }
-        authority_probe_abs_dir(
-            &git.common_dir.join("refs"),
-            if git.in_workspace {
+        authority_probe_rooted_dir(
+            git.common(),
+            std::path::Path::new("refs"),
+            Some(if git.in_workspace {
                 ".git/refs"
             } else {
                 "commondir/refs"
-            },
+            }),
             &mut out,
             &mut budget,
         );
-        if git.git_dir != git.common_dir {
-            authority_probe_abs_dir(
-                &git.git_dir.join("refs"),
-                "gitdir/refs",
+        if git.common.is_some() {
+            authority_probe_rooted_dir(
+                &git.git,
+                std::path::Path::new("refs"),
+                Some("gitdir/refs"),
                 &mut out,
                 &mut budget,
             );
         }
-        // Registered linked worktrees (their HEAD/gitdir/index are authority).
-        let worktrees = git.common_dir.join("worktrees");
-        if let Ok(entries) = std::fs::read_dir(&worktrees) {
-            let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
-            names.sort_by_key(|entry| entry.file_name());
-            for entry in names.into_iter().take(32) {
-                if budget == 0 {
-                    break;
-                }
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                for leaf in ["HEAD", "gitdir", "index"] {
-                    if budget == 0 {
-                        break;
-                    }
-                    budget -= 1;
-                    let worktrees_label = if git.in_workspace {
-                        ".git"
-                    } else {
-                        "commondir"
-                    };
-                    if let Some(hash) = authority_probe_abs(&entry.path().join(leaf)) {
-                        out.insert(format!("{worktrees_label}/worktrees/{name}/{leaf}"), hash);
+        // Registered linked worktrees (their HEAD/gitdir/index are authority):
+        // the listing and every leaf read go through the anchored common dir.
+        let worktrees_label = if git.in_workspace {
+            ".git"
+        } else {
+            "commondir"
+        };
+        if let Ok(Some(meta)) = git.common().entry_meta(std::path::Path::new("worktrees")) {
+            if meta.kind == RootedEntryKind::Directory {
+                if let Ok(listing) = git
+                    .common()
+                    .list_entries(std::path::Path::new("worktrees"), 32)
+                {
+                    let mut entries = listing.entries;
+                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    for entry in entries.into_iter().take(32) {
+                        if budget == 0 {
+                            break;
+                        }
+                        if !entry.is_dir() {
+                            continue;
+                        }
+                        let name = entry.name.to_string_lossy().into_owned();
+                        for leaf in ["HEAD", "gitdir", "index"] {
+                            if budget == 0 {
+                                break;
+                            }
+                            budget -= 1;
+                            let rel = std::path::Path::new("worktrees")
+                                .join(&entry.name)
+                                .join(leaf);
+                            if let Some(hash) = authority_probe_rooted(git.common(), &rel) {
+                                out.insert(
+                                    format!("{worktrees_label}/worktrees/{name}/{leaf}"),
+                                    hash,
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    authority_probe_dir(ws, ".faktor", &mut out, &mut budget);
+    authority_probe_rooted_dir(
+        anchored,
+        std::path::Path::new(".faktor"),
+        None,
+        &mut out,
+        &mut budget,
+    );
     out
 }
 

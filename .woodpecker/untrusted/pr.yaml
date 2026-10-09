@@ -373,6 +373,9 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # Singular-authority law: the retired raw network matcher must never
+      # return; the canonical destination/DNS authority owns egress.
+      - node scripts/check-network-authority-singular.mjs
       # The executable planted-mutation campaign (cargo + JDK/gradle + Node)
       # runs in the trusted workflow's jetbrains-smoke lane; this node-only
       # PR image carries no toolchains, so running it here would count

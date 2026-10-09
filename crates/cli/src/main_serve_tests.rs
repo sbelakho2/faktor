@@ -359,8 +359,9 @@ fn daemon_instructions_resolver_reads_the_live_shadow_of_a_shadowed_workspace() 
         .active_for("anything", &[])
         .iter()
         .any(|i| i.content.contains("user-checkout rules")));
-    // Two live shadows on one workspace: ambiguous — loud degrade to the
-    // stored root (never a guessed root).
+    // Two live shadows on one workspace: ambiguous — a TYPED refusal
+    // (authority law), never a guessed root and never a silent degrade to
+    // the stored tree.
     let other = session.create_session(ws, "other", "fake", "m").unwrap();
     let mut other_row = faktor_session::ShadowRow {
         session_id: other.id().raw(),
@@ -377,13 +378,15 @@ fn daemon_instructions_resolver_reads_the_live_shadow_of_a_shadowed_workspace() 
     revived.state = faktor_session::ShadowRowState::IntegrationBlocked;
     session.put_shadow_row(handle.id(), &revived).unwrap();
     other_row.state = faktor_session::ShadowRowState::Active;
-    let loaded = resolver.resolve(ws.raw(), None).unwrap();
+    let err = resolver.resolve(ws.raw(), None).unwrap_err();
     assert!(
-        loaded
-            .active_for("anything", &[])
-            .iter()
-            .any(|i| i.content.contains("user-checkout rules")),
-        "ambiguous shadows never hijack the stored root"
+        matches!(err, faktor_instructions::RulesLoadError::Unreadable(_)),
+        "ambiguous shadows must be a typed refusal: {err:?}"
+    );
+    let detail = err.to_string();
+    assert!(
+        detail.contains("unavailable") && detail.contains("ambiguous"),
+        "the refusal names the ambiguous authority: {detail}"
     );
 }
 

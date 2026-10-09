@@ -28,44 +28,54 @@
     "commands": [
       {
         "command": "faktor.startServer",
-        "title": "Faktor: Start Daemon"
+        "title": "Diagnostics: Start Service",
+        "category": "Faktor"
       },
       {
         "command": "faktor.stopServer",
-        "title": "Faktor: Stop Daemon"
+        "title": "Diagnostics: Stop Service",
+        "category": "Faktor"
       },
       {
         "command": "faktor.openChat",
-        "title": "Faktor: Open Chat",
-        "icon": "$(comment-discussion)"
+        "title": "Open",
+        "icon": "$(comment-discussion)",
+        "category": "Faktor"
       },
       {
         "command": "faktor.newTask",
-        "title": "Faktor: New Task"
+        "title": "New Task",
+        "category": "Faktor"
       },
       {
         "command": "faktor.cancelTask",
-        "title": "Faktor: Cancel Active Task"
+        "title": "Stop Current Run",
+        "category": "Faktor"
       },
       {
         "command": "faktor.replyPermission",
-        "title": "Faktor: Reply to Pending Permission"
+        "title": "Reply to Permission",
+        "category": "Faktor"
       },
       {
         "command": "faktor.refresh",
-        "title": "Faktor: Refresh State"
+        "title": "Diagnostics: Refresh State",
+        "category": "Faktor"
       },
       {
         "command": "faktor.controlPlaneSignIn",
-        "title": "Faktor: Sign in to Control Plane"
+        "title": "Sign In",
+        "category": "Faktor"
       },
       {
         "command": "faktor.controlPlaneSignOut",
-        "title": "Faktor: Sign out of Control Plane"
+        "title": "Sign Out",
+        "category": "Faktor"
       },
       {
         "command": "faktor.reconnectStream",
-        "title": "Faktor: Reconnect Event Stream"
+        "title": "Diagnostics: Reconnect Event Stream",
+        "category": "Faktor"
       }
     ],
     "viewsContainers": {
@@ -86,97 +96,137 @@
         }
       ]
     },
-    "configuration": {
-      "title": "Faktor",
-      "properties": {
-        "faktor.binaryPath": {
-          "type": "string",
-          "default": "",
-          "description": "Explicit path to the faktor-cli binary (overrides FAKTOR_BIN and the target/debug|release lookup)."
-        },
-        "faktor.dataDir": {
-          "type": "string",
-          "default": "",
-          "description": "Persistent daemon data directory; empty uses the daemon default."
-        },
-        "faktor.installRoot": {
-          "type": "string",
-          "default": "",
-          "description": "Install root holding the immutable release layout (current, launcher, versions/). When a layout exists there the daemon is spawned through the stable bootstrap launcher, so the activated release and only that release runs; empty resolves to <faktor.dataDir>/install (or ~/.faktor/install), with the legacy binary lookup as the fallback when no layout exists."
-        },
-        "faktor.extraArgs": {
-          "type": "array",
-          "items": {
-            "type": "string"
+    "configuration": [
+      {
+        "title": "Faktor",
+        "properties": {
+          "faktor.autoStart": {
+            "type": "boolean",
+            "default": false,
+            "description": "Start the daemon when the extension activates."
           },
-          "default": [],
-          "description": "Extra argv appended to `faktor-cli serve --port 0`."
-        },
-        "faktor.startupTimeoutMs": {
-          "type": "number",
-          "default": 45000,
-          "minimum": 1000,
-          "description": "How long to wait for the daemon startup line before failing (must exceed the bootstrap launcher's ~30 s launch window)."
-        },
-        "faktor.autoStart": {
-          "type": "boolean",
-          "default": false,
-          "description": "Start the daemon when the extension activates."
-        },
-        "faktor.defaultProvider": {
-          "type": "string",
-          "default": "",
-          "description": "Provider id for new sessions; empty uses the first model in the daemon catalog."
-        },
-        "faktor.defaultModel": {
-          "type": "string",
-          "default": "",
-          "description": "Model id for new sessions; empty uses the first model in the daemon catalog."
-        },
-        "faktor.mutationMode": {
-          "type": "string",
-          "enum": [
-            "shadow",
-            ""
-          ],
-          "default": "",
-          "description": "Mutation mode for new task runs (informational, shadow-only). Empty (default) inherits the daemon mode; \"shadow\" names the daemon's only mutation mode explicitly. Every mutating run executes in an isolated candidate. \"direct_compat\" was removed and is a typed refusal, never a downgrade."
-        },
-        "faktor.budgetTokens": {
-          "type": "number",
-          "default": 0,
-          "minimum": 0,
-          "description": "max_tokens for new task runs (0 = daemon default)."
-        },
-        "faktor.budgetCostMicro": {
-          "type": "number",
-          "default": 0,
-          "minimum": 0,
-          "description": "max_cost_micro for new task runs (0 = daemon default)."
-        },
-        "faktor.controlPlaneEndpoint": {
-          "type": "string",
-          "default": "https://api.faktor.dev",
-          "description": "Cloud control-plane endpoint the stored credential belongs to. Non-secret: it is half of the SecretStorage key (endpoint + organization), never a credential."
-        },
-        "faktor.controlPlaneOrganization": {
-          "type": "string",
-          "default": "",
-          "description": "Organization (or account) id the stored control-plane credential belongs to. Non-secret: written by \"Faktor: Sign in to Control Plane\"."
-        },
-        "faktor.controlPlaneAuthSession": {
-          "type": "string",
-          "default": "",
-          "description": "Auth-session id (non-secret) the stored credential owns, from the SSO callback or bootstrap result. Written by \"Faktor: Sign in to Control Plane\"; used only to name the session in the daemon's sign-out revoke body. Never a credential."
-        },
-        "faktor.controlToken": {
-          "type": "string",
-          "default": "",
-          "deprecationMessage": "Deprecated plaintext credential. The extension never sends this value to control-plane routes; sign in through \"Faktor: Sign in to Control Plane\" to store the credential in the OS/IDE secret store (this setting is deleted once migrated).",
-          "description": "DEPRECATED (plaintext, never sent): legacy control-plane credential kept only so the one-shot migration prompt can find and delete it. Use \"Faktor: Sign in to Control Plane\" instead; the local daemon password is handled separately and is unchanged."
+          "faktor.defaultProvider": {
+            "type": "string",
+            "default": "",
+            "description": "Provider id for new sessions; empty uses the first model in the daemon catalog."
+          },
+          "faktor.defaultModel": {
+            "type": "string",
+            "default": "",
+            "description": "Model id for new sessions; empty uses the first model in the daemon catalog."
+          },
+          "faktor.mutationMode": {
+            "type": "string",
+            "enum": [
+              "shadow",
+              ""
+            ],
+            "default": "",
+            "description": "Mutation mode for new task runs (informational, shadow-only). Empty (default) inherits the daemon mode; \"shadow\" names the daemon's only mutation mode explicitly. Every mutating run executes in an isolated candidate. \"direct_compat\" was removed and is a typed refusal, never a downgrade."
+          },
+          "faktor.budgetTokens": {
+            "type": "number",
+            "default": 0,
+            "minimum": 0,
+            "description": "max_tokens for new task runs (0 = daemon default)."
+          },
+          "faktor.budgetCostMicro": {
+            "type": "number",
+            "default": 0,
+            "minimum": 0,
+            "description": "max_cost_micro for new task runs (0 = daemon default)."
+          }
+        }
+      },
+      {
+        "title": "Faktor: Advanced",
+        "properties": {
+          "faktor.binaryPath": {
+            "type": "string",
+            "default": "",
+            "description": "Explicit path to the faktor-cli binary (overrides FAKTOR_BIN and the target/debug|release lookup)."
+          },
+          "faktor.dataDir": {
+            "type": "string",
+            "default": "",
+            "description": "Persistent daemon data directory; empty uses the daemon default."
+          },
+          "faktor.installRoot": {
+            "type": "string",
+            "default": "",
+            "description": "Install root holding the immutable release layout (current, launcher, versions/). When a layout exists there the daemon is spawned through the stable bootstrap launcher, so the activated release and only that release runs; empty resolves to <faktor.dataDir>/install (or ~/.faktor/install), with the legacy binary lookup as the fallback when no layout exists."
+          },
+          "faktor.extraArgs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "Extra argv appended to `faktor-cli serve --port 0`."
+          },
+          "faktor.startupTimeoutMs": {
+            "type": "number",
+            "default": 45000,
+            "minimum": 1000,
+            "description": "How long to wait for the daemon startup line before failing (must exceed the bootstrap launcher's ~30 s launch window)."
+          },
+          "faktor.controlPlaneEndpoint": {
+            "type": "string",
+            "default": "https://api.faktor.dev",
+            "description": "Cloud control-plane endpoint the stored credential belongs to. Non-secret: it is half of the SecretStorage key (endpoint + organization), never a credential."
+          },
+          "faktor.controlPlaneOrganization": {
+            "type": "string",
+            "default": "",
+            "description": "Organization (or account) id the stored control-plane credential belongs to. Non-secret: written by \"Faktor: Sign in to Control Plane\"."
+          },
+          "faktor.controlPlaneAuthSession": {
+            "type": "string",
+            "default": "",
+            "description": "Auth-session id (non-secret) the stored credential owns, from the SSO callback or bootstrap result. Written by \"Faktor: Sign in to Control Plane\"; used only to name the session in the daemon's sign-out revoke body. Never a credential."
+          },
+          "faktor.controlToken": {
+            "type": "string",
+            "default": "",
+            "deprecationMessage": "Deprecated plaintext credential. The extension never sends this value to control-plane routes; sign in through \"Faktor: Sign in to Control Plane\" to store the credential in the OS/IDE secret store (this setting is deleted once migrated).",
+            "description": "DEPRECATED (plaintext, never sent): legacy control-plane credential kept only so the one-shot migration prompt can find and delete it. Use \"Faktor: Sign in to Control Plane\" instead; the local daemon password is handled separately and is unchanged."
+          }
         }
       }
-    }
+    ],
+    "walkthroughs": [
+      {
+        "id": "faktor.getStarted",
+        "title": "Get started with Faktor",
+        "description": "An engineering agent that can inspect, modify and verify this workspace.",
+        "steps": [
+          {
+            "id": "faktor.ask",
+            "title": "Ask Faktor to do something",
+            "description": "Open Faktor and describe the task in plain language. Faktor works in an isolated candidate workspace and only integrates verified changes.",
+            "completionEvents": [
+              "onCommand:faktor.openChat"
+            ]
+          },
+          {
+            "id": "faktor.review",
+            "title": "Inspect what Faktor is doing",
+            "description": "The current run and the conversation stay primary. Use **Inspect** for run details, agents, the coordination board and evidence.",
+            "completionEvents": [
+              "onCommand:faktor.refresh"
+            ]
+          },
+          {
+            "id": "faktor.finish",
+            "title": "Choose how work finishes",
+            "description": "Set **Finish when done** in the composer to commit, push or open a pull request once verification passes.",
+            "completionEvents": [
+              "onCommand:faktor.newTask"
+            ]
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "build": "tsc -p .",

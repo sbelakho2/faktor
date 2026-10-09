@@ -3329,7 +3329,13 @@ async function shadowDefaultTests() {
     const manifest = JSON.parse(
       readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
     );
-    const setting = manifest.contributes.configuration.properties['faktor.mutationMode'];
+    const configurationSections = Array.isArray(manifest.contributes.configuration)
+      ? manifest.contributes.configuration
+      : [manifest.contributes.configuration];
+    const setting = Object.assign(
+      {},
+      ...configurationSections.map((section) => section.properties ?? {}),
+    )['faktor.mutationMode'];
     assertEqual(setting.default, '', 'the setting default must be inherit-daemon');
     assertDeepEqual(setting.enum, ['shadow', ''], 'the setting must offer shadow/empty only');
     assert(!setting.enum.includes('direct_compat'), 'the removed mode must not be selectable');
@@ -7376,7 +7382,15 @@ async function composerAttachmentTests() {
 
   await test('every contributed setting is declared with its pinned type and description', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    const props = pkg.contributes.configuration.properties;
+    const sections = Array.isArray(pkg.contributes.configuration)
+      ? pkg.contributes.configuration
+      : [pkg.contributes.configuration];
+    assertDeepEqual(
+      sections.map((section) => section.title),
+      ['Faktor', 'Faktor: Advanced'],
+      'the settings hierarchy is pinned: everyday settings first, advanced last',
+    );
+    const props = Object.assign({}, ...sections.map((section) => section.properties ?? {}));
     const expected = {
       'faktor.binaryPath': 'string',
       'faktor.dataDir': 'string',
@@ -7399,6 +7413,14 @@ async function composerAttachmentTests() {
       Object.keys(expected).sort(),
       'the contributed setting id set is pinned',
     );
+    const placements = sections.map((section) => new Set(Object.keys(section.properties ?? {})));
+    for (const id of Object.keys(expected)) {
+      assertEqual(
+        placements.filter((keys) => keys.has(id)).length,
+        1,
+        `${id} must live in exactly one settings section`,
+      );
+    }
     for (const [id, type] of Object.entries(expected)) {
       assertEqual(props[id].type, type, `${id} type`);
       assert(
@@ -7418,6 +7440,47 @@ async function composerAttachmentTests() {
       true,
       'the legacy plaintext token must stay marked deprecated',
     );
+  });
+
+  await test('the palette taxonomy and the onboarding walkthrough are pinned', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    const commands = new Map(
+      pkg.contributes.commands.map((entry) => [entry.command, entry]),
+    );
+    const pinned = {
+      'faktor.openChat': 'Open',
+      'faktor.newTask': 'New Task',
+      'faktor.cancelTask': 'Stop Current Run',
+      'faktor.replyPermission': 'Reply to Permission',
+      'faktor.controlPlaneSignIn': 'Sign In',
+      'faktor.controlPlaneSignOut': 'Sign Out',
+      'faktor.startServer': 'Diagnostics: Start Service',
+      'faktor.stopServer': 'Diagnostics: Stop Service',
+      'faktor.refresh': 'Diagnostics: Refresh State',
+      'faktor.reconnectStream': 'Diagnostics: Reconnect Event Stream',
+    };
+    assertEqual(commands.size, Object.keys(pinned).length, 'the command id set is pinned');
+    for (const [id, title] of Object.entries(pinned)) {
+      const entry = commands.get(id);
+      assert(entry, `${id} must be contributed`);
+      assertEqual(entry.title, title, `${id} visible label`);
+      assertEqual(entry.category, 'Faktor', `${id} palette category`);
+    }
+    const walkthroughs = pkg.contributes.walkthroughs ?? [];
+    assertEqual(walkthroughs.length, 1, 'exactly one onboarding walkthrough');
+    assertEqual(walkthroughs[0].id, 'faktor.getStarted');
+    assertEqual(walkthroughs[0].title, 'Get started with Faktor');
+    assertEqual(walkthroughs[0].steps.length, 3, 'three onboarding steps');
+    for (const step of walkthroughs[0].steps) {
+      assert(
+        typeof step.title === 'string' && step.title.length > 0,
+        'every walkthrough step carries a title',
+      );
+      assert(
+        typeof step.description === 'string' && step.description.length > 0,
+        'every walkthrough step carries user-facing copy',
+      );
+    }
   });
 
   await test('the webview markup and canonical DOM identity are pinned against drift', () => {

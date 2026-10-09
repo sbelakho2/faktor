@@ -1,5 +1,34 @@
 # Faktor
 
+**An engineering agent that can inspect, modify and verify this workspace.**
+
+Faktor plans the work, edits code in an isolated candidate workspace behind
+transactions and checkpoints, runs the verification you asked for, and only
+integrates changes that pass. The conversation and the current run stay
+primary; run details, agents, coordination and evidence are one click away
+behind **Inspect**.
+
+## What it does
+
+- **Implement a feature** — describe the goal; Faktor plans, edits and verifies.
+- **Fix a bug** — investigate with hybrid retrieval, patch transactionally,
+  prove the fix.
+- **Investigate code** — ask questions and get evidence-backed answers.
+- **Verify changes** — acceptance criteria, checks and an independent review
+  gate completion; a run is never marked done on optimism.
+- **Parallelize larger tasks** — child agents with explicit budgets and an
+  explicit integration step.
+
+## Quick start
+
+- **VS Code** — install the Faktor extension (`apps/vscode`), open your
+  project, run **Faktor: Open** and describe the task.
+- **JetBrains** — install the Faktor plugin (`apps/jetbrains`), open the
+  Faktor tool window and describe the task.
+- **CLI** — `faktor run "describe the task"`; `faktor --help` groups commands
+  into Daily (run, doctor, sessions), Service (serve, build, acp, bootstrap)
+  and Admin (commerce, enterprise, updater, worker).
+
 **A native Rust engineering runtime with Faktor-owned IDE UIs.**
 
 Faktor is an independent implementation: the daemon speaks the Faktor

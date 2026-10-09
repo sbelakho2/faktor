@@ -1774,16 +1774,13 @@ release_critical = true
 platforms = ["linux", "macos", "windows"]
 
 [[invariant]]
-id = "INV-NETWORK-POLICY-STRICT"
-statement = "NetworkPolicy matching is anchored on scheme, host and port (and a path segment boundary when specified); unparseable or continuation-extended destinations are denied."
-owner = "crates/core NetworkPolicy"
-authority = "planted mutation scripts/mutations/INV-NETWORK-POLICY-STRICT.json"
-script_check = ""
-unit_test = "network_policy_matrix"
-production_wiring = "core_resource_gauge_and_capability_sets"
-fault = ""
-mutation_witness = "network_policy_matrix"
-mutation_command = "node scripts/mutation-run.mjs INV-NETWORK-POLICY-STRICT"
+id = "INV-NETWORK-AUTHORITY-SINGULAR"
+statement = "Production egress has one authority: the canonical destination/DNS parser. The retired NetworkPolicy raw URL/prefix matcher cannot be reintroduced; a mechanical script check fails on any call or matcher definition."
+owner = "crates/core NetworkPolicy vocabulary"
+authority = "scripts/check-network-authority-singular.mjs + planted mutation scripts/mutations/INV-NETWORK-AUTHORITY-SINGULAR.json"
+script_check = "node scripts/check-network-authority-singular.mjs"
+mutation_witness = "node scripts/check-network-authority-singular.mjs"
+mutation_command = "node scripts/mutation-run.mjs INV-NETWORK-AUTHORITY-SINGULAR"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]

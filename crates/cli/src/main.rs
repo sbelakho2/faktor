@@ -55,7 +55,11 @@ use graph::DaemonGraph;
 #[command(
     name = "faktor",
     version,
-    about = "Faktor — native Rust agent engine, daemon and CLI"
+    about = "Faktor — an engineering agent for code investigation, implementation and verification",
+    long_about = "Faktor — an engineering agent for code investigation, implementation and verification.\n\n\
+                  Daily:   run, doctor, sessions\n\
+                  Service: serve, build, acp, bootstrap\n\
+                  Admin:   commerce, enterprise, updater, worker"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -65,6 +69,7 @@ struct Cli {
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Start the daemon; prints the Faktor startup line on stdout.
+    #[command(display_order = 40)]
     Serve {
         #[arg(long, default_value_t = 0)]
         port: u16,
@@ -74,6 +79,7 @@ pub(crate) enum Command {
         config: Option<String>,
     },
     /// Headless: create a session and run one prompt.
+    #[command(display_order = 10)]
     Run {
         prompt: String,
         /// Provider instance id. Omitted, the daemon's single registered
@@ -91,6 +97,7 @@ pub(crate) enum Command {
         config: Option<String>,
     },
     /// Self-check: storage, CAS, permissions, providers.
+    #[command(display_order = 20)]
     Doctor {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
@@ -111,6 +118,7 @@ pub(crate) enum Command {
     },
     /// ACP (Agent Client Protocol) stdio agent server over the real daemon
     /// graph. Framed JSON-RPC on stdout ONLY; logs stay on stderr.
+    #[command(display_order = 60)]
     Acp {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
@@ -120,6 +128,7 @@ pub(crate) enum Command {
     /// explicitly authorized downgrade below the anti-rollback floor. The
     /// `[updater]` section must be enabled; manifests are verified against
     /// its operator key allowlist and downloads ride the checked transport.
+    #[command(display_order = 100)]
     Updater {
         #[command(subcommand)]
         action: UpdaterAction,
@@ -134,6 +143,7 @@ pub(crate) enum Command {
     /// deletion jobs, artifacts, settings and effective config. The
     /// `[enterprise]` section must be enabled; the local operator acts as
     /// an owner principal of the configured organization.
+    #[command(display_order = 90)]
     Enterprise {
         #[command(subcommand)]
         action: EnterpriseAction,
@@ -146,6 +156,7 @@ pub(crate) enum Command {
     /// Remote worker mode: register, claim, execute and submit remote jobs
     /// through a control plane. The `[worker_node]` section must be enabled
     /// (disabled by default: the entry refuses before any effect).
+    #[command(display_order = 110)]
     Worker {
         #[command(subcommand)]
         action: WorkerAction,
@@ -156,6 +167,7 @@ pub(crate) enum Command {
         config: Option<String>,
     },
     /// List sessions.
+    #[command(display_order = 30)]
     Sessions {
         #[arg(long, default_value = "~/.faktor")]
         data_dir: String,
@@ -165,6 +177,7 @@ pub(crate) enum Command {
     /// its signed manifest and digest, and exec exactly those bytes. Refuses
     /// (exit 3) on a missing pointer, an unsigned/tampered manifest or a
     /// digest mismatch; never falls back to another binary.
+    #[command(display_order = 70)]
     Bootstrap {
         /// The install root holding `current`, `launcher` and `versions/`.
         #[arg(long, default_value = "~/.faktor/install")]
@@ -177,12 +190,14 @@ pub(crate) enum Command {
     /// sha256 of the RUNNING executable, and the release id/digest the
     /// bootstrap launcher verified (absent when the binary was started
     /// directly). Supervisors use this to observe which artifact is live.
+    #[command(display_order = 50)]
     Build,
     /// Faktor Acquire local admin (never a model tool): `doctor`, `status`,
     /// `login <source>`, `logout <source>`, `clear-cache`. Login opens the
     /// headed dedicated profile browser; credentials never enter the model
     /// context. The `[commerce]` section must be enabled for every action
     /// except reading the disabled `doctor`/`status` report.
+    #[command(display_order = 80)]
     Commerce {
         #[command(subcommand)]
         action: CommerceAction,
@@ -222,6 +237,7 @@ pub(crate) enum WorkerAction {
     /// Run the bounded worker loop: register once, then claim/execute/submit
     /// until the iteration budget or the stop condition. Prints one JSON
     /// tally line on stdout.
+    #[command(display_order = 10)]
     Run {
         /// Loop budget (bounded by the worker crate; default 1 = one pass).
         #[arg(long)]
