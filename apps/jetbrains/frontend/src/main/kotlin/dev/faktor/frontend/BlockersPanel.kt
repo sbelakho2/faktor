@@ -180,11 +180,37 @@ class BlockersPanel : JPanel(BorderLayout()) {
         return card
     }
 
+    /** Human decision headline: what the agent wants to do, and to what. */
+    private fun permissionHeadline(permission: NativePermissionEntry): String {
+        val kind = permission.capability.lowercase()
+        val what = when {
+            kind.contains("shell") || kind.contains("execute") -> "Run a shell command"
+            kind.contains("write") -> "Write files in this workspace"
+            kind.contains("read") -> "Read files in this workspace"
+            kind.contains("network") -> "Use the network"
+            kind.contains("browser") -> "Control the browser"
+            kind.contains("git") || kind.contains("scm") -> "Run Git operations"
+            kind.contains("mcp") -> "Call an external tool service"
+            else -> "Use ${permission.capability}"
+        }
+        val target = Regex("\"(?:tool|path|command|destination)\"\\s*:\\s*\"([^\"]+)\"")
+            .find(permission.detail)
+            ?.groupValues
+            ?.get(1)
+        return if (target.isNullOrEmpty()) what else "$what: $target"
+    }
+
     private fun permissionCard(permission: NativePermissionEntry): JPanel {
-        val info = WrappedLabel(
-            "#${permission.id} capability=${permission.capability}" +
-                (if (permission.detail.isEmpty()) "" else "\n" + bound(permission.detail, 240))
-        )
+        // Decision-first wording (UI audit): the headline says WHAT the
+        // agent wants to do and to what; the reply handle and capability key
+        // stay one muted diagnostic line below the Allow/Deny actions.
+        val body = pageColumn(gap = Spacing.XS, padding = 0)
+        body.add(WrappedLabel(permissionHeadline(permission)))
+        if (permission.detail.isNotEmpty()) {
+            body.add(mutedLabel(bound(permission.detail, 240)))
+        }
+        body.add(mutedLabel("#${permission.id} capability=${permission.capability}"))
+        val info = body
         val allow = primaryButton("Allow")
         allow.addActionListener { listener?.onPermissionReply(permission, "allow") }
         val deny = secondaryButton("Deny")
