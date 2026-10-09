@@ -54,6 +54,20 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     private val abortButton = secondaryButton("Abort")
 
+    /**
+     * Destructive-action confirmation seam: production asks; the host matrix
+     * and smoke tests never click Abort, so the dialog cannot fire offscreen.
+     */
+    internal var confirmAbort: (String) -> Boolean = {
+        javax.swing.JOptionPane.showConfirmDialog(
+            this,
+            "Abort the open tournament? Settled candidates stay, and the run can no longer be decided.",
+            "Abort tournament",
+            javax.swing.JOptionPane.OK_CANCEL_OPTION,
+            javax.swing.JOptionPane.WARNING_MESSAGE
+        ) == javax.swing.JOptionPane.OK_OPTION
+    }
+
     private val abortReasonField = JTextField(14)
 
     private val detail = compactArea(4)
@@ -142,7 +156,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
         }
         abortButton.addActionListener {
             val id = currentTournament?.id
-            if (id != null && abortButton.isEnabled) {
+            if (id != null && abortButton.isEnabled && confirmAbort(abortReasonField.text.trim())) {
                 listener?.onAbortTournament(id, abortReasonField.text.trim())
             }
         }
