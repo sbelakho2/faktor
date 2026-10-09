@@ -3037,6 +3037,11 @@ impl AgentRuntime {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "open verification jobs unreadable; refusing to complete this turn");
+                        // No change this turn means there is no completion
+                        // claim to gate: keep the documented no-claim path.
+                        if changed.is_empty() {
+                            return TurnEndVerdict::default();
+                        }
                         return self.unverified_verdict(
                             handle,
                             changed,

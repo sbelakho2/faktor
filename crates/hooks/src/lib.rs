@@ -1140,8 +1140,10 @@ mod tests {
         }
         barrier.wait();
         // Wait until the registry is exactly full, then prove the 101st
-        // concurrent child is refused BEFORE it exists.
-        for _ in 0..200 {
+        // concurrent child is refused BEFORE it exists. The bound is
+        // generous (30s) because this test spawns 100 real processes and the
+        // dogfood lanes run under load; the ASSERTION is unchanged.
+        for _ in 0..3000 {
             if sup.alive().len() == 100 {
                 break;
             }

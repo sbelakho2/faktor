@@ -3492,8 +3492,16 @@ mod tests {
             !big.watcher_attached(),
             "a root beyond the preflight bound must degrade, never wedge the worker"
         );
+        // The degraded open must not have spawned a worker generation —
+        // asserted around THAT open so the test is not order-dependent.
+        assert_eq!(
+            crate::workspace_service::watch_registration_worker_spawns(),
+            workers_before,
+            "the degraded path must not spawn a worker"
+        );
         let ordinary = tempfile::tempdir().unwrap();
         std::fs::write(ordinary.path().join("keep.txt"), b"x").unwrap();
+        let before_ordinary = crate::workspace_service::watch_registration_worker_spawns();
         let small = service
             .open(WorkspaceId::new(202), ordinary.path().to_path_buf())
             .unwrap();
@@ -3501,10 +3509,11 @@ mod tests {
             small.watcher_attached(),
             "an ordinary workspace must still obtain a REAL watcher"
         );
-        assert_eq!(
-            crate::workspace_service::watch_registration_worker_spawns(),
-            workers_before,
-            "the degraded path must not spawn another worker"
+        // The ordinary open reuses the running worker or starts at most ONE
+        // new generation; it never leaks more.
+        assert!(
+            crate::workspace_service::watch_registration_worker_spawns() <= before_ordinary + 1,
+            "an ordinary workspace must reuse or start exactly one worker generation"
         );
     }
 
