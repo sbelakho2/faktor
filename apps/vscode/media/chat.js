@@ -1719,6 +1719,15 @@
     }
     vscode.postMessage({ type: 'clearAttachments' });
   });
+  // Inspect is progressive disclosure (audit UI-1): the conversation, the
+  // current run and the composer stay primary; run details, agents, board
+  // and evidence live behind this one explicit toggle. The DOM stays intact
+  // (and focusable) — only the visual grouping changes.
+  byId('btn-inspect').addEventListener('click', function () {
+    var app = byId('app');
+    var collapsed = app.classList.toggle('inspect-collapsed');
+    byId('btn-inspect').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  });
   byId('btn-refresh-snapshot').addEventListener('click', function () {
     vscode.postMessage({ type: 'refresh' });
   });

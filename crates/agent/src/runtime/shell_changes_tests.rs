@@ -1429,6 +1429,69 @@ async fn task_capability_budget_denies_a_tool_class_before_execution() {
     );
 }
 
+/// P0/P1: a checkpoint-STORE read failure makes the high-risk edit
+/// evidence gate fail closed with a typed refusal — it is never read as
+/// "there were no prior expectations" (which would drop exactly the
+/// anti-drift evidence the gate exists to enforce).
+#[test]
+fn unreadable_checkpoint_store_fails_the_edit_evidence_gate_closed() {
+    let (manager, session, _cas, snapshots, dir) =
+        super::fixtures_tests::snapshot_review_env(&[("src/lib.rs", "pub fn f() -> u32 { 2 }\n")]);
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let ws = faktor_fs::WorkspaceFileService::new()
+        .open(handle.row().unwrap().workspace_id, dir.path().join("ws"))
+        .unwrap();
+    let changed = vec!["src/lib.rs".to_string()];
+    // Absent store: the legitimate empty case still passes.
+    assert!(
+        super::retrieval::require_edit_evidence_hashes_for_store(None, &handle, &ws, &changed)
+            .is_ok(),
+        "an absent checkpoint store is the documented empty case"
+    );
+    snapshots.inject_checkpoint_read_failure_for_test();
+    let refusal = super::retrieval::require_edit_evidence_hashes_for_store(
+        Some(snapshots.as_ref()),
+        &handle,
+        &ws,
+        &changed,
+    )
+    .expect_err("an unreadable expectation store must refuse");
+    assert!(
+        matches!(
+            refusal,
+            super::retrieval::EditEvidenceRefusal::ExpectationsUnavailable { .. }
+        ),
+        "{refusal:?}"
+    );
+}
+
+/// P0/P1 identity law: a root whose tree equality is unprovable (special
+/// files) has NO snapshot identity — `None`, never the synthetic
+/// `snapshot-unavailable` marker (which must never key proof/reuse identity).
+#[cfg(unix)]
+#[test]
+fn unprovable_root_has_no_snapshot_identity_only_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
+    // A unix socket is a special file: the tree manifest refuses typed.
+    let _listener = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+    let ws = faktor_fs::WorkspaceFileService::new()
+        .open(faktor_core::id::WorkspaceId::new(7), root.clone())
+        .unwrap();
+    assert_eq!(
+        super::root_snapshot_best_effort(&ws),
+        None,
+        "an unprovable tree yields UNAVAILABLE, never a synthetic identity"
+    );
+    std::fs::remove_file(root.join("sock")).unwrap();
+    assert!(
+        super::root_snapshot_best_effort(&ws).is_some_and(|digest| digest.starts_with("tm1:")),
+        "an ordinary tree yields the canonical tm1 identity"
+    );
+}
+
 /// P0-SEC: an UNREADABLE durable capability budget (corrupt identity row or
 /// store failure) is surfaced as an EMPTY budget plus a typed reason — the
 /// tool gate fails closed and never falls back to `CapabilitySet::ALL`.

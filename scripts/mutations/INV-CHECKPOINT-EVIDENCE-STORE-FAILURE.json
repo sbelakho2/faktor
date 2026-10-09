@@ -1,0 +1,9 @@
+{
+  "id": "INV-CHECKPOINT-EVIDENCE-STORE-FAILURE",
+  "file": "crates/agent/src/runtime/retrieval.rs",
+  "find": "Some(snapshots) => match snapshots.checkpoints(handle.id()) {\n            Ok(rows) => rows,\n            Err(e) => {\n                return Err(EditEvidenceRefusal::ExpectationsUnavailable {\n                    reason: e.to_string(),\n                })\n            }\n        },",
+  "replace": "Some(snapshots) => snapshots.checkpoints(handle.id()).unwrap_or_default(),",
+  "gate": "cargo test -p faktor-agent --lib unreadable_checkpoint_store_fails_the_edit_evidence_gate_closed",
+  "expect": "FAILED",
+  "note": "Mapping a checkpoint-store failure to \"no prior expectations\" erases the anti-drift evidence at the high-risk edit gate."
+}

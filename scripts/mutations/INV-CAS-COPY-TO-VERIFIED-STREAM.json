@@ -1,0 +1,9 @@
+{
+  "id": "INV-CAS-COPY-TO-VERIFIED-STREAM",
+  "file": "crates/cas/src/lib.rs",
+  "find": "// Pass 1: strict verification of the whole stored object. Nothing\n        // reaches `w` until the content re-hashes to the address.\n        let file = self.open_blob(hash)?;\n        let verified_identity = FileIdentity::of_file(&file);\n        let mut sink = std::io::sink();\n        let size = match self.decode_verified(hash, file, &mut sink, None)? {",
+  "replace": "// Pass 1: strict verification of the whole stored object. Nothing\n        // reaches `w` until the content re-hashes to the address.\n        let file = self.open_blob(hash)?;\n        let verified_identity = FileIdentity::of_file(&file);\n        let mut sink = std::io::sink();\n        let size = match decode_stream(file, &mut sink, None, None)? {",
+  "gate": "cargo test -p faktor-cas --lib copy_to_corruption_writes_zero_bytes",
+  "expect": "FAILED",
+  "note": "Skipping the pre-write verification pass lets a corrupted CAS object stream to the writer (unverified bytes escape)."
+}

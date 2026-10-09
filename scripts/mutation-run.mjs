@@ -1,20 +1,35 @@
 #!/usr/bin/env node
 // Generic planted-mutation runner for tests/invariants.toml.
 //
-// A spec under scripts/mutations/ ({id, file, find, replace, gate[, note,
-// timeout_ms, expect]}) names one exact byte-level edit of one production
-// source and the gate command that must FAIL while that edit is live. This
-// runner:
+// A spec under scripts/mutations/ names the byte-level edits of production
+// source and the gate command that must FAIL while those edits are live.
+// Three shapes, all validated by the same rules below:
 //
-//   1. snapshots the target file's bytes;
-//   2. refuses to run unless `find` occurs EXACTLY ONCE in the file;
+//   { id, file, find, replace, gate[, note, timeout_ms, expect] }
+//     one anchored edit of one existing file (legacy shape);
+//   { id, files: [{ file, find, replace }], gate[, …] }
+//     several anchored edits, each `find` occurring EXACTLY ONCE;
+//   { id, create: [{ file, content }], gate[, …] }
+//     brand-new files that exist only for the gate run. `create` proves a
+//     scanner is closed over NEW MODULES: the gate must discover the planted
+//     file through the module tree although the proof manifest has never
+//     seen it. Created files are removed (and edited files restored) in the
+//     restore path before the runner decides.
+//
+// The runner:
+//
+//   1. snapshots every target file's bytes (or records that a target file
+//      does not exist, for `create`);
+//   2. refuses to run unless each `find` occurs EXACTLY ONCE in its file and
+//      every `create` target is absent;
 //   3. runs `gate` on the PRISTINE source and requires it to exit 0 (a gate
 //      that is already failing proves nothing about the oracle);
-//   4. applies `find` -> `replace`;
+//   4. applies `find` -> `replace` and writes every `create` file;
 //   5. runs `gate` (expected non-zero with the mutation live, and matching
 //      the spec's optional `expect` signature when one is declared);
-//   6. restores the snapshot in `finally` BEFORE deciding the exit code
-//      (`process.exit` is never called inside the try);
+//   6. restores the snapshots and removes created files in `finally` BEFORE
+//      deciding the exit code (`process.exit` is never called inside the
+//      try);
 //   7. exits 0 ONLY when the pristine control passed AND the mutated gate
 //      failed for the planted reason. Environment failures (missing
 //      toolchain, exit 126/127, harness timeout), a mutation that does not
@@ -48,7 +63,7 @@ import { spawn } from 'node:child_process';
 import { provisionSupport } from './mutation-support.mjs';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -109,12 +124,15 @@ function cleanupGateRoot() {
   }
 }
 
-let active = null; // { abs, original }
+let active = null; // Array<{ mode: 'edit', abs, original } | { mode: 'create', abs }>
 let activeChild = null;
 
 function restore() {
   if (active !== null) {
-    writeFileSync(active.abs, active.original);
+    for (const entry of active) {
+      if (entry.mode === 'create') rmSync(entry.abs, { force: true });
+      else writeFileSync(entry.abs, entry.original);
+    }
     active = null;
   }
 }
@@ -238,13 +256,61 @@ function loadSpecs() {
 }
 
 /**
- * Validate one spec. With `checkFind` the target file must exist and `find`
- * must occur exactly once (the --check-specs contract, no mutation).
+ * The spec's edit shape, decided by property PRESENCE so a malformed array is
+ * reported instead of silently falling through to the legacy fields:
+ * `create` (brand-new files), `files` (several anchored edits) or the legacy
+ * single `{file, find, replace}` edit.
+ */
+function specMode(spec) {
+  if (Object.prototype.hasOwnProperty.call(spec, 'create')) return 'create';
+  if (Object.prototype.hasOwnProperty.call(spec, 'files')) return 'files';
+  return 'legacy';
+}
+
+/** Normalized `[{ mode, file, find?, replace?, content? }]` for a valid spec. */
+function specEdits(spec) {
+  const mode = specMode(spec);
+  if (mode === 'create') {
+    return (Array.isArray(spec.create) ? spec.create : []).map((entry) => ({
+      mode: 'create',
+      file: entry?.file,
+      content: entry?.content,
+    }));
+  }
+  if (mode === 'files') {
+    return (Array.isArray(spec.files) ? spec.files : []).map((entry) => ({
+      mode: 'edit',
+      file: entry?.file,
+      find: entry?.find,
+      replace: entry?.replace,
+    }));
+  }
+  return [{ mode: 'edit', file: spec.file, find: spec.find, replace: spec.replace }];
+}
+
+/** `INV-…`-shaped human summary of a spec's targets, for --list. */
+function specTargets(spec) {
+  if (specMode(spec) === 'legacy') return spec.file;
+  const entries = Array.isArray(spec[specMode(spec)]) ? spec[specMode(spec)] : [];
+  return `${specMode(spec)}(${entries.map((entry) => entry?.file).join(', ')})`;
+}
+
+/** TRUE when `file` resolves inside the repository root. */
+function staysInsideRoot(file) {
+  const rel = relative(SCRIPT_ROOT, resolve(SCRIPT_ROOT, file));
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+/**
+ * Validate one spec. With `checkFind` every anchored target file must exist
+ * and its `find` must occur exactly once, and every `create` target must NOT
+ * exist yet (the --check-specs contract, no mutation).
  */
 function validateSpec(spec, checkFind) {
   const problems = [];
   const where = spec.__file ?? spec.id ?? '<unknown>';
-  for (const field of ['id', 'file', 'find', 'replace', 'gate']) {
+  const mode = specMode(spec);
+  for (const field of ['id', 'gate']) {
     if (typeof spec[field] !== 'string' || spec[field].trim() === '') {
       problems.push(`${where}: missing non-empty '${field}'`);
     }
@@ -253,8 +319,66 @@ function validateSpec(spec, checkFind) {
   if (!/^INV-[A-Z0-9-]+$/.test(spec.id)) {
     problems.push(`${where}: id '${spec.id}' is not an INV-* id`);
   }
-  if (spec.find === spec.replace) {
-    problems.push(`${where}: find and replace are identical; the spec mutates nothing`);
+  if (Object.prototype.hasOwnProperty.call(spec, 'create') && Object.prototype.hasOwnProperty.call(spec, 'files')) {
+    problems.push(`${where}: 'create' and 'files' are mutually exclusive`);
+  }
+  if (mode === 'legacy') {
+    for (const field of ['file', 'find', 'replace']) {
+      if (typeof spec[field] !== 'string' || spec[field].trim() === '') {
+        problems.push(`${where}: missing non-empty '${field}'`);
+      }
+    }
+    if (typeof spec.file === 'string' && spec.file.trim() !== '' && !staysInsideRoot(spec.file)) {
+      problems.push(`${where}: file ${JSON.stringify(spec.file)} escapes the repository`);
+    }
+    if (
+      typeof spec.find === 'string' &&
+      typeof spec.replace === 'string' &&
+      spec.find === spec.replace
+    ) {
+      problems.push(`${where}: find and replace are identical; the spec mutates nothing`);
+    }
+  } else {
+    for (const field of ['file', 'find', 'replace']) {
+      if (Object.prototype.hasOwnProperty.call(spec, field)) {
+        problems.push(`${where}: '${field}' cannot be combined with '${mode}'`);
+      }
+    }
+    const entries = Array.isArray(spec[mode]) ? spec[mode] : null;
+    if (entries === null || entries.length === 0) {
+      problems.push(`${where}: '${mode}' must be a non-empty array of edits`);
+    } else {
+      for (const [index, entry] of entries.entries()) {
+        const at = `${where}: ${mode}[${index}]`;
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          problems.push(`${at} must be an object`);
+          continue;
+        }
+        if (typeof entry.file !== 'string' || entry.file.trim() === '') {
+          problems.push(`${at} needs a non-empty 'file'`);
+        } else if (!staysInsideRoot(entry.file)) {
+          problems.push(`${at} file ${JSON.stringify(entry.file)} escapes the repository`);
+        }
+        if (mode === 'create') {
+          if (typeof entry.content !== 'string') {
+            problems.push(`${at} needs a string 'content'`);
+          }
+        } else {
+          for (const field of ['find', 'replace']) {
+            if (typeof entry[field] !== 'string') {
+              problems.push(`${at} needs a string '${field}'`);
+            }
+          }
+          if (
+            typeof entry.find === 'string' &&
+            typeof entry.replace === 'string' &&
+            entry.find === entry.replace
+          ) {
+            problems.push(`${at}: find and replace are identical; the spec mutates nothing`);
+          }
+        }
+      }
+    }
   }
   if (spec.gate.includes('\n')) {
     problems.push(`${where}: gate must be a single command line`);
@@ -270,18 +394,28 @@ function validateSpec(spec, checkFind) {
       }
     }
   }
-  if (checkFind) {
-    const abs = resolve(SCRIPT_ROOT, spec.file);
-    if (!existsSync(abs)) {
-      problems.push(`${where}: target file ${spec.file} does not exist`);
-    } else {
-      const haystack = readFileSync(abs);
-      const needle = Buffer.from(spec.find, 'utf8');
-      const first = haystack.indexOf(needle);
-      if (first === -1) {
-        problems.push(`${where}: find anchor not found in ${spec.file}`);
-      } else if (haystack.indexOf(needle, first + 1) !== -1) {
-        problems.push(`${where}: find anchor is ambiguous in ${spec.file} (occurs more than once)`);
+  if (checkFind && problems.length === 0) {
+    for (const edit of specEdits(spec)) {
+      const abs = resolve(SCRIPT_ROOT, edit.file);
+      if (edit.mode === 'create') {
+        if (existsSync(abs)) {
+          problems.push(
+            `${where}: create target ${edit.file} already exists (a planted NEW module must not pre-exist)`,
+          );
+        }
+        continue;
+      }
+      if (!existsSync(abs)) {
+        problems.push(`${where}: target file ${edit.file} does not exist`);
+      } else {
+        const haystack = readFileSync(abs);
+        const needle = Buffer.from(edit.find, 'utf8');
+        const first = haystack.indexOf(needle);
+        if (first === -1) {
+          problems.push(`${where}: find anchor not found in ${edit.file}`);
+        } else if (haystack.indexOf(needle, first + 1) !== -1) {
+          problems.push(`${where}: find anchor is ambiguous in ${edit.file} (occurs more than once)`);
+        }
       }
     }
   }
@@ -430,24 +564,39 @@ async function runOne(id) {
     return 2;
   }
 
-  // The planted edit and both gate runs happen in the ISOLATED scratch root:
+  // The planted edits and both gate runs happen in the ISOLATED scratch root:
   // the trusted tree is never mutated, even transiently.
   prepareGateRoot();
   try {
-    const abs = resolve(GATE_ROOT, spec.file);
-    const original = readFileSync(abs);
-    if (original.indexOf(Buffer.from(spec.find, 'utf8')) === -1) {
-      console.error(`mutation-run: find anchor not found in the scratch copy of ${spec.file}`);
-      return 2;
+    const planned = [];
+    for (const edit of specEdits(spec)) {
+      const abs = resolve(GATE_ROOT, edit.file);
+      if (edit.mode === 'create') {
+        if (existsSync(abs)) {
+          console.error(`mutation-run: create target ${edit.file} already exists in the scratch copy`);
+          return 2;
+        }
+        planned.push({ mode: 'create', abs, content: edit.content });
+        continue;
+      }
+      const original = readFileSync(abs);
+      const find = Buffer.from(edit.find, 'utf8');
+      if (original.indexOf(find) === -1) {
+        console.error(`mutation-run: find anchor not found in the scratch copy of ${edit.file}`);
+        return 2;
+      }
+      const at = original.indexOf(find);
+      planned.push({
+        mode: 'edit',
+        abs,
+        original,
+        mutated: Buffer.concat([
+          original.subarray(0, at),
+          Buffer.from(edit.replace, 'utf8'),
+          original.subarray(at + find.length),
+        ]),
+      });
     }
-    const find = Buffer.from(spec.find, 'utf8');
-    const replace = Buffer.from(spec.replace, 'utf8');
-    const at = original.indexOf(find);
-    const mutated = Buffer.concat([
-      original.subarray(0, at),
-      replace,
-      original.subarray(at + find.length),
-    ]);
 
     // Pristine control run: the gate must be green BEFORE the mutation, or a
     // failure with the mutation live says nothing about the oracle.
@@ -464,9 +613,16 @@ async function runOne(id) {
     let detected = false;
     let reason = '';
     let tail = '';
-    active = { abs, original };
+    active = planned;
     try {
-      writeFileSync(abs, mutated);
+      for (const entry of planned) {
+        if (entry.mode === 'create') {
+          mkdirSync(dirname(entry.abs), { recursive: true });
+          writeFileSync(entry.abs, entry.content);
+        } else {
+          writeFileSync(entry.abs, entry.mutated);
+        }
+      }
       const result = await runGate(spec);
       tail = result.tail ?? '';
       const how = howOf(result);
@@ -512,7 +668,7 @@ async function main() {
     const { specs, problems } = loadSpecs();
     for (const problem of problems) console.error(`mutation-spec: ${problem}`);
     if (problems.length > 0) return 2;
-    for (const spec of specs) console.log(`${spec.id}  ${spec.file}`);
+    for (const spec of specs) console.log(`${spec.id}  ${specTargets(spec)}`);
     return 0;
   }
   return runOne(args[0]);

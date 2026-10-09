@@ -2750,7 +2750,17 @@ impl AgentRuntime {
         // recorded once the environment is RULES-BEARING (or an epoch row
         // already exists, so later rule deletions still move the stamp) —
         // a vacuous empty-tree epoch never pollutes the ledger.
-        if let Some((epoch, has_rules)) = self.session_instruction_epoch(handle) {
+        if let Some((epoch, has_rules)) = self
+            .session_instruction_epoch_strict(handle)
+            .map_err(|e| {
+                faktor_core::Error::new(
+                    faktor_core::ErrorKind::Store,
+                    format!(
+                        "workspace instruction root is unavailable; refusing to end the turn under unverified instructions: {e}"
+                    ),
+                )
+            })?
+        {
             let recordable = view.head.epoch.is_some() || has_rules;
             if recordable
                 && view.head.epoch != Some(epoch)
@@ -3475,22 +3485,37 @@ impl AgentRuntime {
         // admitted); the raw review value still gates through
         // `review_blocking_reasons` above.
         let review_evidence = admit_review_evidence(review.as_ref());
-        let proof = if executed.is_empty() {
-            None
+        let (proof, completion) = if executed.is_empty() {
+            (None, completion)
         } else {
-            Some(
-                verification_proof_from_attempt(
-                    criteria.as_deref(),
-                    &checks,
-                    &results,
-                    &unavailable,
-                    &executed,
-                    changed,
-                    &ws,
-                    review_evidence.as_ref(),
-                )
-                .await,
+            match verification_proof_from_attempt(
+                criteria.as_deref(),
+                &checks,
+                &results,
+                &unavailable,
+                &executed,
+                changed,
+                &ws,
+                review_evidence.as_ref(),
             )
+            .await
+            {
+                Ok(proof) => (Some(proof), completion),
+                // Identity law (audit P1): a root with no provable content
+                // identity cannot be minted into a durable proof — the
+                // completion is blocked, never silently verified.
+                Err(detail) => {
+                    let mut reasons = match completion {
+                        CompletionGate::BlockedVerification { reasons } => reasons,
+                        _ => Vec::new(),
+                    };
+                    reasons.push(OutcomeReason::new(
+                        ReasonCode::CheckUnavailable,
+                        format!("durable verification proof refused: {detail}"),
+                    ));
+                    (None, CompletionGate::BlockedVerification { reasons })
+                }
+            }
         };
         self.persist_gate_facts(
             handle,

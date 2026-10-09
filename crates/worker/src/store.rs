@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -145,6 +146,13 @@ pub enum ResultAppend {
 /// the caller must treat that as "someone else moved first", never retry
 /// blindly.
 pub trait WorkerStore: Send + Sync {
+    /// Test-only fault injection: the next `workers()` read fails with a
+    /// Backend error, proving recovery never collapses an infrastructure
+    /// failure into "no eligible worker" (audit P1). Production stores keep
+    /// the no-op default.
+    #[cfg(test)]
+    fn inject_workers_read_failure(&self) {}
+
     fn put_worker(&self, worker: &WorkerRegistration) -> Result<(), WorkerError>;
     fn worker(&self, id: &WorkerId) -> Result<Option<WorkerRegistration>, WorkerError>;
     fn workers(
@@ -304,6 +312,8 @@ struct MemoryState {
 #[derive(Default)]
 pub struct MemoryWorkerStore {
     state: Mutex<MemoryState>,
+    /// One-shot `workers()` read fault (audit P1 reproducer).
+    fail_next_workers_read: AtomicBool,
 }
 
 impl MemoryWorkerStore {
@@ -342,12 +352,20 @@ impl WorkerStore for MemoryWorkerStore {
         Ok(self.lock()?.workers.get(id.as_str()).cloned())
     }
 
+    #[cfg(test)]
+    fn inject_workers_read_failure(&self) {
+        self.fail_next_workers_read.store(true, Ordering::SeqCst);
+    }
+
     fn workers(
         &self,
         organization: &str,
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<WorkerRegistration>, WorkerError> {
+        if self.fail_next_workers_read.swap(false, Ordering::SeqCst) {
+            return Err(WorkerError::Backend("injected workers-read failure".into()));
+        }
         let state = self.lock()?;
         Ok(state
             .workers

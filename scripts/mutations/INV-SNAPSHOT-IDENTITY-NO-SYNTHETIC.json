@@ -1,0 +1,9 @@
+{
+  "id": "INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC",
+  "file": "crates/agent/src/runtime/turn/state.rs",
+  "find": "pub(crate) fn root_snapshot_best_effort(ws: &faktor_fs::WorkspaceHandle) -> Option<String> {\n    faktor_fs::tree_manifest::tree_manifest_digest(\n        ws.root(),\n        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,\n    )\n    .ok()\n}",
+  "replace": "pub(crate) fn root_snapshot_best_effort(ws: &faktor_fs::WorkspaceHandle) -> Option<String> {\n    faktor_fs::tree_manifest::tree_manifest_digest(\n        ws.root(),\n        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,\n    )\n    .ok()\n    .or_else(|| Some(\"snapshot-unavailable\".to_string()))\n}",
+  "gate": "cargo test -p faktor-agent --lib unprovable_root_has_no_snapshot_identity_only_none",
+  "expect": "FAILED",
+  "note": "Returning a synthetic snapshot marker for an unprovable tree aliases two different trees under one reusable identity."
+}

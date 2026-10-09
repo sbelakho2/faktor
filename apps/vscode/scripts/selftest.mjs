@@ -6761,6 +6761,28 @@ function makeFakeDom() {
       }
       return copy;
     };
+    node.classList = {
+      contains: (name) => String(node.className).split(/\s+/).includes(name),
+      add: (name) => {
+        if (!node.classList.contains(name)) {
+          node.className = `${node.className} ${name}`.trim();
+        }
+      },
+      remove: (name) => {
+        node.className = String(node.className)
+          .split(/\s+/)
+          .filter((part) => part && part !== name)
+          .join(' ');
+      },
+      toggle: (name) => {
+        if (node.classList.contains(name)) {
+          node.classList.remove(name);
+          return false;
+        }
+        node.classList.add(name);
+        return true;
+      },
+    };
     Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
     Object.defineProperty(node, 'childNodes', { get: () => node.children });
     return node;
@@ -7055,6 +7077,33 @@ async function presentationWebviewTests() {
       state: 'background',
     });
   });
+
+  await test('Inspect is progressive disclosure: run details, agents and board stay contextual', () => {
+    const { dom } = runChatWebview(webviewSnapshot([]));
+    const app = dom.document.getElementById('app');
+    // The real markup ships this class; the fake DOM starts from the same
+    // documented state (pinned by the markup drift baseline).
+    app.className = 'inspect-collapsed';
+    const toggle = dom.document.getElementById('btn-inspect');
+    toggle.setAttribute('aria-expanded', 'false');
+    assert(
+      String(app.className).includes('inspect-collapsed'),
+      'contextual surfaces start collapsed so conversation, run and composer stay primary',
+    );
+    assertEqual(toggle.getAttribute('aria-expanded'), 'false');
+    toggle.click();
+    assert(
+      !String(app.className).includes('inspect-collapsed'),
+      'the toggle reveals the inspect region',
+    );
+    assertEqual(toggle.getAttribute('aria-expanded'), 'true');
+    toggle.click();
+    assert(
+      String(app.className).includes('inspect-collapsed'),
+      'a second toggle collapses it again',
+    );
+    assertEqual(toggle.getAttribute('aria-expanded'), 'false');
+  });
 }
 
 // ---------------------------- composer attachments + a11y (findings 2/7/8)
@@ -7265,7 +7314,12 @@ async function composerAttachmentTests() {
       assert(markup.includes(`id="${id}"`), `the markup must carry #${id}`);
     }
     assert(/<label for="goal"/.test(markup), 'the goal textarea must have a real <label for>');
-    assert(markup.includes('>Task goal</label>'), 'the accessible name must be the visible label text');
+    assert(markup.includes('>Ask Faktor…</label>'), 'the accessible name must be the visible label text');
+    assert(
+      /<div id="app" class="inspect-collapsed">/.test(markup),
+      'the shipped webview starts with inspect content contextual',
+    );
+    assert(/<button id="btn-inspect"/.test(markup), 'the inspect toggle must exist');
     assert(/<label for="board-subject"/.test(markup), 'the board subject must have a real <label for>');
     assert(/<label for="board-body"/.test(markup), 'the board body must have a real <label for>');
     assert(/<label for="board-subject"[^>]*>Subject<\/label>/.test(markup), 'board subject visible label text');

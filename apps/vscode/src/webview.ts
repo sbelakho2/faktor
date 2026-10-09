@@ -176,11 +176,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <title>Faktor</title>
 </head>
 <body>
-<div id="app">
+<div id="app" class="inspect-collapsed">
   <header>
+    <span id="brand">Faktor</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text">stopped</span>
     <span class="spacer"></span>
+    <button id="btn-inspect" class="secondary" type="button" aria-expanded="false" title="Show run details, agents, board and evidence">Inspect</button>
     <button id="btn-refresh" type="button" title="Refresh state">Refresh</button>
     <button id="btn-stop" type="button" title="Stop the daemon">Stop</button>
     <button id="btn-start" type="button" title="Start the daemon">Start</button>
@@ -190,10 +192,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div class="meta-row"><span class="meta-key">State</span><span id="machine-label">daemon stopped</span></div>
     <div class="meta-row"><span class="meta-key">Stream</span><span id="stream-status">stopped</span></div>
   </section>
-  <section id="task-card" class="card" hidden>
-    <h2>Task</h2>
+  <section id="stream-recovery" class="card" hidden>
+    <h2>Event stream blocked</h2>
+    <div id="stream-recovery-reason" class="warn" role="alert"></div>
+    <div class="composer-actions">
+      <button id="btn-refresh-snapshot" type="button" title="Re-read the durable state (the blocked cursor is not skipped)">Refresh from snapshot</button>
+      <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good cursor after the daemon is upgraded">Reconnect stream</button>
+    </div>
+    <div class="muted">The durable journal event that blocked the stream is never skipped. If the daemon predates this panel, upgrade it and reconnect; the daemon doctor (<code>faktor-cli doctor</code>) checks the journal.</div>
+  </section>
+  <section id="notices" aria-live="polite"></section>
+  <section id="task-card" class="card run-card" hidden>
+    <h2>Current run</h2>
     <div class="task-head"><span id="task-state" class="badge">—</span><button id="btn-cancel-run" type="button">Cancel run</button></div>
     <div id="task-goal" class="goal"></div>
+  </section>
+  <section id="transcript-card" class="card transcript-card">
+    <h2>Conversation</h2>
+    <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript"></div>
+  </section>
+  <form id="composer">
+    <label for="goal" class="composer-label">Ask Faktor…</label>
+    <textarea id="goal" rows="3" placeholder="Describe what you want done."></textarea>
+    <div id="attachment-hint" class="muted">Attach files, drop them here, or paste an image (Ctrl/Cmd+V).</div>
+    <div class="composer-actions">
+      <button id="btn-attach" type="button" title="Attach files through the host file picker">Attach…</button>
+      <button id="btn-clear-attachments" type="button" hidden>Clear all attachments</button>
+    </div>
+    <ul id="attachment-list" aria-label="Attached files"></ul>
+    <div id="attachment-notice" class="muted" hidden role="status"></div>
+    <details id="finish-options" class="finish-options">
+      <summary>Finish when done</summary>
+      <fieldset id="completion-contract" class="completion-contract">
+        <legend>Task completion contract (Task mode; never sent by plain chat)</legend>
+        <label><input type="checkbox" id="contract-commit" /> Commit when verified</label>
+        <label><input type="checkbox" id="contract-push" /> Push</label>
+        <label><input type="checkbox" id="contract-pr" /> Create PR</label>
+      </fieldset>
+    </details>
+    <div class="composer-actions">
+      <button id="btn-send" type="submit">Run task</button>
+      <button id="btn-new-task" type="button">New task…</button>
+    </div>
+  </form>
+  <section id="inspect-card" class="card">
+    <h2>Inspect</h2>
     <div id="task-completion" class="completion"></div>
     <div id="cockpit" class="cockpit"></div>
   </section>
@@ -217,41 +260,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
     </form>
   </section>
-  <section id="transcript-card" class="card">
-    <h2>Conversation</h2>
-    <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript"></div>
-  </section>
-  <section id="stream-recovery" class="card" hidden>
-    <h2>Event stream blocked</h2>
-    <div id="stream-recovery-reason" class="warn" role="alert"></div>
-    <div class="composer-actions">
-      <button id="btn-refresh-snapshot" type="button" title="Re-read the durable state (the blocked cursor is not skipped)">Refresh from snapshot</button>
-      <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good cursor after the daemon is upgraded">Reconnect stream</button>
-    </div>
-    <div class="muted">The durable journal event that blocked the stream is never skipped. If the daemon predates this panel, upgrade it and reconnect; the daemon doctor (<code>faktor-cli doctor</code>) checks the journal.</div>
-  </section>
-  <section id="notices" aria-live="polite"></section>
-  <form id="composer">
-    <label for="goal" class="composer-label">Task goal</label>
-    <textarea id="goal" rows="3" placeholder="Describe the goal. It starts a task run."></textarea>
-    <div id="attachment-hint" class="muted">Attach files, drop them here, or paste an image (Ctrl/Cmd+V).</div>
-    <div class="composer-actions">
-      <button id="btn-attach" type="button" title="Attach files through the host file picker">Attach…</button>
-      <button id="btn-clear-attachments" type="button" hidden>Clear all attachments</button>
-    </div>
-    <ul id="attachment-list" aria-label="Attached files"></ul>
-    <div id="attachment-notice" class="muted" hidden role="status"></div>
-    <fieldset id="completion-contract" class="completion-contract">
-      <legend>Task completion contract (Task mode; never sent by plain chat)</legend>
-      <label><input type="checkbox" id="contract-commit" /> Commit when verified</label>
-      <label><input type="checkbox" id="contract-push" /> Push</label>
-      <label><input type="checkbox" id="contract-pr" /> Create PR</label>
-    </fieldset>
-    <div class="composer-actions">
-      <button id="btn-send" type="submit">Run task</button>
-      <button id="btn-new-task" type="button">New task…</button>
-    </div>
-  </form>
 </div>
 <script nonce="${nonce}" src="${boardUri}"></script>
 <script nonce="${nonce}" src="${composerUri}"></script>

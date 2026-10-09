@@ -42,6 +42,9 @@ pub const MAX_ENTITY_ID_BYTES: usize = 256;
 pub const MAX_PROVIDER_ID_BYTES: usize = 128;
 /// Maximum bytes of a context query / edit intent.
 pub const MAX_QUERY_BYTES: usize = 64 * 1024;
+/// Maximum `max_bytes` of one context request: the provider workload ceiling
+/// (0 is refused too — a request for no bytes is malformed, not bounded).
+pub const SEMANTIC_CONTEXT_MAX_BYTES: usize = 256 * 1024;
 /// Maximum entity refs in one payload unless caps say otherwise.
 pub const MAX_ENTITY_REFS: usize = 4096;
 /// Default envelope payload ceiling (1 MiB).
@@ -911,6 +914,17 @@ impl SemanticContextRequest {
             return Err(SemanticError::Oversized {
                 max: MAX_ENTITY_REFS,
                 actual: self.max_items,
+            });
+        }
+        if self.max_bytes == 0 {
+            return Err(SemanticError::Malformed(
+                "context request max_bytes must be non-zero".to_string(),
+            ));
+        }
+        if self.max_bytes > SEMANTIC_CONTEXT_MAX_BYTES {
+            return Err(SemanticError::Oversized {
+                max: SEMANTIC_CONTEXT_MAX_BYTES,
+                actual: self.max_bytes,
             });
         }
         Ok(())
@@ -1946,6 +1960,57 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&RiskLevel::Safe).unwrap(), "\"safe\"");
         assert!(serde_json::from_str::<RiskLevel>("\"Unknown\"").is_err());
+    }
+
+    fn context_request(max_bytes: usize) -> SemanticContextRequest {
+        SemanticContextRequest {
+            call: SemanticCall::new(
+                OpId::new(1),
+                SessionId::new(1),
+                WorkspaceId::new(1),
+                0,
+                CancellationToken::new(),
+            ),
+            workspace: WorkspaceId::new(1),
+            source_revision: "rev-1".to_string(),
+            snapshot_id: snapshot(WorkspaceId::new(1), "rev-1"),
+            query: "where is the scheduler".to_string(),
+            max_items: 8,
+            max_bytes,
+        }
+    }
+
+    /// Audit P2: the public context API bounds the provider workload — an
+    /// over-budget `max_bytes` is typed-oversized, zero is malformed, the
+    /// exact bound passes inclusively, and the production tool's render
+    /// bound (8 KiB in `crates/agent/src/semantic_tool.rs`) stays inside.
+    #[test]
+    fn context_request_max_bytes_is_bounded() {
+        assert!(
+            context_request(SEMANTIC_CONTEXT_MAX_BYTES)
+                .validate()
+                .is_ok(),
+            "the exact bound is inclusive"
+        );
+        assert!(
+            context_request(8 * 1024).validate().is_ok(),
+            "the production semantic tool renders within 8 KiB"
+        );
+        match context_request(SEMANTIC_CONTEXT_MAX_BYTES + 1).validate() {
+            Err(SemanticError::Oversized { max, actual }) => {
+                assert_eq!(
+                    (max, actual),
+                    (SEMANTIC_CONTEXT_MAX_BYTES, SEMANTIC_CONTEXT_MAX_BYTES + 1)
+                );
+            }
+            other => panic!("over-budget max_bytes must be Oversized, got {other:?}"),
+        }
+        match context_request(0).validate() {
+            Err(SemanticError::Malformed(message)) => {
+                assert!(message.contains("max_bytes"), "{message}");
+            }
+            other => panic!("zero max_bytes must be Malformed, got {other:?}"),
+        }
     }
 }
 

@@ -1,9 +1,12 @@
 {
   "id": "INV-CAPABILITY-DISCOVERY-OMISSION",
-  "file": "crates/server/src/api/lifecycle.rs",
-  "find": "        .route(\"/models\", get(native_models))",
-  "replace": "        .route(\"/models\", get(native_models))\n        .route(\"/ghost-probe\", get(native_models).post(native_models))",
+  "create": [
+    {
+      "file": "crates/server/src/ghost_router.rs",
+      "content": "// Planted mutation: a brand-new production module the proof manifest has\n// never seen. Discovery must be closed over the whole server module tree, so\n// BOTH methods of the chained ghost route below are discovered and the\n// equality check fails.\nuse axum::routing::get;\nuse axum::Router;\n\npub fn ghost_router() -> Router {\n    Router::new()\n        .route(\"/ghost-probe\", get(ghost_handler).post(ghost_handler))\n}\n\nasync fn ghost_handler() -> &'static str {\n    \"ghost\"\n}\n"
+    }
+  ],
   "gate": "node scripts/check-invariant-coverage.mjs --check",
-  "expect": "FAIL",
-  "note": "Adds a chained native route with no proof-manifest row: BOTH methods (get and post) must be discovered and the equality check must fail in --check mode, so a route method can never hide behind a first-method-only scan."
+  "expect": "undiscovered-capability: native\\.get\\.ghost-probe",
+  "note": "Creates a brand-new server module whose chained /ghost-probe route has no manifest row. The recursive production-module walk must discover native.get.ghost-probe AND native.post.ghost-probe and turn check-invariant-coverage --check red: route discovery is closed over new modules, not only the historically enumerated lifecycle.rs/worker_plane.rs files."
 }

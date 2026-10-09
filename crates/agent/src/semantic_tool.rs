@@ -50,22 +50,21 @@ pub fn spec() -> ToolSpec {
     }
 }
 
-/// The live semantic revision of a workspace root (audit P1-SEMANTIC): the
-/// CONTENT identity (`tm1:<hex>`, the ONE tree identity shared with run
-/// bases/candidates/proofs) of the source tree the session actually runs in.
-/// It is never `session:<id>` — an internal handle with no relation to
-/// program content. An unreadable/oversized tree yields the shared honest
-/// `snapshot-unavailable` marker, never a fabricated revision that could
-/// masquerade as content identity.
-pub(crate) fn semantic_source_revision(root: Option<&std::path::Path>) -> String {
-    match root {
-        Some(root) => faktor_fs::tree_manifest::tree_manifest_digest(
-            root,
-            faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
-        )
-        .unwrap_or_else(|_| "snapshot-unavailable".into()),
-        None => "snapshot-unavailable".into(),
-    }
+/// The live semantic revision of a workspace root (audit P1-SEMANTIC /
+/// identity law): the CONTENT identity (`tm1:<hex>`, the ONE tree identity
+/// shared with run bases/candidates/proofs) of the source tree the session
+/// actually runs in. It is never `session:<id>` — an internal handle with no
+/// relation to program content — and an unreadable/oversized tree is
+/// `None`: callers REFUSE the semantic operation instead of deriving a
+/// snapshot id from a synthetic marker (a marker is a status value, never
+/// an identity).
+pub(crate) fn semantic_source_revision(root: Option<&std::path::Path>) -> Option<String> {
+    let root = root?;
+    faktor_fs::tree_manifest::tree_manifest_digest(
+        root,
+        faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
+    )
+    .ok()
 }
 
 fn unavailable(detail: &str) -> Error {
@@ -172,8 +171,15 @@ pub fn tool(registry: Arc<SemanticProviderRegistry>) -> Arc<Tool> {
                 let provider_version = provider.version();
                 let workspace = ctx.identity.workspace_id;
                 // The live revision is the workspace CONTENT identity (audit
-                // P1-SEMANTIC), never the session id.
-                let revision = semantic_source_revision(ctx.workspace.as_ref().map(|ws| ws.root()));
+                // P1-SEMANTIC), never the session id. Without it there is no
+                // snapshot identity to derive: refuse typed.
+                let Some(revision) =
+                    semantic_source_revision(ctx.workspace.as_ref().map(|ws| ws.root()))
+                else {
+                    return Err(unavailable(
+                        "the workspace content identity is unavailable; refusing to derive a semantic snapshot from a synthetic revision",
+                    ));
+                };
                 let snapshot_id = SemanticSnapshotId::derive(
                     workspace,
                     &revision,
@@ -354,7 +360,7 @@ mod tests {
             cancellation: faktor_core::cancellation::CancellationToken::new(),
             artifacts: Arc::new(crate::ToolArtifactSink::Null),
             tool_call_mode: crate::ToolCallMode::Native,
-            workspace: None,
+            workspace: Some(test_workspace()),
             edit: None,
             snapshots: None,
             sandbox: None,
@@ -362,6 +368,20 @@ mod tests {
             deadline_ms: 0,
             permission_granted: true,
         }
+    }
+
+    /// A real small workspace root so the semantic revision is derivable
+    /// (the tempdir is leaked: the anchored handle outlives the test body).
+    fn test_workspace() -> Arc<faktor_fs::WorkspaceHandle> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
+        let handle = faktor_fs::WorkspaceFileService::new()
+            .open(faktor_core::id::WorkspaceId::new(1), root)
+            .unwrap();
+        std::mem::forget(dir);
+        Arc::new(handle)
     }
 
     #[tokio::test]
@@ -411,12 +431,16 @@ mod tests {
     fn live_semantic_revision_is_content_derived_never_a_session_id() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
-        let first = semantic_source_revision(Some(dir.path()));
+        let first = semantic_source_revision(Some(dir.path())).expect("content revision");
         assert!(first.starts_with("tm1:"), "{first}");
         std::fs::write(dir.path().join("a.rs"), "pub fn a() -> u32 { 1 }\n").unwrap();
-        let second = semantic_source_revision(Some(dir.path()));
+        let second = semantic_source_revision(Some(dir.path())).expect("content revision");
         assert!(second.starts_with("tm1:"), "{second}");
         assert_ne!(first, second, "content changes must move the revision");
-        assert_eq!(semantic_source_revision(None), "snapshot-unavailable");
+        assert_eq!(
+            semantic_source_revision(None),
+            None,
+            "an absent root is UNAVAILABLE, never a synthetic identity"
+        );
     }
 }

@@ -1959,7 +1959,14 @@ pub(crate) async fn verification_proof_from_attempt(
     // (verification-opinion provenance); a raw model value cannot reach the
     // proof.
     review: Option<&ReviewEvidence>,
-) -> VerificationProof {
+) -> Result<VerificationProof, String> {
+    let Some(candidate_snapshot) = root_snapshot_best_effort(ws) else {
+        return Err(
+            "the verification root has no provable content identity (special/oversized tree); \
+             refusing to mint proof against a synthetic snapshot"
+                .to_string(),
+        );
+    };
     let mut executions = Vec::new();
     for run in runs {
         let category = match run.kind {
@@ -1990,7 +1997,6 @@ pub(crate) async fn verification_proof_from_attempt(
         });
     }
     let entries: &[String] = criteria.unwrap_or(&[]);
-    let candidate_snapshot = root_snapshot_best_effort(ws);
     let verdicts = criterion_verdicts_from_attempt(
         entries,
         checks,
@@ -2022,12 +2028,12 @@ pub(crate) async fn verification_proof_from_attempt(
         }
         _ => None,
     };
-    VerificationProof {
+    Ok(VerificationProof {
         checks: executions,
         criteria: verdicts,
         changed_files: files,
         review: reviewer,
-    }
+    })
 }
 
 impl AgentRuntime {
@@ -2255,7 +2261,13 @@ impl AgentRuntime {
             .workspaces
             .open_ephemeral(root.to_path_buf())
             .map_err(|e| format!("integration root could not be opened: {e}"))?;
-        let candidate_snapshot = root_snapshot_best_effort(&ws);
+        let Some(candidate_snapshot) = root_snapshot_best_effort(&ws) else {
+            return Err(format!(
+                "the integrated root {} has no provable content identity (special/oversized tree); \
+                 refusing to verify against a synthetic snapshot",
+                root.display()
+            ));
+        };
         // P2-VERIFY: the goal is an INPUT of the review/verification; an
         // unreadable task row must refuse the verification, never feed an
         // empty goal into a passing verdict.
@@ -2502,7 +2514,13 @@ impl AgentRuntime {
             .workspaces
             .open(row.workspace_id, root.to_path_buf())
             .map_err(|e| format!("integration root could not be opened: {e}"))?;
-        let candidate_snapshot = root_snapshot_best_effort(&ws);
+        let Some(candidate_snapshot) = root_snapshot_best_effort(&ws) else {
+            return Err(format!(
+                "the integrated root {} has no provable content identity (special/oversized tree); \
+                 refusing to verify against a synthetic snapshot",
+                root.display()
+            ));
+        };
         // P2-VERIFY: same rule as the fresh path — the task row is a review
         // input, and a read failure refuses the attempt.
         let goal = handle
@@ -3319,6 +3337,21 @@ impl AgentRuntime {
     ) -> faktor_core::Result<(EnvironmentFingerprint, CandidateProofRef)> {
         let (mut environment, manifest_hashes, lockfile_hashes) =
             self.observe_environment_fingerprint(handle, task_id, check_basis, workspace);
+        // Authority law (audit P0/P1): the instruction epoch is part of the
+        // REUSABLE proof basis. An unreadable workspace instruction root
+        // refuses the basis — the projection's best-effort `None` must never
+        // make two different instruction states alias the same key.
+        environment.instruction_epoch = self
+            .session_instruction_epoch_strict(handle)
+            .map_err(|e| {
+                faktor_core::Error::new(
+                    faktor_core::ErrorKind::Conflict,
+                    format!(
+                        "workspace instruction root is unavailable; refusing to derive a reusable proof basis: {e}"
+                    ),
+                )
+            })?
+            .map(|(epoch, _)| epoch);
         // Candidate aggregates: `base` is the observed manifest/lockfile set
         // MINUS the paths this candidate changed (the build-input baseline);
         // `candidate` is the full observed set.
@@ -3379,9 +3412,10 @@ impl AgentRuntime {
         // REUSE. A store failure must refuse the basis (never silently fold
         // in an empty integration/criteria set and then reuse a weaker key).
         let integration = handle.ledger_integration_record_for_task(task_id.raw())?;
-        let candidate_snapshot = workspace
-            .map(root_snapshot_best_effort)
-            .unwrap_or_else(|| "snapshot-unavailable".into());
+        // Identity law (audit P1): the candidate snapshot is part of a
+        // REUSABLE proof basis. An unprovable content identity refuses the
+        // basis — a synthetic marker must never key proof reuse.
+        let candidate_snapshot = proof_basis_candidate_snapshot(workspace)?;
         let changed_files_digest = changed_files_fold(changed_files);
         let criteria: Vec<ProofBasisCriterion> = handle
             .get_task(task_id)?
@@ -3545,4 +3579,26 @@ impl AgentRuntime {
             None => Ok(None),
         }
     }
+}
+
+/// The candidate content identity of a REUSABLE proof basis (audit P1
+/// identity law): an absent workspace or an unprovable tree is a typed
+/// refusal — `snapshot-unavailable` is a status value and must never key
+/// proof reuse.
+fn proof_basis_candidate_snapshot(
+    workspace: Option<&faktor_fs::WorkspaceHandle>,
+) -> faktor_core::Result<String> {
+    let Some(workspace) = workspace else {
+        return Err(faktor_core::Error::new(
+            faktor_core::ErrorKind::Conflict,
+            "the candidate workspace is unavailable; refusing to derive a reusable proof basis",
+        ));
+    };
+    root_snapshot_best_effort(workspace).ok_or_else(|| {
+        faktor_core::Error::new(
+            faktor_core::ErrorKind::Conflict,
+            "the candidate workspace has no provable content identity (special/oversized tree); \
+             refusing to derive a reusable proof basis",
+        )
+    })
 }

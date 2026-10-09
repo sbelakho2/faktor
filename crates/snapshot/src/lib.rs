@@ -282,11 +282,26 @@ pub const DIFF_MAX_LINES: usize = 2000;
 pub struct CheckpointStore {
     cas: Arc<Cas>,
     store: Arc<Store>,
+    /// One-shot checkpoint-read fault used by cross-crate adversarial tests
+    /// (audit P0/P1: a store failure must never read as "no expectations").
+    fail_next_checkpoint_read: std::sync::atomic::AtomicBool,
 }
 
 impl CheckpointStore {
     pub fn new(cas: Arc<Cas>, store: Arc<Store>) -> Self {
-        Self { cas, store }
+        Self {
+            cas,
+            store,
+            fail_next_checkpoint_read: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Test-only fault injection: the next [`Self::checkpoints`] read fails
+    /// typed with a store error.
+    #[doc(hidden)]
+    pub fn inject_checkpoint_read_failure_for_test(&self) {
+        self.fail_next_checkpoint_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Store the original content (deduped) and return its hash.
@@ -681,6 +696,15 @@ impl CheckpointStore {
         &self,
         session: SessionId,
     ) -> Result<Vec<faktor_store::CheckpointRow>, Error> {
+        if self
+            .fail_next_checkpoint_read
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::new(
+                ErrorKind::Store,
+                "injected checkpoint read failure",
+            ));
+        }
         self.store.checkpoints_of(session).map_err(map_store)
     }
 

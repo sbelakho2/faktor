@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-RECOVERY-ERROR-PROPAGATION",
+  "file": "crates/worker/src/service.rs",
+  "find": "                    None => {\n                        self.find_eligible(organization, &job.trust_domain, &job.requirements)?\n                    }\n                };",
+  "replace": "                    None => self\n                        .find_eligible(organization, &job.trust_domain, &job.requirements)\n                        .ok()\n                        .flatten(),\n                };",
+  "gate": "cargo test -p faktor-worker --lib resume_assignments_propagates_a_store_read_failure",
+  "expect": "FAILED",
+  "note": "Collapsing an infrastructure read failure into \"no eligible worker\" lets crash recovery report success while jobs stay stranded."
+}

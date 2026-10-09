@@ -1,0 +1,9 @@
+{
+  "id": "INV-GIT-LEASE-UNREADABLE-NOT-STOLEN",
+  "file": "crates/git/src/guard.rs",
+  "find": "let old = std::fs::metadata(path)\n                        .ok()\n                        .and_then(|m| m.modified().ok())\n                        .and_then(|t| t.elapsed().ok())\n                        .is_some_and(|age| age > MALFORMED_LEASE_TTL);",
+  "replace": "let old = true;",
+  "gate": "cargo test -p faktor-git --lib unreadable_lease_residue_is_never_stolen_immediately",
+  "expect": "FAILED",
+  "note": "Treating an unreadable lease residue as immediately old lets a second daemon steal the repository mutation lease after a transient read/permission failure."
+}

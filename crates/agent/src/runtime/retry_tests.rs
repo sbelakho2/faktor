@@ -5,6 +5,50 @@ use crate::runtime::fixtures_tests::*;
 use crate::runtime::tests::*;
 use crate::*;
 
+/// P0/P1 identity law: the proof basis REFUSES when the candidate workspace
+/// is unavailable — a synthetic marker must never key proof reuse.
+#[tokio::test]
+async fn proof_basis_refuses_a_missing_candidate_workspace() {
+    let (manager, session, dir) = verified_shared_env();
+    let (turn_deps, _d) = verified_turn_deps(&manager, vec![], fake_ok(), 0.65);
+    let runtime = AgentRuntime::new(turn_deps).unwrap();
+    let handle = manager.get_session(session).unwrap().unwrap();
+    let root = dir.path().join("ws");
+    let workspace_id = handle.row().unwrap().workspace_id;
+    let workspace = runtime.deps.workspaces.open(workspace_id, root).unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    handle
+        .create_task(Task {
+            task_id,
+            session_id: session,
+            goal: "no workspace".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+        })
+        .unwrap();
+    let basis = vec![(
+        "rust_check".to_string(),
+        "cargo".to_string(),
+        vec!["check".to_string()],
+    )];
+    let err = runtime
+        .verification_fingerprint(&handle, task_id, &basis, &[], None, None)
+        .expect_err("without a content identity there is no reusable proof basis");
+    assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err:?}");
+    assert!(
+        runtime
+            .verification_fingerprint(&handle, task_id, &basis, &[], None, Some(&workspace))
+            .is_ok(),
+        "an available workspace still yields the basis"
+    );
+}
+
 #[tokio::test]
 async fn environment_fingerprint_is_stable_and_manifest_sensitive() {
     // Audits 94/116/117: identical verification inputs produce an

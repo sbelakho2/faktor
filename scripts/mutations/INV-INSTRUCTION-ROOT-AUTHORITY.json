@@ -1,0 +1,9 @@
+{
+  "id": "INV-INSTRUCTION-ROOT-AUTHORITY",
+  "file": "crates/instructions/src/lib.rs",
+  "find": "let Some(root) = self.provider.workspace_root(workspace_id).map_err(|e| {\n            RulesLoadError::Unreadable(format!(\n                \"workspace root of workspace {workspace_id} is unavailable: {e}\"\n            ))\n        })?\n        else {\n            return Ok(LoadedInstructions::Empty);\n        };",
+  "replace": "let Some(root) = self.provider.workspace_root(workspace_id).ok().flatten()\n        else {\n            return Ok(LoadedInstructions::Empty);\n        };",
+  "gate": "cargo test -p faktor-instructions --lib unreadable_root_authority_is_a_typed_refusal_never_empty",
+  "expect": "FAILED",
+  "note": "Collapsing an unreadable workspace-root authority into Empty lets the agent continue under no instructions exactly when its authoritative root cannot be established."
+}

@@ -1,3 +1,5 @@
+#![allow(deprecated)] // NetworkPolicy::allows is a non-authoritative test matcher
+
 //! Hostile-corpus certification for the pure core types (no I/O).
 //!
 //! Every case is individually asserted with a message naming the category,

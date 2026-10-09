@@ -14,10 +14,30 @@ body {
 #app {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 8px;
+  gap: 10px;
+  padding: 10px 12px;
   box-sizing: border-box;
   min-height: 100vh;
+}
+
+/* Primary hierarchy (audit UI-1): conversation → current run → composer.
+   Everything else is contextual inspect content behind the header toggle.
+   Order is expressed here so the semantic DOM (and every id) stays intact. */
+#app > header { order: 0; }
+#app > #meta { order: 1; }
+#app > #stream-recovery { order: 2; }
+#app > #notices { order: 3; }
+#app > #task-card { order: 4; }
+#app > #transcript-card { order: 5; }
+#app > #composer { order: 6; }
+#app > #inspect-card { order: 7; }
+#app > #agents-card { order: 8; }
+#app > #board-card { order: 9; }
+
+.inspect-collapsed > #inspect-card,
+.inspect-collapsed > #agents-card,
+.inspect-collapsed > #board-card {
+  display: none;
 }
 
 header {
@@ -25,10 +45,36 @@ header {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-bottom: 6px;
+  background: var(--vscode-sideBar-background, transparent);
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
 }
 
 .spacer {
   flex: 1;
+}
+
+#brand {
+  font-weight: 600;
+  flex: none;
+}
+
+/* The daemon URL is diagnostics, not product copy: keep it one line and
+   never let it push the service controls onto their own row. */
+#daemon-text {
+  max-width: 26vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 360px) {
+  #daemon-text {
+    display: none;
+  }
 }
 
 .dot {
@@ -59,7 +105,13 @@ button {
   background: var(--vscode-button-background);
   border: none;
   border-radius: 2px;
-  padding: 3px 8px;
+  padding: 4px 10px;
+  box-sizing: border-box;
+  /* WCAG 2.2 target-size minimum (2.5.8): 24x24 CSS px for every control,
+     28px for the primary actions. The compact feel is preserved by keeping
+     the secondary row controls (below) at exactly 24px. */
+  min-width: 28px;
+  min-height: 28px;
   cursor: pointer;
 }
 
@@ -72,13 +124,29 @@ button:disabled {
   cursor: default;
 }
 
+/* Keyboard focus: one consistent, theme-driven ring on every interactive
+   affordance (buttons, links, tree-like summary rows, inputs, selects and
+   custom tabindex controls). outline-offset keeps the ring outside the
+   control; scroll-margin keeps the focused element clear of the scrollport
+   edge inside overflow containers. Pointer interactions are suppressed so a
+   mouse click never paints the ring. Text inputs keep their ring even on a
+   pointer click, as browsers and WCAG expect. */
+:where(button, a, summary, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: 1px;
+  scroll-margin: 4px;
+}
+
+:where(button, a, summary, input, select, textarea, [tabindex]):focus:not(:focus-visible) {
+  outline: none;
+}
+
 #meta {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 6px;
-  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-  border-radius: 4px;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 0 2px;
 }
 
 .meta-row {
@@ -87,23 +155,36 @@ button:disabled {
 }
 
 .meta-key {
-  width: 56px;
+  width: auto;
   flex: none;
-  opacity: 0.7;
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
 }
 
 .card {
   border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-  border-radius: 4px;
-  padding: 6px;
+  border-radius: 6px;
+  padding: 10px;
+  min-width: 0;
 }
 
 .card h2 {
-  margin: 0 0 4px;
-  font-size: 1em;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  opacity: 0.8;
+  margin: 0 0 6px;
+  font-size: 0.95em;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* The conversation is the product: no card chrome, room to breathe. */
+.transcript-card {
+  border: none;
+  padding: 0;
+}
+
+.run-card {
+  border-left: 3px solid var(--vscode-textLink-foreground, #3794ff);
 }
 
 .task-head {
@@ -160,12 +241,20 @@ button:disabled {
 
 .agent-controls button {
   font-size: 0.85em;
-  padding: 1px 6px;
+  padding: 3px 8px;
+  box-sizing: border-box;
+  /* Secondary control: the 24px WCAG 2.2 minimum, never below it. */
+  min-width: 24px;
+  min-height: 24px;
 }
 
-/* Background children: dimmed and tucked into their own group. */
+/* Background children: dimmed and tucked into their own group. 0.70 keeps
+   normal text at WCAG AA contrast over the stock themes (0.55 measured
+   ~4.1:1 on #cccccc over #1e1e1e and ~3.2:1 on light theme), while the
+   italic title, the explicit "background" marker, the group label and the
+   Foreground toggle keep the state legible without relying on opacity. */
 .agent.agent-background {
-  opacity: 0.55;
+  opacity: 0.7;
 }
 
 .agent.agent-background .agent-title {
@@ -185,14 +274,15 @@ button:disabled {
 #entries {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 60vh;
+  gap: 10px;
+  min-height: 220px;
+  max-height: 52vh;
   overflow-y: auto;
 }
 
 .entry {
   border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
-  padding-left: 6px;
+  padding-left: 8px;
 }
 
 .entry-user {
@@ -204,7 +294,13 @@ button:disabled {
   opacity: 0.6;
 }
 
-.entry-text,
+/* Prose reads as prose; tool output, reasoning and excerpts read as code. */
+.entry-text {
+  margin: 2px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .reasoning,
 .entry-summary,
 .excerpt {
@@ -239,6 +335,10 @@ button:disabled {
 details summary {
   cursor: pointer;
   opacity: 0.75;
+  box-sizing: border-box;
+  min-height: 24px;
+  padding: 3px 0;
+  /* Keep the disclosure marker: only the target height changes. */
 }
 
 #notices {
@@ -259,15 +359,74 @@ details summary {
   border-color: var(--vscode-inputValidation-errorBorder, rgba(248, 81, 73, 0.4));
 }
 
+button.secondary {
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+button.secondary:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+
 #composer {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 6px;
+  min-width: 0;
 }
 
 .composer-label {
   font-weight: 600;
-  opacity: 0.85;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.95em;
+}
+
+#goal,
+#board-subject,
+#board-body {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 4px;
+  padding: 6px 8px;
+  resize: vertical;
+}
+
+#goal {
+  min-height: 64px;
+}
+
+.finish-options {
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  padding-top: 6px;
+}
+
+.finish-options summary {
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+}
+
+.completion-contract {
+  border: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.completion-contract legend {
+  padding: 0;
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
 }
 
 #attachment-list {
@@ -305,7 +464,10 @@ details summary {
 
 .attachment-remove {
   font-size: 0.85em;
-  padding: 1px 6px;
+  padding: 3px 8px;
+  box-sizing: border-box;
+  min-width: 24px;
+  min-height: 24px;
 }
 
 #stream-recovery {
@@ -329,6 +491,28 @@ details summary {
   border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.4));
   border-radius: 2px;
   padding: 4px;
+}
+
+/* Board composer controls: the subject input is a primary single-line
+   target (28px); the body textarea never drops below the 24px minimum. */
+#board-subject {
+  box-sizing: border-box;
+  min-height: 28px;
+}
+
+#board-body {
+  box-sizing: border-box;
+  min-height: 28px;
+}
+
+/* The checkbox label is the clickable target for the completion-contract
+   toggles: inline-flex keeps the inline flow while honoring 24px. */
+#completion-contract label {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
 }
 
 .composer-actions {
@@ -601,4 +785,66 @@ details summary {
   .pixel-done { opacity: 1; }
   .pixel-failed { opacity: 1; }
   .pixel-cancelled { opacity: 0.35; }
+}
+
+/* ------------------------------------------------- container-width behavior
+   The webview viewport IS the container: VS Code sidebar views render around
+   240-420 CSS px and the panel area renders wide (>700px). Two-column rows
+   stack before they can overflow, and no action menu is introduced (this
+   panel has no pre-existing overflow menu to move actions into). */
+
+/* Sidebar range: let every two-column row wrap instead of overflowing. */
+@media (max-width: 420px) {
+  .task-head,
+  .composer-actions,
+  .criterion-head,
+  .evidence,
+  .agent-head {
+    flex-wrap: wrap;
+  }
+}
+
+/* Ultra-compact range: stack the key/value and action rows outright. */
+@media (max-width: 279px) {
+  #app {
+    padding: 6px 4px;
+    gap: 6px;
+  }
+  #meta,
+  .card {
+    padding: 4px;
+  }
+  .meta-row {
+    flex-direction: column;
+    gap: 0;
+  }
+  .meta-key {
+    width: auto;
+  }
+  .task-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .composer-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* Wide panel range: use the extra width for the cockpit grid and a taller
+   transcript instead of stretching single-column rows edge to edge. */
+@media (min-width: 701px) {
+  #app {
+    padding: 12px 16px;
+    max-width: 1024px;
+    margin: 0 auto;
+  }
+  #entries {
+    max-height: 70vh;
+  }
+  .cockpit {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    align-items: start;
+  }
 }

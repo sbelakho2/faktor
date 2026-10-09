@@ -395,15 +395,16 @@ pub(crate) fn hook_registry(
 /// live shadow row (a shadowed single-agent drive), the workspace's rules
 /// resolve from that shadow root (P0 isolation: mutating runs always carry
 /// one): the drive reads the instruction environment of the world it
-/// mutates. Ambiguity (more
-/// than one live shadow — hostile residue the executor discipline never
-/// produces) degrades loudly to the stored root, never a guess.
+/// mutates. An UNREADABLE store or MORE THAN ONE live shadow (hostile
+/// residue the executor discipline never produces) is a TYPED error (audit
+/// P0/P1 authority law): the operation stops, it never falls back to a
+/// guessed or stale root and never silently resolves no instructions.
 pub(crate) struct SessionWorkspaceRoots(pub(crate) Arc<SessionManager>);
 
 impl SessionWorkspaceRoots {
-    pub(crate) fn resolve(&self, workspace_id: u64) -> Option<PathBuf> {
+    pub(crate) fn resolve(&self, workspace_id: u64) -> Result<Option<PathBuf>, faktor_core::Error> {
         if workspace_id == 0 {
-            return None;
+            return Ok(None);
         }
         let ws = faktor_core::id::WorkspaceId::new(workspace_id);
         match self.0.live_workspace_shadow_root(ws) {
@@ -412,36 +413,23 @@ impl SessionWorkspaceRoots {
                     workspace = %workspace_id, shadow = %shadow.display(),
                     "workspace instructions resolve from the live shadow root (shadow mutation drive)"
                 );
-                Some(shadow)
+                Ok(Some(shadow))
             }
-            Ok(None) => match self.0.workspace_root(ws) {
-                Ok(Some(root)) => Some(root),
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::warn!(error = %e, workspace = %workspace_id,
-                        "durable workspace-root lookup failed; resolving no instructions for this session");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, workspace = %workspace_id,
-                    "ambiguous live shadows on this workspace; resolving instructions from the stored workspace root");
-                match self.0.workspace_root(ws) {
-                    Ok(Some(root)) => Some(root),
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, workspace = %workspace_id,
-                            "durable workspace-root lookup failed; resolving no instructions for this session");
-                        None
-                    }
-                }
-            }
+            // The stored durable root is authoritative only when the shadow
+            // probe succeeded and found none.
+            Ok(None) => self.0.workspace_root(ws),
+            Err(e) => Err(faktor_core::Error::new(
+                faktor_core::ErrorKind::Conflict,
+                format!(
+                    "live shadows on workspace {workspace_id} are ambiguous; refusing to resolve instructions from a guessed root: {e}"
+                ),
+            )),
         }
     }
 }
 
 impl faktor_instructions::WorkspaceRootProvider for SessionWorkspaceRoots {
-    fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf> {
+    fn workspace_root(&self, workspace_id: u64) -> Result<Option<PathBuf>, faktor_core::Error> {
         self.resolve(workspace_id)
     }
 }

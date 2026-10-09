@@ -1076,6 +1076,83 @@ pub(crate) async fn completion_steps_are_additive_and_fail_closed() {
     );
 }
 
+/// Audit P2 reproducer: a TaskExecutor whose agent carries NO sandbox (the
+/// library/test construction) refuses an egress-requiring completion step
+/// typed — the push is never executed. Only production wiring supplies a
+/// sandbox; absence must fail closed, never mean unrestricted egress.
+#[tokio::test]
+pub(crate) async fn completion_push_without_a_sandbox_refuses_egress_typed() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    // The supervised fixture wires a REAL supervisor but deliberately no
+    // sandbox: exactly the library construction under audit.
+    let env = open_real_tool_env_supervised(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+    );
+    cs_seed_repo(&env.owner_root);
+    cs_git(
+        &env.owner_root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://git.example.invalid/team/repo.git",
+        ],
+    );
+    let task_id = seed_contract_task(
+        &env,
+        "push without a sandbox",
+        faktor_core::completion::CompletionContract {
+            include_commit: false,
+            include_push: true,
+            include_pr: false,
+        },
+    );
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let proof = h
+        .list_verification_records(task_id)
+        .unwrap()
+        .into_iter()
+        .next_back()
+        .map(|record| record.record_id)
+        .expect("seed_contract_task minted a passing record");
+    // No runner is installed: the executor builds its OWN from the agent's
+    // supervisor + (absent) sandbox — the audited decision point.
+    let report = env
+        .executor
+        .run_completion_steps(env.parent, proof)
+        .await
+        .unwrap()
+        .expect("a contracted, non-terminal run consults the runner");
+    assert_eq!(
+        report.failed_step(),
+        Some(faktor_core::completion::CompletionStep::Push),
+        "{report:?}"
+    );
+    let (revision, _) = h.completion_contract(task_id).unwrap().expect("contract");
+    let rows = h
+        .ledger_completion_step_statuses(task_id.raw(), revision.raw())
+        .unwrap();
+    let last = rows.last().unwrap();
+    assert_eq!(
+        last.status,
+        faktor_core::completion::CompletionStepOutcome::Failed,
+        "{last:?}"
+    );
+    assert!(
+        last.detail.contains("no sandbox configured") && last.detail.contains("requires egress"),
+        "{}",
+        last.detail
+    );
+    assert!(
+        !last.detail.contains("git push failed"),
+        "the typed refusal happened BEFORE any push attempt: {}",
+        last.detail
+    );
+}
+
 // ----------------------------------- attachments + unified settlement (P1)
 
 /// Every durable USER message's `files` set of one session.

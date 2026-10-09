@@ -1833,17 +1833,20 @@ pub(crate) fn fingerprint_task_contract(
 /// workspace handle (never a mutation).
 pub(crate) struct CandidateRepo(pub(crate) faktor_fs::WorkspaceHandle);
 
-/// Best-effort canonical tree-manifest digest of the verification root
+/// Canonical tree-manifest digest of the verification root
 /// (`tm1:<64-hex>`, the ONE tree identity shared with run bases, candidates,
 /// integration records and completion gates). An unreadable/oversized root —
-/// or one carrying special files, where tree equality is unprovable — yields
-/// the honest `snapshot-unavailable` id, never a guessed digest.
-pub(crate) fn root_snapshot_best_effort(ws: &faktor_fs::WorkspaceHandle) -> String {
+/// or one carrying special files, where tree equality is unprovable — is
+/// `None`: an honest UNAVAILABLE state. It is NEVER a synthetic replacement
+/// identity (`snapshot-unavailable` must not be derivable into proof,
+/// reuse, cache or settlement identity — audit P1 identity law); callers
+/// refuse the operation instead.
+pub(crate) fn root_snapshot_best_effort(ws: &faktor_fs::WorkspaceHandle) -> Option<String> {
     faktor_fs::tree_manifest::tree_manifest_digest(
         ws.root(),
         faktor_fs::tree_manifest::MAX_TREE_MANIFEST_ENTRIES,
     )
-    .unwrap_or_else(|_| "snapshot-unavailable".into())
+    .ok()
 }
 
 // --------------------------------------------------------------------------
@@ -2202,29 +2205,44 @@ impl AgentRuntime {
             .map(|e| e.kind)
     }
 
-    /// Resolve the instruction epoch of the session's DURABLE workspace
-    /// root through the per-workspace resolver (P0-32): `(epoch,
-    /// rules_present)`. `None` when the session has no durable workspace
-    /// root (documented Empty result — the ledger simply records no epoch,
-    /// exactly like an unwired loader did). A hostile tree
-    /// (oversized/unreadable authority rule file) is a typed resolver
-    /// error, surfaced as a warn — the ledger never records an epoch it
-    /// cannot verify.
-    pub(crate) fn session_instruction_epoch(
+    /// STRICT instruction-epoch resolve (audit P0/P1 authority law): the
+    /// session's DURABLE workspace root is the instruction authority, and
+    /// an UNREADABLE/AMBIGUOUS root (store failure, hostile shadow residue,
+    /// oversized rule tree) is a TYPED error — never `None`, and never a
+    /// fallback to a different tree. `Ok(None)` is the documented legitimate
+    /// absence (no durable root ⇒ the ledger records no epoch).
+    pub(crate) fn session_instruction_epoch_strict(
         &self,
         handle: &faktor_session::SessionHandle,
-    ) -> Option<(u64, bool)> {
-        let row = handle.row().ok()?;
+    ) -> Result<Option<(u64, bool)>, faktor_instructions::RulesLoadError> {
+        let row = handle.row().map_err(|e| {
+            faktor_instructions::RulesLoadError::Unreadable(format!(
+                "session row unresolvable while resolving the workspace instruction root: {e}"
+            ))
+        })?;
         match self
             .deps
             .instructions_resolver
             .resolve(row.workspace_id.raw(), None)
         {
-            Ok(loaded) => loaded.epoch().map(|e| (e.as_u64(), loaded.has_rules())),
+            Ok(loaded) => Ok(loaded.epoch().map(|e| (e.as_u64(), loaded.has_rules()))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Best-effort projection for environment/telemetry only (audit P0/P1):
+    /// a root failure degrades loudly to `None`. Authority paths use
+    /// [`Self::session_instruction_epoch_strict`].
+    pub(crate) fn session_instruction_epoch(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> Option<(u64, bool)> {
+        match self.session_instruction_epoch_strict(handle) {
+            Ok(epoch) => epoch,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "workspace instructions resolve failed; no epoch row recorded"
+                    "workspace instructions resolve failed; projection records no epoch"
                 );
                 None
             }
