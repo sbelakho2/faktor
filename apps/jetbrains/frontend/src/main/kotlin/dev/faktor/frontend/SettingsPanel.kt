@@ -122,7 +122,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
         body.add(vSpace(Spacing.S))
         body.add(card("Daemon", JScrollPane(daemonArea)))
         body.add(vSpace(Spacing.S))
-        body.add(card("Control plane credential", buildControlPlaneSection()))
+        body.add(card("Advanced: control plane credential (manual)", buildControlPlaneSection()))
         status.font = sectionTitleFont()
         val statusRow = JPanel(BorderLayout())
         statusRow.isOpaque = true
@@ -370,7 +370,13 @@ class SettingsPanel : JPanel(BorderLayout()) {
             .row("Credential", controlPlaneToken)
             .build()
         val section = pageColumn(gap = Spacing.S, padding = 0)
-        section.add(mutedLabel("Stored in the IDE credential store; never written to settings."))
+        section.add(
+            mutedLabel(
+                "Advanced/manual path: paste the endpoint, organization and credential issued by your control plane. " +
+                    "The guided sign-in flow lives in the VS Code extension (Faktor: Sign In) and in the CLI/API; " +
+                    "the credential is stored in the IDE credential store, never written to settings."
+            )
+        )
         section.add(form)
         section.add(actionRow(saveCredentialButton, signOutButton))
         section.add(controlPlaneStatus)
