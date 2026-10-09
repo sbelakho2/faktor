@@ -1,0 +1,9 @@
+{
+  "id": "INV-COMPLETION-EGRESS-REQUIRES-SANDBOX",
+  "file": "crates/orchestrator/src/task_executor/mod.rs",
+  "find": "None => Err(\n                \"no sandbox configured: refusing to execute a completion step that requires egress\"\n                    .to_string(),\n            ),",
+  "replace": "None => Ok(()),",
+  "gate": "cargo test -p faktor-orchestrator --lib completion_push_without_a_sandbox_refuses_egress_typed",
+  "expect": "FAILED",
+  "note": "An absent sandbox read as unrestricted egress turns a configuration omission into an ungated network path for completion steps."
+}

@@ -846,6 +846,68 @@ fn resumed_assignment_repairs_a_crash_between_generation_and_lease() {
     }
 }
 
+/// Audit P1: an infrastructure failure during recovery (a `workers()` read
+/// failing typed) is never collapsed into "no eligible worker" — recovery
+/// must return the store error instead of a successful empty report that
+/// silently strands the job.
+#[test]
+fn resume_assignments_propagates_a_store_read_failure() {
+    let h = Harness::memory();
+    h.register("wrk_1", &["rust"]);
+    let job_id = ExecutionJobId::try_new("job_fault").unwrap();
+    let mut req = requirements();
+    req.normalize().unwrap();
+    let job = ExecutionJob {
+        job_id: job_id.clone(),
+        organization_id: "org_1".into(),
+        trust_domain: "org_1".into(),
+        job_key: JobKey::try_new("fault").unwrap(),
+        requirements: req,
+        payload_digest: digest("7"),
+        requeue: RequeuePolicy { max_attempts: 3 },
+        assigned_worker: None,
+        created_ms: h.clock.now_ms(),
+        current_generation: JobGeneration::FIRST,
+        state: JobState::Assigned,
+    };
+    let generation = JobGenerationRow {
+        job_id: job_id.clone(),
+        organization_id: "org_1".into(),
+        generation: JobGeneration::FIRST,
+        state: GenerationState::Assigned,
+        created_ms: h.clock.now_ms(),
+        ended_ms: None,
+        reason: None,
+    };
+    let attempt = JobAttempt {
+        job_id: job_id.clone(),
+        generation: JobGeneration::FIRST,
+        attempt: 1,
+        worker_id: None,
+        lease_id: None,
+        state: AttemptState::Pending,
+        started_ms: h.clock.now_ms(),
+        ended_ms: None,
+        reason: None,
+    };
+    h.store
+        .insert_generation_and_attempt(&job, &generation, &attempt)
+        .unwrap();
+    h.store
+        .append_journal(
+            &JournalEntry::new("org_1", "job_scheduled", h.clock.now_ms(), "test")
+                .unwrap()
+                .with_job(&job_id, JobGeneration::FIRST),
+        )
+        .unwrap();
+    h.store.inject_workers_read_failure();
+    let err = h
+        .plane
+        .resume_assignments(&org("org_1"))
+        .expect_err("a store failure must abort recovery, never read as no-eligible-worker");
+    assert!(matches!(err, WorkerError::Backend(_)), "{err:?}");
+}
+
 // ------------------------------------------------------------------- protocol
 
 #[test]

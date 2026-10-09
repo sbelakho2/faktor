@@ -770,11 +770,39 @@ impl Cas {
         }
     }
 
-    /// Stream a blob to a writer, verifying the hash while copying.
+    /// Stream a blob to a writer, verifying BEFORE any byte is written: the
+    /// first pass streams the stored decode through the strict re-hash check
+    /// (bounded 64 KiB chunks) into a sink; only a fully verified object is
+    /// then streamed to `w` in bounded chunks, counting the bytes. A corrupt
+    /// or truncated blob is a typed error with ZERO bytes handed to `w`.
     pub fn copy_to<W: Write>(&self, hash: FileHash, w: &mut W) -> CasResult<u64> {
-        let bytes = self.get_verified_now(hash)?;
-        w.write_all(&bytes)?;
-        Ok(bytes.len() as u64)
+        // Pass 1: strict verification of the whole stored object. Nothing
+        // reaches `w` until the content re-hashes to the address.
+        let file = self.open_blob(hash)?;
+        let verified_identity = FileIdentity::of_file(&file);
+        let mut sink = std::io::sink();
+        let size = match self.decode_verified(hash, file, &mut sink, None)? {
+            Some(s) => s,
+            None => unreachable!("no cap means the decode always completes"),
+        };
+        self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
+        // Pass 2: the store never mutates a blob in place (writes are atomic
+        // renames), so the second bounded decode yields exactly the bytes
+        // pass 1 re-hashed; the size cross-check catches a concurrent
+        // replacement/truncation before the count is returned.
+        let file = self.open_blob(hash)?;
+        let copied = match decode_stream(file, w, None, None)? {
+            Some(s) => s,
+            None => unreachable!("no cap means the decode always completes"),
+        };
+        if copied != size {
+            return Err(CasError::SizeMismatch {
+                hash,
+                expected: size,
+                actual: copied,
+            });
+        }
+        Ok(copied)
     }
 
     /// Verify integrity of the whole store; returns the list of corrupted
@@ -896,6 +924,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cas = Cas::open(dir.path().join("cas")).unwrap();
         (dir, cas)
+    }
+
+    /// A writer that counts bytes and stores nothing (bounded-memory probe).
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that fails with a typed io error after accepting `allow`
+    /// bytes (mid-write failure probe).
+    struct FailingWriter {
+        allow: usize,
+        accepted: usize,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.accepted >= self.allow {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected mid-write failure",
+                ));
+            }
+            let n = buf.len().min(self.allow - self.accepted);
+            self.accepted += n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1031,6 +1101,73 @@ mod tests {
         let n = cas.copy_to(h, &mut buf).unwrap();
         assert_eq!(n, 9);
         assert_eq!(buf.into_inner(), b"stream me");
+    }
+
+    #[test]
+    fn copy_to_corruption_writes_zero_bytes() {
+        let (_d, cas) = tmp_cas();
+        // Valid zstd, wrong content: the strict verification pass re-hashes
+        // and refuses before the writer is ever touched.
+        let h = cas.put(b"the quick brown fox").unwrap();
+        let evil = zstd::encode_all(&b"the lazy dog"[..], 3).unwrap();
+        fs::write(cas.blob_path(h), evil).unwrap();
+        let mut sink = CountingWriter::default();
+        match cas.copy_to(h, &mut sink) {
+            Err(CasError::HashMismatch(x)) => assert_eq!(x, h),
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+        assert_eq!(sink.bytes, 0, "no unverified byte may reach the writer");
+        // Hostile non-zstd bytes: decode failure, still zero bytes.
+        fs::write(cas.blob_path(h), b"hostile bytes, no zstd frame at all").unwrap();
+        let mut sink = CountingWriter::default();
+        match cas.copy_to(h, &mut sink) {
+            Err(CasError::Zstd(_)) | Err(CasError::Io(_)) => {}
+            other => panic!("expected a loud decode error, got {other:?}"),
+        }
+        assert_eq!(
+            sink.bytes, 0,
+            "no byte may reach the writer on decode failure"
+        );
+        // Missing blob: typed absence, still nothing written.
+        let ghost = FileHash::from([9u8; 32]);
+        let mut sink = CountingWriter::default();
+        assert!(matches!(
+            cas.copy_to(ghost, &mut sink),
+            Err(CasError::NotFound(_))
+        ));
+        assert_eq!(sink.bytes, 0);
+    }
+
+    #[test]
+    fn copy_to_failing_writer_is_a_typed_error_not_a_panic() {
+        let (_d, cas) = tmp_cas();
+        let payload: Vec<u8> = (0..200_000).map(|i| ((i * 29 + 11) % 251) as u8).collect();
+        let h = cas.put(&payload).unwrap();
+        let mut w = FailingWriter {
+            allow: 1000,
+            accepted: 0,
+        };
+        match cas.copy_to(h, &mut w) {
+            Err(CasError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected a typed Io error, got {other:?}"),
+        }
+        assert_eq!(
+            w.accepted, 1000,
+            "the failure surfaced at the injected bound"
+        );
+        assert!(w.accepted < payload.len(), "the write stopped mid-stream");
+    }
+
+    #[test]
+    fn copy_to_multi_chunk_counts_and_matches_content() {
+        let (_d, cas) = tmp_cas();
+        // 200 KiB spans more than three 64 KiB decode chunks.
+        let payload: Vec<u8> = (0..200_000).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+        let h = cas.put(&payload).unwrap();
+        let mut out = Vec::new();
+        let n = cas.copy_to(h, &mut out).unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert_eq!(out, payload);
     }
 
     #[test]

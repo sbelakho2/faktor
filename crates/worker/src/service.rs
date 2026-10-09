@@ -1371,27 +1371,37 @@ impl WorkerPlane {
                 if generation_row.state != GenerationState::Assigned {
                     continue;
                 }
+                // Audit P1: domain refusals may skip a target, but
+                // infrastructure failures (store/schema/decode) must abort
+                // recovery — never be read as "no eligible worker".
                 let target = match &job.assigned_worker {
-                    Some(id) => self
-                        .require_eligible(id, organization, &job.trust_domain, &job.requirements)
-                        .ok(),
-                    None => self
-                        .find_eligible(organization, &job.trust_domain, &job.requirements)
-                        .ok()
-                        .flatten(),
+                    Some(id) => {
+                        match self.require_eligible(
+                            id,
+                            organization,
+                            &job.trust_domain,
+                            &job.requirements,
+                        ) {
+                            Ok(worker) => Some(worker),
+                            Err(e) if e.is_recovery_domain_refusal() => None,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    None => {
+                        self.find_eligible(organization, &job.trust_domain, &job.requirements)?
+                    }
                 };
                 if let Some(worker) = target {
-                    if self
-                        .accept_lease_inner(
-                            &worker,
-                            organization,
-                            &job,
-                            job.current_generation,
-                            now,
-                        )
-                        .is_ok()
-                    {
-                        report.reassigned.push(job.job_id.to_string());
+                    match self.accept_lease_inner(
+                        &worker,
+                        organization,
+                        &job,
+                        job.current_generation,
+                        now,
+                    ) {
+                        Ok(_) => report.reassigned.push(job.job_id.to_string()),
+                        Err(e) if e.is_recovery_domain_refusal() => {}
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -1660,17 +1670,27 @@ impl WorkerPlane {
                 )))
             }
         };
+        // Audit P1: the same discipline as recovery — an expected domain
+        // refusal may leave the new generation unassigned, but an
+        // infrastructure failure must surface, and a failed acceptance after
+        // the durable requeue is never silently equal to "not reassigned".
         let target = match &job.assigned_worker {
-            Some(id) => self
-                .require_eligible(id, &organization, &job.trust_domain, &job.requirements)
-                .ok(),
-            None => self
-                .find_eligible(&organization, &job.trust_domain, &job.requirements)
-                .ok()
-                .flatten(),
+            Some(id) => {
+                match self.require_eligible(id, &organization, &job.trust_domain, &job.requirements)
+                {
+                    Ok(worker) => Some(worker),
+                    Err(e) if e.is_recovery_domain_refusal() => None,
+                    Err(e) => return Err(e),
+                }
+            }
+            None => self.find_eligible(&organization, &job.trust_domain, &job.requirements)?,
         };
         if let Some(worker) = target {
-            let _ = self.accept_lease_inner(&worker, &organization, &job_row, next_generation, now);
+            match self.accept_lease_inner(&worker, &organization, &job_row, next_generation, now) {
+                Ok(_) => {}
+                Err(e) if e.is_recovery_domain_refusal() => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

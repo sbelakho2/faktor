@@ -1787,3 +1787,138 @@ mutation_command = "node scripts/mutation-run.mjs INV-NETWORK-POLICY-STRICT"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-GIT-LEASE-UNREADABLE-NOT-STOLEN"
+statement = "An unreadable lease residue is never treated as immediately stale: only a readable stale record or an age beyond the malformed TTL may reconcile, so a transient read or permission failure cannot hand the repository mutation lease to a second daemon."
+owner = "crates/git mutation lease"
+authority = "planted mutation scripts/mutations/INV-GIT-LEASE-UNREADABLE-NOT-STOLEN.json"
+script_check = ""
+unit_test = "unreadable_lease_residue_is_never_stolen_immediately"
+production_wiring = "lease_verdict_matrix_unknown_is_live_and_only_proof_reclaims"
+fault = ""
+mutation_witness = "unreadable_lease_residue_is_never_stolen_immediately"
+mutation_command = "node scripts/mutation-run.mjs INV-GIT-LEASE-UNREADABLE-NOT-STOLEN"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-INSTRUCTION-ROOT-AUTHORITY"
+statement = "An unreadable or ambiguous workspace instruction root is a typed refusal; only a legitimate absence resolves to Empty, so the agent never continues under no instructions when its authoritative root cannot be established."
+owner = "crates/instructions workspace root authority"
+authority = "planted mutation scripts/mutations/INV-INSTRUCTION-ROOT-AUTHORITY.json"
+script_check = ""
+unit_test = "unreadable_root_authority_is_a_typed_refusal_never_empty"
+production_wiring = "resolver_uses_durable_roots_and_returns_empty_for_rootless_sessions"
+fault = ""
+mutation_witness = "unreadable_root_authority_is_a_typed_refusal_never_empty"
+mutation_command = "node scripts/mutation-run.mjs INV-INSTRUCTION-ROOT-AUTHORITY"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CHECKPOINT-EVIDENCE-STORE-FAILURE"
+statement = "A checkpoint-store read failure at the high-risk edit evidence gate is a typed refusal, never 'no prior expectations'."
+owner = "crates/agent high-risk edit evidence gate"
+authority = "planted mutation scripts/mutations/INV-CHECKPOINT-EVIDENCE-STORE-FAILURE.json"
+script_check = ""
+unit_test = "unreadable_checkpoint_store_fails_the_edit_evidence_gate_closed"
+production_wiring = "high_risk_review_refuses_drifted_evidence_hash"
+fault = ""
+mutation_witness = "unreadable_checkpoint_store_fails_the_edit_evidence_gate_closed"
+mutation_command = "node scripts/mutation-run.mjs INV-CHECKPOINT-EVIDENCE-STORE-FAILURE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC"
+statement = "An unprovable verification root yields no snapshot identity (None); the synthetic snapshot-unavailable marker never participates in proof, reuse or cache identity."
+owner = "crates/agent snapshot identity"
+authority = "planted mutation scripts/mutations/INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC.json"
+script_check = ""
+unit_test = "unprovable_root_has_no_snapshot_identity_only_none"
+production_wiring = "environment_fingerprint_is_stable_and_manifest_sensitive"
+fault = ""
+mutation_witness = "unprovable_root_has_no_snapshot_identity_only_none"
+mutation_command = "node scripts/mutation-run.mjs INV-SNAPSHOT-IDENTITY-NO-SYNTHETIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-PROOF-BASIS-NO-SYNTHETIC"
+statement = "A reusable proof basis refuses when the candidate workspace or its content identity is unavailable; a synthetic marker never keys proof reuse."
+owner = "crates/agent reusable proof basis"
+authority = "planted mutation scripts/mutations/INV-PROOF-BASIS-NO-SYNTHETIC.json"
+script_check = ""
+unit_test = "proof_basis_refuses_a_missing_candidate_workspace"
+production_wiring = "environment_fingerprint_is_stable_and_manifest_sensitive"
+fault = ""
+mutation_witness = "proof_basis_refuses_a_missing_candidate_workspace"
+mutation_command = "node scripts/mutation-run.mjs INV-PROOF-BASIS-NO-SYNTHETIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-WORKER-RECOVERY-ERROR-PROPAGATION"
+statement = "Worker crash recovery propagates infrastructure read and lease errors typed and only skips expected domain refusals, so it never reports success while jobs stay stranded."
+owner = "crates/worker crash recovery"
+authority = "planted mutation scripts/mutations/INV-WORKER-RECOVERY-ERROR-PROPAGATION.json"
+script_check = ""
+unit_test = "resume_assignments_propagates_a_store_read_failure"
+production_wiring = "resumed_assignment_repairs_a_crash_between_generation_and_lease"
+fault = ""
+mutation_witness = "resume_assignments_propagates_a_store_read_failure"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-RECOVERY-ERROR-PROPAGATION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CAS-COPY-TO-VERIFIED-STREAM"
+statement = "CAS copy_to verifies the stored object in a bounded pre-pass and only then streams bounded chunks; a corrupt object yields a typed error with zero bytes written."
+owner = "crates/cas copy_to"
+authority = "planted mutation scripts/mutations/INV-CAS-COPY-TO-VERIFIED-STREAM.json"
+script_check = ""
+unit_test = "copy_to_corruption_writes_zero_bytes"
+production_wiring = "copy_to_multi_chunk_counts_and_matches_content"
+fault = ""
+mutation_witness = "copy_to_corruption_writes_zero_bytes"
+mutation_command = "node scripts/mutation-run.mjs INV-CAS-COPY-TO-VERIFIED-STREAM"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-COMPLETION-EGRESS-REQUIRES-SANDBOX"
+statement = "A completion step that requires egress is refused typed when no sandbox is configured; an absent sandbox is never an egress grant."
+owner = "crates/orchestrator completion-step egress"
+authority = "planted mutation scripts/mutations/INV-COMPLETION-EGRESS-REQUIRES-SANDBOX.json"
+script_check = ""
+unit_test = "completion_push_without_a_sandbox_refuses_egress_typed"
+production_wiring = "settle_run_converges_after_the_push_status_write_seam"
+fault = ""
+mutation_witness = "completion_push_without_a_sandbox_refuses_egress_typed"
+mutation_command = "node scripts/mutation-run.mjs INV-COMPLETION-EGRESS-REQUIRES-SANDBOX"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
+
+[[invariant]]
+id = "INV-SEMANTIC-CONTEXT-BYTE-BOUND"
+statement = "SemanticContextRequest::validate bounds max_bytes (non-zero, at or below the public cap); an unbounded provider workload cannot be requested through the semantic API."
+owner = "crates/semantic context request bounds"
+authority = "planted mutation scripts/mutations/INV-SEMANTIC-CONTEXT-BYTE-BOUND.json"
+script_check = ""
+unit_test = "context_request_max_bytes_is_bounded"
+production_wiring = "provider_absence_falls_back_and_never_fails_ordinary_operation"
+fault = ""
+mutation_witness = "context_request_max_bytes_is_bounded"
+mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-CONTEXT-BYTE-BOUND"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]

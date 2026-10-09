@@ -114,9 +114,11 @@ async fn turn_verification_runs_required_check_and_passes() {
 #[tokio::test]
 async fn completion_contract_gate_refuses_verified_complete_until_step_succeeds() {
     use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
-    let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+    // A REAL scoped workspace root: the proof-basis identity refuses to
+    // derive from an unprovable tree (audit P1 identity law).
+    let (deps, _dir, root) = verified_rust_env(vec![], None);
     let runtime = AgentRuntime::new(deps).unwrap();
-    let session = new_session(runtime.deps());
+    let session = session_in_workspace(runtime.deps(), &root);
     let handle = runtime
         .deps()
         .session

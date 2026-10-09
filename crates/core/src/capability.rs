@@ -238,6 +238,12 @@ pub enum NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    /// NON-AUTHORITATIVE (singular-authority law, audit P2): this raw
+    /// matcher must not gate egress anywhere. Production egress
+    /// authorization lives in the canonical destination/DNS authority;
+    /// `allows` is retained only for non-authoritative classification and
+    /// tests, and is deprecated so any new production use is a warning.
+    ///
     /// TRUE when `destination` is admitted. Matching is ANCHORED on the URL
     /// authority (scheme + host + port) and a `/`-segment path boundary
     /// (audit P2-API): a configured `https://api.example.com` admits
@@ -245,6 +251,9 @@ impl NetworkPolicy {
     /// nor a different scheme/port. Raw prefix matching is deliberately
     /// retired — it admitted attacker-controlled string continuations.
     /// Anything unparseable fails closed.
+    #[deprecated(
+        note = "non-authoritative: production egress uses the canonical destination/DNS authority"
+    )]
     pub fn allows(&self, destination: &str) -> bool {
         match self {
             NetworkPolicy::DenyAll => false,
@@ -339,6 +348,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)] // non-authoritative classification matcher, tests only
     fn network_policy_matrix() {
         let deny = NetworkPolicy::DenyAll;
         assert!(!deny.allows("https://api.openai.com/v1"));

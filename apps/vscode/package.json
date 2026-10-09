@@ -181,6 +181,8 @@
   "scripts": {
     "build": "tsc -p .",
     "selftest": "node scripts/selftest.mjs",
+    "render:check": "node scripts/render-webview.mjs --check",
+    "render:screenshots": "node scripts/render-webview.mjs --screenshots --prefix render",
     "package:vsix": "npx --no-install vsce package"
   },
   "devDependencies": {

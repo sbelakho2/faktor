@@ -1247,10 +1247,16 @@ pub fn kind_for_rel_path(rel: &Path) -> Option<RuleSourceKind> {
 /// cycle.
 pub trait WorkspaceRootProvider: Send + Sync {
     /// The durable root directory of `workspace_id` (raw `WorkspaceId` from
-    /// the daemon workspace table). `None` for an unknown workspace or a
-    /// workspace without a root — the caller resolves that to
-    /// [`LoadedInstructions::Empty`], never an error.
-    fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf>;
+    /// the daemon workspace table). `Ok(None)` is the LEGITIMATE absence —
+    /// an unknown workspace or a workspace without a root, resolved to
+    /// [`LoadedInstructions::Empty`]. An UNREADABLE/AMBIGUOUS authority is
+    /// `Err` (audit P0/P1 authority law): a store failure or hostile
+    /// shadow residue must stop the operation, never silently degrade to
+    /// "no instructions" or a guessed root.
+    fn workspace_root(
+        &self,
+        workspace_id: u64,
+    ) -> Result<Option<PathBuf>, faktor_core::error::Error>;
 }
 
 /// Default bound on cached loaded instruction sets per resolver.
@@ -1262,8 +1268,11 @@ pub const DEFAULT_RESOLVER_CACHE_ENTRIES: usize = 32;
 struct NoRoots;
 
 impl WorkspaceRootProvider for NoRoots {
-    fn workspace_root(&self, _workspace_id: u64) -> Option<PathBuf> {
-        None
+    fn workspace_root(
+        &self,
+        _workspace_id: u64,
+    ) -> Result<Option<PathBuf>, faktor_core::error::Error> {
+        Ok(None)
     }
 }
 
@@ -1356,7 +1365,15 @@ impl InstructionResolver {
         workspace_id: u64,
         pinned_epoch: Option<InstructionEpoch>,
     ) -> Result<LoadedInstructions, RulesLoadError> {
-        let Some(root) = self.provider.workspace_root(workspace_id) else {
+        // Authority law (audit P0/P1): only a LEGITIMATE absence is Empty; an
+        // unreadable/ambiguous root authority is a typed refusal, never a
+        // silent degradation to "no instructions".
+        let Some(root) = self.provider.workspace_root(workspace_id).map_err(|e| {
+            RulesLoadError::Unreadable(format!(
+                "workspace root of workspace {workspace_id} is unavailable: {e}"
+            ))
+        })?
+        else {
             return Ok(LoadedInstructions::Empty);
         };
         match pinned_epoch {
@@ -2916,8 +2933,28 @@ mod tests {
     struct MapRoots(HashMap<u64, PathBuf>);
 
     impl WorkspaceRootProvider for MapRoots {
-        fn workspace_root(&self, workspace_id: u64) -> Option<PathBuf> {
-            self.0.get(&workspace_id).cloned()
+        fn workspace_root(
+            &self,
+            workspace_id: u64,
+        ) -> Result<Option<PathBuf>, faktor_core::error::Error> {
+            Ok(self.0.get(&workspace_id).cloned())
+        }
+    }
+
+    /// A provider whose durable-root read FAILS (store/IO error): the
+    /// resolver must surface a typed refusal, never `Empty` (audit P0/P1
+    /// authority law: unreadable ≠ absent).
+    struct BrokenRoots;
+
+    impl WorkspaceRootProvider for BrokenRoots {
+        fn workspace_root(
+            &self,
+            _workspace_id: u64,
+        ) -> Result<Option<PathBuf>, faktor_core::error::Error> {
+            Err(faktor_core::error::Error::new(
+                faktor_core::error::ErrorKind::Store,
+                "workspace root store is unreadable",
+            ))
         }
     }
 
@@ -2949,6 +2986,19 @@ mod tests {
             r2.resolve(8, None),
             Err(RulesLoadError::Oversized(_))
         ));
+    }
+
+    /// P0/P1: an UNREADABLE root authority is a typed refusal — never the
+    /// `Empty` (no-instructions) degradation.
+    #[test]
+    fn unreadable_root_authority_is_a_typed_refusal_never_empty() {
+        let resolver = InstructionResolver::new(Arc::new(BrokenRoots), 4);
+        let err = resolver.resolve(7, None).unwrap_err();
+        assert!(matches!(err, RulesLoadError::Unreadable(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("unavailable"),
+            "the refusal names the unavailable authority: {err}"
+        );
     }
 
     #[test]

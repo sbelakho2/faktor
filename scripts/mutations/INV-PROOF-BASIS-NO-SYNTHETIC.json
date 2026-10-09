@@ -1,0 +1,9 @@
+{
+  "id": "INV-PROOF-BASIS-NO-SYNTHETIC",
+  "file": "crates/agent/src/runtime/verification_attribution.rs",
+  "find": "    let Some(workspace) = workspace else {\n        return Err(faktor_core::Error::new(\n            faktor_core::ErrorKind::Conflict,\n            \"the candidate workspace is unavailable; refusing to derive a reusable proof basis\",\n        ));\n    };",
+  "replace": "    let Some(workspace) = workspace else {\n        return Ok(\"snapshot-unavailable\".to_string());\n    };",
+  "gate": "cargo test -p faktor-agent --lib proof_basis_refuses_a_missing_candidate_workspace",
+  "expect": "FAILED",
+  "note": "Letting an absent candidate workspace key a proof basis with a synthetic marker makes unrelated verification states reusable."
+}

@@ -1947,7 +1947,13 @@ impl TaskExecutor {
         let sandbox = self.agent.deps().sandbox.clone();
         let egress: Arc<dyn EgressPolicy> = Arc::new(move |url: &str| match &sandbox {
             Some(engine) => engine.check_egress(url).map_err(|e| e.to_string()),
-            None => Ok(()),
+            // Fail closed (audit P2): an absent sandbox is never an egress
+            // grant — a completion step that needs the network is refused
+            // typed, and local/file:// remotes never consult this policy.
+            None => Err(
+                "no sandbox configured: refusing to execute a completion step that requires egress"
+                    .to_string(),
+            ),
         });
         let runner = Arc::new(
             CompletionStepRunner::new(supervisor, egress, wiring.config.clone())

@@ -477,6 +477,10 @@ pub(crate) enum EditEvidenceRefusal {
     UnexpectedlyPresent { path: String },
     /// The file could not be read for the check (not proof of absence).
     Unreadable { path: String, reason: String },
+    /// The checkpoint/expectation STORE could not be read: the recorded
+    /// expectations are unknown, never "there were none" (audit P0/P1 —
+    /// anti-drift evidence fails closed).
+    ExpectationsUnavailable { reason: String },
 }
 
 impl std::fmt::Display for EditEvidenceRefusal {
@@ -501,6 +505,11 @@ impl std::fmt::Display for EditEvidenceRefusal {
             EditEvidenceRefusal::Unreadable { path, reason } => {
                 write!(f, "{path} cannot be read for the edit-hash check: {reason}")
             }
+            EditEvidenceRefusal::ExpectationsUnavailable { reason } => write!(
+                f,
+                "the recorded edit expectations are unreadable ({reason}); \
+                 failing closed instead of reviewing without them"
+            ),
         }
     }
 }
@@ -519,11 +528,31 @@ pub(crate) fn require_edit_evidence_hashes(
     ws: &faktor_fs::WorkspaceHandle,
     changed: &[String],
 ) -> Result<(), EditEvidenceRefusal> {
-    let rows = deps
-        .snapshots
-        .as_ref()
-        .and_then(|s| s.checkpoints(handle.id()).ok())
-        .unwrap_or_default();
+    require_edit_evidence_hashes_for_store(deps.snapshots.as_deref(), handle, ws, changed)
+}
+
+/// The store-parameterized core of [`require_edit_evidence_hashes`] so the
+/// fail-closed behavior is directly testable (audit P0/P1).
+pub(crate) fn require_edit_evidence_hashes_for_store(
+    snapshots: Option<&faktor_snapshot::CheckpointStore>,
+    handle: &faktor_session::SessionHandle,
+    ws: &faktor_fs::WorkspaceHandle,
+    changed: &[String],
+) -> Result<(), EditEvidenceRefusal> {
+    // Audit P0/P1: a checkpoint-STORE read failure is NOT "no prior
+    // expectations" — the anti-drift gate would otherwise lose exactly the
+    // evidence it exists to enforce. Only an absent store is the empty case.
+    let rows = match snapshots {
+        None => Vec::new(),
+        Some(snapshots) => match snapshots.checkpoints(handle.id()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return Err(EditEvidenceRefusal::ExpectationsUnavailable {
+                    reason: e.to_string(),
+                })
+            }
+        },
+    };
     for path in changed
         .iter()
         .take(faktor_verify::review::REVIEW_MAX_CHANGED_FILES)

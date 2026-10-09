@@ -47,12 +47,15 @@ pub(crate) fn fake_ok() -> Arc<crate::VerificationService> {
 pub(crate) struct TestSessionRoots(pub(crate) Arc<SessionManager>);
 
 impl WorkspaceRootProvider for TestSessionRoots {
-    fn workspace_root(&self, workspace_id: u64) -> Option<std::path::PathBuf> {
+    fn workspace_root(
+        &self,
+        workspace_id: u64,
+    ) -> Result<Option<std::path::PathBuf>, faktor_core::Error> {
         if workspace_id == 0 {
-            return None;
+            return Ok(None);
         }
         let ws = faktor_core::id::WorkspaceId::new(workspace_id);
-        self.0.workspace_root(ws).ok().flatten()
+        self.0.workspace_root(ws)
     }
 }
 

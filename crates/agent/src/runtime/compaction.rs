@@ -76,7 +76,17 @@ pub(crate) async fn semantic_turn_consult(
         .resolve_workspace_root(handle.id())
         .ok()
         .flatten();
-    let revision = crate::semantic_tool::semantic_source_revision(workspace_root.as_deref());
+    // Identity law (audit P1): without a CONTENT revision there is no
+    // snapshot identity to derive — degrade to Unknown instead of deriving
+    // one from a synthetic marker.
+    let Some(revision) = crate::semantic_tool::semantic_source_revision(workspace_root.as_deref())
+    else {
+        tracing::warn!(
+            session = %handle.id(),
+            "workspace content identity unavailable; semantic consult degraded to unknown"
+        );
+        return Some(SemanticTurnState::unknown(provider_id.to_string()));
+    };
     let snapshot_id = SemanticSnapshotId::derive(
         workspace,
         &revision,

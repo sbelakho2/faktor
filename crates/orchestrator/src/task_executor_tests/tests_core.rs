@@ -2049,14 +2049,18 @@ pub(crate) fn parked_write_tool(gate: Arc<tokio::sync::Notify>, fired: Arc<Atomi
 pub(crate) struct RealRoots(Arc<SessionManager>);
 
 impl faktor_instructions::WorkspaceRootProvider for RealRoots {
-    fn workspace_root(&self, workspace_id: u64) -> Option<std::path::PathBuf> {
+    fn workspace_root(
+        &self,
+        workspace_id: u64,
+    ) -> Result<Option<std::path::PathBuf>, faktor_core::Error> {
         if workspace_id == 0 {
-            return None;
+            return Ok(None);
         }
         let ws = WorkspaceId::new(workspace_id);
         match self.0.live_workspace_shadow_root(ws) {
-            Ok(Some(root)) => Some(root),
-            Ok(None) | Err(_) => self.0.workspace_root(ws).ok().flatten(),
+            Ok(Some(root)) => Ok(Some(root)),
+            Ok(None) => self.0.workspace_root(ws),
+            Err(e) => Err(e),
         }
     }
 }

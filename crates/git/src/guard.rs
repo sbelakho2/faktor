@@ -534,12 +534,16 @@ fn try_create<T: serde::Serialize>(path: &Path, record: &T) -> Result<LeaseAttem
                 None => {
                     // Unreadable/malformed residue: reconcile only after the
                     // TTL ceiling, so a writer mid-create is never stolen.
-                    let old = raw.is_none()
-                        || std::fs::metadata(path)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.elapsed().ok())
-                            .is_some_and(|age| age > MALFORMED_LEASE_TTL);
+                    // An UNREADABLE file is NEVER assumed old (audit P0: a
+                    // transient I/O or permission failure must not hand the
+                    // repository to a second daemon) — only a metadata
+                    // modification time older than the TTL reclaims; an
+                    // unobservable age keeps the conservative Live verdict.
+                    let old = std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > MALFORMED_LEASE_TTL);
                     if old {
                         Ok(LeaseAttempt::Reconcile)
                     } else {
@@ -732,6 +736,30 @@ mod tests {
             dir.path().join(LEASE_FILE).exists(),
             "the unobservable owner's lease is left untouched"
         );
+    }
+
+    /// Audit P0: an UNREADABLE lease residue (permission or transient I/O
+    /// failure) is never treated as immediately old — the acquisition stays
+    /// Live and conflicts until the residue becomes observable or its age
+    /// provably exceeds the malformed TTL. Only a READABLE stale record may
+    /// be reconciled by identity.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_lease_residue_is_never_stolen_immediately() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LEASE_FILE);
+        std::fs::write(&path, b"{not-json").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = DiskLease::acquire(dir.path(), "repro", Duration::from_millis(60))
+            .expect_err("an unreadable young lease must not be stolen");
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err:?}");
+        assert!(
+            err.message.contains("mutation lease"),
+            "the typed conflict names the lease: {err:?}"
+        );
+        // Restore permissions so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     }
 
     #[test]

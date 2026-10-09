@@ -139,6 +139,23 @@ pub enum WorkerError {
     JobTerminal { job: String, state: String },
 }
 
+impl WorkerError {
+    /// TRUE when this error is an expected RECOVERY-DOMAIN refusal (the
+    /// target is not eligible/leasable *right now*: revoked, foreign,
+    /// superseded, already leased, saturated) rather than an infrastructure
+    /// failure. Recovery may skip such a target, but a store/schema/decode
+    /// failure must NEVER be collapsed into "no eligible worker" (audit P1:
+    /// recovery may not finish successfully while jobs stay stranded).
+    pub fn is_recovery_domain_refusal(&self) -> bool {
+        !matches!(
+            self,
+            WorkerError::Backend(_)
+                | WorkerError::Malformed(_)
+                | WorkerError::UnsupportedSchema { .. }
+        )
+    }
+}
+
 impl From<WorkerError> for faktor_cloud::ControlPlaneError {
     fn from(e: WorkerError) -> Self {
         match e {

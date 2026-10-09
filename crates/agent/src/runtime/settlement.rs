@@ -860,22 +860,36 @@ impl AgentRuntime {
             faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
             faktor_verify::Acceptance::Pending => VerificationStatus::Pending,
         };
-        let proof = if executed.is_empty() {
-            None
+        let (proof, completion) = if executed.is_empty() {
+            (None, completion)
         } else {
-            Some(
-                verification_proof_from_attempt(
-                    criteria.as_deref(),
-                    &mirrors,
-                    &results,
-                    &unavailable,
-                    &executed,
-                    &changed,
-                    &ws,
-                    None,
-                )
-                .await,
+            match verification_proof_from_attempt(
+                criteria.as_deref(),
+                &mirrors,
+                &results,
+                &unavailable,
+                &executed,
+                &changed,
+                &ws,
+                None,
             )
+            .await
+            {
+                Ok(proof) => (Some(proof), completion),
+                // Identity law (audit P1): no content identity, no durable
+                // proof; the completion is blocked instead.
+                Err(detail) => {
+                    let mut reasons = match completion {
+                        CompletionGate::BlockedVerification { reasons } => reasons,
+                        _ => Vec::new(),
+                    };
+                    reasons.push(OutcomeReason::new(
+                        ReasonCode::CheckUnavailable,
+                        format!("durable verification proof refused: {detail}"),
+                    ));
+                    (None, CompletionGate::BlockedVerification { reasons })
+                }
+            }
         };
         self.persist_gate_facts(
             handle,

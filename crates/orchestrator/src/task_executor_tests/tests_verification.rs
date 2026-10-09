@@ -1029,13 +1029,16 @@ pub(crate) struct AlternatingRoots {
 }
 
 impl faktor_instructions::WorkspaceRootProvider for AlternatingRoots {
-    fn workspace_root(&self, _workspace_id: u64) -> Option<std::path::PathBuf> {
+    fn workspace_root(
+        &self,
+        _workspace_id: u64,
+    ) -> Result<Option<std::path::PathBuf>, faktor_core::Error> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        Some(if call.is_multiple_of(2) {
+        Ok(Some(if call.is_multiple_of(2) {
             self.first.clone()
         } else {
             self.second.clone()
-        })
+        }))
     }
 }
 

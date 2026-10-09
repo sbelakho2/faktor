@@ -1,0 +1,9 @@
+{
+  "id": "INV-SEMANTIC-CONTEXT-BYTE-BOUND",
+  "file": "crates/semantic/src/types.rs",
+  "find": "        if self.max_bytes > SEMANTIC_CONTEXT_MAX_BYTES {\n            return Err(SemanticError::Oversized {\n                max: SEMANTIC_CONTEXT_MAX_BYTES,\n                actual: self.max_bytes,\n            });\n        }",
+  "replace": "        if false {\n            return Err(SemanticError::Oversized {\n                max: SEMANTIC_CONTEXT_MAX_BYTES,\n                actual: self.max_bytes,\n            });\n        }",
+  "gate": "cargo test -p faktor-semantic --lib context_request_max_bytes_is_bounded",
+  "expect": "FAILED",
+  "note": "Dropping the max_bytes bound lets the public semantic API request an unbounded provider workload."
+}
