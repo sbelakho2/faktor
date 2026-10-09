@@ -917,14 +917,19 @@ impl AgentRuntime {
     pub(crate) fn latest_attempt_record(
         handle: &faktor_session::SessionHandle,
         status: VerificationStatus,
-    ) -> Option<faktor_session::VerificationRecord> {
-        let task_id = handle.task_id().ok()?;
-        handle
-            .list_verification_records(task_id)
-            .ok()?
+    ) -> Result<Option<faktor_session::VerificationRecord>, faktor_learning::LearningError> {
+        // P2-VERIFY: a store read failure is an ERROR, not "no record" — the
+        // learning hooks must not silently skip on a broken ledger.
+        let task_id = handle.task_id().map_err(|e| {
+            faktor_learning::LearningError::Store(format!("task id unreadable: {e}"))
+        })?;
+        let records = handle.list_verification_records(task_id).map_err(|e| {
+            faktor_learning::LearningError::Store(format!("verification records unreadable: {e}"))
+        })?;
+        Ok(records
             .into_iter()
             .filter(|record| record.status == status)
-            .max_by_key(|record| record.record_id.raw())
+            .max_by_key(|record| record.record_id.raw()))
     }
 
     /// Durable learning-corpus DATA for the turn's evidence (audits
@@ -1163,7 +1168,7 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
     ) -> Result<(), faktor_learning::LearningError> {
-        let Some(passed) = Self::latest_attempt_record(handle, VerificationStatus::Passed) else {
+        let Some(passed) = Self::latest_attempt_record(handle, VerificationStatus::Passed)? else {
             return Ok(());
         };
         let Some(recovery_actions) = Self::learning_recovery_actions(&passed) else {

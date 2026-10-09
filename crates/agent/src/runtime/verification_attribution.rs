@@ -2200,7 +2200,7 @@ impl AgentRuntime {
         &self,
         handle: &faktor_session::SessionHandle,
     ) -> Result<(), faktor_learning::LearningError> {
-        let Some(record) = Self::latest_attempt_record(handle, VerificationStatus::Failed) else {
+        let Some(record) = Self::latest_attempt_record(handle, VerificationStatus::Failed)? else {
             return Ok(());
         };
         let Some(episode) = self.learning_episode_from_record(handle, &record) else {
@@ -3220,6 +3220,9 @@ impl AgentRuntime {
         );
         if let Some(criteria) = criteria {
             let text = criteria_canonical_text(criteria);
+            // A fact READ failure is never "already seeded" (P2-VERIFY): the
+            // upsert below is idempotent, so healing on unknown is safe and
+            // the read failure can never suppress the durable criteria row.
             let seeded = handle
                 .memory_facts()
                 .map(|facts| {
@@ -3227,7 +3230,7 @@ impl AgentRuntime {
                         .iter()
                         .any(|(kind, key, _)| kind == "criteria" && key == "0")
                 })
-                .unwrap_or(true);
+                .unwrap_or(false);
             if !seeded {
                 self.dw_note_upsert_memory_fact(
                     handle,
