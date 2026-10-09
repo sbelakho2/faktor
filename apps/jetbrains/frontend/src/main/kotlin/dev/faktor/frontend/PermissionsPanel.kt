@@ -8,10 +8,8 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.NativePermissionEntry
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
+import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
-import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
@@ -30,15 +28,15 @@ class PermissionsPanel : JPanel(BorderLayout()) {
 
     private val list = JList(model)
 
-    private val detail = compactArea(4)
+    private val detail = compactArea(4, monospace = true)
 
-    private val header = JLabel("pending permissions: -")
+    private val header = WrappedLabel("pending permissions: -")
 
-    private val allowButton = JButton("Allow")
+    private val allowButton = primaryButton("Allow")
 
-    private val denyButton = JButton("Deny")
+    private val denyButton = secondaryButton("Deny")
 
-    private val refreshButton = JButton("Refresh")
+    private val refreshButton = secondaryButton("Refresh")
 
     private var listener: Listener? = null
 
@@ -55,15 +53,26 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         allowButton.addActionListener { reply("allow") }
         denyButton.addActionListener { reply("deny") }
         refreshButton.addActionListener { listener?.onRefresh() }
-        val body = JPanel(GridLayout(0, 1, 0, 4))
-        body.add(titledSection("pending permissions", JScrollPane(list)))
-        body.add(titledSection("request detail", JScrollPane(detail)))
-        val actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        actions.add(allowButton)
-        actions.add(denyButton)
-        actions.add(refreshButton)
-        body.add(titledSection("actions", actions))
-        add(header, BorderLayout.NORTH)
+        val detailBody = JPanel(BorderLayout(0, Spacing.S))
+        detailBody.isOpaque = false
+        detailBody.add(JScrollPane(detail), BorderLayout.CENTER)
+        detailBody.add(
+            actionRow(allowButton, denyButton, refreshButton),
+            BorderLayout.SOUTH
+        )
+        val body = pageColumn()
+        body.add(card("Pending requests", JScrollPane(list)))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Request detail", detailBody))
+        header.font = sectionTitleFont()
+        val headerRow = JPanel(BorderLayout())
+        headerRow.isOpaque = true
+        headerRow.background = panelSurface()
+        headerRow.border = BorderFactory.createEmptyBorder(
+            Spacing.S, Spacing.M, 0, Spacing.M
+        )
+        headerRow.add(header, BorderLayout.CENTER)
+        add(headerRow, BorderLayout.NORTH)
         add(body, BorderLayout.CENTER)
         updateButtons()
     }
@@ -136,7 +145,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
 
     fun denyEnabled(): Boolean = denyButton.isEnabled
 
-    fun headerText(): String = header.text
+    fun headerText(): String = header.fullText
 
     fun detailText(): String = detail.text
 

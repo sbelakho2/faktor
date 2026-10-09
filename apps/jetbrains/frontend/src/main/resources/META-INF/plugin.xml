@@ -16,6 +16,7 @@
         <toolWindow id="Faktor"
                     anchor="right"
                     canCloseContents="true"
+                    icon="/META-INF/faktor.svg"
                     factoryClass="dev.faktor.frontend.FaktorToolWindowFactory"/>
     </extensions>
 </idea-plugin>

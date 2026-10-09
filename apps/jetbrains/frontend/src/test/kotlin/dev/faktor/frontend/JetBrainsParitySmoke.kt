@@ -442,7 +442,7 @@ object JetBrainsParitySmoke {
         assertTrue(panel.eventsText().contains("#1 created"), panel.eventsText())
         panel.select(0)
         assertEquals("5", panel.selectedTerminalId())
-        panel.setComposerFields("bash", "-lc echo-parity", "/tmp")
+        panel.setComposerFields("bash", "-lc\necho-parity", "/tmp")
         panel.submitSpawn()
         assertEquals("bash", spawnCommand)
         assertEquals(listOf("-lc", "echo-parity"), spawnArgs)
@@ -778,7 +778,7 @@ object JetBrainsParitySmoke {
                     chat.terminalView().terminalLabel(0).contains("task=3"),
                     chat.terminalView().terminalLabel(0)
                 )
-                chat.terminalView().setComposerFields("bash", "-lc echo-parity", "/tmp")
+                chat.terminalView().setComposerFields("bash", "-lc\necho-parity", "/tmp")
                 chat.terminalView().submitSpawn()
                 await("terminal spawn routed") {
                     daemon.lastRequest("POST", "/native/session/7/terminal") != null

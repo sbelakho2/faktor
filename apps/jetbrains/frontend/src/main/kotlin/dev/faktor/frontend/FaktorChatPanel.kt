@@ -35,7 +35,6 @@ import java.math.BigInteger
 import java.nio.file.Path
 import java.util.UUID
 import java.awt.BorderLayout
-import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.GridLayout
 import java.util.concurrent.CountDownLatch
@@ -58,6 +57,7 @@ import javax.swing.JSplitPane
 import javax.swing.JTabbedPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
+import javax.swing.JToggleButton
 import javax.swing.SwingUtilities
 import javax.swing.WindowConstants
 
@@ -136,39 +136,39 @@ class FaktorChatPanel(
 
     private val modelField = JTextField("default", 10)
 
-    private val startButton = JButton("Start daemon")
+    private val startButton = secondaryButton("Start daemon")
 
-    private val stopButton = JButton("Stop daemon")
+    private val stopButton = secondaryButton("Stop daemon")
 
-    private val newSessionButton = JButton("New session")
+    private val newSessionButton = secondaryButton("New session")
 
-    private val refreshButton = JButton("Refresh")
+    private val refreshButton = secondaryButton("Refresh")
 
-    private val sendButton = JButton("Send")
+    private val sendButton = primaryButton("Send")
 
-    private val abortButton = JButton("Abort")
+    private val abortButton = secondaryButton("Abort")
 
-    private val daemonLabel = JLabel("daemon: stopped")
+    private val daemonLabel = WrappedLabel("daemon: stopped")
 
-    private val streamLabel = JLabel("stream: off")
+    private val streamLabel = WrappedLabel("stream: off")
 
-    private val stateLabel = JLabel("state: -")
+    private val stateLabel = WrappedLabel("state: -")
 
-    private val modelLabel = JLabel("model: -")
+    private val modelLabel = WrappedLabel("model: -")
 
-    private val toolLabel = JLabel("active tool: -")
+    private val toolLabel = WrappedLabel("active tool: -")
 
-    private val queuedLabel = JLabel("queued: 0")
+    private val queuedLabel = WrappedLabel("queued: 0")
 
-    private val usageLabel = JLabel("usage: -")
+    private val usageLabel = WrappedLabel("usage: -")
 
-    private val verifyLabel = JLabel("verification: -")
+    private val verifyLabel = WrappedLabel("verification: -")
 
-    private val filesLabel = JLabel("files changed: 0")
+    private val filesLabel = WrappedLabel("files changed: 0")
 
     /** Durable index coverage (audits 5/6): a PARTIAL generation / capped
      * fingerprint round is named, never flattened to "ready". */
-    private val indexLabel = JLabel("index: -")
+    private val indexLabel = WrappedLabel("index: -")
 
     private val goalField = JTextField(24)
 
@@ -192,13 +192,13 @@ class FaktorChatPanel(
 
     private var submittedCompletion: NativeCompletionContract? = null
 
-    private val startTaskButton = JButton("Start task")
+    private val startTaskButton = primaryButton("Start task")
 
     private val runsModel = DefaultComboBoxModel<NativeTaskRun>()
 
     private val runsCombo = JComboBox(runsModel)
 
-    private val cancelRunButton = JButton("Cancel run")
+    private val cancelRunButton = secondaryButton("Cancel run")
 
     private val taskArea = JTextArea(5, 32)
 
@@ -260,6 +260,21 @@ class FaktorChatPanel(
 
     private val tabs = JTabbedPane()
 
+    /**
+     * The inspector is a COLLAPSIBLE secondary plane: the tool window defaults
+     * to the single chat plane (which works at narrow tool-window widths) and
+     * the toolbar toggle reveals the tabbed inspector. There is deliberately
+     * no fixed 430x600 minimum/preferred size forcing the chat out of narrow
+     * layouts.
+     */
+    private val inspectorToggle = JToggleButton("Inspector", false)
+
+    private val chatPlane = JPanel(BorderLayout())
+
+    private val contentHost = JPanel(BorderLayout())
+
+    private var inspectorSplit: JSplitPane? = null
+
     private var renderedSeq: Long = 0
 
     private var currentTree: TaskTreeModel? = null
@@ -307,12 +322,18 @@ class FaktorChatPanel(
         transcript.isEditable = false
         transcript.lineWrap = true
         transcript.wrapStyleWord = true
-        transcript.font = transcript.font.deriveFont(13f)
+        transcript.font = uiPanelFont().deriveFont(13f)
 
         input.lineWrap = true
         input.wrapStyleWord = true
+        input.font = uiPanelFont()
 
-        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT))
+        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.S, Spacing.XS))
+        toolbar.isOpaque = true
+        toolbar.background = panelSurface()
+        toolbar.border = BorderFactory.createEmptyBorder(
+            Spacing.XS, Spacing.M, Spacing.XS, Spacing.M
+        )
         toolbar.add(startButton)
         toolbar.add(stopButton)
         toolbar.add(newSessionButton)
@@ -321,14 +342,21 @@ class FaktorChatPanel(
         toolbar.add(fieldLabel("model", modelField))
         toolbar.add(modelField)
         toolbar.add(refreshButton)
+        toolbar.add(inspectorToggle)
+        inspectorToggle.addActionListener { setInspectorVisible(inspectorToggle.isSelected) }
 
-        val chat = JPanel(BorderLayout())
-        chat.add(JScrollPane(transcript), BorderLayout.CENTER)
-        val inputRow = JPanel(BorderLayout())
+        val chat = chatPlane
+        val transcriptBody = JPanel(BorderLayout())
+        transcriptBody.isOpaque = false
+        transcriptBody.add(JScrollPane(transcript), BorderLayout.CENTER)
+        chat.add(card("Transcript", transcriptBody), BorderLayout.CENTER)
+        val buttons = actionRow(abortButton, sendButton)
+        val inputRow = JPanel(BorderLayout(0, Spacing.S))
+        inputRow.isOpaque = false
+        inputRow.border = BorderFactory.createEmptyBorder(
+            Spacing.S, Spacing.M, Spacing.M, Spacing.M
+        )
         inputRow.add(JScrollPane(input), BorderLayout.CENTER)
-        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT))
-        buttons.add(abortButton)
-        buttons.add(sendButton)
         inputRow.add(buttons, BorderLayout.SOUTH)
         chat.add(inputRow, BorderLayout.SOUTH)
 
@@ -346,27 +374,65 @@ class FaktorChatPanel(
         tabs.addTab("Settings", settingsPanel)
         tabs.addTab("Usage", usagePanel)
         tabs.addTab("History", historyPanel)
-        tabs.preferredSize = Dimension(430, 600)
 
         add(toolbar, BorderLayout.NORTH)
-        add(chat, BorderLayout.CENTER)
-        add(tabs, BorderLayout.EAST)
+        add(contentHost, BorderLayout.CENTER)
+        setInspectorVisible(false)
     }
 
+    /**
+     * Shows/hides the tabbed inspector beside the chat plane. Hiding removes
+     * the whole plane so the tool window stays usable at narrow widths
+     * (no fixed 430x600 floor); showing it embeds one resizable split.
+     */
+    private fun setInspectorVisible(visible: Boolean) {
+        if (visible) {
+            val split = inspectorSplit ?: JSplitPane(JSplitPane.HORIZONTAL_SPLIT, chatPlane, tabs)
+                .apply {
+                    resizeWeight = 0.62
+                    isContinuousLayout = true
+                }
+                .also { inspectorSplit = it }
+            split.leftComponent = chatPlane
+            split.rightComponent = tabs
+            split.setDividerLocation(0.62)
+            contentHost.removeAll()
+            contentHost.add(split, BorderLayout.CENTER)
+        } else {
+            if (inspectorSplit != null) contentHost.removeAll()
+            contentHost.add(chatPlane, BorderLayout.CENTER)
+        }
+        inspectorToggle.isSelected = visible
+        contentHost.revalidate()
+        contentHost.repaint()
+    }
+
+    internal fun inspectorVisibleForTest(): Boolean = tabs.parent != null
+
+    internal fun toggleInspectorForTest(): Boolean {
+        if (SwingUtilities.isEventDispatchThread()) {
+            inspectorToggle.doClick(0)
+        } else {
+            SwingUtilities.invokeAndWait { inspectorToggle.doClick(0) }
+        }
+        return inspectorToggle.isSelected
+    }
+
+    internal fun chatPlaneForTest(): JPanel = chatPlane
+
+    internal fun inspectorTabsForTest(): JTabbedPane = tabs
+
     private fun buildStatusTab(): JPanel {
-        val panel = JPanel(GridLayout(0, 1, 4, 4))
-        panel.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
-        panel.add(daemonLabel)
-        panel.add(streamLabel)
-        panel.add(stateLabel)
-        panel.add(modelLabel)
-        panel.add(toolLabel)
-        panel.add(queuedLabel)
-        panel.add(usageLabel)
-        panel.add(verifyLabel)
-        panel.add(filesLabel)
-        panel.add(indexLabel)
-        return panel
+        val statusBody = pageColumn(gap = Spacing.XS, padding = 0)
+        for (label in listOf(
+            daemonLabel, streamLabel, stateLabel, modelLabel, toolLabel,
+            queuedLabel, usageLabel, verifyLabel, filesLabel, indexLabel
+        )) {
+            statusBody.add(label)
+        }
+        val page = pageColumn()
+        page.add(card("Session status", statusBody))
+        return page
     }
 
     /**
@@ -389,30 +455,37 @@ class FaktorChatPanel(
         }
 
     private fun buildTaskTab(): JScrollPane {
-        val panel = JPanel(BorderLayout())
-        panel.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
-        val form = JPanel(GridLayout(0, 1, 4, 4))
-        form.add(fieldLabel("goal", goalField))
-        form.add(goalField)
-        form.add(fieldLabel("criteria (comma separated, optional)", criteriaField))
-        form.add(criteriaField)
-        val contractBox = JPanel(GridLayout(3, 1, 2, 2))
+        val startBody = pageColumn(gap = Spacing.S, padding = 0)
+        startBody.add(
+            FormGrid()
+                .row("Goal", goalField)
+                .row("Criteria (comma separated, optional)", criteriaField)
+                .build()
+        )
+        val contractBox = JPanel(GridLayout(3, 1, Spacing.XS, Spacing.XS))
+        contractBox.isOpaque = false
         contractBox.add(completionCommit)
         contractBox.add(completionPush)
         contractBox.add(completionPr)
-        form.add(titledSection("completion contract (Task mode only)", contractBox))
-        form.add(titledSection("attachments (submitted as files)", attachments))
-        val startRow = JPanel(FlowLayout(FlowLayout.LEFT))
-        startRow.add(startTaskButton)
-        form.add(startRow)
-        form.add(JLabel("task runs"))
-        form.add(runsCombo)
-        val cancelRow = JPanel(FlowLayout(FlowLayout.LEFT))
-        cancelRow.add(cancelRunButton)
-        form.add(cancelRow)
+        startBody.add(sectionHeader("Completion contract (Task mode only)", muted = true))
+        startBody.add(contractBox)
+        startBody.add(sectionHeader("Attachments (submitted as files)", muted = true))
+        startBody.add(attachments)
+        startBody.add(actionRow(startTaskButton))
+        val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
+        runsBody.add(sectionHeader("Task runs", muted = true))
+        runsBody.add(runsCombo)
+        runsBody.add(vSpace(Spacing.XS))
         taskArea.isEditable = false
-        form.add(JScrollPane(taskArea))
-        panel.add(form, BorderLayout.NORTH)
+        taskArea.font = uiPanelFont()
+        runsBody.add(JScrollPane(taskArea))
+        runsBody.add(actionRow(cancelRunButton))
+        val page = pageColumn()
+        page.add(card("Start task", startBody))
+        page.add(vSpace(Spacing.S))
+        page.add(card("Task runs", runsBody))
+        val panel = JPanel(BorderLayout())
+        panel.add(page, BorderLayout.CENTER)
         return scrollable(panel)
     }
 
@@ -426,18 +499,14 @@ class FaktorChatPanel(
     }
 
     private fun buildAgentsTab(): JScrollPane {
-        val panel = JPanel(BorderLayout())
-        panel.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
-        val form = JPanel(GridLayout(0, 1, 4, 4))
-        val refreshAgents = JButton("Refresh agents")
+        val refreshAgents = secondaryButton("Refresh agents")
         refreshAgents.addActionListener {
             runAsync("refresh agents") {
                 refreshAgentsBlocking()
             }
         }
-        form.add(refreshAgents)
-        form.add(agentsCombo)
-        val controls = JPanel(GridLayout(0, 2, 4, 4))
+        val controls = JPanel(GridLayout(0, 2, Spacing.S, Spacing.XS))
+        controls.isOpaque = false
         controls.add(agentButton("Pause") { agent -> service.pauseAgent(agent.agentId) })
         controls.add(agentButton("Resume") { agent -> service.resumeAgent(agent.agentId) })
         controls.add(agentButton("Cancel") { agent -> service.cancelAgent(agent.agentId) })
@@ -472,10 +541,20 @@ class FaktorChatPanel(
                 else -> service.setAgentBudget(agent.agentId, maxCostMicro = micro)
             }
         })
-        form.add(controls)
+        val controlsBody = pageColumn(gap = Spacing.S, padding = 0)
+        controlsBody.add(agentsCombo)
+        controlsBody.add(controls)
+        controlsBody.add(actionRow(refreshAgents))
         agentsArea.isEditable = false
-        form.add(JScrollPane(agentsArea))
-        panel.add(form, BorderLayout.NORTH)
+        agentsArea.font = uiPanelFont()
+        val outputBody = pageColumn(gap = Spacing.XS, padding = 0)
+        outputBody.add(JScrollPane(agentsArea))
+        val page = pageColumn()
+        page.add(card("Agent controls", controlsBody))
+        page.add(vSpace(Spacing.S))
+        page.add(card("Agent detail", outputBody))
+        val panel = JPanel(BorderLayout())
+        panel.add(page, BorderLayout.CENTER)
         return scrollable(panel)
     }
 
@@ -1167,6 +1246,27 @@ class FaktorChatPanel(
                     refreshBoardBlocking(acknowledge = true)
                 }
             }
+
+            override fun onLoadOlder(beforeRevision: Long) {
+                runAsync("board older page") {
+                    try {
+                        val page = service.board(since = beforeRevision, limit = 100L)
+                        onEdt { boardPanel.appendOlderPage(page) }
+                    } catch (e: NativeApiException) {
+                        onEdt {
+                            boardPanel.setPagingNote(
+                                "older page refused (status ${e.status} ${e.code})"
+                            )
+                        }
+                    } catch (e: Exception) {
+                        onEdt {
+                            boardPanel.setPagingNote(
+                                "older page failed: ${e.message ?: e.javaClass.simpleName}"
+                            )
+                        }
+                    }
+                }
+            }
         })
         navigator.setListener(object : EvidenceNavigatorPanel.Listener {
             override fun onRetrieve(evidenceId: Long, selectorJson: String) {
@@ -1212,6 +1312,27 @@ class FaktorChatPanel(
                 runAsync("terminal output $ptyId") {
                     val output = service.terminalOutput(ptyId)
                     onEdt { terminalPanel.setOutput(output) }
+                }
+            }
+
+            override fun onLoadEvents(after: Long) {
+                runAsync("terminal events page") {
+                    try {
+                        val page = service.terminalEvents(after = after, limit = 64L)
+                        onEdt { terminalPanel.appendEvents(page) }
+                    } catch (e: NativeApiException) {
+                        onEdt {
+                            terminalPanel.setEventsNote(
+                                "lifetime events page refused (status ${e.status} ${e.code})"
+                            )
+                        }
+                    } catch (e: Exception) {
+                        onEdt {
+                            terminalPanel.setEventsNote(
+                                "lifetime events page failed: ${e.message ?: e.javaClass.simpleName}"
+                            )
+                        }
+                    }
                 }
             }
         })

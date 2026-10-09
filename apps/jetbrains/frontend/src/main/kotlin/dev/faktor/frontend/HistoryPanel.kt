@@ -8,10 +8,8 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.NativeSessionSummary
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
+import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
-import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
@@ -40,13 +38,13 @@ class HistoryPanel : JPanel(BorderLayout()) {
 
     private val daemonLabel = JLabel("daemon: stopped")
 
-    private val openButton = JButton("Open session")
+    private val openButton = primaryButton("Open session")
 
-    private val restartButton = JButton("Restart daemon")
+    private val restartButton = secondaryButton("Restart daemon")
 
-    private val reconnectButton = JButton("Reconnect stream")
+    private val reconnectButton = secondaryButton("Reconnect stream")
 
-    private val refreshButton = JButton("Refresh history")
+    private val refreshButton = secondaryButton("Refresh history")
 
     private var listener: Listener? = null
 
@@ -66,20 +64,33 @@ class HistoryPanel : JPanel(BorderLayout()) {
         restartButton.addActionListener { listener?.onRestart() }
         reconnectButton.addActionListener { listener?.onReconnect() }
         refreshButton.addActionListener { listener?.onRefresh() }
-        val actions = JPanel(GridLayout(0, 1, 4, 4))
-        actions.add(openButton)
-        actions.add(refreshButton)
-        actions.add(reconnectButton)
-        actions.add(restartButton)
-        val body = JPanel(GridLayout(0, 1, 0, 4))
-        body.add(titledSection("sessions", JScrollPane(list)))
-        body.add(titledSection("connection", actions))
-        val south = JPanel(GridLayout(0, 1, 0, 2))
-        south.add(daemonLabel)
-        south.add(streamLabel)
-        add(status, BorderLayout.NORTH)
+        val sessionsBody = JPanel(BorderLayout(0, Spacing.S))
+        sessionsBody.isOpaque = false
+        sessionsBody.add(JScrollPane(list), BorderLayout.CENTER)
+        sessionsBody.add(actionRow(openButton, refreshButton), BorderLayout.SOUTH)
+        daemonLabel.font = uiPanelFont()
+        streamLabel.font = uiPanelFont()
+        daemonLabel.foreground = mutedForeground()
+        streamLabel.foreground = mutedForeground()
+        val connectionBody = pageColumn(gap = Spacing.XS, padding = 0)
+        connectionBody.add(daemonLabel)
+        connectionBody.add(streamLabel)
+        connectionBody.add(vSpace(Spacing.XS))
+        connectionBody.add(actionRow(reconnectButton, restartButton))
+        val body = pageColumn()
+        body.add(card("Sessions", sessionsBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Connection", connectionBody))
+        status.font = sectionTitleFont()
+        val statusRow = JPanel(BorderLayout())
+        statusRow.isOpaque = true
+        statusRow.background = panelSurface()
+        statusRow.border = BorderFactory.createEmptyBorder(
+            Spacing.S, Spacing.M, 0, Spacing.M
+        )
+        statusRow.add(status, BorderLayout.CENTER)
+        add(statusRow, BorderLayout.NORTH)
         add(body, BorderLayout.CENTER)
-        add(south, BorderLayout.SOUTH)
         updateButtons()
     }
 

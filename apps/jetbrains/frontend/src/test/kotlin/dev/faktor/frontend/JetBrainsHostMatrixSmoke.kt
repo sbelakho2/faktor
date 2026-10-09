@@ -35,6 +35,7 @@ import java.nio.file.StandardCopyOption
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 import java.util.zip.ZipFile
+import javax.imageio.ImageIO
 import javax.swing.AbstractButton
 import javax.swing.JComponent
 import javax.swing.JLabel
@@ -47,6 +48,7 @@ object JetBrainsHostMatrixSmoke {
 
     private const val HOST_MATRIX_PATH = "target/certification/jetbrains-host-matrix.json"
     private const val MAX_ZIP_BYTES = 256L * 1024L * 1024L
+    private const val SCREENSHOT_DIR = "apps/jetbrains/frontend/build/screenshots"
 
     private val WIDTHS = intArrayOf(240, 320, 480, 800)
     private val ZOOMS = doubleArrayOf(1.0, 1.25, 2.0)
@@ -64,6 +66,7 @@ object JetBrainsHostMatrixSmoke {
         "permissions" to { cannedPermissionsPanel() },
         "terminal" to { cannedTerminalPanel() },
         "evidence" to { cannedEvidencePanel() },
+        "board" to { cannedBoardPanel() },
         "settings" to { cannedSettingsPanel() },
         "history" to { cannedHistoryPanel() }
     )
@@ -136,8 +139,11 @@ object JetBrainsHostMatrixSmoke {
             widthChecks()
             zoomChecks()
             themeChecks()
+            semanticColorChecks()
             keyboardChecks()
             stateChecks()
+            iconChecks(extracted)
+            screenshotChecks()
         } finally {
             if (extracted != null) {
                 try {
@@ -250,6 +256,146 @@ object JetBrainsHostMatrixSmoke {
         }
     }
 
+    // ------------------------------------------------------- semantic colors
+
+    /**
+     * Proof verdicts and the tournament winner consume theme/UI tokens, never
+     * raw RGB. Each meaningful state must stay legible (contrast-ratio delta
+     * against the effective background) under every host theme variant, and
+     * the state is ALSO carried by text (`[verdict]`, `WINNER`), never by
+     * color alone.
+     */
+    private fun semanticColorChecks() {
+        for (theme in THEMES) {
+            check("theme/semantic-colors/$theme") {
+                applyTheme(theme)
+                try {
+                    val tree = cannedTaskTreePanel()
+                    val treeBackground = colorLuminance(effectiveBackground(tree))
+                    for (tone in CriterionVerdictTone.values()) {
+                        val delta = Math.abs(colorLuminance(tree.criterionColor(tone)) - treeBackground)
+                        requireTrue(
+                            delta >= 0.20,
+                            "criterion $tone is not legible in $theme (luminance delta=$delta)"
+                        )
+                    }
+                    val labels = tree.criterionLabels(criterionProofModel())
+                    requireTrue(
+                        labels.all { it.startsWith("[") },
+                        "criterion state must be carried by the leading verdict text"
+                    )
+                    val tournament = cannedTournamentPanel()
+                    val tournamentBackground = colorLuminance(effectiveBackground(tournament))
+                    val winnerDelta = Math.abs(
+                        colorLuminance(tournament.winnerForeground()) - tournamentBackground
+                    )
+                    requireTrue(
+                        winnerDelta >= 0.20,
+                        "the tournament winner tone is not legible in $theme " +
+                            "(luminance delta=$winnerDelta)"
+                    )
+                } finally {
+                    applyTheme("light")
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- screenshots
+
+    /**
+     * Test-only visual evidence: paints the affected panels offscreen at every
+     * matrix width and writes bounded PNGs under
+     * `apps/jetbrains/frontend/build/screenshots/` (build output, never
+     * committed), so a reviewer can inspect the rendered states directly.
+     */
+    private fun screenshotChecks() {
+        val dir = File(ParityPath.repoRoot(), SCREENSHOT_DIR)
+        dir.mkdirs()
+        val affected = listOf(
+            "task-tree" to { cannedTaskTreePanel() },
+            "blockers" to { cannedBlockersPanel() },
+            "tournament" to { cannedTournamentPanel() },
+            "terminal" to { cannedTerminalPanel() },
+            "evidence" to { cannedEvidencePanel() },
+            "board" to { cannedBoardPanel() }
+        )
+        for ((name, factory) in affected) {
+            for (width in WIDTHS) {
+                check("screenshot/$name/$width") {
+                    val panel = factory()
+                    ParityAwt.layout(panel, width, 600)
+                    val image = BufferedImage(width, 600, BufferedImage.TYPE_INT_RGB)
+                    val graphics = image.createGraphics()
+                    try {
+                        panel.paint(graphics)
+                    } finally {
+                        graphics.dispose()
+                    }
+                    val file = File(dir, "$name-$width.png")
+                    ImageIO.write(image, "png", file)
+                    requireTrue(
+                        file.isFile && file.length() > 0L,
+                        "screenshot must be written: $file"
+                    )
+                }
+            }
+        }
+        println(
+            "JETBRAINS HOST MATRIX screenshots: $SCREENSHOT_DIR/" +
+                affected.joinToString(",") { it.first } + "-{240,320,480,800}.png"
+        )
+    }
+
+    // ---------------------------------------------------------------- plugin icon
+
+    /** The tool window must carry a registered, monochrome icon. */
+    private fun iconChecks(extracted: File?) {
+        check("plugin-icon/registered") {
+            val resources = File(
+                ParityPath.repoRoot(),
+                "apps/jetbrains/frontend/src/main/resources/META-INF"
+            )
+            val pluginXml = File(resources, "plugin.xml")
+            requireTrue(pluginXml.isFile, "plugin.xml must exist: $pluginXml")
+            val text = pluginXml.readText(Charsets.UTF_8)
+            requireTrue(
+                text.contains("icon=\"/META-INF/faktor.svg\""),
+                "the Faktor tool window must register /META-INF/faktor.svg"
+            )
+            val svg = File(resources, "faktor.svg")
+            requireTrue(svg.isFile && svg.length() > 0L, "the icon resource must exist")
+            val colors = Regex("(?:fill|stroke)=\"(#[0-9A-Fa-f]{3,8})\"")
+                .findAll(svg.readText(Charsets.UTF_8))
+                .map { it.groupValues[1].lowercase() }
+                .toSet()
+            requireTrue(
+                colors.size == 1,
+                "the tool-window icon must be monochrome (distinct colors=$colors)"
+            )
+        }
+        if (extracted != null) {
+            check("plugin-icon/packaged") {
+                val jar = File(extracted, "faktor/lib/frontend-0.1.0.jar")
+                requireTrue(jar.isFile, "the packaged frontend jar must exist: $jar")
+                ZipFile(jar).use { archive ->
+                    requireTrue(
+                        archive.getEntry("META-INF/faktor.svg") != null,
+                        "the packaged jar must carry META-INF/faktor.svg"
+                    )
+                    val pluginEntry = archive.getEntry("META-INF/plugin.xml")
+                        ?: error("the packaged jar must carry META-INF/plugin.xml")
+                    val pluginText = archive.getInputStream(pluginEntry)
+                        .bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    requireTrue(
+                        pluginText.contains("icon=\"/META-INF/faktor.svg\""),
+                        "the packaged plugin.xml must register the icon"
+                    )
+                }
+            }
+        }
+    }
+
     // -------------------------------------------------------------- keyboard
 
     /**
@@ -316,6 +462,7 @@ object JetBrainsHostMatrixSmoke {
                 "permissions" to PermissionsPanel(),
                 "terminal" to TerminalPanel(),
                 "evidence" to EvidenceNavigatorPanel(),
+                "board" to BoardPanel(),
                 "settings" to SettingsPanel(),
                 "history" to HistoryPanel()
             )

@@ -1,50 +1,688 @@
 // Small shared Swing helpers for the Faktor panels (no third-party deps).
+//
+// This file owns the plugin's tiny visual system: a 4/8/12/16 spacing scale,
+// cards with subtle theme-token borders and a normal-case semibold header,
+// muted secondary text, status chips, consistently sized actions and
+// width-aware wrapped text. Every color is resolved from the active
+// UIManager/LAF tokens (with contrast-derived fallbacks) so the panels follow
+// IDE themes and HiDPI/zoom settings instead of a hardcoded palette.
 package dev.faktor.frontend
 
 import java.awt.BorderLayout
+import java.awt.Color
 import java.awt.Component
+import java.awt.Dimension
 import java.awt.Font
+import java.awt.GridBagConstraints
+import java.awt.GridBagLayout
+import java.awt.Insets
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
+import java.awt.font.FontRenderContext
 import javax.swing.BorderFactory
+import javax.swing.Box
+import javax.swing.JButton
+import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
-import javax.swing.JScrollPane
 import javax.swing.JTextArea
+import javax.swing.UIManager
 
-/** A read-only, wrapped, monospace text area sized for compact payloads. */
-internal fun compactArea(rows: Int, cols: Int = 36): JTextArea {
+/** The shared 4/8/12/16 spacing scale (px at 100% IDE zoom). */
+internal object Spacing {
+    const val XS = 4
+    const val S = 8
+    const val M = 12
+    const val L = 16
+}
+
+/** One vertical gap in a BoxLayout column (the shared spacing scale). */
+internal fun vSpace(px: Int = Spacing.S): Component = Box.createVerticalStrut(px)
+
+/**
+ * The active IDE/LAF UI font. Ordinary panel text derives from it instead of
+ * a hardcoded family/size, so IDE zoom, HiDPI scaling and user font settings
+ * flow through; the platform label font is the honest fallback.
+ */
+internal fun uiPanelFont(): Font =
+    UIManager.getFont("Label.font")
+        ?: JLabel().font
+        ?: Font(Font.SANS_SERIF, Font.PLAIN, 12)
+
+/**
+ * Monospace typography for code/output/commands/hashes (explicit opt-in).
+ * The IDE editor font is used when the active UIManager exposes one (IntelliJ
+ * sets `TextArea.font` to the editor font); otherwise the platform monospaced
+ * family is derived at the UI font size.
+ */
+internal fun monospacePanelFont(): Font {
+    val base = uiPanelFont()
+    val editor = UIManager.getFont("TextArea.font")
+    if (editor != null && isMonospaced(editor)) return editor
+    return Font(Font.MONOSPACED, Font.PLAIN, base.size)
+}
+
+private fun isMonospaced(font: Font): Boolean {
+    val context = FontRenderContext(null, false, false)
+    val narrow = font.getStringBounds("i", context).width
+    val wide = font.getStringBounds("W", context).width
+    return Math.abs(narrow - wide) < 0.5
+}
+
+/** The semibold face used for card/section headers and primary actions. */
+internal fun sectionTitleFont(): Font = uiPanelFont().deriveFont(Font.BOLD)
+
+/** The active label foreground (the primary text color). */
+internal fun textForeground(): Color =
+    UIManager.getColor("Label.foreground")
+        ?: JLabel().foreground
+        ?: Color(0x33, 0x33, 0x33)
+
+/** The active panel surface every card and page sits on. */
+internal fun panelSurface(): Color =
+    UIManager.getColor("Panel.background")
+        ?: JPanel().background
+        ?: Color(0xF2, 0xF2, 0xF2)
+
+/**
+ * Muted secondary text: the IDE's disabled-foreground token when the theme
+ * exposes one, otherwise the normal foreground blended toward the panel
+ * surface so it stays legible in every light/dark/high-contrast theme.
+ */
+internal fun mutedForeground(): Color {
+    for (key in MUTED_KEYS) {
+        val color = UIManager.getColor(key)
+        if (color != null) return color
+    }
+    return mix(textForeground(), panelSurface(), 0.42f)
+}
+
+private val MUTED_KEYS = arrayOf(
+    "Label.disabledForeground",
+    "Component.disabledForeground"
+)
+
+/**
+ * The subtle card outline: the IDE's own border token when registered,
+ * otherwise a low-contrast blend of the foreground into the panel surface
+ * (a hint of structure, never a heavy box).
+ */
+internal fun cardBorderColor(): Color {
+    for (key in arrayOf("Component.borderColor", "Separator.separatorColor", "controlShadow")) {
+        val color = UIManager.getColor(key)
+        if (color != null) return color
+    }
+    return mix(textForeground(), panelSurface(), 0.76f)
+}
+
+/** Linear blend of two colors (t = 0 keeps [from], t = 1 returns [to]). */
+internal fun mix(from: Color, to: Color, t: Float): Color {
+    val clamped = t.coerceIn(0f, 1f)
+    fun channel(a: Int, b: Int): Int =
+        (a * (1 - clamped) + b * clamped).toInt().coerceIn(0, 255)
+    return Color(channel(from.red, to.red), channel(from.green, to.green), channel(from.blue, to.blue))
+}
+
+/** The active label foreground is light: a dark IDE/LAF surface. */
+internal fun isDarkSurface(): Boolean {
+    val foreground = UIManager.getColor("Label.foreground") ?: return false
+    return luminance(foreground) > 0.5
+}
+
+/** Relative luminance of one color (WCAG weights). */
+internal fun luminance(color: Color): Double {
+    fun channel(value: Int): Double {
+        val v = value / 255.0
+        return if (v <= 0.03928) v / 12.92 else Math.pow((v + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * channel(color.red) +
+        0.7152 * channel(color.green) +
+        0.0722 * channel(color.blue)
+}
+
+/**
+ * A read-only, wrapped text area sized for compact payloads. Ordinary prose
+ * uses the IDE UI font; [monospace] is the explicit opt-in reserved for
+ * code/output/commands/hashes.
+ */
+internal fun compactArea(rows: Int, cols: Int = 36, monospace: Boolean = false): JTextArea {
     val area = JTextArea(rows, cols)
     area.isEditable = false
     area.lineWrap = true
     area.wrapStyleWord = true
-    area.font = Font(Font.MONOSPACED, Font.PLAIN, 12)
+    area.font = if (monospace) monospacePanelFont() else uiPanelFont()
     return area
 }
 
-/** A titled vertical section with a bordered body. */
-internal fun titledSection(title: String, body: Component): JPanel {
-    val panel = JPanel(BorderLayout(0, 2))
-    panel.border = BorderFactory.createEmptyBorder(4, 6, 4, 6)
-    panel.add(JLabel(title).apply { font = font.deriveFont(Font.BOLD) }, BorderLayout.NORTH)
-    panel.add(body, BorderLayout.CENTER)
-    return panel
-}
-
-/** Wraps a component in a scroll pane with a vertical-only policy default. */
-internal fun scroll(component: Component): JScrollPane = JScrollPane(component)
-
+/** Strip invisible C0/C1 controls plus bidi embedding/override controls. */
 private val DISPLAY_CONTROL_CHARS = Regex(
     "[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F-\\u009F" +
         "\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]"
 )
 
+/** Escape a plain display string for Swing's HTML 3.2 renderer. */
+internal fun escapeHtml(text: String): String = text
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+
 /**
- * Bounds a display string to [max] chars with an ellipsis marker. UTF-16
- * truncation never splits a surrogate pair (a cut mid-pair renders as
- * U+FFFD), and invisible C0/C1 controls plus explicit bidi embedding/
- * override controls are stripped: they are layout/spoofing vectors, never
- * human text. RTL letters and shaping are untouched.
+ * Insert zero-width break opportunities after path/identifier separators so
+ * a long path or hash wraps instead of clipping (Swing's HTML renderer breaks
+ * at U+200B). Newlines become `<br>`.
  */
-/** take(max) that never splits a surrogate pair at the cut. */
+internal fun breakableText(text: String): String {
+    val sb = StringBuilder(text.length + 16)
+    for (ch in text) {
+        when (ch) {
+            '\n' -> sb.append("<br>")
+            '/', '\\', '.', '_', '-', ',', ';', ':', '|' -> {
+                sb.append(ch).append('\u200B')
+            }
+            else -> sb.append(ch)
+        }
+    }
+    return sb.toString()
+}
+
+/**
+ * A width-aware wrapped label: the text is rendered as escaped HTML with a
+ * real pixel width hint, recomputed whenever the label is resized. Long
+ * unbroken tokens (paths, hashes) get zero-width break opportunities. The
+ * untruncated text stays available as the tooltip.
+ */
+internal class WrappedLabel(
+    text: String = "",
+    private val preferredWidthCap: Int = Int.MAX_VALUE
+) : JLabel() {
+
+    private var wrappedWidth = -1
+
+    private var rendering = false
+
+    var fullText: String = ""
+        set(value) {
+            field = DISPLAY_CONTROL_CHARS.replace(value, "")
+            wrappedWidth = -1
+            refresh()
+        }
+
+    init {
+        font = uiPanelFont()
+        foreground = textForeground()
+        verticalAlignment = TOP
+        alignmentX = Component.LEFT_ALIGNMENT
+        addComponentListener(
+            object : ComponentAdapter() {
+                override fun componentResized(event: ComponentEvent?) {
+                    refresh()
+                }
+            }
+        )
+        fullText = text
+    }
+
+    /**
+     * AWT posts component-resized events through the EventQueue, so an
+     * offscreen/one-pass layout would render stale text. Re-wrap synchronously
+     * at the exact moment the layout manager assigns the width; the posted
+     * event remains a harmless second notification.
+     */
+    override fun setBounds(x: Int, y: Int, w: Int, h: Int) {
+        super.setBounds(x, y, w, h)
+        refresh()
+    }
+
+    override fun setSize(dimension: Dimension?) {
+        super.setSize(dimension)
+        refresh()
+    }
+
+    /**
+     * Existing `label.text = ...` call sites keep working: an external text
+     * assignment sets the UNWRAPPED text, which is re-wrapped on resize.
+     */
+    override fun setText(value: String?) {
+        if (rendering) {
+            super.setText(value)
+        } else {
+            fullText = value ?: ""
+        }
+    }
+
+    /**
+     * A wrapped label must be allowed to shrink below the fallback wrap
+     * width, otherwise GridBag/BorderLayout clip it at narrow widths instead
+     * of allocating the real column width (and triggering a re-wrap).
+     */
+    override fun getMinimumSize(): Dimension {
+        val base = super.getMinimumSize()
+        return Dimension(Spacing.L * 4, base.height)
+    }
+
+    /**
+     * The HTML preferred width over-reports the visual width; a caller can
+     * cap it so a label column does not swallow the whole form.
+     */
+    override fun getPreferredSize(): Dimension {
+        val base = super.getPreferredSize()
+        return Dimension(Math.min(base.width, preferredWidthCap), base.height)
+    }
+
+    /**
+     * Re-wraps at the current width. Before the first layout pass a
+     * conservative 220px hint is used; the synchronous [setBounds] re-wrap
+     * replaces it with the real width.
+     *
+     * The lines are broken here with the label's own font metrics and joined
+     * with `<br>`, so the rendered text can never be clipped by Swing's HTML
+     * body-margin/width-style arithmetic (the old `style='width:...'` hint
+     * under-measured the margins and cut words at the right edge at 240px).
+     */
+    private fun refresh() {
+        val available = if (width > 0) width else 220
+        if (available == wrappedWidth) return
+        wrappedWidth = available
+        val maxWidth = (available - Spacing.L - Spacing.XS).coerceAtLeast(40)
+        val metrics = getFontMetrics(font ?: uiPanelFont())
+        val lines = wrapLines(fullText, maxWidth) { candidate -> metrics.stringWidth(candidate) }
+        rendering = true
+        try {
+            super.setText("<html>" + lines.joinToString("<br>") { escapeHtml(it) } + "</html>")
+        } finally {
+            rendering = false
+        }
+        toolTipText = fullText.ifEmpty { null }
+    }
+
+    companion object {
+        /**
+         * Greedy wrap at spaces and after path/identifier separators, with a
+         * hard character cut only when one glyph run is wider than the whole
+         * line. Pure, so it is exercised without a display.
+         */
+        internal fun wrapLines(
+            text: String,
+            maxWidth: Int,
+            widthOf: (String) -> Int
+        ): List<String> {
+            val lines = ArrayList<String>()
+            for (hard in text.split('\n')) {
+                if (hard.isEmpty()) {
+                    lines.add("")
+                    continue
+                }
+                var start = 0
+                var lastBreak = -1
+                var i = 0
+                while (i < hard.length) {
+                    val ch = hard[i]
+                    if (isBreakAfter(ch)) lastBreak = i + 1
+                    val candidate = hard.substring(start, i + 1)
+                    if (candidate.isNotEmpty() && widthOf(candidate) > maxWidth && lastBreak > start) {
+                        lines.add(hard.substring(start, lastBreak).trimEnd())
+                        start = lastBreak
+                        i = start
+                        lastBreak = -1
+                        continue
+                    }
+                    i++
+                }
+                lines.add(hard.substring(start).trimEnd())
+            }
+            return lines
+        }
+
+        private fun isBreakAfter(ch: Char): Boolean = when (ch) {
+            ' ', '\u200B', '/', '\\', '.', '-', '_', ',', ';', ':', '|' -> true
+            else -> false
+        }
+    }
+}
+
+/**
+ * Top-down page layout: every child keeps its preferred height (stacked in
+ * order) and only the width is forced to the container. Unlike BoxLayout it
+ * never stretches a child to fill leftover space (no giant voids, no blown-up
+ * rows) and never caches stale requirements when a wrapped card grows.
+ */
+internal class PageLayout : java.awt.LayoutManager {
+    override fun addLayoutComponent(name: String?, comp: Component?) = Unit
+
+    override fun removeLayoutComponent(comp: Component?) = Unit
+
+    override fun preferredLayoutSize(parent: java.awt.Container): Dimension {
+        val insets = parent.insets
+        var width = 0
+        var height = 0
+        for (child in parent.components) {
+            if (!child.isVisible) continue
+            val size = child.preferredSize
+            width = Math.max(width, size.width)
+            height += size.height
+        }
+        return Dimension(width + insets.left + insets.right, height + insets.top + insets.bottom)
+    }
+
+    override fun minimumLayoutSize(parent: java.awt.Container): Dimension = preferredLayoutSize(parent)
+
+    override fun layoutContainer(parent: java.awt.Container) {
+        val insets = parent.insets
+        val width = (parent.width - insets.left - insets.right).coerceAtLeast(0)
+        var y = insets.top
+        for (child in parent.components) {
+            if (!child.isVisible) continue
+            val height = child.preferredSize.height
+            child.setBounds(insets.left, y, width, height)
+            y += height
+        }
+    }
+}
+
+/**
+ * A vertical card/page column that tracks the scroll viewport width (no
+ * horizontal scrollbar at 240px: wrapped content reflows instead) and scrolls
+ * by 16px units (wheel/HiDPI friendly).
+ */
+internal open class ScrollableColumn : JPanel(), javax.swing.Scrollable {
+    init {
+        layout = PageLayout()
+        isOpaque = true
+        background = panelSurface()
+    }
+
+    override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
+
+    override fun getScrollableUnitIncrement(
+        visibleRect: java.awt.Rectangle?,
+        orientation: Int,
+        direction: Int
+    ): Int = Spacing.L
+
+    override fun getScrollableBlockIncrement(
+        visibleRect: java.awt.Rectangle?,
+        orientation: Int,
+        direction: Int
+    ): Int = 64
+
+    override fun getScrollableTracksViewportWidth(): Boolean = true
+
+    override fun getScrollableTracksViewportHeight(): Boolean = false
+}
+
+/**
+ * A form-field label wrapped at a FIXED width: the break points never depend
+ * on how much column the layout manager assigns, so the label column cannot
+ * creep narrower pass after pass (the feedback loop that used to shred
+ * "Verification" into "Verifi catio n" at wide widths). Long unbroken words
+ * simply overflow into the (empty) gap before the field.
+ */
+internal class FixedWrapLabel(text: String, private val wrapWidth: Int = Spacing.L * 6) : JLabel() {
+    init {
+        font = uiPanelFont()
+        foreground = mutedForeground()
+        verticalAlignment = TOP
+        val metrics = getFontMetrics(font)
+        val lines = WrappedLabel.wrapLines(text, (wrapWidth - Spacing.L).coerceAtLeast(24)) {
+            metrics.stringWidth(it)
+        }
+        super.setText("<html>" + lines.joinToString("<br>") { escapeHtml(it) } + "</html>")
+        toolTipText = text
+    }
+
+    override fun getPreferredSize(): Dimension {
+        val base = super.getPreferredSize()
+        return Dimension(Math.min(base.width, wrapWidth + Spacing.XS), base.height)
+    }
+
+    override fun getMinimumSize(): Dimension = preferredSize
+}
+
+/**
+ * A page/card body column on the shared spacing scale: vertical BoxLayout
+ * with uniform outer padding (the "no giant gray voids, consistent outer
+ * padding" rule). Children are stacked in order; callers add [vSpace] gaps.
+ */
+internal fun pageColumn(gap: Int = Spacing.S, padding: Int = Spacing.M): JPanel {
+    val panel = ScrollableColumn()
+    panel.border = BorderFactory.createEmptyBorder(padding, padding, padding, padding)
+    panel.putClientProperty("faktor.gap", gap)
+    return panel
+}
+
+/**
+ * The card factory: one bordered surface matching the panel background, with
+ * an optional normal-case semibold header and 6px inner padding. The 1px
+ * rounded outline uses the theme's border token (never raw RGB), so cards
+ * read as one product under light, dark and high-contrast themes.
+ */
+internal fun card(
+    title: String?,
+    body: Component,
+    hgap: Int = 0,
+    vgap: Int = if (title == null) 0 else Spacing.S
+): JPanel {
+    val panel = JPanel(BorderLayout(hgap, vgap))
+    panel.isOpaque = true
+    panel.background = panelSurface()
+    panel.alignmentX = Component.LEFT_ALIGNMENT
+    panel.border = BorderFactory.createCompoundBorder(
+        BorderFactory.createLineBorder(cardBorderColor(), 1, true),
+        BorderFactory.createEmptyBorder(6, Spacing.S, 6, Spacing.S)
+    )
+    if (title != null) {
+        val header = JLabel(title)
+        header.font = sectionTitleFont()
+        header.foreground = textForeground()
+        panel.add(header, BorderLayout.NORTH)
+    }
+    panel.add(body, BorderLayout.CENTER)
+    return panel
+}
+
+/** A titled vertical section with a bordered body (card factory shorthand). */
+internal fun titledSection(title: String, body: Component): JPanel = card(title, body)
+
+/** A standalone card/section header in the normal-case semibold face. */
+internal fun sectionHeader(text: String, muted: Boolean = false): JLabel =
+    JLabel(text).apply {
+        font = sectionTitleFont()
+        foreground = if (muted) mutedForeground() else textForeground()
+        alignmentX = Component.LEFT_ALIGNMENT
+    }
+
+/** Muted secondary text (hints, counts, empty states). */
+internal fun mutedLabel(text: String): JLabel =
+    JLabel(text).apply {
+        font = uiPanelFont()
+        foreground = mutedForeground()
+        alignmentX = Component.LEFT_ALIGNMENT
+    }
+
+/** A width-aware muted hint that wraps instead of clipping at 240px. */
+internal fun wrappedMutedLabel(text: String): WrappedLabel =
+    WrappedLabel(text).apply {
+        font = uiPanelFont()
+        foreground = mutedForeground()
+        alignmentX = Component.LEFT_ALIGNMENT
+    }
+
+/** A semantic state that the UI must keep legible under every IDE theme. */
+internal enum class SemanticState { POSITIVE, NEGATIVE, WARNING, DIM }
+
+/**
+ * Theme-derived semantic foregrounds. IntelliJ registers its `Objects.*` and
+ * disabled-foreground tokens with UIManager, so the panels consume the live
+ * theme instead of raw RGB; plain Swing/LAF hosts fall back to
+ * contrast-aware values derived from the current label foreground. State is
+ * NEVER carried by color alone: call sites also render an explicit
+ * pass/fail/unavailable marker or label.
+ */
+internal fun semanticForeground(state: SemanticState): Color {
+    val keys = when (state) {
+        SemanticState.POSITIVE -> arrayOf("Objects.Green")
+        SemanticState.NEGATIVE -> arrayOf("Objects.Red")
+        SemanticState.WARNING -> arrayOf("Objects.Yellow")
+        SemanticState.DIM -> arrayOf("Label.disabledForeground", "Component.disabledForeground")
+    }
+    for (key in keys) {
+        val color = UIManager.getColor(key)
+        if (color != null) return color
+    }
+    val dark = isDarkSurface()
+    return when (state) {
+        SemanticState.POSITIVE ->
+            if (dark) Color(0x7A, 0xD9, 0x8A) else Color(0x1B, 0x6E, 0x2F)
+        SemanticState.NEGATIVE ->
+            if (dark) Color(0xFF, 0x8A, 0x8A) else Color(0xA6, 0x2A, 0x2A)
+        SemanticState.WARNING ->
+            if (dark) Color(0xE6, 0xC3, 0x66) else Color(0x7A, 0x5A, 0x00)
+        SemanticState.DIM ->
+            if (dark) Color(0x9E, 0x9E, 0x9E) else Color(0x8C, 0x8C, 0x8C)
+    }
+}
+
+/**
+ * A status chip: the state word plus a subtle rounded outline in the theme's
+ * semantic tone. The text carries the state; the color only re-enforces it.
+ */
+internal fun statusChip(text: String, state: SemanticState): JLabel {
+    val tone = semanticForeground(state)
+    return JLabel(text).apply {
+        font = sectionTitleFont()
+        foreground = tone
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(tone, 1, true),
+            BorderFactory.createEmptyBorder(0, Spacing.XS + 2, 0, Spacing.XS + 2)
+        )
+        isOpaque = false
+    }
+}
+
+/**
+ * A consistently sized action: the shared UI font, 4/12px padding and the
+ * platform button rendering (IntelliJ's round-rect client property is inert
+ * under plain Swing). [primary] marks the one affirmative action of a card
+ * with the semibold face, so the emphasis survives every LAF.
+ */
+internal fun actionButton(text: String, primary: Boolean = false): JButton {
+    val button = JButton(text)
+    button.font = if (primary) sectionTitleFont() else uiPanelFont()
+    button.margin = Insets(4, Spacing.M, 4, Spacing.M)
+    button.putClientProperty("JButton.buttonType", "roundRect")
+    return button
+}
+
+/** The affirmative action of a card (bold, default-button emphasis). */
+internal fun primaryButton(text: String): JButton = actionButton(text, primary = true)
+
+/** A supporting action (normal weight, never competing with the primary). */
+internal fun secondaryButton(text: String): JButton = actionButton(text, primary = false)
+
+/**
+ * A compact two-column form grid: muted field labels in the west column,
+ * fields filling east. Rows are on the 8px grid; [span] adds a full-width
+ * row (areas, hints).
+ */
+internal class FormGrid {
+
+    private val panel = JPanel(GridBagLayout())
+
+    private var row = 0
+
+    init {
+        panel.isOpaque = false
+        panel.background = panelSurface()
+    }
+
+    private fun constraints(): GridBagConstraints = GridBagConstraints().apply {
+        insets = Insets(0, 0, 6, Spacing.S)
+        anchor = GridBagConstraints.WEST
+        fill = GridBagConstraints.HORIZONTAL
+        gridy = row
+    }
+
+    fun row(labelText: String, field: JComponent): FormGrid {
+        val label = FixedWrapLabel(labelText).apply {
+            labelFor = field
+        }
+        panel.add(label, constraints().apply {
+            gridx = 0
+            weightx = 0.0
+        })
+        panel.add(field, constraints().apply {
+            gridx = 1
+            weightx = 1.0
+        })
+        row++
+        return this
+    }
+
+    fun span(component: JComponent): FormGrid {
+        panel.add(component, constraints().apply {
+            gridx = 0
+            gridwidth = 2
+            weightx = 1.0
+        })
+        row++
+        return this
+    }
+
+    /** A west column without a field (checkbox rows, hints). */
+    fun west(component: JComponent): FormGrid {
+        panel.add(component, constraints().apply {
+            gridx = 0
+            gridwidth = 2
+            weightx = 1.0
+        })
+        row++
+        return this
+    }
+
+    fun build(): JPanel = panel
+}
+
+/** One horizontal action row on the shared spacing scale. */
+internal fun actionRow(vararg buttons: JButton): JPanel {
+    val panel = JPanel()
+    panel.layout = javax.swing.BoxLayout(panel, javax.swing.BoxLayout.X_AXIS)
+    panel.isOpaque = false
+    for ((index, button) in buttons.withIndex()) {
+        if (index > 0) panel.add(Box.createHorizontalStrut(Spacing.S))
+        panel.add(button)
+    }
+    panel.add(Box.createHorizontalGlue())
+    panel.maximumSize = Dimension(Int.MAX_VALUE, panel.preferredSize.height)
+    return panel
+}
+
+/**
+ * A scroll pane for a bare table. `JScrollPane` only auto-installs the
+ * column header from `JTable.addNotify()`, which never runs for an offscreen
+ * render; installing it explicitly keeps the header visible in every host
+ * (screenshots, tests and the IDE tool window alike).
+ */
+internal fun tableScroll(table: javax.swing.JTable): javax.swing.JScrollPane {
+    val scroll = javax.swing.JScrollPane(table)
+    val header = table.tableHeader
+    if (header != null) scroll.setColumnHeaderView(header)
+    scroll.verticalScrollBar.unitIncrement = Spacing.L
+    return scroll
+}
+
+/**
+ * A scroll pane that never shows a horizontal scrollbar: list rows carry
+ * their full text in a tooltip instead of forcing sideways panning at 240px.
+ */
+internal fun noHorizontalScroll(view: Component): javax.swing.JScrollPane =
+    javax.swing.JScrollPane(view).apply {
+        horizontalScrollBarPolicy = javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+        verticalScrollBar.unitIncrement = Spacing.L
+    }
+
+/**
+ * take(max) that never splits a surrogate pair at the cut.
+ */
 internal fun safeTake(text: String, max: Int): String {
     if (text.length <= max) return text
     var end = max.coerceAtLeast(0)
