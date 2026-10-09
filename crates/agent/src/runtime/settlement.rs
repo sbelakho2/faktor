@@ -596,7 +596,16 @@ impl AgentRuntime {
         let service = self.deps.verification.clone();
         let rows = match handle.verification_attempt_jobs(task_raw, attempt.op_id) {
             Ok(rows) => rows,
-            Err(_) => return 0,
+            // Fail-safe (jobs stay open) but never invisible: the background
+            // executor reports the read failure typed instead of equating it
+            // with "nothing to resolve".
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "background verification executor: attempt jobs unreadable; no job resolved this pass"
+                );
+                return 0;
+            }
         };
         let mut resolved = 0usize;
         for job in rows.iter().filter(|j| j.state.is_open()) {

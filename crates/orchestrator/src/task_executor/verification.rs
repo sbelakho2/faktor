@@ -234,8 +234,18 @@ pub(crate) fn record_completion_contract(
 /// [`CompletionStepRunner::run_completion_steps`] with an immutable
 /// verification-record proof.
 pub(crate) fn verification_passed(handle: &faktor_session::SessionHandle) -> bool {
-    let Ok(facts) = handle.memory_facts() else {
-        return false;
+    // Documented UI-only projection (never authorization). A store read
+    // failure still reports not-passed, but it is VISIBLE as a typed log
+    // instead of being indistinguishable from a recorded failure.
+    let facts = match handle.memory_facts() {
+        Ok(facts) => facts,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "verification_passed: fact store unreadable; reporting not-passed"
+            );
+            return false;
+        }
     };
     let Some((_, _, last)) = facts
         .iter()

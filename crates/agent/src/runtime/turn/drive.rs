@@ -2931,29 +2931,58 @@ impl AgentRuntime {
         //     settled, terminal job set.
         let background_service = self.deps.verification.can_persist_jobs();
         if background_service {
-            let task_id = handle.row().ok().map(|r| r.task_id.raw());
-            if let Some(task_id) = task_id {
+            // P2-VERIFY (audit): these reads gate settlement. A store failure
+            // must not silently skip the whole background path; it blocks the
+            // completion typed instead.
+            let task_id = match handle.row() {
+                Ok(row) => row.task_id.raw(),
+                Err(e) => {
+                    tracing::error!(error = %e, "turn-end settlement skipped: session row unreadable");
+                    if changed.is_empty() {
+                        return TurnEndVerdict::default();
+                    }
+                    return self.unverified_verdict(
+                        handle,
+                        changed,
+                        None,
+                        "session row unreadable; verification cannot be settled",
+                    );
+                }
+            };
+            {
                 match handle.open_verification_jobs(task_id) {
                     Ok(open) if !open.is_empty() => {
                         if changed.is_empty() {
                             return self.settle_verification_jobs(handle, cancel).await;
                         }
-                        if let Ok(Some(attempt)) = handle.current_verification_attempt(task_id) {
-                            let note = format!(
-                                "superseded by the newer verification attempt of turn op {} \
-                                 (its content moved; the open jobs were never certified)",
-                                op_id.raw()
-                            );
-                            // The verdict function is infallible: the supersede
-                            // cancel is recorded (marker + audit), not
-                            // propagated.
-                            self.dw_note_cancel_verification_attempt(
-                                handle,
-                                task_id,
-                                attempt.op_id,
-                                &note,
-                                DW_SITE_SUPERSEDE_CANCEL,
-                            );
+                        match handle.current_verification_attempt(task_id) {
+                            Ok(Some(attempt)) => {
+                                let note = format!(
+                                    "superseded by the newer verification attempt of turn op {} \
+                                     (its content moved; the open jobs were never certified)",
+                                    op_id.raw()
+                                );
+                                // The verdict function is infallible: the supersede
+                                // cancel is recorded (marker + audit), not
+                                // propagated.
+                                self.dw_note_cancel_verification_attempt(
+                                    handle,
+                                    task_id,
+                                    attempt.op_id,
+                                    &note,
+                                    DW_SITE_SUPERSEDE_CANCEL,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!(error = %e, "verification attempt unreadable; refusing to complete this turn");
+                                return self.unverified_verdict(
+                                    handle,
+                                    changed,
+                                    None,
+                                    "verification attempt unreadable; completion is blocked",
+                                );
+                            }
                         }
                     }
                     Ok(_) => {
@@ -2964,22 +2993,57 @@ impl AgentRuntime {
                         // exact rows (the executor never settles the task
                         // itself).
                         if changed.is_empty() {
-                            let non_terminal = handle
-                                .task_id()
-                                .ok()
-                                .and_then(|t| handle.get_task(t).ok().flatten())
-                                .is_some_and(|t| !t.state.is_terminal());
-                            let attempt_exists = handle
-                                .current_verification_attempt(task_id)
-                                .ok()
-                                .flatten()
-                                .is_some();
+                            let non_terminal = match handle.task_id() {
+                                Ok(t) => match handle.get_task(t) {
+                                    Ok(Some(task)) => !task.state.is_terminal(),
+                                    Ok(None) => false,
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "task row unreadable; refusing to complete this turn");
+                                        return self.unverified_verdict(
+                                            handle,
+                                            changed,
+                                            None,
+                                            "task row unreadable; completion is blocked",
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::error!(error = %e, "task id unreadable; refusing to complete this turn");
+                                    return self.unverified_verdict(
+                                        handle,
+                                        changed,
+                                        None,
+                                        "task id unreadable; completion is blocked",
+                                    );
+                                }
+                            };
+                            let attempt_exists = match handle.current_verification_attempt(task_id)
+                            {
+                                Ok(attempt) => attempt.is_some(),
+                                Err(e) => {
+                                    tracing::error!(error = %e, "verification attempt unreadable; refusing to complete this turn");
+                                    return self.unverified_verdict(
+                                        handle,
+                                        changed,
+                                        None,
+                                        "verification attempt unreadable; completion is blocked",
+                                    );
+                                }
+                            };
                             if non_terminal && attempt_exists {
                                 return self.settle_verification_jobs(handle, cancel).await;
                             }
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "open verification jobs unreadable; refusing to complete this turn");
+                        return self.unverified_verdict(
+                            handle,
+                            changed,
+                            None,
+                            "open verification jobs unreadable; completion is blocked",
+                        );
+                    }
                 }
             }
         }
