@@ -878,6 +878,9 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # Singular-authority law: the retired raw network matcher must never
+      # return; the canonical destination/DNS authority owns egress.
+      - node scripts/check-network-authority-singular.mjs
       # P1-ASSURANCE / P0-PROOF: every production crate enumerated from
       # cargo metadata must carry an explicit RELEASE disposition: a
       # release-critical owner plus capability rows whose unit proofs exist

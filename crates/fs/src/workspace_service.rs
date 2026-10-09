@@ -957,6 +957,14 @@ impl WorkspaceHandle {
         self.rooted.list_entries(rel, max)
     }
 
+    /// The RETAINED anchored root authority (audit P1): upper layers that
+    /// must fingerprint workspace-owned metadata (`.faktor`, `.git`) use
+    /// this handle for every read/walk so no pathname is re-resolved while a
+    /// child process may be mutating the tree.
+    pub fn rooted(&self) -> &crate::rooted::RootedDir {
+        &self.rooted
+    }
+
     /// Budgeted handle-relative recursive walk (the shared traversal
     /// primitive for upper-layer walkers), anchored on the RETAINED rooted
     /// authority: every entry is charged to `budget`; the visitor may charge

@@ -653,8 +653,12 @@ hard-coded lists.
   `Network`, `Mcp`, `Git`), never scattered conditionals.
 - Path checks are canonicalization-safe: symlink escapes and `..`
   traversal are rejected.
-- `NetworkPolicy` is the three-mode sandbox: `DenyAll` /
-  `AllowProviders { endpoints }` / `AllowConfigured { endpoints, domains }`.
+- `NetworkPolicy` is the serialized sandbox vocabulary (`DenyAll` /
+  `AllowProviders { endpoints }` / `AllowConfigured { endpoints, domains }`).
+  The raw URL/prefix matcher was retired: production egress authorization is
+  the canonical destination/DNS authority, and
+  `scripts/check-network-authority-singular.mjs` fails the gate if a second
+  parser is reintroduced.
 - Tool-call JSON parsing has three modes (`ToolCallMode`): `Native`,
   `NativeWithRepair` (ONE deterministic repair pass on almost-valid JSON —
   repair happens once, never five times), `StructuredFallback` (extract

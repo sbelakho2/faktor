@@ -25,7 +25,10 @@ impl PermissionEngine {
 ```
 Rules: `is_within_workspace` canonicalizes the parent dir + joins the file name,
 rejects symlink escapes and `..`. External reads/writes evaluate against policy with
-the real path. Network destinations use NetworkPolicy::allows. The spawn projection
+the real path. Network destinations are authorized by the canonical
+destination/DNS authority (single egress authority); the retired raw
+`NetworkPolicy::allows` matcher is enforced absent by
+`scripts/check-network-authority-singular.mjs`. The spawn projection
 (`SandboxPolicy::spawn_profile`) is enforcement-honest: `filesystem: "workspace"`
 appears only where both external rules are `Deny`, the guarantee is `Required`, and
 the build has an OS filesystem backend (Linux Landlock); `BestEffort` projects

@@ -225,6 +225,11 @@ impl<'de> serde::Deserialize<'de> for CapabilitySet {
 /// Network sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+/// The sandbox network vocabulary (serialized config). The raw matcher was
+/// RETIRED (audit P2 singular-authority law): production egress
+/// authorization is the canonical destination/DNS authority, and
+/// `scripts/check-network-authority-singular.mjs` fails if a URL/prefix
+/// matcher is ever reintroduced (see `docs/specs/mcp_lsp_sandbox.md`).
 pub enum NetworkPolicy {
     /// Everything blocked.
     DenyAll,
@@ -237,161 +242,9 @@ pub enum NetworkPolicy {
     },
 }
 
-impl NetworkPolicy {
-    /// NON-AUTHORITATIVE (singular-authority law, audit P2): this raw
-    /// matcher must not gate egress anywhere. Production egress
-    /// authorization lives in the canonical destination/DNS authority;
-    /// `allows` is retained only for non-authoritative classification and
-    /// tests, and is deprecated so any new production use is a warning.
-    ///
-    /// TRUE when `destination` is admitted. Matching is ANCHORED on the URL
-    /// authority (scheme + host + port) and a `/`-segment path boundary
-    /// (audit P2-API): a configured `https://api.example.com` admits
-    /// `https://api.example.com/v1` but never `https://api.example.com.evil`
-    /// nor a different scheme/port. Raw prefix matching is deliberately
-    /// retired — it admitted attacker-controlled string continuations.
-    /// Anything unparseable fails closed.
-    #[deprecated(
-        note = "non-authoritative: production egress uses the canonical destination/DNS authority"
-    )]
-    pub fn allows(&self, destination: &str) -> bool {
-        match self {
-            NetworkPolicy::DenyAll => false,
-            NetworkPolicy::AllowProviders { endpoints } => endpoints
-                .iter()
-                .any(|rule| authority_allows(rule, destination)),
-            NetworkPolicy::AllowConfigured { endpoints, domains } => endpoints
-                .iter()
-                .chain(domains.iter())
-                .any(|rule| authority_allows(rule, destination)),
-        }
-    }
-}
-
-/// Parse one absolute HTTP(S)-style URL into `(scheme, host, port, path)`.
-/// `None` for anything malformed, non-http(s), or carrying userinfo — the
-/// strict parse is part of the policy (an unparsed destination is denied).
-fn split_authority(url: &str) -> Option<(String, String, Option<u16>, String)> {
-    let (scheme, rest) = url.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
-    let scheme = scheme.to_ascii_lowercase();
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(end);
-    if authority.is_empty() || authority.contains('@') || authority.contains(' ') {
-        return None;
-    }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let host = &rest[..close];
-        let after = &rest[close + 1..];
-        let port = if after.is_empty() {
-            None
-        } else {
-            Some(after.strip_prefix(':')?.parse().ok()?)
-        };
-        (host.to_ascii_lowercase(), port)
-    } else if let Some((host, port)) = authority.rsplit_once(':') {
-        (host.to_ascii_lowercase(), Some(port.parse().ok()?))
-    } else {
-        (authority.to_ascii_lowercase(), None)
-    };
-    if host.is_empty() {
-        return None;
-    }
-    let path = if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    };
-    Some((scheme, host, port, path))
-}
-
-fn default_port(scheme: &str) -> u16 {
-    if scheme == "https" {
-        443
-    } else {
-        80
-    }
-}
-
-/// TRUE when `destination` matches `rule` at the authority boundary and, when
-/// the rule names a path, at a '/'-segment boundary (`/v1` admits `/v1` and
-/// `/v1/x`, never `/v10`).
-fn authority_allows(rule: &str, destination: &str) -> bool {
-    let Some((rule_scheme, rule_host, rule_port, rule_path)) = split_authority(rule) else {
-        return false;
-    };
-    let Some((dest_scheme, dest_host, dest_port, dest_path)) = split_authority(destination) else {
-        return false;
-    };
-    if rule_scheme != dest_scheme || rule_host != dest_host {
-        return false;
-    }
-    if rule_port.unwrap_or_else(|| default_port(&rule_scheme))
-        != dest_port.unwrap_or_else(|| default_port(&dest_scheme))
-    {
-        return false;
-    }
-    let rule_path = rule_path.trim_end_matches('/');
-    if rule_path.is_empty() {
-        return true;
-    }
-    dest_path == rule_path
-        || dest_path.starts_with(&format!("{rule_path}/"))
-        || dest_path.starts_with(&format!("{rule_path}?"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[allow(deprecated)] // non-authoritative classification matcher, tests only
-    fn network_policy_matrix() {
-        let deny = NetworkPolicy::DenyAll;
-        assert!(!deny.allows("https://api.openai.com/v1"));
-        let providers = NetworkPolicy::AllowProviders {
-            endpoints: vec!["https://api.openai.com".into()],
-        };
-        assert!(providers.allows("https://api.openai.com/v1/chat"));
-        // Authority-anchored matching (audit P2-API): continuations that a
-        // prefix comparison would admit are refused.
-        assert!(!providers.allows("https://api.openai.com.evil/v1"));
-        assert!(!providers.allows("https://evilapi.openai.com/v1"));
-        assert!(!providers.allows("http://api.openai.com/v1"));
-        assert!(!providers.allows("https://api.openai.com:8443/v1"));
-        assert!(!providers.allows("https://api.openai.com@evil.test/v1"));
-        assert!(!providers.allows("https://evil.test/?next=https://api.openai.com"));
-        assert!(!providers.allows("not-a-url"));
-        let configured = NetworkPolicy::AllowConfigured {
-            endpoints: vec!["https://api.anthropic.com".into()],
-            domains: vec!["https://mcp.example.com".into()],
-        };
-        assert!(configured.allows("https://api.anthropic.com/v1/messages"));
-        assert!(configured.allows("https://mcp.example.com"));
-        assert!(configured.allows("https://mcp.example.com/a/b"));
-        assert!(
-            !configured.allows("https://mcp.example.com.evil/x"),
-            "the host component is anchored, not prefixed"
-        );
-        assert!(!configured.allows("https://example.com"));
-        // A path-carrying rule is anchored at a '/' segment boundary.
-        let path_rule = NetworkPolicy::AllowProviders {
-            endpoints: vec!["https://api.openai.com/v1".into()],
-        };
-        assert!(path_rule.allows("https://api.openai.com/v1/chat"));
-        assert!(path_rule.allows("https://api.openai.com/v1"));
-        assert!(!path_rule.allows("https://api.openai.com/v10"));
-        assert!(!path_rule.allows("https://api.openai.com/v2"));
-        // Explicit ports and IPv6 brackets are authority components too.
-        let port_rule = NetworkPolicy::AllowProviders {
-            endpoints: vec!["https://[::1]:8443".into()],
-        };
-        assert!(port_rule.allows("https://[::1]:8443/x"));
-        assert!(!port_rule.allows("https://[::1]/x"));
-    }
 
     #[test]
     fn capability_describe_is_nonempty_and_carries_detail() {

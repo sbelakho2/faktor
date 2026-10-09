@@ -1,5 +1,3 @@
-#![allow(deprecated)] // NetworkPolicy::allows is a non-authoritative test matcher
-
 //! Hostile-corpus certification for the pure core types (no I/O).
 //!
 //! Every case is individually asserted with a message naming the category,
@@ -15,7 +13,7 @@
 //! 6. authority-digest domain separation and classification;
 //! 7. file hashes, deadlines, op metadata;
 //! 8. retry-policy matrix;
-//! 9. resource gauges, capability sets, network policy;
+//! 9. resource gauges, capability sets;
 //! 10. child-blocker/phase vocabularies;
 //! 11. deterministic-LCG property laws.
 
@@ -38,7 +36,7 @@ use crate::blocker::{
     ExecutionPhase, CHILD_LIFECYCLE_TAGS, MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
     MAX_CHILD_BLOCKER_REASON_CHARS,
 };
-use crate::capability::{CapabilityKind, CapabilitySet, NetworkPolicy};
+use crate::capability::{CapabilityKind, CapabilitySet};
 use crate::error::ErrorKind;
 use crate::event::{Event, EventKind, JournalInvariants};
 use crate::hash::FileHash;
@@ -1486,45 +1484,7 @@ fn core_resource_gauge_and_capability_sets() {
         "capability case #{case}: kinds iterator"
     );
 
-    let deny = NetworkPolicy::DenyAll;
-    case += 1;
-    assert!(
-        !deny.allows("https://api.example.com"),
-        "network case #{case}: deny-all refuses all"
-    );
-    let providers = NetworkPolicy::AllowProviders {
-        endpoints: vec!["https://api.example.com".into()],
-    };
-    case += 1;
-    assert!(
-        providers.allows("https://api.example.com/v1"),
-        "network case #{case}: prefix allowed"
-    );
-    case += 1;
-    assert!(
-        !providers.allows("https://evilapi.example.com/v1"),
-        "network case #{case}: prefix matching must not admit a longer host"
-    );
-    case += 1;
-    assert!(
-        !providers.allows("http://api.example.com"),
-        "network case #{case}: scheme matters"
-    );
-    let configured = NetworkPolicy::AllowConfigured {
-        endpoints: vec!["https://api.example.com".into()],
-        domains: vec!["https://docs.example.org".into()],
-    };
-    case += 1;
-    assert!(
-        configured.allows("https://docs.example.org/x"),
-        "network case #{case}: domain allowed"
-    );
-    case += 1;
-    assert!(
-        !configured.allows("https://other.example.org"),
-        "network case #{case}: unlisted refused"
-    );
-    assert_eq!(case, 40, "COUNT");
+    assert_eq!(case, 34, "COUNT");
 }
 
 #[test]
