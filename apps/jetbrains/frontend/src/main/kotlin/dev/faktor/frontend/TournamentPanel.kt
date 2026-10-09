@@ -30,9 +30,9 @@ class TournamentPanel : JPanel(BorderLayout()) {
         fun onAbortTournament(tournamentId: String, reason: String)
     }
 
-    private val title = WrappedLabel("tournament: none on this session")
+    private val title = WrappedLabel("No tournament on this session yet.")
 
-    private val summariesLabel = WrappedLabel("session tournaments: none")
+    private val summariesLabel = WrappedLabel("No saved tournaments in this session yet.")
 
     private val candidatesModel = CandidateTableModel()
 
@@ -78,10 +78,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     init {
         candidatesTable.fillsViewportHeight = true
-        candidatesTable.rowHeight = Math.max(
-            candidatesTable.rowHeight,
-            candidatesTable.getFontMetrics(uiPanelFont()).height + 8
-        )
+        TableRhythm.install(candidatesTable)
         candidatesTable.showVerticalLines = false
         candidatesTable.intercellSpacing = java.awt.Dimension(0, 1)
         candidatesTable.gridColor = cardBorderColor()
@@ -131,9 +128,10 @@ class TournamentPanel : JPanel(BorderLayout()) {
         val startBody = FormGrid()
             .row("Goal", goalField)
             .row("Criteria (comma separated)", criteriaField)
-            .row("Candidates (2-4)", countSpinner)
+            .row("Candidates", countSpinner)
             .span(actionRow(startButton))
             .build()
+        countSpinner.toolTipText = "Candidate count (2-4)"
         startButton.addActionListener {
             val goal = goalField.text.trim()
             val criteria = criteriaField.text.split(',')
@@ -180,14 +178,14 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
         val body = pageColumn()
         body.add(card("Tournament", summaryBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Start tournament", startBody))
-        body.add(vSpace(Spacing.S))
-        body.add(card("Candidates", tableScroll(candidatesTable)))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
+        body.add(card("Candidates", insetTableScroll(candidatesTable)))
+        body.add(vSpace(Spacing.M))
         body.add(card("Decide / abort", controlBody))
-        body.add(vSpace(Spacing.S))
-        body.add(card("Candidate detail", JScrollPane(detail)))
+        body.add(vSpace(Spacing.M))
+        body.add(card("Candidate detail", insetScroll(detail)))
         add(pageScroll(body), BorderLayout.CENTER)
     }
 
@@ -198,7 +196,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
     /** The durable listing of the session's tournaments (newest last). */
     fun setSummaries(summaries: List<NativeTournamentSummary>) {
         if (summaries.isEmpty()) {
-            summariesLabel.text = "session tournaments: none"
+            summariesLabel.text = "No saved tournaments in this session yet."
             return
         }
         summariesLabel.text = "session tournaments: " + summaries.joinToString(", ") {
@@ -212,7 +210,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
         decideButton.isEnabled = tournament != null && tournament.canDecide
         abortButton.isEnabled = tournament != null && tournament.open
         if (tournament == null) {
-            title.text = "tournament: none on this session"
+            title.text = "No tournament on this session yet."
             candidatesModel.setCandidates(emptyList())
             detail.text = ""
             return
@@ -330,6 +328,9 @@ class TournamentPanel : JPanel(BorderLayout()) {
                 table, value, isSelected, hasFocus, row, column
             )
             toolTipText = value?.toString()
+            if (!isSelected && table != null && TableRhythm.isHovered(table, row)) {
+                component.background = FaktorTheme.hover()
+            }
             val winnerColumn = table != null &&
                 table.model.getColumnName(table.convertColumnIndexToModel(column)) == "winner"
             val winner = winnerColumn && value == "WINNER"

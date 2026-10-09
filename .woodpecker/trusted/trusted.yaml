@@ -273,6 +273,7 @@ steps:
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo test --workspace --all-features
+        cargo test --workspace --all-features -- --list | python3 scripts/certification/check-capability-tests-compiled.py
         cargo run -p faktor-cli -- doctor --data-dir /tmp/faktor-ci
         CMDS
         )"
@@ -319,6 +320,7 @@ steps:
         cargo test -p faktor-tests-static-authority
         cargo test -p faktor-security
         cargo test -p faktor-tests-fuzz-seeds
+        cargo test -p faktor-provider --lib classify
         cargo run -p faktor-contracts -- check
         bash scripts/check-licenses.sh
         SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
@@ -878,6 +880,17 @@ steps:
       - node scripts/check-ignored-tests.mjs
       # Invariant registry coverage (node-only; the rust static lane has no node).
       - node scripts/check-invariants.mjs
+      # DOGFOOD coverage law (scripts/dogfood.mjs): every repo surface —
+      # production crates (unit-site + capability row), every discovered
+      # native route/builtin tool/CLI command/provider kind, every VS Code
+      # contribution (commands/views/configuration/walkthrough steps), every
+      # JetBrains panel vs the host-matrix panel list, every scripts/ file
+      # (invoked by the dogfood run plan or allowlisted with a reason) and
+      # every docs/*.md — must have a registered gate, and the UI/UX rules
+      # (no raw Color( outside token functions, no space-split terminal argv,
+      # calm card headers, no unreviewed internal-identifier labels) hold with
+      # file:line evidence. A new surface without a gate fails here.
+      - node scripts/dogfood.mjs selftest && node scripts/dogfood.mjs --coverage
       # Singular-authority law: the retired raw network matcher must never
       # return; the canonical destination/DNS authority owns egress.
       - node scripts/check-network-authority-singular.mjs

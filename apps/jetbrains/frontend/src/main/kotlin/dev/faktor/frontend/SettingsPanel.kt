@@ -111,27 +111,19 @@ class SettingsPanel : JPanel(BorderLayout()) {
             .build()
         val providerBody = JPanel(BorderLayout(0, Spacing.S))
         providerBody.isOpaque = false
-        providerBody.add(JScrollPane(providerArea), BorderLayout.CENTER)
+        providerBody.add(insetScroll(providerArea), BorderLayout.CENTER)
         providerBody.add(actionRow(refreshButton), BorderLayout.SOUTH)
         val body = pageColumn()
         body.add(card("Provider selection", selectors))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Mutation mode (Task composer)", mutationBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("Providers", providerBody))
-        body.add(vSpace(Spacing.S))
-        body.add(card("Daemon", JScrollPane(daemonArea)))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
+        body.add(card("Daemon", insetScroll(daemonArea)))
+        body.add(vSpace(Spacing.M))
         body.add(card("Advanced: control plane credential (manual)", buildControlPlaneSection()))
-        status.font = sectionTitleFont()
-        val statusRow = JPanel(BorderLayout())
-        statusRow.isOpaque = true
-        statusRow.background = panelSurface()
-        statusRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, 0, Spacing.M
-        )
-        statusRow.add(status, BorderLayout.CENTER)
-        add(statusRow, BorderLayout.NORTH)
+        add(panelHeader(status), BorderLayout.NORTH)
         add(pageScroll(body), BorderLayout.CENTER)
         daemonArea.text = "daemon: not started"
         providerArea.text = "no providers served"

@@ -212,9 +212,14 @@ async fn queue_runner_kick_in_budget_boundary_is_armed_and_drains_exactly_once()
     let provider = Arc::new(InspectingProvider::new(base, |_, _| Ok(())));
     let (deps, _dir) = deps_with(provider.clone(), vec![]);
     let runtime = AgentRuntime::new(deps).unwrap();
-    // A short wall budget: the runner's first bounded pass expires while
-    // the active turn is still mid-flight.
-    runtime.set_turn_budget_ms(250);
+    // A bounded pass budget that the runner can actually wait out while the
+    // active turn is mid-flight. This is a SCHEDULING envelope, not the
+    // subject under test: the contract is arm-on-kick + drain-exactly-once.
+    // 250ms was tight enough that a loaded host could deschedule the test
+    // task past both passes (A completed after the runner exited, B stayed
+    // queued); 5s keeps the deterministic boundary (pass 1 expires before A
+    // is driven) while giving the test task a real window to drive A.
+    runtime.set_turn_budget_ms(5000);
     let session = new_session(runtime.deps());
     let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
     // A is the active logical turn (submitted, not driven); B queues.

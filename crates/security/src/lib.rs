@@ -83,7 +83,7 @@ pub mod secret;
 /// the secret-scanning bound. Secret scanning sees whole payloads
 /// ([`scan_secrets`] for `&str`, [`payload`] for bytes) and never reports
 /// `Clean` for bytes it has not inspected.
-const MAX_SCAN_BYTES: usize = 256 * 1024;
+pub const MAX_SCAN_BYTES: usize = 256 * 1024;
 // ---------------------------------------------------------------------------
 // 1. Provenance / taint
 // ---------------------------------------------------------------------------

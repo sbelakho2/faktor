@@ -31,6 +31,9 @@ private const val MAX_BOARD_LINE_CHARS = 240
  */
 private const val MAX_BOARD_POSTS = 500
 
+/** The board's human empty state (one sentence; never a fabricated post). */
+private const val NO_BOARD_POSTS = "No posts yet. Root notes and handoffs appear here."
+
 class BoardPanel : JPanel(BorderLayout()) {
 
     interface Listener {
@@ -103,7 +106,7 @@ class BoardPanel : JPanel(BorderLayout()) {
         // in this row collapsed the subject field to a sliver at 240px.
         subjectRow.add(subjectField, BorderLayout.CENTER)
         val bodyLabel = mutedLabel("Body")
-        val bodyScroll = JScrollPane(bodyArea)
+        val bodyScroll = insetScroll(bodyArea)
         val pagingHint = wrappedMutedLabel(
             "Older pages load on demand; the local window is bounded."
         )
@@ -124,21 +127,12 @@ class BoardPanel : JPanel(BorderLayout()) {
         val body = pageColumn()
         val postsBody = JPanel(BorderLayout())
         postsBody.isOpaque = false
-        postsBody.add(JScrollPane(postsArea), BorderLayout.CENTER)
+        postsBody.add(insetScroll(postsArea), BorderLayout.CENTER)
         body.add(card("Posts", postsBody))
-        body.add(vSpace(Spacing.S))
+        body.add(vSpace(Spacing.M))
         body.add(card("New post", composer))
 
-        header.font = sectionTitleFont()
-        val headerRow = JPanel(BorderLayout())
-        headerRow.isOpaque = true
-        headerRow.background = panelSurface()
-        headerRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, 0, Spacing.M
-        )
-        headerRow.add(header, BorderLayout.CENTER)
-
-        add(headerRow, BorderLayout.NORTH)
+        add(panelHeader(header), BorderLayout.NORTH)
         add(pageScroll(body), BorderLayout.CENTER)
         setAvailable(false)
     }
@@ -166,7 +160,7 @@ class BoardPanel : JPanel(BorderLayout()) {
         val text = StringBuilder()
         for (post in page.posts) appendPost(text, post)
         postsArea.text = if (text.isEmpty()) {
-            "no posts on this run-family board"
+            NO_BOARD_POSTS
         } else {
             text.toString()
         }
@@ -183,7 +177,7 @@ class BoardPanel : JPanel(BorderLayout()) {
     fun appendOlderPage(page: NativeBoardPage) {
         setAvailable(true)
         val text = StringBuilder()
-        if (loadedPosts == 0 && postsArea.text == "no posts on this run-family board") {
+        if (loadedPosts == 0 && postsArea.text == NO_BOARD_POSTS) {
             postsArea.text = ""
         } else {
             text.append(postsArea.text)
