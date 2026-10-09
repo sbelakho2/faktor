@@ -73,13 +73,36 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
             .row("End", endField)
             .row("Query", queryField)
             .row("Max hits", maxHitsField)
-            .span(actionRow(retrieveButton))
             .build()
+
+        // Normal use is Retrieve over the current evidence; the raw selector
+        // primitives (byte_range/line_range/...) live behind an explicit
+        // Advanced disclosure so the enum values are never the default
+        // vocabulary (audit UI: evidence is material, not an API explorer).
+        val advancedPanel = JPanel(BorderLayout())
+        advancedPanel.isOpaque = false
+        advancedPanel.add(controls, BorderLayout.CENTER)
+        advancedPanel.isVisible = false
+        val advancedToggle = secondaryButton("Advanced retrieval ▸")
+        advancedToggle.addActionListener {
+            advancedPanel.isVisible = !advancedPanel.isVisible
+            advancedToggle.text = if (advancedPanel.isVisible) {
+                "Advanced retrieval ▾"
+            } else {
+                "Advanced retrieval ▸"
+            }
+            advancedPanel.revalidate()
+            advancedPanel.repaint()
+        }
+        val actionBody = JPanel(BorderLayout(0, Spacing.XS))
+        actionBody.isOpaque = false
+        actionBody.add(actionRow(retrieveButton, advancedToggle), BorderLayout.NORTH)
+        actionBody.add(advancedPanel, BorderLayout.CENTER)
 
         val evidenceBody = JPanel(BorderLayout(0, Spacing.S))
         evidenceBody.isOpaque = false
         evidenceBody.add(noHorizontalScroll(evidenceList), BorderLayout.CENTER)
-        evidenceBody.add(controls, BorderLayout.SOUTH)
+        evidenceBody.add(actionBody, BorderLayout.SOUTH)
 
         val messagesBody = JPanel(BorderLayout(0, Spacing.XS))
         messagesBody.isOpaque = false

@@ -488,7 +488,7 @@ class FaktorChatPanel(
         contractBox.add(completionCommit)
         contractBox.add(completionPush)
         contractBox.add(completionPr)
-        startBody.add(sectionHeader("Completion contract (Task mode only)", muted = true))
+        startBody.add(sectionHeader("Finish when done (Task mode only)", muted = true))
         startBody.add(contractBox)
         startBody.add(sectionHeader("Attachments (submitted as files)", muted = true))
         startBody.add(attachments)
