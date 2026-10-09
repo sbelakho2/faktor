@@ -16,8 +16,10 @@ import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
+import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
+import dev.faktor.shared.NativeTerminalOutput
 import dev.faktor.shared.ProtocolAttachmentRef
 import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeAttachmentId
@@ -37,6 +39,7 @@ import dev.faktor.shared.indexCoverageLabel
 import dev.faktor.shared.parseNativeIndexCoverage
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
+import dev.faktor.shared.parseNativeTerminalEventPage
 import dev.faktor.shared.parseNativeTournament
 import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
@@ -55,6 +58,8 @@ import java.nio.file.Files
 import java.nio.file.Paths
 import javax.imageio.ImageIO
 import javax.swing.KeyStroke
+import javax.swing.tree.DefaultMutableTreeNode
+import javax.swing.tree.TreePath
 
 // ----------------------------------------------------------------- fixtures
 
@@ -2488,6 +2493,362 @@ object FrontendSmoke {
                 )
             }
             assertTrue(partial.isFailure, "a refused entry fails the whole plan")
+        }
+
+        // P1: compact areas derive from IDE typography; monospace is opt-in.
+        step("compact area typography follows the IDE font; monospace is opt-in") {
+            val ui = compactArea(2)
+            val mono = compactArea(2, monospace = true)
+            assertEquals(uiPanelFont(), ui.font, "default text must use the IDE UI font")
+            assertEquals(monospacePanelFont(), mono.font, "monospace must be explicit opt-in")
+            val context = java.awt.font.FontRenderContext(null, false, false)
+            val narrow = mono.font.getStringBounds("i", context).width
+            val wide = mono.font.getStringBounds("W", context).width
+            assertTrue(Math.abs(narrow - wide) < 0.5, "the opt-in font must actually be monospaced")
+        }
+
+        // P0: every blocker/permission action is attached to its OWN card;
+        // there is no shared action bar driven by hidden selection precedence.
+        step("blockers panel: each item carries its own inline controls, no shared bar") {
+            val permissionBlocker = BlockerRow(
+                childId = "child-1",
+                kind = "permission",
+                reason = "shell call needs approval",
+                dependency = null,
+                resolution = "allow the shell tool",
+                lastProgressMs = 42L,
+                presence = PixelAgents.presence("child-1", "Blocked"),
+                actions = listOf(
+                    BlockerAction.RESUME,
+                    BlockerAction.PERMISSION_ALLOW,
+                    BlockerAction.PERMISSION_DENY,
+                    BlockerAction.RETRY
+                )
+            )
+            val dependencyBlocker = BlockerRow(
+                childId = "child-2",
+                kind = "dependency",
+                reason = "waiting on impl-a",
+                dependency = "impl-a",
+                resolution = "wait for impl-a",
+                lastProgressMs = 7L,
+                presence = PixelAgents.presence("child-2", "Blocked"),
+                actions = listOf(BlockerAction.RESUME, BlockerAction.RETRY)
+            )
+            val permission7 = NativePermissionEntry("7", "9", "shell", "{\"tool\":\"bash\"}")
+            val permission8 = NativePermissionEntry("8", "9", "network", "{\"host\":\"example\"}")
+            val panel = BlockersPanel()
+            val routed = ArrayList<String>()
+            panel.setListener(object : BlockersPanel.Listener {
+                override fun onBlockerAction(row: BlockerRow, action: BlockerAction) {
+                    routed.add("blocker:${row.childId}:${action.name}")
+                }
+
+                override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
+                    routed.add("permission:${permission.id}:$decision")
+                }
+            })
+            panel.update(
+                listOf(permissionBlocker, dependencyBlocker),
+                listOf(permission7, permission8),
+                listOf("waiting on review")
+            )
+            assertEquals(2, panel.blockerCount())
+            assertEquals(2, panel.permissionCount())
+            // Each blocker card has its OWN distinct button objects; the
+            // allow/deny actions live on the permission cards, not on a
+            // shared bar.
+            val child1Retry = panel.blockerActionButton("child-1", BlockerAction.RETRY)
+                ?: fail("child-1 card must carry its own Retry")
+            val child2Retry = panel.blockerActionButton("child-2", BlockerAction.RETRY)
+                ?: fail("child-2 card must carry its own Retry")
+            assertTrue(child1Retry !== child2Retry, "cards must not share one button instance")
+            assertEquals(
+                null,
+                panel.blockerActionButton("child-1", BlockerAction.PERMISSION_ALLOW),
+                "allow/deny belong to the permission cards, not the blocker cards"
+            )
+            val allow7 = panel.permissionActionButton("7", "allow")
+                ?: fail("permission 7 must carry its own Allow")
+            val deny8 = panel.permissionActionButton("8", "deny")
+                ?: fail("permission 8 must carry its own Deny")
+            assertTrue(allow7 !== deny8, "permission cards must not share one button instance")
+
+            // Acting on one card NEVER affects another: no selection exists to
+            // become ambiguous with nothing highlighted.
+            child1Retry.doClick(0)
+            assertEquals(listOf("blocker:child-1:RETRY"), routed)
+            child2Retry.doClick(0)
+            assertEquals(listOf("blocker:child-1:RETRY", "blocker:child-2:RETRY"), routed)
+            allow7.doClick(0)
+            deny8.doClick(0)
+            assertEquals(
+                listOf(
+                    "blocker:child-1:RETRY",
+                    "blocker:child-2:RETRY",
+                    "permission:7:allow",
+                    "permission:8:deny"
+                ),
+                routed
+            )
+            ParityAwt.layout(panel, 480, 600)
+        }
+
+        // P0: faithful argv entry — one argument per line, never a space split.
+        step("terminal composer: spaces stay inside one argv element; shell mode is explicit") {
+            val panel = TerminalPanel()
+            var command: String? = null
+            var args: List<String>? = null
+            var cwd: String? = null
+            var loadedAfter: Long? = null
+            panel.setListener(object : TerminalPanel.Listener {
+                override fun onRefresh() {}
+                override fun onSpawn(c: String, a: List<String>, w: String?) {
+                    command = c
+                    args = a
+                    cwd = w
+                }
+
+                override fun onOutput(ptyId: String) {}
+                override fun onLoadEvents(after: Long) {
+                    loadedAfter = after
+                }
+            })
+            panel.setComposerFields("echo", "hello world\n-c", "")
+            panel.submitSpawn()
+            assertEquals("echo", command)
+            assertEquals(listOf("hello world", "-c"), args, "spaces must stay inside one argument")
+            assertEquals(null, cwd)
+            // Every non-empty line is one argument, verbatim (no trim).
+            panel.setComposerFields("echo", "  padded  \n\n", "")
+            panel.submitSpawn()
+            assertEquals(listOf("  padded  "), args)
+            // Explicit shell mode: the labeled command goes to the platform
+            // shell as ONE argument; it is never word-split by the panel.
+            assertEquals(false, panel.shellModeSelected())
+            panel.setShellMode(true)
+            panel.setShellCommand("echo 'hello world'")
+            panel.submitSpawn()
+            if (System.getProperty("os.name", "").lowercase().contains("win")) {
+                assertEquals("cmd.exe", command)
+                assertEquals(listOf("/c", "echo 'hello world'"), args)
+            } else {
+                assertEquals("/bin/sh", command)
+                assertEquals(listOf("-lc", "echo 'hello world'"), args)
+            }
+            // Event paging: the has_more hint is backed by a real control.
+            panel.setEvents(
+                parseNativeTerminalEventPage(
+                    "{\"sessionId\":\"7\",\"events\":[{\"id\":1,\"type\":\"created\"," +
+                        "\"ptyId\":\"5\",\"pid\":123,\"tsMs\":1700,\"sessionId\":\"7\"}]," +
+                        "\"hasMore\":true,\"nextCursor\":42}"
+                )
+            )
+            assertEquals(true, panel.loadMoreEventsEnabled(), "has_more must arm Load more events")
+            panel.loadMoreEvents()
+            assertEquals(42L, loadedAfter)
+            panel.appendEvents(
+                parseNativeTerminalEventPage(
+                    "{\"sessionId\":\"7\",\"events\":[{\"id\":2,\"type\":\"exit\"," +
+                        "\"ptyId\":\"5\",\"pid\":123,\"tsMs\":1800,\"sessionId\":\"7\"}]," +
+                        "\"hasMore\":false,\"nextCursor\":null}"
+                )
+            )
+            assertEquals(false, panel.loadMoreEventsEnabled(), "no more pages: control disables")
+            assertTrue(panel.eventsText().contains("#1 created"), panel.eventsText())
+            assertTrue(panel.eventsText().contains("#2 exit"), panel.eventsText())
+            // Output snapshot truncation is explicit AND pageable in bounded steps.
+            val longOutput = "abcdefgh".repeat(2000)
+            panel.setOutput(NativeTerminalOutput("6", longOutput, true))
+            assertTrue(
+                panel.outputText().contains("showing ${TerminalPanel.OUTPUT_INITIAL_CHARS} of ${longOutput.length} chars"),
+                panel.outputText().take(160)
+            )
+            assertEquals(true, panel.showMoreOutputEnabled(), "truncated output must offer more")
+            panel.showMoreOutput()
+            assertTrue(
+                panel.outputText().contains(longOutput),
+                "one bounded step must reveal the whole 16k snapshot"
+            )
+            assertEquals(false, panel.showMoreOutputEnabled(), "nothing left to reveal")
+            // A snapshot beyond the bounded display cap stays honest: the
+            // header names the cap and the control disables at the bound.
+            val hugeOutput = "z".repeat(100_000)
+            panel.setOutput(NativeTerminalOutput("6", hugeOutput, true))
+            panel.showMoreOutput()
+            panel.showMoreOutput()
+            assertTrue(
+                panel.outputText().contains("display cap reached"),
+                panel.outputText().take(160)
+            )
+            assertTrue(
+                panel.outputText().contains(
+                    "showing ${TerminalPanel.OUTPUT_MAX_CHARS} of ${hugeOutput.length} chars"
+                ),
+                panel.outputText().take(160)
+            )
+            assertEquals(false, panel.showMoreOutputEnabled(), "local display bound reached")
+        }
+
+        // P1: the tree update keeps expansion, selection, detail and scroll.
+        step("task tree update preserves expansion, selection and detail by stable node ids") {
+            fun findNode(
+                tree: javax.swing.JTree,
+                panel: TaskTreePanel,
+                keyPath: String
+            ): DefaultMutableTreeNode? {
+                val root = tree.model.root as? DefaultMutableTreeNode ?: return null
+                fun walk(node: DefaultMutableTreeNode): DefaultMutableTreeNode? {
+                    if (panel.nodeKeyPathForTest(node) == keyPath) return node
+                    for (index in 0 until node.childCount) {
+                        val found = walk(node.getChildAt(index) as DefaultMutableTreeNode)
+                        if (found != null) return found
+                    }
+                    return null
+                }
+                return walk(root)
+            }
+
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            val model = TaskTree.build(task = task, agents = parseNativeAgents(AGENTS_JSON))
+            val panel = TaskTreePanel()
+            panel.update(model)
+            val tree = panel.treeForTest()
+            ParityAwt.layout(panel, 480, 600)
+
+            val sectionPath = "goal/section:children"
+            val childPath = "$sectionPath/child:child-1"
+            val section = findNode(tree, panel, sectionPath) ?: fail("children section must exist")
+            val child = findNode(tree, panel, childPath) ?: fail("child-1 node must exist")
+            tree.expandPath(TreePath(section.path))
+            tree.selectionPath = TreePath(child.path)
+            assertTrue(
+                panel.selectedDetailText().contains("child-1"),
+                panel.selectedDetailText()
+            )
+            val viewport = panel.treeScrollForTest().viewport
+            viewport.viewPosition = java.awt.Point(0, 24)
+            val savedScroll = java.awt.Point(viewport.viewPosition)
+
+            // New data: one more child arrives; nothing was selected/expanded
+            // by the operator beyond what we just did.
+            val extra = parseNativeAgents(AGENTS_JSON)[1].copy(
+                agentId = "child-9",
+                sessionId = 44L,
+                state = "Running",
+                blocker = null,
+                result = null
+            )
+            panel.update(
+                TaskTree.build(task = task, agents = parseNativeAgents(AGENTS_JSON) + extra)
+            )
+            val selectedNode = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode
+            assertEquals(childPath, selectedNode?.let { panel.nodeKeyPathForTest(it) })
+            assertTrue(tree.isExpanded(TreePath(section.path)), "expanded section must stay expanded")
+            assertTrue(
+                panel.selectedDetailText().contains("child-1"),
+                "the inspector detail must follow the preserved selection"
+            )
+            assertTrue(
+                findNode(tree, panel, "$sectionPath/child:child-9") != null,
+                "the new child must appear in the same tree"
+            )
+            assertEquals(savedScroll, java.awt.Point(viewport.viewPosition))
+
+            // A section the operator collapsed must NOT be re-expanded.
+            val evidence = findNode(tree, panel, "goal/section:evidence")
+                ?: fail("evidence section must exist")
+            tree.collapsePath(TreePath(evidence.path))
+            panel.update(model)
+            assertTrue(
+                !tree.isExpanded(TreePath(evidence.path)),
+                "a collapsed section must never be re-expanded by an update"
+            )
+        }
+
+        // P1: an atomic session switch clears message rows and selection too.
+        step("evidence navigator session reset clears message rows and every per-session atom") {
+            val panel = EvidenceNavigatorPanel()
+            panel.setEvidence(listOf(EvidenceRefs.parse("evidence:41")))
+            panel.setMessages(
+                listOf(NativeMessage(seq = 1, id = 1, role = "user", createdMs = 1, text = "old"))
+            )
+            panel.selectMessage(0)
+            panel.showTranscriptSlice("child old", "old transcript")
+            panel.showRetrieval(41L, "old output", 3L, false)
+            assertEquals(1, panel.messageCount())
+            assertTrue(panel.selectedMessage() != null, "the old row must be selected first")
+            panel.resetSessionView()
+            assertEquals(0, panel.evidenceCount(), "evidence rows must clear")
+            assertEquals(0, panel.messageCount(), "message rows must clear")
+            assertEquals(null, panel.selectedMessage(), "message selection must clear")
+            assertEquals("", panel.outputText(), "retrieval output must clear")
+            assertEquals("", panel.transcriptText(), "child transcript must clear")
+            // New-session rows never mix with the previous session's rows.
+            panel.setMessages(
+                listOf(NativeMessage(seq = 1, id = 2, role = "assistant", createdMs = 2, text = "new"))
+            )
+            assertEquals(1, panel.messageCount())
+            assertEquals("", panel.transcriptText())
+            assertEquals("", panel.outputText())
+        }
+
+        // P1: real bounded "Load older" on the board instead of an inert hint.
+        step("board panel pages older posts through a bounded Load older control") {
+            val panel = BoardPanel()
+            var requested: Long? = null
+            panel.setListener(object : BoardPanel.Listener {
+                override fun onRead() {}
+                override fun onPost(subject: String, body: String) {}
+                override fun onLoadOlder(beforeRevision: Long) {
+                    requested = beforeRevision
+                }
+            })
+            panel.setBoard(parseNativeBoardPage(BOARD_PAGE_JSON))
+            assertEquals(true, panel.loadOlderEnabled(), "has_more must arm Load older")
+            assertEquals(2L, panel.loadOlderCursor())
+            assertTrue(panel.headerText().contains("older pages exist"), panel.headerText())
+            panel.loadOlder()
+            assertEquals(2L, requested)
+            panel.appendOlderPage(
+                parseNativeBoardPage(
+                    "{\"board_id\":7,\"revision\":1,\"posts\":[" +
+                        "{\"id\":1,\"board_id\":7,\"author_child\":null,\"author_session\":7," +
+                        "\"subject\":\"oldest\",\"body\":\"first post\",\"refs\":[]," +
+                        "\"revision\":1,\"created_ms\":1500}" +
+                        "],\"next_before_revision\":null,\"has_more\":false}"
+                )
+            )
+            assertEquals(false, panel.loadOlderEnabled(), "no more pages: control disables")
+            assertTrue(panel.postsText().contains("#3 [child:8] handoff"), panel.postsText())
+            assertTrue(panel.postsText().contains("#1 [root] oldest"), panel.postsText())
+        }
+
+        // Bounded architecture: the 430x600 east inspector is now collapsible
+        // and the default is the single chat content plane.
+        step("chat inspector is a toggle; default layout is one content plane") {
+            val service = FaktorFrontendService(
+                Paths.get("unused-binary"),
+                Files.createTempDirectory("faktor-inspector-smoke-")
+            )
+            val panel = FaktorChatPanel(service)
+            try {
+                assertEquals(false, panel.inspectorVisibleForTest(), "inspector must default collapsed")
+                ParityAwt.layout(panel, 240, 600)
+                assertEquals(240, panel.chatPlaneForTest().width, "chat must use the full narrow width")
+                assertEquals(true, panel.toggleInspectorForTest())
+                assertTrue(panel.inspectorVisibleForTest(), "the toolbar action must reveal the inspector")
+                ParityAwt.layout(panel, 800, 600)
+                assertTrue(
+                    panel.chatPlaneForTest().width in 1 until 800,
+                    "chat and inspector must share the width in the split"
+                )
+                assertEquals(false, panel.toggleInspectorForTest())
+                ParityAwt.layout(panel, 240, 600)
+                assertEquals(240, panel.chatPlaneForTest().width)
+            } finally {
+                panel.shutdown()
+            }
         }
 
         if (args.isEmpty()) {

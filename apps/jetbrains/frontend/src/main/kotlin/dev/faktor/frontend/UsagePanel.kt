@@ -20,9 +20,7 @@ import dev.faktor.shared.NativeInFlightTxn
 import dev.faktor.shared.NativeUsageBuckets
 import java.awt.BorderLayout
 import java.math.BigInteger
-import java.awt.FlowLayout
-import javax.swing.JButton
-import javax.swing.JLabel
+import javax.swing.BorderFactory
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 
@@ -333,31 +331,38 @@ class UsagePanel : JPanel(BorderLayout()) {
         fun onGrantCredits()
     }
 
-    private val statusLabel = JLabel("usage: -")
+    private val statusLabel = WrappedLabel("usage: -")
 
     private val linesArea = compactArea(10)
 
-    private val previousButton = JButton("Previous page")
+    private val previousButton = secondaryButton("Previous page")
 
-    private val nextButton = JButton("Next page")
+    private val nextButton = secondaryButton("Next page")
 
-    private val grantButton = JButton("Grant credits…")
+    private val grantButton = primaryButton("Grant credits…")
 
     private var listener: Listener? = null
 
     private var model: UsagePanelModel? = null
 
     init {
-        val body = JPanel(BorderLayout(0, 4))
-        body.border = javax.swing.BorderFactory.createEmptyBorder(4, 6, 4, 6)
-        body.add(statusLabel, BorderLayout.NORTH)
-        body.add(JScrollPane(linesArea), BorderLayout.CENTER)
-        val actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        actions.add(previousButton)
-        actions.add(nextButton)
-        actions.add(grantButton)
-        body.add(actions, BorderLayout.SOUTH)
-        add(body, BorderLayout.NORTH)
+        val linesBody = JPanel(BorderLayout())
+        linesBody.isOpaque = false
+        linesBody.add(JScrollPane(linesArea), BorderLayout.CENTER)
+        val body = pageColumn()
+        body.add(card("Billing detail", linesBody))
+        body.add(vSpace(Spacing.S))
+        body.add(actionRow(previousButton, nextButton, grantButton))
+        statusLabel.font = sectionTitleFont()
+        val statusRow = JPanel(BorderLayout())
+        statusRow.isOpaque = true
+        statusRow.background = panelSurface()
+        statusRow.border = BorderFactory.createEmptyBorder(
+            Spacing.S, Spacing.M, 0, Spacing.M
+        )
+        statusRow.add(statusLabel, BorderLayout.CENTER)
+        add(statusRow, BorderLayout.NORTH)
+        add(body, BorderLayout.CENTER)
 
         previousButton.addActionListener { listener?.onPreviousPage() }
         nextButton.addActionListener { listener?.onNextPage() }
@@ -435,6 +440,10 @@ class UsagePanel : JPanel(BorderLayout()) {
                 value.subscription == "grace" ||
                 value.subscription == "canceled"
             )
-        statusLabel.foreground = if (alert) java.awt.Color(0xC0, 0x39, 0x2B) else null
+        statusLabel.foreground = if (alert) {
+            semanticForeground(SemanticState.NEGATIVE)
+        } else {
+            textForeground()
+        }
     }
 }

@@ -1,22 +1,21 @@
 // Dedicated blockers section: every blocked child with its blocker kind,
-// reason, dependency, suggested resolution and the action buttons that
-// apply (resume / permission reply / retry), plus the session's pending
-// permission requests with allow/deny replies over the daemon's permission
-// reply route. Pure presentation: actions are delivered to a Listener.
+// reason, dependency, suggested resolution and its OWN inline action
+// controls (Resume / Retry attached to that blocker card), plus the
+// session's pending permission requests, each with its OWN Allow / Deny
+// attached to that permission card. There is deliberately NO shared action
+// bar and no hidden selection precedence: an action can never apply to a
+// different item than the one it is drawn on. Pure presentation: actions are
+// delivered to a Listener.
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativePermissionEntry
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
-import javax.swing.DefaultListModel
+import java.util.LinkedHashMap
+import javax.swing.BorderFactory
 import javax.swing.JButton
-import javax.swing.JLabel
-import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
-import javax.swing.ListSelectionModel
 
 class BlockersPanel : JPanel(BorderLayout()) {
 
@@ -25,71 +24,35 @@ class BlockersPanel : JPanel(BorderLayout()) {
         fun onPermissionReply(permission: NativePermissionEntry, decision: String)
     }
 
-    private val blockersModel = DefaultListModel<BlockerRow>()
+    private val cards = ScrollableColumn().apply {
+        border = BorderFactory.createEmptyBorder(
+            Spacing.M, Spacing.M, Spacing.M, Spacing.M
+        )
+    }
 
-    private val blockersList = JList(blockersModel)
+    private val taskBlockersArea = compactArea(2).apply {
+        isFocusable = false
+        isOpaque = false
+        font = uiPanelFont()
+    }
 
-    private val permissionsModel = DefaultListModel<NativePermissionEntry>()
+    private var blockers: List<BlockerRow> = emptyList()
 
-    private val permissionsList = JList(permissionsModel)
+    private var permissions: List<NativePermissionEntry> = emptyList()
 
-    private val taskBlockersArea = compactArea(2)
+    private var taskBlockers: List<String> = emptyList()
 
-    private val detail = compactArea(4)
+    private val blockerButtons = LinkedHashMap<String, LinkedHashMap<BlockerAction, JButton>>()
 
-    private val resumeButton = JButton("Resume")
+    private class PermissionActions(val allow: JButton, val deny: JButton)
 
-    private val retryButton = JButton("Retry")
-
-    private val allowButton = JButton("Allow")
-
-    private val denyButton = JButton("Deny")
+    private val permissionButtons = LinkedHashMap<String, PermissionActions>()
 
     private var listener: Listener? = null
 
     init {
-        blockersList.selectionMode = ListSelectionModel.SINGLE_SELECTION
-        blockersList.cellRenderer = BlockerCellRenderer()
-        blockersList.addListSelectionListener { applySelection() }
-        permissionsList.selectionMode = ListSelectionModel.SINGLE_SELECTION
-        permissionsList.cellRenderer = PermissionCellRenderer()
-        permissionsList.addListSelectionListener { updatePermissionButtons() }
-
-        val body = JPanel(GridLayout(0, 1, 0, 4))
-        body.add(titledSection("blocked children", JScrollPane(blockersList)))
-        body.add(titledSection("blocker detail", JScrollPane(detail)))
-
-        val actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        actions.add(resumeButton)
-        actions.add(retryButton)
-        actions.add(allowButton)
-        actions.add(denyButton)
-        body.add(titledSection("actions that apply", actions))
-
-        body.add(titledSection("task blockers", JScrollPane(taskBlockersArea)))
-        body.add(titledSection("pending permissions", JScrollPane(permissionsList)))
-
-        add(body, BorderLayout.NORTH)
-
-        resumeButton.addActionListener { withSelected { row -> listener?.onBlockerAction(row, BlockerAction.RESUME) } }
-        retryButton.addActionListener { withSelected { row -> listener?.onBlockerAction(row, BlockerAction.RETRY) } }
-        allowButton.addActionListener {
-            val permission = permissionsList.selectedValue
-            if (permission != null) {
-                listener?.onPermissionReply(permission, "allow")
-            } else {
-                withSelected { row -> listener?.onBlockerAction(row, BlockerAction.PERMISSION_ALLOW) }
-            }
-        }
-        denyButton.addActionListener {
-            val permission = permissionsList.selectedValue
-            if (permission != null) {
-                listener?.onPermissionReply(permission, "deny")
-            } else {
-                withSelected { row -> listener?.onBlockerAction(row, BlockerAction.PERMISSION_DENY) }
-            }
-        }
-        updateButtons(null)
+        add(JScrollPane(cards), BorderLayout.CENTER)
+        render()
     }
 
     fun setListener(value: Listener?) {
@@ -106,131 +69,129 @@ class BlockersPanel : JPanel(BorderLayout()) {
         permissions: List<NativePermissionEntry>,
         taskBlockers: List<String>
     ) {
-        val selectedId = blockersList.selectedValue?.childId
-        blockersModel.clear()
-        for (blocker in blockers) blockersModel.addElement(blocker)
+        this.blockers = blockers
+        this.permissions = permissions
+        this.taskBlockers = taskBlockers
         taskBlockersArea.text = if (taskBlockers.isEmpty()) {
-            "no task-level blockers"
+            "No task-level blockers."
         } else {
             taskBlockers.joinToString("\n")
         }
-        permissionsModel.clear()
-        for (permission in permissions) permissionsModel.addElement(permission)
-        if (selectedId != null) {
-            for (i in 0 until blockersModel.size()) {
-                if (blockersModel.getElementAt(i).childId == selectedId) {
-                    blockersList.selectedIndex = i
-                    break
-                }
-            }
-        } else if (blockersModel.size() > 0) {
-            blockersList.selectedIndex = 0
+        taskBlockersArea.foreground = if (taskBlockers.isEmpty()) {
+            mutedForeground()
         } else {
-            detail.text = "no blocked children"
+            textForeground()
         }
-        updatePermissionButtons()
+        render()
     }
 
-    fun blockerCount(): Int = blockersModel.size()
+    fun blockerCount(): Int = blockers.size
 
-    fun permissionCount(): Int = permissionsModel.size()
+    fun permissionCount(): Int = permissions.size
 
-    /** The action buttons the selected blocker applies (for the smoke). */
+    /**
+     * The model's applicable actions (union over blocker rows) for smoke
+     * observability. The UI renders each row's OWN controls inline; this is
+     * never a shared selection-driven action set.
+     */
     fun applicableActions(): List<BlockerAction> =
-        blockersList.selectedValue?.actions ?: emptyList()
+        blockers.flatMap { it.actions }.distinct()
 
-    private fun withSelected(block: (BlockerRow) -> Unit) {
-        val row = blockersList.selectedValue ?: return
-        block(row)
+    /** The inline Resume/Retry button attached to one blocker card. */
+    internal fun blockerActionButton(childId: String, action: BlockerAction): JButton? =
+        blockerButtons[childId]?.get(action)
+
+    /** The inline Allow/Deny button attached to one permission card. */
+    internal fun permissionActionButton(permissionId: String, decision: String): JButton? {
+        val actions = permissionButtons[permissionId] ?: return null
+        return if (decision == "allow") actions.allow else actions.deny
     }
 
-    private fun applySelection() {
-        val row = blockersList.selectedValue
-        updateButtons(row)
-        if (row == null) {
-            detail.text = if (blockersModel.size() == 0) "no blocked children" else "select a child"
-            return
+    /** One card's rendered reason text (smoke observability). */
+    internal fun blockerReasonText(childId: String): String? =
+        blockers.firstOrNull { it.childId == childId }?.reason
+
+    // ----------------------------------------------------------------- cards
+
+    private fun render() {
+        blockerButtons.clear()
+        permissionButtons.clear()
+        cards.removeAll()
+
+        cards.add(sectionHeader("Blocked children (${blockers.size})"))
+        if (blockers.isEmpty()) {
+            cards.add(vSpace(Spacing.XS))
+            cards.add(mutedLabel("No blocked children."))
         }
-        val text = StringBuilder()
-        text.append("child: ").append(row.childId)
-        text.append("\nstate: ").append(row.presence.state.tag)
-        text.append("\nblocker kind: ").append(row.kind)
-        text.append("\nreason: ").append(bound(row.reason, 240))
-        if (row.dependency != null) text.append("\ndependency: ").append(bound(row.dependency, 240))
-        if (row.resolution != null) {
-            text.append("\nsuggested resolution: ").append(bound(row.resolution, 240))
+        for (row in blockers) {
+            cards.add(vSpace(Spacing.S))
+            cards.add(blockerCard(row))
         }
-        if (row.lastProgressMs != null) text.append("\nlast progress ms: ").append(row.lastProgressMs)
-        detail.text = text.toString()
-    }
 
-    private fun updateButtons(row: BlockerRow?) {
-        val actions = row?.actions ?: emptyList()
-        resumeButton.isEnabled = actions.contains(BlockerAction.RESUME)
-        retryButton.isEnabled = actions.contains(BlockerAction.RETRY)
-        allowButton.isEnabled = actions.contains(BlockerAction.PERMISSION_ALLOW) || permissionsList.selectedValue != null
-        denyButton.isEnabled = actions.contains(BlockerAction.PERMISSION_DENY) || permissionsList.selectedValue != null
-    }
+        cards.add(vSpace(Spacing.M))
+        cards.add(sectionHeader("Task blockers (${taskBlockers.size})"))
+        cards.add(vSpace(Spacing.XS))
+        cards.add(taskBlockersArea)
 
-    private fun updatePermissionButtons() {
-        val permissionSelected = permissionsList.selectedValue != null
-        if (permissionSelected) {
-            allowButton.isEnabled = true
-            denyButton.isEnabled = true
-        } else {
-            val actions = blockersList.selectedValue?.actions ?: emptyList()
-            allowButton.isEnabled = actions.contains(BlockerAction.PERMISSION_ALLOW)
-            denyButton.isEnabled = actions.contains(BlockerAction.PERMISSION_DENY)
+        cards.add(vSpace(Spacing.M))
+        cards.add(sectionHeader("Pending permissions (${permissions.size})"))
+        if (permissions.isEmpty()) {
+            cards.add(vSpace(Spacing.XS))
+            cards.add(mutedLabel("No pending permissions."))
         }
+        for (permission in permissions) {
+            cards.add(vSpace(Spacing.S))
+            cards.add(permissionCard(permission))
+        }
+
+        cards.revalidate()
+        cards.repaint()
     }
 
-    private class BlockerCellRenderer : javax.swing.DefaultListCellRenderer() {
-        private val panel = JPanel(BorderLayout(4, 0))
-        private val label = JLabel()
-        private var spriteId: String? = null
-        private var sprite: PixelSprite? = null
-
-        override fun getListCellRendererComponent(
-            list: JList<*>?,
-            value: Any?,
-            index: Int,
-            selected: Boolean,
-            focus: Boolean
-        ): java.awt.Component {
-            val row = value as? BlockerRow
-                ?: return super.getListCellRendererComponent(list, value, index, selected, focus)
-            if (spriteId != row.childId) {
-                spriteId = row.childId
-                sprite = PixelSprite(row.childId, row.presence.state.tag)
-                panel.removeAll()
-                panel.add(sprite, BorderLayout.WEST)
-                panel.add(label, BorderLayout.CENTER)
+    private fun blockerCard(row: BlockerRow): JPanel {
+        val info = WrappedLabel(
+            buildString {
+                append(row.childId).append(" [").append(row.presence.state.tag)
+                    .append('/').append(row.kind).append("] ")
+                append(bound(row.reason, 240))
+                row.dependency?.let { append("\ndependency: ").append(bound(it, 160)) }
+                row.resolution?.let { append("\nresolution: ").append(bound(it, 160)) }
+                row.lastProgressMs?.let { append("\nlast progress: ").append(it).append("ms") }
             }
-            sprite?.setState(row.presence.state.tag)
-            label.text = "${row.childId} [${row.presence.state.tag}/${row.kind}] " +
-                bound(row.reason, 120)
-            panel.background = if (selected) list?.selectionBackground else list?.background
-            panel.isOpaque = true
-            label.foreground = if (selected) list?.selectionForeground else list?.foreground
-            return panel
+        )
+        val card = card(null, info, hgap = Spacing.S, vgap = Spacing.S)
+        val perCard = LinkedHashMap<BlockerAction, JButton>()
+        // Permission allow/deny belongs to the PERMISSION card; the blocker
+        // card carries only the child-level controls (resume/retry/cancel).
+        val buttons = ArrayList<JButton>()
+        for (action in row.actions.filter {
+            it != BlockerAction.PERMISSION_ALLOW && it != BlockerAction.PERMISSION_DENY
+        }) {
+            val button = actionButton(action.label, primary = action == BlockerAction.RESUME)
+            button.addActionListener { listener?.onBlockerAction(row, action) }
+            perCard[action] = button
+            buttons.add(button)
         }
+        blockerButtons[row.childId] = perCard
+        card.add(PixelSprite(row.childId, row.presence.state.tag), BorderLayout.WEST)
+        if (buttons.isNotEmpty()) {
+            card.add(actionRow(*buttons.toTypedArray()), BorderLayout.SOUTH)
+        }
+        return card
     }
 
-    private class PermissionCellRenderer : javax.swing.DefaultListCellRenderer() {
-        override fun getListCellRendererComponent(
-            list: JList<*>?,
-            value: Any?,
-            index: Int,
-            selected: Boolean,
-            focus: Boolean
-        ): java.awt.Component {
-            val permission = value as? NativePermissionEntry
-            val text = if (permission == null) {
-                ""
-            } else {
-                "#${permission.id} ${permission.capability} ${bound(permission.detail, 80)}"
-            }
-            return super.getListCellRendererComponent(list, text, index, selected, focus)
-        }
+    private fun permissionCard(permission: NativePermissionEntry): JPanel {
+        val info = WrappedLabel(
+            "#${permission.id} capability=${permission.capability}" +
+                (if (permission.detail.isEmpty()) "" else "\n" + bound(permission.detail, 240))
+        )
+        val allow = primaryButton("Allow")
+        allow.addActionListener { listener?.onPermissionReply(permission, "allow") }
+        val deny = secondaryButton("Deny")
+        deny.addActionListener { listener?.onPermissionReply(permission, "deny") }
+        permissionButtons[permission.id] = PermissionActions(allow, deny)
+        val card = card(null, info, hgap = Spacing.S, vgap = Spacing.S)
+        card.add(actionRow(allow, deny), BorderLayout.SOUTH)
+        return card
     }
 }

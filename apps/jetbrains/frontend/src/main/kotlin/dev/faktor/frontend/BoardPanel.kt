@@ -8,10 +8,9 @@
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativeBoardPage
+import dev.faktor.shared.NativeBoardPost
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
-import javax.swing.JButton
+import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
@@ -25,6 +24,13 @@ private const val MAX_BOARD_SUBJECT_BYTES = 512
 private const val MAX_BOARD_BODY_BYTES = 16 * 1024
 private const val MAX_BOARD_LINE_CHARS = 240
 
+/**
+ * The bounded local window of loaded posts: Load older keeps paging while
+ * the daemon says `has_more`, but the local transcript stops at this many
+ * posts and the header says so instead of growing without bound.
+ */
+private const val MAX_BOARD_POSTS = 500
+
 class BoardPanel : JPanel(BorderLayout()) {
 
     interface Listener {
@@ -33,9 +39,12 @@ class BoardPanel : JPanel(BorderLayout()) {
 
         /** One bounded post; engine refusals stay typed and visible. */
         fun onPost(subject: String, body: String)
+
+        /** Loads the next OLDER page before [beforeRevision]; default no-op. */
+        fun onLoadOlder(beforeRevision: Long) {}
     }
 
-    private val header = JLabel("board: not read yet")
+    private val header = WrappedLabel("board: not read yet")
 
     private val postsArea = compactArea(10)
 
@@ -43,11 +52,13 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     private val bodyArea = JTextArea(2, 18)
 
-    private val postButton = JButton("Post")
+    private val postButton = primaryButton("Post")
 
-    private val readButton = JButton("Read board")
+    private val readButton = secondaryButton("Read board")
 
-    private val composer = JPanel(GridLayout(0, 1, 2, 2))
+    private val loadOlderButton = secondaryButton("Load older")
+
+    private val composer = ScrollableColumn()
 
     private var listener: Listener? = null
 
@@ -55,14 +66,28 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     private var seenRevision: Long = 0L
 
+    private var latestRevision: Long = 0L
+
+    private var unread: Int = 0
+
+    private var loadedPosts: Int = 0
+
+    private var nextBeforeRevision: Long? = null
+
+    private var hasMore: Boolean = false
+
+    private var pagingNote: String? = null
+
     init {
         bodyArea.lineWrap = true
         bodyArea.wrapStyleWord = true
-        subjectField.maximumSize = java.awt.Dimension(Int.MAX_VALUE, 24)
+        bodyArea.font = uiPanelFont()
         postButton.isEnabled = false
         readButton.isEnabled = false
+        loadOlderButton.isEnabled = false
         postButton.addActionListener { submitComposer() }
         readButton.addActionListener { if (readButton.isEnabled) listener?.onRead() }
+        loadOlderButton.addActionListener { loadOlder() }
         val draftListener = object : javax.swing.event.DocumentListener {
             override fun insertUpdate(e: javax.swing.event.DocumentEvent?) = updateComposer()
             override fun removeUpdate(e: javax.swing.event.DocumentEvent?) = updateComposer()
@@ -71,22 +96,49 @@ class BoardPanel : JPanel(BorderLayout()) {
         subjectField.document.addDocumentListener(draftListener)
         bodyArea.document.addDocumentListener(draftListener)
 
-        val row1 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        row1.add(JLabel("subject"))
-        row1.add(subjectField)
-        row1.add(readButton)
-        val row2 = JPanel(BorderLayout(4, 0))
-        row2.add(JLabel("body"), BorderLayout.WEST)
-        row2.add(JScrollPane(bodyArea), BorderLayout.CENTER)
-        val row3 = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0))
-        row3.add(postButton)
-        composer.add(row1)
-        composer.add(row2)
-        composer.add(row3)
+        val subjectRow = JPanel(BorderLayout(Spacing.S, 0))
+        subjectRow.isOpaque = false
+        subjectRow.add(mutedLabel("Subject"), BorderLayout.WEST)
+        subjectRow.add(subjectField, BorderLayout.CENTER)
+        subjectRow.add(readButton, BorderLayout.EAST)
+        val bodyLabel = mutedLabel("Body")
+        val bodyScroll = JScrollPane(bodyArea)
+        val pagingHint = wrappedMutedLabel(
+            "Older pages load on demand; the local window is bounded."
+        )
+        val postRow = actionRow(postButton)
+        composer.border = BorderFactory.createEmptyBorder(0, 0, 0, 0)
+        composer.add(subjectRow)
+        composer.add(vSpace(Spacing.S))
+        composer.add(bodyLabel)
+        composer.add(vSpace(Spacing.XS))
+        composer.add(bodyScroll)
+        composer.add(vSpace(Spacing.S))
+        composer.add(actionRow(loadOlderButton))
+        composer.add(vSpace(Spacing.XS))
+        composer.add(pagingHint)
+        composer.add(vSpace(Spacing.S))
+        composer.add(postRow)
 
-        add(header, BorderLayout.NORTH)
-        add(JScrollPane(postsArea), BorderLayout.CENTER)
-        add(composer, BorderLayout.SOUTH)
+        val body = pageColumn()
+        val postsBody = JPanel(BorderLayout())
+        postsBody.isOpaque = false
+        postsBody.add(JScrollPane(postsArea), BorderLayout.CENTER)
+        body.add(card("Posts", postsBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("New post", composer))
+
+        header.font = sectionTitleFont()
+        val headerRow = JPanel(BorderLayout())
+        headerRow.isOpaque = true
+        headerRow.background = panelSurface()
+        headerRow.border = BorderFactory.createEmptyBorder(
+            Spacing.S, Spacing.M, 0, Spacing.M
+        )
+        headerRow.add(header, BorderLayout.CENTER)
+
+        add(headerRow, BorderLayout.NORTH)
+        add(body, BorderLayout.CENTER)
         setAvailable(false)
     }
 
@@ -104,26 +156,87 @@ class BoardPanel : JPanel(BorderLayout()) {
         if (acknowledge) {
             seenRevision = maxOf(seenRevision, page.revision)
         }
-        val unread = page.posts.count { it.revision > seenRevision }
-        header.text = "board: rev=${page.revision} unread=$unread posts=${page.posts.size}" +
-            if (page.hasMore) " (older pages exist)" else ""
+        latestRevision = page.revision
+        unread = page.posts.count { it.revision > seenRevision }
+        loadedPosts = page.posts.size
+        nextBeforeRevision = page.nextBeforeRevision
+        hasMore = page.hasMore
+        pagingNote = null
         val text = StringBuilder()
-        for (post in page.posts) {
-            val author = post.authorChild?.let { "child:$it" } ?: "root"
-            text.append('#').append(post.revision).append(" [").append(author).append("] ")
-                .append(bound(post.subject, MAX_BOARD_LINE_CHARS))
-                .append(" - ")
-                .append(bound(post.body, MAX_BOARD_LINE_CHARS))
-            if (post.refs.isNotEmpty()) {
-                text.append(" refs=").append(post.refs.joinToString(",", limit = 5))
-            }
-            text.append('\n')
-        }
+        for (post in page.posts) appendPost(text, post)
         postsArea.text = if (text.isEmpty()) {
             "no posts on this run-family board"
         } else {
             text.toString()
         }
+        renderHeader()
+        updateLoadOlder()
+    }
+
+    /**
+     * Appends the next OLDER page (Load older). The local window is bounded:
+     * once [MAX_BOARD_POSTS] posts are loaded, the control disables itself
+     * and the header names the bound instead of the transcript growing
+     * without limit.
+     */
+    fun appendOlderPage(page: NativeBoardPage) {
+        setAvailable(true)
+        val text = StringBuilder()
+        if (loadedPosts == 0 && postsArea.text == "no posts on this run-family board") {
+            postsArea.text = ""
+        } else {
+            text.append(postsArea.text)
+            if (text.isNotEmpty() && text.last() != '\n') text.append('\n')
+        }
+        for (post in page.posts) appendPost(text, post)
+        unread += page.posts.count { it.revision > seenRevision }
+        loadedPosts += page.posts.size
+        nextBeforeRevision = page.nextBeforeRevision
+        hasMore = page.hasMore
+        pagingNote = if (hasMore && loadedPosts >= MAX_BOARD_POSTS) {
+            "local window bound reached ($MAX_BOARD_POSTS posts); older pages remain on the daemon"
+        } else {
+            null
+        }
+        postsArea.text = text.toString()
+        renderHeader()
+        updateLoadOlder()
+    }
+
+    private fun appendPost(text: StringBuilder, post: NativeBoardPost) {
+        val author = post.authorChild?.let { "child:$it" } ?: "root"
+        text.append('#').append(post.revision).append(" [").append(author).append("] ")
+            .append(bound(post.subject, MAX_BOARD_LINE_CHARS))
+            .append(" - ")
+            .append(bound(post.body, MAX_BOARD_LINE_CHARS))
+        if (post.refs.isNotEmpty()) {
+            text.append(" refs=").append(post.refs.joinToString(",", limit = 5))
+        }
+        text.append('\n')
+    }
+
+    private fun renderHeader() {
+        header.text = "board: rev=$latestRevision unread=$unread posts=$loadedPosts" +
+            (if (hasMore) " (older pages exist)" else "") +
+            (pagingNote?.let { " - $it" } ?: "")
+    }
+
+    /** Pages one bounded older window when the daemon says more exists. */
+    fun loadOlder() {
+        if (!loadOlderButton.isEnabled) return
+        val cursor = nextBeforeRevision ?: return
+        listener?.onLoadOlder(cursor)
+    }
+
+    private fun updateLoadOlder() {
+        loadOlderButton.isEnabled = available && hasMore &&
+            nextBeforeRevision != null && loadedPosts < MAX_BOARD_POSTS
+    }
+
+    /** A typed failure while paging: stays visible, never fabricated posts. */
+    fun setPagingNote(text: String) {
+        pagingNote = bound(text, MAX_BOARD_LINE_CHARS)
+        renderHeader()
     }
 
     /**
@@ -133,16 +246,30 @@ class BoardPanel : JPanel(BorderLayout()) {
      */
     fun setUnavailable(reason: String) {
         setAvailable(false)
+        latestRevision = 0L
+        unread = 0
+        loadedPosts = 0
+        nextBeforeRevision = null
+        hasMore = false
+        pagingNote = null
         header.text = "board: unavailable (" + bound(reason, MAX_BOARD_LINE_CHARS) + ")"
         postsArea.text = ""
+        loadOlderButton.isEnabled = false
     }
 
     /** Clears to the pre-read state (daemon stopped / session switched). */
     fun reset() {
         seenRevision = 0L
+        latestRevision = 0L
+        unread = 0
+        loadedPosts = 0
+        nextBeforeRevision = null
+        hasMore = false
+        pagingNote = null
         setAvailable(false)
         header.text = "board: not read yet"
         postsArea.text = ""
+        loadOlderButton.isEnabled = false
     }
 
     fun clearComposer() {
@@ -152,13 +279,19 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     fun available(): Boolean = available
 
-    fun headerText(): String = header.text
+    fun headerText(): String = header.fullText
 
     fun postsText(): String = postsArea.text
 
     fun postEnabled(): Boolean = postButton.isEnabled
 
     fun readEnabled(): Boolean = readButton.isEnabled
+
+    fun loadOlderEnabled(): Boolean = loadOlderButton.isEnabled
+
+    fun loadOlderCursor(): Long? = nextBeforeRevision
+
+    fun postsBoundReached(): Boolean = loadedPosts >= MAX_BOARD_POSTS
 
     fun subject(): String = subjectField.text.trim()
 

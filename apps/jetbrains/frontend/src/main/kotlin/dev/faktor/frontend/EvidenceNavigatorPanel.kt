@@ -9,12 +9,8 @@ package dev.faktor.frontend
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeRequests
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
 import javax.swing.DefaultListModel
-import javax.swing.JButton
 import javax.swing.JComboBox
-import javax.swing.JLabel
 import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.JScrollPane
@@ -42,9 +38,9 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
 
     private val maxHitsField = JTextField(4)
 
-    private val retrieveButton = JButton("Retrieve")
+    private val retrieveButton = primaryButton("Retrieve")
 
-    private val output = compactArea(9)
+    private val output = compactArea(9, monospace = true)
 
     private val messagesModel = DefaultListModel<NativeMessage>()
 
@@ -71,38 +67,37 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
         modeBox.addActionListener { updateSelectorFields() }
         retrieveButton.addActionListener { retrieve() }
 
-        val controls = JPanel(GridLayout(0, 1, 2, 2))
-        val modeRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        modeRow.add(JLabel("selector"))
-        modeRow.add(modeBox)
-        controls.add(modeRow)
-        val rangeRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        rangeRow.add(JLabel("start"))
-        rangeRow.add(startField)
-        rangeRow.add(JLabel("end"))
-        rangeRow.add(endField)
-        rangeRow.add(JLabel("query"))
-        rangeRow.add(queryField)
-        rangeRow.add(JLabel("max hits"))
-        rangeRow.add(maxHitsField)
-        rangeRow.add(retrieveButton)
-        controls.add(rangeRow)
+        val controls = FormGrid()
+            .row("Selector", modeBox)
+            .row("Start", startField)
+            .row("End", endField)
+            .row("Query", queryField)
+            .row("Max hits", maxHitsField)
+            .span(actionRow(retrieveButton))
+            .build()
 
-        val evidence = JPanel(BorderLayout(0, 2))
-        evidence.add(JScrollPane(evidenceList), BorderLayout.CENTER)
-        evidence.add(controls, BorderLayout.SOUTH)
+        val evidenceBody = JPanel(BorderLayout(0, Spacing.S))
+        evidenceBody.isOpaque = false
+        evidenceBody.add(noHorizontalScroll(evidenceList), BorderLayout.CENTER)
+        evidenceBody.add(controls, BorderLayout.SOUTH)
 
-        val body = JPanel(GridLayout(0, 1, 0, 4))
-        body.add(titledSection("evidence", evidence))
-        body.add(titledSection("compact representation", JScrollPane(output)))
-        body.add(
-            titledSection(
-                "messages (select to jump the transcript)",
-                JScrollPane(messagesList)
-            )
+        val messagesBody = JPanel(BorderLayout(0, Spacing.XS))
+        messagesBody.isOpaque = false
+        messagesBody.add(
+            wrappedMutedLabel("Select a message to jump the main transcript to it."),
+            BorderLayout.NORTH
         )
-        body.add(titledSection("transcript slice", JScrollPane(transcriptArea)))
-        add(body, BorderLayout.NORTH)
+        messagesBody.add(noHorizontalScroll(messagesList), BorderLayout.CENTER)
+
+        val body = pageColumn()
+        body.add(card("Evidence", evidenceBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Compact representation", JScrollPane(output)))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Messages", messagesBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Transcript slice", JScrollPane(transcriptArea)))
+        add(body, BorderLayout.CENTER)
         updateSelectorFields()
     }
 
@@ -164,13 +159,34 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
 
     /**
      * Clears every per-session content pane on a session switch: a stale
-     * evidence list, retrieval output or child transcript must never remain
-     * visible (or be applied by a late worker) under a new session.
+     * evidence list, retrieval output, message rows or child transcript must
+     * never remain visible (or be applied by a late worker) under a new
+     * session. The message model, both list selections and the selector form
+     * are part of the session state and are cleared together.
      */
     fun resetSessionView() {
         evidenceModel.clear()
+        evidenceList.clearSelection()
         output.text = ""
+        messagesModel.clear()
+        messagesList.clearSelection()
         transcriptArea.text = ""
+        modeBox.selectedItem = "all"
+        startField.text = ""
+        endField.text = ""
+        queryField.text = ""
+        maxHitsField.text = "50"
+        updateSelectorFields()
+    }
+
+    fun transcriptText(): String = transcriptArea.text
+
+    fun outputText(): String = output.text
+
+    fun selectedMessage(): NativeMessage? = messagesList.selectedValue
+
+    fun selectMessage(index: Int) {
+        messagesList.selectedIndex = index
     }
 
     fun showTranscriptSlice(title: String, text: String) {
@@ -257,6 +273,9 @@ class EvidenceNavigatorPanel : JPanel(BorderLayout()) {
                 ""
             } else if (ref.id == null) {
                 "[ref] ${bound(ref.label, 100)}"
+            } else if (EvidenceRefs.parse(ref.label).id == ref.id) {
+                // The label already carries the marker; never double it.
+                bound(ref.label, 100)
             } else {
                 "evidence:${ref.id} ${bound(ref.label, 100)}"
             }

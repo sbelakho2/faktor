@@ -33,6 +33,7 @@ import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.asciiLowerCase
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBoardPage
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativePermissionList
 import dev.faktor.shared.parseNativeProviders
@@ -1261,8 +1262,14 @@ internal object ParityAwt {
     fun layout(panel: Component, width: Int, height: Int) {
         panel.setSize(width, height)
         if (panel is Container) {
-            panel.doLayout()
-            layoutChildren(panel)
+            // Swing validates a container repeatedly: a width-aware wrapped
+            // label changes its preferred height during the first pass, and
+            // the real window settles on the re-validated layout. Reproduce
+            // the settled passes instead of digesting a stale single pass.
+            for (pass in 0 until 3) {
+                panel.doLayout()
+                layoutChildren(panel)
+            }
         }
     }
 
@@ -1465,6 +1472,13 @@ internal fun cannedEvidencePanel(): EvidenceNavigatorPanel {
     return panel
 }
 
+/** A populated board with a real older-page cursor (host-matrix render). */
+internal fun cannedBoardPanel(): BoardPanel {
+    val panel = BoardPanel()
+    panel.setBoard(parseNativeBoardPage(PARITY_BOARD_POSTS_JSON))
+    return panel
+}
+
 internal fun cannedSettingsPanel(): SettingsPanel {
     val panel = SettingsPanel()
     panel.setDaemonInfo("/bin/faktor-cli", "/tmp/data", "1.2.3", "http://127.0.0.1:9")
@@ -1651,6 +1665,17 @@ internal const val PARITY_TERMINAL_OUTPUT_JSON =
 internal const val PARITY_BOARD_PAGE_JSON = "{" +
     "\"board_id\":7,\"revision\":0,\"posts\":[]," +
     "\"next_before_revision\":null,\"has_more\":false}"
+
+/** A populated board page with `has_more` for the host-matrix board render. */
+internal const val PARITY_BOARD_POSTS_JSON = "{" +
+    "\"board_id\":7,\"revision\":3,\"posts\":[" +
+    "{\"id\":3,\"board_id\":7,\"author_child\":8,\"author_session\":8," +
+    "\"subject\":\"handoff\",\"body\":\"main step ready\",\"refs\":[\"evidence:41\"]," +
+    "\"revision\":3,\"created_ms\":1700}," +
+    "{\"id\":2,\"board_id\":7,\"author_child\":null,\"author_session\":7," +
+    "\"subject\":\"root note\",\"body\":\"no children yet\",\"refs\":[]," +
+    "\"revision\":2,\"created_ms\":1600}" +
+    "],\"next_before_revision\":2,\"has_more\":true}"
 
 internal const val PARITY_TOURNAMENTS_LIST_JSON = "[" +
     "{\"id\":\"t-1\",\"state\":\"decided\",\"candidate_count\":2," +

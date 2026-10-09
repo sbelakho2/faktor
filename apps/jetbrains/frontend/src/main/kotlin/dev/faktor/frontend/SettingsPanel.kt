@@ -12,10 +12,8 @@ package dev.faktor.frontend
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeProviderInfo
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
+import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
-import javax.swing.JButton
 import javax.swing.JComboBox
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -59,9 +57,9 @@ class SettingsPanel : JPanel(BorderLayout()) {
 
     private val daemonArea = compactArea(5)
 
-    private val status = JLabel("providers: -")
+    private val status = WrappedLabel("providers: -")
 
-    private val refreshButton = JButton("Refresh providers")
+    private val refreshButton = secondaryButton("Refresh providers")
 
     // Control-plane credential section: the token field is write-only (it is
     // never read back from the store and is cleared on every save/logout), so
@@ -79,9 +77,9 @@ class SettingsPanel : JPanel(BorderLayout()) {
 
     private val controlPlaneStatus = JLabel("control plane: no credential stored")
 
-    private val saveCredentialButton = JButton("Store credential")
+    private val saveCredentialButton = primaryButton("Store credential")
 
-    private val signOutButton = JButton("Sign out")
+    private val signOutButton = secondaryButton("Sign out")
 
     private var listener: Listener? = null
 
@@ -103,21 +101,37 @@ class SettingsPanel : JPanel(BorderLayout()) {
         refreshButton.addActionListener { listener?.onRefreshProviders() }
         saveCredentialButton.addActionListener { submitControlPlaneCredential() }
         signOutButton.addActionListener { submitControlPlaneLogout() }
-        val selectors = JPanel(GridLayout(2, 2, 4, 4))
-        selectors.add(JLabel("provider"))
-        selectors.add(JLabel("model"))
-        selectors.add(providerCombo)
-        selectors.add(modelCombo)
-        val actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        actions.add(refreshButton)
-        val body = JPanel(GridLayout(0, 1, 0, 4))
-        body.add(titledSection("provider selection", selectors))
-        body.add(titledSection("mutation mode (Task composer)", mutationCombo))
-        body.add(titledSection("providers", JScrollPane(providerArea)))
-        body.add(titledSection("daemon", JScrollPane(daemonArea)))
-        body.add(titledSection("control plane credential", buildControlPlaneSection()))
-        body.add(titledSection("actions", actions))
-        add(status, BorderLayout.NORTH)
+        val selectors = FormGrid()
+            .row("Provider", providerCombo)
+            .row("Model", modelCombo)
+            .build()
+        val mutationBody = FormGrid()
+            .row("Mode", mutationCombo)
+            .span(mutedLabel("Shadow-only: the removed direct-owner mode cannot be selected."))
+            .build()
+        val providerBody = JPanel(BorderLayout(0, Spacing.S))
+        providerBody.isOpaque = false
+        providerBody.add(JScrollPane(providerArea), BorderLayout.CENTER)
+        providerBody.add(actionRow(refreshButton), BorderLayout.SOUTH)
+        val body = pageColumn()
+        body.add(card("Provider selection", selectors))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Mutation mode (Task composer)", mutationBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Providers", providerBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Daemon", JScrollPane(daemonArea)))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Control plane credential", buildControlPlaneSection()))
+        status.font = sectionTitleFont()
+        val statusRow = JPanel(BorderLayout())
+        statusRow.isOpaque = true
+        statusRow.background = panelSurface()
+        statusRow.border = BorderFactory.createEmptyBorder(
+            Spacing.S, Spacing.M, 0, Spacing.M
+        )
+        statusRow.add(status, BorderLayout.CENTER)
+        add(statusRow, BorderLayout.NORTH)
         add(body, BorderLayout.CENTER)
         daemonArea.text = "daemon: not started"
         providerArea.text = "no providers served"
@@ -275,7 +289,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
         return out
     }
 
-    fun statusText(): String = status.text
+    fun statusText(): String = status.fullText
 
     fun providerText(): String = providerArea.text
 
@@ -349,22 +363,16 @@ class SettingsPanel : JPanel(BorderLayout()) {
     }
 
     private fun buildControlPlaneSection(): JPanel {
-        val form = JPanel(GridLayout(0, 2, 4, 4))
-        form.add(JLabel("endpoint"))
-        form.add(controlPlaneEndpoint)
-        form.add(JLabel("organization"))
-        form.add(controlPlaneOrganization)
-        form.add(JLabel("auth session id (non-secret)"))
-        form.add(controlPlaneSession)
-        form.add(JLabel("credential"))
-        form.add(controlPlaneToken)
-        val actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        actions.add(saveCredentialButton)
-        actions.add(signOutButton)
-        val section = JPanel(GridLayout(0, 1, 0, 4))
-        section.add(JLabel("stored in the IDE credential store; never written to settings"))
+        val form = FormGrid()
+            .row("Endpoint", controlPlaneEndpoint)
+            .row("Organization", controlPlaneOrganization)
+            .row("Auth session id (non-secret)", controlPlaneSession)
+            .row("Credential", controlPlaneToken)
+            .build()
+        val section = pageColumn(gap = Spacing.S, padding = 0)
+        section.add(mutedLabel("Stored in the IDE credential store; never written to settings."))
         section.add(form)
-        section.add(actions)
+        section.add(actionRow(saveCredentialButton, signOutButton))
         section.add(controlPlaneStatus)
         return section
     }

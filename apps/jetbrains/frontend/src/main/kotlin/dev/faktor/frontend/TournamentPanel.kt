@@ -10,9 +10,6 @@ package dev.faktor.frontend
 
 import dev.faktor.shared.NativeTournamentSummary
 import java.awt.BorderLayout
-import java.awt.FlowLayout
-import java.awt.GridLayout
-import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
@@ -33,9 +30,9 @@ class TournamentPanel : JPanel(BorderLayout()) {
         fun onAbortTournament(tournamentId: String, reason: String)
     }
 
-    private val title = JLabel("tournament: none on this session")
+    private val title = WrappedLabel("tournament: none on this session")
 
-    private val summariesLabel = JLabel("session tournaments: none")
+    private val summariesLabel = WrappedLabel("session tournaments: none")
 
     private val candidatesModel = CandidateTableModel()
 
@@ -43,7 +40,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     private val loadField = JTextField(10)
 
-    private val loadButton = JButton("Load")
+    private val loadButton = secondaryButton("Load")
 
     private val goalField = JTextField(18)
 
@@ -51,11 +48,11 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     private val countSpinner = JSpinner(SpinnerNumberModel(2, 2, 4, 1))
 
-    private val startButton = JButton("Start tournament")
+    private val startButton = primaryButton("Start tournament")
 
-    private val decideButton = JButton("Decide winner")
+    private val decideButton = primaryButton("Decide winner")
 
-    private val abortButton = JButton("Abort")
+    private val abortButton = secondaryButton("Abort")
 
     private val abortReasonField = JTextField(14)
 
@@ -67,7 +64,31 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     init {
         candidatesTable.fillsViewportHeight = true
+        candidatesTable.rowHeight = Math.max(
+            candidatesTable.rowHeight,
+            candidatesTable.getFontMetrics(uiPanelFont()).height + 8
+        )
+        candidatesTable.showVerticalLines = false
+        candidatesTable.intercellSpacing = java.awt.Dimension(0, 1)
+        candidatesTable.gridColor = cardBorderColor()
+        // Natural column widths with horizontal scrolling: at 240px the old
+        // proportional resize shredded every heading to "c... st..."; the
+        // overview keeps readable columns and each cell carries its full text
+        // as a tooltip.
+        candidatesTable.autoResizeMode = JTable.AUTO_RESIZE_OFF
         candidatesTable.setDefaultRenderer(Any::class.java, WinnerAwareRenderer())
+        for (index in 0 until candidatesTable.columnCount) {
+            val preferred = when (index) {
+                0 -> 110
+                1 -> 90
+                2 -> 120
+                3 -> 140
+                4 -> 90
+                5 -> 80
+                else -> 80
+            }
+            candidatesTable.columnModel.getColumn(index).preferredWidth = preferred
+        }
         candidatesTable.selectionModel.addListSelectionListener {
             val row = candidatesTable.selectedRow
             if (row >= 0) {
@@ -76,11 +97,14 @@ class TournamentPanel : JPanel(BorderLayout()) {
             }
         }
 
-        val loadRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        loadRow.add(JLabel("tournament id"))
-        loadRow.add(loadField)
-        loadRow.add(loadButton)
-        loadRow.add(JLabel("winners are proposed only; integration stays the explicit approved-merge path"))
+        title.font = sectionTitleFont()
+        summariesLabel.font = uiPanelFont()
+        summariesLabel.foreground = mutedForeground()
+
+        val loadBody = FormGrid()
+            .row("Tournament id", loadField)
+            .span(actionRow(loadButton))
+            .build()
         loadButton.addActionListener {
             val id = loadField.text.trim()
             if (id.isEmpty()) {
@@ -90,14 +114,12 @@ class TournamentPanel : JPanel(BorderLayout()) {
             }
         }
 
-        val startRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        startRow.add(JLabel("goal"))
-        startRow.add(goalField)
-        startRow.add(JLabel("criteria (comma separated)"))
-        startRow.add(criteriaField)
-        startRow.add(JLabel("n"))
-        startRow.add(countSpinner)
-        startRow.add(startButton)
+        val startBody = FormGrid()
+            .row("Goal", goalField)
+            .row("Criteria (comma separated)", criteriaField)
+            .row("Candidates (2-4)", countSpinner)
+            .span(actionRow(startButton))
+            .build()
         startButton.addActionListener {
             val goal = goalField.text.trim()
             val criteria = criteriaField.text.split(',')
@@ -124,24 +146,35 @@ class TournamentPanel : JPanel(BorderLayout()) {
                 listener?.onAbortTournament(id, abortReasonField.text.trim())
             }
         }
-        val controlRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        controlRow.add(summariesLabel)
-        controlRow.add(decideButton)
-        controlRow.add(JLabel("abort reason"))
-        controlRow.add(abortReasonField)
-        controlRow.add(abortButton)
+        val controlBody = FormGrid()
+            .row("Abort reason", abortReasonField)
+            .span(actionRow(decideButton, abortButton))
+            .build()
 
-        val header = JPanel(GridLayout(0, 1, 0, 2))
-        header.add(title)
-        header.add(loadRow)
-        header.add(startRow)
-        header.add(controlRow)
+        val summaryBody = JPanel(BorderLayout(0, Spacing.XS))
+        summaryBody.isOpaque = false
+        summaryBody.add(title, BorderLayout.NORTH)
+        val loadColumn = JPanel(BorderLayout(0, Spacing.XS))
+        loadColumn.isOpaque = false
+        loadColumn.add(summariesLabel, BorderLayout.NORTH)
+        loadColumn.add(loadBody, BorderLayout.CENTER)
+        summaryBody.add(loadColumn, BorderLayout.CENTER)
+        summaryBody.add(
+            wrappedMutedLabel("Winners are proposed only; integration stays the explicit approved-merge path."),
+            BorderLayout.SOUTH
+        )
 
-        val body = JPanel(BorderLayout(0, 4))
-        body.add(header, BorderLayout.NORTH)
-        body.add(JScrollPane(candidatesTable), BorderLayout.CENTER)
-        body.add(JScrollPane(detail), BorderLayout.SOUTH)
-        add(body, BorderLayout.NORTH)
+        val body = pageColumn()
+        body.add(card("Tournament", summaryBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Start tournament", startBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Candidates", tableScroll(candidatesTable)))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Decide / abort", controlBody))
+        body.add(vSpace(Spacing.S))
+        body.add(card("Candidate detail", JScrollPane(detail)))
+        add(body, BorderLayout.CENTER)
     }
 
     fun setListener(value: Listener?) {
@@ -179,11 +212,14 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     fun current(): TournamentView? = currentTournament
 
+    /** The theme-derived winner foreground (smoke legibility observability). */
+    internal fun winnerForeground(): java.awt.Color = semanticForeground(SemanticState.POSITIVE)
+
     fun decideEnabled(): Boolean = decideButton.isEnabled
 
     fun abortEnabled(): Boolean = abortButton.isEnabled
 
-    fun summariesText(): String = summariesLabel.text
+    fun summariesText(): String = summariesLabel.fullText
 
     fun abortReason(): String = abortReasonField.text.trim()
 
@@ -279,11 +315,14 @@ class TournamentPanel : JPanel(BorderLayout()) {
             val component = super.getTableCellRendererComponent(
                 table, value, isSelected, hasFocus, row, column
             )
+            toolTipText = value?.toString()
             val winnerColumn = table != null &&
                 table.model.getColumnName(table.convertColumnIndexToModel(column)) == "winner"
             val winner = winnerColumn && value == "WINNER"
             if (winner) {
-                component.foreground = java.awt.Color(20, 110, 40)
+                // Theme token, never raw RGB; "WINNER" text keeps the state
+                // distinguishable without color.
+                component.foreground = semanticForeground(SemanticState.POSITIVE)
                 component.font = component.font.deriveFont(java.awt.Font.BOLD)
             } else {
                 component.foreground = if (isSelected) table?.selectionForeground else table?.foreground

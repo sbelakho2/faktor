@@ -9,35 +9,39 @@ package dev.faktor.frontend
 
 import java.awt.BorderLayout
 import java.awt.Component
+import java.awt.Dimension
 import java.awt.Font
-import java.awt.GridLayout
+import java.awt.Point
 import java.math.BigInteger
+import java.util.LinkedHashMap
+import java.util.LinkedHashSet
+import javax.swing.BorderFactory
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
-import javax.swing.JSplitPane
 import javax.swing.JTree
 import javax.swing.event.TreeSelectionEvent
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeCellRenderer
 import javax.swing.tree.DefaultTreeModel
+import javax.swing.tree.TreePath
 
-/** Typed payloads the tree renders and routes on selection. */
-sealed class TaskTreeNode(val label: String) {
-    class Goal(label: String) : TaskTreeNode(label)
-    class Child(val child: ChildNode) : TaskTreeNode("")
-    class Evidence(val ref: EvidenceRef) : TaskTreeNode("")
-    class Criterion(val row: CriterionProofRow) : TaskTreeNode("")
-    class Plain(label: String) : TaskTreeNode(label)
+/**
+ * Typed payloads the tree renders and routes on selection. Every node carries
+ * a stable [nodeKey] so an in-place update can diff old and new rows without
+ * disturbing expansion, selection or scroll.
+ */
+sealed class TaskTreeNode(val label: String, val nodeKey: String) {
+    class Goal(label: String) : TaskTreeNode(label, "goal")
+    class Child(val child: ChildNode) : TaskTreeNode("", "child:" + child.childId)
+    class Evidence(val ref: EvidenceRef) :
+        TaskTreeNode("", "evidence:" + (ref.id?.toString() ?: ref.label))
+    class Criterion(val row: CriterionProofRow) :
+        TaskTreeNode("", "criterion:" + row.criterionKey)
+    class Plain(label: String, nodeKey: String) : TaskTreeNode(label, nodeKey)
 }
 
-/** Dimmed label color of background children (a presentation-only concept). */
-private val BACKGROUND_DIM = java.awt.Color(140, 140, 140)
-
-/** Verdict tones: pass (green), fail (red), unavailable (amber, italic). */
-private val CRITERION_PASS_COLOR = java.awt.Color(63, 185, 80)
-private val CRITERION_FAIL_COLOR = java.awt.Color(248, 81, 73)
-private val CRITERION_UNAVAILABLE_COLOR = java.awt.Color(210, 153, 34)
+/** Verdict tones derive from the live theme (never raw RGB). */
 
 class TaskTreePanel : JPanel(BorderLayout()) {
 
@@ -46,30 +50,58 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         fun onChildSelected(child: ChildNode)
     }
 
-    private val stateLabel = JLabel("state: -")
+    private val stateLabel = JLabel("-")
 
-    private val phaseLabel = JLabel("phase: -")
+    private val phaseLabel = JLabel("-")
 
-    private val spendLabel = JLabel("spend: -")
+    private val spendLabel = WrappedLabel("not loaded")
 
-    private val verificationLabel = JLabel("verification: -")
+    private val verificationLabel = WrappedLabel("not loaded")
 
-    private val completionLabel = JLabel("completion: -")
+    private val completionLabel = WrappedLabel("not loaded")
 
-    private val treeModel = DefaultTreeModel(DefaultMutableTreeNode(TaskTreeNode.Plain("no task data")))
+    private val treeModel = DefaultTreeModel(
+        DefaultMutableTreeNode(TaskTreeNode.Plain("no task data", "placeholder"))
+    )
 
     private val tree = JTree(treeModel)
+
+    private val treeScroll = JScrollPane(tree)
+
+    /** One detail region for the selected node (no nested dead split pane). */
+    private val detailArea = compactArea(3).apply {
+        isFocusable = false
+        preferredSize = Dimension(200, 116)
+    }
+
+    private val detailScroll = JScrollPane(detailArea)
 
     private var listener: Listener? = null
 
     private var currentModel: TaskTreeModel? = null
 
+    /** Suppresses action dispatch while an update restores selection. */
+    private var suppressSelectionEvents = false
+
+    /** Captured UI state keyed by stable node ids across one update. */
+    private data class TreeUiState(
+        val expandedKeys: Set<String>,
+        val selectedKey: String?,
+        val scrollPosition: Point?
+    )
+
     init {
         tree.isRootVisible = true
         tree.showsRootHandles = true
+        tree.rowHeight = Math.max(tree.rowHeight, tree.getFontMetrics(uiPanelFont()).height + 10)
         tree.cellRenderer = TaskTreeRenderer()
+        treeScroll.horizontalScrollBarPolicy =
+            javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
         tree.addTreeSelectionListener { event: TreeSelectionEvent ->
-            val node = event.path.lastPathComponent as? DefaultMutableTreeNode ?: return@addTreeSelectionListener
+            updateDetail()
+            if (suppressSelectionEvents) return@addTreeSelectionListener
+            val node = event.path.lastPathComponent as? DefaultMutableTreeNode
+                ?: return@addTreeSelectionListener
             when (val payload = node.userObject) {
                 is TaskTreeNode.Child -> listener?.onChildSelected(payload.child)
                 is TaskTreeNode.Evidence -> listener?.onEvidenceSelected(payload.ref)
@@ -77,21 +109,23 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             }
         }
 
-        val summary = JPanel(GridLayout(0, 1, 2, 2))
-        summary.add(stateLabel)
-        summary.add(phaseLabel)
-        summary.add(verificationLabel)
-        summary.add(completionLabel)
-        summary.add(spendLabel)
+        val summary = FormGrid()
+            .row("State", stateLabel)
+            .row("Phase", phaseLabel)
+            .row("Verification", verificationLabel)
+            .row("Completion", completionLabel)
+            .row("Spend", spendLabel)
+            .build()
 
-        val top = JPanel(BorderLayout(0, 4))
-        top.add(summary, BorderLayout.NORTH)
-        top.add(JScrollPane(tree), BorderLayout.CENTER)
-
-        val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, top, scroll(compactArea(4)))
-        split.resizeWeight = 0.7
-        split.isContinuousLayout = true
-        add(split, BorderLayout.CENTER)
+        val top = JPanel(BorderLayout(0, Spacing.S))
+        top.border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.S, Spacing.S, Spacing.S)
+        top.isOpaque = true
+        top.background = panelSurface()
+        top.add(card("Task", summary), BorderLayout.NORTH)
+        top.add(treeScroll, BorderLayout.CENTER)
+        top.add(card("Selected node", detailScroll), BorderLayout.SOUTH)
+        add(top, BorderLayout.CENTER)
+        updateDetail()
     }
 
     fun setListener(value: Listener?) {
@@ -100,42 +134,232 @@ class TaskTreePanel : JPanel(BorderLayout()) {
 
     fun model(): TaskTreeModel? = currentModel
 
-    /** Rebuilds every section from one model; all values are real DTO fields. */
+    /** The selected node detail (empty when nothing is selected). */
+    internal fun selectedDetailText(): String = detailArea.text
+
+    internal fun treeForTest(): JTree = tree
+
+    internal fun treeScrollForTest(): JScrollPane = treeScroll
+
+    /** The stable key path of one tree node (smoke observability). */
+    internal fun nodeKeyPathForTest(node: DefaultMutableTreeNode): String = keyPath(node)
+
+    /**
+     * In-place diff update keyed by stable node ids: every section/row keeps
+     * its node object when its key still exists, so user expansion state,
+     * selection and (best effort) the scroll offset survive a data refresh.
+     * The rejected alternative — rebuilding the root and expanding every row —
+     * reset all three on every refresh.
+     */
     fun update(model: TaskTreeModel) {
         currentModel = model
-        stateLabel.text = "state: ${model.state}"
-        phaseLabel.text = "phase: ${model.phase}"
+        stateLabel.text = model.state
+        phaseLabel.text = model.phase
         val verification = model.verification
         // The top-level summary: a served record that proves the full
         // criterion set with no failed check renders VERIFIED plus the served
         // criteria/checks/review/tree/commit/remote-head facts and the
         // durable spend's cost; otherwise the honest status counters stay.
         val costSuffix = model.spend?.let { " cost=${it.spentCostMicro}micro" } ?: ""
-        verificationLabel.text = if (verification.verified) {
-            "verification: " + verification.summaryText() + costSuffix
+        verificationLabel.fullText = if (verification.verified) {
+            verification.summaryText() + costSuffix
         } else {
-            "verification: " + verification.summaryText() +
+            verification.summaryText() +
                 " (criteria ${verification.criteriaPassed}/${verification.criteriaTotal}" +
                 ", failed ${verification.failedChecks}, owed ${verification.owed})"
         }
-        completionLabel.text = completionText(model.completion)
-        spendLabel.text = spendText(model.spend)
+        completionLabel.fullText = completionText(model.completion)
+        spendLabel.fullText = spendText(model.spend)
 
-        val root = DefaultMutableTreeNode(
+        val desired = DefaultMutableTreeNode(
             TaskTreeNode.Goal("goal: ${model.goal.ifEmpty { "(none)" }} [${model.state}]")
         )
-        root.add(criteriaNode(model))
-        root.add(proofNode(model))
-        root.add(planNode(model))
-        root.add(completionNode(model))
-        root.add(childrenNode(model))
-        root.add(verificationNode(model))
-        root.add(evidenceNode(model))
-        root.add(DefaultMutableTreeNode(TaskTreeNode.Plain(spendText(model.spend))))
-        if (model.tournament != null) root.add(tournamentNode(model.tournament))
-        treeModel.setRoot(root)
-        for (row in 0 until tree.rowCount) tree.expandRow(row)
-        tree.selectionModel.clearSelection()
+        desired.add(criteriaNode(model))
+        desired.add(proofNode(model))
+        desired.add(planNode(model))
+        desired.add(completionNode(model))
+        desired.add(childrenNode(model))
+        desired.add(verificationNode(model))
+        desired.add(evidenceNode(model))
+        desired.add(DefaultMutableTreeNode(TaskTreeNode.Plain(spendText(model.spend), "section:spend")))
+        if (model.tournament != null) desired.add(tournamentNode(model.tournament))
+
+        val state = captureUiState()
+        val existingRoot = treeModel.root as? DefaultMutableTreeNode
+        suppressSelectionEvents = true
+        try {
+            if (existingRoot == null || existingRoot.userObject !is TaskTreeNode.Goal) {
+                treeModel.setRoot(desired)
+                // First build: present the sections open (later updates never
+                // re-expand rows the operator collapsed).
+                for (row in 0 until tree.rowCount) tree.expandRow(row)
+            } else {
+                mergeNode(existingRoot, desired)
+                restoreUiState(state)
+            }
+        } finally {
+            suppressSelectionEvents = false
+        }
+        updateDetail()
+    }
+
+    // ------------------------------------------------------- in-place diff
+
+    private fun keyOf(node: DefaultMutableTreeNode): String =
+        (node.userObject as? TaskTreeNode)?.nodeKey ?: node.userObject?.toString() ?: "node"
+
+    private fun keyPath(node: DefaultMutableTreeNode): String {
+        val parts = ArrayList<String>()
+        var current: DefaultMutableTreeNode? = node
+        while (current != null) {
+            var key = keyOf(current)
+            val parent = current.parent as? DefaultMutableTreeNode
+            if (parent != null) {
+                var duplicates = 0
+                for (index in 0 until parent.childCount) {
+                    val sibling = parent.getChildAt(index) as DefaultMutableTreeNode
+                    if (sibling === current) break
+                    if (keyOf(sibling) == key) duplicates++
+                }
+                if (duplicates > 0) key = "$key#$duplicates"
+            }
+            parts.add(key)
+            current = parent
+        }
+        return parts.asReversed().joinToString("/")
+    }
+
+    private fun captureUiState(): TreeUiState {
+        val expanded = LinkedHashSet<String>()
+        for (row in 0 until tree.rowCount) {
+            val path = tree.getPathForRow(row) ?: continue
+            val node = path.lastPathComponent as? DefaultMutableTreeNode ?: continue
+            if (tree.isExpanded(path)) expanded.add(keyPath(node))
+        }
+        val selected = (tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode)
+            ?.let { keyPath(it) }
+        val viewPosition = treeScroll.viewport.viewPosition
+        return TreeUiState(
+            expanded,
+            selected,
+            if (viewPosition == null) null else Point(viewPosition)
+        )
+    }
+
+    private fun restoreUiState(state: TreeUiState) {
+        val root = treeModel.root as? DefaultMutableTreeNode ?: return
+        if (state.expandedKeys.isNotEmpty()) {
+            walk(root) { node ->
+                if (!node.isLeaf && state.expandedKeys.contains(keyPath(node))) {
+                    tree.expandPath(TreePath(node.path))
+                }
+            }
+        }
+        val selectedKey = state.selectedKey
+        if (selectedKey != null) {
+            val target = findFirst(root) { keyPath(it) == selectedKey }
+            if (target != null) {
+                tree.selectionPath = TreePath(target.path)
+            }
+        }
+        state.scrollPosition?.let { treeScroll.viewport.viewPosition = it }
+    }
+
+    private fun walk(node: DefaultMutableTreeNode, visit: (DefaultMutableTreeNode) -> Unit) {
+        visit(node)
+        for (index in 0 until node.childCount) {
+            walk(node.getChildAt(index) as DefaultMutableTreeNode, visit)
+        }
+    }
+
+    private fun findFirst(
+        node: DefaultMutableTreeNode,
+        match: (DefaultMutableTreeNode) -> Boolean
+    ): DefaultMutableTreeNode? {
+        if (match(node)) return node
+        for (index in 0 until node.childCount) {
+            val found = findFirst(node.getChildAt(index) as DefaultMutableTreeNode, match)
+            if (found != null) return found
+        }
+        return null
+    }
+
+    /** Updates [existing] from [desired], reusing matching children by key. */
+    private fun mergeNode(existing: DefaultMutableTreeNode, desired: DefaultMutableTreeNode) {
+        if (existing.userObject != desired.userObject) {
+            existing.userObject = desired.userObject
+        }
+        mergeChildren(existing, desired)
+    }
+
+    private fun mergeChildren(existing: DefaultMutableTreeNode, desired: DefaultMutableTreeNode) {
+        val buckets = LinkedHashMap<String, ArrayDeque<DefaultMutableTreeNode>>()
+        for (index in 0 until existing.childCount) {
+            val child = existing.getChildAt(index) as DefaultMutableTreeNode
+            buckets.getOrPut(keyOf(child)) { ArrayDeque() }.addLast(child)
+        }
+        val ordered = ArrayList<DefaultMutableTreeNode>(desired.childCount)
+        for (index in 0 until desired.childCount) {
+            val wanted = desired.getChildAt(index) as DefaultMutableTreeNode
+            val reused = buckets[keyOf(wanted)]?.removeFirstOrNull()
+            if (reused != null) {
+                mergeNode(reused, wanted)
+                ordered.add(reused)
+            } else {
+                ordered.add(wanted)
+            }
+        }
+        for (bucket in buckets.values) {
+            for (dead in bucket) {
+                if (dead.parent != null) treeModel.removeNodeFromParent(dead)
+            }
+        }
+        val currentOrder = ArrayList<DefaultMutableTreeNode>(existing.childCount)
+        for (index in 0 until existing.childCount) {
+            currentOrder.add(existing.getChildAt(index) as DefaultMutableTreeNode)
+        }
+        if (currentOrder != ordered) {
+            for (child in currentOrder) {
+                if (child.parent != null) treeModel.removeNodeFromParent(child)
+            }
+            for ((index, child) in ordered.withIndex()) {
+                treeModel.insertNodeInto(child, existing, index)
+            }
+        }
+    }
+
+    private fun updateDetail() {
+        val node = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode
+        detailArea.text = if (node == null) {
+            "select a node to inspect its details"
+        } else {
+            detailText(node)
+        }
+    }
+
+    private fun detailText(node: DefaultMutableTreeNode): String =
+        when (val payload = node.userObject) {
+            is TaskTreeNode.Child ->
+                childLabel(payload.child) + "\n" + childResultLabel(payload.child)
+            is TaskTreeNode.Evidence -> evidenceLabel(payload.ref)
+            is TaskTreeNode.Criterion -> criterionLabel(payload.row)
+            is TaskTreeNode.Goal -> payload.label
+            is TaskTreeNode.Plain -> payload.label
+            else -> ""
+        }
+
+    /** One plain row label (never the Kotlin class@hash fallback). */
+    private fun nodeLabel(payload: TaskTreeNode): String = when (payload) {
+        is TaskTreeNode.Goal -> payload.label
+        is TaskTreeNode.Plain -> payload.label
+        is TaskTreeNode.Evidence -> evidenceLabel(payload.ref)
+        else -> payload.label
+    }
+
+    private fun evidenceLabel(ref: EvidenceRef): String {
+        val id = ref.id ?: return ref.label
+        // The label often already carries the same marker; never double it.
+        return if (EvidenceRefs.parse(ref.label).id == id) ref.label else "evidence:$id " + ref.label
     }
 
     private fun criteriaNode(model: TaskTreeModel): DefaultMutableTreeNode {
@@ -146,7 +370,10 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         // "unavailable" text, never a fabricated pass.
         if (model.criteriaProof.isNotEmpty()) {
             val node = DefaultMutableTreeNode(
-                TaskTreeNode.Plain("acceptance criteria · proof (${model.criteriaProof.size})")
+                TaskTreeNode.Plain(
+                    "acceptance criteria · proof (${model.criteriaProof.size})",
+                    "section:criteria"
+                )
             )
             for (row in model.criteriaProof) {
                 val criterionNode = DefaultMutableTreeNode(TaskTreeNode.Criterion(row))
@@ -158,13 +385,20 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             return node
         }
         val node = DefaultMutableTreeNode(
-            TaskTreeNode.Plain("acceptance criteria (${model.acceptanceCriteria.size})")
+            TaskTreeNode.Plain(
+                "acceptance criteria (${model.acceptanceCriteria.size})",
+                "section:criteria"
+            )
         )
         for (criterion in model.acceptanceCriteria) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound(criterion, 240))))
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(bound(criterion, 240), "criterion-text:" + bound(criterion, 240))
+                )
+            )
         }
         if (model.acceptanceCriteria.isEmpty()) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none served)")))
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none served)", "criteria:none")))
         }
         return node
     }
@@ -178,32 +412,48 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     private fun proofNode(model: TaskTreeModel): DefaultMutableTreeNode {
         val proof = model.proof
         val node = DefaultMutableTreeNode(
-            TaskTreeNode.Plain("verification proof: " + (proof?.summaryText() ?: "not fetched"))
+            TaskTreeNode.Plain(
+                "verification proof: " + (proof?.summaryText() ?: "not fetched"),
+                "section:proof"
+            )
         )
         if (proof == null) return node
         proof.reviewer?.takeIf { it.isNotEmpty() }?.let {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound("reviewer: " + it, 240))))
-        }
-        proof.reason?.takeIf { it.isNotEmpty() }?.let {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound("reason: " + it, 240))))
-        }
-        for (entry in proof.unavailable) {
             node.add(
                 DefaultMutableTreeNode(
-                    TaskTreeNode.Plain(
-                        bound(entry.component + " (" + entry.kind + "): " + entry.reason, 240)
-                    )
+                    TaskTreeNode.Plain(bound("reviewer: " + it, 240), "proof:reviewer")
+                )
+            )
+        }
+        proof.reason?.takeIf { it.isNotEmpty() }?.let {
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(bound("reason: " + it, 240), "proof:reason")
+                )
+            )
+        }
+        for (entry in proof.unavailable) {
+            val line = bound(entry.component + " (" + entry.kind + "): " + entry.reason, 240)
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(line, "proof:unavailable:" + entry.component)
                 )
             )
         }
         for (line in proof.stepLines()) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(bound(line, 240))))
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(bound(line, 240), "proof:line:" + bound(line, 80))
+                )
+            )
         }
         return node
     }
 
     private fun planNode(model: TaskTreeModel): DefaultMutableTreeNode {
-        val node = DefaultMutableTreeNode(TaskTreeNode.Plain("plan / DAG steps (${model.steps.size})"))
+        val node = DefaultMutableTreeNode(
+            TaskTreeNode.Plain("plan / DAG steps (${model.steps.size})", "section:plan")
+        )
         for (step in model.steps) {
             val label = StringBuilder()
             label.append("[").append(step.state).append("] ").append(step.id)
@@ -216,7 +466,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             if (step.childIds.isNotEmpty()) {
                 label.append(" children=").append(step.childIds.joinToString(","))
             }
-            val stepNode = DefaultMutableTreeNode(TaskTreeNode.Plain(bound(label.toString(), 240)))
+            val stepNode = DefaultMutableTreeNode(
+                TaskTreeNode.Plain(bound(label.toString(), 240), "step:" + step.id)
+            )
             node.add(stepNode)
             for (childId in step.childIds) {
                 val child = model.children.firstOrNull { it.childId == childId } ?: continue
@@ -224,7 +476,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             }
         }
         if (model.steps.isEmpty()) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none served)")))
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none served)", "plan:none")))
         }
         return node
     }
@@ -232,16 +484,26 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     private fun completionNode(model: TaskTreeModel): DefaultMutableTreeNode {
         val completion = model.completion
         val node = DefaultMutableTreeNode(
-            TaskTreeNode.Plain(completionText(completion))
+            TaskTreeNode.Plain(completionText(completion), "section:completion")
         )
         if (completion == null) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none: plain task, no commit/push/PR steps)")))
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(
+                        "(none: plain task, no commit/push/PR steps)",
+                        "completion:none"
+                    )
+                )
+            )
         } else {
             for (step in completion.steps) {
                 val detail = if (step.detail == null) "" else " - ${step.detail}"
                 node.add(
                     DefaultMutableTreeNode(
-                        TaskTreeNode.Plain(bound("[${step.status}] ${step.step}$detail", 240))
+                        TaskTreeNode.Plain(
+                            bound("[${step.status}] ${step.step}$detail", 240),
+                            "completion-step:" + step.step
+                        )
                     )
                 )
             }
@@ -250,12 +512,14 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     }
 
     private fun childrenNode(model: TaskTreeModel): DefaultMutableTreeNode {
-        val node = DefaultMutableTreeNode(TaskTreeNode.Plain("children (${model.children.size})"))
+        val node = DefaultMutableTreeNode(
+            TaskTreeNode.Plain("children (${model.children.size})", "section:children")
+        )
         for (child in model.children) {
             node.add(DefaultMutableTreeNode(TaskTreeNode.Child(child)))
         }
         if (model.children.isEmpty()) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(no child agents)")))
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(no child agents)", "children:none")))
         }
         return node
     }
@@ -266,30 +530,36 @@ class TaskTreePanel : JPanel(BorderLayout()) {
             TaskTreeNode.Plain(
                 "verification: ${summary.status} criteria=${summary.criteriaPassed}/${summary.criteriaTotal}" +
                     " failedChecks=${summary.failedChecks} owed=${summary.owed}" +
-                    (if (summary.recordStatus == null) "" else " record=${summary.recordStatus}")
+                    (if (summary.recordStatus == null) "" else " record=${summary.recordStatus}"),
+                "section:verification"
             )
         )
         if (summary.recordStatus != null) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("record status: ${summary.recordStatus}")))
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(
+                        "record status: ${summary.recordStatus}",
+                        "verification:record"
+                    )
+                )
+            )
         }
         return node
     }
 
     private fun evidenceNode(model: TaskTreeModel): DefaultMutableTreeNode {
         val node = DefaultMutableTreeNode(
-            TaskTreeNode.Plain("evidence (${model.evidence.size}) - select to retrieve")
+            TaskTreeNode.Plain(
+                "evidence (${model.evidence.size}) - select to retrieve",
+                "section:evidence"
+            )
         )
         for (ref in model.evidence) {
-            val label = if (ref.id == null) {
-                bound(ref.label, 200)
-            } else {
-                "evidence:${ref.id} ${bound(ref.label, 160)}"
-            }
             val child = DefaultMutableTreeNode(TaskTreeNode.Evidence(ref))
             node.add(child)
         }
         if (model.evidence.isEmpty()) {
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(no evidence refs)")))
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(no evidence refs)", "evidence:none")))
         }
         return node
     }
@@ -297,7 +567,8 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     private fun tournamentNode(tournament: TournamentView): DefaultMutableTreeNode {
         val node = DefaultMutableTreeNode(
             TaskTreeNode.Plain(
-                "tournament ${tournament.id} [${tournament.state}] winner=${tournament.winner ?: "-"}"
+                "tournament ${tournament.id} [${tournament.state}] winner=${tournament.winner ?: "-"}",
+                "section:tournament"
             )
         )
         for (candidate in tournament.candidates) {
@@ -306,7 +577,11 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                 " review=" + (candidate.reviewRank ?: "-") +
                 " cost=${candidate.costMicro}micro wall=${candidate.wallMs}ms" +
                 (if (candidate.winner) " WINNER" else "")
-            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain(label)))
+            node.add(
+                DefaultMutableTreeNode(
+                    TaskTreeNode.Plain(label, "tournament:candidate:" + candidate.childId)
+                )
+            )
         }
         return node
     }
@@ -398,9 +673,9 @@ class TaskTreePanel : JPanel(BorderLayout()) {
 
     /** The tone color of one criterion verdict (unavailable stays distinct). */
     fun criterionColor(tone: CriterionVerdictTone): java.awt.Color = when (tone) {
-        CriterionVerdictTone.PASS -> CRITERION_PASS_COLOR
-        CriterionVerdictTone.FAIL -> CRITERION_FAIL_COLOR
-        CriterionVerdictTone.UNAVAILABLE -> CRITERION_UNAVAILABLE_COLOR
+        CriterionVerdictTone.PASS -> semanticForeground(SemanticState.POSITIVE)
+        CriterionVerdictTone.FAIL -> semanticForeground(SemanticState.NEGATIVE)
+        CriterionVerdictTone.UNAVAILABLE -> semanticForeground(SemanticState.WARNING)
     }
 
     /**
@@ -460,9 +735,11 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                     tree, value, selected, expanded, leaf, row, hasFocus
                 )
                 val proof = payload.row
-                text = bound(criterionLabel(proof), 420)
+                val full = criterionLabel(proof)
+                text = bound(full, 300)
+                toolTipText = full
                 foreground = if (selected) textSelectionColor else criterionColor(proof.tone)
-                font = font.deriveFont(
+                font = uiPanelFont().deriveFont(
                     if (proof.tone == CriterionVerdictTone.UNAVAILABLE) Font.ITALIC else Font.PLAIN
                 )
                 return component
@@ -484,17 +761,31 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                 label.foreground = if (selected) {
                     textSelectionColor
                 } else if (child.background) {
-                    BACKGROUND_DIM
+                    semanticForeground(SemanticState.DIM)
                 } else {
                     textNonSelectionColor
                 }
-                label.font = label.font.deriveFont(if (child.background) Font.ITALIC else Font.PLAIN)
-                label.text = bound(childLabel(child) + " || " + childResultLabel(child), 420)
+                label.font = uiPanelFont().deriveFont(if (child.background) Font.ITALIC else Font.PLAIN)
+                val full = childLabel(child) + " || " + childResultLabel(child)
+                label.text = bound(full, 300)
+                label.toolTipText = full
+                panel.toolTipText = full
                 return panel
             }
             return super.getTreeCellRendererComponent(
                 tree, value, selected, expanded, leaf, row, hasFocus
-            )
+            ).also {
+                font = uiPanelFont()
+                toolTipText = null
+                if (payload is TaskTreeNode) {
+                    val full = nodeLabel(payload)
+                    text = bound(full, 300)
+                    toolTipText = full
+                    val section = payload is TaskTreeNode.Goal ||
+                        (payload is TaskTreeNode.Plain && payload.nodeKey.startsWith("section:"))
+                    if (section) font = sectionTitleFont()
+                }
+            }
         }
 
         private fun paneAdd(component: Component) {
