@@ -2086,6 +2086,11 @@
    "class": "delegated",
    "delegate": "INV-CLIENT-ROUTE-CONTRACT",
    "reason": "vscode.view.faktor.chat is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
+  },
+  "vscode.configuration.faktor-advanced": {
+   "class": "delegated",
+   "delegate": "INV-CLIENT-ROUTE-CONTRACT",
+   "reason": "vscode.configuration.faktor-advanced is discovered on a real vscode surface; its implementation authority is centrally mutation-tested by INV-CLIENT-ROUTE-CONTRACT."
   }
  }
 }
