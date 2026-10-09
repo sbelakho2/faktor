@@ -195,6 +195,16 @@
     return node;
   }
 
+  function span(parent, value, className) {
+    var node = document.createElement('span');
+    if (className) {
+      node.className = className;
+    }
+    node.textContent = String(value);
+    parent.appendChild(node);
+    return node;
+  }
+
   // ------------------------------------------------------------- cockpit
 
   function renderCockpit(view, sections) {
@@ -436,16 +446,141 @@
     block.appendChild(card);
   }
 
-  function renderTask(task, view) {
+  function renderTask(task, view, agents) {
     var card = byId('task-card');
-    if (!task && !view) {
+    // No task, no run strip: an empty card full of em-dashes would be pure
+    // noise. The Inspect sections carry whatever metadata outlives the task.
+    if (!task) {
       card.hidden = true;
       return;
     }
     card.hidden = false;
-    setText('task-state', task ? task.state : '—');
+    renderRunStrip(task);
+    renderTaskProgress(task);
+    renderTaskTests(task);
+    renderTaskAgents(agents);
     setText('task-goal', task ? task.goal : '—');
     renderCompletion(task);
+  }
+
+  /** One lifecycle bucket per run state: the strip chip is theme-colored. */
+  function runStateClass(state) {
+    var value = String(state == null ? '' : state).trim().toLowerCase();
+    if (value === 'running' || value === 'working' || value === 'in_progress' || value === 'active') {
+      return 'running';
+    }
+    if (
+      value === 'done' ||
+      value === 'complete' ||
+      value === 'completed' ||
+      value === 'verified_complete' ||
+      value === 'succeeded'
+    ) {
+      return 'done';
+    }
+    if (value === 'failed' || value === 'error' || value === 'errored') {
+      return 'failed';
+    }
+    if (value === 'cancelled' || value === 'canceled') {
+      return 'cancelled';
+    }
+    if (value === 'waiting' || value === 'pending' || value === 'paused' || value === 'blocked') {
+      return 'waiting';
+    }
+    return 'unknown';
+  }
+
+  /** The run strip: one state chip, muted chips, and the quiet goal line. */
+  function renderRunStrip(task) {
+    var node = byId('task-state');
+    if (!node) {
+      return;
+    }
+    var state = task ? String(task.state == null ? '' : task.state) : '';
+    var bucket = runStateClass(state);
+    node.textContent = state.length > 0 ? state : '—';
+    node.className = 'state-chip state-' + bucket;
+    node.setAttribute('data-state', bucket);
+  }
+
+  /** One compact chip in a run-meta slot; an empty value hides the slot. */
+  function setRunMeta(id, text, tone) {
+    var node = byId(id);
+    if (!node) {
+      return;
+    }
+    clear(node);
+    if (text === null || text === undefined || String(text).length === 0) {
+      node.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    span(node, String(text), 'chip run-chip' + (tone ? ' run-chip-' + tone : ''));
+  }
+
+  function renderTaskProgress(task) {
+    var completed = task && Array.isArray(task.completed) ? task.completed.length : 0;
+    var open = task && Array.isArray(task.open) ? task.open.length : 0;
+    var total = completed + open;
+    if (total > 0) {
+      setRunMeta('task-progress', completed + '/' + total + ' steps', 'neutral');
+      return;
+    }
+    if (task && typeof task.phase === 'string' && task.phase.length > 0) {
+      setRunMeta('task-progress', task.phase, 'neutral');
+      return;
+    }
+    setRunMeta('task-progress', null);
+  }
+
+  function renderTaskTests(task) {
+    var node = byId('task-tests');
+    if (!node) {
+      return;
+    }
+    clear(node);
+    var run = task && Array.isArray(task.testsRun) ? task.testsRun.length : 0;
+    var failed = task && Array.isArray(task.testsFailed) ? task.testsFailed.length : 0;
+    if (run === 0 && failed === 0) {
+      node.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    if (run > 0) {
+      span(node, 'tests ' + run, 'chip run-chip run-chip-neutral');
+    }
+    span(
+      node,
+      failed > 0 ? 'failed ' + failed : 'all passed',
+      'chip run-chip run-chip-' + (failed > 0 ? 'fail' : 'pass'),
+    );
+  }
+
+  function renderTaskAgents(agents) {
+    var count = Array.isArray(agents) ? agents.length : 0;
+    if (count === 0) {
+      setRunMeta('task-agents', null);
+      return;
+    }
+    setRunMeta('task-agents', count + (count === 1 ? ' agent' : ' agents'), 'neutral');
+  }
+
+  /**
+   * The empty/onboarding state. It exists only while the conversation is
+   * empty: the first rendered entry puts it out of the way for good, and the
+   * example chips feed the composer (fill + focus), never submit.
+   */
+  function renderWelcome(entries) {
+    var node = byId('welcome');
+    if (!node) {
+      return;
+    }
+    var title = byId('transcript-title');
+    var empty = !entries || entries.length === 0;
+    node.hidden = !empty;
+    if (title) {
+      title.hidden = empty;
+    }
   }
 
   /**
@@ -954,7 +1089,9 @@
         transcriptKey = key;
         transcriptEntryKeys = keys;
         transcriptPinRequested = false;
-        line(container, 'No messages yet.', 'muted');
+        // The empty slot stays empty: the onboarding/welcome state right
+        // above the log explains the panel; a duplicated "no messages" line
+        // would only restate it.
         if (pin) {
           container.scrollTop = 0;
         }
@@ -974,21 +1111,236 @@
     }
   }
 
+  // ------------------------------------------------------- message grammar
+  // One compact activity grammar inside assistant turns: tool use reads as a
+  // single row (icon, name, outcome chip), test/check/verify runs carry
+  // pass/fail chips, file edits carry +/- counts when the daemon excerpt is
+  // a diff, and commands carry their exit code. The excerpt and the evidence
+  // affordance stay behind the row's own disclosure. Prose stays prose; no
+  // verdict is ever fabricated beyond what the tool data carries.
+
+  function classifyTool(name) {
+    var value = String(name == null ? '' : name).toLowerCase();
+    if (value.indexOf('test') !== -1) {
+      return 'test';
+    }
+    if (
+      value.indexOf('edit') !== -1 ||
+      value.indexOf('write') !== -1 ||
+      value.indexOf('patch') !== -1 ||
+      value.indexOf('apply') !== -1 ||
+      value.indexOf('create') !== -1 ||
+      value.indexOf('replace') !== -1
+    ) {
+      return 'edit';
+    }
+    if (value.indexOf('verify') !== -1) {
+      return 'verify';
+    }
+    if (
+      value.indexOf('check') !== -1 ||
+      value.indexOf('lint') !== -1 ||
+      value.indexOf('diagno') !== -1 ||
+      value.indexOf('compile') !== -1
+    ) {
+      return 'check';
+    }
+    if (
+      value.indexOf('search') !== -1 ||
+      value.indexOf('grep') !== -1 ||
+      value.indexOf('glob') !== -1 ||
+      value.indexOf('find') !== -1
+    ) {
+      return 'search';
+    }
+    if (
+      value.indexOf('bash') !== -1 ||
+      value.indexOf('shell') !== -1 ||
+      value.indexOf('terminal') !== -1 ||
+      value.indexOf('command') !== -1 ||
+      value.indexOf('exec') !== -1
+    ) {
+      return 'command';
+    }
+    if (value.indexOf('read') !== -1 || value.indexOf('open') !== -1) {
+      return 'read';
+    }
+    return 'tool';
+  }
+
+  var TOOL_GLYPHS = {
+    command: [
+      { tag: 'rect', attrs: { x: '2', y: '3.5', width: '12', height: '9', rx: '1.5' } },
+      { tag: 'polyline', attrs: { points: '5,7 7.5,9 5,11' } },
+      { tag: 'line', attrs: { x1: '8.5', y1: '11', x2: '11.5', y2: '11' } },
+    ],
+    edit: [
+      { tag: 'path', attrs: { d: 'M3 13l1-4 8-8 3 3-8 8-4 1z' } },
+      { tag: 'line', attrs: { x1: '10.5', y1: '3.5', x2: '12.5', y2: '5.5' } },
+    ],
+    test: [
+      { tag: 'circle', attrs: { cx: '8', cy: '8', r: '5.5' } },
+      { tag: 'polyline', attrs: { points: '5.5,8.2 7.2,10 10.5,6' } },
+    ],
+    verify: [
+      { tag: 'path', attrs: { d: 'M8 1.5l5.5 2.3v4.2c0 3.5-2.5 5.6-5.5 6.5-3-.9-5.5-3-5.5-6.5V3.8z' } },
+      { tag: 'polyline', attrs: { points: '5.5,8 7.2,9.8 10.5,6' } },
+    ],
+    check: [
+      { tag: 'circle', attrs: { cx: '8', cy: '8', r: '5.5' } },
+      { tag: 'line', attrs: { x1: '8', y1: '5.2', x2: '8', y2: '8.8' } },
+      { tag: 'line', attrs: { x1: '8', y1: '10.9', x2: '8', y2: '11.1' } },
+    ],
+    search: [
+      { tag: 'circle', attrs: { cx: '7', cy: '7', r: '4.5' } },
+      { tag: 'line', attrs: { x1: '10.5', y1: '10.5', x2: '14', y2: '14' } },
+    ],
+    read: [
+      { tag: 'path', attrs: { d: 'M3.5 2h6l3 3v9h-9z' } },
+      { tag: 'line', attrs: { x1: '6', y1: '7', x2: '10.5', y2: '7' } },
+      { tag: 'line', attrs: { x1: '6', y1: '9.5', x2: '10.5', y2: '9.5' } },
+    ],
+    tool: [
+      { tag: 'polygon', attrs: { points: '8,2 9.6,6.4 14,8 9.6,9.6 8,14 6.4,9.6 2,8 6.4,6.4' } },
+    ],
+  };
+
+  function toolGlyph(kind) {
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('width', '14');
+    svg.setAttribute('height', '14');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('class', 'activity-icon');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.3');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    var shapes = TOOL_GLYPHS[kind] || TOOL_GLYPHS.tool;
+    for (var i = 0; i < shapes.length; i++) {
+      var shape = shapes[i];
+      var node = document.createElementNS('http://www.w3.org/2000/svg', shape.tag);
+      for (var key in shape.attrs) {
+        if (Object.prototype.hasOwnProperty.call(shape.attrs, key)) {
+          node.setAttribute(key, shape.attrs[key]);
+        }
+      }
+      svg.appendChild(node);
+    }
+    return svg;
+  }
+
+  var DIFF_SCAN_MAX_LINES = 400;
+
+  /**
+   * Honest +/- counts: only when the daemon excerpt carries diff markers
+   * (git-style +/- lines). No markers, no counts — never a fabricated edit
+   * statistic. The scan is bounded.
+   */
+  function diffCounts(excerpt) {
+    if (typeof excerpt !== 'string' || excerpt.length === 0) {
+      return null;
+    }
+    var lines = excerpt.split('\n');
+    var limit = Math.min(lines.length, DIFF_SCAN_MAX_LINES);
+    var adds = 0;
+    var dels = 0;
+    for (var i = 0; i < limit; i++) {
+      var text = lines[i];
+      if (text.length === 0) {
+        continue;
+      }
+      if (text.charCodeAt(0) === 43) {
+        if (text.indexOf('+++') !== 0) {
+          adds += 1;
+        }
+      } else if (text.charCodeAt(0) === 45) {
+        if (text.indexOf('---') !== 0) {
+          dels += 1;
+        }
+      }
+    }
+    if (adds === 0 && dels === 0) {
+      return null;
+    }
+    return { adds: adds, dels: dels };
+  }
+
+  /** The outcome tone of one tool from its exit code and durable state. */
+  function toolOutcome(tool) {
+    var exit = tool.exitCode;
+    if (typeof exit === 'number' && isFinite(exit)) {
+      return exit === 0 ? { tone: 'pass', label: 'exit 0' } : { tone: 'fail', label: 'exit ' + exit };
+    }
+    var state = String(tool.state == null ? '' : tool.state).trim().toLowerCase();
+    var label = state.length > 0 ? state.replace(/_/g, ' ') : 'unknown';
+    if (state === 'failed' || state === 'error' || state === 'errored') {
+      return { tone: 'fail', label: label };
+    }
+    if (state === 'running' || state === 'in_progress' || state === 'pending' || state === 'validating') {
+      return { tone: 'run', label: label };
+    }
+    if (state === 'completed' || state === 'done') {
+      return { tone: 'pass', label: 'done' };
+    }
+    return { tone: 'neutral', label: label };
+  }
+
+  function activityChipOf(kind, outcome, counts) {
+    if (kind === 'edit' && counts !== null) {
+      return { tone: 'diff', label: '' };
+    }
+    if (kind === 'test' || kind === 'verify' || kind === 'check') {
+      if (outcome.tone === 'pass') {
+        return { tone: 'pass', label: 'passed' };
+      }
+      if (outcome.tone === 'fail') {
+        return { tone: 'fail', label: 'failed' };
+      }
+      return { tone: outcome.tone, label: outcome.label };
+    }
+    if (kind === 'search' || kind === 'read' || kind === 'tool') {
+      return { tone: outcome.tone === 'pass' ? 'neutral' : outcome.tone, label: outcome.label };
+    }
+    return { tone: outcome.tone, label: outcome.label };
+  }
+
   function renderTool(container, tool) {
+    var name = String(tool.name == null ? '' : tool.name);
+    var kind = classifyTool(name);
+    var outcome = toolOutcome(tool);
+    var counts = kind === 'edit' ? diffCounts(tool.excerpt) : null;
+    var chip = activityChipOf(kind, outcome, counts);
+
     var row = document.createElement('div');
-    row.className = 'tool';
-    var head = document.createElement('div');
-    head.className = 'tool-head';
-    var exitText =
-      tool.exitCode === null || tool.exitCode === undefined ? '' : ' · exit ' + tool.exitCode;
-    head.textContent = tool.name + ' [' + tool.state + ']' + exitText;
-    row.appendChild(head);
+    row.className = 'activity activity-' + kind + ' tone-' + outcome.tone;
+
+    var details = document.createElement('details');
+    details.className = 'activity-details';
+    // A running or failed row opens itself: the live/broken output is the
+    // part worth showing; settled rows stay compact until asked.
+    if (outcome.tone === 'fail' || outcome.tone === 'run') {
+      details.open = true;
+    }
+    var summary = document.createElement('summary');
+    summary.className = 'activity-summary';
+    summary.appendChild(toolGlyph(kind));
+    span(summary, name.length > 0 ? name : '(unnamed tool)', 'activity-name');
+    if (chip.tone === 'diff') {
+      var diff = span(summary, '', 'activity-chip activity-chip-diff');
+      span(diff, '+' + counts.adds, 'activity-add');
+      span(diff, '\u2212' + counts.dels, 'activity-del');
+    } else {
+      span(summary, chip.label, 'activity-chip activity-chip-' + chip.tone);
+    }
+    details.appendChild(summary);
 
     if (tool.excerpt) {
       var excerpt = document.createElement('pre');
       excerpt.className = 'excerpt';
       excerpt.textContent = tool.excerpt;
-      row.appendChild(excerpt);
+      details.appendChild(excerpt);
     }
 
     var evidenceId = evidenceIdOf(tool.artifact);
@@ -1003,8 +1355,9 @@
         vscode.postMessage({ type: 'retrieveEvidence', evidenceId: evidenceId });
       });
       holder.appendChild(button);
-      row.appendChild(holder);
+      details.appendChild(holder);
     }
+    row.appendChild(details);
     container.appendChild(row);
   }
 
@@ -1018,13 +1371,14 @@
     wrapper.appendChild(head);
 
     if (entry.text) {
-      var text = document.createElement('pre');
+      var text = document.createElement('div');
       text.className = 'entry-text';
       text.textContent = entry.text;
       wrapper.appendChild(text);
     }
     if (entry.reasoning) {
       var details = document.createElement('details');
+      details.className = 'reasoning-details';
       var summary = document.createElement('summary');
       summary.textContent = 'Reasoning';
       details.appendChild(summary);
@@ -1035,13 +1389,14 @@
       wrapper.appendChild(details);
     }
     if (entry.summary) {
-      var summaryLine = document.createElement('pre');
+      var summaryLine = document.createElement('div');
       summaryLine.className = 'entry-summary';
       summaryLine.textContent = entry.summary;
       wrapper.appendChild(summaryLine);
     }
-    for (var i = 0; i < entry.tools.length; i++) {
-      renderTool(wrapper, entry.tools[i]);
+    var tools = Array.isArray(entry.tools) ? entry.tools : [];
+    for (var i = 0; i < tools.length; i++) {
+      renderTool(wrapper, tools[i]);
     }
     return wrapper;
   }
@@ -1124,6 +1479,10 @@
         label.textContent =
           (item.filename || '(unnamed)') + ' · ' + item.mime + ' · ' + formatBytes(item.bytes);
         row.appendChild(label);
+        var status = document.createElement('span');
+        status.className = 'attachment-status ' + (item.refusal ? 'status-refused' : 'status-ready');
+        status.textContent = item.refusal ? 'refused' : 'ready';
+        row.appendChild(status);
         if (item.refusal) {
           if (firstRefusal === null) {
             firstRefusal = item.refusal;
@@ -1378,14 +1737,34 @@
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', streamStatusLabel(snapshot.streamStatus));
+    renderComposerModel(snapshot.session);
     renderStreamRecovery(snapshot.streamStatus);
-    renderTask(snapshot.task, snapshot.cockpit);
+    renderTask(snapshot.task, snapshot.cockpit, snapshot.agents);
     renderCockpit(snapshot.cockpit, snapshot.cockpitSections);
     renderAgents(snapshot.agents);
     renderBoard(snapshot.board);
+    renderWelcome(snapshot.transcript);
     renderTranscript(snapshot.transcript);
     if (snapshot.lastError) {
       showNotice('error', snapshot.lastError);
+    }
+  }
+
+  /** The composer's model chip: session identity, quiet and non-interactive. */
+  function renderComposerModel(session) {
+    var node = byId('composer-model');
+    if (!node) {
+      return;
+    }
+    var provider = session && session.provider ? String(session.provider) : '';
+    var model = session && session.model ? String(session.model) : '';
+    var text = model.length > 0 && provider.length > 0 ? provider + ' / ' + model : model || provider;
+    node.hidden = text.length === 0;
+    node.textContent = text;
+    if (text.length > 0) {
+      node.setAttribute('title', 'Session model: ' + text);
+    } else if (node.removeAttribute) {
+      node.removeAttribute('title');
     }
   }
 
@@ -1756,6 +2135,32 @@
   byId('btn-stop').addEventListener('click', function () {
     vscode.postMessage({ type: 'stopDaemon' });
   });
+
+  // Onboarding prompt chips: fill the composer and focus it (feed, never
+  // submit). They live in the empty-state markup, so the static markup pin
+  // covers their labels and their data-prompt payloads.
+  var welcomeChips =
+    typeof document.querySelectorAll === 'function'
+      ? document.querySelectorAll('.welcome-chip')
+      : [];
+  for (var welcomeIndex = 0; welcomeIndex < welcomeChips.length; welcomeIndex++) {
+    (function (chip) {
+      chip.addEventListener('click', function () {
+        var prompt = chip.getAttribute ? chip.getAttribute('data-prompt') : null;
+        if (!prompt) {
+          return;
+        }
+        var goalNode = byId('goal');
+        if (!goalNode) {
+          return;
+        }
+        goalNode.value = prompt;
+        if (typeof goalNode.focus === 'function') {
+          goalNode.focus();
+        }
+      });
+    })(welcomeChips[welcomeIndex]);
+  }
 
   vscode.postMessage({ type: 'ready' });
 })();

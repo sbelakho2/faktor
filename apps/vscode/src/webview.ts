@@ -182,10 +182,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
     <span id="daemon-text">stopped</span>
     <span class="spacer"></span>
-    <button id="btn-inspect" class="secondary" type="button" aria-expanded="false" title="Show run details, agents, board and evidence">Inspect</button>
-    <button id="btn-refresh" type="button" title="Refresh state">Refresh</button>
-    <button id="btn-stop" type="button" title="Stop the daemon">Stop</button>
-    <button id="btn-start" type="button" title="Start the daemon">Start</button>
+    <button id="btn-inspect" class="toggle" type="button" aria-expanded="false" title="Show run details, agents, board and evidence">Inspect</button>
+    <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
+    <button id="btn-stop" class="secondary" type="button" title="Stop the daemon">Stop</button>
+    <button id="btn-start" class="secondary" type="button" title="Start the daemon">Start</button>
   </header>
   <section id="meta">
     <div class="meta-row"><span class="meta-key">Session</span><span id="session-title">none</span></div>
@@ -204,20 +204,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <section id="notices" aria-live="polite"></section>
   <section id="task-card" class="card run-card" hidden>
     <h2>Current run</h2>
-    <div class="task-head"><span id="task-state" class="badge">—</span><button id="btn-cancel-run" type="button">Cancel run</button></div>
-    <div id="task-goal" class="goal"></div>
+    <div class="run-strip">
+      <span id="task-state" class="state-chip" data-state="unknown">—</span>
+      <span id="task-progress" class="run-meta" hidden></span>
+      <span id="task-tests" class="run-meta" hidden></span>
+      <span id="task-agents" class="run-meta" hidden></span>
+      <span class="spacer"></span>
+      <button id="btn-cancel-run" class="secondary" type="button">Cancel run</button>
+    </div>
+    <div id="task-goal" class="run-goal"></div>
   </section>
   <section id="transcript-card" class="card transcript-card">
-    <h2>Conversation</h2>
+    <h2 id="transcript-title">Conversation</h2>
+    <section id="welcome" class="welcome">
+      <div class="welcome-mark" aria-hidden="true">
+        <svg viewBox="0 0 5 5" width="36" height="36" class="pixel pixel-done">
+          <rect class="pixel-body" x="1" y="0" width="3" height="5"></rect>
+          <rect class="pixel-body" x="0" y="1" width="5" height="3"></rect>
+          <rect class="pixel-body" x="0" y="4" width="1" height="1"></rect>
+          <rect class="pixel-body" x="4" y="4" width="1" height="1"></rect>
+          <rect class="pixel-eye" x="1" y="1" width="1" height="1"></rect>
+          <rect class="pixel-eye" x="3" y="1" width="1" height="1"></rect>
+        </svg>
+      </div>
+      <p class="welcome-lead">Describe a task below. Faktor plans it, works in an isolated candidate workspace, and runs the checks.</p>
+      <p class="welcome-lead">Follow the run as it works — every edit, test and verification result lands in the conversation.</p>
+      <p class="welcome-lead">Changes only land after verification passes; you stay in control of the final step.</p>
+      <p class="welcome-hint muted">Start with one of these:</p>
+      <ul class="welcome-prompts" aria-label="Example prompts">
+        <li><button type="button" class="welcome-chip" data-prompt="Find and fix the failing tests">Find and fix the failing tests</button></li>
+        <li><button type="button" class="welcome-chip" data-prompt="Review this change for correctness and edge cases">Review this change for correctness and edge cases</button></li>
+        <li><button type="button" class="welcome-chip" data-prompt="Implement the next item in the plan">Implement the next item in the plan</button></li>
+      </ul>
+    </section>
     <div id="entries" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation transcript"></div>
   </section>
   <form id="composer">
     <label for="goal" class="composer-label">Ask Faktor…</label>
     <textarea id="goal" rows="3" placeholder="Describe what you want done."></textarea>
-    <div id="attachment-hint" class="muted">Attach files, drop them here, or paste an image (Ctrl/Cmd+V).</div>
-    <div class="composer-actions">
-      <button id="btn-attach" type="button" title="Attach files through the host file picker">Attach…</button>
-      <button id="btn-clear-attachments" type="button" hidden>Clear all attachments</button>
+    <div class="composer-chips">
+      <span id="composer-model" class="chip chip-model" hidden></span>
+      <button id="btn-attach" class="chip chip-action" type="button" title="Attach files through the host file picker">Attach files…</button>
+      <button id="btn-clear-attachments" class="chip chip-action" type="button" hidden>Clear all</button>
+      <span id="attachment-hint" class="chip-hint muted">Drop files here or paste an image (Ctrl/Cmd+V).</span>
     </div>
     <ul id="attachment-list" aria-label="Attached files"></ul>
     <div id="attachment-notice" class="muted" hidden role="status"></div>
@@ -231,8 +260,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </fieldset>
     </details>
     <div class="composer-actions">
-      <button id="btn-send" type="submit">Run task</button>
-      <button id="btn-new-task" type="button">New task…</button>
+      <button id="btn-send" class="primary-action" type="submit">Run task</button>
+      <button id="btn-new-task" class="secondary" type="button">New task…</button>
     </div>
   </form>
   <section id="inspect-card" class="card">

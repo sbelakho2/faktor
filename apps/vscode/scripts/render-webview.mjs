@@ -65,7 +65,16 @@ const THEME_CSS = `:root {
   --vscode-input-border: #3c3c3c;
   --vscode-focusBorder: #007fd4;
   --vscode-textLink-foreground: #3794ff;
+  --vscode-textLink-activeForeground: #4daafc;
   --vscode-textCodeBlock-background: #0a0a0a;
+  --vscode-textBlockQuote-background: #2b2b2b;
+  --vscode-editorWidget-background: #252526;
+  --vscode-toolbar-hoverBackground: rgba(90, 93, 94, 0.31);
+  --vscode-widget-border: #3c3c3c;
+  --vscode-widget-shadow: rgba(0, 0, 0, 0.36);
+  --vscode-button-secondaryBackground: #3a3d41;
+  --vscode-button-secondaryForeground: #cccccc;
+  --vscode-button-secondaryHoverBackground: #45494e;
   --vscode-inputValidation-infoBackground: #063b49;
   --vscode-inputValidation-infoBorder: #007acc;
   --vscode-inputValidation-errorBackground: #5a1d1d;
@@ -103,8 +112,8 @@ export function findChrome() {
 }
 
 /** The deterministic, self-contained snapshot the harness renders. */
-function harnessSnapshot() {
-  return {
+function harnessSnapshot(empty = false) {
+  const snapshot = {
     daemon: 'running',
     daemonDetail: 'http://127.0.0.1:7337',
     baseUrl: 'http://127.0.0.1:7337',
@@ -184,6 +193,11 @@ function harnessSnapshot() {
     task: {
       state: 'running',
       goal: 'Close the UX audit interaction defects',
+      completed: ['Reconcile the audit findings', 'Fix target sizes and focus'],
+      open: ['Re-run the render checks'],
+      testsRun: ['selftest', 'render-webview'],
+      testsFailed: ['selftest'],
+      phase: 'verify',
       completion: {
         source: 'daemon',
         steps: [
@@ -271,16 +285,38 @@ function harnessSnapshot() {
         role: 'assistant',
         seq: 2,
         createdMs: 2,
-        text: 'I measured every control and added the focus ring.',
-        reasoning: 'The audit requires 24px minimum targets.',
-        summary: 'Targets and focus-visible implemented.',
+        text: 'I measured every control and added the focus ring across the composer and transcript.',
+        reasoning: 'The audit requires 24px minimum targets and a visible keyboard focus ring.',
+        summary: 'Targets and focus-visible implemented; one selftest is still failing.',
         tools: [
           {
             name: 'bash',
             state: 'completed',
             excerpt: 'render check: 41 controls pass',
             exitCode: 0,
+            artifact: null,
+          },
+          {
+            name: 'edit_file',
+            state: 'completed',
+            excerpt:
+              '@@ apps/vscode/media/chat.css @@\n+  min-height: 28px;\n+  outline-offset: 1px;\n+  border-radius: 6px;\n-  border-radius: 2px;\n-  padding: 4px 10px;',
+            exitCode: null,
+            artifact: null,
+          },
+          {
+            name: 'cargo test',
+            state: 'completed',
+            excerpt: 'FAILED apps/vscode/scripts/selftest.mjs::target-sizes',
+            exitCode: 1,
             artifact: 'evidence:41',
+          },
+          {
+            name: 'verify_changes',
+            state: 'completed',
+            excerpt: 'criteria 2/2 passed · landed == verified',
+            exitCode: 0,
+            artifact: null,
           },
         ],
       },
@@ -307,10 +343,34 @@ function harnessSnapshot() {
     lastError: null,
     busy: false,
   };
+  if (empty) {
+    // The onboarding/empty-state fixture: no conversation, no run, no
+    // agents — the welcome state is the only content in the transcript slot.
+    snapshot.transcript = [];
+    snapshot.task = null;
+    snapshot.agents = [];
+    snapshot.cockpit = null;
+    snapshot.cockpitSections = [];
+    snapshot.tournament = null;
+    snapshot.verification = null;
+    snapshot.usage = null;
+    snapshot.usagePanel = null;
+    snapshot.indexCoverage = null;
+    snapshot.runs = [];
+    snapshot.board = {
+      available: false,
+      source: 'none',
+      revision: null,
+      unread: null,
+      reason: 'no run-family board yet',
+      posts: [],
+    };
+  }
+  return snapshot;
 }
 
 /** Strip the CSP + nonces, point the template at real files, inject stubs. */
-export function buildHarnessHtml() {
+export function buildHarnessHtml(empty = false, attachments = false) {
   const webviewSource = readFileSync(join(ROOT, 'src', 'webview.ts'), 'utf8');
   const start = webviewSource.indexOf('<!DOCTYPE html>');
   const end = webviewSource.indexOf('</html>', start) + '</html>'.length;
@@ -334,9 +394,19 @@ export function buildHarnessHtml() {
   }
   const theme = `<style id="faktor-harness-theme">${THEME_CSS}</style>`;
   const apiStub = `<script>window.__posted = []; window.acquireVsCodeApi = function () { return { postMessage: function (message) { window.__posted.push(message); } }; };</script>`;
-  const snapshotJson = JSON.stringify(harnessSnapshot()).replace(/</g, '\\u003c');
+  const snapshotJson = JSON.stringify(harnessSnapshot(empty)).replace(/</g, '\\u003c');
+  // The attachment fixture exercises the compact attachment cards (ready and
+  // refused) exactly the way the host delivers them.
+  const attachmentsScript = attachments
+    ? `
+    window.postMessage({ type: 'attachments', items: [
+      { id: 'att-1', filename: 'chat.css', mime: 'text/css', bytes: 21477 },
+      { id: 'att-2', filename: 'screen.png', mime: 'image/png', bytes: 284112, isImage: true },
+      { id: 'att-3', filename: 'archive.zip', mime: 'application/zip', bytes: 9999999, refusal: 'application/zip is outside the advertised attachment mime types' }
+    ] }, '*');`
+    : '';
   const snapshotScript = `<script>
-    window.postMessage({ type: 'snapshot', snapshot: ${snapshotJson} }, '*');
+    window.postMessage({ type: 'snapshot', snapshot: ${snapshotJson} }, '*');${attachmentsScript}
     setTimeout(function () { window.__ready = true; }, 120);
   </script>`;
   html = html.replace('</head>', `${theme}</head>`);
@@ -548,10 +618,12 @@ const MAIN_MIN = 28;
 const OTHER_MIN = 24;
 
 function parseArgs(argv) {
-  const args = { check: false, screenshots: false, prefix: 'shot', out: SHOT_DIR };
+  const args = { check: false, screenshots: false, empty: false, attachments: false, prefix: 'shot', out: SHOT_DIR };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--check') args.check = true;
     else if (argv[i] === '--screenshots') args.screenshots = true;
+    else if (argv[i] === '--empty') args.empty = true;
+    else if (argv[i] === '--attachments') args.attachments = true;
     else if (argv[i] === '--prefix') args.prefix = argv[++i];
     else if (argv[i] === '--out') args.out = argv[++i];
   }
@@ -563,7 +635,7 @@ export async function runHarness(args) {
   if (!chrome) {
     throw new Error('no chrome/chromium binary found on PATH');
   }
-  const html = buildHarnessHtml();
+  const html = buildHarnessHtml(args.empty === true, args.attachments === true);
   const pageDir = mkdtempSync(join(tmpdir(), 'faktor-render-page-'));
   const pagePath = join(pageDir, 'index.html');
   writeFileSync(pagePath, html);

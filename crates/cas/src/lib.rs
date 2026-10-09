@@ -71,6 +71,8 @@ pub enum CasError {
     Zstd(String),
     #[error("malformed hash: {0}")]
     Malformed(String),
+    #[error("internal invariant violated: {0}")]
+    Internal(String),
 }
 
 pub type CasResult<T> = Result<T, CasError>;
@@ -682,7 +684,14 @@ impl Cas {
         let mut sink = std::io::sink();
         let size = match self.decode_verified(hash, file, &mut sink, None)? {
             Some(s) => s,
-            None => unreachable!("no cap means the decode always completes"),
+            // Unbounded decodes can only "hit the cap" when a cap exists; a
+            // None here is an internal invariant violation, reported typed
+            // instead of panicking in production.
+            None => {
+                return Err(CasError::Internal(
+                    "unbounded decode reported a cap halt".to_string(),
+                ))
+            }
         };
         self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         Ok(ContentVerified {
@@ -706,7 +715,14 @@ impl Cas {
         let mut out = Vec::new();
         let size = match self.decode_verified(hash, file, &mut out, None)? {
             Some(s) => s,
-            None => unreachable!("no cap means the decode always completes"),
+            // Unbounded decodes can only "hit the cap" when a cap exists; a
+            // None here is an internal invariant violation, reported typed
+            // instead of panicking in production.
+            None => {
+                return Err(CasError::Internal(
+                    "unbounded decode reported a cap halt".to_string(),
+                ))
+            }
         };
         self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         Ok(out)
@@ -755,7 +771,14 @@ impl Cas {
         let verified_identity = FileIdentity::of_file(&file);
         let size = match self.decode_verified(hash, file, &mut w, None)? {
             Some(s) => s,
-            None => unreachable!("no cap means the decode always completes"),
+            // Unbounded decodes can only "hit the cap" when a cap exists; a
+            // None here is an internal invariant violation, reported typed
+            // instead of panicking in production.
+            None => {
+                return Err(CasError::Internal(
+                    "unbounded decode reported a cap halt".to_string(),
+                ))
+            }
         };
         self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         Ok(())
@@ -783,7 +806,14 @@ impl Cas {
         let mut sink = std::io::sink();
         let size = match self.decode_verified(hash, file, &mut sink, None)? {
             Some(s) => s,
-            None => unreachable!("no cap means the decode always completes"),
+            // Unbounded decodes can only "hit the cap" when a cap exists; a
+            // None here is an internal invariant violation, reported typed
+            // instead of panicking in production.
+            None => {
+                return Err(CasError::Internal(
+                    "unbounded decode reported a cap halt".to_string(),
+                ))
+            }
         };
         self.record_verified(hash, size, &self.blob_path(hash), verified_identity);
         // Pass 2: the store never mutates a blob in place (writes are atomic
@@ -793,7 +823,14 @@ impl Cas {
         let file = self.open_blob(hash)?;
         let copied = match decode_stream(file, w, None, None)? {
             Some(s) => s,
-            None => unreachable!("no cap means the decode always completes"),
+            // Unbounded decodes can only "hit the cap" when a cap exists; a
+            // None here is an internal invariant violation, reported typed
+            // instead of panicking in production.
+            None => {
+                return Err(CasError::Internal(
+                    "unbounded decode reported a cap halt".to_string(),
+                ))
+            }
         };
         if copied != size {
             return Err(CasError::SizeMismatch {
