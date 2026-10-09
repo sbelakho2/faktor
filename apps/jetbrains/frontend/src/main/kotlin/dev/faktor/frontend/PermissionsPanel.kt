@@ -49,6 +49,24 @@ class PermissionsPanel : JPanel(BorderLayout()) {
 
     init {
         list.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        // One bounded row label (#id capability — detail), never the raw DTO
+        // toString ("NativePermissionEntry(id=7, ...").
+        list.cellRenderer = object : javax.swing.DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                listComponent: JList<*>?,
+                value: Any?,
+                index: Int,
+                selected: Boolean,
+                focus: Boolean
+            ): java.awt.Component {
+                super.getListCellRendererComponent(listComponent, value, index, selected, focus)
+                val permission = value as? NativePermissionEntry ?: return this
+                text = "#${permission.id} ${permission.capability} — " +
+                    bound(permission.detail, 120)
+                toolTipText = text
+                return this
+            }
+        }
         list.addListSelectionListener { applySelection() }
         allowButton.addActionListener { reply("allow") }
         denyButton.addActionListener { reply("deny") }
@@ -73,7 +91,7 @@ class PermissionsPanel : JPanel(BorderLayout()) {
         )
         headerRow.add(header, BorderLayout.CENTER)
         add(headerRow, BorderLayout.NORTH)
-        add(body, BorderLayout.CENTER)
+        add(pageScroll(body), BorderLayout.CENTER)
         updateButtons()
     }
 

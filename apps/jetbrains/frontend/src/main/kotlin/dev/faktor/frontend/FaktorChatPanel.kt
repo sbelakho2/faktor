@@ -28,7 +28,6 @@ import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.indexCoverageLabel
-import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
 import dev.faktor.shared.NativeTournament
 import java.math.BigInteger
@@ -148,28 +147,6 @@ class FaktorChatPanel(
 
     private val abortButton = secondaryButton("Abort")
 
-    private val daemonLabel = WrappedLabel("daemon: stopped")
-
-    private val streamLabel = WrappedLabel("stream: off")
-
-    private val stateLabel = WrappedLabel("state: -")
-
-    private val modelLabel = WrappedLabel("model: -")
-
-    private val toolLabel = WrappedLabel("active tool: -")
-
-    private val queuedLabel = WrappedLabel("queued: 0")
-
-    private val usageLabel = WrappedLabel("usage: -")
-
-    private val verifyLabel = WrappedLabel("verification: -")
-
-    private val filesLabel = WrappedLabel("files changed: 0")
-
-    /** Durable index coverage (audits 5/6): a PARTIAL generation / capped
-     * fingerprint round is named, never flattened to "ready". */
-    private val indexLabel = WrappedLabel("index: -")
-
     private val goalField = JTextField(24)
 
     private val criteriaField = JTextField(24)
@@ -202,13 +179,6 @@ class FaktorChatPanel(
 
     private val taskArea = JTextArea(5, 32)
 
-    private val agentsModel = DefaultComboBoxModel<NativeAgent>()
-
-    private val agentsCombo = JComboBox(agentsModel)
-
-    /** The agent-control buttons by label, so tests can drive the dialog path. */
-    private val agentControlButtons = LinkedHashMap<String, JButton>()
-
     /**
      * The agent-control input resolver, invoked ON the EDT by
      * [agentInputOnEdt] (the production default is the modal JOptionPane
@@ -222,8 +192,6 @@ class FaktorChatPanel(
      * call, so a smoke can prove the dialog never ran there.
      */
     internal var agentControlDispatchObserver: ((String) -> Unit)? = null
-
-    private val agentsArea = JTextArea(5, 32)
 
     private val treePanel = TaskTreePanel()
 
@@ -245,6 +213,10 @@ class FaktorChatPanel(
 
     private val usagePanel = UsagePanel()
 
+    private val statusPanel = StatusPanel()
+
+    private val agentsPanel = AgentsPanel()
+
     /** The bounded PasswordSafe row watch (no platform change event exists). */
     private val controlPlaneWatcher: ControlPlaneCredentialWatcher?
 
@@ -258,7 +230,17 @@ class FaktorChatPanel(
 
     private val billingPrevCursors = ArrayList<String>()
 
+    /** The inspector root: 3 top-level cluster destinations (Work/Inspect/History). */
     private val tabs = JTabbedPane()
+
+    /** Work cluster: the task composer, the agent roster and the terminals. */
+    private val workTabs = JTabbedPane()
+
+    /** Inspect cluster: the task tree, evidence, tournaments and permissions. */
+    private val inspectTabs = JTabbedPane()
+
+    /** History cluster: durable sessions, board, usage and diagnostics (Settings/Status). */
+    private val historyTabs = JTabbedPane()
 
     /**
      * The inspector is a COLLAPSIBLE secondary plane: the tool window defaults
@@ -360,20 +342,33 @@ class FaktorChatPanel(
         inputRow.add(buttons, BorderLayout.SOUTH)
         chat.add(inputRow, BorderLayout.SOUTH)
 
+        // One top-level row of cluster destinations; the former peer tabs are
+        // now sub-tabs (inner panes) of their cluster, so the tool window
+        // presents the Work / Inspect / History mental model while every panel
+        // stays one click away.
+        workTabs.removeAll()
+        workTabs.addTab("Task", buildTaskTab())
+        workTabs.addTab("Agents", agentsPanel)
+        workTabs.addTab("Terminal", terminalPanel)
+
+        inspectTabs.removeAll()
+        inspectTabs.addTab("Task Tree", buildTaskTreeTab())
+        inspectTabs.addTab("Evidence", navigator)
+        inspectTabs.addTab("Tournament", tournamentPanel)
+        inspectTabs.addTab("Permissions", permissionsPanel)
+
+        historyTabs.removeAll()
+        historyTabs.addTab("History", historyPanel)
+        historyTabs.addTab("Board", boardPanel)
+        historyTabs.addTab("Usage", usagePanel)
+        historyTabs.addTab("Settings", settingsPanel)
+        historyTabs.addTab("Status", statusPanel)
+
         val tabs = this.tabs
         tabs.removeAll()
-        tabs.addTab("Status", buildStatusTab())
-        tabs.addTab("Task", buildTaskTab())
-        tabs.addTab("Task Tree", buildTaskTreeTab())
-        tabs.addTab("Agents", buildAgentsTab())
-        tabs.addTab("Permissions", permissionsPanel)
-        tabs.addTab("Tournament", tournamentPanel)
-        tabs.addTab("Board", boardPanel)
-        tabs.addTab("Evidence", navigator)
-        tabs.addTab("Terminal", terminalPanel)
-        tabs.addTab("Settings", settingsPanel)
-        tabs.addTab("Usage", usagePanel)
-        tabs.addTab("History", historyPanel)
+        tabs.addTab("Work", workTabs)
+        tabs.addTab("Inspect", inspectTabs)
+        tabs.addTab("History", historyTabs)
 
         add(toolbar, BorderLayout.NORTH)
         add(contentHost, BorderLayout.CENTER)
@@ -422,17 +417,43 @@ class FaktorChatPanel(
 
     internal fun inspectorTabsForTest(): JTabbedPane = tabs
 
-    private fun buildStatusTab(): JPanel {
-        val statusBody = pageColumn(gap = Spacing.XS, padding = 0)
-        for (label in listOf(
-            daemonLabel, streamLabel, stateLabel, modelLabel, toolLabel,
-            queuedLabel, usageLabel, verifyLabel, filesLabel, indexLabel
-        )) {
-            statusBody.add(label)
+    /** The Work cluster's Task composer pane (host-matrix render hook). */
+    internal fun taskComposerPaneForTest(): java.awt.Component = workTabs.getComponentAt(0)
+
+    /**
+     * Selects the cluster + sub-tab that owns [panel] (used by evidence and
+     * child-transcript navigation, which live in the Inspect cluster).
+     */
+    private fun selectInspectorPanel(panel: java.awt.Component) {
+        for (i in 0 until tabs.tabCount) {
+            val cluster = tabs.getComponentAt(i) as? JTabbedPane ?: continue
+            for (j in 0 until cluster.tabCount) {
+                if (cluster.getComponentAt(j) === panel) {
+                    tabs.selectedIndex = i
+                    cluster.selectedIndex = j
+                    return
+                }
+            }
         }
-        val page = pageColumn()
-        page.add(card("Session status", statusBody))
-        return page
+    }
+
+    /** Selects one top-level cluster or sub-tab by title (smoke reachability). */
+    internal fun selectPanelForTest(title: String): Boolean {
+        for (i in 0 until tabs.tabCount) {
+            if (tabs.getTitleAt(i) == title) {
+                tabs.selectedIndex = i
+                return true
+            }
+            val cluster = tabs.getComponentAt(i) as? JTabbedPane ?: continue
+            for (j in 0 until cluster.tabCount) {
+                if (cluster.getTitleAt(j) == title) {
+                    tabs.selectedIndex = i
+                    cluster.selectedIndex = j
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /**
@@ -473,7 +494,6 @@ class FaktorChatPanel(
         startBody.add(attachments)
         startBody.add(actionRow(startTaskButton))
         val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
-        runsBody.add(sectionHeader("Task runs", muted = true))
         runsBody.add(runsCombo)
         runsBody.add(vSpace(Spacing.XS))
         taskArea.isEditable = false
@@ -484,9 +504,10 @@ class FaktorChatPanel(
         page.add(card("Start task", startBody))
         page.add(vSpace(Spacing.S))
         page.add(card("Task runs", runsBody))
-        val panel = JPanel(BorderLayout())
-        panel.add(page, BorderLayout.CENTER)
-        return scrollable(panel)
+        // The page column IS the scroll view (it tracks the viewport width),
+        // so a 240px tool window reflows instead of showing a horizontal
+        // scrollbar under a wider intermediate panel.
+        return scrollable(page)
     }
 
     private fun buildTaskTreeTab(): JPanel {
@@ -496,87 +517,6 @@ class FaktorChatPanel(
         val panel = JPanel(BorderLayout())
         panel.add(split, BorderLayout.CENTER)
         return panel
-    }
-
-    private fun buildAgentsTab(): JScrollPane {
-        val refreshAgents = secondaryButton("Refresh agents")
-        refreshAgents.addActionListener {
-            runAsync("refresh agents") {
-                refreshAgentsBlocking()
-            }
-        }
-        val controls = JPanel(GridLayout(0, 2, Spacing.S, Spacing.XS))
-        controls.isOpaque = false
-        controls.add(agentButton("Pause") { agent -> service.pauseAgent(agent.agentId) })
-        controls.add(agentButton("Resume") { agent -> service.resumeAgent(agent.agentId) })
-        controls.add(agentButton("Cancel") { agent -> service.cancelAgent(agent.agentId) })
-        controls.add(agentButton("Retry") { agent -> service.retryAgent(agent.agentId) })
-        controls.add(agentButton("Steer") { agent ->
-            val text = agentInputOnEdt("Steer note for ${agent.agentId}", null)
-            if (text != null && text.isNotEmpty()) service.steerAgent(agent.agentId, text)
-        })
-        controls.add(agentButton("Model") { agent ->
-            val model = agentInputOnEdt("Model for ${agent.agentId}", agent.model ?: "")
-            if (model != null && model.isNotEmpty()) service.setAgentModel(agent.agentId, model)
-        })
-        controls.add(agentButton("Token budget") { agent ->
-            val raw = agentInputOnEdt("max_tokens for ${agent.agentId}", "10000")
-            val tokens = raw?.trim()?.toLongOrNull()
-            if (tokens != null && tokens > 0) service.setAgentBudget(agent.agentId, maxTokens = tokens)
-        })
-        controls.add(agentButton("Cost budget") { agent ->
-            val raw = agentInputOnEdt("max_cost_micro for ${agent.agentId}", "1000000")
-            // Exact money: a plain decimal amount within i64::MAX; a junk or
-            // out-of-range value is refused loudly, never truncated.
-            val micro = raw?.trim()?.let { MicroMoney.parseDecimal(it) }
-            when {
-                raw == null -> Unit
-                micro == null || micro.signum() <= 0 ->
-                    onEdt {
-                        appendSystem(
-                            "refused max_cost_micro \"${raw.trim()}\": enter a positive decimal " +
-                                "integer no larger than ${MicroMoney.I64_MAX}"
-                        )
-                    }
-                else -> service.setAgentBudget(agent.agentId, maxCostMicro = micro)
-            }
-        })
-        val controlsBody = pageColumn(gap = Spacing.S, padding = 0)
-        controlsBody.add(agentsCombo)
-        controlsBody.add(controls)
-        controlsBody.add(actionRow(refreshAgents))
-        agentsArea.isEditable = false
-        agentsArea.font = uiPanelFont()
-        val outputBody = pageColumn(gap = Spacing.XS, padding = 0)
-        outputBody.add(JScrollPane(agentsArea))
-        val page = pageColumn()
-        page.add(card("Agent controls", controlsBody))
-        page.add(vSpace(Spacing.S))
-        page.add(card("Agent detail", outputBody))
-        val panel = JPanel(BorderLayout())
-        panel.add(page, BorderLayout.CENTER)
-        return scrollable(panel)
-    }
-
-    private fun agentButton(
-        label: String,
-        control: (NativeAgent) -> Any?
-    ): JButton {
-        val button = JButton(label)
-        agentControlButtons[label] = button
-        button.addActionListener {
-            val agent = agentsCombo.selectedItem as? NativeAgent
-            if (agent == null) {
-                appendSystem("select an agent first")
-                return@addActionListener
-            }
-            runAsync("agent $label") {
-                agentControlDispatchObserver?.invoke(label)
-                control(agent)
-                refreshAgentsBlocking()
-            }
-        }
-        return button
     }
 
     /**
@@ -1046,7 +986,7 @@ class FaktorChatPanel(
                 // selector is a Swing READ, so it is captured on the EDT too;
                 // only the network retrieval runs on the worker.
                 onEdt {
-                    tabs.selectedComponent = navigator
+                    selectInspectorPanel(navigator)
                     navigator.selectEvidence(ref)
                 }
                 if (ref.id != null) {
@@ -1091,6 +1031,74 @@ class FaktorChatPanel(
             override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
                 runControl("permission ${permission.id} $decision") {
                     replyPermissionBlocking(permission, decision)
+                }
+            }
+        })
+        agentsPanel.setListener(object : AgentsPanel.Listener {
+            override fun onRefresh() {
+                runAsync("refresh agents") { refreshAgentsBlocking() }
+            }
+
+            override fun onNotice(message: String) {
+                onEdt { appendSystem(message) }
+            }
+
+            override fun onPause(agent: NativeAgent) {
+                runAgentControl("Pause") { service.pauseAgent(agent.agentId) }
+            }
+
+            override fun onResume(agent: NativeAgent) {
+                runAgentControl("Resume") { service.resumeAgent(agent.agentId) }
+            }
+
+            override fun onCancel(agent: NativeAgent) {
+                runAgentControl("Cancel") { service.cancelAgent(agent.agentId) }
+            }
+
+            override fun onRetry(agent: NativeAgent) {
+                runAgentControl("Retry") { service.retryAgent(agent.agentId) }
+            }
+
+            override fun onSteer(agent: NativeAgent) {
+                runAgentControl("Steer") {
+                    val text = agentInputOnEdt("Steer note for ${agent.agentId}", null)
+                    if (text != null && text.isNotEmpty()) service.steerAgent(agent.agentId, text)
+                }
+            }
+
+            override fun onSetModel(agent: NativeAgent) {
+                runAgentControl("Model") {
+                    val model = agentInputOnEdt("Model for ${agent.agentId}", agent.model ?: "")
+                    if (model != null && model.isNotEmpty()) service.setAgentModel(agent.agentId, model)
+                }
+            }
+
+            override fun onSetTokenBudget(agent: NativeAgent) {
+                runAgentControl("Token budget") {
+                    val raw = agentInputOnEdt("max_tokens for ${agent.agentId}", "10000")
+                    val tokens = raw?.trim()?.toLongOrNull()
+                    if (tokens != null && tokens > 0) service.setAgentBudget(agent.agentId, maxTokens = tokens)
+                }
+            }
+
+            override fun onSetCostBudget(agent: NativeAgent) {
+                runAgentControl("Cost budget") {
+                    val raw = agentInputOnEdt("max_cost_micro for ${agent.agentId}", "1000000")
+                    // Exact money: a plain decimal amount within i64::MAX; a
+                    // junk or out-of-range value is refused loudly, never
+                    // truncated.
+                    val micro = raw?.trim()?.let { MicroMoney.parseDecimal(it) }
+                    when {
+                        raw == null -> Unit
+                        micro == null || micro.signum() <= 0 ->
+                            onEdt {
+                                appendSystem(
+                                    "refused max_cost_micro \"${raw.trim()}\": enter a positive decimal " +
+                                        "integer no larger than ${MicroMoney.I64_MAX}"
+                                )
+                            }
+                        else -> service.setAgentBudget(agent.agentId, maxCostMicro = micro)
+                    }
                 }
             }
         })
@@ -1699,7 +1707,7 @@ class FaktorChatPanel(
 
     private fun refreshStatusBlocking() {
         val projection = service.projection()
-        onEdt { applyProjection(projection) }
+        onEdt { statusPanel.applyProjection(projection) }
     }
 
     /**
@@ -1712,11 +1720,11 @@ class FaktorChatPanel(
         if (!service.isRunning() || service.currentSessionId() == null) return
         try {
             val response = service.indexCoverage()
-            onEdt { indexLabel.text = indexCoverageLabel(response.snapshot) }
+            onEdt { statusPanel.setIndex(indexCoverageLabel(response.snapshot)) }
         } catch (e: NativeApiException) {
-            onEdt { indexLabel.text = "index: refused (${e.status} ${e.code})" }
+            onEdt { statusPanel.setIndex("index: refused (${e.status} ${e.code})") }
         } catch (e: Exception) {
-            onEdt { indexLabel.text = "index: read failed" }
+            onEdt { statusPanel.setIndex("index: read failed") }
         }
     }
 
@@ -1772,32 +1780,17 @@ class FaktorChatPanel(
 
     private fun refreshAgentsBlocking() {
         val agents = service.agents()
-        onEdt {
-            agentsModel.removeAllElements()
-            for (agent in agents) agentsModel.addElement(agent)
-            if (agents.isEmpty()) {
-                agentsArea.text = "no background agents"
-            } else {
-                val sb = StringBuilder()
-                for (agent in agents) {
-                    sb.append(agent.agentId).append(" [").append(agent.kind).append("] ")
-                        .append(agent.state).append(" ownership=").append(agent.ownership)
-                        .append(" model=").append(agent.model ?: "-")
-                        .append(" budget=").append(agent.budget ?: "-")
-                        .append('\n')
-                }
-                agentsArea.text = sb.toString()
-            }
-        }
+        onEdt { agentsPanel.update(agents) }
     }
 
     private fun refreshUsageBlocking() {
         val usage = service.usage()
         val sessionUsage = service.sessionUsage()
         onEdt {
-            usageLabel.text =
+            statusPanel.setUsage(
                 "usage: sessions=${usage.sessions} tokens=${sessionUsage.tokens} " +
                     "taskCostMicro=${usage.settledCostMicro}"
+            )
         }
     }
 
@@ -1851,9 +1844,10 @@ class FaktorChatPanel(
     private fun refreshVerificationBlocking() {
         val verification = service.verification()
         onEdt {
-            verifyLabel.text =
+            statusPanel.setVerification(
                 "verification: owed=${verification.owed.size} " +
                     "failed=${verification.failedChecks.size}"
+            )
         }
     }
 
@@ -2091,7 +2085,7 @@ class FaktorChatPanel(
                     "child ${child.childId} (session ${child.sessionId})",
                     text.ifEmpty { "(no messages in the child transcript window)" }
                 )
-                tabs.selectedComponent = navigator
+                selectInspectorPanel(navigator)
             }
         }
     }
@@ -2120,32 +2114,17 @@ class FaktorChatPanel(
         }
     }
 
-    private fun applyProjection(projection: NativeProjection) {
-        stateLabel.text = "state: ${projection.machine} (${projection.label})"
-        val active = projection.activeModel
-        modelLabel.text = if (active == null) {
-            "model: ${projection.provider}/${projection.model}"
-        } else {
-            "model: ${active.provider}/${active.model}" +
-                (if (active.variant == null) "" else " (${active.variant})")
-        }
-        val tool = projection.activeTool
-        toolLabel.text = if (tool == null) "active tool: -" else "active tool: ${tool.tool} [${tool.status}]"
-        queuedLabel.text = "queued: ${projection.queued}"
-        filesLabel.text = "files changed: ${projection.filesChanged.size}"
-    }
-
     // -------------------------------------------------------------- listener
 
     override fun onDaemonStatus(status: String, detail: String?) {
         onEdt {
-            daemonLabel.text = "daemon: $status" + (if (detail == null) "" else " ($detail)")
+            statusPanel.setDaemon("daemon: $status" + (if (detail == null) "" else " ($detail)"))
         }
     }
 
     override fun onStreamStatus(status: String, detail: String?) {
         onEdt {
-            streamLabel.text = "stream: $status" + (if (detail == null) "" else " ($detail)")
+            statusPanel.setStream("stream: $status" + (if (detail == null) "" else " ($detail)"))
             historyPanel.setConnection(
                 service.daemonDescription(), status, service.streamCursor(), service.currentSessionId()
             )
@@ -2244,26 +2223,10 @@ class FaktorChatPanel(
     internal fun attachmentsView(): AttachmentsPanel = attachments
 
     /** Selects one agent in the Agents combo (the dialog-path smoke hook). */
-    internal fun selectAgentForTest(agentId: String): Boolean {
-        for (i in 0 until agentsModel.size) {
-            if (agentsModel.getElementAt(i).agentId == agentId) {
-                agentsCombo.selectedIndex = i
-                return true
-            }
-        }
-        return false
-    }
+    internal fun selectAgentForTest(agentId: String): Boolean = agentsPanel.selectAgent(agentId)
 
     /** Clicks one agent-control button on the EDT (the dialog-path smoke hook). */
-    internal fun triggerAgentControlForTest(label: String): Boolean {
-        val button = agentControlButtons[label] ?: return false
-        if (SwingUtilities.isEventDispatchThread()) {
-            button.doClick(0)
-        } else {
-            SwingUtilities.invokeAndWait { button.doClick(0) }
-        }
-        return true
-    }
+    internal fun triggerAgentControlForTest(label: String): Boolean = agentsPanel.clickControl(label)
 
     /** The rendered transcript (smoke assertions on typed refusals). */
     internal fun transcriptTextForTest(): String = transcript.text
@@ -2317,7 +2280,22 @@ class FaktorChatPanel(
 
     internal fun evidenceView(): EvidenceNavigatorPanel = navigator
 
+    /**
+     * Every reachable tab title, clusters first then each cluster's sub-tabs
+     * (the flattening is the smoke's "every panel is still reachable" view).
+     */
     internal fun tabTitles(): List<String> {
+        val out = ArrayList<String>()
+        for (i in 0 until tabs.tabCount) {
+            out.add(tabs.getTitleAt(i))
+            val cluster = tabs.getComponentAt(i) as? JTabbedPane ?: continue
+            for (j in 0 until cluster.tabCount) out.add(cluster.getTitleAt(j))
+        }
+        return out
+    }
+
+    /** The top-level cluster destinations only (the Work/Inspect/History model). */
+    internal fun clusterTitles(): List<String> {
         val out = ArrayList<String>()
         for (i in 0 until tabs.tabCount) out.add(tabs.getTitleAt(i))
         return out
@@ -2366,6 +2344,18 @@ class FaktorChatPanel(
                 val message = e.message ?: e.javaClass.simpleName
                 onEdt { appendSystem("error: $label: $message") }
             }
+        }
+    }
+
+    /**
+     * One agent control: the observer sees the worker-side dispatch, the
+     * control runs on the `faktor-ui` worker, and the roster refreshes after.
+     */
+    private fun runAgentControl(label: String, work: () -> Unit) {
+        runAsync("agent $label") {
+            agentControlDispatchObserver?.invoke(label)
+            work()
+            refreshAgentsBlocking()
         }
     }
 

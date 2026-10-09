@@ -277,6 +277,20 @@ object JetBrainsParitySmoke {
             )
         )
         try {
+            // Information architecture: exactly three top-level cluster
+            // destinations (the Work / Inspect / History mental model), and
+            // every former peer tab is still reachable as a sub-tab.
+            assertEquals(listOf("Work", "Inspect", "History"), panel.clusterTitles())
+            for (title in listOf(
+                "Task", "Agents", "Terminal",
+                "Task Tree", "Evidence", "Tournament", "Permissions",
+                "History", "Board", "Usage", "Settings", "Status"
+            )) {
+                assertTrue(
+                    panel.selectPanelForTest(title),
+                    "tab '$title' must be reachable: ${panel.tabTitles()}"
+                )
+            }
             assertTrue(panel.tabTitles().contains("Task"), panel.tabTitles().toString())
             assertTrue(panel.tabTitles().contains("Permissions"), panel.tabTitles().toString())
             assertTrue(panel.tabTitles().contains("Terminal"), panel.tabTitles().toString())

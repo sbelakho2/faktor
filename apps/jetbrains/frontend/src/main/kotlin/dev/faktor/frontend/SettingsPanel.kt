@@ -107,7 +107,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
             .build()
         val mutationBody = FormGrid()
             .row("Mode", mutationCombo)
-            .span(mutedLabel("Shadow-only: the removed direct-owner mode cannot be selected."))
+            .span(wrappedMutedLabel("Shadow-only: the removed direct-owner mode cannot be selected."))
             .build()
         val providerBody = JPanel(BorderLayout(0, Spacing.S))
         providerBody.isOpaque = false
@@ -132,7 +132,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
         )
         statusRow.add(status, BorderLayout.CENTER)
         add(statusRow, BorderLayout.NORTH)
-        add(body, BorderLayout.CENTER)
+        add(pageScroll(body), BorderLayout.CENTER)
         daemonArea.text = "daemon: not started"
         providerArea.text = "no providers served"
     }

@@ -174,7 +174,7 @@ class TournamentPanel : JPanel(BorderLayout()) {
         body.add(card("Decide / abort", controlBody))
         body.add(vSpace(Spacing.S))
         body.add(card("Candidate detail", JScrollPane(detail)))
-        add(body, BorderLayout.CENTER)
+        add(pageScroll(body), BorderLayout.CENTER)
     }
 
     fun setListener(value: Listener?) {

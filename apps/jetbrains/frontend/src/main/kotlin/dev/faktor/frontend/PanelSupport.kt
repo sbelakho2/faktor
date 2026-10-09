@@ -439,6 +439,20 @@ internal class FixedWrapLabel(text: String, private val wrapWidth: Int = Spacing
 }
 
 /**
+ * A scroll pane for a tall page column: a short tool window scrolls (16px
+ * wheel units) instead of clipping the last cards out of reach. The page
+ * column already tracks the viewport width, so no horizontal scrollbar is
+ * needed; the scrollbar only appears when the content overflows.
+ */
+internal fun pageScroll(content: JComponent): javax.swing.JScrollPane =
+    javax.swing.JScrollPane(content).apply {
+        border = null
+        verticalScrollBar.unitIncrement = Spacing.L
+        horizontalScrollBarPolicy =
+            javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+    }
+
+/**
  * A page/card body column on the shared spacing scale: vertical BoxLayout
  * with uniform outer padding (the "no giant gray voids, consistent outer
  * padding" rule). Children are stacked in order; callers add [vSpace] gaps.
@@ -471,9 +485,12 @@ internal fun card(
         BorderFactory.createEmptyBorder(6, Spacing.S, 6, Spacing.S)
     )
     if (title != null) {
-        val header = JLabel(title)
-        header.font = sectionTitleFont()
-        header.foreground = textForeground()
+        // Width-aware: a long card title wraps at 240px instead of being
+        // ellipsized ("Mutation mode (Task c...)").
+        val header = WrappedLabel(title).apply {
+            font = sectionTitleFont()
+            foreground = textForeground()
+        }
         panel.add(header, BorderLayout.NORTH)
     }
     panel.add(body, BorderLayout.CENTER)
@@ -484,8 +501,8 @@ internal fun card(
 internal fun titledSection(title: String, body: Component): JPanel = card(title, body)
 
 /** A standalone card/section header in the normal-case semibold face. */
-internal fun sectionHeader(text: String, muted: Boolean = false): JLabel =
-    JLabel(text).apply {
+internal fun sectionHeader(text: String, muted: Boolean = false): WrappedLabel =
+    WrappedLabel(text).apply {
         font = sectionTitleFont()
         foreground = if (muted) mutedForeground() else textForeground()
         alignmentX = Component.LEFT_ALIGNMENT
@@ -606,6 +623,15 @@ internal class FormGrid {
         val label = FixedWrapLabel(labelText).apply {
             labelFor = field
         }
+        // A text field's default minimum size equals its preferred size, and
+        // GridBagLayout only distributes negative space down to minimum
+        // sizes: at 240px tool windows the east column used to overflow and
+        // clip the input. Allowing the field to shrink keeps the form inside
+        // the card at every host width (the label column stays wrapped).
+        field.minimumSize = Dimension(
+            Spacing.L * 3,
+            field.minimumSize.height
+        )
         panel.add(label, constraints().apply {
             gridx = 0
             weightx = 0.0
@@ -644,16 +670,42 @@ internal class FormGrid {
 
 /** One horizontal action row on the shared spacing scale. */
 internal fun actionRow(vararg buttons: JButton): JPanel {
-    val panel = JPanel()
-    panel.layout = javax.swing.BoxLayout(panel, javax.swing.BoxLayout.X_AXIS)
+    val panel = ActionRowPanel()
+    panel.layout = java.awt.FlowLayout(java.awt.FlowLayout.LEFT, Spacing.S, Spacing.XS)
     panel.isOpaque = false
-    for ((index, button) in buttons.withIndex()) {
-        if (index > 0) panel.add(Box.createHorizontalStrut(Spacing.S))
-        panel.add(button)
-    }
-    panel.add(Box.createHorizontalGlue())
-    panel.maximumSize = Dimension(Int.MAX_VALUE, panel.preferredSize.height)
+    for (button in buttons) panel.add(button)
     return panel
+}
+
+/**
+ * A left-aligned button row that WRAPS when the host narrows (240px tool
+ * window) instead of clipping the trailing controls out of reach. The
+ * preferred height is computed for the width the page layout assigns —
+ * `FlowLayout` performs the actual row wrapping — so the column reserves the
+ * wrapped rows' full height.
+ */
+private class ActionRowPanel : JPanel() {
+    override fun getPreferredSize(): Dimension {
+        val natural = super.getPreferredSize()
+        val target = if (width > 0) width else parent?.width ?: 0
+        if (target <= 0 || natural.width <= target) return natural
+        val layout = layout as? java.awt.FlowLayout ?: return natural
+        val rowHeight = (natural.height - 2 * layout.vgap).coerceAtLeast(1)
+        var rows = 1
+        var x = insets.left
+        for (child in components) {
+            if (!child.isVisible) continue
+            val childWidth = child.preferredSize.width
+            if (x > insets.left &&
+                x + childWidth + layout.hgap > target - insets.right
+            ) {
+                rows++
+                x = insets.left
+            }
+            x += childWidth + layout.hgap
+        }
+        return Dimension(natural.width, natural.height + (rows - 1) * (rowHeight + layout.vgap))
+    }
 }
 
 /**

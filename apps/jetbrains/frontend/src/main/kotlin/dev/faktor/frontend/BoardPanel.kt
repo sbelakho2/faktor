@@ -99,8 +99,9 @@ class BoardPanel : JPanel(BorderLayout()) {
         val subjectRow = JPanel(BorderLayout(Spacing.S, 0))
         subjectRow.isOpaque = false
         subjectRow.add(mutedLabel("Subject"), BorderLayout.WEST)
+        // The Read control lives with the paging actions (below): keeping it
+        // in this row collapsed the subject field to a sliver at 240px.
         subjectRow.add(subjectField, BorderLayout.CENTER)
-        subjectRow.add(readButton, BorderLayout.EAST)
         val bodyLabel = mutedLabel("Body")
         val bodyScroll = JScrollPane(bodyArea)
         val pagingHint = wrappedMutedLabel(
@@ -114,7 +115,7 @@ class BoardPanel : JPanel(BorderLayout()) {
         composer.add(vSpace(Spacing.XS))
         composer.add(bodyScroll)
         composer.add(vSpace(Spacing.S))
-        composer.add(actionRow(loadOlderButton))
+        composer.add(actionRow(loadOlderButton, readButton))
         composer.add(vSpace(Spacing.XS))
         composer.add(pagingHint)
         composer.add(vSpace(Spacing.S))
@@ -138,7 +139,7 @@ class BoardPanel : JPanel(BorderLayout()) {
         headerRow.add(header, BorderLayout.CENTER)
 
         add(headerRow, BorderLayout.NORTH)
-        add(body, BorderLayout.CENTER)
+        add(pageScroll(body), BorderLayout.CENTER)
         setAvailable(false)
     }
 
