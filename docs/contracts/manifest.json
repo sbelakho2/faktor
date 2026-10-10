@@ -2,7 +2,7 @@
   "schema": "faktor-frozen-contracts-manifest/v1",
   "generator": "faktor-contracts",
   "algorithm": "sha256",
-  "digest": "sha256:d0590e37a01e820a2ea4beffc21c8e5e9b5132a48f23bb1492920e13007dd155",
+  "digest": "sha256:0a6174b747449aaaf8ca26910596943baf6e95441df243c350fc9e0bf7f0c2de",
   "files": [
     {
       "path": "docs/contracts/agent-state.json",
@@ -30,7 +30,7 @@
     },
     {
       "path": "docs/contracts/reason-code.json",
-      "sha256": "sha256:14ed0d3396efbb0a29cbf1ca4517cb139453eda3475ee56886fde8893c5e7fe4"
+      "sha256": "sha256:0a7090fe8938957154f30e084d7c3f278d8984ebc450f1ca0b71a18c541162af"
     },
     {
       "path": "docs/contracts/task-state.json",
