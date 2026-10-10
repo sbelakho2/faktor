@@ -238,6 +238,11 @@ run_shell "cd apps/vscode && $NODE_BIN scripts/verify-vsix.mjs faktor-ci.vsix --
 run_shell "rm -rf '$VSIX_DIR/extract' && mkdir -p '$VSIX_DIR/extract' && unzip -q apps/vscode/faktor-ci.vsix -d '$VSIX_DIR/extract'"
 run_shell "cd apps/vscode && $NODE_BIN scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir '$VSIX_DIR/extract/extension'"
 run_shell "cd apps/vscode && $NODE_BIN scripts/selftest.mjs --packaged '$VSIX_DIR/extract/extension'"
+# A VS Code CLI may live at a non-PATH snap location; export it so the
+# packaged-extension load is REAL evidence instead of a recorded skip.
+if [ -z "${VSCODE_CLI:-}" ] && [ -x /snap/bin/code ]; then
+    export VSCODE_CLI=/snap/bin/code
+fi
 run_shell "cd apps/vscode && $NODE_BIN scripts/verify-vsix.mjs faktor-ci.vsix --ide-load"
 # Real Extension Host e2e: run only when the pinned tarball is cached or the
 # pinned URL is reachable; otherwise record an explicit SKIP (never silent).
