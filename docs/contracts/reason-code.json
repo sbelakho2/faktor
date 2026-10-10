@@ -73,6 +73,11 @@
       "name": "UnattributedChange",
       "wire": "unattributed_change",
       "code": "unattributed_change"
+    },
+    {
+      "name": "ProofObligationDisproven",
+      "wire": "proof_obligation_disproven",
+      "code": "proof_obligation_disproven"
     }
   ]
 }
