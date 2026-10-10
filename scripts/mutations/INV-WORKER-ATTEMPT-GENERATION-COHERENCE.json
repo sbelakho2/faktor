@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-ATTEMPT-GENERATION-COHERENCE",
+  "file": "crates/worker/src/service.rs",
+  "find": "        .find(|a| a.generation == generation)\n        .map(|a| a.attempt)\n        .unwrap_or(1)",
+  "replace": "        .find(|_oldest| true)\n        .map(|a| a.attempt)\n        .unwrap_or(1)",
+  "gate": "cargo test -p faktor-worker --lib requeued_generation_attempt_is_leased_then_terminal",
+  "expect": "FAILED",
+  "note": "Looking the attempt up by literal number instead of generation leaves a requeued generation stuck Pending/Leased forever."
+}

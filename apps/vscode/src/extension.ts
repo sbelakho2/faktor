@@ -1981,10 +1981,11 @@ async function startTask(
 
 /**
  * Task-mode completion controls for the command path (the chat composer
- * carries the same three checkboxes): a multi-select list of the three
- * conditional steps. An explicit empty selection = today's default path (no
- * contract, no work item); a DISMISSED picker aborts the flow (the caller
- * must not start the run the operator just cancelled).
+ * carries the same three steps as one ordered finish-level radio group): a
+ * multi-select list of the three conditional steps. An explicit empty
+ * selection = today's default path (no contract, no work item); a DISMISSED
+ * picker aborts the flow (the caller must not start the run the operator
+ * just cancelled).
  */
 async function promptCompletionContract(): Promise<
   NativeCompletionContract | null | undefined

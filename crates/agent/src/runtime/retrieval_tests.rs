@@ -1869,3 +1869,78 @@ async fn index_worker_shutdown_during_an_in_flight_pass_is_terminal_and_bounded(
         Some(faktor_index::WorkerShutdown::NotRunning)
     );
 }
+
+/// Authority law reproducer: an unreadable session identity must SKIP the
+/// durable evidence-poll archive, never fabricate a workspace id. Pre-fix
+/// this filed the diagnostic under `WorkspaceId::new(1)` (the first
+/// workspace of the store — potentially a foreign one).
+#[test]
+fn evidence_poll_archive_skips_when_the_session_identity_is_unreadable() {
+    let (deps, _dir, sid, ws, task_id) = poll_drive_deps(
+        Arc::new(scripted_provider(one_text_turn())),
+        Arc::new(EmptyEvidence),
+    );
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let handle = runtime.deps().session.get_session(sid).unwrap().unwrap();
+    // Corrupt the durable row so the identity read fails typed (the
+    // lifecycle decode fails closed on garbage, so the whole row read is a
+    // typed corruption).
+    runtime
+        .deps()
+        .session
+        .store()
+        .sql_execute(&format!(
+            "UPDATE session SET lifecycle = 'not-a-lifecycle' WHERE id = {}",
+            sid.raw()
+        ))
+        .unwrap();
+    assert!(
+        handle.identity().is_err(),
+        "the corruption must make the identity read fail"
+    );
+    runtime.archive_turn_evidence_poll(
+        &handle,
+        task_id,
+        OpId::new(9),
+        &crate::EvidencePollStatus::Served,
+    );
+    for scope in [ws, WorkspaceId::new(1), WorkspaceId::new(2)] {
+        let durable = archived_poll_statuses(runtime.evidence_authority(), sid, scope, task_id);
+        assert!(
+            durable.is_empty(),
+            "an unreadable identity must never file the archive under a guessed workspace \
+             {scope:?}: {durable:?}"
+        );
+    }
+}
+
+/// Authority law reproducer: a CORRUPT durable activation value is an
+/// unreadable read (`ReadFailed`), never a `Found` empty (inactive) set —
+/// garbage bytes must not silently deactivate every tool.
+#[test]
+fn corrupt_durable_activation_fact_is_a_typed_read_failure() {
+    let (deps, _dir) = deps(scripted_provider(one_text_turn()), vec![]);
+    let runtime = AgentRuntime::new(deps).unwrap();
+    let session = new_session(runtime.deps());
+    let handle = runtime
+        .deps()
+        .session
+        .get_session(session)
+        .unwrap()
+        .unwrap();
+    handle
+        .upsert_memory_fact(
+            TOOL_ACTIVATION_FACT_KIND,
+            TOOL_ACTIVATION_FACT_KEY,
+            "{not json",
+        )
+        .unwrap();
+    let load = runtime.load_tool_activation(&handle);
+    assert_eq!(
+        load.scan,
+        ToolActivationScan::ReadFailed,
+        "a corrupt activation value must be an unreadable read, not an inactive fact: {load:?}"
+    );
+    assert!(load.set.is_empty());
+    assert!(!load.found());
+}

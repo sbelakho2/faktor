@@ -12,12 +12,17 @@
 //   node scripts/verify-vsix.mjs <vsix> --ide-load
 //
 // --ide-load installs the VSIX into an isolated VS Code extensions directory
-// when a `code` CLI harness is available. When none is available it records an
-// explicit skip (never a silent pass) in
+// when a `code` CLI harness is available. Discovery has an explicit
+// precedence: VSCODE_CLI (when it names an executable file), then the common
+// absolute locations /snap/bin/code and /usr/bin/code, then `command -v code`
+// on PATH. When none is usable it records an explicit skip (never a silent
+// pass) naming every probed candidate in
 // target/certification/vsix-ide-load.json and exits 0.
 
 import { execFileSync } from 'node:child_process';
 import {
+  accessSync,
+  constants,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -216,23 +221,69 @@ function writeIdeRecord(record) {
   console.log(`[ide-load] recorded ${path}: ${record.status}`);
 }
 
-function findCodeCli() {
-  if (process.env.VSCODE_CLI !== undefined && process.env.VSCODE_CLI.length > 0) {
-    return existsSync(process.env.VSCODE_CLI) ? process.env.VSCODE_CLI : null;
-  }
+const CODE_ABSOLUTE_CANDIDATES = ['/snap/bin/code', '/usr/bin/code'];
+
+function isExecutableFile(path) {
   try {
-    const found = execFileSync('sh', ['-c', 'command -v code'], { encoding: 'utf8' }).trim();
-    return found.length > 0 ? found : null;
+    accessSync(path, constants.X_OK);
+    return statSync(path).isFile();
   } catch {
-    return null;
+    return false;
   }
 }
 
+/**
+ * Resolve the VS Code CLI with an explicit precedence:
+ *   1. VSCODE_CLI, when it is a real executable file. The name is shared with
+ *      VS Code's own extension-host marker (VSCODE_CLI=1 is exported as a
+ *      boolean, not a path), so a value that is not an executable file must
+ *      fall through to the remaining probes instead of reading as "no CLI";
+ *   2. the common absolute locations `/snap/bin/code` (snap) and
+ *      `/usr/bin/code` (distro package);
+ *   3. `command -v code` on PATH.
+ * Returns { code, probed }: `code` is null only after every candidate was
+ * probed and none is usable, and `probed` records each candidate so the skip
+ * record names exactly what was looked at.
+ */
+function findCodeCli() {
+  const probed = [];
+  const override = (process.env.VSCODE_CLI ?? '').trim();
+  if (override.length > 0) {
+    if (isExecutableFile(override)) {
+      return { code: override, probed };
+    }
+    probed.push(`VSCODE_CLI=${override} (not an executable file)`);
+  } else {
+    probed.push('VSCODE_CLI (unset)');
+  }
+  for (const candidate of CODE_ABSOLUTE_CANDIDATES) {
+    if (isExecutableFile(candidate)) {
+      return { code: candidate, probed };
+    }
+    probed.push(candidate);
+  }
+  let onPath = '';
+  try {
+    onPath = execFileSync('sh', ['-c', 'command -v code'], { encoding: 'utf8' }).trim();
+  } catch {
+    onPath = '';
+  }
+  if (onPath.length > 0 && isExecutableFile(onPath)) {
+    return { code: onPath, probed };
+  }
+  probed.push(
+    onPath.length > 0
+      ? `PATH (\`command -v code\` -> ${onPath}, not an executable file)`
+      : 'PATH (`command -v code`)',
+  );
+  return { code: null, probed };
+}
+
 function ideLoad(vsix) {
-  const code = findCodeCli();
+  const { code, probed } = findCodeCli();
   if (code === null) {
     const reason =
-      'no `code` CLI on PATH (VS Code harness unavailable on this runner); ' +
+      `no usable VS Code \`code\` CLI (probed: ${probed.join('; ')}); ` +
       'the required job still ran the copied-extension assertions';
     console.log(`SKIP  IDE launch: ${reason}`);
     writeIdeRecord({ status: 'skipped', reason, vsix: resolve(vsix) });

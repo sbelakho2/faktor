@@ -815,10 +815,19 @@ impl AgentRuntime {
         turn_op: OpId,
         status: &crate::EvidencePollStatus,
     ) {
-        let workspace_id = handle
-            .identity()
-            .map(|i| i.workspace_id)
-            .unwrap_or_else(|_| WorkspaceId::new(1));
+        // Authority law: an unreadable session identity is never a fabricated
+        // workspace (the sibling `task_facts_for` refuses typed). The
+        // diagnostic archive is SKIPPED loudly instead of being filed under a
+        // guessed workspace id.
+        let Ok(identity) = handle.identity() else {
+            tracing::warn!(
+                session = %handle.id(),
+                turn_op = %turn_op,
+                "evidence-poll status archive skipped: session identity unreadable"
+            );
+            return;
+        };
+        let workspace_id = identity.workspace_id;
         let revision = format!("evidence-poll:{turn_op}");
         let encoded = encode_evidence_poll_status(status);
         if let Err(err) = self.evidence_authority.archive_text(
@@ -1093,18 +1102,24 @@ impl AgentRuntime {
         // Project identity: workspace id from the durable record, project
         // key from the session's durable workspace root when resolvable
         // (honest fallback, never a guess at a private repo identity).
-        let project_key = self
-            .deps
-            .session
-            .resolve_workspace_root(handle.id())
-            .ok()
-            .flatten()
-            .and_then(|root| {
-                root.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .filter(|key| !key.is_empty())
-            .unwrap_or_else(|| "workspace".to_string());
+        let project_key = match self.deps.session.resolve_workspace_root(handle.id()) {
+            Ok(root) => root,
+            Err(e) => {
+                // Typed warn: the hint degrades to no project key, never a
+                // guessed identity, and the failure is visible.
+                tracing::warn!(
+                    error = %e,
+                    "project key hint skipped: workspace root unreadable"
+                );
+                None
+            }
+        }
+        .and_then(|root| {
+            root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| "workspace".to_string());
         let scope = ProjectScope::new(record.workspace_id, &project_key).ok()?;
         let (platform, toolchain, source_hash) = match &record.environment_fingerprint {
             Some(fingerprint) => (
@@ -1667,7 +1682,20 @@ impl AgentRuntime {
             };
             for (kind, key, value) in &page.facts {
                 if kind == TOOL_ACTIVATION_FACT_KIND && key == TOOL_ACTIVATION_FACT_KEY {
-                    let names: Vec<String> = serde_json::from_str(value).unwrap_or_default();
+                    // Authority law: a corrupt durable activation value is an
+                    // UNREADABLE read, never an empty (inactive) set: the
+                    // typed `ReadFailed` scan is the refusal, exactly like a
+                    // failed store read above.
+                    let Ok(names) = serde_json::from_str::<Vec<String>>(value) else {
+                        tracing::warn!(
+                            session = %handle.id(),
+                            "tool activation fact is corrupt; treating the read as failed"
+                        );
+                        return ToolActivationLoad {
+                            set: ToolActivationSet::new(),
+                            scan: ToolActivationScan::ReadFailed,
+                        };
+                    };
                     let mut set = ToolActivationSet::new();
                     for name in names {
                         set.activate(name);

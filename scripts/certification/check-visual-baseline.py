@@ -3,18 +3,21 @@
 
 The JetBrains visual matrix pins one record per platform. A record that was
 copied from another platform (or that lacks the resolved font fingerprint the
-render actually used) is not platform proof: the Darwin lane must verify ITS
-record here, the Windows lane verifies its record in its own PowerShell gate,
-and the Linux parity matrix verifies the linux record in-process.
+render actually used, or whose environment names a different platform) is not
+platform proof: the Darwin lane must verify ITS record here, the Windows lane
+verifies its record in its own PowerShell gate, and the Linux parity matrix
+verifies the linux record in-process.
 
 This gate fails closed unless visual-baselines.json has a record for the
 requested platform whose:
 
+  * environment names THAT platform (the `visualEnvironment()` prefix:
+    `linux-`, `mac-os-`/`darwin-`, `windows-`), so a linux render can never
+    stand in for another platform's record, and
   * environment carries a resolved font fingerprint (a `-f<hex>` suffix), and
   * digest is non-empty, and
   * digest differs from every OTHER platform record (a copied file is not a
-    separately produced render), and
-  * size is a positive integer.
+    separately produced render).
 
 Usage:
   python3 scripts/certification/check-visual-baseline.py --platform macos \
@@ -29,6 +32,16 @@ import re
 import sys
 
 FINGERPRINT = re.compile(r"-f[0-9a-f]{8,}$")
+
+# The environment prefixes the Kotlin visualEnvironment() writer produces per
+# host (os.name slug): Linux -> `linux-…`, macOS -> `mac-os-x-…`, Windows ->
+# `windows-…`. Aliases (`darwin-`) are accepted only as the named platform's
+# own spelling; the prefix binds a record to the host that produced it.
+PLATFORM_ENVIRONMENT_PREFIXES = {
+    "linux": ("linux-",),
+    "macos": ("mac-os-", "darwin-"),
+    "windows": ("windows-",),
+}
 
 
 def fail(detail):
@@ -47,6 +60,13 @@ def record_for(document, platform):
 def check(document, platform):
     """Return a list of problems for one platform record."""
     problems = []
+    prefixes = PLATFORM_ENVIRONMENT_PREFIXES.get(platform)
+    if prefixes is None:
+        return [
+            f"{platform}=unknown-platform (expected one of "
+            + ", ".join(sorted(PLATFORM_ENVIRONMENT_PREFIXES))
+            + "; a record is only accepted for a release platform)"
+        ]
     record = record_for(document, platform)
     if record is None:
         return [f"{platform}=missing (the lane must pin its own record before release)"]
@@ -54,6 +74,11 @@ def check(document, platform):
     if not isinstance(environment, str) or not FINGERPRINT.search(environment):
         problems.append(
             f"{platform}=unfingerprinted (environment {environment!r} lacks a resolved -f<hex> font fingerprint)"
+        )
+    if isinstance(environment, str) and not environment.startswith(prefixes):
+        problems.append(
+            f"{platform}=foreign-environment (environment {environment!r} does not name the "
+            f"{platform} host; prefixes {prefixes}; another platform's render is never accepted)"
         )
     digests = record.get("digests")
     if not isinstance(digests, dict) or not digests:
@@ -120,6 +145,42 @@ def selftest():
                 "macos",
             )
         ),
+    )
+    check_case(
+        "a linux render under the macos key refuses (foreign environment)",
+        any(
+            "foreign-environment" in problem
+            for problem in check(
+                {
+                    "platforms": {
+                        "macos": {
+                            "environment": "linux-amd64-jvm17-f0a1b2c3d4e5",
+                            "digests": {"a": "b" * 64},
+                        }
+                    }
+                },
+                "macos",
+            )
+        ),
+    )
+    check_case(
+        "the darwin alias is accepted as this platform's own spelling",
+        check(
+            {
+                "platforms": {
+                    "macos": {
+                        "environment": "darwin-arm64-jvm17-f0a1b2c3d4e5",
+                        "digests": {"a": "b" * 64},
+                    }
+                }
+            },
+            "macos",
+        )
+        == [],
+    )
+    check_case(
+        "an unknown platform refuses",
+        any("unknown-platform" in problem for problem in check(good, "freebsd")),
     )
     if failures:
         print(f"visual-baseline selftest: FAIL ({failures})", file=sys.stderr)

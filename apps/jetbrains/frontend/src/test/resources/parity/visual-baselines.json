@@ -6,7 +6,11 @@
     "linux": "bash apps/jetbrains/compile-and-smoke.sh --write-baselines (or ./gradlew :frontend:smoke -PwriteBaselines=true) on the Linux host, under the pinned core-fonts fontconfig",
     "fonts": "apps/jetbrains/frontend/src/test/resources/parity/fonts/core-fonts.conf (FONTCONFIG_FILE); digest bounds derive from resolved font metrics"
   },
-  "requiredPlatforms": ["linux", "macos", "windows"],
+  "requiredPlatforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
   "platforms": {
     "linux": {
       "environment": "linux-amd64-jvm17-f29cb65792a65",

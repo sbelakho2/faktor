@@ -160,8 +160,21 @@ pub trait WorkerStore: Send + Sync {
     #[cfg(test)]
     fn inject_next_journal_failure(&self) {}
 
+    /// Test-only one-shot hook run immediately BEFORE `touch_worker` takes
+    /// its lock (heartbeat/revocation race reproducer: a test can perform a
+    /// full revocation in the window between `renew_lease` and the last-seen
+    /// CAS). Production stores keep the no-op default.
+    #[cfg(test)]
+    fn inject_before_worker_touch(&self, _hook: Box<dyn FnOnce() + Send>) {}
+
     fn put_worker(&self, worker: &WorkerRegistration) -> Result<(), WorkerError>;
     fn worker(&self, id: &WorkerId) -> Result<Option<WorkerRegistration>, WorkerError>;
+    /// CAS touch of one worker's `last_seen_ms`: only an EXISTING, NOT
+    /// revoked row advances, and only FORWARD. Returns `false` for a missing
+    /// or revoked row, so a stale heartbeat snapshot can never rewrite a
+    /// full worker row (which would clear a concurrent revocation or revert
+    /// a concurrent capability reconciliation).
+    fn touch_worker(&self, worker: &WorkerId, last_seen_ms: i64) -> Result<bool, WorkerError>;
     fn workers(
         &self,
         organization: &str,
@@ -355,6 +368,10 @@ pub struct MemoryWorkerStore {
     fail_next_workers_read: AtomicBool,
     /// One-shot `try_accept_lease` journal fault (audit P1 reproducer).
     fail_next_journal: AtomicBool,
+    /// One-shot `touch_worker` pre-lock hook (heartbeat/revocation race
+    /// reproducer).
+    #[cfg(test)]
+    before_touch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl MemoryWorkerStore {
@@ -383,6 +400,34 @@ pub(crate) fn content_identity<T: Serialize>(value: &T) -> Result<String, Worker
 impl WorkerStore for MemoryWorkerStore {
     fn put_worker(&self, worker: &WorkerRegistration) -> Result<(), WorkerError> {
         let mut state = self.lock()?;
+        if let Some(existing) = state.workers.get(worker.worker_id.as_str()) {
+            // The binding of an existing worker is immutable through this
+            // raw put (only `register_worker_with_token` may bind), so the
+            // payload can never diverge from the token-hash index; and a
+            // revocation is monotonic: a stale snapshot can never clear it.
+            if existing.token_hash != worker.token_hash {
+                return Err(WorkerError::WorkerAlreadyBound {
+                    worker: worker.worker_id.clone(),
+                    token_hash: existing.token_hash.clone(),
+                });
+            }
+            if existing.revoked && !worker.revoked {
+                return Err(WorkerError::WorkerRevoked(worker.worker_id.clone()));
+            }
+        }
+        // The token row is global (one hash = one org), so the one-worker-
+        // per-hash binding is global too — the structural invariant the
+        // SQLite twin enforces with `UNIQUE (token_hash)`.
+        if let Some(other) = state
+            .workers
+            .values()
+            .find(|w| w.worker_id != worker.worker_id && w.token_hash == worker.token_hash)
+        {
+            return Err(WorkerError::TokenBoundElsewhere {
+                worker: other.worker_id.clone(),
+                token_hash: worker.token_hash.clone(),
+            });
+        }
         state
             .workers
             .insert(worker.worker_id.to_string(), worker.clone());
@@ -401,6 +446,34 @@ impl WorkerStore for MemoryWorkerStore {
     #[cfg(test)]
     fn inject_next_journal_failure(&self) {
         self.fail_next_journal.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_before_worker_touch(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.before_touch_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn touch_worker(&self, worker: &WorkerId, last_seen_ms: i64) -> Result<bool, WorkerError> {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_touch_hook
+                .lock()
+                .map_err(|_| WorkerError::Backend("worker store lock is poisoned".into()))?
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut state = self.lock()?;
+        let Some(row) = state.workers.get_mut(worker.as_str()) else {
+            return Ok(false);
+        };
+        if row.revoked {
+            return Ok(false);
+        }
+        row.last_seen_ms = row.last_seen_ms.max(last_seen_ms);
+        Ok(true)
     }
 
     fn workers(
@@ -481,11 +554,11 @@ impl WorkerStore for MemoryWorkerStore {
         }
         // A legacy partial state can leave the token unconsumed while a
         // worker row already carries its hash: that token is structurally
-        // unavailable to any OTHER worker (audit P1).
+        // unavailable to any OTHER worker (audit P1). The token table is
+        // GLOBAL (one hash = one org), so this refusal is global too — the
+        // same invariant the SQLite twin enforces with `UNIQUE (token_hash)`.
         if let Some(other) = state.workers.values().find(|w| {
-            w.organization_id == registration.organization_id
-                && w.token_hash == registration.token_hash
-                && w.worker_id != registration.worker_id
+            w.token_hash == registration.token_hash && w.worker_id != registration.worker_id
         }) {
             return Err(WorkerError::TokenBoundElsewhere {
                 worker: other.worker_id.clone(),
@@ -701,12 +774,20 @@ impl WorkerStore for MemoryWorkerStore {
                 job.state = crate::model::JobState::Leased;
             }
         }
-        let akey = (lease.job_id.to_string(), lease.generation.as_u64(), 1);
-        if let Some(attempt) = state.attempts.get_mut(&akey) {
-            if attempt.state == AttemptState::Pending {
-                attempt.state = AttemptState::Leased;
-                attempt.worker_id = Some(lease.worker_id.clone());
-                attempt.lease_id = Some(lease.lease_id.clone());
+        // The attempt row of this generation (one attempt per generation;
+        // keyed by the attempt NUMBER, which is not 1 after a requeue).
+        let akey = state
+            .attempts
+            .keys()
+            .find(|(j, g, _)| j == lease.job_id.as_str() && *g == lease.generation.as_u64())
+            .cloned();
+        if let Some(akey) = akey {
+            if let Some(attempt) = state.attempts.get_mut(&akey) {
+                if attempt.state == AttemptState::Pending {
+                    attempt.state = AttemptState::Leased;
+                    attempt.worker_id = Some(lease.worker_id.clone());
+                    attempt.lease_id = Some(lease.lease_id.clone());
+                }
             }
         }
         for entry in journal {
@@ -952,11 +1033,19 @@ impl WorkerStore for MemoryWorkerStore {
         if let Some(root) = state.jobs.get_mut(result.job_id.as_str()) {
             root.state = crate::model::JobState::Completed;
         }
-        let akey = (result.job_id.to_string(), result.generation.as_u64(), 1);
-        if let Some(attempt) = state.attempts.get_mut(&akey) {
-            if !attempt.state.is_terminal() {
-                attempt.state = AttemptState::Completed;
-                attempt.ended_ms = Some(result.accepted_ms);
+        // The attempt row of this generation (keyed by its attempt NUMBER,
+        // which is not 1 after a requeue).
+        let akey = state
+            .attempts
+            .keys()
+            .find(|(j, g, _)| j == result.job_id.as_str() && *g == result.generation.as_u64())
+            .cloned();
+        if let Some(akey) = akey {
+            if let Some(attempt) = state.attempts.get_mut(&akey) {
+                if !attempt.state.is_terminal() {
+                    attempt.state = AttemptState::Completed;
+                    attempt.ended_ms = Some(result.accepted_ms);
+                }
             }
         }
         Ok(ResultAppend::Landed)
@@ -1221,8 +1310,48 @@ impl WorkerStore for SqliteWorkerStore {
     }
 
     fn put_worker(&self, worker: &WorkerRegistration) -> Result<(), WorkerError> {
-        let conn = self.lock()?;
-        conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        if let Some(existing_payload) =
+            payload_string(&tx, "wp_worker", "id", worker.worker_id.as_str())?
+        {
+            let existing: WorkerRegistration = parse(&existing_payload)?;
+            // The binding of an existing worker is immutable through this raw
+            // put (only `register_worker_with_token` may bind), so the payload
+            // can never diverge from the token-hash column; and a revocation
+            // is monotonic: a stale snapshot can never clear it.
+            if existing.token_hash != worker.token_hash {
+                return Err(WorkerError::WorkerAlreadyBound {
+                    worker: worker.worker_id.clone(),
+                    token_hash: existing.token_hash.clone(),
+                });
+            }
+            if existing.revoked && !worker.revoked {
+                return Err(WorkerError::WorkerRevoked(worker.worker_id.clone()));
+            }
+        }
+        // The token table is global (one hash = one org), so the one-worker-
+        // per-hash binding is global too — exactly what `UNIQUE (token_hash)`
+        // enforces structurally; the check turns the raw constraint failure
+        // into the same typed refusal the memory twin returns.
+        let other_payload: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM wp_worker WHERE token_hash = ?1 AND id != ?2",
+                params![worker.token_hash, worker.worker_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(payload) = other_payload {
+            let other: WorkerRegistration = parse(&payload)?;
+            return Err(WorkerError::TokenBoundElsewhere {
+                worker: other.worker_id,
+                token_hash: worker.token_hash.clone(),
+            });
+        }
+        tx.execute(
             "INSERT INTO wp_worker (id, organization_id, trust_domain, revoked, token_hash, payload)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
@@ -1240,6 +1369,7 @@ impl WorkerStore for SqliteWorkerStore {
             ],
         )
         .map_err(backend)?;
+        tx.commit().map_err(backend)?;
         Ok(())
     }
 
@@ -1249,6 +1379,38 @@ impl WorkerStore for SqliteWorkerStore {
             Some(payload) => Ok(Some(parse(&payload)?)),
             None => Ok(None),
         }
+    }
+
+    fn touch_worker(&self, worker: &WorkerId, last_seen_ms: i64) -> Result<bool, WorkerError> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM wp_worker WHERE id = ?1",
+                params![worker.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(payload) = payload else {
+            tx.commit().map_err(backend)?;
+            return Ok(false);
+        };
+        let mut row: WorkerRegistration = parse(&payload)?;
+        if row.revoked {
+            tx.commit().map_err(backend)?;
+            return Ok(false);
+        }
+        row.last_seen_ms = row.last_seen_ms.max(last_seen_ms);
+        tx.execute(
+            "UPDATE wp_worker SET payload = ?2 WHERE id = ?1",
+            params![worker.as_str(), encode(&row)?],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(true)
     }
 
     fn workers(
@@ -1351,14 +1513,15 @@ impl WorkerStore for SqliteWorkerStore {
         }
         // A legacy partial state can leave the token unconsumed while a
         // worker row already carries its hash: that token is structurally
-        // unavailable to any OTHER worker (audit P1).
+        // unavailable to any OTHER worker (audit P1). The token table is
+        // GLOBAL (one hash = one org), so this refusal is global too — the
+        // same invariant `UNIQUE (token_hash)` enforces structurally.
         let other_payload: Option<String> = tx
             .query_row(
                 "SELECT payload FROM wp_worker
-                 WHERE organization_id = ?1 AND token_hash = ?2 AND id != ?3
+                 WHERE token_hash = ?1 AND id != ?2
                  ORDER BY id LIMIT 1",
                 params![
-                    registration.organization_id.as_str(),
                     registration.token_hash.as_str(),
                     registration.worker_id.as_str()
                 ],

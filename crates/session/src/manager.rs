@@ -576,10 +576,12 @@ impl SessionManager {
     /// `doctor`-style health report: store diagnostics + recovery scan.
     pub fn integrity_report(&self) -> faktor_core::Result<serde_json::Value> {
         let diagnostics = self.store().diagnostics().map_err(crate::map_store_err)?;
+        // Authority law: an unreadable recovery scan is a typed error, never
+        // a false-clean "0 orphaned runs" health claim.
         let pending = self
             .store()
             .pending_tool_runs(SessionId::new(1))
-            .unwrap_or_default()
+            .map_err(crate::map_store_err)?
             .len();
         let mut v = diagnostics.as_object().cloned().unwrap_or_default();
         v.insert("orphaned_runs".into(), serde_json::json!(pending));

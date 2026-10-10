@@ -1019,7 +1019,7 @@ object FrontendSmoke {
             assertEquals(listOf("[succeeded] commit - abc"), TaskTreePanel().completionLabels(daemon))
         }
 
-        step("Task-mode contract controls are checked only in the Task tab") {
+        step("Task-mode contract controls are checked only in the Work composer") {
             val panel = FaktorChatPanel(
                 FaktorFrontendService(
                     Paths.get("target/debug/faktor-cli"),

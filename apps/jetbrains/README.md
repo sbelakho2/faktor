@@ -16,7 +16,7 @@ were removed by the Faktor-owned-UI migration).
 | --- | --- |
 | `:shared` | `dev.faktor.shared` — plain Kotlin data classes with zero dependencies. `Protocol.kt` holds only the daemon stdout startup-line and the Faktor-native bearer auth form; `NativeProtocol.kt` is the native surface: a JSON value model, a recursive-descent reader/writer, typed DTO parsers (incl. providers and terminals), and the strict request bodies. |
 | `:backend` | `dev.faktor.backend` — `BackendProcessManager` (launch, startup line, bounded stdout drainer, SIGTERM-then-forcible stop), `NativeClient` (bearer-authenticated HTTP client of the native endpoints incl. providers/terminals/output), `NativeEventStream` (SSE journal stream with cursor resume and bounded backoff). |
-| `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop/attach/restart, session, task-run/agent/usage/verification/evidence/provider/terminal routing, stream lifecycle and `reconnectStream` cursor resume), `FaktorChatPanel` (native Swing tool-window panel with Status, Task, Task Tree, Agents, Permissions, Tournament, Board, Evidence, Terminal, Settings and History tabs) plus the section panels (`TaskTreePanel`, `BlockersPanel`, `PermissionsPanel`, `TerminalPanel`, `SettingsPanel`, `HistoryPanel`, `TournamentPanel`, `BoardPanel`, `EvidenceNavigatorPanel`, `AttachmentsPanel`) and `FaktorToolWindowFactory` (the IntelliJ tool-window host). `FaktorFrontendApp` launches the panel standalone. `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
+| `:frontend` | `dev.faktor.frontend` — `FaktorFrontendService` (the UI-free bridge: start/stop/attach/restart, session, task-run/agent/usage/verification/evidence/provider/terminal routing, stream lifecycle and `reconnectStream` cursor resume) and `FaktorChatPanel`, the native Swing tool-window panel. Its inspector navigation is exactly three cluster destinations: **Work** (conversation + current run + ONE composer with the Run options disclosure), **Inspect** (Overview, Plan with Compare approaches, Changes, Verification, and Agents with Roster / Approvals / Coordination) and **History** (prior work only: title, durable time, outcome, search). Settings, Usage and Diagnostics are contextual utilities opened from the header/overflow and dismissed back to the clusters, never destinations; permissions render as the contextual Approvals surface and the board lives under Agents → Coordination. The section panels are `TaskTreePanel`, `BlockersPanel`, `PermissionsPanel`, `TerminalPanel`, `SettingsPanel`, `UsagePanel`, `DiagnosticsPanel`, `HistoryPanel`, `TournamentPanel`, `BoardPanel`, `EvidenceNavigatorPanel`, `AgentsPanel`, `OverviewPanel`, `ChangesPanel`, `VerificationPanel` and `AttachmentsPanel`; `FaktorToolWindowFactory` is the IntelliJ tool-window host. `FaktorFrontendApp` launches the panel standalone (smoke/diagnostic path). `src/main/resources/META-INF/plugin.xml` is the real plugin descriptor (`dev.faktor.jetbrains`, name/vendor `Faktor`, version `0.1.0`, `since-build 241`). |
 
 ## Authentication and lifecycle
 
@@ -106,6 +106,73 @@ IntelliJ IDEA Community 2024.1.7 installer from the JetBrains CDN
 (JDK 17 toolchain). The project cache is redirected under `build/` via
 `org.jetbrains.intellij.platform.intellijPlatformCache`, so no generated
 state lands outside gitignored directories.
+
+### Real IDE host journey (JetBrains platform integration lane)
+
+The audit-grade interaction journey runs inside the REAL IntelliJ Platform
+test application, not an offscreen render harness: it opens a
+`ProjectManager` project, registers the `plugin.xml` Faktor tool-window bean
+through the platform's own registration API, creates content through the
+production `FaktorToolWindowFactory` (the run shows the `Work / Inspect /
+History` clusters and the ONE composer), requests composer focus, types
+through the composer's own typed-character editor action (the action the
+Swing keymap dispatches for `KEY_TYPED`), and dispatches the exact action
+bound to Ctrl+Enter while observing the immutable submission id + goal.
+Evidence is written to `target/certification/jetbrains-ide-journey/`
+(`journey.json` plus `faktor-tool-window.png`, a render of the real
+platform-created component tree).
+
+```bash
+bash apps/jetbrains/ide-journey.sh                    # probe + run (lane)
+cd apps/jetbrains && ./gradlew :frontend:ideJourney   # direct Gradle task
+```
+
+- Availability: the lane needs the pinned IntelliJ IDEA Community 2024.1.7
+  distribution either cached under `~/.gradle/caches/.../idea/ideaIC/` plus
+  the platform test runtime, or reachable from the JetBrains repository.
+  `ide-journey.sh` probes both (the network probe is a bounded 6 s HEAD);
+  when neither holds it records
+  `target/certification/jetbrains-ide-journey/skip.json` and prints
+  `SKIPPED` — a skip is never reported as a run.
+- What the journey does NOT prove (recorded in `journey.json` as
+  `does_not_prove`): OS-level focus ownership (the platform test harness has
+  no showing window; the focus request routing is the observable) and daemon
+  connectivity (no daemon binary is configured for this lane; the send's
+  transport failure is expected and does not fail the journey).
+- A plain `:frontend:test` run prints `IDE JOURNEY SKIPPED`; only
+  `:frontend:ideJourney` (or `ide-journey.sh`) executes the journey.
+
+### Per-platform visual-baseline acceptance (one command per platform)
+
+Each release platform pins only its OWN render. The acceptance tool is
+host-bound: it refuses a record for any platform other than the host it runs
+on, requires the `environment` to name that platform (`linux-`, `mac-os-` /
+`darwin-`, `windows-`) with the resolved `-f<hex>` font fingerprint, and
+requires digests distinct from every other platform's. A linux run can
+therefore never write the macos/windows record, and a copied or
+fingerprint-less record is refused. One documented command per platform,
+run ON that platform:
+
+```bash
+# Linux host (renders, validates and pins the linux record):
+node scripts/certification/accept-visual-baseline.mjs linux --render
+# macOS host:
+node scripts/certification/accept-visual-baseline.mjs macos --render
+# Windows host, Git Bash (the owned certifying lane also captures the merged
+# file at target/certification/visual-baselines-windows.json):
+node scripts/certification/accept-visual-baseline.mjs windows --render
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-visual-baseline.ps1 -WriteBaselines
+```
+
+`--render` runs `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`
+on this host; the Kotlin writer detects the host platform itself (it is never
+passed in) and re-pins only that platform's record with its resolved-font
+environment fingerprint. To accept a record file produced elsewhere by its
+own lane:
+`node scripts/certification/accept-visual-baseline.mjs windows target/certification/visual-baselines-windows.json`.
+The legacy fingerprint-less `macos` record in this tree stays
+`unfingerprinted` (the canonical checker refuses it) until a real Mac host
+runs the command above; that is a recorded evidence gap, not a pass.
 
 ### kotlinc + daemon smoke (fallback, no Gradle)
 

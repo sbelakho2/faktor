@@ -1972,3 +1972,421 @@ fn seeded_model_preserves_identity_and_journal_invariants_across_sqlite_reopen()
     reopened.accepted_leases = accepted;
     reopened.check_invariants();
 }
+
+// --------------------------- audit P1 follow-up: attempt/lease coherence
+
+/// The attempt row belongs to its GENERATION, not to the number 1: a lease
+/// accepted for a requeued generation moves THAT attempt to `leased` (both
+/// twins), and when the lease is lost the attempt becomes terminal with an
+/// end time — a lost lease can never leave a live-looking attempt behind.
+#[test]
+fn requeued_generation_attempt_is_leased_then_terminal() {
+    for (label, h) in harnesses() {
+        let _token = h.register("wrk_1", &["rust"]);
+        let job = h.schedule("attempt-coherence", &digest("a"));
+        assert!(job.lease.is_some(), "{label}");
+        // Expire generation 1 -> requeue to generation 2 (auto-assigned).
+        h.clock.advance(60_000);
+        let r1 = h.plane.recover(&org("org_1")).unwrap();
+        assert_eq!(r1.requeued.len(), 1, "{label}: {r1:?}");
+        let status = h.plane.job_status(&org("org_1"), &job.job.job_id).unwrap();
+        assert_eq!(status.job.current_generation.as_u64(), 2, "{label}");
+        let gen2 = status
+            .attempts
+            .iter()
+            .find(|a| a.generation.as_u64() == 2)
+            .unwrap_or_else(|| panic!("{label}: generation 2 has its attempt row"));
+        assert_eq!(
+            gen2.state,
+            AttemptState::Leased,
+            "{label}: accepting generation 2 must move ITS attempt row to leased"
+        );
+        // Expire generation 2 -> requeue to generation 3.
+        h.clock.advance(60_000);
+        let r2 = h.plane.recover(&org("org_1")).unwrap();
+        assert_eq!(r2.requeued.len(), 1, "{label}: {r2:?}");
+        let status = h.plane.job_status(&org("org_1"), &job.job.job_id).unwrap();
+        for attempt in &status.attempts {
+            if attempt.generation != status.job.current_generation {
+                assert!(
+                    attempt.state.is_terminal(),
+                    "{label}: attempt of lost generation {} must be terminal, got {:?}",
+                    attempt.generation.as_u64(),
+                    attempt.state
+                );
+                assert!(
+                    attempt.ended_ms.is_some(),
+                    "{label}: terminal attempt must carry ended_ms: {attempt:?}"
+                );
+            }
+        }
+    }
+}
+
+// ----------------------- audit P1 follow-up: revocation is not resurrectable
+
+/// A stale full worker snapshot (exactly what `heartbeat` reads in
+/// `authenticate` and used to write back wholesale) can never clear a
+/// durable revocation: the raw write refuses typed, the row stays revoked,
+/// the plane places no work, and the in-flight heartbeat that raced the
+/// revocation is refused typed instead of winning.
+#[test]
+fn stale_worker_snapshot_cannot_resurrect_a_revocation() {
+    for (label, h) in harnesses() {
+        let token = h.register("wrk_a", &["rust"]);
+        let hash = TokenHash::of(token.expose()).as_str().to_string();
+        let stale = h.store.worker(&worker_id("wrk_a")).unwrap().unwrap();
+        assert!(!stale.revoked, "{label}");
+        h.plane
+            .revoke_worker(&org("org_1"), &worker_id("wrk_a"))
+            .unwrap();
+        // The exact tail `WorkerPlane::heartbeat` used to run after
+        // `renew_lease`: write the stale snapshot back with a fresh
+        // last_seen. It must be refused, and nothing may move.
+        let err = h
+            .store
+            .put_worker(&WorkerRegistration {
+                last_seen_ms: h.clock.now_ms(),
+                ..stale.clone()
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::WorkerRevoked(ref w) if w.as_str() == "wrk_a"),
+            "{label}: {err}"
+        );
+        let after = h.store.worker(&worker_id("wrk_a")).unwrap().unwrap();
+        assert!(after.revoked, "{label}: the revocation survives");
+        assert_eq!(after.last_seen_ms, stale.last_seen_ms, "{label}");
+        assert!(
+            h.store.token(&hash).unwrap().unwrap().revoked,
+            "{label}: the token stays revoked"
+        );
+        assert!(
+            h.plane
+                .find_eligible(&org("org_1"), "org_1", &requirements())
+                .unwrap()
+                .is_none(),
+            "{label}: a revoked worker is never eligible"
+        );
+        let job = h.schedule("resurrect", &digest("c"));
+        assert!(job.lease.is_none(), "{label}: no work after revocation");
+    }
+}
+
+/// The heartbeat/revocation race itself, deterministically: the test-only
+/// hook completes a full revocation in the window between `renew_lease` and
+/// the last-seen CAS. The heartbeat must return a typed refusal and the
+/// durable revocation must stand — the stale snapshot never lands.
+#[test]
+fn heartbeat_losing_the_revocation_race_is_refused_and_cannot_resurrect() {
+    let h = Harness::memory();
+    let token = h.register("wrk_race", &["rust"]);
+    let job = h.schedule("race", &digest("d"));
+    let lease = job.lease.clone().unwrap();
+    let plane = h.plane.clone();
+    let worker = worker_id("wrk_race");
+    let hook_worker = worker.clone();
+    h.store.inject_before_worker_touch(Box::new(move || {
+        plane
+            .revoke_worker(&org("org_1"), &hook_worker)
+            .expect("the revocation in the race window must succeed");
+    }));
+    let err = h
+        .plane
+        .heartbeat(
+            &org("org_1"),
+            &worker,
+            &token,
+            WORKER_PROTOCOL_VERSION,
+            &lease.lease_id,
+            JobGeneration::FIRST,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, WorkerError::WorkerRevoked(_)),
+        "the heartbeat that raced the revocation must be refused typed: {err}"
+    );
+    let after = h.store.worker(&worker).unwrap().unwrap();
+    assert!(after.revoked, "the revocation was resurrected: {after:?}");
+    assert!(
+        h.store.live_leases_of_worker(&worker).unwrap().is_empty(),
+        "no live lease may survive the revocation race"
+    );
+    assert!(
+        h.plane
+            .find_eligible(&org("org_1"), "org_1", &requirements())
+            .unwrap()
+            .is_none(),
+        "a revoked worker is never eligible"
+    );
+}
+
+// ----------------------- audit P1 follow-up: token-hash binding is global
+
+/// The token table is global (one hash = one org), so a second worker — in
+/// THIS organization or ANY other — can never bind a hash another worker
+/// already carries. Both twins refuse typed (never a raw UNIQUE backend
+/// error) and no second row appears.
+#[test]
+fn duplicate_token_hash_binding_is_refused_typed_across_orgs() {
+    for (label, h) in harnesses() {
+        let issued = h
+            .plane
+            .mint_registration_token(&org("org_1"), "org_1", "wl")
+            .unwrap();
+        let plain = SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+        h.plane
+            .register(
+                &org("org_1"),
+                &worker_id("wrk_a"),
+                &plain,
+                caps("linux", &["rust"]),
+                "a",
+            )
+            .unwrap();
+        // Tamper the admin surface: the token row moves to org_2 unconsumed
+        // (a legacy/partial state the structural index must still refuse).
+        let mut row = h.store.token(&issued.token_hash).unwrap().unwrap();
+        row.organization_id = "org_2".into();
+        row.trust_domain = "org_2".into();
+        row.consumed_by = None;
+        h.store.put_token(&row).unwrap();
+        let mut caps2 = caps("linux", &["rust"]);
+        caps2.trust_domain = "org_2".into();
+        let err = h
+            .plane
+            .register(&org("org_2"), &worker_id("wrk_b"), &plain, caps2, "b")
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::TokenBoundElsewhere { ref worker, .. } if worker.as_str() == "wrk_a"),
+            "{label}: {err}"
+        );
+        assert!(
+            h.store.worker(&worker_id("wrk_b")).unwrap().is_none(),
+            "{label}: no second worker row"
+        );
+        assert_eq!(
+            h.store
+                .workers_by_token_hash("org_1", &issued.token_hash)
+                .unwrap()
+                .len(),
+            1,
+            "{label}: the one binding is the original org_1 worker"
+        );
+    }
+}
+
+/// A raw `put_worker` can neither change an existing worker's token binding
+/// (which would diverge the payload from the token-hash index) nor duplicate
+/// a hash another worker holds. Both twins refuse typed and stay coherent.
+#[test]
+fn raw_put_worker_cannot_rebind_or_duplicate_a_token_hash() {
+    for (label, h) in harnesses() {
+        let _t = h.register("wrk_a", &["rust"]);
+        let mut w = h.store.worker(&worker_id("wrk_a")).unwrap().unwrap();
+        let old_hash = w.token_hash.clone();
+        w.token_hash = "f".repeat(64);
+        let err = h.store.put_worker(&w).unwrap_err();
+        assert!(
+            matches!(err, WorkerError::WorkerAlreadyBound { .. }),
+            "{label}: rebinding through a raw put must refuse typed: {err}"
+        );
+        let read = h.store.worker(&worker_id("wrk_a")).unwrap().unwrap();
+        assert_eq!(
+            read.token_hash, old_hash,
+            "{label}: the binding is unchanged"
+        );
+        assert_eq!(
+            h.store
+                .workers_by_token_hash("org_1", &old_hash)
+                .unwrap()
+                .len(),
+            1,
+            "{label}: the index still names the worker"
+        );
+        // A NEW worker id carrying an already-bound hash is refused too.
+        let mut clone = read.clone();
+        clone.worker_id = worker_id("wrk_b");
+        let err = h.store.put_worker(&clone).unwrap_err();
+        assert!(
+            matches!(err, WorkerError::TokenBoundElsewhere { .. }),
+            "{label}: {err}"
+        );
+        assert!(h.store.worker(&worker_id("wrk_b")).unwrap().is_none());
+    }
+}
+
+// -------------------- audit P1 follow-up: crash windows between store ops
+
+/// Crash AFTER `end_lease` committed but BEFORE the requeue tail: the
+/// durable state is a non-live lease on a generation still marked `leased`.
+/// Recovery must complete the loss (attempt terminal, bounded requeue) —
+/// never leave the job stranded forever.
+#[test]
+fn crash_after_end_lease_is_completed_by_recovery() {
+    for (label, h) in harnesses() {
+        h.register("wrk_1", &["rust"]);
+        let job = h.schedule("crash-end-lease", &digest("e"));
+        let lease = job.lease.clone().unwrap();
+        // The FIRST store operation `end_lease_and_requeue` runs, then the
+        // process dies (the generation/attempt/requeue tail never ran).
+        assert!(h
+            .store
+            .end_lease(
+                &lease.lease_id,
+                JobGeneration::FIRST,
+                LeaseState::Expired,
+                h.clock.now_ms(),
+                "crash",
+            )
+            .unwrap());
+        // Restart: a new plane over the same durable state.
+        let plane = WorkerPlane::new(h.store.clone(), h.clock.clone());
+        let report = plane.recover(&org("org_1")).unwrap();
+        assert!(
+            report.expired.contains(&lease.lease_id.to_string()),
+            "{label}: recovery reports the completed loss: {report:?}"
+        );
+        let status = plane.job_status(&org("org_1"), &job.job.job_id).unwrap();
+        assert_eq!(
+            status.generations[0].state,
+            GenerationState::Lost,
+            "{label}: the interrupted generation is lost"
+        );
+        assert_eq!(
+            status.attempts[0].state,
+            AttemptState::Lost,
+            "{label}: the interrupted attempt is terminal"
+        );
+        assert!(
+            status.attempts[0].ended_ms.is_some(),
+            "{label}: terminal attempt carries ended_ms"
+        );
+        assert_eq!(
+            status.job.current_generation.as_u64(),
+            2,
+            "{label}: the bounded requeue ran (never stranded)"
+        );
+        // Idempotent: a second sweep changes nothing.
+        let again = plane.recover(&org("org_1")).unwrap();
+        assert!(
+            again.requeued.is_empty() && again.expired.is_empty(),
+            "{label}: {again:?}"
+        );
+        let status = plane.job_status(&org("org_1"), &job.job.job_id).unwrap();
+        assert_eq!(status.generations.len(), 2, "{label}: no extra generation");
+    }
+}
+
+/// The plane's durable order for a minted job is index-first: a crash
+/// between the `job_scheduled` journal row and the job/generation/attempt
+/// insert leaves ONLY a dangling row, which every recovery/claim path skips
+/// without error, and the same key schedules cleanly afterwards.
+#[test]
+fn dangling_job_scheduled_index_row_is_inert() {
+    for (label, h) in harnesses() {
+        let token = h.register("wrk_1", &["rust"]);
+        let job_id = ExecutionJobId::try_new(format!("job_dangling_{label}")).unwrap();
+        h.store
+            .append_journal(
+                &JournalEntry::new(
+                    "org_1",
+                    "job_scheduled",
+                    h.clock.now_ms(),
+                    "crash-window probe",
+                )
+                .unwrap()
+                .with_job(&job_id, JobGeneration::FIRST),
+            )
+            .unwrap();
+        let plane = WorkerPlane::new(h.store.clone(), h.clock.clone());
+        assert!(plane.recover(&org("org_1")).unwrap().is_empty(), "{label}");
+        assert!(
+            plane
+                .resume_assignments(&org("org_1"))
+                .unwrap()
+                .reassigned
+                .is_empty(),
+            "{label}"
+        );
+        assert!(
+            plane
+                .claim_next(
+                    &org("org_1"),
+                    &worker_id("wrk_1"),
+                    &token,
+                    WORKER_PROTOCOL_VERSION
+                )
+                .unwrap()
+                .is_none(),
+            "{label}: a dangling index row is never claimed"
+        );
+        // The key schedules cleanly: the dangling row neither blocks nor
+        // duplicates a fresh mint.
+        let scheduled = h.schedule("dangling", &digest("g"));
+        assert!(scheduled.lease.is_some(), "{label}");
+        assert!(!scheduled.replay, "{label}");
+    }
+}
+
+/// Reopen after a lease accept whose journal rows were deleted out-of-band:
+/// the durable lease is resumed and NO duplicate assignment/generation may
+/// ever be minted by recovery.
+#[test]
+fn journal_deleted_after_accept_reopen_is_duplicate_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delete-journal.db");
+    let store: Arc<dyn WorkerStore> = Arc::new(SqliteWorkerStore::open(&path).unwrap());
+    let clock = Arc::new(ManualClock::new(1_000_000));
+    let plane = WorkerPlane::new(store.clone(), clock.clone());
+    let issued = plane
+        .mint_registration_token(&org("org_1"), "org_1", "wl")
+        .unwrap();
+    let plain = SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+    plane
+        .register(
+            &org("org_1"),
+            &worker_id("wrk_1"),
+            &plain,
+            caps("linux", &["rust"]),
+            "w",
+        )
+        .unwrap();
+    let job = plane
+        .schedule_job(
+            &org("org_1"),
+            "org_1",
+            &JobKey::try_new("delete-journal").unwrap(),
+            requirements(),
+            &digest("h"),
+            RequeuePolicy { max_attempts: 3 },
+            None,
+        )
+        .unwrap();
+    let lease = job.lease.clone().unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM wp_journal", []).unwrap();
+    }
+    drop(plane);
+    drop(store);
+    let store: Arc<dyn WorkerStore> = Arc::new(SqliteWorkerStore::open(&path).unwrap());
+    let plane = WorkerPlane::new(store, clock);
+    let report = plane.recover(&org("org_1")).unwrap();
+    assert_eq!(
+        report.resumed,
+        vec![lease.lease_id.to_string()],
+        "the accepted lease is resumed untouched"
+    );
+    assert!(
+        plane
+            .resume_assignments(&org("org_1"))
+            .unwrap()
+            .reassigned
+            .is_empty(),
+        "no duplicate assignment"
+    );
+    let status = plane.job_status(&org("org_1"), &job.job.job_id).unwrap();
+    assert_eq!(status.generations.len(), 1, "no duplicate generation");
+    assert_eq!(status.lease.unwrap().lease_id, lease.lease_id);
+}

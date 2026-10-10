@@ -540,8 +540,13 @@ impl WorkerPlane {
             ended_ms: None,
             reason: None,
         };
-        self.store
-            .insert_generation_and_attempt(&job, &generation, &attempt)?;
+        // Audit P1 follow-up (crash between store operations): the journal
+        // row is the durable INDEX of a minted job, so it is written BEFORE
+        // the job/generation/attempt rows. A crash after the journal append
+        // leaves a dangling index row that recovery skips (the job is
+        // missing), and the scheduler's same-key retry mints the job fresh;
+        // the old order (job first, index second) left a minted job that was
+        // invisible to `claim_next`/`resume_assignments` forever.
         self.journal(
             organization.as_str(),
             "job_scheduled",
@@ -551,6 +556,8 @@ impl WorkerPlane {
             Some(JobGeneration::FIRST),
             format!("job_key={job_key} digest={payload_digest}"),
         )?;
+        self.store
+            .insert_generation_and_attempt(&job, &generation, &attempt)?;
         let lease = match worker {
             Some(worker) => Some(self.accept_lease_inner(
                 &worker,
@@ -1038,10 +1045,22 @@ impl WorkerPlane {
                 }),
             };
         }
-        self.store.put_worker(&WorkerRegistration {
-            last_seen_ms: now,
-            ..worker.clone()
-        })?;
+        // Audit P1 follow-up: the last-seen update is a CAS touch, never a
+        // full-row rewrite of the stale `authenticate` snapshot. A concurrent
+        // revocation that landed after `renew_lease` refuses here (typed)
+        // instead of being silently cleared, and a concurrent capability
+        // reconciliation is never reverted.
+        if !self.store.touch_worker(&worker.worker_id, now)? {
+            return match self.store.worker(&worker.worker_id)? {
+                Some(after) if after.revoked => {
+                    Err(WorkerError::WorkerRevoked(worker.worker_id.clone()))
+                }
+                Some(_) => Err(WorkerError::Backend(
+                    "worker last-seen touch refused for a non-revoked row".into(),
+                )),
+                None => Err(WorkerError::UnknownWorker(worker.worker_id.clone())),
+            };
+        }
         Ok(HeartbeatOutcome {
             lease_id: lease_id.clone(),
             generation,
@@ -1316,9 +1335,12 @@ impl WorkerPlane {
     /// The deterministic recovery sweep. Idempotent: a second immediate call
     /// is empty. Live leases inside their window are RESUMED untouched; live
     /// leases past their window EXPIRE (attempt lost + bounded requeue);
-    /// assigned generations without a lease are re-assigned to an eligible
-    /// worker when one exists. Result acceptance is never duplicated: the
-    /// durable result row is unique per generation.
+    /// crash-interrupted lease-loss transitions (a non-live lease on a
+    /// current generation still marked `leased`, or a `lost` generation
+    /// whose attempt/requeue tail never ran) are COMPLETED from the durable
+    /// rows; assigned generations without a lease are re-assigned to an
+    /// eligible worker when one exists. Result acceptance is never
+    /// duplicated: the durable result row is unique per generation.
     pub fn recover(&self, organization: &OrganizationId) -> Result<RecoveryReport, WorkerError> {
         let now = self.now_ms();
         let mut report = RecoveryReport::default();
@@ -1336,7 +1358,90 @@ impl WorkerPlane {
             }
         }
         report.resumed.sort();
+        // Audit P1 follow-up (crash between store operations): a crash after
+        // `end_lease` committed but before the generation/attempt/requeue
+        // tail leaves a non-live lease on a generation still marked
+        // `leased` (or a `lost` generation whose attempt is not terminal and
+        // whose requeue never ran). That state is invisible to the live-lease
+        // sweep above; finish it here so a crashed lease loss can never
+        // strand a job. Never a blind re-run: every step is the same CAS tail
+        // the original operation would have executed.
+        self.finish_interrupted_lease_losses(organization, now, &mut report)?;
         Ok(report)
+    }
+
+    /// Complete every crash-interrupted lease-loss transition of one
+    /// organization, indexed by the journal's scheduled/requeued job rows.
+    /// A generation is only touched when its CURRENT generation is `leased`
+    /// or `lost` AND its lease row is not `live` (a healthy live lease is
+    /// the ordinary path, handled above).
+    fn finish_interrupted_lease_losses(
+        &self,
+        organization: &OrganizationId,
+        now: i64,
+        report: &mut RecoveryReport,
+    ) -> Result<(), WorkerError> {
+        let mut after: Option<i64> = None;
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        loop {
+            let page = self
+                .store
+                .journal(organization.as_str(), after, MAX_JOURNAL_PAGE)?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|e| e.seq);
+            let short_page = page.len() < MAX_JOURNAL_PAGE;
+            for entry in &page {
+                if entry.kind != "job_scheduled" && entry.kind != "job_requeued" {
+                    continue;
+                }
+                let Some(job_id_raw) = &entry.job_id else {
+                    continue;
+                };
+                if !seen.insert(job_id_raw.clone()) {
+                    continue;
+                }
+                let Ok(job_id) = crate::ids::ExecutionJobId::try_new(job_id_raw.clone()) else {
+                    continue;
+                };
+                let Some(job) = self.store.job(&job_id)? else {
+                    continue;
+                };
+                if job.organization_id != organization.as_str() || job.state.is_terminal() {
+                    continue;
+                }
+                let Some(generation_row) =
+                    self.store.generation(&job_id, job.current_generation)?
+                else {
+                    continue;
+                };
+                if generation_row.state != GenerationState::Leased
+                    && generation_row.state != GenerationState::Lost
+                {
+                    continue;
+                }
+                let Some(lease) = self
+                    .store
+                    .lease_for_generation(&job_id, job.current_generation)?
+                else {
+                    continue;
+                };
+                if lease.state == LeaseState::Live {
+                    continue;
+                }
+                // The lease is no longer live but the generation still
+                // refers to it: the loss transition was interrupted.
+                // `finish_lost_lease` is CAS-guarded, so re-running it on an
+                // already-moved row is a no-op beyond the journal evidence.
+                report.expired.push(lease.lease_id.to_string());
+                self.finish_lost_lease(&lease, "lease loss completed by recovery", now, report)?;
+            }
+            if short_page {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Complete the crash-recovery pass for a CRASHED SCHEDULER: re-attempt
@@ -1601,6 +1706,21 @@ impl WorkerPlane {
             return Ok(());
         }
         report.expired.push(lease.lease_id.to_string());
+        self.finish_lost_lease(lease, reason, now, report)
+    }
+
+    /// The durable tail of a lost lease: generation `leased -> lost`, the
+    /// attempt terminal (`lost`), the journal evidence, then requeue-or-fail
+    /// under the job's bounded policy. Every step is CAS-guarded, so the tail
+    /// is safe to run again after a crash interrupted it (the moved row is
+    /// left alone and only the missing steps are applied).
+    fn finish_lost_lease(
+        &self,
+        lease: &WorkerLease,
+        reason: &str,
+        now: i64,
+        report: &mut RecoveryReport,
+    ) -> Result<(), WorkerError> {
         let _ = self.store.set_generation_state(
             &lease.job_id,
             lease.generation,
@@ -1774,8 +1894,13 @@ fn attempt_number_for(
     job_id: &crate::ids::ExecutionJobId,
     generation: JobGeneration,
 ) -> Result<u32, WorkerError> {
+    // The attempt row belongs to the GENERATION (one attempt per generation);
+    // its attempt NUMBER is not 1 after a requeue, so the lookup is by
+    // generation, never by the literal number 1.
     Ok(store
-        .attempt(job_id, generation, 1)?
+        .attempts(job_id)?
+        .into_iter()
+        .find(|a| a.generation == generation)
         .map(|a| a.attempt)
         .unwrap_or(1))
 }

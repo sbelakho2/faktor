@@ -910,9 +910,20 @@ pub(crate) async fn run_independent_review_call(
 ) -> IndependentReviewOutcome {
     let session = handle.id();
     // Routing consult (phase Review) — the decision fixes provider/model.
-    // A session whose durable task identity is unresolvable falls back to
-    // the documented standalone default (1); TaskId::new(0) is never legal.
-    let task_id = handle.task_id().unwrap_or_else(|_| TaskId::new(1));
+    // Authority law: a paid review call must not run under a FABRICATED task
+    // identity; an unreadable durable task identity is a typed refusal
+    // (exactly like the provider/model refusal below), never the standalone
+    // default.
+    let task_id = match handle.task_id() {
+        Ok(task_id) => task_id,
+        Err(error) => {
+            return IndependentReviewOutcome::refused(
+                "",
+                "",
+                format!("session task identity unreadable; independent review cannot run: {error}"),
+            );
+        }
+    };
     // A paid review call must not run under fabricated routing identity: an
     // unreadable provider/model is a typed refusal (authority law).
     let (mut provider_id, mut model) = match (handle.provider(), handle.model()) {

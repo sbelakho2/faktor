@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-RECOVERY-COMPLETES-LOSS",
+  "file": "crates/worker/src/service.rs",
+  "find": "        self.finish_interrupted_lease_losses(organization, now, &mut report)?;",
+  "replace": "        let _ = (organization, now, &mut report);",
+  "gate": "cargo test -p faktor-worker --lib crash_after_end_lease_is_completed_by_recovery",
+  "expect": "FAILED",
+  "note": "Skipping interrupted-lease completion strands a job whose end_lease/requeue tail was cut by a crash."
+}

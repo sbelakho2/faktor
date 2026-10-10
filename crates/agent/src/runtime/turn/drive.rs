@@ -1173,13 +1173,22 @@ impl AgentRuntime {
                 // penalty, never an error on the turn — documented). The
                 // read runs on the bounded pool (audit 13), never on this
                 // Tokio worker.
-                let prefix_history = self
+                let prefix_history = match self
                     .deps
                     .session
                     .provider_prefix_history(handle.id())
                     .await
-                    .ok()
-                    .map(|rows| {
+                {
+                    Ok(rows) => Some(rows),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "provider prefix history unreadable; this turn routes without cache history"
+                        );
+                        None
+                    }
+                }
+                .map(|rows| {
                         // v19: rows carry the per-call segment observation;
                         // the router measures each turn's longest stable
                         // leading prefix against its predecessor and consumes

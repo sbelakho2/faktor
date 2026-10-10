@@ -118,6 +118,12 @@ class FaktorChatPanel(
     @Volatile
     private var pendingTaskSubmission: TaskStartSubmission? = null
 
+    /**
+     * Host-journey seam: observes every logical send from the Work composer
+     * (submission id + captured goal) as the real IDE journey dispatches it.
+     */
+    internal var taskStartObserver: ((String, String) -> Unit)? = null
+
     private val transcript = JTextArea()
 
     /** The ONE composer input: every request to Faktor starts here. */
@@ -134,9 +140,16 @@ class FaktorChatPanel(
     @Volatile
     private var pendingPromptSubmission: PromptSubmission? = null
 
-    private val startButton = secondaryButton("Start daemon")
+    // Service lifecycle stays under More ▾ → Diagnostics (taxonomy law:
+    // infrastructure is not default-surface vocabulary); the buttons remain
+    // the single dispatch/enable authority for the menu items.
+    private val startButton = secondaryButton("Start service")
 
-    private val stopButton = secondaryButton("Stop daemon")
+    private val stopButton = secondaryButton("Stop service")
+
+    private val serviceStartItem = JMenuItem("Start service")
+
+    private val serviceStopItem = JMenuItem("Stop service")
 
     private val newSessionButton = secondaryButton("New session")
 
@@ -337,8 +350,6 @@ class FaktorChatPanel(
         // clipping controls out of reach.
         toolbar.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
         toolbar.add(FaktorMark())
-        toolbar.add(startButton)
-        toolbar.add(stopButton)
         toolbar.add(newSessionButton)
         toolbar.add(refreshButton)
         val settingsButton = secondaryButton("Settings")
@@ -352,6 +363,11 @@ class FaktorChatPanel(
         val diagnosticsItem = JMenuItem("Diagnostics")
         diagnosticsItem.addActionListener { showUtility("Diagnostics", diagnosticsPanel) }
         moreMenu.add(diagnosticsItem)
+        moreMenu.addSeparator()
+        serviceStartItem.addActionListener { startButton.doClick() }
+        serviceStopItem.addActionListener { stopButton.doClick() }
+        moreMenu.add(serviceStartItem)
+        moreMenu.add(serviceStopItem)
         moreButton.addActionListener { moreMenu.show(moreButton, 0, moreButton.height) }
         toolbar.add(moreButton)
         val toolbarScroll = JScrollPane(
@@ -723,6 +739,9 @@ class FaktorChatPanel(
         } else {
             TaskStartSubmission(UUID.randomUUID().toString(), draft, sessionId)
         }
+        // Host-journey observable: the logical send is captured before the job
+        // reaches the worker queue, exactly like a click on Run task.
+        taskStartObserver?.invoke(submission.submissionId, draft.goal)
         // Disable the start surface for the whole flight; the retry click
         // cannot even reach the queue while a start is pending.
         onEdt { setStartControlsEnabled(false) }
@@ -2304,6 +2323,51 @@ class FaktorChatPanel(
         startTaskFromControls()
     }
 
+    /**
+     * Host-journey hook: requests keyboard focus for the ONE composer and
+     * reports whether the AWT focus system granted ownership. In a
+     * display-less test harness the request is still routed to the composer
+     * component; the boolean then honestly reports that no OS window granted
+     * ownership.
+     */
+    internal fun requestComposerFocusForTest(): Boolean {
+        input.requestFocusInWindow()
+        return input.isFocusOwner
+    }
+
+    /**
+     * Host-journey hook: types through the composer's own typed-character
+     * editor action (the action the Swing keymap dispatches for KEY_TYPED),
+     * not by assigning the text, so the journey exercises the insertion path
+     * the IDE keystrokes use.
+     */
+    internal fun typeComposerForTest(text: String) {
+        val typed = input.actionMap.get(javax.swing.text.DefaultEditorKit.defaultKeyTypedAction)
+            ?: throw IllegalStateException("the composer has no DefaultEditorKit typed-character action")
+        for (ch in text) {
+            typed.actionPerformed(
+                java.awt.event.ActionEvent(
+                    input,
+                    java.awt.event.ActionEvent.ACTION_PERFORMED,
+                    ch.toString()
+                )
+            )
+        }
+    }
+
+    /**
+     * Host-journey hook: dispatches the exact action bound to Ctrl+Enter in
+     * the composer (the same actionMap entry the keystroke resolves to, so no
+     * synthetic key event is fabricated).
+     */
+    internal fun triggerRunTaskActionForTest() {
+        val action = input.actionMap.get("faktor.runTask")
+            ?: throw IllegalStateException("the composer has no faktor.runTask action")
+        action.actionPerformed(
+            java.awt.event.ActionEvent(input, java.awt.event.ActionEvent.ACTION_PERFORMED, "")
+        )
+    }
+
     internal fun startTaskEnabledForTest(): Boolean = startTaskButton.isEnabled
 
     internal fun newSessionEnabledForTest(): Boolean = newSessionButton.isEnabled
@@ -2418,6 +2482,8 @@ class FaktorChatPanel(
     private fun setControlsEnabled(running: Boolean) {
         startButton.isEnabled = !running
         stopButton.isEnabled = running
+        serviceStartItem.isEnabled = !running
+        serviceStopItem.isEnabled = running
         refreshButton.isEnabled = running
         sendButton.isEnabled = running
         abortButton.isEnabled = running
