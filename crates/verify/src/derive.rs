@@ -296,7 +296,7 @@ fn relative_to<'a>(root: &str, file: &'a str) -> Option<&'a str> {
     }
 }
 
-fn component_id(component: &ProjectComponent, base: &str) -> String {
+pub(crate) fn component_id(component: &ProjectComponent, base: &str) -> String {
     let root = component.root.to_string_lossy();
     if root.is_empty() {
         return base.to_string();

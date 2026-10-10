@@ -13,16 +13,77 @@
 //! - `GET /native/semantic/capabilities` — the capability matrix plus the
 //!   union coverage; selection on this surface is capability-driven only.
 //!
-//! Only provider identity, version and capability booleans are exposed:
-//! no endpoints, credentials, model names or other implementation data.
+//! Only provider identity, version, declared truth (fidelity, completeness,
+//! validated intelligence tier, capability booleans) and the derived
+//! bounded intelligence confidence are exposed: no endpoints, credentials,
+//! model names or other implementation data.
 
 use faktor_semantic::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
-use faktor_semantic::registry::{fallback_operation_status, SemanticProviderRegistry};
+use faktor_semantic::intelligence::{
+    fallback_intelligence_capability, highest_available_tier, native_capabilities,
+    IntelligenceCapability,
+};
+use faktor_semantic::registry::SemanticProviderRegistry;
 use faktor_semantic::types::{
     SemanticCapabilities, SemanticCompleteness, SemanticFidelity, SemanticOp, SemanticProvider,
 };
 
 use super::*;
+
+/// One [`IntelligenceCapability`]'s public JSON shape: the existing
+/// per-operation status fields plus `tier` (`null` = unknown, never assumed
+/// high) and the bounded `confidence_bps`.
+fn intelligence_capability_json(capability: &IntelligenceCapability) -> serde_json::Value {
+    serde_json::json!({
+        "available": capability.available,
+        "fidelity": capability.fidelity,
+        "completeness": capability.completeness,
+        "source": capability.source,
+        "tier": capability.tier,
+        "confidence_bps": capability.confidence_bps(),
+    })
+}
+
+/// The bounded native capability report (Tier 0: file discovery, text
+/// search, read-only pass) plus its per-op capability statuses. Data only.
+fn native_intelligence_json() -> serde_json::Value {
+    let report = native_capabilities();
+    let services = report
+        .services
+        .iter()
+        .map(|service| {
+            serde_json::json!({
+                "name": service.name,
+                "tier": service.tier,
+                "available": service.available,
+                "fidelity": service.fidelity,
+                "completeness": service.completeness,
+                "confidence_bps": service.confidence_bps(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let operations = report
+        .operations
+        .iter()
+        .map(|capability| {
+            serde_json::json!({
+                "op": capability.op,
+                "tier": capability.tier,
+                "available": capability.available,
+                "fidelity": capability.fidelity,
+                "completeness": capability.completeness,
+                "source": capability.source,
+                "confidence_bps": capability.confidence_bps(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "tier": report.tier,
+        "source": report.source,
+        "services": services,
+        "operations": operations,
+    })
+}
 
 /// One capability set's public introspection shape.
 fn capabilities_json(caps: SemanticCapabilities) -> serde_json::Value {
@@ -55,6 +116,9 @@ fn provider_json(provider: &dyn SemanticProvider) -> serde_json::Value {
             "completeness": descriptor
                 .completeness
                 .unwrap_or(SemanticCompleteness::Unknown),
+            // Declared intelligence tier; `null` = undeclared (unknown,
+            // confidence carries no tier bonus).
+            "tier": descriptor.intelligence_tier(),
             "capabilities": capabilities_json(descriptor.capabilities),
         }),
         None => serde_json::json!({
@@ -63,18 +127,26 @@ fn provider_json(provider: &dyn SemanticProvider) -> serde_json::Value {
             "validated": false,
             "fidelity": SemanticFidelity::None,
             "completeness": SemanticCompleteness::Unknown,
+            // An UNVALIDATED tier claim never reaches this surface: the
+            // claim is indistinguishable from identity until handshake.
+            "tier": serde_json::Value::Null,
             "capabilities": capabilities_json(SemanticCapabilities::NONE),
         }),
     }
 }
 
 /// The fallback shape WITHOUT constructing a registry: the generic
-/// fallback's identity and capability set are process constants, and
+/// fallback's identity, honest truth (heuristic fidelity, partial
+/// completeness, Tier 0) and capability set are process constants, and
 /// reporting them must never create a parallel authority.
 fn fallback_json() -> serde_json::Value {
     serde_json::json!({
         "id": GENERIC_FALLBACK_ID,
         "version": 1,
+        "validated": true,
+        "fidelity": SemanticFidelity::Heuristic,
+        "completeness": SemanticCompleteness::Partial,
+        "tier": faktor_semantic::intelligence::IntelligenceTier::FILESYSTEM,
         "capabilities": capabilities_json(GenericSemanticFallback::default().capabilities()),
     })
 }
@@ -125,22 +197,27 @@ fn status_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value
         });
     // Per-operation fidelity/completeness/source (audit Tangerine-4): a bare
     // boolean could not distinguish heuristic fallback from compiler-exact
-    // Tangerine; consumers branch on these fields instead.
+    // Tangerine; consumers branch on these fields instead. The intelligence
+    // projection adds the tier (`null` = unknown, never assumed high) and
+    // the bounded confidence in basis points.
     let mut operations = serde_json::Map::new();
+    let mut per_op_tiers = serde_json::Map::new();
+    let mut capabilities = Vec::new();
     for op in SemanticOp::ALL {
-        let status = registry
-            .map(|registry| registry.operation_status(op))
-            .unwrap_or_else(|| fallback_operation_status(op));
+        let capability = registry
+            .map(|registry| registry.intelligence_capability(op))
+            .unwrap_or_else(|| fallback_intelligence_capability(op));
         operations.insert(
             op_slug(op).to_string(),
-            serde_json::json!({
-                "available": status.available,
-                "fidelity": status.fidelity,
-                "completeness": status.completeness,
-                "source": status.source,
-            }),
+            intelligence_capability_json(&capability),
         );
+        per_op_tiers.insert(op_slug(op).to_string(), serde_json::json!(capability.tier));
+        capabilities.push(capability);
     }
+    // Highest AVAILABLE tier: unavailable operations never raise it. With
+    // no registry the native fallback still serves context/delta/affected/
+    // explain at Tier 0, so this is 0 rather than null in that shape.
+    let highest_tier = highest_available_tier(&capabilities);
     serde_json::json!({
         "configured": registry.is_some(),
         "providerCount": providers.len(),
@@ -151,6 +228,11 @@ fn status_json(registry: Option<&SemanticProviderRegistry>) -> serde_json::Value
             "fallback": fallback_snapshot,
         },
         "operations": operations,
+        "intelligence": {
+            "tier": highest_tier,
+            "operations": per_op_tiers,
+            "native": native_intelligence_json(),
+        },
     })
 }
 
@@ -264,7 +346,8 @@ mod tests {
     use super::*;
     use faktor_core::{CancellationToken, OpId, SessionId, WorkspaceId};
     use faktor_semantic::types::{
-        SemanticContextPack, SemanticContextRequest, SemanticError, SemanticProviderId,
+        SemanticContextPack, SemanticContextRequest, SemanticError, SemanticProviderDescriptor,
+        SemanticProviderId, SEMANTIC_SCHEMA_VERSION,
     };
     use std::sync::Arc;
 
@@ -339,6 +422,10 @@ mod tests {
         assert_eq!(body["providerCount"], 1);
         assert_eq!(body["providers"][0]["id"], "probe.provider-1");
         assert_eq!(body["providers"][0]["version"], 7);
+        assert!(
+            body["providers"][0]["tier"].is_null(),
+            "an undeclared tier reports null, never assumed high"
+        );
         assert_eq!(
             body["providers"][0]["capabilities"]["operations"]["context"],
             true
@@ -351,6 +438,19 @@ mod tests {
             body["snapshotState"]["providers"].as_array().unwrap().len(),
             0
         );
+        // Every per-op entry carries the additive intelligence fields.
+        for op in ["context", "snapshot", "verify"] {
+            assert!(
+                body["operations"][op]["confidence_bps"].is_number(),
+                "{op} must carry confidence_bps"
+            );
+            assert!(
+                body["operations"][op].get("tier").is_some(),
+                "{op} must carry tier"
+            );
+        }
+        assert!(body["intelligence"]["tier"].is_number());
+        assert!(body["intelligence"]["native"]["services"].is_array());
         let caps = capabilities_report_json(Some(&registry));
         assert_eq!(caps["configured"], true);
         assert_eq!(caps["union"]["operations"]["context"], true);
@@ -368,8 +468,36 @@ mod tests {
         assert_eq!(body["operations"]["context"]["available"], true);
         assert_eq!(body["operations"]["context"]["fidelity"], "heuristic");
         assert_eq!(body["operations"]["context"]["completeness"], "partial");
+        assert_eq!(body["operations"]["context"]["tier"], 0);
+        // 2500 (heuristic) × 7500 (partial) / 10000 + 0 (tier 0) = 1875.
+        assert_eq!(body["operations"]["context"]["confidence_bps"], 1875);
         assert_eq!(body["operations"]["verify"]["available"], false);
+        assert_eq!(body["operations"]["verify"]["confidence_bps"], 0);
         assert_eq!(body["operations"]["snapshot"]["available"], false);
+        // The fallback still declares its true Tier 0 even where it is not
+        // available: no claim is fabricated for an uncovered op.
+        assert_eq!(body["operations"]["snapshot"]["tier"], 0);
+        // The top-level intelligence block: highest AVAILABLE tier + per-op
+        // tiers + the bounded native report.
+        assert_eq!(body["intelligence"]["tier"], 0);
+        assert_eq!(body["intelligence"]["operations"]["context"], 0);
+        assert_eq!(body["intelligence"]["operations"]["snapshot"], 0);
+        assert_eq!(body["intelligence"]["native"]["tier"], 0);
+        assert_eq!(
+            body["intelligence"]["native"]["source"],
+            GENERIC_FALLBACK_ID
+        );
+        assert_eq!(
+            body["intelligence"]["native"]["services"][0]["name"],
+            "file_discovery"
+        );
+        assert_eq!(
+            body["intelligence"]["native"]["operations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            SemanticOp::ALL.len()
+        );
         let caps = capabilities_report_json(None);
         assert_eq!(caps["configured"], false);
         assert_eq!(caps["union"]["operations"]["explain"], true);
@@ -384,6 +512,10 @@ mod tests {
         let body = status_json(Some(&registry));
         assert_eq!(body["providerCount"], 1);
         assert_eq!(body["providers"][0]["validated"], false);
+        assert!(
+            body["providers"][0]["tier"].is_null(),
+            "an unvalidated tier claim never reaches the status surface"
+        );
         assert_eq!(
             body["providers"][0]["capabilities"]["operations"]["context"],
             false
@@ -445,5 +577,120 @@ mod tests {
             Poll::Pending => panic!("probe must resolve immediately"),
         };
         assert!(matches!(result, Err(SemanticError::Refused(_))));
+    }
+
+    /// A provider that declares its real tier/fidelity/completeness through
+    /// a validated descriptor (the default handshake validates it).
+    struct TieredProvider {
+        id: SemanticProviderId,
+        tier: Option<u8>,
+    }
+
+    impl SemanticProvider for TieredProvider {
+        fn id(&self) -> SemanticProviderId {
+            self.id.clone()
+        }
+
+        fn version(&self) -> u32 {
+            3
+        }
+
+        fn capabilities(&self) -> SemanticCapabilities {
+            SemanticCapabilities::CONTEXT
+        }
+
+        fn descriptor(&self) -> SemanticProviderDescriptor {
+            let mut descriptor = SemanticProviderDescriptor::new(
+                self.id.clone(),
+                3,
+                SEMANTIC_SCHEMA_VERSION,
+                self.capabilities(),
+            );
+            descriptor.fidelity = Some(SemanticFidelity::CompilerExact);
+            descriptor.completeness = Some(SemanticCompleteness::Complete);
+            descriptor.tier = self.tier;
+            descriptor
+        }
+    }
+
+    /// A registry whose provider handshake ran, so the VALIDATED descriptor
+    /// is what the status surface reads (the same cache selection uses).
+    async fn warmed_registry(tier: Option<u8>) -> SemanticProviderRegistry {
+        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        registry.register(Arc::new(TieredProvider {
+            id: SemanticProviderId::parse("tiered.provider").unwrap(),
+            tier,
+        }));
+        let _ = registry
+            .select_validated(
+                &SemanticCapabilities::CONTEXT,
+                SemanticOp::Context,
+                &CancellationToken::new(),
+            )
+            .await;
+        registry
+    }
+
+    /// A declared external descriptor tier is reported verbatim; an absent
+    /// tier reports null with confidence computed WITHOUT the tier bonus and
+    /// strictly below the same descriptor declaring tier 5.
+    #[tokio::test]
+    async fn declared_tier_reports_and_absent_tier_is_never_assumed_high() {
+        let two = warmed_registry(Some(2)).await;
+        let body = status_json(Some(&two));
+        assert_eq!(body["providers"][0]["validated"], true);
+        assert_eq!(body["providers"][0]["tier"], 2);
+        assert_eq!(body["operations"]["context"]["tier"], 2);
+        // 8000 (compiler_exact) × 10000 (complete) / 10000 + 2 × 200 = 8400.
+        assert_eq!(body["operations"]["context"]["confidence_bps"], 8400);
+        assert_eq!(body["intelligence"]["tier"], 2);
+        assert_eq!(body["intelligence"]["operations"]["context"], 2);
+        // Uncovered ops still report the honest fallback Tier 0.
+        assert_eq!(body["intelligence"]["operations"]["verify"], 0);
+        assert_eq!(body["operations"]["verify"]["confidence_bps"], 0);
+
+        let absent = warmed_registry(None).await;
+        let absent_body = status_json(Some(&absent));
+        assert!(absent_body["providers"][0]["tier"].is_null());
+        assert!(absent_body["operations"]["context"]["tier"].is_null());
+        assert_eq!(
+            absent_body["operations"]["context"]["confidence_bps"], 8000,
+            "no tier bonus without a declared tier"
+        );
+        assert_eq!(
+            absent_body["intelligence"]["tier"], 0,
+            "the native fallback's Tier 0 is still the highest AVAILABLE tier"
+        );
+
+        let five = warmed_registry(Some(5)).await;
+        let five_body = status_json(Some(&five));
+        assert_eq!(five_body["providers"][0]["tier"], 5);
+        assert_eq!(five_body["operations"]["context"]["tier"], 5);
+        assert_eq!(five_body["operations"]["context"]["confidence_bps"], 9000);
+        assert_eq!(five_body["intelligence"]["tier"], 5);
+        assert!(
+            absent_body["operations"]["context"]["confidence_bps"]
+                .as_u64()
+                .unwrap()
+                < five_body["operations"]["context"]["confidence_bps"]
+                    .as_u64()
+                    .unwrap(),
+            "an absent tier must never be assumed as high as a declared tier 5"
+        );
+    }
+
+    /// An out-of-range tier is refused at handshake, so the invalid claim is
+    /// never cached: the provider stays unvalidated and the operation
+    /// reports the honest Tier 0 fallback.
+    #[tokio::test]
+    async fn out_of_range_tier_never_reaches_the_status_surface() {
+        let registry = warmed_registry(Some(6)).await;
+        let body = status_json(Some(&registry));
+        assert_eq!(body["providers"][0]["validated"], false);
+        assert!(body["providers"][0]["tier"].is_null());
+        assert_eq!(body["operations"]["context"]["tier"], 0);
+        assert_eq!(body["operations"]["context"]["source"], GENERIC_FALLBACK_ID);
+        assert_eq!(body["operations"]["context"]["confidence_bps"], 1875);
+        assert_eq!(body["intelligence"]["tier"], 0);
     }
 }

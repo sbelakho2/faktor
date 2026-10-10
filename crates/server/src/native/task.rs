@@ -4,6 +4,10 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use faktor_core::contract::{
+    Constraint, ContractOrigin, EngineeringContract, Invariant, ProofEvidenceKind, RiskHypothesis,
+    RiskSeverity,
+};
 use faktor_core::state::TaskState;
 use faktor_protocol::error::ApiError;
 
@@ -200,6 +204,45 @@ pub(crate) struct StartTaskRunRequest {
     /// STRICTLY (`deny_unknown_fields`; missing or non-boolean members are
     /// a plain 400 — never a silent default). Absent = today's behavior.
     completion_contract: Option<faktor_core::completion::CompletionContract>,
+    /// Additive user-authored engineering-contract entries (see
+    /// `docs/specs/autonomous-engineering.md` and the frozen
+    /// [`EngineeringContract`] model): constraints that cannot be violated,
+    /// invariants that must remain true, risk hypotheses (severity starts
+    /// `unknown`) and proof obligations (a bare claim text defaults its
+    /// evidence kind to `test_execution`; `{claim, evidence}` states it
+    /// explicitly). Ids are DERIVED daemon-side, so a repeated start unions
+    /// by id instead of duplicating. Each list is bounded
+    /// (<= [`faktor_session::MAX_TASK_CONTRACT_ENTRIES`] entries, each
+    /// non-empty and <= [`faktor_session::MAX_TASK_CONTRACT_STRING_BYTES`]
+    /// bytes); out-of-bound input is a typed 400 before any dispatch, never
+    /// a truncated contract.
+    #[serde(default)]
+    constraints: Option<Vec<String>>,
+    #[serde(default)]
+    invariants: Option<Vec<String>>,
+    #[serde(default)]
+    risks: Option<Vec<String>>,
+    #[serde(default)]
+    proof_obligations: Option<Vec<ProofObligationInput>>,
+}
+
+/// One wire proof obligation of an additive task-start contract: either the
+/// bare claim text (evidence defaults to `test_execution`) or the explicit
+/// `{claim, evidence}` pair. Both members are REQUIRED in the object form;
+/// an unknown member is a strict 400 (never silently dropped).
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ProofObligationInput {
+    Claim(String),
+    Detailed(ProofObligationInputDetailed),
+}
+
+/// The explicit `{claim, evidence}` object form of [`ProofObligationInput`].
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProofObligationInputDetailed {
+    claim: String,
+    evidence: ProofEvidenceKind,
 }
 
 /// One wire work item of [`StartTaskRunRequest`]. `kind` speaks the
@@ -265,6 +308,143 @@ fn validate_submission_id(id: &str) -> Result<(), ApiError> {
     })
 }
 
+/// The typed 400 of one malformed/oversized user-authored contract entry.
+fn contract_refusal(code: &'static str, message: String) -> ApiError {
+    ApiError {
+        code,
+        message,
+        http_status: 400,
+        retryable: false,
+    }
+}
+
+/// Validate one user-authored contract string list: bounded count, every
+/// entry non-empty (after trimming) and bounded in bytes. `what` names the
+/// list in the refusal message.
+fn validate_contract_strings(what: &str, entries: &[String]) -> Result<(), ApiError> {
+    if entries.len() > faktor_session::MAX_TASK_CONTRACT_ENTRIES {
+        return Err(contract_refusal(
+            "oversized",
+            format!(
+                "{what}: {} entries exceed MAX_TASK_CONTRACT_ENTRIES ({})",
+                entries.len(),
+                faktor_session::MAX_TASK_CONTRACT_ENTRIES
+            ),
+        ));
+    }
+    for entry in entries {
+        if entry.trim().is_empty() {
+            return Err(contract_refusal(
+                "malformed",
+                format!("{what}: an entry is empty"),
+            ));
+        }
+        if entry.len() > faktor_session::MAX_TASK_CONTRACT_STRING_BYTES {
+            return Err(contract_refusal(
+                "oversized",
+                format!(
+                    "{what}: an entry of {} bytes exceeds MAX_TASK_CONTRACT_STRING_BYTES ({})",
+                    entry.len(),
+                    faktor_session::MAX_TASK_CONTRACT_STRING_BYTES
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the additive user-authored engineering contract of ONE task start.
+/// Ids are DERIVED (`c1:`/`i1:`/`r1:` from the entry text via
+/// [`faktor_session::task::derived_contract_entry_id`], obligations via
+/// [`EngineeringContract::obligation_id`]), so the same request always
+/// produces the same ids and duplicates within one request dedupe by id.
+/// Everything is validated HERE, before any dispatch: an out-of-bound entry
+/// is a typed 400, never a truncated contract.
+fn build_user_contract(
+    constraints: Option<Vec<String>>,
+    invariants: Option<Vec<String>>,
+    risks: Option<Vec<String>>,
+    proof_obligations: Option<Vec<ProofObligationInput>>,
+) -> Result<EngineeringContract, ApiError> {
+    let constraints = constraints.unwrap_or_default();
+    let invariants = invariants.unwrap_or_default();
+    let risks = risks.unwrap_or_default();
+    let proof_obligations = proof_obligations.unwrap_or_default();
+    validate_contract_strings("constraints", &constraints)?;
+    validate_contract_strings("invariants", &invariants)?;
+    validate_contract_strings("risks", &risks)?;
+    if proof_obligations.len() > faktor_session::MAX_TASK_CONTRACT_ENTRIES {
+        return Err(contract_refusal(
+            "oversized",
+            format!(
+                "proof_obligations: {} entries exceed MAX_TASK_CONTRACT_ENTRIES ({})",
+                proof_obligations.len(),
+                faktor_session::MAX_TASK_CONTRACT_ENTRIES
+            ),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut contract = EngineeringContract::default();
+    for statement in constraints {
+        let id = faktor_session::task::derived_contract_entry_id("c1", &statement);
+        if seen.insert(id.clone()) {
+            contract.constraints.push(Constraint {
+                id,
+                statement,
+                origin: ContractOrigin::User,
+            });
+        }
+    }
+    for statement in invariants {
+        let id = faktor_session::task::derived_contract_entry_id("i1", &statement);
+        if seen.insert(id.clone()) {
+            contract.invariants.push(Invariant {
+                id,
+                statement,
+                origin: ContractOrigin::User,
+            });
+        }
+    }
+    for description in risks {
+        let id = faktor_session::task::derived_contract_entry_id("r1", &description);
+        if seen.insert(id.clone()) {
+            contract.risks.push(RiskHypothesis {
+                id,
+                description,
+                severity: RiskSeverity::Unknown,
+                origin: ContractOrigin::User,
+            });
+        }
+    }
+    for input in proof_obligations {
+        let (claim, evidence) = match input {
+            ProofObligationInput::Claim(claim) => (claim, ProofEvidenceKind::TestExecution),
+            ProofObligationInput::Detailed(detailed) => (detailed.claim, detailed.evidence),
+        };
+        if claim.trim().is_empty() {
+            return Err(contract_refusal(
+                "malformed",
+                "proof_obligations: an entry has an empty claim".into(),
+            ));
+        }
+        if claim.len() > faktor_session::MAX_TASK_CONTRACT_STRING_BYTES {
+            return Err(contract_refusal(
+                "oversized",
+                format!(
+                    "proof_obligations: a claim of {} bytes exceeds MAX_TASK_CONTRACT_STRING_BYTES ({})",
+                    claim.len(),
+                    faktor_session::MAX_TASK_CONTRACT_STRING_BYTES
+                ),
+            ));
+        }
+        let obligation = EngineeringContract::obligation(&claim, evidence, ContractOrigin::User);
+        if seen.insert(obligation.id.clone()) {
+            contract.proof_obligations.push(obligation);
+        }
+    }
+    Ok(contract)
+}
+
 /// `POST /native/session/{id}/task-runs` — start ONE task through the
 /// daemon's TaskExecutor ([`ServerDeps::tasks`]; the ONLY task-start
 /// authority the server reaches). The strict DTO is validated by the
@@ -303,6 +483,18 @@ pub(crate) async fn native_task_run_start(
     if let Err(e) = validate_submission_id(&req.submission_id) {
         return wire_status(e);
     }
+    // The additive user-authored contract entries: validated and id-derived
+    // HERE (typed 400s before any session resolution/dispatch), then merged
+    // durably into the session's task row after a successful start.
+    let contract = match build_user_contract(
+        req.constraints.take(),
+        req.invariants.take(),
+        req.risks.take(),
+        req.proof_obligations.take(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return wire_status(e),
+    };
     let handle = match native_resolve_session(&state, &id) {
         Ok(h) => h,
         Err(r) => return *r,
@@ -450,6 +642,22 @@ pub(crate) async fn native_task_run_start(
             }
         }
     };
+    // The additive engineering-contract merge: the task row exists by now
+    // (the executor seeds/re-goals it synchronously at start) and the merge
+    // is a union by id — existing entries and their claim states are
+    // preserved, only NEW entries are appended, and a replayed identical
+    // start changes nothing (no revision bump). Durable failures after the
+    // run was already admitted are LOUD (never a silent drop of the user's
+    // contract).
+    if !contract.is_empty() {
+        let task_id = match handle.row() {
+            Ok(row) => row.task_id,
+            Err(e) => return api_err(&e),
+        };
+        if let Err(e) = handle.merge_task_contract(task_id, &contract) {
+            return task_contract_merge_response(&e);
+        }
+    }
     // The response carries the durable run identity + the run's own state
     // projection (the same derivation the list/state endpoints serve). An
     // orchestrated run's plan row is committed by the detached drive AFTER
@@ -493,6 +701,28 @@ pub(crate) async fn native_task_run_start(
         "state": entry.get("state").cloned().unwrap_or(serde_json::Value::Null),
     }))
     .into_response()
+}
+
+/// The native wire mapping of one durable contract-merge refusal (the DTO
+/// already screened bounds, so these are durable-state causes): a missing
+/// task row is 404, a frozen terminal row or a concurrent move is 409, and
+/// any store failure is a loud 500 — the user's contract is never silently
+/// dropped.
+fn task_contract_merge_response(e: &faktor_session::TaskError) -> Response {
+    use faktor_session::TaskError as T;
+    let (code, status) = match e {
+        T::NotFound(_) => ("not_found", 404),
+        T::Oversized(_) => ("oversized", 400),
+        T::Malformed(_) => ("malformed", 400),
+        T::TerminalTask { .. } | T::RevisionMismatch { .. } | T::Conflict(_) => ("conflict", 409),
+        _ => ("internal", 500),
+    };
+    wire_status(ApiError {
+        code,
+        message: e.to_string(),
+        http_status: status,
+        retryable: false,
+    })
 }
 
 /// `POST /native/session/{id}/task-runs/{run_id}/cancel` — task-level
@@ -1262,6 +1492,243 @@ mod money_dto_tests {
                 .is_err(),
                 "agent budget must refuse {bad}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod engineering_contract_dto_tests {
+    //! Adversarial strict-DTO covers for the additive user-authored contract
+    //! arrays of a native task start. Every `Err` below is mapped to a plain
+    //! 400 by [`native_task_run_start`]'s uniform body/validation handling
+    //! (never a 422, never a silent truncation), and the daemon derives all
+    //! ids so a repeated start unions instead of duplicating.
+    use super::{build_user_contract, ProofObligationInput, StartTaskRunRequest};
+    use faktor_core::contract::{ClaimState, ContractOrigin, ProofEvidenceKind, RiskSeverity};
+
+    fn parse(value: serde_json::Value) -> StartTaskRunRequest {
+        serde_json::from_value(value).expect("valid bodies parse")
+    }
+
+    fn parse_err(value: serde_json::Value) -> String {
+        match serde_json::from_value::<StartTaskRunRequest>(value.clone()) {
+            Ok(_) => panic!("hostile body must be refused: {value}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn base_body() -> serde_json::Value {
+        serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+        })
+    }
+
+    #[test]
+    fn contract_arrays_parse_and_ids_are_derived_deterministically() {
+        let mut req = parse(serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+            "constraints": ["existing sessions remain valid"],
+            "invariants": ["revoked sessions cannot authenticate"],
+            "risks": ["race conditions"],
+            "proof_obligations": [
+                "replayed refresh tokens fail",
+                {"claim": "legacy sessions survive the migration", "evidence": "compile"},
+            ],
+        }));
+        let contract = build_user_contract(
+            req.constraints.take(),
+            req.invariants.take(),
+            req.risks.take(),
+            req.proof_obligations.take(),
+        )
+        .unwrap();
+        assert_eq!(contract.constraints.len(), 1);
+        let constraint = &contract.constraints[0];
+        assert!(constraint.id.starts_with("c1:"), "{}", constraint.id);
+        assert_eq!(constraint.id.len(), 3 + 16);
+        assert_eq!(constraint.origin, ContractOrigin::User);
+        assert!(constraint.id.bytes().all(|b| b.is_ascii()));
+        assert!(contract.invariants[0].id.starts_with("i1:"));
+        assert!(contract.risks[0].id.starts_with("r1:"));
+        assert_eq!(contract.risks[0].severity, RiskSeverity::Unknown);
+        assert_eq!(contract.risks[0].origin, ContractOrigin::User);
+        // Plain claims default their evidence to test_execution; the object
+        // form states it explicitly; both get canonical obligation ids.
+        assert_eq!(contract.proof_obligations.len(), 2);
+        assert_eq!(
+            contract.proof_obligations[0].evidence,
+            ProofEvidenceKind::TestExecution
+        );
+        assert_eq!(
+            contract.proof_obligations[1].evidence,
+            ProofEvidenceKind::Compile
+        );
+        for obligation in &contract.proof_obligations {
+            assert_eq!(
+                obligation.id,
+                faktor_core::contract::EngineeringContract::obligation_id(
+                    &obligation.claim,
+                    obligation.evidence
+                )
+            );
+            assert!(obligation.id.starts_with("po1:"));
+            assert_eq!(obligation.state, ClaimState::Unknown);
+            assert_eq!(obligation.origin, ContractOrigin::User);
+        }
+        // Deterministic: a repeated parse derives identical ids.
+        let mut req2 = parse(serde_json::json!({
+            "goal": "g",
+            "submission_id": "22222222-2222-4222-8222-222222222222",
+            "constraints": ["existing sessions remain valid"],
+            "invariants": ["revoked sessions cannot authenticate"],
+            "risks": ["race conditions"],
+            "proof_obligations": ["replayed refresh tokens fail"],
+        }));
+        let again = build_user_contract(
+            req2.constraints.take(),
+            req2.invariants.take(),
+            req2.risks.take(),
+            req2.proof_obligations.take(),
+        )
+        .unwrap();
+        assert_eq!(again.constraints[0].id, constraint.id);
+        assert_eq!(again.invariants[0].id, contract.invariants[0].id);
+        assert_eq!(again.risks[0].id, contract.risks[0].id);
+        assert_eq!(
+            again.proof_obligations[0].id,
+            contract.proof_obligations[0].id
+        );
+    }
+
+    #[test]
+    fn duplicate_claims_dedupe_by_obligation_id() {
+        let mut req = parse(serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+            "constraints": ["same constraint", "same constraint"],
+            "proof_obligations": [
+                "same claim",
+                "same claim",
+                {"claim": "same claim", "evidence": "test_execution"},
+                {"claim": "same claim", "evidence": "compile"},
+            ],
+        }));
+        assert_eq!(req.constraints.as_ref().unwrap().len(), 2);
+        let contract = build_user_contract(
+            req.constraints.take(),
+            req.invariants.take(),
+            req.risks.take(),
+            req.proof_obligations.take(),
+        )
+        .unwrap();
+        assert_eq!(contract.constraints.len(), 1, "duplicates dedupe by id");
+        // `same claim` + test_execution dedupes; compile is a DIFFERENT
+        // obligation id (domain-separated by evidence kind).
+        assert_eq!(contract.proof_obligations.len(), 2);
+        assert!(contract
+            .proof_obligations
+            .iter()
+            .any(|o| o.evidence == ProofEvidenceKind::TestExecution));
+        assert!(contract
+            .proof_obligations
+            .iter()
+            .any(|o| o.evidence == ProofEvidenceKind::Compile));
+    }
+
+    #[test]
+    fn contract_bounds_and_hostile_shapes_are_typed_400s() {
+        // A field-name typo is still an unknown-field refusal.
+        let err = parse_err(serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+            "constrained_by": ["same"],
+        }));
+        assert!(err.contains("unknown field"), "{err}");
+
+        // More than MAX entries in any string list (constraints / invariants
+        // / risks share one helper).
+        let many: Vec<String> = (0..=faktor_session::MAX_TASK_CONTRACT_ENTRIES)
+            .map(|i| format!("entry {i}"))
+            .collect();
+        for field in ["constraints", "invariants", "risks"] {
+            let mut body = base_body();
+            body[field] = serde_json::json!(many);
+            let req = parse(body);
+            let err = build_user_contract(
+                req.constraints,
+                req.invariants,
+                req.risks,
+                req.proof_obligations,
+            )
+            .expect_err("over-count must refuse");
+            assert_eq!(err.http_status, 400, "{field}");
+            assert_eq!(err.code, "oversized", "{field}");
+        }
+        // The obligation list carries the same count bound.
+        let mut req = parse(serde_json::json!({
+            "goal": "g",
+            "submission_id": "11111111-1111-4111-8111-111111111111",
+            "proof_obligations": (0..=faktor_session::MAX_TASK_CONTRACT_ENTRIES)
+                .map(|i| serde_json::json!(format!("claim {i}")))
+                .collect::<Vec<_>>(),
+        }));
+        let err = build_user_contract(
+            req.constraints.take(),
+            req.invariants.take(),
+            req.risks.take(),
+            req.proof_obligations.take(),
+        )
+        .expect_err("over-count obligations must refuse");
+        assert_eq!(err.http_status, 400);
+        assert_eq!(err.code, "oversized");
+
+        // Empty and whitespace-only strings.
+        for hostile in ["", "   "] {
+            let err = build_user_contract(Some(vec![hostile.to_string()]), None, None, None)
+                .expect_err("empty entry must refuse");
+            assert_eq!(err.http_status, 400);
+            assert_eq!(err.code, "malformed");
+            let err = build_user_contract(
+                None,
+                None,
+                None,
+                Some(vec![ProofObligationInput::Claim(hostile.to_string())]),
+            )
+            .expect_err("empty claim must refuse");
+            assert_eq!(err.http_status, 400);
+        }
+        // Oversized strings at the exact bound and one byte over.
+        let at_bound = "x".repeat(faktor_session::MAX_TASK_CONTRACT_STRING_BYTES);
+        assert!(build_user_contract(Some(vec![at_bound]), None, None, None).is_ok());
+        let over = "x".repeat(faktor_session::MAX_TASK_CONTRACT_STRING_BYTES + 1);
+        let err = build_user_contract(Some(vec![over]), None, None, None)
+            .expect_err("oversized entry must refuse");
+        assert_eq!(err.http_status, 400);
+        assert_eq!(err.code, "oversized");
+
+        // The DTO is still strict: wrong member types, a missing evidence
+        // member in the object form, an unknown member and an unknown
+        // evidence kind are all parse errors (plain 400s).
+        for hostile in [
+            serde_json::json!({"constraints": "not-a-list"}),
+            serde_json::json!({"constraints": [1, 2]}),
+            serde_json::json!({"risks": [{"description": "x"}]}),
+            serde_json::json!({"proof_obligations": [{"claim": "c"}]}),
+            serde_json::json!({"proof_obligations": [{"claim": "c", "evidence": "guess"}]}),
+            serde_json::json!({"proof_obligations": [{"claim": "c", "evidence": "compile", "extra": true}]}),
+            serde_json::json!({"proof_obligations": [{"evidence": "compile"}]}),
+            serde_json::json!({"proof_obligations": [true]}),
+            serde_json::json!({"proof_obligations": [null]}),
+        ] {
+            let mut body = base_body();
+            let object = body.as_object_mut().unwrap();
+            for (key, value) in hostile.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            let err = parse_err(body);
+            assert!(!err.is_empty(), "{hostile}");
         }
     }
 }

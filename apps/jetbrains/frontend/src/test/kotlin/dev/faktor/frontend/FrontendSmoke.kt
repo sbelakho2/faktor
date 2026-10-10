@@ -14,6 +14,7 @@ import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeAttachmentId
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeContractRows
 import dev.faktor.shared.NativePermissionReplyRefusal
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativePermissionEntry
@@ -99,6 +100,48 @@ private const val TASK_JSON = "[" +
     "\"blockers\":[\"waiting on review\"]," +
     "\"evidenceRefs\":[\"evidence:41\"],\"phase\":\"building\"}" +
     "]"
+
+// The additive engineering contract of one task
+// (`crates/core/src/contract.rs`) as the task DTO serves it; TASK_JSON above
+// predates it, so a legacy read stays an honest null.
+private const val CONTRACT_TASK_JSON = "[" +
+    "{\"goal\":\"ship it\",\"constraints\":[],\"state\":\"in_progress\"," +
+    "\"milestones\":{\"completed\":[],\"open\":[]}," +
+    "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"verification\":[]," +
+    "\"contract\":{" +
+    "\"constraints\":[{\"id\":\"c1\",\"statement\":\"existing sessions remain valid\"," +
+    "\"origin\":\"user\"}]," +
+    "\"invariants\":[{\"id\":\"i1\",\"statement\":\"revoked sessions cannot authenticate\"," +
+    "\"origin\":{\"external\":{\"provider\":\"example.graph\"}}}]," +
+    "\"risks\":[{\"id\":\"r1\",\"description\":\"race conditions\",\"severity\":\"high\"," +
+    "\"origin\":\"heuristic\"}]," +
+    "\"proof_obligations\":[" +
+    "{\"id\":\"o1\",\"claim\":\"concurrent refresh produces one valid result\"," +
+    "\"evidence\":\"test_execution\",\"origin\":\"user\",\"state\":\"supported\"," +
+    "\"confidence_bps\":9100,\"evidence_refs\":[]}," +
+    "{\"id\":\"o2\",\"claim\":\"replayed refresh tokens fail\"," +
+    "\"evidence\":\"contract_check\",\"origin\":\"native\",\"state\":\"inferred\"," +
+    "\"confidence_bps\":5000,\"evidence_refs\":[]}]}}]"
+
+/** Malformed entries are dropped/disclosed; bad severity/state weaken. */
+private const val CONTRACT_MALFORMED_JSON = "[" +
+    "{\"goal\":\"ship it\",\"constraints\":[],\"state\":\"in_progress\"," +
+    "\"milestones\":{\"completed\":[],\"open\":[]}," +
+    "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"verification\":[]," +
+    "\"contract\":{" +
+    "\"constraints\":[{\"id\":\"c2\",\"statement\":\"\",\"origin\":\"user\"}," +
+    "\"junk\"]," +
+    "\"risks\":[{\"id\":\"r1\",\"description\":\"race\",\"severity\":\"catastrophic\"," +
+    "\"origin\":\"heuristic\"}]," +
+    "\"proof_obligations\":[{\"id\":\"o1\",\"claim\":\"ok\",\"evidence\":\"not_a_kind\"," +
+    "\"origin\":\"native\",\"state\":\"maybe\",\"confidence_bps\":12000}]}}]"
+
+/** A present non-object member is an explicit malformed read. */
+private const val CONTRACT_UNREADABLE_JSON = "[" +
+    "{\"goal\":\"ship it\",\"constraints\":[],\"state\":\"in_progress\"," +
+    "\"milestones\":{\"completed\":[],\"open\":[]}," +
+    "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"verification\":[]," +
+    "\"contract\":\"nope\"}]"
 
 private const val SESSION_USAGE_JSON = "{" +
     "\"sessionId\":\"1\",\"providerCalls\":{\"tokens\":7,\"prefixObservations\":[]}," +
@@ -766,6 +809,68 @@ object FrontendSmoke {
             assertEquals(
                 "{\"selector\":\"line_range\",\"start\":2,\"end\":5}",
                 NativeRequests.evidenceSelectorLines(2, 5)
+            )
+        }
+
+        step("engineering contract decodes additively and rides task starts") {
+            // A legacy daemon (no member) stays an honest null, never a
+            // fabricated empty contract.
+            val legacy = parseNativeTaskViews(TASK_JSON).single()
+            assertEquals(null, legacy.contract)
+            assertEquals(null, legacy.contractMalformed)
+            assertEquals(0, legacy.contractDroppedRows)
+            val parsed = parseNativeTaskViews(CONTRACT_TASK_JSON).single()
+            val contract = parsed.contract ?: fail("the served contract must decode")
+            assertEquals(1, contract.constraints.size)
+            assertEquals("existing sessions remain valid", contract.constraints[0].statement)
+            assertEquals("user", contract.constraints[0].origin.label)
+            assertEquals("example.graph", contract.invariants[0].origin.label)
+            assertEquals("high", contract.risks[0].severity)
+            assertEquals("test execution", contract.proofObligations[0].evidenceLabel)
+            assertEquals("supported · 91%", contract.proofObligations[0].stateText)
+            assertTrue(contract.needsDisclosure)
+            // The panel projection carries the exact disclosure lines.
+            val projected = TaskTree.build(task = parsed).contract
+                ?: fail("the projection must keep the served contract")
+            assertEquals(
+                listOf("risk:high · race conditions", "inferred · replayed refresh tokens fail"),
+                projected.disclosureLines()
+            )
+            // Per-entry resilience: malformed rows are counted, a non-object
+            // entry is dropped, and a bad severity/state lands on the WEAKEST
+            // state (unknown => disclosure), never a lesser claim.
+            val malformed = parseNativeTaskViews(CONTRACT_MALFORMED_JSON).single()
+            assertEquals(2, malformed.contractDroppedRows)
+            assertEquals("unknown", malformed.contract!!.risks[0].severity)
+            assertEquals("unknown", malformed.contract!!.proofObligations[0].state)
+            assertEquals(
+                "not_a_kind",
+                malformed.contract!!.proofObligations[0].evidenceLabel
+            )
+            assertEquals(null, malformed.contract!!.proofObligations[0].confidenceBps)
+            // A present non-object member is an explicit malformed read.
+            val unreadable = parseNativeTaskViews(CONTRACT_UNREADABLE_JSON).single()
+            assertEquals(null, unreadable.contract)
+            assertEquals("the contract member is not an object", unreadable.contractMalformed)
+            // The wire rows: only non-empty category arrays serialize, and an
+            // all-empty instance stays the byte-identical default path.
+            assertEquals(
+                "{\"goal\":\"g\",\"constraints\":[\"keep\"]}",
+                NativeRequests.startTaskRun(
+                    "g",
+                    contractRows = NativeContractRows(constraints = listOf("keep"))
+                )
+            )
+            assertEquals(
+                "{\"goal\":\"g\",\"proof_obligations\":[\"claim\"]}",
+                NativeRequests.startTaskRun(
+                    "g",
+                    contractRows = NativeContractRows(proofObligations = listOf("claim"))
+                )
+            )
+            assertEquals(
+                "{\"goal\":\"g\"}",
+                NativeRequests.startTaskRun("g", contractRows = NativeContractRows())
             )
         }
 

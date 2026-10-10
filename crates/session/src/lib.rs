@@ -147,6 +147,7 @@ pub use recovery::{RecoveredOp, RecoveryAction, RecoveryReport};
 pub use retention::{LiveReferenceScanner, LiveReferenceSet, ScanLimits, DEFAULT_SCAN_LIMITS};
 pub use task::{
     CompletionContractGate, Task, TaskBudget, TaskError, TaskPatch, VerificationRecord,
+    MAX_TASK_CONTRACT_ENTRIES, MAX_TASK_CONTRACT_JSON_BYTES, MAX_TASK_CONTRACT_STRING_BYTES,
     MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES, MAX_TASK_PLAN_STEPS,
     MAX_TASK_STEP_BYTES, MAX_VERIFICATION_CANDIDATE_REF_JSON_BYTES,
     MAX_VERIFICATION_CATEGORY_BYTES, MAX_VERIFICATION_CHANGED_FILES,

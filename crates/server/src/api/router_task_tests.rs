@@ -1527,6 +1527,7 @@ async fn native_verification_serves_criterion_binding_origin_requirement_and_ver
         acceptance_criteria: encode_criteria(&typed),
         plan: Vec::new(),
         attachments: Vec::new(),
+        contract: Default::default(),
         budget: Default::default(),
         state: TaskState::Running,
         created_ms: now,
@@ -3770,5 +3771,144 @@ async fn native_board_endpoints_are_scoped_strict_and_hostile_inputs_are_typed()
         after.posts.len(),
         "a refused terminal post writes nothing"
     );
+    let _ = handle.request_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_start_contract_is_validated_merged_and_projected_on_the_listing() {
+    // The additive user-authored contract of a native task start: hostile
+    // input is a plain 400 BEFORE any session resolution, an accepted start
+    // lands the derived-id entries durably on the session's task row, and
+    // `GET /native/session/{id}/tasks` projects the frozen contract model
+    // with full provenance/state for client rendering.
+    let dir = tempfile::tempdir().unwrap();
+    let rig = native_task_rig(dir.path(), vec![], false, false);
+    seed_native_owner(&rig.owner_root);
+    let NativeTaskRig {
+        deps,
+        manager,
+        parent: sid,
+        ..
+    } = rig;
+    let token = deps.auth_token.clone();
+    let handle = serve(deps, 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr);
+
+    // Over the count bound: typed 400 before any dispatch.
+    let resp = client
+        .post(format!("{base}/native/session/{sid}/task-runs"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "goal": "hostile",
+            "submission_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "constraints": (0..=faktor_session::MAX_TASK_CONTRACT_ENTRIES)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "over-count constraints refuse pre-dispatch"
+    );
+
+    // The accepted start: optional arrays on the explicit work-items path.
+    let resp = client
+        .post(format!("{base}/native/session/{sid}/task-runs"))
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "goal": "add the engineering contract",
+            "submission_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "work_items": [
+                {"id": "main", "kind": "Implementation", "ownership": "isolated_worktree"},
+            ],
+            "constraints": ["existing sessions remain valid"],
+            "invariants": ["revoked sessions cannot authenticate"],
+            "risks": ["race conditions"],
+            "proof_obligations": [
+                "replayed refresh tokens fail",
+                {"claim": "legacy sessions survive the migration", "evidence": "compile"},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let start: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{start}");
+
+    // The durable row carries the derived-id contract immediately (the
+    // merge runs inside the start handler, before the response).
+    let handle_typed = manager.get_session(sid).unwrap().unwrap();
+    let task_row = handle_typed
+        .get_task(handle_typed.task_id().unwrap())
+        .unwrap()
+        .expect("the start seeded the durable task row");
+    let contract = &task_row.contract;
+    assert_eq!(contract.constraints.len(), 1);
+    assert!(contract.constraints[0].id.starts_with("c1:"));
+    assert_eq!(
+        contract.constraints[0].origin,
+        faktor_core::contract::ContractOrigin::User
+    );
+    assert!(contract.risks[0].id.starts_with("r1:"));
+    assert_eq!(
+        contract.risks[0].severity,
+        faktor_core::contract::RiskSeverity::Unknown
+    );
+    assert_eq!(contract.proof_obligations.len(), 2);
+    assert_eq!(contract.proof_obligations[0].id.len(), 4 + 64);
+
+    // The listing projects the same contract on the task entry.
+    handle_typed
+        .put_task_ledger(serde_json::json!({
+            "goal": "add the engineering contract",
+            "constraints": [],
+            "completed_steps": [],
+            "open_steps": ["render the contract"],
+            "decisions": [],
+            "known_failures": [],
+            "changed_files": [],
+            "tests_run": [],
+            "tests_failed": [],
+            "user_preferences": [],
+        }))
+        .unwrap();
+    let resp = client
+        .get(format!("{base}/native/session/{sid}/tasks"))
+        .bearer_auth(token.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let entry = &body.as_array().unwrap()[0];
+    let projected = &entry["contract"];
+    assert_eq!(
+        projected["constraints"][0]["statement"],
+        "existing sessions remain valid"
+    );
+    assert_eq!(projected["constraints"][0]["origin"], "user");
+    assert_eq!(
+        projected["invariants"][0]["statement"],
+        "revoked sessions cannot authenticate"
+    );
+    assert_eq!(projected["risks"][0]["severity"], "unknown");
+    assert_eq!(
+        projected["proof_obligations"][0]["evidence"], "test_execution",
+        "a plain claim defaults its evidence kind"
+    );
+    assert_eq!(
+        projected["proof_obligations"][0]["state"], "unknown",
+        "an unevaluated obligation starts unknown"
+    );
+    assert_eq!(projected["proof_obligations"][1]["evidence"], "compile");
+    assert!(projected["proof_obligations"][0]["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("po1:"));
     let _ = handle.request_shutdown();
 }

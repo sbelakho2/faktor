@@ -21,6 +21,7 @@ pub mod cancellation;
 pub mod capability;
 pub mod command;
 pub mod completion;
+pub mod contract;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -60,6 +61,10 @@ pub use command::{
     ResolvedCommand, ShellKind,
 };
 pub use completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
+pub use contract::{
+    ClaimState, Constraint, ContractDisclosure, ContractOrigin, EngineeringContract, EvidenceRef,
+    Invariant, ProofEvidenceKind, ProofObligation, RiskHypothesis, RiskSeverity,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};
 pub use hash::FileHash;

@@ -450,6 +450,7 @@ impl AgentRuntime {
                     acceptance_criteria: Vec::new(),
                     plan: Vec::new(),
                     attachments: Vec::new(),
+                    contract: Default::default(),
                     budget: faktor_session::TaskBudget {
                         max_tokens: caps.max_tokens,
                         max_turns: caps.max_turns,
@@ -869,7 +870,7 @@ impl AgentRuntime {
             faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
             faktor_verify::Acceptance::Pending => VerificationStatus::Pending,
         };
-        let (proof, completion) = if executed.is_empty() {
+        let (proof, mut completion) = if executed.is_empty() {
             (None, completion)
         } else {
             match verification_proof_from_attempt(
@@ -900,6 +901,15 @@ impl AgentRuntime {
                 }
             }
         };
+        // Engineering contract (autonomous-engineering spec): the background
+        // settlement path evaluates the same durable proof obligations from
+        // the attempt's executed checks (no review value exists on this
+        // path, so Review obligations keep their prior state).
+        let contract_outcome =
+            crate::runtime::contract_eval::evaluate_and_persist_contract(handle, &executed, None)
+                .await;
+        completion =
+            crate::runtime::contract_eval::apply_contract_outcome(completion, contract_outcome);
         self.persist_gate_facts(
             handle,
             &completion,
@@ -1107,6 +1117,7 @@ impl AgentRuntime {
                         acceptance_criteria: Vec::new(),
                         plan: Vec::new(),
                         attachments: Vec::new(),
+                        contract: Default::default(),
                         budget: Default::default(),
                         state: faktor_core::state::TaskState::Pending,
                         created_ms: now,
@@ -1220,6 +1231,7 @@ impl AgentRuntime {
                     acceptance_criteria: Vec::new(),
                     plan: Vec::new(),
                     attachments: Vec::new(),
+                    contract: Default::default(),
                     budget: Default::default(),
                     state: faktor_core::state::TaskState::Pending,
                     created_ms: now,

@@ -884,6 +884,17 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         ON task_admission(state, key);
      CREATE INDEX IF NOT EXISTS idx_prompt_admission_pending
         ON prompt_admission(state, key);",
+    // v31 — the task's durable engineering contract (schema target 32; array
+    // index 31). ONE bounded JSON column holding the frozen
+    // `faktor_core::contract::EngineeringContract` (constraints, invariants,
+    // risk hypotheses and proof obligations with their per-claim state,
+    // confidence and evidence refs). The column default `'{}'` makes every
+    // pre-v31 row decode to an EMPTY contract (all four arrays absent are
+    // serde defaults), so legacy rows keep reading byte-compatibly and every
+    // write stays additive. The session layer enforces the count/byte bounds
+    // before any write; a corrupt value is a typed `StoreError::Corrupt`,
+    // never a silently defaulted contract.
+    "ALTER TABLE task ADD COLUMN contract TEXT NOT NULL DEFAULT '{}';",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

@@ -24,6 +24,8 @@ import type {
   NativeTaskRunStarted,
   StartTaskRunRequest,
 } from './nativeClient.ts';
+import { MAX_CONTRACT_ROWS, MAX_CONTRACT_ROW_BYTES } from './contract.ts';
+import { stripDisplayControls } from './displayText.ts';
 import { microWireValue, type MicroMoney } from './money.ts';
 
 /** One durable typed attachment id a task start accepts (native DTO mirror). */
@@ -610,6 +612,101 @@ export interface CompletionContractPick {
 }
 
 /**
+ * The bounded user-authored rows of the composer's "Acceptance & contract"
+ * disclosure, as the HOST validates them. The wire form is the daemon's four
+ * optional top-level string arrays (`proofObligations` maps to
+ * `proof_obligations`); the daemon derives ids/origins itself.
+ */
+export interface StartTaskContractRows {
+  readonly constraints: readonly string[];
+  readonly invariants: readonly string[];
+  readonly risks: readonly string[];
+  readonly proofObligations: readonly string[];
+}
+
+/**
+ * Strict parse of the composer's contract rows. Absent/null = the default
+ * path (no rows, no wire fields). A present value is validated member by
+ * member: unknown members, non-arrays, non-string/empty entries, more than
+ * [`MAX_CONTRACT_ROWS`] rows or an entry over [`MAX_CONTRACT_ROW_BYTES`]
+ * UTF-8 bytes are refused as `{reason}` — the caller must refuse the START
+ * loudly rather than silently drop a constraint the operator stated. The
+ * webview drops blank textarea lines before posting, so an empty entry here
+ * is a malformed envelope, not user content.
+ */
+export function parseContractRows(
+  raw: unknown,
+): { readonly rows: StartTaskContractRows | null } | { readonly reason: string } {
+  if (raw === undefined || raw === null) {
+    return { rows: null };
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { reason: 'contractRows must be an object' };
+  }
+  const record = raw as Record<string, unknown>;
+  const members = ['constraints', 'invariants', 'risks', 'proofObligations'] as const;
+  for (const key of Object.keys(record)) {
+    if (!(members as readonly string[]).includes(key)) {
+      return { reason: `contractRows.${key} is not a known member` };
+    }
+  }
+  const rows: Record<(typeof members)[number], string[]> = {
+    constraints: [],
+    invariants: [],
+    risks: [],
+    proofObligations: [],
+  };
+  for (const member of members) {
+    const value = record[member];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (!Array.isArray(value)) {
+      return { reason: `contractRows.${member} must be an array` };
+    }
+    if (value.length > MAX_CONTRACT_ROWS) {
+      return {
+        reason:
+          `contractRows.${member} carries ${value.length} rows; ` +
+          `at most ${MAX_CONTRACT_ROWS} are accepted`,
+      };
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const entry = value[index];
+      if (typeof entry !== 'string') {
+        return { reason: `contractRows.${member}[${index}] must be a string` };
+      }
+      const line = stripDisplayControls(entry).trim();
+      if (line.length === 0) {
+        return { reason: `contractRows.${member}[${index}] is empty` };
+      }
+      const bytes = Buffer.byteLength(line, 'utf8');
+      if (bytes > MAX_CONTRACT_ROW_BYTES) {
+        return {
+          reason:
+            `contractRows.${member}[${index}] is ${bytes} bytes; ` +
+            `at most ${MAX_CONTRACT_ROW_BYTES} bytes are accepted`,
+        };
+      }
+      rows[member].push(line);
+    }
+  }
+  const any = members.some((member) => rows[member].length > 0);
+  return { rows: any ? rows : null };
+}
+
+/** TRUE when at least one contract row was authored. */
+export function hasContractRows(rows: StartTaskContractRows | null): boolean {
+  return (
+    rows !== null &&
+    (rows.constraints.length > 0 ||
+      rows.invariants.length > 0 ||
+      rows.risks.length > 0 ||
+      rows.proofObligations.length > 0)
+  );
+}
+
+/**
  * The completion-contract DECISION, independent of the VS Code picker:
  * - `undefined` picks = the operator dismissed the step (Escape / closed):
  *   the caller must ABORT the new-task flow, never start with the default;
@@ -643,6 +740,12 @@ export interface StartTaskSettings {
   readonly attachments?: readonly TaskAttachmentId[];
   /** The Task-mode completion contract (null / all-false = default path). */
   readonly completionContract?: NativeCompletionContract | null;
+  /**
+   * The bounded user-authored engineering-contract rows of this start
+   * (null = none). Sent as the daemon's four optional top-level string
+   * arrays; empty categories are omitted.
+   */
+  readonly contractRows?: StartTaskContractRows | null;
   /**
    * The client submission UUID of THIS logical submission. A retry of the
    * same immutable submission (lost response) reuses it so the daemon
@@ -721,6 +824,9 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
   const contract = hasCompletionSteps(settings.completionContract ?? null)
     ? (settings.completionContract as NativeCompletionContract)
     : null;
+  const contractRows = hasContractRows(settings.contractRows ?? null)
+    ? (settings.contractRows as StartTaskContractRows)
+    : null;
   const submissionId = canonicalSubmissionId(settings.submissionId ?? null);
   const request: StartTaskRunRequest = {
     goal,
@@ -746,6 +852,24 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
             },
           ],
           completion_contract: contract,
+        }
+      : {}),
+    // The user-authored contract rows ride the daemon's own optional
+    // top-level arrays (accepted on both the work-items and plain-prompt
+    // paths). Only non-empty categories are sent; the daemon derives
+    // ids/origins, bounds every entry, and unions by id.
+    ...(contractRows !== null
+      ? {
+          ...(contractRows.constraints.length > 0
+            ? { constraints: contractRows.constraints }
+            : {}),
+          ...(contractRows.invariants.length > 0
+            ? { invariants: contractRows.invariants }
+            : {}),
+          ...(contractRows.risks.length > 0 ? { risks: contractRows.risks } : {}),
+          ...(contractRows.proofObligations.length > 0
+            ? { proof_obligations: contractRows.proofObligations }
+            : {}),
         }
       : {}),
   };
@@ -1608,6 +1732,8 @@ export interface StartSubmissionSnapshot {
   readonly pending: PendingSubmission;
   readonly files: readonly string[];
   readonly contract: NativeCompletionContract | null;
+  /** The bounded user-authored contract rows captured at admission. */
+  readonly contractRows: StartTaskContractRows | null;
   /**
    * The HOST-SIDE composer attachment ids this snapshot selected (empty for
    * a legacy raw envelope). On durable acceptance ONLY these entries are
@@ -1725,6 +1851,34 @@ function sameContract(
   );
 }
 
+function sameStringList(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Body identity of the user-authored contract rows (order-sensitive). */
+export function sameContractRows(
+  a: StartTaskContractRows | null,
+  b: StartTaskContractRows | null,
+): boolean {
+  if (a === null || b === null) {
+    return a === b;
+  }
+  return (
+    sameStringList(a.constraints, b.constraints) &&
+    sameStringList(a.invariants, b.invariants) &&
+    sameStringList(a.risks, b.risks) &&
+    sameStringList(a.proofObligations, b.proofObligations)
+  );
+}
+
 /**
  * The host single-flight gate of task starts. It holds the ONE in-flight
  * logical submission and rejects/ignores every other `sendGoal` while that
@@ -1760,15 +1914,18 @@ export class TaskStartGate {
     readonly pending: PendingSubmission;
     readonly files: readonly string[];
     readonly contract: NativeCompletionContract | null;
+    readonly contractRows?: StartTaskContractRows | null;
     readonly attachmentIds?: readonly string[];
     readonly newId: () => string;
   }): SubmissionStartDecision {
+    const contractRows = input.contractRows ?? null;
     const current = this.current;
     if (current !== null) {
       const sameBody =
         samePendingSubmission(input.pending, current.snapshot.pending) &&
         sameFileList(input.files, current.snapshot.files) &&
-        sameContract(input.contract, current.snapshot.contract);
+        sameContract(input.contract, current.snapshot.contract) &&
+        sameContractRows(contractRows, current.snapshot.contractRows);
       if (current.state === 'in_flight') {
         if (sameBody) {
           return { action: 'duplicate' };
@@ -1793,6 +1950,7 @@ export class TaskStartGate {
       pending: input.pending,
       files: input.files,
       contract: input.contract,
+      contractRows,
       attachmentIds: input.attachmentIds ?? [],
     };
     this.current = { snapshot, state: 'in_flight' };

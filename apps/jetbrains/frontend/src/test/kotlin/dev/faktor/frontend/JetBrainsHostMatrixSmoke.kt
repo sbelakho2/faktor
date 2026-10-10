@@ -66,7 +66,9 @@ object JetBrainsHostMatrixSmoke {
     /**
      * The real Task composer tab (Work cluster), on a fresh FaktorChatPanel:
      * zoom checks mutate fonts, so the panel must never be shared across
-     * checks. The host has no daemon; it renders the empty composer state.
+     * checks. The host has no daemon; it renders the composer with the Run
+     * options disclosure open and the Acceptance & contract editors filled,
+     * so the rendered state covers the new contract rows.
      */
     private fun freshTaskComposerPane(): JComponent {
         val service = FaktorFrontendService(
@@ -75,6 +77,12 @@ object JetBrainsHostMatrixSmoke {
         )
         val panel = FaktorChatPanel(service)
         taskPanels.add(panel)
+        panel.setContractFieldsForTest(
+            "existing sessions remain valid\nexisting API clients cannot break",
+            "revoked sessions cannot authenticate",
+            "race conditions",
+            "replayed refresh tokens fail"
+        )
         // A themed surface root: the raw JScrollPane keeps its LAF background,
         // which would fail the high-contrast background assertion.
         val host = javax.swing.JPanel(java.awt.BorderLayout())

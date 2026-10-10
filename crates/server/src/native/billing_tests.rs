@@ -297,6 +297,7 @@ async fn usage_fold_matches_the_reservation_ledger_byte_for_byte() {
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: Default::default(),
             state: faktor_core::state::TaskState::Running,
             created_ms: NOW_MS,

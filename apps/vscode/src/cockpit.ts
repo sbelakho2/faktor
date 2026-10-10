@@ -12,6 +12,17 @@
 
 import type { AgentSummary, TaskSummary, UsageSummary, VerificationSummary } from './state';
 import { safeSlice, stripDisplayControls } from './displayText.ts';
+import {
+  contractDisclosureLines,
+  contractOriginLabel,
+  engineeringContractIsEmpty,
+  evidenceKindLabel,
+  obligationStateText,
+  riskRequiresDisclosure,
+  type EngineeringContractView,
+  type ProofEvidenceKindView,
+  type RiskSeverityView,
+} from './contract.ts';
 import type {
   NativeBillingUsage,
   NativeEntitlementSnapshot,
@@ -222,6 +233,11 @@ export interface CockpitView {
    * `null` when the proof was never fetched; an explicit `unavailable`
    * state when the fetch/validation failed (never a stale VERIFIED). */
   readonly proof: CockpitProofView | null;
+  /** The durable engineering contract (null when the daemon serves none). */
+  readonly contract: EngineeringContractView | null;
+  /** Present-but-unreadable contract member / dropped rows, disclosed. */
+  readonly contractMalformed: string | null;
+  readonly contractDroppedRows: number;
 }
 
 /** The completion-contract block as the cockpit renders it. */
@@ -1016,6 +1032,45 @@ export interface CockpitAction {
   readonly enabled: boolean;
 }
 
+/**
+ * One contract row pre-labeled for the webview: provenance/state/severity
+ * are rendered as text plus chips, never as color alone. Statements keep
+ * their bounded full text (<=512 chars, the daemon's own bound).
+ */
+export interface CockpitContractStatementRow {
+  readonly statement: string;
+  readonly origin: string;
+}
+
+export interface CockpitContractRiskRow {
+  readonly description: string;
+  readonly severity: string;
+  readonly origin: string;
+  /** The explicit disclosure token (`risk:<severity>`) when one is owed. */
+  readonly disclosure: string | null;
+}
+
+export interface CockpitContractObligationRow {
+  readonly claim: string;
+  readonly evidence: string;
+  readonly state: string;
+  /** `supported · 91%` — state plus the derived confidence, when served. */
+  readonly stateText: string;
+  readonly origin: string;
+  /** Bounded evidence source/detail lines recorded so far. */
+  readonly evidenceRefs: readonly string[];
+}
+
+/** The structured contract section payload the cockpit renders. */
+export interface CockpitContractSection {
+  readonly constraints: readonly CockpitContractStatementRow[];
+  readonly invariants: readonly CockpitContractStatementRow[];
+  readonly risks: readonly CockpitContractRiskRow[];
+  readonly obligations: readonly CockpitContractObligationRow[];
+  readonly droppedRows: number;
+  readonly malformed: string | null;
+}
+
 export interface CockpitSection {
   readonly key: string;
   readonly title: string;
@@ -1028,6 +1083,8 @@ export interface CockpitSection {
    * `[verdict]`-led lines).
    */
   readonly criteria?: readonly CockpitCriterionProof[];
+  /** The structured engineering-contract rows of the contract section. */
+  readonly contract?: CockpitContractSection;
   /** State-gated controls (tournament decide/abort), when the section owns any. */
   readonly actions?: readonly CockpitAction[];
 }
@@ -1989,6 +2046,9 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     tournament,
     completion: task?.completion ?? null,
     proof: proofViewOf(input.proof ?? null, input.proofUnavailable ?? null),
+    contract: task?.contract ?? null,
+    contractMalformed: task?.contractMalformed ?? null,
+    contractDroppedRows: task?.contractDroppedRows ?? 0,
   };
 }
 
@@ -2021,9 +2081,61 @@ export function projectCockpit(input: CockpitInput): CockpitProjection {
   }
 }
 
+/** Bound of evidence-ref lines one obligation row renders. */
+const MAX_CONTRACT_EVIDENCE_REFS = 8;
+
+/** The disclosure token core's `disclosures()` emits for a risk, or null. */
+function riskDisclosureToken(severity: RiskSeverityView): string | null {
+  return riskRequiresDisclosure(severity) ? `risk:${severity}` : null;
+}
+
+/** One bounded evidence-ref line: kind · source · detail. */
+function contractEvidenceLine(
+  kind: ProofEvidenceKindView | null,
+  source: string,
+  detail: string,
+): string {
+  return [
+    kind === null ? null : evidenceKindLabel(kind),
+    source.length > 0 ? source : null,
+    detail.length > 0 ? detail : null,
+  ]
+    .filter((bit): bit is string => bit !== null)
+    .join(' · ');
+}
+
 /** The render plan of the persistent cockpit panel, in fixed order. */
 export function cockpitSections(view: CockpitView): CockpitSection[] {
   const sections: CockpitSection[] = [];
+  // "Needs disclosure" leads the run details whenever the served contract
+  // owes one: a high/unknown risk, an unsatisfied proof obligation, or a
+  // contract member that exists but could not be read. Text-first; the
+  // state token is the core's own (`risk:high`, `inferred`, ...).
+  const disclosureLines: string[] = [];
+  if (view.contractMalformed !== null) {
+    disclosureLines.push(`contract unreadable · ${view.contractMalformed}`);
+  }
+  if (view.contractDroppedRows > 0) {
+    disclosureLines.push(
+      `contract incomplete · ${view.contractDroppedRows} ${
+        view.contractDroppedRows === 1 ? 'entry' : 'entries'
+      } could not be read and are not rendered`,
+    );
+  }
+  if (view.contract !== null) {
+    disclosureLines.push(
+      ...contractDisclosureLines(view.contract).map((line) => `${line.state} · ${line.summary}`),
+    );
+  }
+  if (disclosureLines.length > 0) {
+    sections.push({
+      key: 'disclosure',
+      title: 'Needs disclosure',
+      present: true,
+      lines: disclosureLines.slice(0, MAX_LINES),
+      evidence: [],
+    });
+  }
   const proofLines = view.criteriaProof
     .slice(0, MAX_CRITERIA_PROOF)
     .map((row) => criterionProofLine(row));
@@ -2041,6 +2153,60 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
     evidence: [],
     criteria: view.criteriaProof.slice(0, MAX_CRITERIA_PROOF),
   });
+  if (view.contract !== null || view.contractMalformed !== null) {
+    sections.push({
+      key: 'contract',
+      title: 'Contract',
+      present: true,
+      lines:
+        view.contract === null
+          ? ['the served contract member is unreadable; no entries are rendered']
+          : engineeringContractIsEmpty(view.contract)
+            ? ['no contract entries are recorded for this run']
+            : [
+                ...(view.contractDroppedRows > 0
+                  ? [
+                      `${view.contractDroppedRows} ${
+                        view.contractDroppedRows === 1 ? 'entry' : 'entries'
+                      } could not be read and are not rendered`,
+                    ]
+                  : []),
+              ],
+      evidence: [],
+      contract:
+        view.contract === null
+          ? undefined
+          : {
+              constraints: view.contract.constraints.map((row) => ({
+                statement: row.statement,
+                origin: contractOriginLabel(row.origin),
+              })),
+              invariants: view.contract.invariants.map((row) => ({
+                statement: row.statement,
+                origin: contractOriginLabel(row.origin),
+              })),
+              risks: view.contract.risks.map((row) => ({
+                description: row.description,
+                severity: row.severity,
+                origin: contractOriginLabel(row.origin),
+                disclosure: riskDisclosureToken(row.severity),
+              })),
+              obligations: view.contract.proofObligations.map((row) => ({
+                claim: row.claim,
+                evidence: row.evidenceLabel,
+                state: row.state,
+                stateText: obligationStateText(row),
+                origin: contractOriginLabel(row.origin),
+                evidenceRefs: row.evidenceRefs
+                  .slice(0, MAX_CONTRACT_EVIDENCE_REFS)
+                  .map((ref) => contractEvidenceLine(ref.kind, ref.source, ref.detail))
+                  .filter((line) => line.length > 0),
+              })),
+              droppedRows: view.contractDroppedRows,
+              malformed: view.contractMalformed,
+            },
+    });
+  }
   sections.push({
     key: 'proof',
     title: 'Verification proof (daemon)',

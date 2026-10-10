@@ -21,6 +21,7 @@ import dev.faktor.shared.NativeAgentProgress
 import dev.faktor.shared.NativeBlocker
 import dev.faktor.shared.NativeChildResult
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeContractEvidenceRef
 import dev.faktor.shared.NativeCriterionBinding
 import dev.faktor.shared.NativeCriterionVerdict
 import dev.faktor.shared.NativeModelInfo
@@ -255,6 +256,78 @@ data class ProofStepView(
     val atMs: Long?
 )
 
+/** One engineering-contract statement row (constraint or invariant). */
+data class ContractStatementRow(val statement: String, val origin: String)
+
+/** One risk row; `disclosure` is `risk:<severity>` when one is owed. */
+data class ContractRiskRow(
+    val description: String,
+    val severity: String,
+    val origin: String,
+    val disclosure: String?
+)
+
+/** One proof-obligation row with its claim, evidence kind and claim state. */
+data class ContractObligationRow(
+    val claim: String,
+    val evidence: String,
+    val state: String,
+    /** `supported · 91%` — state plus the derived confidence, when served. */
+    val stateText: String,
+    val origin: String,
+    val evidenceRefs: List<String>
+)
+
+/**
+ * The durable engineering contract as the Verification view renders it:
+ * constraints/invariants/risks/obligations with provenance, severity/state
+ * chips-as-text and the completion-disclosure decision. Null means the
+ * serving daemon exposes no contract at all (legacy — never fabricated);
+ * a present-but-unreadable member keeps `malformed` set and no rows.
+ */
+data class ContractView(
+    val constraints: List<ContractStatementRow>,
+    val invariants: List<ContractStatementRow>,
+    val risks: List<ContractRiskRow>,
+    val obligations: List<ContractObligationRow>,
+    val droppedRows: Int,
+    val malformed: String?
+) {
+    val isEmpty: Boolean
+        get() = constraints.isEmpty() && invariants.isEmpty() && risks.isEmpty() &&
+            obligations.isEmpty()
+
+    /** TRUE when any high/unknown risk or unsatisfied obligation is owed. */
+    val needsDisclosure: Boolean
+        get() = risks.any { it.disclosure != null } ||
+            obligations.any { it.state != "known_true" && it.state != "supported" }
+
+    /**
+     * The bounded disclosure lines, deterministic: unreadable/refused first,
+     * then `risk:<severity>` rows, then unsatisfied claim states. Text-first
+     * (the core's own state tokens), never color-only.
+     */
+    fun disclosureLines(): List<String> {
+        val lines = ArrayList<String>()
+        malformed?.let { lines.add("contract unreadable · " + it) }
+        if (droppedRows > 0) {
+            lines.add(
+                "contract incomplete · " + plural(droppedRows, "entry", "entries") +
+                    " could not be read and are not rendered"
+            )
+        }
+        for (risk in risks) {
+            risk.disclosure?.let { lines.add(it + " · " + risk.description) }
+        }
+        for (row in obligations) {
+            if (row.state != "known_true" && row.state != "supported") {
+                lines.add(row.state.replace('_', ' ') + " · " + row.claim)
+            }
+        }
+        return lines
+    }
+}
+
 /** One explicitly unavailable proof component (missing/unavailable/corrupt/mismatch). */
 data class ProofUnavailableView(
     val component: String,
@@ -417,6 +490,8 @@ data class TaskTreeModel(
     val tournament: TournamentView?,
     /** The Task-mode completion contract + durable step statuses. */
     val completion: CompletionView? = null,
+    /** The durable engineering contract (null when the daemon serves none). */
+    val contract: ContractView? = null,
     /** The top-level VERIFIED view (strict proof summary; null = not fetched). */
     val proof: ProofView? = null
 )
@@ -475,8 +550,65 @@ object TaskTree {
             spend = spend(usage, task),
             tournament = tournament?.let { tournamentView(it) },
             completion = completion(task, submittedCompletion, runState),
+            contract = contract(task),
             proof = proof(proof, proofUnavailable)
         )
+    }
+
+    // -------------------------------------------------------------- contract
+
+    /**
+     * Project the additive engineering contract. Null only when the daemon
+     * serves no member at all; a present-but-malformed read keeps its
+     * disclosure text so the panel can say so instead of rendering silence.
+     */
+    private fun contract(task: NativeTaskView?): ContractView? {
+        if (task == null) return null
+        val served = task.contract
+        val malformed = task.contractMalformed
+        if (served == null && malformed == null) return null
+        return ContractView(
+            constraints = served?.constraints.orEmpty().map {
+                ContractStatementRow(it.statement, it.origin.label)
+            },
+            invariants = served?.invariants.orEmpty().map {
+                ContractStatementRow(it.statement, it.origin.label)
+            },
+            risks = served?.risks.orEmpty().map {
+                ContractRiskRow(
+                    description = it.description,
+                    severity = it.severity,
+                    origin = it.origin.label,
+                    disclosure = if (it.severity == "high" || it.severity == "unknown") {
+                        "risk:" + it.severity
+                    } else {
+                        null
+                    }
+                )
+            },
+            obligations = served?.proofObligations.orEmpty().map {
+                ContractObligationRow(
+                    claim = it.claim,
+                    evidence = it.evidenceLabel,
+                    state = it.state,
+                    stateText = it.stateText,
+                    origin = it.origin.label,
+                    evidenceRefs = it.evidenceRefs.map { ref -> contractEvidenceLine(ref) }
+                        .filter { line -> line.isNotEmpty() }
+                )
+            },
+            droppedRows = task.contractDroppedRows,
+            malformed = malformed
+        )
+    }
+
+    /** `test execution · cargo test · refresh suite` (kind · source · detail). */
+    private fun contractEvidenceLine(ref: NativeContractEvidenceRef): String {
+        val bits = ArrayList<String>()
+        ref.kind?.replace('_', ' ')?.takeIf { it.isNotEmpty() }?.let { bits.add(it) }
+        if (ref.source.isNotEmpty()) bits.add(ref.source)
+        if (ref.detail.isNotEmpty()) bits.add(ref.detail)
+        return bits.joinToString(" · ")
     }
 
     // --------------------------------------------------------------- proof

@@ -532,6 +532,7 @@ pub fn run_scripted_task(
         acceptance_criteria: acceptance_criteria.clone(),
         plan: Vec::new(),
         attachments: Vec::new(),
+        contract: Default::default(),
         max_tokens: None,
         max_turns: None,
         spent_tokens: 0,

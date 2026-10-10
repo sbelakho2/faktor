@@ -2206,6 +2206,7 @@ pub(crate) async fn routed_settlement_runtime(
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: faktor_session::TaskBudget::default(),
             state: faktor_core::state::TaskState::Pending,
             created_ms: now,

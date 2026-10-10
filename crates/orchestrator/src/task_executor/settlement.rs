@@ -755,6 +755,7 @@ impl TaskExecutor {
                         acceptance_criteria: Vec::new(),
                         plan: Vec::new(),
                         attachments: Vec::new(),
+                        contract: Default::default(),
                         budget: TaskBudget::default(),
                         state: TaskState::Pending,
                         created_ms: now,

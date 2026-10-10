@@ -2799,6 +2799,7 @@ mod tests {
             acceptance_criteria: vec![],
             plan: vec!["step one".into()],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: Some(1000),
             max_turns: Some(5),
             spent_tokens: 0,

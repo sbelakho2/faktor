@@ -187,20 +187,15 @@ mod tests {
     use crate::budget::{BudgetAuthority as _, DurableBudgetLedger};
     use crate::handle::tests::{session, test_manager};
     use crate::Task;
-    use faktor_core::state::TaskState;
 
     fn seeded_task(s: &SessionHandle) -> TaskId {
         let task = Task {
             task_id: s.task_id().unwrap(),
             session_id: s.id,
             goal: "metered goal".into(),
-            acceptance_criteria: vec![],
-            plan: vec![],
-            attachments: Vec::new(),
-            budget: crate::TaskBudget::default(),
-            state: TaskState::Pending,
             created_ms: 1,
             updated_ms: 1,
+            ..Default::default()
         };
         s.create_task(task).unwrap().task_id
     }

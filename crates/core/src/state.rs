@@ -1980,12 +1980,18 @@ pub enum ReasonCode {
     /// manifest reconciliation could not bind every change): certification is
     /// refused instead of assuming "no changes" (P0-2 remainder).
     UnattributedChange,
+    /// A proof obligation of the engineering contract was DISPROVEN by
+    /// evidence (a concrete counterexample): completion is refused so the
+    /// task can replan instead of finishing on an established falsehood.
+    /// Unsatisfied-but-not-disproven obligations never use this code: they
+    /// are disclosed, not blocked.
+    ProofObligationDisproven,
 }
 
 impl ReasonCode {
     /// The complete, ordered code table. The uniqueness test iterates this
     /// array: adding a variant without extending it (or vice versa) fails.
-    pub const ALL: [ReasonCode; 14] = [
+    pub const ALL: [ReasonCode; 15] = [
         ReasonCode::CheckFailed,
         ReasonCode::CheckUnavailable,
         ReasonCode::ReviewBlocked,
@@ -2000,6 +2006,7 @@ impl ReasonCode {
         ReasonCode::PatchRevertPatch,
         ReasonCode::RepeatedEvidenceSet,
         ReasonCode::UnattributedChange,
+        ReasonCode::ProofObligationDisproven,
     ];
 
     /// The stable machine code (snake_case; equals the serde spelling).
@@ -2019,6 +2026,7 @@ impl ReasonCode {
             ReasonCode::PatchRevertPatch => "patch_revert_patch",
             ReasonCode::RepeatedEvidenceSet => "repeated_evidence_set",
             ReasonCode::UnattributedChange => "unattributed_change",
+            ReasonCode::ProofObligationDisproven => "proof_obligation_disproven",
         }
     }
 
@@ -2044,6 +2052,9 @@ impl ReasonCode {
             }
             ReasonCode::UnattributedChange => {
                 "a shell mutation could not be attributed to the change set"
+            }
+            ReasonCode::ProofObligationDisproven => {
+                "a proof obligation of the engineering contract was disproven"
             }
         }
     }
@@ -2494,7 +2505,7 @@ mod tests {
         // without a table row breaks ALL (serde deserializes it but no
         // machine code exists). Exhaustive via a manual listing — adding a
         // variant here without a row above fails the next match arm.
-        assert_eq!(ReasonCode::ALL.len(), 14);
+        assert_eq!(ReasonCode::ALL.len(), 15);
     }
 
     #[test]

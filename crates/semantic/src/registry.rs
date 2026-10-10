@@ -33,6 +33,7 @@ use faktor_core::{CancellationToken, Clock, Deadline, SystemClock, WorkspaceId};
 
 use crate::fallback::{GenericSemanticFallback, GENERIC_FALLBACK_ID};
 use crate::health::{ProviderHealthKey, SemanticHealthTracker};
+use crate::intelligence::{fallback_intelligence_capability, IntelligenceCapability};
 use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, EnvelopeIdentity, SemanticCall, SemanticCapabilities,
     SemanticCompleteness, SemanticContextPack, SemanticContextRequest, SemanticDelta,
@@ -227,6 +228,57 @@ impl SemanticProviderRegistry {
             }
         }
         fallback_operation_status(op)
+    }
+
+    /// The per-operation intelligence capability (tier + bounded
+    /// confidence) over the SAME selection rules [`Self::operation_status`]
+    /// uses: a registered provider whose VALIDATED descriptor covers the
+    /// operation reports its DECLARED tier (absent = `None`, never assumed
+    /// high); otherwise the generic fallback reports Tier 0 (filesystem +
+    /// text search) with heuristic fidelity. Unavailable operations keep
+    /// their true tier and report zero confidence.
+    pub fn intelligence_capability(&self, op: SemanticOp) -> IntelligenceCapability {
+        for (index, provider) in self.providers.iter().enumerate() {
+            let Some(descriptor) = self.cached_descriptor(index) else {
+                continue;
+            };
+            if descriptor
+                .capabilities
+                .covers(SemanticCapabilities::for_op(op))
+            {
+                return IntelligenceCapability {
+                    op,
+                    // The descriptor was validated at handshake, so an
+                    // out-of-range tier cannot appear here; a failed parse
+                    // conservatively degrades to `None` (no bonus).
+                    tier: descriptor.intelligence_tier(),
+                    available: true,
+                    fidelity: descriptor.fidelity.unwrap_or(SemanticFidelity::None),
+                    completeness: descriptor
+                        .completeness
+                        .unwrap_or(SemanticCompleteness::Unknown),
+                    source: provider.id().as_str().to_string(),
+                };
+            }
+        }
+        fallback_intelligence_capability(op)
+    }
+
+    /// Every semantic operation's intelligence capability, in
+    /// [`SemanticOp::ALL`] order.
+    pub fn intelligence_capabilities(&self) -> Vec<IntelligenceCapability> {
+        SemanticOp::ALL
+            .iter()
+            .map(|op| self.intelligence_capability(*op))
+            .collect()
+    }
+
+    /// The bounded confidence (`0..=10_000`) for one operation under the
+    /// shared fidelity × completeness × tier mapping (see
+    /// [`crate::intelligence::confidence_bps_for`]). Unavailable operations
+    /// report `0`.
+    pub fn confidence_for(&self, op: SemanticOp) -> u16 {
+        self.intelligence_capability(op).confidence_bps()
     }
 
     /// TRUE when at least one EXTERNAL provider is registered (the generic
@@ -1188,6 +1240,127 @@ mod tests {
         );
     }
 
+    /// The intelligence projection reports a declared tier verbatim, `None`
+    /// when no tier was declared (never assumed high), computes confidence
+    /// WITHOUT a bonus for the absent declaration, and reports the generic
+    /// fallback as Tier 0.
+    #[test]
+    fn intelligence_capability_reports_declared_tier_and_never_assumes() {
+        let handshake = |registry: &SemanticProviderRegistry| {
+            assert!(block_on(registry.fetch_descriptors(
+                SemanticOp::Context,
+                &CancellationToken::new(),
+                None
+            ))
+            .is_ok());
+        };
+
+        let mut two = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        two.register(Arc::new(
+            ScriptedProvider::new(
+                "tier-two",
+                SemanticCapabilities::CONTEXT,
+                ScriptedBehavior::Ready,
+            )
+            .declaring(
+                SemanticFidelity::CompilerExact,
+                SemanticCompleteness::Complete,
+            )
+            .tiering(2),
+        ));
+        handshake(&two);
+        let capability = two.intelligence_capability(SemanticOp::Context);
+        assert_eq!(capability.op, SemanticOp::Context);
+        assert_eq!(
+            capability.tier,
+            Some(crate::intelligence::IntelligenceTier::COMPILER)
+        );
+        assert!(capability.available);
+        assert_eq!(capability.source, "tier-two");
+        // 8000 × 10000 / 10000 + 2 × 200 = 8400.
+        assert_eq!(capability.confidence_bps(), 8_400);
+        assert_eq!(two.confidence_for(SemanticOp::Context), 8_400);
+
+        let mut absent = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        absent.register(Arc::new(
+            ScriptedProvider::new(
+                "no-tier",
+                SemanticCapabilities::CONTEXT,
+                ScriptedBehavior::Ready,
+            )
+            .declaring(
+                SemanticFidelity::CompilerExact,
+                SemanticCompleteness::Complete,
+            ),
+        ));
+        handshake(&absent);
+        let capability = absent.intelligence_capability(SemanticOp::Context);
+        assert_eq!(capability.tier, None, "an absent tier stays unknown");
+        assert_eq!(
+            capability.confidence_bps(),
+            8_000,
+            "no tier bonus without a declared tier"
+        );
+
+        let mut five = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        five.register(Arc::new(
+            ScriptedProvider::new(
+                "tier-five",
+                SemanticCapabilities::CONTEXT,
+                ScriptedBehavior::Ready,
+            )
+            .declaring(
+                SemanticFidelity::CompilerExact,
+                SemanticCompleteness::Complete,
+            )
+            .tiering(5),
+        ));
+        handshake(&five);
+        assert_eq!(five.confidence_for(SemanticOp::Context), 9_000);
+        assert!(
+            absent.confidence_for(SemanticOp::Context) < five.confidence_for(SemanticOp::Context),
+            "an undeclared tier must never be assumed as high"
+        );
+
+        // The fallback path is Tier 0 with heuristic fidelity; unavailable
+        // operations keep the tier but report zero confidence.
+        let fallback = absent.intelligence_capability(SemanticOp::Verify);
+        assert!(!fallback.available);
+        assert_eq!(
+            fallback.tier,
+            Some(crate::intelligence::IntelligenceTier::FILESYSTEM)
+        );
+        assert_eq!(fallback.confidence_bps(), 0);
+    }
+
+    /// An out-of-range tier is refused at handshake, so the invalid claim is
+    /// never cached and the operation degrades to the honest fallback.
+    #[test]
+    fn invalid_tier_handshake_never_reaches_the_capability_projection() {
+        let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+        registry.register(Arc::new(
+            ScriptedProvider::new(
+                "out-of-range",
+                SemanticCapabilities::CONTEXT,
+                ScriptedBehavior::Ready,
+            )
+            .tiering(crate::intelligence::MAX_INTELLIGENCE_TIER + 1),
+        ));
+        assert!(block_on(registry.fetch_descriptors(
+            SemanticOp::Context,
+            &CancellationToken::new(),
+            None
+        ))
+        .is_ok());
+        let capability = registry.intelligence_capability(SemanticOp::Context);
+        assert_eq!(capability.source, GENERIC_FALLBACK_ID);
+        assert_eq!(
+            capability.tier,
+            Some(crate::intelligence::IntelligenceTier::FILESYSTEM)
+        );
+        assert_eq!(capability.fidelity, SemanticFidelity::Heuristic);
+    }
+
     /// Tangerine-2 production wiring: the registry dispatch path ITSELF
     /// refuses a provider response whose entity refs carry Faktor-heuristic
     /// (path-derived) origins. Stable provider identities must originate in
@@ -1303,6 +1476,7 @@ mod tests {
         advance_ms: i64,
         fidelity_declared: Option<SemanticFidelity>,
         completeness_declared: Option<SemanticCompleteness>,
+        tier_declared: Option<u8>,
     }
 
     impl ScriptedProvider {
@@ -1317,6 +1491,7 @@ mod tests {
                 advance_ms: 0,
                 fidelity_declared: None,
                 completeness_declared: None,
+                tier_declared: None,
             }
         }
 
@@ -1331,6 +1506,11 @@ mod tests {
         ) -> Self {
             self.fidelity_declared = Some(fidelity);
             self.completeness_declared = Some(completeness);
+            self
+        }
+
+        fn tiering(mut self, tier: u8) -> Self {
+            self.tier_declared = Some(tier);
             self
         }
 
@@ -1389,6 +1569,7 @@ mod tests {
             );
             descriptor.fidelity = self.fidelity_declared;
             descriptor.completeness = self.completeness_declared;
+            descriptor.tier = self.tier_declared;
             descriptor
         }
 

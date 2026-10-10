@@ -2650,6 +2650,7 @@ mod typed_ledger_tests {
             acceptance_criteria: criteria,
             plan: vec![],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,
@@ -3590,7 +3591,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 31, "schema target 31 after the v29/v30 migrations");
+        assert_eq!(v, 32, "schema target 32 after the v29/v30/v31 migrations");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -3655,6 +3656,8 @@ mod typed_ledger_tests {
             let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
             // The v30 shell-attribution column is post-this-version too.
             let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+            // The v31 engineering-contract column is post-this-version too.
+            let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
             conn.execute("PRAGMA user_version = 18", []).unwrap();
         }
         let store = Store::open(dir.path().join("store"), true).unwrap();

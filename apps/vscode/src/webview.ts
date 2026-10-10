@@ -286,6 +286,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <label><input type="radio" name="finish-level" id="contract-pr" value="pr" /> Open pull request <span class="finish-implied muted">also commits and pushes</span></label>
       </fieldset>
     </details>
+    <details id="contract-options" class="contract-options">
+      <summary>Acceptance &amp; contract</summary>
+      <p class="muted">The run must respect these. One entry per line; at most 64 lines of 512 bytes each, sent with this task start.</p>
+      <label for="contract-constraints" class="composer-label">Constraints — conditions that cannot be violated</label>
+      <textarea id="contract-constraints" class="contract-rows" rows="2" spellcheck="false" placeholder="One constraint per line"></textarea>
+      <label for="contract-invariants" class="composer-label">Invariants — properties that must remain true</label>
+      <textarea id="contract-invariants" class="contract-rows" rows="2" spellcheck="false" placeholder="One invariant per line"></textarea>
+      <label for="contract-risks" class="composer-label">Risks — likely ways the change could fail</label>
+      <textarea id="contract-risks" class="contract-rows" rows="2" spellcheck="false" placeholder="One risk per line"></textarea>
+      <label for="contract-obligations" class="composer-label">Proof obligations — claims verification must evaluate</label>
+      <textarea id="contract-obligations" class="contract-rows" rows="2" spellcheck="false" placeholder="One claim per line"></textarea>
+    </details>
     <div class="composer-actions">
       <button id="btn-send" class="primary-action" type="submit">Run task</button>
       <button id="btn-new-task" class="secondary" type="button">New task…</button>

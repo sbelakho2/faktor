@@ -1404,6 +1404,61 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
 }
 
 #[test]
+fn verification_provider_registry_is_native_by_default_and_kiwi_only_when_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let supervisor = ProcessSupervisor::try_shared().expect("standalone supervisor");
+    let roots: Arc<dyn faktor_verify::VerificationRootResolver> =
+        Arc::new(faktor_verify::FixedRootResolver::new(dir.path()));
+
+    // Default section: the native baseline only, no external provider.
+    let cfg = config::Config::default();
+    let wiring = daemon_verification_providers(
+        &cfg.verification,
+        roots.clone(),
+        &supervisor,
+        &permissive_transport(),
+    )
+    .expect("native-only registry builds");
+    let registry = &wiring.registry;
+    assert!(wiring.kiwi.is_none());
+    assert!(!registry.has_external_provider());
+    assert!(!registry.has_external_provider_for(faktor_verify::VerificationOp::VerifyClaim));
+    assert_eq!(registry.providers().len(), 1);
+    assert_eq!(registry.providers()[0].id().as_str(), "native");
+    assert!(registry.providers()[0].is_native());
+
+    // Enabled + valid section: the external provider joins after native,
+    // and the concrete contract-ful seam carries the same instance.
+    let mut section = config::VerificationCfg::default();
+    section.kiwi.enabled = true;
+    section.kiwi.endpoint = Some("http://127.0.0.1:9/verify".to_string());
+    let wiring = daemon_verification_providers(
+        &section,
+        roots.clone(),
+        &supervisor,
+        &permissive_transport(),
+    )
+    .expect("configured kiwi registry builds");
+    let registry = &wiring.registry;
+    assert!(registry.has_external_provider());
+    assert!(registry.has_external_provider_for(faktor_verify::VerificationOp::VerifyClaim));
+    assert_eq!(registry.providers().len(), 2);
+    assert_eq!(registry.providers()[0].id().as_str(), "native");
+    assert_eq!(registry.providers()[1].id().as_str(), "kiwi");
+    let kiwi = wiring.kiwi.expect("configured kiwi is exposed concretely");
+    assert_eq!(kiwi.endpoint(), "http://127.0.0.1:9/verify");
+
+    // A hostile enabled section refuses the daemon build (never a
+    // half-configured registry).
+    let mut hostile = section.clone();
+    hostile.kiwi.endpoint = Some("ftp://nope".to_string());
+    assert!(
+        daemon_verification_providers(&hostile, roots, &supervisor, &permissive_transport())
+            .is_err()
+    );
+}
+
+#[test]
 fn the_build_report_names_the_running_artifact_honestly() {
     // Directly started (no bootstrap env): the version is reported, the
     // self hash is optional and no release identity is claimed.

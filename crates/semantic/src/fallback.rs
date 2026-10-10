@@ -22,12 +22,13 @@ use faktor_core::{Clock, FileHash, SystemClock, WorkspaceId};
 
 use crate::types::{
     AffectedRequest, AffectedSet, BoxFuture, SemanticCall, SemanticCapabilities, SemanticCheck,
-    SemanticContextItem, SemanticContextPack, SemanticContextRequest, SemanticDelta,
-    SemanticDeltaChange, SemanticDeltaKind, SemanticDeltaRequest, SemanticEntityRef,
+    SemanticCompleteness, SemanticContextItem, SemanticContextPack, SemanticContextRequest,
+    SemanticDelta, SemanticDeltaChange, SemanticDeltaKind, SemanticDeltaRequest, SemanticEntityRef,
     SemanticEnvelope, SemanticError, SemanticExpectation, SemanticExplainRequest,
-    SemanticExplanation, SemanticPayload, SemanticProvider, SemanticProviderId,
-    SemanticResponseCaps, SemanticSnapshot, SemanticSnapshotId, SemanticSnapshotRequest,
-    SemanticVerification, SemanticVerifyRequest, WorkspacePath,
+    SemanticExplanation, SemanticFidelity, SemanticPayload, SemanticProvider,
+    SemanticProviderDescriptor, SemanticProviderId, SemanticResponseCaps, SemanticSnapshot,
+    SemanticSnapshotId, SemanticSnapshotRequest, SemanticVerification, SemanticVerifyRequest,
+    WorkspacePath, SEMANTIC_SCHEMA_VERSION,
 };
 
 /// The fallback's provider id. Not a language and not a vendor.
@@ -209,12 +210,29 @@ impl SemanticProvider for GenericSemanticFallback {
             .union(SemanticCapabilities::EXPLAIN)
     }
 
-    fn fidelity(&self) -> crate::types::SemanticFidelity {
-        crate::types::SemanticFidelity::Heuristic
+    fn fidelity(&self) -> SemanticFidelity {
+        SemanticFidelity::Heuristic
     }
 
-    fn completeness(&self) -> crate::types::SemanticCompleteness {
-        crate::types::SemanticCompleteness::Partial
+    fn completeness(&self) -> SemanticCompleteness {
+        SemanticCompleteness::Partial
+    }
+
+    /// The fallback's honest self-description: heuristic fidelity, partial
+    /// completeness and Tier 0 (filesystem + text search). It never claims
+    /// a tier or capability it cannot deliver — snapshot/verify stay
+    /// uncovered in `capabilities`.
+    fn descriptor(&self) -> SemanticProviderDescriptor {
+        let mut descriptor = SemanticProviderDescriptor::new(
+            self.provider_id(),
+            self.version(),
+            SEMANTIC_SCHEMA_VERSION,
+            self.capabilities(),
+        );
+        descriptor.fidelity = Some(SemanticFidelity::Heuristic);
+        descriptor.completeness = Some(SemanticCompleteness::Partial);
+        descriptor.tier = Some(crate::intelligence::IntelligenceTier::FILESYSTEM.raw());
+        descriptor
     }
 
     fn snapshot(

@@ -182,6 +182,17 @@ pub struct DaemonGraph {
     ///     instance the runtime gates completion with — the graph holds it so
     ///     no consumer can build a second verifier over a second executor.
     pub verification: Arc<faktor_agent::VerificationService>,
+    /// 12. The daemon's generic verification PROVIDER registry: the native
+    ///     baseline always, plus the OPTIONAL external (Kiwi-shaped) provider
+    ///     only while `[verification.kiwi]` is enabled. The SAME `Arc` a
+    ///     later runtime wave consumes for op-based verification
+    ///     (build/lint/tests/claim verification); completion behavior still
+    ///     rides [`DaemonGraph::verification`] unchanged.
+    pub verification_providers: Arc<faktor_verify::VerificationRegistry>,
+    /// 12. The OPTIONAL concrete Kiwi provider (`Some` exactly when
+    ///     `[verification.kiwi]` is enabled and valid) for provider-specific
+    ///     contract-ful submissions (`KiwiVerificationProvider::submit`).
+    pub kiwi_verification: Option<Arc<faktor_kiwi::KiwiVerificationProvider>>,
     /// 13. The ONE semantic-provider registry (audits 48-54/58/59/83): built
     ///     once from the strict `[semantic]` section over the daemon's
     ///     supervisor + checked transport; handed to the agent and the

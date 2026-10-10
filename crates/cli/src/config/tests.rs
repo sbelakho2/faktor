@@ -1434,6 +1434,69 @@ fn verification_section_unknown_fields_fail_everywhere() {
     assert!(Config::load(&path).is_err());
 }
 
+/// The OPTIONAL external Kiwi verifier: absent/disabled by default (native
+/// degradation), strictly validated when enabled, and never half-built.
+#[test]
+fn verification_kiwi_subsection_is_disabled_by_default_and_strict_when_enabled() {
+    // Absent subsection: no external provider.
+    let cfg = Config::default();
+    assert_eq!(
+        cfg.verification.kiwi.provider_config().unwrap(),
+        None,
+        "an absent [verification.kiwi] must yield no provider"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kiwi.json");
+    // Explicit disabled form parses and stays None.
+    std::fs::write(
+        &path,
+        r#"{"verification": {"kiwi": {"enabled": false, "endpoint": "https://kiwi.example/verify"}}}"#,
+    )
+    .unwrap();
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.verification.kiwi.provider_config().unwrap(), None);
+
+    // Enabled WITHOUT an endpoint refuses typed (no silent default).
+    std::fs::write(&path, r#"{"verification": {"kiwi": {"enabled": true}}}"#).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let err = cfg
+        .verification
+        .kiwi
+        .provider_config()
+        .expect_err("enabled kiwi requires an endpoint");
+    assert!(err.contains("endpoint"), "{err}");
+
+    // A full enabled subsection maps onto the bounded kiwi config.
+    std::fs::write(
+        &path,
+        r#"{"verification": {"kiwi": {"enabled": true, "endpoint": "https://kiwi.example/verify", "auth_env": "KIWI_TOKEN", "timeout_ms": 15000}}}"#,
+    )
+    .unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let kiwi = cfg
+        .verification
+        .kiwi
+        .provider_config()
+        .unwrap()
+        .expect("enabled kiwi resolves a provider config");
+    assert_eq!(kiwi.endpoint, "https://kiwi.example/verify");
+    assert_eq!(kiwi.auth_env.as_deref(), Some("KIWI_TOKEN"));
+    assert_eq!(kiwi.timeout_ms, 15_000);
+
+    // Hostile shapes refuse (parse error or typed validation error).
+    for bad in [
+        r#"{"verification": {"kiwi": {"enabled": true, "endpoint": "ftp://x"}}}"#,
+        r#"{"verification": {"kiwi": {"enabled": true, "endpoint": "https://x", "auth_env": "bad name"}}}"#,
+        r#"{"verification": {"kiwi": {"enabled": true, "endpoint": "https://x", "timeout_ms": 0}}}"#,
+        r#"{"verification": {"kiwi": {"enabled": true, "endpoint": "https://x", "bogus": 1}}}"#,
+        r#"{"verification": {"kiwi": {"enabled": true, "endpoint": "https://x", "timeout_ms": "soon"}}}"#,
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        let outcome = Config::load(&path).and_then(|cfg| cfg.verification.kiwi.provider_config());
+        assert!(outcome.is_err(), "{bad} must be refused");
+    }
+}
+
 #[test]
 fn sandbox_section_maps_guarantees_and_rows_strictly() {
     use faktor_sandbox::{SandboxGuarantee, SandboxPolicy, ShellExecutionMode};

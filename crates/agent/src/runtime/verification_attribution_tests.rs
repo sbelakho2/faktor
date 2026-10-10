@@ -135,6 +135,7 @@ async fn completion_contract_gate_refuses_verified_complete_until_step_succeeds(
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: faktor_session::TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: now,
@@ -1634,6 +1635,7 @@ async fn spend_over_budget_and_review_block_precedence_is_identical_after_restar
         acceptance_criteria: vec![],
         plan: vec![],
         attachments: Vec::new(),
+        contract: Default::default(),
         budget: faktor_session::TaskBudget {
             max_tokens: Some(10),
             max_turns: None,
@@ -3566,6 +3568,7 @@ async fn completion_gate_refusal_rows_lost_are_marked_and_replayed() {
         acceptance_criteria: vec![],
         plan: vec![],
         attachments: Vec::new(),
+        contract: Default::default(),
         budget: faktor_session::TaskBudget {
             max_tokens: Some(10),
             max_turns: None,
@@ -3692,6 +3695,7 @@ async fn verification_job_resolve_loss_is_marked_and_reconstructed_on_reopen() {
         acceptance_criteria: vec![],
         plan: vec![],
         attachments: Vec::new(),
+        contract: Default::default(),
         budget: Default::default(),
         state: TaskState::Running,
         created_ms: now,

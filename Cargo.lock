@@ -969,6 +969,7 @@ dependencies = [
  "faktor-hooks",
  "faktor-index",
  "faktor-instructions",
+ "faktor-kiwi",
  "faktor-learning",
  "faktor-lsp",
  "faktor-mcp",
@@ -1281,6 +1282,20 @@ dependencies = [
  "faktor-fs",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "faktor-kiwi"
+version = "0.1.0"
+dependencies = [
+ "faktor-core",
+ "faktor-provider",
+ "faktor-security",
+ "faktor-verify",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1877,6 +1892,7 @@ dependencies = [
  "faktor-hooks",
  "faktor-index",
  "faktor-instructions",
+ "faktor-kiwi",
  "faktor-learning",
  "faktor-lsp",
  "faktor-mcp",

@@ -146,6 +146,7 @@ mod tests {
             acceptance_criteria: criteria,
             plan: vec![],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,

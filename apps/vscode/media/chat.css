@@ -826,6 +826,38 @@ button.chip-action:hover:not(:disabled) {
   color: var(--vscode-foreground);
 }
 
+.contract-options {
+  border-top: 1px solid var(--faktor-border-quiet);
+  padding-top: var(--space-1);
+  margin-top: var(--space-1);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.contract-options summary {
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+}
+
+.contract-options summary:hover {
+  color: var(--vscode-foreground);
+}
+
+.contract-options p {
+  margin: 0;
+  font-size: 0.85em;
+}
+
+.contract-rows {
+  box-sizing: border-box;
+  width: 100%;
+  resize: vertical;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.9em;
+}
+
 .completion-contract {
   border: none;
   margin: var(--space-1) 0 0;
@@ -1234,6 +1266,95 @@ button.attachment-remove {
 .usage-alert {
   color: var(--vscode-testing-iconFailed, #f85149);
   font-weight: 600;
+}
+
+/* ---------------------------------------------------------- contract */
+
+/* The "Needs disclosure" block leads the run details. It is a text-first
+   warning: the core's own state token (`risk:high`, `inferred`, ...) plus
+   the summary; the border tone only re-enforces it. */
+.cockpit-disclosure {
+  border: 1px solid var(--faktor-border);
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #d29922);
+  border-radius: var(--faktor-radius);
+  padding: var(--space-1) var(--space-2) var(--space-2);
+  background: var(--vscode-textBlockQuote-background);
+}
+
+.cockpit-disclosure h3 {
+  margin: 0 0 var(--space-1) 0;
+  font-size: 0.9em;
+  font-weight: 600;
+}
+
+.disclosure-line {
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  overflow-wrap: anywhere;
+}
+
+.contract-group-label {
+  margin-top: var(--space-1);
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+}
+
+.contract-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  min-width: 0;
+}
+
+.contract-statement {
+  flex: 1 1 160px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.contract-evidence {
+  font-size: 0.85em;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+.contract-disclosure-text {
+  font-size: 0.85em;
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  overflow-wrap: anywhere;
+}
+
+.contract-evidence-ref {
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+/* Severity/state chips reuse the shared `.chip` shell; the tone text stays
+   readable in every theme and the state text is always present. */
+.chip-severity-high,
+.chip-severity-unknown,
+.chip-state-inferred,
+.chip-state-uncertain,
+.chip-state-unknown {
+  color: var(--vscode-editorWarning-foreground, #d29922);
+  border-color: currentColor;
+}
+
+.chip-state-disproven {
+  color: var(--vscode-testing-iconFailed, #f85149);
+  border-color: currentColor;
+}
+
+.chip-state-supported,
+.chip-state-known_true {
+  color: var(--vscode-testing-iconPassed, #3fb950);
+  border-color: currentColor;
+}
+
+.chip-origin {
+  color: var(--vscode-descriptionForeground);
 }
 
 .board-posts {

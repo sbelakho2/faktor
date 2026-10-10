@@ -1514,3 +1514,169 @@ fn unreadable_task_capability_budget_is_empty_never_all() {
         "the refusal must be typed and loud: {error:?}"
     );
 }
+
+/// Autonomous-engineering contract: a DISPROVEN proof obligation is
+/// persisted with its evidence and blocks a passing completion gate with the
+/// typed reason code; a supported obligation persists and leaves the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disproven_obligation_blocks_and_persists_evaluated_states() {
+    use super::contract_eval::{apply_contract_outcome, evaluate_and_persist_contract};
+    use super::ExecutedCheck;
+    use faktor_core::contract::{
+        ClaimState, ContractOrigin, EngineeringContract, ProofEvidenceKind,
+    };
+
+    let env = shell_env(vec![ScriptedResponse::End]);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    let contract = EngineeringContract {
+        proof_obligations: vec![
+            EngineeringContract::obligation(
+                "all tests pass",
+                ProofEvidenceKind::TestExecution,
+                ContractOrigin::User,
+            ),
+            EngineeringContract::obligation(
+                "the workspace compiles",
+                ProofEvidenceKind::Compile,
+                ContractOrigin::User,
+            ),
+        ],
+        ..Default::default()
+    };
+    handle
+        .create_task(faktor_session::Task {
+            task_id,
+            session_id: env.session,
+            goal: "contract gate".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+            contract,
+        })
+        .unwrap();
+
+    let failing = ExecutedCheck {
+        id: "cargo-test".into(),
+        kind: faktor_verify::CheckKind::Test,
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        passed: false,
+        exit: Some(101),
+        summary: None,
+        started_ms: now,
+        finished_ms: now + 1,
+    };
+    let outcome = evaluate_and_persist_contract(&handle, &[failing], None).await;
+    let super::contract_eval::ContractGateOutcome::Evaluated { disproven, .. } = &outcome else {
+        panic!("expected an evaluated outcome, got {outcome:?}");
+    };
+    assert_eq!(disproven.len(), 1, "{disproven:?}");
+    assert_eq!(disproven[0].summary, "all tests pass");
+
+    // The evaluated states are DURABLE on the task row.
+    let row = handle.get_task(task_id).unwrap().unwrap();
+    let tests = row
+        .contract
+        .proof_obligations
+        .iter()
+        .find(|o| o.claim == "all tests pass")
+        .unwrap();
+    assert_eq!(tests.state, ClaimState::Disproven);
+    assert_eq!(tests.confidence_bps, Some(0));
+    assert_eq!(tests.evidence_refs.len(), 1);
+    let compile = row
+        .contract
+        .proof_obligations
+        .iter()
+        .find(|o| o.claim == "the workspace compiles")
+        .unwrap();
+    assert_eq!(
+        compile.state,
+        ClaimState::Unknown,
+        "an obligation with no matching evidence keeps its prior state"
+    );
+
+    // A passing gate is BLOCKED by the disproven obligation.
+    let blocked = apply_contract_outcome(super::CompletionGate::VerifiedComplete, outcome);
+    match blocked {
+        super::CompletionGate::BlockedVerification { reasons } => {
+            assert!(
+                reasons.iter().any(|r| {
+                    r.code == faktor_core::state::ReasonCode::ProofObligationDisproven
+                }),
+                "{reasons:?}"
+            );
+        }
+        other => panic!("expected a blocked gate, got {other:?}"),
+    }
+}
+
+/// A supported obligation persists with its evidence and leaves a passing
+/// gate untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supported_obligation_persists_and_keeps_the_passing_gate() {
+    use super::contract_eval::{apply_contract_outcome, evaluate_and_persist_contract};
+    use super::ExecutedCheck;
+    use faktor_core::contract::{
+        ClaimState, ContractOrigin, EngineeringContract, ProofEvidenceKind,
+    };
+
+    let env = shell_env(vec![ScriptedResponse::End]);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    let contract = EngineeringContract {
+        proof_obligations: vec![EngineeringContract::obligation(
+            "all tests pass",
+            ProofEvidenceKind::TestExecution,
+            ContractOrigin::User,
+        )],
+        ..Default::default()
+    };
+    handle
+        .create_task(faktor_session::Task {
+            task_id,
+            session_id: env.session,
+            goal: "contract gate pass".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+            contract,
+        })
+        .unwrap();
+    let passing = ExecutedCheck {
+        id: "cargo-test".into(),
+        kind: faktor_verify::CheckKind::Test,
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        passed: true,
+        exit: Some(0),
+        summary: None,
+        started_ms: now,
+        finished_ms: now + 1,
+    };
+    let outcome = evaluate_and_persist_contract(&handle, &[passing], None).await;
+    let super::contract_eval::ContractGateOutcome::Evaluated { disproven, .. } = &outcome else {
+        panic!("expected an evaluated outcome, got {outcome:?}");
+    };
+    assert!(disproven.is_empty());
+    let row = handle.get_task(task_id).unwrap().unwrap();
+    let obligation = &row.contract.proof_obligations[0];
+    assert_eq!(obligation.state, ClaimState::Supported);
+    assert_eq!(obligation.confidence_bps, Some(8000));
+    assert_eq!(obligation.evidence_refs.len(), 1);
+    assert!(matches!(
+        apply_contract_outcome(super::CompletionGate::VerifiedComplete, outcome),
+        super::CompletionGate::VerifiedComplete
+    ));
+}

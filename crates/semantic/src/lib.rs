@@ -44,6 +44,7 @@ pub mod cache;
 pub mod external;
 pub mod fallback;
 pub mod health;
+pub mod intelligence;
 pub mod registry;
 pub mod risk;
 pub mod types;
@@ -66,6 +67,12 @@ pub use fallback::{
 pub use health::{
     ProviderHealth, ProviderHealthKey, SemanticHealthTracker, BASE_COOLDOWN_MS, MAX_COOLDOWN_MS,
     MAX_HEALTH_ENTRIES, MAX_LATENCY_SAMPLES, MAX_TRANSPORT_IDENTITY_BYTES,
+};
+pub use intelligence::{
+    confidence_bps_for, fallback_intelligence_capabilities, fallback_intelligence_capability,
+    highest_available_tier, native_capabilities, IntelligenceCapability, IntelligenceTier,
+    NativeIntelligenceReport, NativeIntelligenceService, MAX_INTELLIGENCE_TIER,
+    MAX_NATIVE_INTELLIGENCE_SERVICES,
 };
 pub use registry::{guard_call, GuardedCall, SemanticProviderRegistry, SemanticSelection};
 pub use risk::{capability_intersection, RiskPolicy};

@@ -25,6 +25,7 @@ import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeContractRows
 import dev.faktor.shared.NativeCreditGrant
 import dev.faktor.shared.NativeEntitlementSnapshot
 import dev.faktor.shared.NativeEventPage
@@ -330,13 +331,15 @@ class NativeClient(
          * the same immutable submission, so a lost response never creates a
          * second run.
          */
-        submissionId: String? = null
+        submissionId: String? = null,
+        /** The user-authored engineering-contract rows (composer disclosure). */
+        contractRows: NativeContractRows? = null
     ): NativeTaskRunStarted = parseNativeTaskRunStarted(
         request(
             "POST", "/native/session/" + encode(sessionId) + "/task-runs", null,
             NativeRequests.startTaskRun(
                 goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
-                attachments, completionContract, submissionId
+                attachments, completionContract, submissionId, contractRows
             )
         )
     )
