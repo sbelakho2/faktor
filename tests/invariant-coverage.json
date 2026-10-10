@@ -1025,6 +1025,21 @@
      "reason": "faktor-worker delegates this capability to INV-SHUTDOWN-ZERO-LIVE-AUTHORITIES: worker plane recovery is the admission/landing authority"
     }
    ]
+  },
+  {
+   "crate": "faktor-kiwi",
+   "class": "release-critical",
+   "owners": [
+    "INV-KIWI-OPTIONAL-ADAPTER"
+   ],
+   "authority": "authority text of the named invariants",
+   "capabilities": [
+    {
+     "id": "kiwi.optional-provider",
+     "unit": "require_provider_dispatch_reaches_the_configured_kiwi",
+     "mutation": "INV-KIWI-OPTIONAL-ADAPTER"
+    }
+   ]
   }
  ],
  "surfaces": [
