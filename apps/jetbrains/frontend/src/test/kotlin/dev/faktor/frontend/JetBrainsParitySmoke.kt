@@ -269,7 +269,7 @@ object JetBrainsParitySmoke {
                 completionContract = NativeCompletionContract(true, false, true)
             )
         )
-        // The panel's Task tab is the only place a contract is checked.
+        // The Work composer is the only place a contract is checked.
         val panel = FaktorChatPanel(
             FaktorFrontendService(
                 Paths.get("unused-binary"),

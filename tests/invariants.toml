@@ -2006,3 +2006,48 @@ mutation_command = "node scripts/mutation-run.mjs INV-WORKER-REGISTER-JOURNAL-AT
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-ATTEMPT-GENERATION-COHERENCE"
+statement = "Attempt rows are addressed by GENERATION, never by the literal attempt number 1, so a requeued generation's lease/land transitions stay coherent."
+owner = "crates/worker generation/attempt bookkeeping"
+authority = "planted mutation scripts/mutations/INV-WORKER-ATTEMPT-GENERATION-COHERENCE.json"
+script_check = ""
+unit_test = "requeued_generation_attempt_is_leased_then_terminal"
+production_wiring = "double_accept_of_one_generation_yields_exactly_one_lease"
+fault = ""
+mutation_witness = "requeued_generation_attempt_is_leased_then_terminal"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-ATTEMPT-GENERATION-COHERENCE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-REVOCATION-IMMUTABLE"
+statement = "A worker revocation is monotonic: no raw put (including a stale heartbeat snapshot) can clear it or rebind a token hash."
+owner = "crates/worker worker-row mutation"
+authority = "planted mutation scripts/mutations/INV-WORKER-REVOCATION-IMMUTABLE.json"
+script_check = ""
+unit_test = "stale_worker_snapshot_cannot_resurrect_a_revocation"
+production_wiring = "heartbeat_losing_the_revocation_race_is_refused_and_cannot_resurrect"
+fault = ""
+mutation_witness = "stale_worker_snapshot_cannot_resurrect_a_revocation"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-REVOCATION-IMMUTABLE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-RECOVERY-COMPLETES-LOSS"
+statement = "Recovery completes a crash-interrupted lease loss (end_lease accepted but the requeue tail cut), so the job can never be stranded."
+owner = "crates/worker crash recovery"
+authority = "planted mutation scripts/mutations/INV-WORKER-RECOVERY-COMPLETES-LOSS.json"
+script_check = ""
+unit_test = "crash_after_end_lease_is_completed_by_recovery"
+production_wiring = "scheduler_crash_mid_lease_recovers_deterministically"
+fault = ""
+mutation_witness = "crash_after_end_lease_is_completed_by_recovery"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-RECOVERY-COMPLETES-LOSS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

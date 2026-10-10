@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-REVOCATION-IMMUTABLE",
+  "file": "crates/worker/src/store.rs",
+  "find": "// The binding of an existing worker is immutable through this\n            // raw put (only `register_worker_with_token` may bind), so the\n            // payload can never diverge from the token-hash index; and a\n            // revocation is monotonic: a stale snapshot can never clear it.\n            if existing.token_hash != worker.token_hash {\n                return Err(WorkerError::WorkerAlreadyBound {\n                    worker: worker.worker_id.clone(),\n                    token_hash: existing.token_hash.clone(),\n                });\n            }\n            if existing.revoked && !worker.revoked {\n                return Err(WorkerError::WorkerRevoked(worker.worker_id.clone()));\n            }",
+  "replace": "// The binding of an existing worker is immutable through this\n            // raw put (only `register_worker_with_token` may bind), so the\n            // payload can never diverge from the token-hash index; and a\n            // revocation is monotonic: a stale snapshot can never clear it.\n            if existing.token_hash != worker.token_hash {\n                return Err(WorkerError::WorkerAlreadyBound {\n                    worker: worker.worker_id.clone(),\n                    token_hash: existing.token_hash.clone(),\n                });\n            }\n            if false && existing.revoked && !worker.revoked {\n                return Err(WorkerError::WorkerRevoked(worker.worker_id.clone()));\n            }",
+  "gate": "cargo test -p faktor-worker --lib stale_worker_snapshot_cannot_resurrect_a_revocation",
+  "expect": "FAILED",
+  "note": "Allowing a stale full-row put to clear a revocation resurrects a revoked worker into new work (memory twin; the gate test also runs the SQLite twin)."
+}

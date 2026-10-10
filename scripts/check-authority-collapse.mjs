@@ -35,6 +35,7 @@ const AUTHORITY_FILES = [
   'crates/orchestrator/src/merge_semantic.rs',
   'crates/worker/src/service.rs',
   'crates/session/src/child.rs',
+  'crates/session/src/manager.rs',
 ];
 
 // Reviewed exceptions. `line_contains` is a literal substring of the source
@@ -73,14 +74,64 @@ const ALLOWLIST = [
     reason:
       'fingerprint_workspace auxiliary observation (documented): no manifest observation degrades the ENVIRONMENT projection; the reusable proof basis refuses separately when the content identity is unavailable.',
   },
+  {
+    file: 'crates/agent/src/runtime/verification_attribution.rs',
+    line_contains: '.ok()??;',
+    count: 1,
+    reason:
+      'fingerprint_workspace root read (same auxiliary function): an unreadable root yields NO observation, never a fabricated one; the proof basis refuses separately when identity is required.',
+  },
+  {
+    file: 'crates/agent/src/runtime/verification_attribution.rs',
+    line_contains: 'workspaces.open(row.workspace_id, root).ok()',
+    count: 1,
+    reason:
+      'fingerprint_workspace workspace open (same auxiliary function): an unopenable workspace yields no manifest observation; the proof basis refuses separately.',
+  },
+  {
+    file: 'crates/agent/src/runtime/verification_attribution.rs',
+    line_contains: '.unwrap_or_default()',
+    count: 1,
+    reason:
+      'Option::unwrap_or_default AFTER a typed read (`handle.get_task(task_id)?`): a missing task row is legal absence (empty criteria), and the read error already propagated with `?`.',
+  },
+  {
+    file: 'crates/agent/src/runtime/compaction.rs',
+    line_contains: 'let Ok(row) = handle.row() else',
+    count: 1,
+    reason:
+      'semantic consult on an unreadable session row returns SemanticTurnState::unknown (fail-closed escalation), never absence — the else branch is the conservative Unknown, not a default.',
+  },
+  {
+    file: 'crates/agent/src/runtime/compaction.rs',
+    line_contains: '.ok()',
+    count: 1,
+    reason:
+      'workspace-root resolve inside the consult: the failure flows into the explicit revision-unavailable branch that degrades to Unknown with a warn — never a fabricated snapshot identity.',
+  },
+  {
+    file: 'crates/agent/src/runtime/retrieval.rs',
+    line_contains: 'let Ok(identity) = handle.identity() else',
+    count: 1,
+    reason:
+      'evidence-poll archive on an unreadable identity: the else branch logs a typed warn and SKIPS the archive; no guessed workspace id, no fabricated identity.',
+  },
 ];
 
 // (1) collapse-on-authority-call
 const AUTHORITY_RECEIVER =
   /(?:handle|store|plane|session)\.[a-z_]+\(|\.memory_facts\(|\.list_[a-z_]*\(|\.get_[a-z_]*\(|\.task_id\(|\.row\(|\.checkpoints\(|\.token\(|\.worker\(|\.lease[a-z_]*\(|resolver\.resolve\(/;
-const COLLAPSE = /\.ok\(\)|\.unwrap_or_default\(\)|\.unwrap_or\(/;
-// (2) bare err-arm: `Err(_) => None,` / `Err(_) => {}` / `Err(_) => { }`
-const BARE_ERR_ARM = /Err\(_\s*\)\s*=>\s*(?:\{\s*\}|\{\s*return\s+None;?\s*\}|None\s*,?)\s*$/;
+// `.unwrap_or_else`/`.map_or` fabricate defaults exactly like unwrap_or.
+const COLLAPSE = /\.ok\(\)|\.unwrap_or_default\(\)|\.unwrap_or\(|\.unwrap_or_else\(|\.map_or\(/;
+// (2) bare err-arm: `Err(_) => None,` / `Err(_) => {}` / `Err(_) => { }` /
+//     `Err(_) => return <default>;` — fabricating a default in an authority
+//     path is the same failure mode as a bare None.
+const BARE_ERR_ARM =
+  /Err\(_\s*\)\s*=>\s*(?:\{\s*\}|\{\s*return\s+None;?\s*\}|None\s*,?|\{\s*return\s+(?:Ok\(None\)|Vec::new\(\)|String::new\(\)|false);?\s*\}|return\s+(?:Ok\(None\)|Vec::new\(\)|String::new\(\)|false);?)\s*$/;
+// (3) `let Ok(`/`let Some` on an authority read: a value pattern on a
+//     Result is a collapse unless the else branch refuses typed (the
+//     allowlist/reviewer confirms the else shape).
+const LET_OK = /let\s+Ok\(/;
 
 function scanText(text, file) {
   const hits = [];
@@ -88,11 +139,17 @@ function scanText(text, file) {
   lines.forEach((line, index) => {
     const trimmed = line.trim();
     if (trimmed.startsWith('//')) return;
-    if (COLLAPSE.test(line) && AUTHORITY_RECEIVER.test(line)) {
+    // Multi-line receivers: a collapse continuation on this line whose
+    // previous two lines reference an authority source.
+    const window = `${lines[index - 2] ?? ''} ${lines[index - 1] ?? ''} ${line}`;
+    if (COLLAPSE.test(line) && (AUTHORITY_RECEIVER.test(line) || AUTHORITY_RECEIVER.test(window))) {
       hits.push({ file, line: index + 1, kind: 'collapse', text: trimmed });
     }
     if (BARE_ERR_ARM.test(trimmed)) {
       hits.push({ file, line: index + 1, kind: 'bare-err-arm', text: trimmed });
+    }
+    if (LET_OK.test(line) && AUTHORITY_RECEIVER.test(line)) {
+      hits.push({ file, line: index + 1, kind: 'let-ok', text: trimmed });
     }
   });
   return hits;
@@ -164,6 +221,32 @@ function selftest() {
       name: 'non-authority JSON serialization is NOT a violation',
       hit: false,
       text: '        let spec = serde_json::to_string(spec).unwrap_or_default();',
+    },
+    {
+      name: 'unwrap_or_else fabricating a workspace is a violation',
+      hit: true,
+      text: '        let ws = handle.identity().map(|i| i.workspace_id).unwrap_or_else(|_| WorkspaceId::new(1));',
+    },
+    {
+      name: 'multi-line receiver collapse continuation is a violation',
+      hit: true,
+      text: [
+        '        let project_key = self',
+        '            .deps',
+        '            .session',
+        '            .resolve_workspace_root(handle.id())',
+        '            .ok()',
+      ].join('\n'),
+    },
+    {
+      name: 'let Ok on an authority read is reviewed, not auto-passed',
+      hit: true,
+      text: '        let Ok(identity) = handle.identity() else {',
+    },
+    {
+      name: 'Err(_) return-default arm is a violation',
+      hit: true,
+      text: '            Err(_) => return Ok(None);',
     },
   ];
   let failed = 0;

@@ -2232,7 +2232,8 @@
         attachments = [];
           renderAttachments();
         // The completion contract is per task start: a successful ack
-        // resets the checkboxes; a failure keeps them for the retry.
+        // resets the finish-level radio group; a failure keeps it for the
+        // retry.
         clearCompletionControls();
         if (goalNode && typeof goalNode.focus === 'function') {
           goalNode.focus();

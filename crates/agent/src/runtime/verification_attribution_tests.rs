@@ -3835,3 +3835,47 @@ fn review_evidence_admits_only_verification_opinion_and_tagged_durable_rows() {
     assert!(admit_review_evidence(Some(&serde_json::json!({"verdict":"pass"}))).is_none());
     assert!(admit_review_evidence(Some(admitted.as_value())).is_some());
 }
+
+/// Authority law reproducer: a paid review call must not run under a
+/// FABRICATED task identity. An unreadable durable task identity is a typed
+/// refusal (pre-fix it silently fell back to `TaskId::new(1)`), and the
+/// provider stream never opens.
+#[tokio::test]
+async fn unreadable_task_identity_refuses_the_review_before_the_provider() {
+    let costly = CostReportingProvider::new(vec![(None, false)]);
+    let (deps, _dir) = deps_with(costly.clone(), vec![]);
+    let session = new_session(&deps);
+    let handle = deps.session.get_session(session).unwrap().unwrap();
+    deps.session
+        .store()
+        .sql_execute(&format!(
+            "UPDATE session SET task_id = 0 WHERE id = {}",
+            session.raw()
+        ))
+        .unwrap();
+    assert!(
+        handle.task_id().is_err(),
+        "the corruption must make the task identity read fail"
+    );
+    let cancel = CancellationToken::new();
+    let outcome = run_independent_review_call(
+        &deps,
+        &handle,
+        "{\"package\":\"x\"}",
+        &["criterion".to_string()],
+        None,
+        &cancel,
+    )
+    .await;
+    assert!(
+        outcome.verdict.is_none(),
+        "no verdict without a durable task identity"
+    );
+    let reason = outcome.refused.expect("a refused review");
+    assert!(reason.contains("task identity unreadable"), "{reason}");
+    assert_eq!(
+        costly.stream_count(),
+        0,
+        "no paid provider call may be issued"
+    );
+}
