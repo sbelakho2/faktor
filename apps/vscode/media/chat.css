@@ -43,18 +43,20 @@ body {
 }
 
 /* Primary hierarchy (audit UI-1): conversation → current run → composer.
-   Everything else is contextual inspect content behind the header toggle.
-   Order is expressed here so the semantic DOM (and every id) stays intact. */
+   Everything else is contextual inspect/diagnostics content behind the
+   header toggles. Order is expressed here so the semantic DOM (and every
+   id) stays intact. */
 #app > header { order: 0; }
-#app > #meta { order: 1; }
+#app > #diagnostics { order: 1; }
 #app > #stream-recovery { order: 2; }
 #app > #notices { order: 3; }
 #app > #task-card { order: 4; }
-#app > #transcript-card { order: 5; }
-#app > #composer { order: 6; }
-#app > #inspect-card { order: 7; }
-#app > #agents-card { order: 8; }
-#app > #board-card { order: 9; }
+#app > #permission-card { order: 5; }
+#app > #transcript-card { order: 6; }
+#app > #composer { order: 7; }
+#app > #inspect-card { order: 8; }
+#app > #agents-card { order: 9; }
+#app > #board-card { order: 10; }
 
 .inspect-collapsed > #inspect-card,
 .inspect-collapsed > #agents-card,
@@ -66,7 +68,9 @@ header {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  /* The product header is ONE line: brand, status, Inspect, `⋯`. The
+     status ellipsizes; service controls live behind the overflow. */
+  flex-wrap: nowrap;
   position: sticky;
   top: 0;
   z-index: 2;
@@ -84,10 +88,13 @@ header {
   flex: none;
 }
 
-/* The daemon URL is diagnostics, not product copy: keep it one line and
-   never let it push the service controls onto their own row. */
+/* The header status is product copy (Ready · model / Running · agents): it
+   stays visible at every width and ellipsizes instead of pushing the two
+   header toggles onto another row. Service URLs never render here. */
 #daemon-text {
-  max-width: 26vw;
+  min-width: 0;
+  max-width: 40vw;
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -95,10 +102,19 @@ header {
   font-size: 0.9em;
 }
 
-@media (max-width: 360px) {
-  #daemon-text {
-    display: none;
-  }
+/* Header controls keep their labels on one line; the status yields first. */
+header button {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* The `⋯` overflow: a quiet toggle like Inspect, one glyph wide enough for
+   the 28px target minimum. */
+.overflow-toggle {
+  font-size: 1.1em;
+  line-height: 1;
+  min-width: 28px;
+  padding: 0 8px;
 }
 
 .dot {
@@ -896,6 +912,100 @@ button.attachment-remove {
   white-space: pre-wrap;
   word-break: break-word;
   margin-bottom: var(--space-1);
+}
+
+/* ------------------------------------------------ permission attention card
+   A pending approval is an event, not a destination: this card sits in the
+   main flow right under the run strip and carries the decision. */
+.permission-card {
+  border-color: var(--vscode-editorWarning-foreground, #d29922);
+  border-left-width: 3px;
+}
+
+.permission-card h2 {
+  color: var(--vscode-foreground);
+  font-size: 1em;
+}
+
+.permission-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.permission {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+  border-top: 1px solid var(--faktor-border-quiet);
+}
+
+.permission:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.permission-action {
+  font-weight: 600;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.permission-why {
+  font-size: 0.9em;
+}
+
+.permission-actions {
+  align-items: center;
+}
+
+.permission-details summary {
+  font-size: 0.85em;
+}
+
+.permission-diagnostics {
+  font-size: 0.85em;
+  margin-top: var(--space-1);
+}
+
+/* Structured user errors: human headline + next step + a demoted technical
+   disclosure. Colors come only from theme tokens. */
+.user-error {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.user-error-summary {
+  font-weight: 600;
+}
+
+.user-error-hint {
+  font-size: 0.9em;
+}
+
+.technical-disclosure summary {
+  font-size: 0.85em;
+}
+
+.technical-disclosure .excerpt {
+  max-height: 12em;
+  margin: var(--space-1) 0 0;
+}
+
+.user-error-action {
+  min-height: 28px;
+}
+
+/* The finish choice's implied steps: muted supporting text, one per later
+   option (PR implies commit + push). */
+.finish-implied {
+  font-size: 0.85em;
+  font-weight: 400;
 }
 
 /* Board composer controls: the subject input is a primary single-line

@@ -5,9 +5,8 @@
     <vendor>Faktor</vendor>
 
     <description><![CDATA[
-        Faktor split-mode bridge for JetBrains IDEs: chat, task runs,
-        background agents, usage, verification and evidence against a
-        local faktor-cli daemon over Native Protocol v1.
+        Faktor — an engineering agent for autonomous code investigation,
+        implementation and verification inside your IDE.
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>

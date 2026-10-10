@@ -112,7 +112,7 @@ export function findChrome() {
 }
 
 /** The deterministic, self-contained snapshot the harness renders. */
-function harnessSnapshot(empty = false) {
+function harnessSnapshot(empty = false, permissions = false) {
   const snapshot = {
     daemon: 'running',
     daemonDetail: 'http://127.0.0.1:7337',
@@ -129,6 +129,16 @@ function harnessSnapshot(empty = false) {
     sessions: [],
     runs: [],
     activeRunId: 'r1',
+    permissions: permissions
+      ? [
+          {
+            id: '41',
+            sessionId: '7',
+            capability: 'shell',
+            detail: '{"tool":"bash","command":"cargo test --workspace"}',
+          },
+        ]
+      : [],
     agents: [
       {
         agentId: 'r1',
@@ -370,7 +380,7 @@ function harnessSnapshot(empty = false) {
 }
 
 /** Strip the CSP + nonces, point the template at real files, inject stubs. */
-export function buildHarnessHtml(empty = false, attachments = false) {
+export function buildHarnessHtml(empty = false, attachments = false, permissions = false) {
   const webviewSource = readFileSync(join(ROOT, 'src', 'webview.ts'), 'utf8');
   const start = webviewSource.indexOf('<!DOCTYPE html>');
   const end = webviewSource.indexOf('</html>', start) + '</html>'.length;
@@ -394,7 +404,7 @@ export function buildHarnessHtml(empty = false, attachments = false) {
   }
   const theme = `<style id="faktor-harness-theme">${THEME_CSS}</style>`;
   const apiStub = `<script>window.__posted = []; window.acquireVsCodeApi = function () { return { postMessage: function (message) { window.__posted.push(message); } }; };</script>`;
-  const snapshotJson = JSON.stringify(harnessSnapshot(empty)).replace(/</g, '\\u003c');
+  const snapshotJson = JSON.stringify(harnessSnapshot(empty, permissions)).replace(/</g, '\\u003c');
   // The attachment fixture exercises the compact attachment cards (ready and
   // refused) exactly the way the host delivers them.
   const attachmentsScript = attachments
@@ -618,12 +628,27 @@ const MAIN_MIN = 28;
 const OTHER_MIN = 24;
 
 function parseArgs(argv) {
-  const args = { check: false, screenshots: false, empty: false, attachments: false, prefix: 'shot', out: SHOT_DIR };
+  const args = {
+    check: false,
+    screenshots: false,
+    empty: false,
+    attachments: false,
+    permissions: false,
+    diagnostics: false,
+    finish: false,
+    error: false,
+    prefix: 'shot',
+    out: SHOT_DIR,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--check') args.check = true;
     else if (argv[i] === '--screenshots') args.screenshots = true;
     else if (argv[i] === '--empty') args.empty = true;
     else if (argv[i] === '--attachments') args.attachments = true;
+    else if (argv[i] === '--permissions') args.permissions = true;
+    else if (argv[i] === '--diagnostics') args.diagnostics = true;
+    else if (argv[i] === '--finish') args.finish = true;
+    else if (argv[i] === '--error') args.error = true;
     else if (argv[i] === '--prefix') args.prefix = argv[++i];
     else if (argv[i] === '--out') args.out = argv[++i];
   }
@@ -635,7 +660,11 @@ export async function runHarness(args) {
   if (!chrome) {
     throw new Error('no chrome/chromium binary found on PATH');
   }
-  const html = buildHarnessHtml(args.empty === true, args.attachments === true);
+  const html = buildHarnessHtml(
+    args.empty === true,
+    args.attachments === true,
+    args.permissions === true,
+  );
   const pageDir = mkdtempSync(join(tmpdir(), 'faktor-render-page-'));
   const pagePath = join(pageDir, 'index.html');
   writeFileSync(pagePath, html);
@@ -689,7 +718,7 @@ export async function runHarness(args) {
       // Pointer focus must NOT show the ring (suppression).
       await loadPage(cdp, pageUrl, 480);
       const refreshBox = await cdp.evaluate(`(() => {
-        const r = document.getElementById('btn-refresh').getBoundingClientRect();
+        const r = document.getElementById('btn-inspect').getBoundingClientRect();
         return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
       })()`);
       await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: refreshBox.x, y: refreshBox.y, button: 'left', clickCount: 1 });
@@ -700,7 +729,7 @@ export async function runHarness(args) {
         return { id: el.id, outlineStyle: cs.outlineStyle };
       })()`);
       if (pointer.outlineStyle !== 'none') {
-        failures.push(`pointer click on #btn-refresh left outline ${pointer.outlineStyle}`);
+        failures.push(`pointer click on #btn-inspect left outline ${pointer.outlineStyle}`);
       }
       console.log('RENDER CHECK measured controls (largest width):');
       for (const control of measured.values()) {
@@ -723,6 +752,27 @@ export async function runHarness(args) {
       mkdirSync(args.out, { recursive: true });
       for (const width of WIDTHS) {
         await loadPage(cdp, pageUrl, width);
+        if (args.diagnostics === true) {
+          await cdp.evaluate(
+            `(() => { const b = document.getElementById('btn-overflow'); b.click(); if (typeof b.blur === 'function') b.blur(); return true; })()`,
+          );
+        }
+        if (args.finish === true) {
+          await cdp.evaluate(`document.getElementById('finish-options').open = true`);
+        }
+        if (args.error === true) {
+          await cdp.evaluate(`(() => {
+            window.dispatchEvent(new MessageEvent('message', { data: { type: 'userError', error: {
+              kind: 'stream_gap',
+              summary: 'Live updates paused',
+              hint: 'Reconnect to resume from the last event. Nothing is skipped.',
+              action: { key: 'reconnectStream', label: 'Reconnect' },
+              technical: '[protocol_blocked] durable frame 5 declares unsupported event version 2',
+              code: 'protocol_blocked',
+            } } }));
+            return true;
+          })()`);
+        }
         const file = join(args.out, `${args.prefix}-${width}.png`);
         const height = await capture(cdp, file, width);
         console.log(`screenshot ${file} (${width}x${height})`);

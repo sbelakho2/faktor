@@ -1153,6 +1153,9 @@ pub(crate) async fn native_list_sessions(
                 "provider": row.provider,
                 "model": row.model,
                 "state": agent_state_tag(row.state),
+                // Durable creation time for History surfaces (additive; the
+                // clients parse it tolerantly and never fabricate a time).
+                "created_ms": row.created_ms,
             }),
             Err(_) => serde_json::json!({
                 "id": h.id().to_string(),
@@ -1523,6 +1526,39 @@ mod tests {
             before,
             "an unregistered provider must leave no session behind"
         );
+    }
+
+    /// The History surfaces need a durable time: the listing serves the
+    /// session row's `created_ms` (additive DTO field; clients parse it
+    /// tolerantly and never fabricate one).
+    #[tokio::test]
+    async fn session_listing_serves_the_durable_creation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, sid) = test_state(dir.path(), "history row");
+        let headers = authed_headers(&state);
+        let response = super::native_list_sessions(State(state.clone()), headers).await;
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["sessions"].as_array().expect("sessions array");
+        let row = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(&sid.to_string()))
+            .expect("the created session is listed");
+        let served = row["created_ms"].as_i64().expect("created_ms is served");
+        let durable = state
+            .deps
+            .session
+            .get_session(sid)
+            .unwrap()
+            .unwrap()
+            .row()
+            .unwrap()
+            .created_ms;
+        assert_eq!(
+            served, durable,
+            "the listing serves the DURABLE creation time"
+        );
+        assert_eq!(row["title"], "history row");
     }
 
     #[tokio::test]

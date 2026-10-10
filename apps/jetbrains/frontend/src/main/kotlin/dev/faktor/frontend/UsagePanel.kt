@@ -331,7 +331,27 @@ class UsagePanel : JPanel(BorderLayout()) {
 
     private val statusLabel = WrappedLabel("usage: -")
 
+    private val periodLabel = WrappedLabel("No period is served yet.")
+
+    private val tokenLabel = WrappedLabel("Tokens — not reported")
+
+    private val tokenBar = javax.swing.JProgressBar(0, 100).apply {
+        isStringPainted = false
+        isVisible = false
+        alignmentX = java.awt.Component.LEFT_ALIGNMENT
+    }
+
+    private val spendLabel = WrappedLabel("Managed spend — not reported")
+
+    private val creditsLabel = WrappedLabel("Credits — not reported")
+
+    private val planLabel = WrappedLabel("Plan — not reported")
+
     private val linesArea = compactArea(10)
+
+    private val advancedToggle = secondaryButton("Show advanced")
+
+    private val advancedBody = JPanel(BorderLayout())
 
     private val previousButton = secondaryButton("Previous page")
 
@@ -344,13 +364,35 @@ class UsagePanel : JPanel(BorderLayout()) {
     private var model: UsagePanelModel? = null
 
     init {
-        val linesBody = JPanel(BorderLayout())
-        linesBody.isOpaque = false
-        linesBody.add(insetScroll(linesArea), BorderLayout.CENTER)
+        linesArea.isOpaque = false
+        val periodBody = pageColumn(gap = Spacing.S, padding = 0)
+        periodBody.add(periodLabel)
+        periodBody.add(tokenLabel)
+        periodBody.add(tokenBar)
+        periodBody.add(spendLabel)
+        periodBody.add(creditsLabel)
+        periodBody.add(planLabel)
+        advancedToggle.addActionListener {
+            advancedBody.isVisible = advancedToggle.isSelected
+            advancedToggle.text = if (advancedToggle.isSelected) {
+                "Hide advanced"
+            } else {
+                "Show advanced"
+            }
+            revalidate()
+            repaint()
+        }
+        advancedBody.isOpaque = false
+        advancedBody.add(insetScroll(linesArea), BorderLayout.CENTER)
+        advancedBody.isVisible = false
         val body = pageColumn()
-        body.add(card("Billing detail", linesBody))
+        body.add(card("Current period", periodBody))
         body.add(vSpace(Spacing.M))
         body.add(actionRow(previousButton, nextButton, grantButton))
+        body.add(vSpace(Spacing.M))
+        body.add(advancedToggle)
+        body.add(vSpace(Spacing.XS))
+        body.add(advancedBody)
         add(panelHeader(statusLabel), BorderLayout.NORTH)
         add(pageScroll(body), BorderLayout.CENTER)
 
@@ -394,6 +436,27 @@ class UsagePanel : JPanel(BorderLayout()) {
 
     fun lines(): List<String> = model?.lines() ?: emptyList()
 
+    /** The bounded token progress percentage (0..100), or null when unknown. */
+    fun tokenProgressPercent(): Int? {
+        val quota = model?.quotas?.firstOrNull { it.limit == USAGE_LIMIT_MAX_TOKENS } ?: return null
+        val observed = quota.observed ?: return null
+        val limit = quota.value
+        if (limit.signum() <= 0) return null
+        val percent = observed.multiply(java.math.BigInteger.valueOf(100))
+            .divide(limit)
+            .toInt()
+        return percent.coerceIn(0, 100)
+    }
+
+    /** The primary currency/token lines (smoke observable). */
+    fun periodText(): String = buildString {
+        append(periodLabel.fullText).append('\n')
+        append(tokenLabel.fullText).append('\n')
+        append(spendLabel.fullText).append('\n')
+        append(creditsLabel.fullText).append('\n')
+        append(planLabel.fullText).append('\n')
+    }
+
     /** Test hook: clicks the paging/grant controls exactly like a user. */
     internal fun clickNext() {
         nextButton.doClick()
@@ -413,11 +476,12 @@ class UsagePanel : JPanel(BorderLayout()) {
         linesArea.text = text.joinToString("\n")
         linesArea.caretPosition = 0
         statusLabel.text = when (value?.state) {
-            "ok" -> "usage: ${value.organization ?: "-"} · ${value.subscription}"
+            "ok" -> "usage · current period"
             "disabled" -> "usage: billing disabled locally"
             "unavailable" -> "usage: unavailable"
             else -> "usage: -"
         }
+        applyPeriod(value)
         previousButton.isEnabled = value?.prevEnabled() == true
         nextButton.isEnabled = value?.nextEnabled() == true
         grantButton.isEnabled = value?.grantEnabled() == true
@@ -435,5 +499,65 @@ class UsagePanel : JPanel(BorderLayout()) {
         } else {
             textForeground()
         }
+    }
+
+    /** The humanized period card: tokens bar, currency spend, credits, plan. */
+    private fun applyPeriod(value: UsagePanelModel?) {
+        if (value == null || value.state != "ok") {
+            periodLabel.fullText = when (value?.state) {
+                "disabled" -> "Billing is disabled locally; no period numbers are served."
+                "unavailable" -> "The period is unavailable; no numbers are served."
+                else -> "No period is served yet."
+            }
+            tokenLabel.fullText = "Tokens — not reported"
+            tokenBar.isVisible = false
+            spendLabel.fullText = "Managed spend — not reported"
+            creditsLabel.fullText = "Credits — not reported"
+            planLabel.fullText = "Plan — not reported"
+            return
+        }
+        val tokens = value.totals?.totalTokens()
+        val tokenQuota = value.quotas.firstOrNull { it.limit == USAGE_LIMIT_MAX_TOKENS }
+        tokenLabel.fullText = if (tokens == null) {
+            "Tokens — not reported"
+        } else if (tokenQuota?.observed != null && tokenQuota.value.signum() > 0) {
+            "Tokens — " + tokens.toString() + " of " + tokenQuota.value.toString() +
+                " used this period"
+        } else {
+            "Tokens — " + tokens.toString() + " used this period"
+        }
+        val percent = tokenProgressPercent()
+        if (percent != null) {
+            tokenBar.value = percent
+            tokenBar.isVisible = true
+            tokenBar.toolTipText = "Tokens used this period: $percent% of the plan limit"
+        } else {
+            tokenBar.isVisible = false
+        }
+        val managedQuota = value.quotas.firstOrNull { it.limit == USAGE_LIMIT_MANAGED_SPEND }
+        val managed = value.totals?.managedCostMicro
+        spendLabel.fullText = if (managed == null) {
+            "Managed spend — not reported"
+        } else if (managedQuota != null && managedQuota.value.signum() > 0) {
+            "Managed spend — " + currency(managed) + " of " + currency(managedQuota.value) +
+                " this period"
+        } else {
+            "Managed spend — " + currency(managed) + " this period"
+        }
+        val credits = value.credits
+        creditsLabel.fullText = if (credits == null) {
+            "Credits — not reported"
+        } else {
+            "Credits — " + currency(credits.balanceMicro()) + " available"
+        }
+        planLabel.fullText = buildString {
+            append("Plan — ").append(value.planId ?: "none")
+            if (value.planId != null && !value.planFound) {
+                append(" (not defined in the billing configuration)")
+            }
+            append(" · ").append(value.organization ?: "no organization")
+            append(" · subscription ").append(value.subscription)
+        }
+        periodLabel.fullText = "Usage for the current billing period."
     }
 }

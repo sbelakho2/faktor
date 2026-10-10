@@ -1,17 +1,18 @@
-// Coordination-board panel: the durable run-family board of the current
-// session as served by the additive native route
-// (`GET /native/session/{id}/board`), plus one bounded post composer
-// (`POST .../board`). When the serving daemon exposes no board route the
-// panel records an explicit unavailable state with the typed reason — it
-// never fabricates posts or unread counts. Pure presentation: reads and
-// posts are delegated to a Listener.
+// Coordination: the durable run-family board of the current session as
+// served by the additive native route (`GET /native/session/{id}/board`),
+// rendered as human activity — who posted, what they said and when — plus
+// one bounded post composer (`POST .../board`). Revision numbers, author ids
+// and evidence refs stay behind the Advanced disclosure; the real
+// "Load older" paging contract is unchanged. When the serving daemon
+// exposes no board route the panel records an explicit unavailable state
+// with the typed reason — it never fabricates posts or unread counts.
+// Pure presentation: reads and posts are delegated to a Listener.
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
 import java.awt.BorderLayout
 import javax.swing.BorderFactory
-import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
@@ -32,7 +33,7 @@ private const val MAX_BOARD_LINE_CHARS = 240
 private const val MAX_BOARD_POSTS = 500
 
 /** The board's human empty state (one sentence; never a fabricated post). */
-private const val NO_BOARD_POSTS = "No posts yet. Root notes and handoffs appear here."
+private const val NO_BOARD_POSTS = "No posts yet. Notes and handoffs appear here."
 
 class BoardPanel : JPanel(BorderLayout()) {
 
@@ -47,9 +48,11 @@ class BoardPanel : JPanel(BorderLayout()) {
         fun onLoadOlder(beforeRevision: Long) {}
     }
 
-    private val header = WrappedLabel("board: not read yet")
+    private val header = WrappedLabel("coordination: not read yet")
 
     private val postsArea = compactArea(10)
+
+    private val advancedArea = compactArea(4, monospace = true)
 
     private val subjectField = JTextField(18)
 
@@ -60,6 +63,10 @@ class BoardPanel : JPanel(BorderLayout()) {
     private val readButton = secondaryButton("Read board")
 
     private val loadOlderButton = secondaryButton("Load older")
+
+    private val advancedToggle = secondaryButton("Show advanced")
+
+    private val advancedBody = JPanel(BorderLayout())
 
     private val composer = ScrollableColumn()
 
@@ -105,10 +112,10 @@ class BoardPanel : JPanel(BorderLayout()) {
         // The Read control lives with the paging actions (below): keeping it
         // in this row collapsed the subject field to a sliver at 240px.
         subjectRow.add(subjectField, BorderLayout.CENTER)
-        val bodyLabel = mutedLabel("Body")
+        val bodyLabel = mutedLabel("Message")
         val bodyScroll = insetScroll(bodyArea)
         val pagingHint = wrappedMutedLabel(
-            "Older pages load on demand; the local window is bounded."
+            "Older posts load on demand; the local window is bounded."
         )
         val postRow = actionRow(postButton)
         composer.border = BorderFactory.createEmptyBorder(0, 0, 0, 0)
@@ -124,11 +131,29 @@ class BoardPanel : JPanel(BorderLayout()) {
         composer.add(vSpace(Spacing.S))
         composer.add(postRow)
 
+        advancedToggle.addActionListener {
+            advancedBody.isVisible = advancedToggle.isSelected
+            advancedToggle.text = if (advancedToggle.isSelected) {
+                "Hide advanced"
+            } else {
+                "Show advanced"
+            }
+            revalidate()
+            repaint()
+        }
+        advancedBody.isOpaque = false
+        advancedBody.add(insetScroll(advancedArea), BorderLayout.CENTER)
+        advancedBody.isVisible = false
+
         val body = pageColumn()
         val postsBody = JPanel(BorderLayout())
         postsBody.isOpaque = false
         postsBody.add(insetScroll(postsArea), BorderLayout.CENTER)
-        body.add(card("Posts", postsBody))
+        body.add(card("Agent activity", postsBody))
+        body.add(vSpace(Spacing.M))
+        body.add(advancedToggle)
+        body.add(vSpace(Spacing.XS))
+        body.add(advancedBody)
         body.add(vSpace(Spacing.M))
         body.add(card("New post", composer))
 
@@ -157,13 +182,8 @@ class BoardPanel : JPanel(BorderLayout()) {
         nextBeforeRevision = page.nextBeforeRevision
         hasMore = page.hasMore
         pagingNote = null
-        val text = StringBuilder()
-        for (post in page.posts) appendPost(text, post)
-        postsArea.text = if (text.isEmpty()) {
-            NO_BOARD_POSTS
-        } else {
-            text.toString()
-        }
+        postsArea.text = humanPosts(page.posts)
+        advancedArea.text = advancedPosts(page.posts)
         renderHeader()
         updateLoadOlder()
     }
@@ -176,44 +196,71 @@ class BoardPanel : JPanel(BorderLayout()) {
      */
     fun appendOlderPage(page: NativeBoardPage) {
         setAvailable(true)
-        val text = StringBuilder()
+        val human = StringBuilder()
         if (loadedPosts == 0 && postsArea.text == NO_BOARD_POSTS) {
             postsArea.text = ""
         } else {
-            text.append(postsArea.text)
-            if (text.isNotEmpty() && text.last() != '\n') text.append('\n')
+            human.append(postsArea.text)
+            if (human.isNotEmpty() && human.last() != '\n') human.append('\n')
         }
-        for (post in page.posts) appendPost(text, post)
+        val chunk = humanPosts(page.posts)
+        if (chunk.isNotEmpty()) human.append(chunk)
         unread += page.posts.count { it.revision > seenRevision }
         loadedPosts += page.posts.size
         nextBeforeRevision = page.nextBeforeRevision
         hasMore = page.hasMore
         pagingNote = if (hasMore && loadedPosts >= MAX_BOARD_POSTS) {
-            "local window bound reached ($MAX_BOARD_POSTS posts); older pages remain on the daemon"
+            "local window bound reached ($MAX_BOARD_POSTS posts); older pages remain on the service"
         } else {
             null
         }
-        postsArea.text = text.toString()
+        postsArea.text = human.toString()
+        val advanced = StringBuilder(advancedArea.text)
+        if (advanced.isNotEmpty() && advanced.last() != '\n') advanced.append('\n')
+        advanced.append(advancedPosts(page.posts))
+        advancedArea.text = advanced.toString()
         renderHeader()
         updateLoadOlder()
     }
 
-    private fun appendPost(text: StringBuilder, post: NativeBoardPost) {
-        val author = post.authorChild?.let { "child:$it" } ?: "root"
-        text.append('#').append(post.revision).append(" [").append(author).append("] ")
-            .append(bound(post.subject, MAX_BOARD_LINE_CHARS))
-            .append(" - ")
-            .append(bound(post.body, MAX_BOARD_LINE_CHARS))
-        if (post.refs.isNotEmpty()) {
-            text.append(" refs=").append(post.refs.joinToString(",", limit = 5))
+    /** Human activity lines: author and time first, then the message. */
+    private fun humanPosts(posts: List<NativeBoardPost>): String {
+        if (posts.isEmpty()) return ""
+        val text = StringBuilder()
+        for (post in posts) {
+            text.append(authorLabel(post)).append(" · ").append(historyTimeText(post.createdMs))
+            text.append('\n')
+            text.append(bound(post.subject, MAX_BOARD_LINE_CHARS))
+            text.append('\n')
+            text.append(bound(post.body, MAX_BOARD_LINE_CHARS))
+            text.append('\n')
         }
-        text.append('\n')
+        return text.toString()
     }
 
+    /** Advanced raw lines: revision, author id and evidence refs. */
+    private fun advancedPosts(posts: List<NativeBoardPost>): String {
+        if (posts.isEmpty()) return ""
+        val text = StringBuilder()
+        for (post in posts) {
+            val author = post.authorChild?.let { "child:$it" } ?: "root"
+            text.append("revision ").append(post.revision).append(" [").append(author).append("]")
+            if (post.refs.isNotEmpty()) {
+                text.append(" refs=").append(post.refs.joinToString(",", limit = 5))
+            }
+            text.append('\n')
+        }
+        return text.toString()
+    }
+
+    private fun authorLabel(post: NativeBoardPost): String =
+        post.authorChild?.let { "Agent $it" } ?: "Conversation"
+
     private fun renderHeader() {
-        header.text = "board: rev=$latestRevision unread=$unread posts=$loadedPosts" +
+        header.text = "coordination: " + plural(loadedPosts, "post") +
+            " · $unread unread" +
             (if (hasMore) " (older pages exist)" else "") +
-            (pagingNote?.let { " - $it" } ?: "")
+            (pagingNote?.let { " — $it" } ?: "")
     }
 
     /** Pages one bounded older window when the daemon says more exists. */
@@ -247,8 +294,9 @@ class BoardPanel : JPanel(BorderLayout()) {
         nextBeforeRevision = null
         hasMore = false
         pagingNote = null
-        header.text = "board: unavailable (" + bound(reason, MAX_BOARD_LINE_CHARS) + ")"
+        header.text = "coordination: unavailable (" + bound(reason, MAX_BOARD_LINE_CHARS) + ")"
         postsArea.text = ""
+        advancedArea.text = ""
         loadOlderButton.isEnabled = false
     }
 
@@ -262,8 +310,9 @@ class BoardPanel : JPanel(BorderLayout()) {
         hasMore = false
         pagingNote = null
         setAvailable(false)
-        header.text = "board: not read yet"
+        header.text = "coordination: not read yet"
         postsArea.text = ""
+        advancedArea.text = ""
         loadOlderButton.isEnabled = false
     }
 
@@ -276,7 +325,11 @@ class BoardPanel : JPanel(BorderLayout()) {
 
     fun headerText(): String = header.fullText
 
+    /** The rendered human activity text. */
     fun postsText(): String = postsArea.text
+
+    /** The rendered advanced revision/ref text. */
+    fun advancedText(): String = advancedArea.text
 
     fun postEnabled(): Boolean = postButton.isEnabled
 
@@ -309,9 +362,9 @@ class BoardPanel : JPanel(BorderLayout()) {
         if (utf8Bytes(subject) > MAX_BOARD_SUBJECT_BYTES) {
             return "subject exceeds $MAX_BOARD_SUBJECT_BYTES bytes"
         }
-        if (body.trim().isEmpty()) return "body is required"
+        if (body.trim().isEmpty()) return "message is required"
         if (utf8Bytes(body) > MAX_BOARD_BODY_BYTES) {
-            return "body exceeds $MAX_BOARD_BODY_BYTES bytes"
+            return "message exceeds $MAX_BOARD_BODY_BYTES bytes"
         }
         return null
     }

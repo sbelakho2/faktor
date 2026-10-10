@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-TOKEN-SINGLE-BINDING",
+  "file": "crates/worker/src/store.rs",
+  "find": "            return Err(WorkerError::TokenBoundElsewhere {\n                worker: other.worker_id.clone(),\n                token_hash: registration.token_hash.clone(),\n            });",
+  "replace": "            let _ = other;",
+  "gate": "cargo test -p faktor-worker --lib legacy_partial_binding_refuses_a_second_worker_and_never_authenticates",
+  "expect": "FAILED",
+  "note": "Dropping the in-transaction hash scan lets a second worker bind a token already bound by a partial/crashed registration."
+}

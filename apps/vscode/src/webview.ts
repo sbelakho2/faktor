@@ -14,6 +14,7 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import type { FaktorSnapshot } from './state';
+import type { UserErrorProjection } from './errors';
 
 /** Messages the webview sends to the extension host. */
 export interface ChatMessage {
@@ -117,6 +118,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'notice', level, message });
   }
 
+  /**
+   * ONE structured user-facing error. Raw backend text and typed codes ride
+   * inside `technical` (the panel demotes them behind "Technical details");
+   * the headline is human copy plus a next-step action.
+   */
+  postUserError(error: UserErrorProjection): void {
+    this.post({ type: 'userError', error });
+  }
+
   /** The bounded metadata list of the host-side composer attachments. */
   postAttachments(items: readonly unknown[]): void {
     this.post({ type: 'attachments', items });
@@ -129,11 +139,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * The stable blocked-stream reason (`null` = the stream left the blocked
-   * state). The recovery affordances live in the panel; the reason itself
-   * is not part of the snapshot, so it travels on its own message.
+   * state) and the raw resume position. The recovery affordances live in the
+   * panel; the reason travels on its own message, and the raw cursor is
+   * rendered only inside Diagnostics.
    */
-  postStreamBlocked(reason: string | null): void {
-    this.post({ type: 'streamBlocked', reason });
+  postStreamBlocked(reason: string | null, cursor: number | null = null): void {
+    this.post({ type: 'streamBlocked', reason, cursor });
   }
 
   focus(): void {
@@ -180,26 +191,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <header>
     <span id="brand">Faktor</span>
     <span id="daemon-dot" class="dot dot-stopped" aria-hidden="true"></span>
-    <span id="daemon-text">stopped</span>
+    <span id="daemon-text" class="header-status">Ready</span>
     <span class="spacer"></span>
-    <button id="btn-inspect" class="toggle" type="button" aria-expanded="false" title="Show run details, agents, board and evidence">Inspect</button>
-    <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
-    <button id="btn-stop" class="secondary" type="button" title="Stop the daemon">Stop</button>
-    <button id="btn-start" class="secondary" type="button" title="Start the daemon">Start</button>
+    <button id="btn-inspect" class="toggle" type="button" aria-expanded="false" title="Show run details, agents, coordination and evidence">Inspect</button>
+    <button id="btn-overflow" class="toggle overflow-toggle" type="button" aria-expanded="false" aria-haspopup="true" title="Diagnostics and service controls" aria-label="Diagnostics and service controls">⋯</button>
   </header>
-  <section id="meta">
-    <div class="meta-row"><span class="meta-key">Session</span><span id="session-title">none</span></div>
-    <div class="meta-row"><span class="meta-key">State</span><span id="machine-label">daemon stopped</span></div>
-    <div class="meta-row"><span class="meta-key">Stream</span><span id="stream-status">stopped</span></div>
+  <section id="diagnostics" class="card diagnostics" hidden>
+    <h2>Diagnostics</h2>
+    <section id="meta">
+      <div class="meta-row"><span class="meta-key">Session</span><span id="session-title">none</span></div>
+      <div class="meta-row"><span class="meta-key">State</span><span id="machine-label">service stopped</span></div>
+      <div class="meta-row"><span class="meta-key">Live updates</span><span id="stream-status">stopped</span></div>
+      <div class="meta-row"><span class="meta-key">Service</span><span id="daemon-url">—</span></div>
+    </section>
+    <div class="composer-actions">
+      <button id="btn-refresh" class="secondary" type="button" title="Refresh state">Refresh</button>
+      <button id="btn-stop" class="secondary" type="button" title="Stop the Faktor service">Stop</button>
+      <button id="btn-start" class="secondary" type="button" title="Start the Faktor service">Start</button>
+    </div>
+    <div id="stream-cursor" class="muted" hidden></div>
   </section>
   <section id="stream-recovery" class="card" hidden>
-    <h2>Event stream blocked</h2>
+    <h2>Live updates paused</h2>
     <div id="stream-recovery-reason" class="warn" role="alert"></div>
     <div class="composer-actions">
-      <button id="btn-refresh-snapshot" type="button" title="Re-read the durable state (the blocked cursor is not skipped)">Refresh from snapshot</button>
-      <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good cursor after the daemon is upgraded">Reconnect stream</button>
+      <button id="btn-reconnect-stream" type="button" title="Reconnect from the last good position after the Faktor service is upgraded">Reconnect</button>
+      <button id="btn-refresh-snapshot" class="secondary" type="button" title="Re-read the durable state (the blocked position is not skipped)">Refresh from snapshot</button>
     </div>
-    <div class="muted">The durable journal event that blocked the stream is never skipped. If the daemon predates this panel, upgrade it and reconnect; the daemon doctor (<code>faktor-cli doctor</code>) checks the journal.</div>
+    <details class="technical-disclosure">
+      <summary>Technical details</summary>
+      <div class="muted">The durable journal event that blocked the stream is never skipped. If the Faktor service predates this panel, upgrade it and reconnect; the service doctor (<code>faktor-cli doctor</code>) checks the journal.</div>
+    </details>
   </section>
   <section id="notices" aria-live="polite"></section>
   <section id="task-card" class="card run-card" hidden>
@@ -213,6 +235,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <button id="btn-cancel-run" class="secondary" type="button">Cancel run</button>
     </div>
     <div id="task-goal" class="run-goal"></div>
+  </section>
+  <section id="permission-card" class="card permission-card" hidden aria-labelledby="permission-card-title">
+    <h2 id="permission-card-title">Faktor needs your approval</h2>
+    <ul id="permission-list" class="permission-list" aria-label="Pending permission requests"></ul>
   </section>
   <section id="transcript-card" class="card transcript-card">
     <h2 id="transcript-title">Conversation</h2>
@@ -253,10 +279,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <details id="finish-options" class="finish-options">
       <summary>Finish when done</summary>
       <fieldset id="completion-contract" class="completion-contract">
-        <legend>Task completion contract (Task mode; never sent by plain chat)</legend>
-        <label><input type="checkbox" id="contract-commit" /> Commit when verified</label>
-        <label><input type="checkbox" id="contract-push" /> Push</label>
-        <label><input type="checkbox" id="contract-pr" /> Create PR</label>
+        <legend>Finish actions for this run (Run task only; plain chat never sends this)</legend>
+        <label><input type="radio" name="finish-level" id="contract-local" value="local" checked /> Leave changes locally</label>
+        <label><input type="radio" name="finish-level" id="contract-commit" value="commit" /> Commit changes <span class="finish-implied muted">when verification passes</span></label>
+        <label><input type="radio" name="finish-level" id="contract-push" value="push" /> Push branch <span class="finish-implied muted">also commits when verification passes</span></label>
+        <label><input type="radio" name="finish-level" id="contract-pr" value="pr" /> Open pull request <span class="finish-implied muted">also commits and pushes</span></label>
       </fieldset>
     </details>
     <div class="composer-actions">

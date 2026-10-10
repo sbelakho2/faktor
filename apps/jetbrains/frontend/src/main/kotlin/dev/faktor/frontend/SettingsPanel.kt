@@ -116,7 +116,7 @@ class SettingsPanel : JPanel(BorderLayout()) {
         val body = pageColumn()
         body.add(card("Provider selection", selectors))
         body.add(vSpace(Spacing.M))
-        body.add(card("Mutation mode (Task composer)", mutationBody))
+        body.add(card("Mutation mode (runs)", mutationBody))
         body.add(vSpace(Spacing.M))
         body.add(card("Providers", providerBody))
         body.add(vSpace(Spacing.M))

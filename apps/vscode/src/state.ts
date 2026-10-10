@@ -11,7 +11,11 @@
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
-import type { NativeBoardPage, NativeIndexCoverageSnapshot } from './nativeClient.ts';
+import type {
+  NativeBoardPage,
+  NativeIndexCoverageSnapshot,
+  NativePermissionEntry,
+} from './nativeClient.ts';
 
 import { safeSlice, stripDisplayControls } from './displayText.ts';
 
@@ -375,6 +379,37 @@ export interface SessionSummary {
   readonly state: string;
 }
 
+/** Bound of the pending-permission card list and its free-form detail. */
+export const MAX_PERMISSION_SUMMARIES = 16;
+export const MAX_PERMISSION_DETAIL_CHARS = 2000;
+
+/**
+ * One live pending permission as the panel renders it. The card is the
+ * ATTENTION surface (the request blocks the run); ids/capability/session are
+ * disclosed behind "View details" — never headline copy.
+ */
+export interface PermissionSummary {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly capability: string;
+  readonly detail: string;
+}
+
+/** Project the strict native pending list onto the bounded panel vocabulary. */
+export function permissionSummaries(
+  entries: readonly NativePermissionEntry[],
+): PermissionSummary[] {
+  return entries.slice(0, MAX_PERMISSION_SUMMARIES).map((entry) => ({
+    id: entry.id,
+    sessionId: entry.sessionId,
+    capability: entry.capability.length > 256 ? `${entry.capability.slice(0, 256)}…` : entry.capability,
+    detail:
+      entry.detail.length > MAX_PERMISSION_DETAIL_CHARS
+        ? `${entry.detail.slice(0, MAX_PERMISSION_DETAIL_CHARS)}…`
+        : entry.detail,
+  }));
+}
+
 export type DaemonStatus = 'stopped' | 'starting' | 'running' | 'error';
 
 /** Run states that are terminal: any other tag is still active. */
@@ -436,6 +471,10 @@ export interface FaktorSnapshot {
   readonly runs: readonly RunSummary[];
   readonly activeRunId: string | null;
   readonly agents: readonly AgentSummary[];
+  /** The live pending permission requests of the active session. They are
+   * the operation's ATTENTION gate: one approval card in the main flow, and
+   * an empty list means nothing is waiting on the operator. */
+  readonly permissions: readonly PermissionSummary[];
   readonly task: TaskSummary | null;
   readonly verification: VerificationSummary | null;
   readonly usage: UsageSummary | null;
@@ -483,6 +522,7 @@ export function emptySnapshot(): FaktorSnapshot {
     tournament: null,
     board: null,
     indexCoverage: null,
+    permissions: [],
     transcript: [],
     streamStatus: 'stopped',
     lastError: null,
@@ -532,6 +572,9 @@ export class FaktorStore {
       next.tournament = null;
       next.board = null;
       next.indexCoverage = null;
+      // Pending approvals belong to ONE session/authority: a switch or a
+      // stop must never leave a stale approval card actionable.
+      next.permissions = [];
     }
     // The usage/credits panel is ORGANIZATION-scoped (not session-owned): it
     // survives a session switch and is dropped only when the daemon stops.

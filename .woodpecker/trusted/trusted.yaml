@@ -894,6 +894,9 @@ steps:
       # Singular-authority law: the retired raw network matcher must never
       # return; the canonical destination/DNS authority owns egress.
       - node scripts/check-network-authority-singular.mjs
+      # Authority law: unreadable authority reads must never collapse to
+      # absence/default; the checker reviews exceptions explicitly.
+      - node scripts/check-authority-collapse.mjs --selftest-then-coverage
       # P1-ASSURANCE / P0-PROOF: every production crate enumerated from
       # cargo metadata must carry an explicit RELEASE disposition: a
       # release-critical owner plus capability rows whose unit proofs exist

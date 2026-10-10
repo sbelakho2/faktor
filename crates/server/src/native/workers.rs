@@ -74,6 +74,8 @@ pub(crate) fn worker_err(e: WorkerError) -> ApiError {
         WorkerError::UnknownToken => ("unknown_worker_token", 401, false),
         WorkerError::TokenRevoked => ("worker_token_revoked", 401, false),
         WorkerError::TokenAlreadyUsed(_) => ("worker_token_reused", 409, false),
+        WorkerError::TokenNotConsumed(_) => ("worker_token_unconsumed", 401, false),
+        WorkerError::TokenBoundElsewhere { .. } => ("worker_token_bound_elsewhere", 409, false),
         WorkerError::TokenOrgMismatch { .. } => ("foreign_worker_token", 403, false),
         WorkerError::UnknownWorker(_) => ("not_found", 404, false),
         WorkerError::WorkerRevoked(_) => ("worker_revoked", 403, false),

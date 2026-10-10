@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-AUTH-REQUIRES-CONSUMPTION",
+  "file": "crates/worker/src/service.rs",
+  "find": "                None => Err(WorkerError::TokenNotConsumed(worker_id.clone())),",
+  "replace": "                None => Ok(worker),",
+  "gate": "cargo test -p faktor-worker --lib legacy_partial_binding_refuses_a_second_worker_and_never_authenticates",
+  "expect": "FAILED",
+  "note": "Accepting a token whose consumed_by does not name the worker restores the one-token/one-worker identity violation after a partial registration."
+}

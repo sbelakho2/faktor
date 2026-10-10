@@ -1,14 +1,15 @@
-// The background-agents plane: the session's agent roster with its live
-// ownership/model/budget readout and the operator controls (pause, resume,
-// cancel, retry, steer, model, token budget, cost budget). Pure presentation:
-// the control callbacks are delivered to a Listener; the input dialogs and
-// every native call stay in FaktorChatPanel, so the panel is display-testable
-// and the same component renders in the IDE tool window and the host matrix.
+// The agent roster: every row leads with the plan-derived role/title (the
+// step kind and goal the agent owns), falls back to its id, and shows the
+// state plus what it is doing next. Exact identities (agent id, kind,
+// model, budget, ownership, spend) stay under the Advanced disclosure. The
+// operator controls (pause, resume, cancel, retry, steer, model, token
+// budget, cost budget) are unchanged: one state-aware primary action plus an
+// overflow menu, dispatched to the Listener; the input dialogs and every
+// native call stay in FaktorChatPanel.
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativeAgent
 import java.awt.BorderLayout
-import java.awt.GridLayout
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JComboBox
@@ -52,18 +53,27 @@ class AgentsPanel : JPanel(BorderLayout()) {
 
     private val agentsArea = JTextArea(5, 32)
 
+    private val advancedToggle = secondaryButton("Show advanced")
+
+    private val advancedBody = JPanel(BorderLayout())
+
     private lateinit var primaryAction: JButton
 
     private lateinit var moreMenu: JPopupMenu
 
     private var listener: Listener? = null
 
+    /** The plan-derived role lookup: agent id to the step it owns. */
+    private var roles: Map<String, String> = emptyMap()
+
+    /** The plan-derived spend lookup: agent id to exact micro-USD spend. */
+    private var spends: Map<String, java.math.BigInteger> = emptyMap()
+
     init {
         val refreshAgents = secondaryButton("Refresh agents")
         refreshAgents.addActionListener { listener?.onRefresh() }
-        // The combo renders one bounded identity row, never the raw DTO
-        // toString (which clipped at "NativeAgent(agentId=self-1, kind=self,
-        // runId=run-9, ses..."); the full row stays available as tooltip.
+        // The combo renders one bounded human row (role — state + action);
+        // the full row stays available as tooltip.
         agentsCombo.renderer = object : javax.swing.DefaultListCellRenderer() {
             override fun getListCellRendererComponent(
                 list: javax.swing.JList<*>?,
@@ -74,8 +84,8 @@ class AgentsPanel : JPanel(BorderLayout()) {
             ): java.awt.Component {
                 super.getListCellRendererComponent(list, value, index, selected, focus)
                 val agent = value as? NativeAgent ?: return this
-                text = bound(agentLabel(agent), 96)
-                toolTipText = agentLabel(agent)
+                text = bound(rowText(agent), 96)
+                toolTipText = rowText(agent)
                 return this
             }
         }
@@ -125,15 +135,40 @@ class AgentsPanel : JPanel(BorderLayout()) {
         agentsArea.isEditable = false
         agentsArea.lineWrap = true
         agentsArea.wrapStyleWord = true
-        agentsArea.font = uiPanelFont()
-        val outputBody = pageColumn(gap = Spacing.XS, padding = 0)
-        outputBody.add(insetScroll(agentsArea))
+        agentsArea.font = panelMonospace()
+        advancedToggle.addActionListener {
+            advancedBody.isVisible = advancedToggle.isSelected
+            advancedToggle.text = if (advancedToggle.isSelected) "Hide advanced" else "Show advanced"
+            revalidate()
+            repaint()
+        }
+        advancedBody.isOpaque = false
+        advancedBody.add(card("Agent detail", insetScroll(agentsArea)), BorderLayout.CENTER)
+        advancedBody.isVisible = false
         val page = pageColumn()
         page.add(card("Agent controls", controlsBody))
         page.add(vSpace(Spacing.M))
-        page.add(card("Agent detail", outputBody))
+        page.add(advancedToggle)
+        page.add(vSpace(Spacing.XS))
+        page.add(advancedBody)
         add(pageScroll(page), BorderLayout.CENTER)
         syncAgentControls()
+    }
+
+    private fun panelMonospace(): java.awt.Font = monospacePanelFont()
+
+    /**
+     * Registers one control in the dispatch map. The map is the visible
+     * dispatch source: visible surfaces render a subset (primary + menu),
+     * while every command stays wired exactly once.
+     */
+    private fun agentButton(label: String, action: (NativeAgent) -> Unit) {
+        val button = secondaryButton(label)
+        button.addActionListener {
+            val agent = agentsCombo.selectedItem as? NativeAgent ?: return@addActionListener
+            action(agent)
+        }
+        agentControlButtons[label] = button
     }
 
     private enum class AgentAction { Steer, Resume, Retry, None }
@@ -169,54 +204,100 @@ class AgentsPanel : JPanel(BorderLayout()) {
         }
     }
 
-    /** One bounded identity row for the combo (shared by renderer + tooltip). */
-    private fun agentLabel(agent: NativeAgent): String =
-        "${agent.agentId} [${agent.kind}] ${agent.state}"
+    /**
+     * The plan-derived role/title of one agent: the owned step kind and goal
+     * when the plan knows it, else the agent's own goal, else its id.
+     */
+    internal fun agentTitle(agent: NativeAgent): String {
+        val role = roles[agent.agentId]
+        if (!role.isNullOrBlank()) {
+            val goal = bound(agent.goal, 60)
+            return if (goal.isBlank()) role else "$role · $goal"
+        }
+        val goal = bound(agent.goal, 72)
+        return if (goal.isBlank()) agent.agentId else goal
+    }
+
+    /** The second line: state plus what the agent is doing or waiting on. */
+    internal fun agentAction(agent: NativeAgent): String {
+        val blocker = agent.blocker
+        val progress = agent.progress
+        val result = agent.result
+        val inFlight = progress?.inFlightOp
+        val summary = result?.summary
+        val detail = when {
+            blocker != null && blocker.reason.isNotBlank() -> bound(blocker.reason, 72)
+            inFlight != null -> "running " + bound(inFlight, 60)
+            summary != null -> bound(summary, 72)
+            else -> ""
+        }
+        return if (detail.isBlank()) agent.state else agent.state + " · " + detail
+    }
+
+    /** One bounded human roster row (renderer + tooltip + smoke share it). */
+    internal fun rowText(agent: NativeAgent): String =
+        agentTitle(agent) + " — " + agentAction(agent)
+
+    /** The advanced exact row: identities, model, budget, ownership. */
+    private fun advancedLine(agent: NativeAgent): String {
+        val sb = StringBuilder()
+        sb.append(agent.agentId).append(" [").append(agent.kind).append("] ")
+            .append(agent.state).append(" ownership=").append(agent.ownership)
+            .append(" model=").append(agent.model ?: "-")
+            .append(" budget=").append(agent.budget ?: "-")
+        spends[agent.agentId]?.let { sb.append(" cost=").append(currency(it)) }
+        if (agent.progress?.stalled == true) sb.append(" stalled")
+        return sb.toString()
+    }
 
     fun setListener(value: Listener?) {
         listener = value
     }
 
     /**
-     * Replaces the roster and the detail rows with the served agent list; a
-     * still-served selection is preserved, otherwise the combo falls back to
-     * the first row (DefaultComboBoxModel's own behavior).
+     * Replaces the roster and the advanced rows with the served agent list;
+     * a still-served selection is preserved, otherwise the combo falls back
+     * to the first row (DefaultComboBoxModel's own behavior). [model] feeds
+     * the plan-derived role column when the plan knows the agent's step.
      */
-    fun update(agents: List<NativeAgent>) {
+    fun update(agents: List<NativeAgent>, model: TaskTreeModel? = null) {
+        val roleMap = LinkedHashMap<String, String>()
+        val spendMap = LinkedHashMap<String, java.math.BigInteger>()
+        if (model != null) {
+            for (child in model.children) {
+                val kind = child.itemKind?.takeIf { it.isNotBlank() }
+                if (kind != null) roleMap[child.childId] = kind
+                if (child.spentCostMicro != null) spendMap[child.childId] = child.spentCostMicro
+            }
+        }
+        roles = roleMap
+        spends = spendMap
         val selectedId = (agentsCombo.selectedItem as? NativeAgent)?.agentId
         agentsModel.removeAllElements()
         for (agent in agents) agentsModel.addElement(agent)
         if (selectedId != null) selectAgent(selectedId)
         agentsArea.text = if (agents.isEmpty()) {
-            "No background agents yet. Children appear here while a task runs."
+            "No agents yet. Rows appear here while a run works."
         } else {
             val sb = StringBuilder()
             for (agent in agents) {
-                sb.append(agent.agentId).append(" [").append(agent.kind).append("] ")
-                    .append(agent.state).append(" ownership=").append(agent.ownership)
-                    .append(" model=").append(agent.model ?: "-")
-                    .append(" budget=").append(agent.budget ?: "-")
-                    .append('\n')
+                sb.append(advancedLine(agent)).append('\n')
             }
             sb.toString()
         }
         syncAgentControls()
     }
 
-    /** The agent-control dispatch runs only when a row is selected. */
-    private fun agentButton(label: String, control: (NativeAgent) -> Unit): JButton {
-        val button = secondaryButton(label)
-        agentControlButtons[label] = button
-        button.addActionListener {
-            val agent = agentsCombo.selectedItem as? NativeAgent
-            if (agent == null) {
-                listener?.onNotice("select an agent first")
-                return@addActionListener
-            }
-            control(agent)
+    /** The rendered human roster (smoke observable, no display needed). */
+    fun rosterText(): String {
+        val sb = StringBuilder()
+        for (i in 0 until agentsModel.size) {
+            sb.append(rowText(agentsModel.getElementAt(i))).append('\n')
         }
-        return button
+        return sb.toString()
     }
+
+    fun advancedText(): String = agentsArea.text
 
     /** Selects one agent in the combo (the dialog-path smoke hook). */
     internal fun selectAgent(agentId: String): Boolean {

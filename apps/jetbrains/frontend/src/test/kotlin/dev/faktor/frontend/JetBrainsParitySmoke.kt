@@ -278,24 +278,28 @@ object JetBrainsParitySmoke {
         )
         try {
             // Information architecture: exactly three top-level cluster
-            // destinations (the Work / Inspect / History mental model), and
-            // every former peer tab is still reachable as a sub-tab.
+            // destinations (the Work / Inspect / History mental model). Work
+            // is the unified composer surface; Inspect holds the five views
+            // (with the agent roster / approvals / coordination nested under
+            // Agents); utilities are opened from the toolbar/overflow.
             assertEquals(listOf("Work", "Inspect", "History"), panel.clusterTitles())
             for (title in listOf(
-                "Task", "Agents", "Terminal",
-                "Task Tree", "Evidence", "Tournament", "Permissions",
-                "History", "Board", "Usage", "Settings", "Status"
+                "Work", "Overview", "Plan", "Changes", "Verification", "Agents",
+                "Roster", "Approvals", "Coordination", "History"
             )) {
                 assertTrue(
                     panel.selectPanelForTest(title),
-                    "tab '$title' must be reachable: ${panel.tabTitles()}"
+                    "view '$title' must be reachable: ${panel.tabTitles()}"
                 )
             }
-            assertTrue(panel.tabTitles().contains("Task"), panel.tabTitles().toString())
-            assertTrue(panel.tabTitles().contains("Permissions"), panel.tabTitles().toString())
-            assertTrue(panel.tabTitles().contains("Terminal"), panel.tabTitles().toString())
-            assertTrue(panel.tabTitles().contains("Settings"), panel.tabTitles().toString())
-            assertTrue(panel.tabTitles().contains("History"), panel.tabTitles().toString())
+            for (utility in listOf("Settings", "Usage", "Diagnostics")) {
+                assertTrue(
+                    panel.openUtilityForTest(utility),
+                    "utility '$utility' must be reachable from the header"
+                )
+                assertTrue(panel.utilityOpenForTest(), "$utility must render")
+                panel.closeUtilityForTest()
+            }
             assertEquals(null, panel.completionContractFromControls())
             panel.completionCommit.isSelected = true
             panel.completionPr.isSelected = true
@@ -465,7 +469,10 @@ object JetBrainsParitySmoke {
         panel.setComposerFields("bash", "", "")
         assertEquals("5", panel.selectedTerminalId())
         panel.setOutput(output)
-        assertTrue(panel.outputText().contains("pty 6 alive=true"), panel.outputText())
+        // The primary output text is the human snapshot; the pty identity of
+        // the selected command row stays on its advanced row.
+        assertTrue(panel.outputText().contains("parity-output"), panel.outputText())
+        assertTrue(panel.outputText().contains("second line"), panel.outputText())
         // The strict spawn body: exactly the daemon's accepted fields.
         assertEquals(
             "{\"command\":\"bash\",\"args\":[\"-lc\",\"echo parity\"],\"cwd\":\"/tmp\"," +
@@ -632,45 +639,41 @@ object JetBrainsParitySmoke {
         assertEquals(2, sessions.size)
         val panel = HistoryPanel()
         var openedId: String? = null
-        var restarts = 0
-        var reconnects = 0
         var refreshes = 0
         panel.setListener(object : HistoryPanel.Listener {
             override fun onOpenSession(sessionId: String) {
                 openedId = sessionId
             }
 
-            override fun onRestart() {
-                restarts++
-            }
-
-            override fun onReconnect() {
-                reconnects++
-            }
-
             override fun onRefresh() {
                 refreshes++
             }
         })
-        panel.setUnavailable("history read refused (status 503)")
+        panel.setUnavailable("prior work read refused (status 503)")
         assertEquals(false, panel.available())
         panel.update(sessions, "7")
         assertEquals(true, panel.available())
         assertEquals(2, panel.count())
-        assertTrue(panel.label(0).contains("(current)"), panel.label(0))
-        assertTrue(panel.statusText().contains("current=7"), panel.statusText())
+        assertTrue(panel.label(0).contains("● Open now"), panel.label(0))
+        assertTrue(panel.label(0).contains("2023-11-14 22:13 UTC"), panel.label(0))
+        assertEquals(SemanticState.POSITIVE, panel.outcomeTone(0))
+        panel.setFilterForTest("older")
+        assertEquals(1, panel.count())
+        assertTrue(panel.label(0).contains("✓ Completed"), panel.label(0))
+        panel.setFilterForTest("")
         panel.select(1)
         assertEquals("8", panel.selectedId())
         panel.submitOpen()
         assertEquals("8", openedId)
         assertEquals(true, panel.openEnabled())
-        assertEquals(true, panel.restartEnabled())
-        assertEquals(true, panel.reconnectEnabled())
-        panel.setConnection("connected: http://127.0.0.1:9", "open", 42L, "7")
-        assertTrue(panel.streamText().contains("cursor=42"), panel.streamText())
-        // The restart/reconnect controls are always available; the reconnect
-        // control needs a selected session.
-        panel.setConnection("stopped", "off", 0L, null)
+        assertEquals(0, refreshes)
+        // The daemon/stream machinery intentionally does NOT live on History:
+        // it is on Diagnostics (proven by the diagnostics canned step).
+        val diagnostics = DiagnosticsPanel()
+        diagnostics.setConnection("connected: http://127.0.0.1:9", "open", 42L, "7")
+        assertTrue(diagnostics.streamText().contains("cursor 42"), diagnostics.streamText())
+        assertEquals(true, diagnostics.restartEnabled())
+        assertEquals(true, diagnostics.reconnectEnabled())
     }
 
     // ------------------------------------------------------ fake daemon e2e
@@ -712,15 +715,16 @@ object JetBrainsParitySmoke {
             val chat = panel
 
             registry.observables["history"] = {
-                // Durable session listing with the current session marked.
+                // Prior work rows carry a human title, a time and an outcome;
+                // the daemon/stream state lives on Diagnostics instead.
                 assertEquals(2, chat.historyView().count())
                 assertTrue(
-                    chat.historyView().label(0).contains("[ready]"),
+                    chat.historyView().label(0).contains("● Open now"),
                     chat.historyView().label(0)
                 )
                 assertTrue(
-                    chat.historyView().streamText().contains("session=7"),
-                    chat.historyView().streamText()
+                    chat.diagnosticsView().streamText().contains("cursor"),
+                    chat.diagnosticsView().streamText()
                 )
             }
             registry.observables["provider_selection"] = {
@@ -775,10 +779,9 @@ object JetBrainsParitySmoke {
                     chat.permissionsView().refusalText()
                         ?.contains("permission_session_mismatch") == true
                 }
-                assertTrue(
-                    chat.permissionsView().headerText().contains("last reply refused"),
-                    chat.permissionsView().headerText()
-                )
+                await("header surfaces the refusal") {
+                    chat.permissionsView().headerText().contains("last reply refused")
+                }
                 assertEquals(
                     3,
                     daemon.requestCount("POST", "/native/permission/reply"),
@@ -1012,13 +1015,18 @@ object JetBrainsParitySmoke {
             }
             registry.observables["restart_reconnect"] = {
                 // Opening the other durable session switches the current
-                // session and reopens the SSE stream at the new cursor.
+                // session and reopens the SSE stream at the new cursor; the
+                // reconnect/restart machinery renders on Diagnostics.
                 chat.historyView().select(1)
                 chat.historyView().submitOpen()
                 await("session 8 opened") { service.currentSessionId() == "8" }
                 assertTrue(
-                    chat.historyView().reconnectEnabled(),
-                    "reconnect stays available on the durable session surface"
+                    chat.diagnosticsView().reconnectEnabled(),
+                    "reconnect stays available on Diagnostics"
+                )
+                assertTrue(
+                    chat.diagnosticsView().restartEnabled(),
+                    "restart stays available on Diagnostics"
                 )
             }
             // The executable parity matrix runs NOW, inside the live

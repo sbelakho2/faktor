@@ -499,8 +499,8 @@ internal object ParityMatrix {
                 "task mode",
                 canned = {
                     // Observable: the strict `POST …/task-runs` body carries
-                    // goal + criteria + mutation_mode, and the Task tab is the
-                    // only place a completion contract is checked.
+                    // goal + criteria + mutation_mode, and the ONE composer
+                    // (Work) is the only place a completion contract is set.
                     assertEquals(
                         "{\"goal\":\"g\",\"criteria\":[\"c\"],\"mutation_mode\":\"shadow\"}",
                         NativeRequests.startTaskRun("g", listOf("c"), mutationMode = "shadow")
@@ -515,7 +515,15 @@ internal object ParityMatrix {
                         )
                     )
                     try {
-                        assertTrue(panel.tabTitles().contains("Task"), panel.tabTitles().toString())
+                        assertTrue(
+                            panel.tabTitles().containsAll(
+                                listOf(
+                                    "Work", "Inspect", "History",
+                                    "Overview", "Plan", "Changes", "Verification", "Agents"
+                                )
+                            ),
+                            panel.tabTitles().toString()
+                        )
                         assertEquals(null, panel.completionContractFromControls())
                         panel.completionCommit.isSelected = true
                         panel.completionPr.isSelected = true
@@ -654,8 +662,15 @@ internal object ParityMatrix {
                     panel.setComposerFields("bash", "-lc echo-parity", "/tmp")
                     assertTrue(panel.terminalLabel(0).contains("pty 5"), panel.terminalLabel(0))
                     assertTrue(panel.eventsText().contains("#1 created"), panel.eventsText())
+                    // The primary row is shell-like once the argv is observed.
+                    panel.noteSpawned("5", "bash", listOf("-lc", "echo-parity"), "/tmp")
+                    assertTrue(
+                        panel.commandsText().contains("$ bash -lc echo-parity"),
+                        panel.commandsText()
+                    )
+                    assertTrue(panel.commandsText().contains("(in /tmp)"), panel.commandsText())
                     panel.setOutput(parseNativeTerminalOutput("6", PARITY_TERMINAL_OUTPUT_JSON))
-                    assertTrue(panel.outputText().contains("pty 6 alive=true"), panel.outputText())
+                    assertTrue(panel.outputText().contains("parity-output"), panel.outputText())
                 },
                 daemonCheck = { fakeDaemonCheck("terminal", "terminal") }
             )
@@ -790,15 +805,22 @@ internal object ParityMatrix {
                     // routing + the stream cursor read.
                     val sessions = parseNativeSessionList(PARITY_SESSIONS_JSON)
                     val panel = HistoryPanel()
-                    panel.setUnavailable("history read refused (status 503)")
+                    panel.setUnavailable("prior work read refused (status 503)")
                     assertEquals(false, panel.available())
                     panel.update(sessions, "7")
                     assertEquals(2, panel.count())
-                    assertTrue(panel.label(0).contains("(current)"), panel.label(0))
+                    // Human rows: title, deterministic UTC time, outcome.
+                    assertTrue(panel.label(0).contains("● Open now"), panel.label(0))
+                    assertTrue(panel.label(0).contains("2023-11-14 22:13 UTC"), panel.label(0))
+                    assertEquals(SemanticState.POSITIVE, panel.outcomeTone(0))
+                    // Search filters the rows without re-reading the daemon.
+                    panel.setFilterForTest("older")
+                    assertEquals(1, panel.count())
+                    assertTrue(panel.label(0).contains("✓ Completed"), panel.label(0))
+                    panel.setFilterForTest("")
+                    assertEquals(2, panel.count())
                     panel.select(1)
                     assertEquals("8", panel.selectedId())
-                    panel.setConnection("connected: http://127.0.0.1:9", "open", 42L, "7")
-                    assertTrue(panel.streamText().contains("cursor=42"), panel.streamText())
                 },
                 daemonCheck = { fakeDaemonCheck("history", "history") }
             )
@@ -810,10 +832,12 @@ internal object ParityMatrix {
                     // Observable: the restart/reconnect controls exist on the
                     // durable history surface; a stopped connection renders
                     // honestly (the real daemon drives the live behavior).
-                    val panel = HistoryPanel()
-                    panel.update(parseNativeSessionList(PARITY_SESSIONS_JSON), "7")
+                    // The daemon/stream machinery lives on Diagnostics.
+                    val panel = DiagnosticsPanel()
+                    panel.setConnection("connected: http://127.0.0.1:9", "open", 42L, "7")
                     assertEquals(true, panel.restartEnabled())
                     assertEquals(true, panel.reconnectEnabled())
+                    assertTrue(panel.streamText().contains("cursor 42"), panel.streamText())
                     panel.setConnection("stopped", "off", 0L, null)
                     assertTrue(panel.streamText().contains("off"), panel.streamText())
                 },
@@ -1469,6 +1493,30 @@ internal fun cannedTaskTreePanel(): TaskTreePanel {
     return panel
 }
 
+/** The Overview view: the plan-derived run summary at a glance. */
+internal fun cannedOverviewPanel(): OverviewPanel {
+    val panel = OverviewPanel()
+    panel.updateModel(criterionProofModel())
+    return panel
+}
+
+/** The Changes view: changed files plus their contextual evidence refs. */
+internal fun cannedChangesPanel(): ChangesPanel {
+    val panel = ChangesPanel()
+    panel.update(
+        listOf("apps/jetbrains/frontend/FaktorChatPanel.kt", "docs/ui-terminology.md"),
+        criterionProofModel().evidence
+    )
+    return panel
+}
+
+/** The Verification view: criteria verdicts, checks and reviewer. */
+internal fun cannedVerificationPanel(): VerificationPanel {
+    val panel = VerificationPanel()
+    panel.updateModel(criterionProofModel())
+    return panel
+}
+
 internal fun cannedBlockersPanel(): BlockersPanel {
     val tree = TaskTree.build(
         agents = parseNativeAgents(PARITY_AGENTS_JSON),
@@ -1539,8 +1587,6 @@ internal fun cannedSettingsPanel(): SettingsPanel {
 internal fun cannedHistoryPanel(): HistoryPanel {
     val panel = HistoryPanel()
     panel.update(parseNativeSessionList(PARITY_SESSIONS_JSON), "7")
-    panel.select(1)
-    panel.setConnection("attached port 9 version fake-1", "open", 42L, "7")
     return panel
 }
 
@@ -1551,9 +1597,10 @@ internal fun cannedAgentsPanel(): AgentsPanel {
     return panel
 }
 
-/** A representative session/task status readout (full text lines). */
-internal fun cannedStatusPanel(): StatusPanel {
-    val panel = StatusPanel()
+/** A representative diagnostics readout (muted key/value rows + recovery). */
+internal fun cannedDiagnosticsPanel(): DiagnosticsPanel {
+    val panel = DiagnosticsPanel()
+    panel.setConnection("attached port 9 version fake-1", "open", 42L, "7")
     panel.setDaemon("daemon: attached port 9 version fake-1")
     panel.setStream("stream: open at cursor 42")
     panel.setState("state: awaiting_permission (blocked on shell approval)")
@@ -1724,9 +1771,9 @@ internal const val PARITY_CRITERION_PROOF_JSON = "{" +
 
 internal const val PARITY_SESSIONS_JSON = "{\"sessions\":[" +
     "{\"id\":\"7\",\"title\":\"parity\",\"provider\":\"alpha\",\"model\":\"m\"," +
-    "\"state\":\"ready\"}," +
+    "\"state\":\"ready\",\"created_ms\":1700000000000}," +
     "{\"id\":\"8\",\"title\":\"older\",\"provider\":\"beta\",\"model\":\"n\"," +
-    "\"state\":\"ended\"}]}"
+    "\"state\":\"ended\",\"created_ms\":1700000000000}]}"
 
 /**
  * The advertised attachment contract of the parity fake daemon: tight enough

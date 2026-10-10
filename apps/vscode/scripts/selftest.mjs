@@ -28,6 +28,7 @@ import * as cp from '../src/cockpit.ts';
 import * as cpa from '../src/controlPlaneAuth.ts';
 import * as mn from '../src/money.ts';
 import * as dt from '../src/displayText.ts';
+import * as ue from '../src/errors.ts';
 import composerPolicy from '../media/composer-state.js';
 import boardPolicy from '../media/board-state.js';
 import {
@@ -3701,26 +3702,27 @@ async function completionContractTests() {
     // The explicit result releases the single-flight lock before the next
     // logical submission (the lock itself is covered separately).
     deliver({ type: 'startResult', goal: 'plain goal', ok: true });
-    // Checked boxes: the exact strict contract rides this task start only.
+    // The ordered finish choice: one radio group, later options imply the
+    // earlier steps. Selecting "Open pull request" implies commit + push.
     dom.document.getElementById('goal').value = 'contracted goal';
-    dom.document.getElementById('contract-commit').checked = true;
     dom.document.getElementById('contract-pr').checked = true;
     dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
     assertDeepEqual(posted[posted.length - 1], {
       type: 'sendGoal',
       goal: 'contracted goal',
-      completionContract: { include_commit: true, include_push: false, include_pr: true },
+      completionContract: { include_commit: true, include_push: true, include_pr: true },
     });
-    // A successful start resets the controls (per-start contract).
+    // A successful start resets the choice to "Leave changes locally".
     deliver({
       type: 'startResult',
       goal: 'contracted goal',
       ok: true,
     });
     assert(
-      dom.document.getElementById('contract-commit').checked === false &&
-        dom.document.getElementById('contract-pr').checked === false,
-      'a success ack clears the completion controls',
+      dom.document.getElementById('contract-pr').checked === false &&
+        dom.document.getElementById('contract-commit').checked === false &&
+        dom.document.getElementById('contract-local').checked === true,
+      'a success ack resets the finish choice to leave changes locally',
     );
     // The task card renders the durable status + its explicit source/reason.
     const completionNode = dom.document.getElementById('task-completion');
@@ -3734,6 +3736,112 @@ async function completionContractTests() {
     assert(
       findFake(completionNode, (node) => String(node.textContent).includes('no native completion read')),
     );
+  });
+
+  await test('the finish choice is ONE ordered radio group: later levels imply earlier steps', () => {
+    const { posted, dom, deliver } = runChatWebview(webviewSnapshot([]));
+    const goal = dom.document.getElementById('goal');
+    const submit = () => dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    // Leave changes locally (the default) sends no contract at all.
+    goal.value = 'local only';
+    submit();
+    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'local only' });
+    deliver({ type: 'startResult', goal: 'local only', ok: true });
+    // Push branch implies commit.
+    dom.document.getElementById('contract-push').checked = true;
+    goal.value = 'push it';
+    submit();
+    assertDeepEqual(posted[posted.length - 1].completionContract, {
+      include_commit: true,
+      include_push: true,
+      include_pr: false,
+    });
+    deliver({ type: 'startResult', goal: 'push it', ok: true });
+    // Commit changes alone.
+    dom.document.getElementById('contract-commit').checked = true;
+    goal.value = 'commit it';
+    submit();
+    assertDeepEqual(posted[posted.length - 1].completionContract, {
+      include_commit: true,
+      include_push: false,
+      include_pr: false,
+    });
+    deliver({ type: 'startResult', goal: 'commit it', ok: true });
+    // A success ack returns the group to its default selection.
+    assertEqual(dom.document.getElementById('contract-local').checked, true, 'local radio selected');
+    assertEqual(dom.document.getElementById('contract-commit').checked, false);
+    assertEqual(dom.document.getElementById('contract-push').checked, false);
+    assertEqual(dom.document.getElementById('contract-pr').checked, false);
+  });
+}
+
+// ------------------- 7a-2. the one user-facing error projection
+
+async function errorProjectionTests() {
+  await test('the error projection demotes typed codes and keeps one human shape per kind', () => {
+    const stream = ue.projectError({
+      kind: 'stream_gap',
+      message: 'durable frame 5 data is not JSON',
+      code: 'protocol_blocked',
+    });
+    assertEqual(stream.kind, 'stream_gap');
+    assertEqual(stream.summary, 'Live updates paused');
+    assertEqual(stream.action.key, 'reconnectStream');
+    assertEqual(stream.code, 'protocol_blocked');
+    assert(stream.technical.startsWith('[protocol_blocked] '), stream.technical);
+    assert(
+      !stream.summary.includes('protocol_blocked') && !stream.hint.includes('protocol_blocked'),
+      'the typed code never reaches the product copy',
+    );
+    assertEqual(ue.projectError({ kind: 'daemon_down' }).action.key, 'startService');
+    assertEqual(ue.projectError({ kind: 'daemon_start_failed' }).action.key, 'startService');
+    assertEqual(ue.projectError({ kind: 'permission_expired' }).action.key, 'refresh');
+    assertEqual(ue.projectError({ kind: 'run_failure' }).action.key, 'focusComposer');
+    assertEqual(ue.projectError({ kind: 'attachment_refused' }).action.key, 'attachFiles');
+    assertEqual(ue.projectError({ kind: 'unexpected' }).action, null);
+    // Hostile input: unknown kind / missing message / absurd message.
+    assertEqual(ue.projectError({ kind: 'nonsense' }).kind, 'unexpected');
+    assertEqual(ue.projectError({ kind: 42, message: '' }).technical, 'no further detail was provided');
+    const huge = ue.projectError({ kind: 'run_failure', message: 'x'.repeat(5000) });
+    assert(
+      huge.technical.length <= ue.MAX_ERROR_TECHNICAL_CHARS && huge.technical.endsWith('…'),
+      `the technical tail is hard-bounded: ${huge.technical.length}`,
+    );
+    const hostile = ue.projectError({ kind: 'stream_gap', message: 'x', code: 'c'.repeat(500) });
+    assert(hostile.code.length <= 64, 'a hostile code is bounded');
+    assert(!hostile.technical.includes('c'.repeat(100)), 'the hostile code cannot dominate the tail');
+  });
+
+  await test('attachment-refusal projection bounds reasons and never promotes raw text', () => {
+    const projection = ue.attachmentRefusalProjection(['a'.repeat(400), 'b', 'c', 'd', 'e', 'f', 'g']);
+    assertEqual(projection.kind, 'attachment_refused');
+    assertEqual(projection.action.key, 'attachFiles');
+    assertEqual(projection.summary, 'Some attachments were refused');
+    assert(projection.technical.length <= ue.MAX_ERROR_TECHNICAL_CHARS);
+    assert(
+      !projection.technical.split('; ').includes('f'),
+      'only the first five reasons are kept',
+    );
+    assertEqual(ue.attachmentRefusalProjection([]).technical, 'no reason was reported');
+  });
+
+  await test('pending permissions project bounded list entries for the approval card', () => {
+    const entries = [];
+    for (let i = 0; i < 40; i += 1) {
+      entries.push({ id: String(i), sessionId: '7', capability: 'shell', detail: `${i}` });
+    }
+    const summaries = st.permissionSummaries(entries);
+    assertEqual(summaries.length, st.MAX_PERMISSION_SUMMARIES, 'the pending list is bounded');
+    const huge = st.permissionSummaries([
+      {
+        id: '1',
+        sessionId: '7',
+        capability: 'x'.repeat(300),
+        detail: 'y'.repeat(st.MAX_PERMISSION_DETAIL_CHARS + 50),
+      },
+    ]);
+    assertEqual(huge[0].capability.length, 257, 'capability is bounded with an ellipsis');
+    assertEqual(huge[0].detail.length, st.MAX_PERMISSION_DETAIL_CHARS + 1, 'detail is bounded');
   });
 }
 
@@ -6963,6 +7071,7 @@ function webviewSnapshot(agents) {
     runs: [],
     activeRunId: null,
     agents,
+    permissions: [],
     task: null,
     verification: null,
     usage: null,
@@ -7109,6 +7218,131 @@ async function presentationWebviewTests() {
       'a second toggle collapses it again',
     );
     assertEqual(toggle.getAttribute('aria-expanded'), 'false');
+  });
+}
+
+// -------------------------- permission attention card + user-error rendering
+
+async function attentionWebviewTests() {
+  const pendingPermission = {
+    id: '41',
+    sessionId: '7',
+    capability: 'shell',
+    detail: '{"tool":"bash","command":"cargo test --workspace"}',
+  };
+
+  await test('a pending permission renders the approval card decision-first and posts typed replies', () => {
+    const { posted, dom } = runChatWebview({ ...webviewSnapshot([]), permissions: [pendingPermission] });
+    const card = dom.document.getElementById('permission-card');
+    assertEqual(card.hidden, false, 'a pending permission shows the approval card');
+    const list = dom.document.getElementById('permission-list');
+    assertEqual(list.children.length, 1, 'one card per pending request');
+    const item = list.children[0];
+    assertEqual(item.getAttribute('data-permission-id'), '41');
+    const summary = findFake(item, (node) => String(node.className).includes('permission-action'));
+    assertEqual(summary.textContent, 'Run a shell command: cargo test --workspace');
+    const why = findFake(item, (node) => String(node.className).includes('permission-why'));
+    assert(
+      why && why.textContent.includes('Needed to verify: cargo test --workspace'),
+      why && why.textContent,
+    );
+    // The raw handle, capability key and owning conversation id stay behind
+    // "View details" (a real disclosure), never in the headline.
+    const diagnostics = findFake(
+      item,
+      (node) => String(node.className).includes('permission-diagnostics'),
+    );
+    assert(
+      diagnostics &&
+        diagnostics.textContent.includes('#41') &&
+        diagnostics.textContent.includes('shell') &&
+        diagnostics.textContent.includes('conversation 7'),
+      diagnostics && diagnostics.textContent,
+    );
+    assert(
+      !summary.textContent.includes('41') && !summary.textContent.includes('capability '),
+      'the headline stays decision-first',
+    );
+    const allow = findFake(item, (node) => node.tagName === 'button' && node.textContent === 'Allow');
+    assert(allow, 'Allow exists');
+    allow.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'permissionReply',
+      permissionId: '41',
+      decision: 'allow',
+    });
+    const deny = findFake(item, (node) => node.tagName === 'button' && node.textContent === 'Deny');
+    deny.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'permissionReply',
+      permissionId: '41',
+      decision: 'deny',
+    });
+  });
+
+  await test('an empty pending set hides the approval card; hostile entries stay bounded', () => {
+    const { dom } = runChatWebview(webviewSnapshot([]));
+    assertEqual(dom.document.getElementById('permission-card').hidden, true);
+    const many = [];
+    for (let i = 0; i < 40; i += 1) {
+      many.push({ id: String(i), sessionId: '7', capability: 'shell', detail: 'x' });
+    }
+    const second = runChatWebview({ ...webviewSnapshot([]), permissions: many });
+    const list = second.dom.document.getElementById('permission-list');
+    assertEqual(list.children.length, 16, 'the card list is bounded');
+    const text = fakeText(list);
+    assert(!text.includes('undefined'), 'a hostile entry renders no undefined');
+    // A permission without a capability/detail still renders a human line.
+    const third = runChatWebview({
+      ...webviewSnapshot([]),
+      permissions: [{ id: '9', sessionId: '7' }],
+    });
+    const thirdList = third.dom.document.getElementById('permission-list');
+    assert(fakeText(thirdList).includes('Use a capability'), fakeText(thirdList));
+  });
+
+  await test('a structured userError renders summary, action and a demoted technical disclosure', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const projection = ue.projectError({
+      kind: 'stream_gap',
+      message: 'durable frame 5 data is not JSON',
+      code: 'protocol_blocked',
+    });
+    harness.deliver({ type: 'userError', error: projection });
+    const notices = harness.dom.document.getElementById('notices');
+    const card = notices.children[0];
+    assert(card && String(card.className).includes('user-error'), card && card.className);
+    const text = fakeText(card);
+    assert(text.includes('Live updates paused'), text);
+    assert(text.includes('Technical details'), text);
+    assert(text.includes('durable frame 5 data is not JSON'), text);
+    const summary = findFake(card, (node) => String(node.className).includes('user-error-summary'));
+    assert(
+      !summary.textContent.includes('protocol_blocked'),
+      'the typed code never leaks into the headline',
+    );
+    const action = findFake(card, (node) => node.tagName === 'button' && node.textContent === 'Reconnect');
+    assert(action, 'the projected action renders a real button');
+    action.click();
+    assertDeepEqual(harness.posted[harness.posted.length - 1], { type: 'recoverStream' });
+    // An identical error never stacks.
+    harness.deliver({ type: 'userError', error: projection });
+    assertEqual(notices.children.length, 1, 'an identical technical tail is deduplicated');
+  });
+
+  await test('the snapshot lastError fallback surfaces once through the same renderer', () => {
+    const harness = runChatWebview(webviewSnapshot([]));
+    const snapshot = { ...webviewSnapshot([]), lastError: 'native API error 500 internal: boom' };
+    harness.deliver({ type: 'snapshot', snapshot });
+    const notices = harness.dom.document.getElementById('notices');
+    assertEqual(notices.children.length, 1, 'the raw error surfaces once');
+    assert(fakeText(notices.children[0]).includes('Technical details'));
+    assert(
+      fakeText(notices.children[0]).includes('native API error 500 internal: boom'),
+      fakeText(notices.children[0]),
+    );
+    harness.deliver({ type: 'snapshot', snapshot: { ...snapshot } });
+    assertEqual(notices.children.length, 1, 'an unchanged raw error is not re-announced');
   });
 }
 
@@ -10656,6 +10890,7 @@ async function main() {
   await daemonTests();
   await shadowDefaultTests();
   await completionContractTests();
+  await errorProjectionTests();
   await pendingSubmissionTests();
   await attachmentHttpContractTests();
   await boardAndForwardingTests();
@@ -10672,6 +10907,7 @@ async function main() {
   await moneyTests();
   await controlPlaneCredentialTests();
   await presentationWebviewTests();
+  await attentionWebviewTests();
   await composerAttachmentTests();
   await submissionSingleFlightTests();
   await transcriptScrollTests();

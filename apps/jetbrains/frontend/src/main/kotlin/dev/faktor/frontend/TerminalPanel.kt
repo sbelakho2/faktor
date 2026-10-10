@@ -1,16 +1,14 @@
-// Session-owned terminal surface over the native ACP/PTY routes:
-// `GET /native/terminals?session=`, `GET /native/session/{id}/terminal/events`,
+// Commands: the session's process surface over the native ACP/PTY routes
+// (`GET /native/terminals?session=`, `GET /native/session/{id}/terminal/events`,
 // `POST /native/session/{id}/terminal` and the output snapshot
-// `GET /native/session/{id}/terminals/{terminalId}/output`. Rows carry their durable ownership
-// (session/task/agent/operation/spawned ms); unowned legacy rows are shown
-// only as the page's counted `note`, never mixed into the session list.
-//
-// Spawn composition is a FAITHFUL argv editor: one program field plus one
-// argument per line (spaces inside a line are part of that argument, never a
-// splitter), and an explicitly labeled shell-command mode for real shell
-// input. Event pages and the output snapshot carry real bounded paging
-// controls instead of an inert "(more available)" hint.
-// Pure presentation: every action is delivered to a Listener.
+// `GET /native/session/{id}/terminals/{terminalId}/output`). The primary rows
+// read like a shell engine: `$ program args` with the working directory, then
+// the process state and its live output. PTY ids, pids, owners and spawn
+// lifetimes stay under the Advanced disclosure. Spawn composition is a
+// FAITHFUL argv editor: one program field plus one argument per line (spaces
+// inside a line are part of that argument, never a splitter), and an
+// explicitly labeled shell-command mode for real shell input. Pure
+// presentation: every action is delivered to a Listener.
 package dev.faktor.frontend
 
 import dev.faktor.shared.NativeTerminal
@@ -42,6 +40,19 @@ class TerminalPanel : JPanel(BorderLayout()) {
         fun onLoadEvents(after: Long) {}
     }
 
+    /** One locally observed spawn, so a command row can name its argv. */
+    private data class SpawnSpec(val command: String, val args: List<String>, val cwd: String?) {
+        fun shellLine(): String {
+            val parts = ArrayList<String>()
+            parts.add(command)
+            for (arg in args) {
+                parts.add(if (arg.any { it == ' ' }) "\"" + arg + "\"" else arg)
+            }
+            val line = parts.joinToString(" ")
+            return if (cwd.isNullOrBlank()) line else "$line   (in $cwd)"
+        }
+    }
+
     private val terminalsModel = DefaultListModel<NativeTerminal>()
 
     private val terminalsList: JList<NativeTerminal> = TerminalList(terminalsModel)
@@ -50,7 +61,9 @@ class TerminalPanel : JPanel(BorderLayout()) {
 
     private val outputArea = compactArea(6, monospace = true)
 
-    private val header = WrappedLabel("session terminals: -")
+    private val advancedArea = compactArea(4, monospace = true)
+
+    private val header = WrappedLabel("commands: -")
 
     private val commandField = JTextField("bash", 12)
 
@@ -71,7 +84,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
 
     private val cwdField = JTextField("", 10)
 
-    private val spawnButton = primaryButton("Spawn")
+    private val spawnButton = primaryButton("Run")
 
     private val refreshButton = secondaryButton("Refresh")
 
@@ -80,6 +93,10 @@ class TerminalPanel : JPanel(BorderLayout()) {
     private val moreEventsButton = secondaryButton("Load more events")
 
     private val moreOutputButton = secondaryButton("Show more output")
+
+    private val advancedToggle = secondaryButton("Show advanced")
+
+    private val advancedBody = JPanel(BorderLayout())
 
     private var listener: Listener? = null
 
@@ -95,11 +112,14 @@ class TerminalPanel : JPanel(BorderLayout()) {
 
     private var outputDisplayCap = OUTPUT_INITIAL_CHARS
 
+    /** Bounded local record of argv observed at spawn time (id to spec). */
+    private val spawns = LinkedHashMap<String, SpawnSpec>()
+
     init {
         terminalsList.selectionMode = ListSelectionModel.SINGLE_SELECTION
         terminalsList.visibleRowCount = 4
         RowRhythm.install(terminalsList)
-        terminalsList.cellRenderer = TerminalCellRenderer()
+        terminalsList.cellRenderer = CommandCellRenderer()
         terminalsList.addListSelectionListener { updateButtons() }
         spawnButton.addActionListener { submitSpawn() }
         refreshButton.addActionListener { listener?.onRefresh() }
@@ -117,7 +137,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
             .row("Program", commandField)
             .row("Working dir (optional)", cwdField)
             .build()
-        cwdField.toolTipText = "Working directory the terminal starts in (daemon-relative when empty)"
+        cwdField.toolTipText = "Working directory the command starts in (service-relative when empty)"
         val argsHint = wrappedMutedLabel(
             "Arguments — one per line; spaces inside a line stay one argument"
         )
@@ -142,27 +162,49 @@ class TerminalPanel : JPanel(BorderLayout()) {
         terminalsBody.add(terminalsScroll, BorderLayout.CENTER)
         terminalsBody.add(actionRow(outputButton), BorderLayout.SOUTH)
 
-        val eventsBody = JPanel(BorderLayout(0, Spacing.S))
-        eventsBody.isOpaque = false
-        eventsBody.add(insetScroll(eventsArea), BorderLayout.CENTER)
-        eventsBody.add(actionRow(moreEventsButton), BorderLayout.SOUTH)
-
         val outputBody = JPanel(BorderLayout(0, Spacing.S))
         outputBody.isOpaque = false
         outputBody.add(insetScroll(outputArea), BorderLayout.CENTER)
         outputBody.add(actionRow(moreOutputButton), BorderLayout.SOUTH)
 
+        // Advanced: raw process ownership, lifetime events and the PTY ids
+        // the primary surface deliberately keeps out of the way.
+        val eventsBody = JPanel(BorderLayout(0, Spacing.S))
+        eventsBody.isOpaque = false
+        eventsBody.add(insetScroll(eventsArea), BorderLayout.CENTER)
+        eventsBody.add(actionRow(moreEventsButton), BorderLayout.SOUTH)
+        val advancedColumn = pageColumn(gap = Spacing.S, padding = 0)
+        advancedColumn.add(sectionHeader("Process ownership", muted = true))
+        advancedColumn.add(insetScroll(advancedArea))
+        advancedColumn.add(sectionHeader("Lifetime events", muted = true))
+        advancedColumn.add(eventsBody)
+        advancedToggle.addActionListener {
+            advancedBody.isVisible = advancedToggle.isSelected
+            advancedToggle.text = if (advancedToggle.isSelected) {
+                "Hide advanced"
+            } else {
+                "Show advanced"
+            }
+            revalidate()
+            repaint()
+        }
+        advancedBody.isOpaque = false
+        advancedBody.add(advancedColumn, BorderLayout.CENTER)
+        advancedBody.isVisible = false
+
         // BoxLayout Y keeps every card's own preferred height; the whole
         // body scrolls in a short tool window instead of squashing the
         // structured argv editor down to zero.
         val body = pageColumn()
-        body.add(card("Session terminals", terminalsBody))
+        body.add(card("Commands", terminalsBody))
         body.add(vSpace(Spacing.M))
-        body.add(card("Spawn terminal", spawnBody))
+        body.add(card("Live output", outputBody))
         body.add(vSpace(Spacing.M))
-        body.add(card("Lifetime events", eventsBody))
+        body.add(card("Run a command", spawnBody))
         body.add(vSpace(Spacing.M))
-        body.add(card("Output snapshot", outputBody))
+        body.add(advancedToggle)
+        body.add(vSpace(Spacing.XS))
+        body.add(advancedBody)
         val bodyScroll = JScrollPane(body)
         bodyScroll.verticalScrollBar.unitIncrement = 16
         add(panelHeader(header), BorderLayout.NORTH)
@@ -191,12 +233,33 @@ class TerminalPanel : JPanel(BorderLayout()) {
         } else if (terminalsModel.size() > 0) {
             terminalsList.selectedIndex = 0
         }
-        eventsArea.text = if (page.note.isEmpty()) {
-            "No session-owned terminals. Spawn one below to run commands on it."
+        advancedArea.text = if (page.terminals.isEmpty()) {
+            "No session-owned processes."
         } else {
-            "unowned daemon-level rows: ${page.unowned}\n${page.note}"
+            val sb = StringBuilder()
+            for (terminal in page.terminals) sb.append(rowLabel(terminal)).append('\n')
+            sb.toString()
+        }
+        if (page.note.isNotEmpty()) {
+            // The service-level note belongs with the lifetime readout so the
+            // unowned count is visible without opening Advanced.
+            eventsArea.text = "unowned daemon-level rows: ${page.unowned}\n${page.note}"
         }
         updateButtons()
+    }
+
+    /**
+     * Records the argv of one successful local spawn so the command row can
+     * render `$ program args`. Bounded: only the newest [MAX_SPAWN_SPECS]
+     * specs are retained; pty ids are never reused by the service.
+     */
+    fun noteSpawned(ptyId: String, command: String, args: List<String>, cwd: String?) {
+        spawns[ptyId] = SpawnSpec(command, args, cwd)
+        while (spawns.size > MAX_SPAWN_SPECS) {
+            val oldest = spawns.keys.firstOrNull() ?: break
+            spawns.remove(oldest)
+        }
+        terminalsList.repaint()
     }
 
     /** Replaces the event view with one page and arms the Load-more control. */
@@ -204,7 +267,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
         eventsCursor = page.nextCursor
         eventsHasMore = page.hasMore
         if (page.events.isEmpty()) {
-            eventsArea.text = "No lifetime events yet for session ${page.sessionId}."
+            eventsArea.text = "No lifetime events yet for this conversation."
         } else {
             eventsArea.text = renderEvents(page.events)
         }
@@ -266,14 +329,14 @@ class TerminalPanel : JPanel(BorderLayout()) {
     private fun renderOutput() {
         val output = lastOutput
         if (output == null) {
-            outputArea.text = "Select a terminal and load its output snapshot."
+            outputArea.text = "Select a command and show its output snapshot."
             moreOutputButton.isEnabled = false
             return
         }
         val total = output.output.length
         val shown = Math.min(total, outputDisplayCap)
         val truncated = shown < total
-        val head = "pty ${output.ptyId} alive=${output.alive}" +
+        val head = "command output" +
             if (truncated) {
                 " (showing $shown of $total chars)" +
                     if (shown >= OUTPUT_MAX_CHARS) "; display cap reached" else "; truncated"
@@ -301,12 +364,13 @@ class TerminalPanel : JPanel(BorderLayout()) {
         lastOutput = null
         eventsArea.text = detailText
         outputArea.text = detailText
+        advancedArea.text = detailText
         updateButtons()
     }
 
     fun terminalCount(): Int = terminalsModel.size()
 
-    /** One bounded row label (the renderer and the test helper share it). */
+    /** One bounded ADVANCED row label: pty/pid/owners/lifetime. */
     private fun rowLabel(terminal: NativeTerminal): String {
         val owner = StringBuilder()
         if (terminal.sessionId != null) owner.append(" session=").append(terminal.sessionId)
@@ -318,14 +382,38 @@ class TerminalPanel : JPanel(BorderLayout()) {
             (if (terminal.alive) "alive" else "exited") + owner
     }
 
+    /** The advanced pty row (smoke observability; the UI shows command rows). */
     fun terminalLabel(index: Int): String = rowLabel(terminalsModel.getElementAt(index))
 
     /**
-     * The list renders the bounded row label, never the raw DTO toString
-     * (which used to clip at "NativeTerminal(id=5, pid=123, alive=true,").
-     * A narrowed row keeps the full label as its tooltip.
+     * The PRIMARY command row: `$ program args (in cwd) · state` when the
+     * argv was observed locally, otherwise an honest placeholder — never a
+     * fabricated command line.
      */
-    private inner class TerminalCellRenderer : javax.swing.DefaultListCellRenderer() {
+    internal fun commandLabel(terminal: NativeTerminal): String {
+        val state = if (terminal.alive) "running" else "exited"
+        val spec = spawns[terminal.id]
+        return if (spec == null) {
+            "Command (arguments not reported) · $state"
+        } else {
+            "$ " + spec.shellLine() + " · " + state
+        }
+    }
+
+    /** The rendered human command rows (smoke observable). */
+    fun commandsText(): String {
+        val sb = StringBuilder()
+        for (i in 0 until terminalsModel.size()) {
+            sb.append(commandLabel(terminalsModel.getElementAt(i))).append('\n')
+        }
+        return sb.toString()
+    }
+
+    /**
+     * The list renders the primary command row; the raw pty row stays one
+     * disclosure away (advanced area + tooltip).
+     */
+    private inner class CommandCellRenderer : javax.swing.DefaultListCellRenderer() {
         override fun getListCellRendererComponent(
             list: JList<*>?,
             value: Any?,
@@ -338,12 +426,13 @@ class TerminalPanel : JPanel(BorderLayout()) {
                 RowRhythm.hoverBackground(list, index)?.let { background = it }
             }
             val terminal = value as? NativeTerminal ?: return this
-            text = rowLabel(terminal)
+            text = commandLabel(terminal)
+            toolTipText = rowLabel(terminal)
             return this
         }
     }
 
-    /** Per-cell tooltips: the full row even when the cell is narrowed. */
+    /** Per-cell tooltips: the full advanced row even when the cell is narrowed. */
     private inner class TerminalList(model: DefaultListModel<NativeTerminal>) :
         JList<NativeTerminal>(model) {
         override fun getToolTipText(event: java.awt.event.MouseEvent?): String? {
@@ -360,6 +449,8 @@ class TerminalPanel : JPanel(BorderLayout()) {
     fun eventsText(): String = eventsArea.text
 
     fun outputText(): String = outputArea.text
+
+    fun advancedText(): String = advancedArea.text
 
     fun available(): Boolean = available
 
@@ -409,14 +500,14 @@ class TerminalPanel : JPanel(BorderLayout()) {
             listOf("/bin/sh", "-lc", command)
         }
 
-    /** Submits the composer exactly like the Spawn button. */
+    /** Submits the composer exactly like the Run button. */
     fun submitSpawn() {
         if (!available) return
         val cwd = cwdField.text.trim().ifEmpty { null }
         if (shellModeCheck.isSelected) {
             val command = shellArea.text
             if (command.isBlank()) {
-                eventsArea.text = "spawn refused: no shell command entered"
+                eventsArea.text = "run refused: no shell command entered"
                 return
             }
             val argv = shellArgv(command)
@@ -425,7 +516,7 @@ class TerminalPanel : JPanel(BorderLayout()) {
         }
         val command = commandField.text.trim()
         if (command.isEmpty()) {
-            eventsArea.text = "spawn refused: no command entered"
+            eventsArea.text = "run refused: no command entered"
             return
         }
         listener?.onSpawn(command, argumentLines(argsArea.text), cwd)
@@ -448,9 +539,9 @@ class TerminalPanel : JPanel(BorderLayout()) {
             it.output.length > outputDisplayCap && outputDisplayCap < OUTPUT_MAX_CHARS
         } == true
         header.text = if (!available) {
-            "session terminals: unavailable ($reason)"
+            "commands: unavailable ($reason)"
         } else {
-            "session terminals: ${terminalsModel.size()}"
+            "commands: ${terminalsModel.size()}"
         }
     }
 
@@ -460,5 +551,8 @@ class TerminalPanel : JPanel(BorderLayout()) {
 
         /** The hard bounded display window; beyond this the header is honest. */
         const val OUTPUT_MAX_CHARS = 64 * 1024
+
+        /** The bounded local spawn-spec window. */
+        const val MAX_SPAWN_SPECS = 64
     }
 }

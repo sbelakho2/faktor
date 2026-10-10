@@ -324,7 +324,18 @@ pub(crate) fn review_fetch_changed_files(
                                         )),
                                     )
                                 }
-                                Err(_) => None,
+                                Err(_) => {
+                                    // Authority law: neither the CAS blob nor
+                                    // the workspace read could produce the
+                                    // after side — the review refuses typed
+                                    // instead of proceeding from unknown.
+                                    return (
+                                        out,
+                                        Some(format!(
+                                            "{path}: after content unreadable from CAS and workspace"
+                                        )),
+                                    );
+                                }
                             }
                         }
                     }
@@ -902,8 +913,25 @@ pub(crate) async fn run_independent_review_call(
     // A session whose durable task identity is unresolvable falls back to
     // the documented standalone default (1); TaskId::new(0) is never legal.
     let task_id = handle.task_id().unwrap_or_else(|_| TaskId::new(1));
-    let mut provider_id = handle.provider().unwrap_or_default();
-    let mut model = handle.model().unwrap_or_default();
+    // A paid review call must not run under fabricated routing identity: an
+    // unreadable provider/model is a typed refusal (authority law).
+    let (mut provider_id, mut model) = match (handle.provider(), handle.model()) {
+        (Ok(provider), Ok(model)) => (provider, model),
+        (provider, model) => {
+            let detail = provider
+                .err()
+                .or_else(|| model.err())
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            return IndependentReviewOutcome::refused(
+                "",
+                "",
+                format!(
+                    "session provider/model unreadable; independent review cannot run: {detail}"
+                ),
+            );
+        }
+    };
     // The review is a PAID call: its budget read obeys the same fail-safe
     // policy as the drive's. A hard-cap (or no-cap-evidence) read failure
     // refuses the review typedly — no provider call ever leaves; only a

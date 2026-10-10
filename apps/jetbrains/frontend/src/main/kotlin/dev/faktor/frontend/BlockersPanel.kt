@@ -38,7 +38,7 @@ class BlockersPanel : JPanel(BorderLayout()) {
 
     private var blockers: List<BlockerRow> = emptyList()
 
-    private var permissions: List<NativePermissionEntry> = emptyList()
+    private var permissions: List<NativePermissionEntry>? = emptyList()
 
     private var taskBlockers: List<String> = emptyList()
 
@@ -64,6 +64,28 @@ class BlockersPanel : JPanel(BorderLayout()) {
         update(model.blockers, emptyList(), model.taskBlockers)
     }
 
+    /**
+     * Blocked children + task blockers only. Pending approvals render as
+     * their own contextual cards on the Agents view, so the approval section
+     * is omitted here entirely rather than claiming "no pending permissions".
+     */
+    fun update(blockers: List<BlockerRow>, taskBlockers: List<String>) {
+        this.blockers = blockers
+        this.permissions = null
+        this.taskBlockers = taskBlockers
+        taskBlockersArea.text = if (taskBlockers.isEmpty()) {
+            "No task-level blockers."
+        } else {
+            taskBlockers.joinToString("\n")
+        }
+        taskBlockersArea.foreground = if (taskBlockers.isEmpty()) {
+            mutedForeground()
+        } else {
+            textForeground()
+        }
+        render()
+    }
+
     fun update(
         blockers: List<BlockerRow>,
         permissions: List<NativePermissionEntry>,
@@ -87,7 +109,7 @@ class BlockersPanel : JPanel(BorderLayout()) {
 
     fun blockerCount(): Int = blockers.size
 
-    fun permissionCount(): Int = permissions.size
+    fun permissionCount(): Int = permissions?.size ?: 0
 
     /**
      * The model's applicable actions (union over blocker rows) for smoke
@@ -133,15 +155,18 @@ class BlockersPanel : JPanel(BorderLayout()) {
         cards.add(vSpace(Spacing.XS))
         cards.add(taskBlockersArea)
 
-        cards.add(vSpace(Spacing.M))
-        cards.add(sectionHeader("Pending permissions (${permissions.size})"))
-        if (permissions.isEmpty()) {
-            cards.add(vSpace(Spacing.XS))
-            cards.add(mutedLabel("No pending permissions."))
-        }
-        for (permission in permissions) {
-            cards.add(vSpace(Spacing.S))
-            cards.add(permissionCard(permission))
+        val permissionList = permissions
+        if (permissionList != null) {
+            cards.add(vSpace(Spacing.M))
+            cards.add(sectionHeader("Pending permissions (${permissionList.size})"))
+            if (permissionList.isEmpty()) {
+                cards.add(vSpace(Spacing.XS))
+                cards.add(mutedLabel("No pending permissions."))
+            }
+            for (permission in permissionList) {
+                cards.add(vSpace(Spacing.S))
+                cards.add(permissionCard(permission))
+            }
         }
 
         cards.revalidate()

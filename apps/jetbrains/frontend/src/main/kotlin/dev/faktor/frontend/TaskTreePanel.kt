@@ -151,7 +151,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         top.border = BorderFactory.createEmptyBorder(Spacing.M, Spacing.M, Spacing.M, Spacing.M)
         top.isOpaque = true
         top.background = panelSurface()
-        top.add(card("Task", summary), BorderLayout.NORTH)
+        top.add(card("Plan summary", summary), BorderLayout.NORTH)
         top.add(treeScroll, BorderLayout.CENTER)
         top.add(card("Selected node", detailScroll), BorderLayout.SOUTH)
         add(top, BorderLayout.CENTER)
