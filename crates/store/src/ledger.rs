@@ -491,7 +491,7 @@ mod evidence_store_tests {
                  DROP INDEX IF EXISTS idx_evidence_session_task;
                  DROP INDEX IF EXISTS idx_evidence_backing_cas;
                  DROP TABLE IF EXISTS evidence;
-                 ALTER TABLE task DROP COLUMN attachments;
+                 ALTER TABLE task DROP COLUMN attachments; ALTER TABLE task DROP COLUMN contract;
                  DROP TABLE IF EXISTS attachment;
                  ALTER TABLE tool_run DROP COLUMN pre_manifest;
                  PRAGMA user_version = 21;",
@@ -503,7 +503,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 31, "v30 (admission leases) is the migration head");
+            assert_eq!(version, 32, "v31 is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",
@@ -3731,6 +3731,7 @@ mod typed_ledger_tests {
             acceptance_criteria: criteria,
             plan: vec![],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,

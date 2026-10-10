@@ -535,7 +535,10 @@ internal object ParityMatrix {
                         panel.shutdown()
                     }
                 },
-                daemonCheck = { fakeDaemonCheck("task mode", "task_runs") }
+                daemonCheck = {
+                    fakeDaemonCheck("task mode", "task_runs")
+                    fakeDaemonCheck("task mode", "contract_surface")
+                }
             )
         )
         register(
@@ -1719,6 +1722,28 @@ internal const val PARITY_TASK_JSON = "[" +
     "\"decisions\":[],\"failures\":[],\"changedFiles\":[]," +
     "\"tests\":{\"run\":[],\"failed\":[]},\"preferences\":[],\"verification\":[]," +
     "\"progress\":null,\"budget\":null," +
+    "\"contract\":{" +
+    "\"constraints\":[{\"id\":\"c1\",\"statement\":\"existing sessions remain valid\"," +
+    "\"origin\":\"user\"},{\"id\":\"c2\",\"statement\":\"existing API clients cannot break\"," +
+    "\"origin\":\"native\"}]," +
+    "\"invariants\":[{\"id\":\"i1\",\"statement\":\"revoked sessions cannot authenticate\"," +
+    "\"origin\":{\"external\":{\"provider\":\"example.graph\"}}}]," +
+    "\"risks\":[" +
+    "{\"id\":\"r1\",\"description\":\"race conditions\",\"severity\":\"high\"," +
+    "\"origin\":\"heuristic\"}," +
+    "{\"id\":\"r2\",\"description\":\"migration corruption\",\"severity\":\"medium\"," +
+    "\"origin\":\"native\"}," +
+    "{\"id\":\"r3\",\"description\":\"legacy client incompatibility\"," +
+    "\"severity\":\"unknown\",\"origin\":\"policy\"}]," +
+    "\"proof_obligations\":[" +
+    "{\"id\":\"o1\",\"claim\":\"concurrent refresh produces one valid result\"," +
+    "\"evidence\":\"test_execution\",\"origin\":\"user\",\"state\":\"supported\"," +
+    "\"confidence_bps\":9100," +
+    "\"evidence_refs\":[{\"kind\":\"test_execution\",\"source\":\"cargo test\"," +
+    "\"detail\":\"refresh suite\"}]}," +
+    "{\"id\":\"o2\",\"claim\":\"replayed refresh tokens fail\"," +
+    "\"evidence\":\"contract_check\",\"origin\":\"native\",\"state\":\"inferred\"," +
+    "\"confidence_bps\":5000,\"evidence_refs\":[]}]}," +
     "\"acceptanceCriteria\":[\"criterion A\"]," +
     "\"plan\":[" +
     "{\"id\":\"step-1\",\"summary\":\"first\",\"state\":\"done\",\"depends_on\":[]}," +

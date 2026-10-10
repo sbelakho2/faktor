@@ -2614,6 +2614,7 @@ impl TaskExecutor {
                         acceptance_criteria: req.effective_criteria_patch().unwrap_or_default(),
                         plan: Vec::new(),
                         attachments: req.effective_attachments_patch().unwrap_or_default(),
+                        contract: Default::default(),
                         budget: TaskBudget {
                             max_tokens: req.max_tokens,
                             max_turns: None,
@@ -3007,6 +3008,7 @@ impl TaskExecutor {
                             acceptance_criteria: req.effective_criteria_patch().unwrap_or_default(),
                             plan: Vec::new(),
                             attachments: req.effective_attachments_patch().unwrap_or_default(),
+                            contract: Default::default(),
                             budget: faktor_session::TaskBudget::default(),
                             state: TaskState::Pending,
                             created_ms: now,
@@ -3363,6 +3365,7 @@ mod completion_contract_executor_tests {
                 acceptance_criteria: vec![],
                 plan: vec![],
                 attachments: Vec::new(),
+                contract: Default::default(),
                 budget: TaskBudget::default(),
                 state: TaskState::Pending,
                 created_ms: now,

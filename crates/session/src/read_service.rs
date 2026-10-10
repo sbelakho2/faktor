@@ -563,7 +563,7 @@ mod tests {
     use crate::handle::tests::{session, test_manager};
     use crate::task::Task;
     use faktor_core::id::{OpId, TaskId};
-    use faktor_core::state::{TaskState, VerificationStatus};
+    use faktor_core::state::VerificationStatus;
     use faktor_store::Store;
 
     /// One deterministic burst helper: `count` concurrent submits of a tiny
@@ -649,13 +649,9 @@ mod tests {
             task_id: tid,
             session_id: sid,
             goal: "parity goal".into(),
-            acceptance_criteria: vec![],
-            plan: vec![],
-            attachments: Vec::new(),
-            budget: crate::TaskBudget::default(),
-            state: TaskState::Pending,
             created_ms: 1,
             updated_ms: 1,
+            ..Default::default()
         };
         let created = s.create_task(task).unwrap();
         assert_eq!(s.get_task(tid).unwrap().as_ref(), Some(&created));

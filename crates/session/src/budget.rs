@@ -1619,13 +1619,9 @@ fn seed_child_task_row_if_missing(
             task_id,
             session_id: child_session,
             goal,
-            acceptance_criteria: Vec::new(),
-            plan: Vec::new(),
-            attachments: Vec::new(),
-            budget: crate::TaskBudget::default(),
-            state: faktor_core::state::TaskState::Pending,
             created_ms: now,
             updated_ms: now,
+            ..Default::default()
         })
         .map_err(|e| BudgetError::Store(e.to_string()))?;
     Ok(())
@@ -2178,13 +2174,9 @@ mod tests {
             task_id: s.task_id().unwrap(),
             session_id: s.id,
             goal: "budgeted goal".into(),
-            acceptance_criteria: vec![],
-            plan: vec![],
-            attachments: Vec::new(),
-            budget: crate::TaskBudget::default(),
-            state: TaskState::Pending,
             created_ms: 1,
             updated_ms: 1,
+            ..Default::default()
         };
         let created = s.create_task(task).unwrap();
         let ledger = DurableBudgetLedger::new(s.manager.clone());

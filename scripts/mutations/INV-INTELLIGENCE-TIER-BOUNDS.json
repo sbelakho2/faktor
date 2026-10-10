@@ -1,0 +1,9 @@
+{
+  "id": "INV-INTELLIGENCE-TIER-BOUNDS",
+  "file": "crates/semantic/src/intelligence.rs",
+  "find": "        if raw > MAX_INTELLIGENCE_TIER {\n            return Err(SemanticError::InvalidIntelligenceTier { tier: raw });\n        }",
+  "replace": "        if false && raw > MAX_INTELLIGENCE_TIER {\n            return Err(SemanticError::InvalidIntelligenceTier { tier: raw });\n        }",
+  "gate": "cargo test -p faktor-semantic --lib tier_validation_refuses_out_of_range_typed",
+  "expect": "FAILED",
+  "note": "Accepting an out-of-range tier lets a provider claim intelligence level it cannot honestly declare."
+}

@@ -1042,6 +1042,7 @@ async fn try_compact_consumes_durable_projection_not_the_transcript() {
             acceptance_criteria: vec!["DURABLE-CRITERION-Ω".into()],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: Default::default(),
             state: TaskState::Running,
             created_ms: now,

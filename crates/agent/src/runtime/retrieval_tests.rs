@@ -1526,6 +1526,7 @@ async fn durable_compiler_selects_required_evidence_in_the_real_turn() {
             ],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,

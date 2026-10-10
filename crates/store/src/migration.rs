@@ -1932,6 +1932,7 @@ mod tests {
             acceptance_criteria: vec!["cargo check".into()],
             plan: vec![],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: Some(10_000),
             max_turns: None,
             spent_tokens: 0,
@@ -2206,6 +2207,7 @@ mod tests {
                 // The v30 shell-attribution column is post-this-version too:
                 // drop it (tolerantly) so the full chain replays cleanly.
                 let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
                 conn.execute("PRAGMA user_version = 13", []).unwrap();
             }
             (s.id, row)
@@ -2285,6 +2287,7 @@ mod tests {
                 // The v30 shell-attribution column is post-this-version too:
                 // drop it (tolerantly) so the full chain replays cleanly.
                 let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
                 conn.execute("PRAGMA user_version = 25", []).unwrap();
             }
             s.id
@@ -2347,6 +2350,7 @@ mod tests {
                 // The v30 shell-attribution column is post-this-version too:
                 // drop it (tolerantly) so the full chain replays cleanly.
                 let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
                 conn.execute("PRAGMA user_version = 28", []).unwrap();
             }
             s.id
@@ -2476,6 +2480,7 @@ mod typed_ledger_tests {
                 acceptance_criteria: vec!["cargo check".into()],
                 plan: vec![],
                 attachments: vec![],
+                contract: Default::default(),
                 max_tokens: None,
                 max_turns: None,
                 spent_tokens: 0,
@@ -2529,6 +2534,7 @@ mod typed_ledger_tests {
                 // The v30 shell-attribution column is post-this-version too:
                 // drop it (tolerantly) so the full chain replays cleanly.
                 let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
                 conn.execute("PRAGMA user_version = 14", []).unwrap();
             }
             (s.id, TaskId::new(1))
@@ -2686,6 +2692,7 @@ mod typed_ledger_tests {
                 // The v30 shell-attribution column is post-this-version too:
                 // drop it (tolerantly) so the full chain replays cleanly.
                 let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
                 conn.execute("PRAGMA user_version = 16", []).unwrap();
             }
             (s.id, tid)
@@ -2796,6 +2803,7 @@ mod typed_ledger_tests {
             acceptance_criteria: criteria,
             plan: vec![],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,
@@ -3083,6 +3091,7 @@ mod typed_ledger_tests {
                 // The v30 shell-attribution column is post-this-version too:
                 // drop it (tolerantly) so the full chain replays cleanly.
                 let _ = conn.execute("ALTER TABLE tool_run DROP COLUMN pre_manifest", []);
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN contract", []);
                 conn.execute("PRAGMA user_version = 17", []).unwrap();
             }
             (s.id, tid)

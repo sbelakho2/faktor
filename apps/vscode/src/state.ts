@@ -10,6 +10,7 @@
 
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
+import type { EngineeringContractView } from './contract.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitUsagePanel, CockpitView } from './cockpit';
 import type {
   NativeBoardPage,
@@ -164,6 +165,16 @@ export interface TaskSummary {
   readonly progress: Json;
   /** The Task-mode completion contract + its durable step statuses. */
   readonly completion: TaskCompletionSummary | null;
+  /**
+   * The durable ENGINEERING contract: constraints, invariants, risk
+   * hypotheses and proof obligations with provenance/state/confidence. Null
+   * when the serving daemon exposes no contract member (legacy daemon —
+   * never fabricated). `contractMalformed`/`contractDroppedRows` disclose a
+   * present-but-unreadable member and refused entries.
+   */
+  readonly contract: EngineeringContractView | null;
+  readonly contractMalformed: string | null;
+  readonly contractDroppedRows: number;
 }
 
 

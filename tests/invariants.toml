@@ -2051,3 +2051,78 @@ mutation_command = "node scripts/mutation-run.mjs INV-WORKER-RECOVERY-COMPLETES-
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CONTRACT-DISPROVEN-BLOCKS"
+statement = "A disproven proof obligation blocks a passing completion gate with the typed ProofObligationDisproven reason; unsatisfied-but-not-disproven states are disclosed instead of blocked."
+owner = "crates/agent engineering-contract gate"
+authority = "planted mutation scripts/mutations/INV-CONTRACT-DISPROVEN-BLOCKS.json"
+script_check = ""
+unit_test = "disproven_obligation_blocks_and_persists_evaluated_states"
+production_wiring = "supported_obligation_persists_and_keeps_the_passing_gate"
+fault = ""
+mutation_witness = "disproven_obligation_blocks_and_persists_evaluated_states"
+mutation_command = "node scripts/mutation-run.mjs INV-CONTRACT-DISPROVEN-BLOCKS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CONTRACT-EVIDENCE-PERSISTED"
+statement = "Evaluated obligation states, confidence and evidence refs are persisted to the durable task contract; an unevaluable contract never lets a passing gate stand."
+owner = "crates/agent engineering-contract evaluation"
+authority = "planted mutation scripts/mutations/INV-CONTRACT-EVIDENCE-PERSISTED.json"
+script_check = ""
+unit_test = "disproven_obligation_blocks_and_persists_evaluated_states"
+production_wiring = "supported_obligation_persists_and_keeps_the_passing_gate"
+fault = ""
+mutation_witness = "disproven_obligation_blocks_and_persists_evaluated_states"
+mutation_command = "node scripts/mutation-run.mjs INV-CONTRACT-EVIDENCE-PERSISTED"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-VERIFICATION-REQUIRE-PROVIDER"
+statement = "A require_provider verification call is never served by the native baseline: contract-level independence cannot be impersonated by Faktor's own checks."
+owner = "crates/verify provider registry"
+authority = "planted mutation scripts/mutations/INV-VERIFICATION-REQUIRE-PROVIDER.json"
+script_check = ""
+unit_test = "require_provider_refuses_a_native_substitution"
+production_wiring = "require_provider_dispatch_reaches_the_configured_kiwi"
+fault = ""
+mutation_witness = "require_provider_refuses_a_native_substitution"
+mutation_command = "node scripts/mutation-run.mjs INV-VERIFICATION-REQUIRE-PROVIDER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-INTELLIGENCE-TIER-BOUNDS"
+statement = "Provider-declared intelligence tiers are validated to 0..=5 at handshake; an out-of-range tier is a typed refusal and an absent tier earns no confidence bonus."
+owner = "crates/semantic intelligence tiers"
+authority = "planted mutation scripts/mutations/INV-INTELLIGENCE-TIER-BOUNDS.json"
+script_check = ""
+unit_test = "tier_validation_refuses_out_of_range_typed"
+production_wiring = "fallback_reports_tier_zero_and_heuristic_fidelity"
+fault = ""
+mutation_witness = "tier_validation_refuses_out_of_range_typed"
+mutation_command = "node scripts/mutation-run.mjs INV-INTELLIGENCE-TIER-BOUNDS"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-CONTRACT-MERGE-ADDITIVE"
+statement = "Engineering-contract merges are union-by-id with existing entries (including their evaluated state) always winning; duplicates and replays never mutate the durable contract."
+owner = "crates/session task contract merge"
+authority = "planted mutation scripts/mutations/INV-CONTRACT-MERGE-ADDITIVE.json"
+script_check = ""
+unit_test = "contract_merge_unions_by_id_preserves_state_is_idempotent_and_durable"
+production_wiring = "contract_task_and_contract_json_round_trip_every_variant"
+fault = ""
+mutation_witness = "contract_merge_unions_by_id_preserves_state_is_idempotent_and_durable"
+mutation_command = "node scripts/mutation-run.mjs INV-CONTRACT-MERGE-ADDITIVE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

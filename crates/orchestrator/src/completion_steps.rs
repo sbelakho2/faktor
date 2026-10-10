@@ -2708,7 +2708,7 @@ mod tests {
     use faktor_core::completion::CompletionContract;
     use faktor_core::id::VerificationRecordId;
     use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
-    use faktor_session::{CompletionContractGate, SessionManager, Task, TaskBudget, TaskError};
+    use faktor_session::{CompletionContractGate, SessionManager, Task, TaskError};
     use std::path::Path;
 
     fn allow_all() -> Arc<dyn EgressPolicy> {
@@ -2741,13 +2741,9 @@ mod tests {
             task_id,
             session_id: h.id(),
             goal: goal.into(),
-            acceptance_criteria: vec![],
-            plan: vec![],
-            attachments: Vec::new(),
-            budget: TaskBudget::default(),
-            state: TaskState::Pending,
             created_ms: now,
             updated_ms: now,
+            ..Default::default()
         })
         .unwrap();
         if let Some(contract) = contract {
@@ -3595,13 +3591,9 @@ mod tests {
             task_id,
             session_id: h.id(),
             goal: goal.into(),
-            acceptance_criteria: vec![],
-            plan: vec![],
-            attachments: Vec::new(),
-            budget: TaskBudget::default(),
-            state: TaskState::Pending,
             created_ms: now,
             updated_ms: now,
+            ..Default::default()
         })
         .unwrap();
         if let Some(contract) = contract {

@@ -1732,12 +1732,21 @@ mod tests {
         provider: &SemanticProviderId,
         capabilities: SemanticCapabilities,
     ) -> String {
-        let descriptor = SemanticProviderDescriptor::new(
+        wire_descriptor_body_with_tier(provider, capabilities, None)
+    }
+
+    fn wire_descriptor_body_with_tier(
+        provider: &SemanticProviderId,
+        capabilities: SemanticCapabilities,
+        tier: Option<u8>,
+    ) -> String {
+        let mut descriptor = SemanticProviderDescriptor::new(
             provider.clone(),
             2,
             SEMANTIC_SCHEMA_VERSION,
             capabilities,
         );
+        descriptor.tier = tier;
         serde_json::to_string(&serde_json::json!({
             "v": WIRE_SCHEMA_VERSION,
             "op": "describe",
@@ -1766,6 +1775,10 @@ mod tests {
         assert_eq!(provider.capabilities(), SemanticCapabilities::NONE);
         let descriptor = provider.handshake(CancellationToken::new()).await.unwrap();
         assert_eq!(descriptor.capabilities, advertised);
+        assert_eq!(
+            descriptor.tier, None,
+            "an absent wire tier stays unknown, never assumed high"
+        );
         assert_eq!(provider.capabilities(), advertised);
         assert_eq!(
             mock.requests(),
@@ -1793,6 +1806,58 @@ mod tests {
             Err(SemanticError::ProviderMismatch { .. })
         ));
         assert_eq!(provider.capabilities(), SemanticCapabilities::NONE);
+    }
+
+    /// A declared wire tier is validated at handshake and reported verbatim;
+    /// an out-of-range declaration is refused typed and leaves the provider
+    /// with no validated descriptor (never a partial trust).
+    #[tokio::test]
+    async fn http_descriptor_handshake_reports_tier_and_refuses_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = provider_id("fake-http");
+        let mock = Arc::new(MockHttpTransport::new(
+            200,
+            wire_descriptor_body_with_tier(&expected, SemanticCapabilities::VERIFY, Some(2)),
+        ));
+        let env = SemanticClientEnv {
+            supervisor: supervisor(dir.path()),
+            transport: mock,
+            caps: SemanticResponseCaps::default(),
+        };
+        let provider = http_config("http://provider.example/semantic", None)
+            .build(&env)
+            .unwrap();
+        let descriptor = provider.handshake(CancellationToken::new()).await.unwrap();
+        assert_eq!(descriptor.tier, Some(2));
+        assert_eq!(
+            descriptor.intelligence_tier(),
+            Some(crate::intelligence::IntelligenceTier::COMPILER)
+        );
+        assert_eq!(provider.validated_descriptor().unwrap().tier, Some(2));
+
+        let mock = Arc::new(MockHttpTransport::new(
+            200,
+            wire_descriptor_body_with_tier(&expected, SemanticCapabilities::VERIFY, Some(6)),
+        ));
+        let env = SemanticClientEnv {
+            supervisor: supervisor(dir.path()),
+            transport: mock,
+            caps: SemanticResponseCaps::default(),
+        };
+        let provider = http_config("http://provider.example/semantic", None)
+            .build(&env)
+            .unwrap();
+        match provider.handshake(CancellationToken::new()).await {
+            Err(SemanticError::InvalidIntelligenceTier { tier: 6 }) => {}
+            other => panic!("out-of-range tier must be refused typed, got {other:?}"),
+        }
+        assert!(provider.validated_descriptor().is_none());
+        assert_eq!(provider.capabilities(), SemanticCapabilities::NONE);
+        assert_eq!(
+            provider.descriptor().tier,
+            None,
+            "provisional stays unknown"
+        );
     }
 
     #[tokio::test]

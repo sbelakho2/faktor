@@ -747,7 +747,17 @@ data class NativeTaskView(
     val progress: NativeAgentProgress? = null,
     /** Additive durable completion contract + step rows; null when the
      * serving daemon exposes no completion read (never fabricated). */
-    val completion: NativeTaskCompletion? = null
+    val completion: NativeTaskCompletion? = null,
+    /**
+     * The additive durable engineering contract: constraints, invariants,
+     * risk hypotheses and proof obligations with provenance/state/confidence.
+     * Null when the serving daemon exposes no `contract` member (legacy
+     * daemon — never fabricated). `contractMalformed`/`contractDroppedRows`
+     * disclose a present-but-unreadable member and refused entries.
+     */
+    val contract: NativeEngineeringContract? = null,
+    val contractMalformed: String? = null,
+    val contractDroppedRows: Int = 0
 )
 
 /** The Task-mode completion contract (wire vocabulary `include_*`). */
@@ -787,6 +797,132 @@ data class NativeTaskCompletion(
     val contract: NativeCompletionContract,
     val steps: List<NativeCompletionStepStatus>
 )
+
+/**
+ * Where one engineering-contract entry came from (`ContractOrigin` in
+ * `crates/core/src/contract.rs`). Unknown provenance is never fabricated into
+ * a known origin: an unparseable origin drops its row (counted/disclosed).
+ */
+sealed class NativeContractOrigin {
+    object User : NativeContractOrigin()
+    object Policy : NativeContractOrigin()
+    object Native : NativeContractOrigin()
+    object Heuristic : NativeContractOrigin()
+    data class External(val provider: String) : NativeContractOrigin()
+
+    /** The provenance label the panels render (external names its provider). */
+    val label: String
+        get() = when (this) {
+            User -> "user"
+            Policy -> "policy"
+            Native -> "native"
+            Heuristic -> "heuristic"
+            is External -> provider
+        }
+}
+
+data class NativeContractConstraint(
+    val id: String,
+    val statement: String,
+    val origin: NativeContractOrigin
+)
+
+data class NativeContractInvariant(
+    val id: String,
+    val statement: String,
+    val origin: NativeContractOrigin
+)
+
+data class NativeContractRisk(
+    val id: String,
+    val description: String,
+    val severity: String,
+    val origin: NativeContractOrigin
+)
+
+data class NativeContractEvidenceRef(
+    val kind: String?,
+    val source: String,
+    val detail: String
+)
+
+data class NativeContractObligation(
+    val id: String,
+    val claim: String,
+    val evidence: String?,
+    /** A recognized evidence kind, the raw unrecognized token, or `unknown`. */
+    val evidenceLabel: String,
+    val origin: NativeContractOrigin,
+    val state: String,
+    val confidenceBps: Long?,
+    val evidenceRefs: List<NativeContractEvidenceRef>
+) {
+    /** `supported · 91%` — state plus the derived confidence, when served. */
+    val stateText: String
+        get() {
+            val humanized = state.replace('_', ' ')
+            val bps = confidenceBps ?: return humanized
+            return humanized + " · " + (bps.coerceIn(0L, 10000L) + 50L) / 100L + "%"
+        }
+
+    /** High/unknown risks and unsatisfied claims owe a completion disclosure. */
+    val satisfied: Boolean
+        get() = state == "known_true" || state == "supported"
+
+    val requiresDisclosure: Boolean
+        get() = !satisfied
+}
+
+/** The task's durable engineering contract (additive task-view member). */
+data class NativeEngineeringContract(
+    val constraints: List<NativeContractConstraint>,
+    val invariants: List<NativeContractInvariant>,
+    val risks: List<NativeContractRisk>,
+    val proofObligations: List<NativeContractObligation>
+) {
+    val isEmpty: Boolean
+        get() = constraints.isEmpty() && invariants.isEmpty() && risks.isEmpty() &&
+            proofObligations.isEmpty()
+
+    val needsDisclosure: Boolean
+        get() = risks.any { it.severity == "high" || it.severity == "unknown" } ||
+            proofObligations.any { it.requiresDisclosure }
+}
+
+/**
+ * The additive decode of the task DTO's `contract` member. `malformed` names
+ * a present-but-unreadable member and `droppedRows` counts entries whose
+ * shape was refused (they are disclosed, never rendered as valid claims).
+ */
+data class NativeContractRead(
+    val contract: NativeEngineeringContract?,
+    val malformed: String?,
+    val droppedRows: Int
+)
+
+/**
+ * The bounded user-authored engineering-contract rows of ONE task start
+ * (the composer's "Acceptance & contract" editors). Empty lists mean the
+ * category was not authored; an all-empty instance is the default path and
+ * is never sent. The daemon derives ids/origins and re-validates every bound.
+ */
+data class NativeContractRows(
+    val constraints: List<String> = emptyList(),
+    val invariants: List<String> = emptyList(),
+    val risks: List<String> = emptyList(),
+    val proofObligations: List<String> = emptyList()
+) {
+    val isEmpty: Boolean
+        get() = constraints.isEmpty() && invariants.isEmpty() && risks.isEmpty() &&
+            proofObligations.isEmpty()
+
+    companion object {
+        /** Daemon-mirrored bounds the composer enforces at capture time. */
+        const val MAX_ROWS = 64
+        const val MAX_ROW_CHARS = 512
+        const val MAX_ROW_BYTES = 512
+    }
+}
 
 /**
  * One durable task run (`GET /native/session/{id}/task-runs...`). The shape
@@ -1710,6 +1846,245 @@ private fun parseTaskCompletion(v: JsonView): NativeTaskCompletion {
     )
 }
 
+/** Daemon-mirroring bounds of the engineering contract (<=64 rows, <=512 chars). */
+private const val MAX_CONTRACT_ROWS = 64
+private const val MAX_CONTRACT_PROVIDER_CHARS = 64
+private const val MAX_CONTRACT_ROW_CHARS = 512
+
+/** Keep free text legible: controls stripped (newline/tab kept), bounded. */
+private fun boundedContractText(raw: String, max: Int): String {
+    val clean = raw.filter { !it.isISOControl() || it == '\n' || it == '\t' }.trim()
+    return if (clean.length > max) clean.take(max) + "…" else clean
+}
+
+private fun JsonView.optionalText(key: String): String? =
+    optionalField(key)?.let { (it.value as? JsonValue.Str)?.value }
+
+private fun JsonView.firstText(vararg keys: String): String? {
+    for (key in keys) {
+        val found = optionalText(key)
+        if (found != null) return found
+    }
+    return null
+}
+
+/**
+ * Decode one provenance value. `"user"`/`"policy"`/`"native"`/`"heuristic"`
+ * and `{"external":{"provider":"..."}}` are the frozen vocabulary; anything
+ * else returns null so the row is dropped and counted, never misfiled.
+ */
+private fun parseContractOrigin(v: JsonView?): NativeContractOrigin? {
+    if (v == null) return null
+    val value = v.value
+    if (value is JsonValue.Str) {
+        return when (value.value) {
+            "user" -> NativeContractOrigin.User
+            "policy" -> NativeContractOrigin.Policy
+            "native" -> NativeContractOrigin.Native
+            "heuristic" -> NativeContractOrigin.Heuristic
+            else -> null
+        }
+    }
+    if (value !is JsonValue.Obj) return null
+    val external = v.optionalField("external") ?: return null
+    val provider = when (val inner = external.value) {
+        is JsonValue.Str -> inner.value
+        is JsonValue.Obj -> (external.optionalField("provider")?.value as? JsonValue.Str)?.value
+        else -> null
+    } ?: return null
+    val named = boundedContractText(provider, MAX_CONTRACT_PROVIDER_CHARS)
+    return if (named.isEmpty()) null else NativeContractOrigin.External(named)
+}
+
+/** The weakest severity is `unknown` (disclosure-requiring), never `low`. */
+private fun contractSeverityOf(v: JsonView): String =
+    v.optionalText("severity")?.takeIf {
+        it == "low" || it == "medium" || it == "high" || it == "unknown"
+    } ?: "unknown"
+
+/** The weakest claim state is `unknown` (disclosure-requiring). */
+private fun contractStateOf(v: JsonView): String =
+    v.optionalText("state")?.takeIf {
+        it == "known_true" || it == "supported" || it == "inferred" ||
+            it == "uncertain" || it == "unknown" || it == "disproven"
+    } ?: "unknown"
+
+private val CONTRACT_EVIDENCE_KINDS =
+    setOf("compile", "test_execution", "contract_check", "review", "runtime_trace")
+
+private fun parseContractEvidenceRefs(v: JsonView): Pair<List<NativeContractEvidenceRef>, Int> {
+    val array = v.optionalField("evidence_refs") ?: return Pair(emptyList(), 0)
+    val items = (array.value as? JsonValue.Arr)?.items ?: return Pair(emptyList(), 0)
+    val refs = ArrayList<NativeContractEvidenceRef>()
+    var dropped = 0
+    for (entry in items.take(MAX_CONTRACT_ROWS).mapIndexed { i, item ->
+        JsonView("${array.path}[$i]", item)
+    }) {
+        if (entry.value !is JsonValue.Obj) {
+            dropped += 1
+            continue
+        }
+        refs.add(
+            NativeContractEvidenceRef(
+                kind = entry.optionalText("kind")?.takeIf { it in CONTRACT_EVIDENCE_KINDS },
+                source = boundedContractText(entry.optionalText("source") ?: "", 240),
+                detail = boundedContractText(entry.optionalText("detail") ?: "", 240)
+            )
+        )
+    }
+    if (items.size > MAX_CONTRACT_ROWS) dropped += items.size - MAX_CONTRACT_ROWS
+    return Pair(refs, dropped)
+}
+
+private fun <T> parseContractStatementRows(
+    v: JsonView,
+    key: String,
+    build: (String, String, NativeContractOrigin) -> T
+): Pair<List<T>, Int> {
+    val array = v.optionalField(key) ?: return Pair(emptyList(), 0)
+    val items = (array.value as? JsonValue.Arr)?.items ?: return Pair(emptyList(), 0)
+    val rows = ArrayList<T>()
+    var dropped = 0
+    for (entry in items.take(MAX_CONTRACT_ROWS).mapIndexed { i, item ->
+        JsonView("${array.path}[$i]", item)
+    }) {
+        if (entry.value !is JsonValue.Obj) {
+            dropped += 1
+            continue
+        }
+        val statement = entry.firstText("statement", "text", "description")
+            ?.let { boundedContractText(it, MAX_CONTRACT_ROW_CHARS) }
+        val origin = parseContractOrigin(entry.optionalField("origin"))
+        if (statement.isNullOrEmpty() || origin == null) {
+            dropped += 1
+            continue
+        }
+        rows.add(
+            build(
+                entry.optionalText("id")?.let { boundedContractText(it, 240) } ?: "",
+                statement,
+                origin
+            )
+        )
+    }
+    if (items.size > MAX_CONTRACT_ROWS) dropped += items.size - MAX_CONTRACT_ROWS
+    return Pair(rows, dropped)
+}
+
+private fun parseContractRisks(v: JsonView): Pair<List<NativeContractRisk>, Int> {
+    val array = v.optionalField("risks") ?: return Pair(emptyList(), 0)
+    val items = (array.value as? JsonValue.Arr)?.items ?: return Pair(emptyList(), 0)
+    val rows = ArrayList<NativeContractRisk>()
+    var dropped = 0
+    for (entry in items.take(MAX_CONTRACT_ROWS).mapIndexed { i, item ->
+        JsonView("${array.path}[$i]", item)
+    }) {
+        if (entry.value !is JsonValue.Obj) {
+            dropped += 1
+            continue
+        }
+        val description = entry.firstText("description", "statement", "text")
+            ?.let { boundedContractText(it, MAX_CONTRACT_ROW_CHARS) }
+        val origin = parseContractOrigin(entry.optionalField("origin"))
+        if (description.isNullOrEmpty() || origin == null) {
+            dropped += 1
+            continue
+        }
+        rows.add(
+            NativeContractRisk(
+                id = entry.optionalText("id")?.let { boundedContractText(it, 240) } ?: "",
+                description = description,
+                severity = contractSeverityOf(entry),
+                origin = origin
+            )
+        )
+    }
+    if (items.size > MAX_CONTRACT_ROWS) dropped += items.size - MAX_CONTRACT_ROWS
+    return Pair(rows, dropped)
+}
+
+private fun parseContractObligations(v: JsonView): Pair<List<NativeContractObligation>, Int> {
+    val array = v.optionalField("proof_obligations") ?: return Pair(emptyList(), 0)
+    val items = (array.value as? JsonValue.Arr)?.items ?: return Pair(emptyList(), 0)
+    val rows = ArrayList<NativeContractObligation>()
+    var dropped = 0
+    for (entry in items.take(MAX_CONTRACT_ROWS).mapIndexed { i, item ->
+        JsonView("${array.path}[$i]", item)
+    }) {
+        if (entry.value !is JsonValue.Obj) {
+            dropped += 1
+            continue
+        }
+        val claim = entry.firstText("claim", "statement", "text")
+            ?.let { boundedContractText(it, MAX_CONTRACT_ROW_CHARS) }
+        val origin = parseContractOrigin(entry.optionalField("origin"))
+        if (claim.isNullOrEmpty() || origin == null) {
+            dropped += 1
+            continue
+        }
+        val evidence = entry.optionalText("evidence")?.takeIf { it in CONTRACT_EVIDENCE_KINDS }
+        val evidenceLabel = if (evidence != null) {
+            evidence.replace('_', ' ')
+        } else {
+            entry.optionalText("evidence")?.takeIf { it.isNotBlank() }
+                ?.let { boundedContractText(it, MAX_CONTRACT_PROVIDER_CHARS) }
+                ?: "unknown"
+        }
+        val (refs, refsDropped) = parseContractEvidenceRefs(entry)
+        dropped += refsDropped
+        rows.add(
+            NativeContractObligation(
+                id = entry.optionalText("id")?.let { boundedContractText(it, 240) } ?: "",
+                claim = claim,
+                evidence = evidence,
+                evidenceLabel = evidenceLabel,
+                origin = origin,
+                state = contractStateOf(entry),
+                confidenceBps = (entry.optionalField("confidence_bps")?.value as? JsonValue.Int64)
+                    ?.value?.takeIf { it in 0L..10000L },
+                evidenceRefs = refs
+            )
+        )
+    }
+    if (items.size > MAX_CONTRACT_ROWS) dropped += items.size - MAX_CONTRACT_ROWS
+    return Pair(rows, dropped)
+}
+
+/**
+ * Additive decode of one task DTO's `contract` member. A present non-object
+ * is an explicit malformed read; entries decode independently and malformed
+ * entries are counted/disclosed, never rendered as claims.
+ */
+private fun parseEngineeringContract(v: JsonView): NativeContractRead {
+    if (v.value !is JsonValue.Obj) {
+        return NativeContractRead(
+            contract = null,
+            malformed = "the contract member is not an object",
+            droppedRows = 0
+        )
+    }
+    val (constraints, constraintsDropped) =
+        parseContractStatementRows(v, "constraints") { id, statement, origin ->
+            NativeContractConstraint(id, statement, origin)
+        }
+    val (invariants, invariantsDropped) =
+        parseContractStatementRows(v, "invariants") { id, statement, origin ->
+            NativeContractInvariant(id, statement, origin)
+        }
+    val (risks, risksDropped) = parseContractRisks(v)
+    val (obligations, obligationsDropped) = parseContractObligations(v)
+    return NativeContractRead(
+        contract = NativeEngineeringContract(
+            constraints = constraints,
+            invariants = invariants,
+            risks = risks,
+            proofObligations = obligations
+        ),
+        malformed = null,
+        droppedRows = constraintsDropped + invariantsDropped + risksDropped + obligationsDropped
+    )
+}
+
 fun parseNativeTaskViews(json: String): List<NativeTaskView> {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/tasks")
     return v.array().map {
@@ -1717,6 +2092,7 @@ fun parseNativeTaskViews(json: String): List<NativeTaskView> {
         val tests = it.field("tests")
         val budget = it.optionalField("budget")
         val progress = it.optionalField("progress")
+        val contract = it.optionalField("contract")?.let { c -> parseEngineeringContract(c) }
         NativeTaskView(
             goal = it.field("goal").string(),
             state = it.field("state").string(),
@@ -1734,7 +2110,10 @@ fun parseNativeTaskViews(json: String): List<NativeTaskView> {
             evidenceRefs = optionalStrings(it, "evidenceRefs", "evidence_refs"),
             phase = it.optionalField("phase")?.string(),
             progress = progress?.let { p -> parseAgentProgress(p) },
-            completion = it.optionalField("completion")?.let { c -> parseTaskCompletion(c) }
+            completion = it.optionalField("completion")?.let { c -> parseTaskCompletion(c) },
+            contract = contract?.contract,
+            contractMalformed = contract?.malformed,
+            contractDroppedRows = contract?.droppedRows ?: 0
         )
     }
 }
@@ -2572,7 +2951,14 @@ object NativeRequests {
          * replays the original receipt for an already-recorded id, so a lost
          * response can never create a second durable run.
          */
-        submissionId: String? = null
+        submissionId: String? = null,
+        /**
+         * The user-authored engineering-contract rows (composer disclosure).
+         * Sent as the daemon's four optional top-level string arrays; an
+         * all-empty instance is never sent, and only non-empty categories
+         * are serialized.
+         */
+        contractRows: NativeContractRows? = null
     ): String {
         val builder = JsonObjectBuilder()
             .put("goal", goal)
@@ -2587,6 +2973,15 @@ object NativeRequests {
                 attachments.orEmpty().filterNotNull().map { attachmentJson(it) }
             )
             .put("submission_id", submissionId)
+        contractRows?.takeIf { !it.isEmpty }?.let { rows ->
+            builder.putStrings("constraints", rows.constraints.takeIf { it.isNotEmpty() })
+            builder.putStrings("invariants", rows.invariants.takeIf { it.isNotEmpty() })
+            builder.putStrings("risks", rows.risks.takeIf { it.isNotEmpty() })
+            builder.putStrings(
+                "proof_obligations",
+                rows.proofObligations.takeIf { it.isNotEmpty() }
+            )
+        }
         // A non-default completion contract requires explicit work items (the
         // daemon refuses it on the plain-prompt path). ONE mutating `main`
         // item keeps the same in-session drive with the durable contract seam;

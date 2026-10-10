@@ -110,6 +110,7 @@ mod retry;
 mod settlement;
 pub(crate) use settlement::*;
 mod compaction;
+mod contract_eval;
 pub(crate) use compaction::*;
 mod verification_attribution;
 pub use verification_attribution::*;

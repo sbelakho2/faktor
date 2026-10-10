@@ -748,6 +748,7 @@ pub(crate) fn seed_typed_task(
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: faktor_session::TaskBudget {
                 max_tokens,
                 max_turns,

@@ -532,6 +532,7 @@ mod tests {
                 acceptance_criteria: vec!["a".into()],
                 plan: Vec::new(),
                 attachments: Vec::new(),
+                contract: Default::default(),
                 budget: TaskBudget::default(),
                 state: TaskState::Running,
                 created_ms: 1,

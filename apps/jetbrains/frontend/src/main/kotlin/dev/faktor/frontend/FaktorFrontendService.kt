@@ -25,6 +25,7 @@ import dev.faktor.shared.NativeBoardPage
 import dev.faktor.shared.NativeBoardPost
 import dev.faktor.shared.NativeBillingUsage
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeContractRows
 import dev.faktor.shared.NativeCreditGrant
 import dev.faktor.shared.NativeEntitlementSnapshot
 import dev.faktor.shared.NativeEvidence
@@ -472,7 +473,8 @@ class FaktorFrontendService(
         files: List<String>? = null,
         attachments: List<NativeAttachmentId>? = null,
         completionContract: NativeCompletionContract? = null,
-        submissionId: String? = null
+        submissionId: String? = null,
+        contractRows: NativeContractRows? = null
     ): NativeTaskRunStarted {
         if (!taskStartInFlight.compareAndSet(false, true)) {
             throw BackendException("a task start is already in flight; the duplicate was refused")
@@ -480,7 +482,7 @@ class FaktorFrontendService(
         try {
             return clientOrThrow().startTaskRun(
                 requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
-                attachments, completionContract, submissionId
+                attachments, completionContract, submissionId, contractRows
             )
         } finally {
             taskStartInFlight.set(false)

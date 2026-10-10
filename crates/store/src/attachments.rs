@@ -206,6 +206,7 @@ pub struct PreparedTaskWrite {
     plan_json: String,
     state_json: String,
     attachments_json: String,
+    contract_json: String,
 }
 
 impl PreparedTaskWrite {
@@ -225,12 +226,21 @@ impl PreparedTaskWrite {
             .expect("in-process TaskState serialization cannot fail");
         let attachments_json =
             serde_json::to_string(&row.attachments).map_err(|e| malformed("attachments", e))?;
+        let contract_json =
+            serde_json::to_string(&row.contract).map_err(|e| malformed("contract", e))?;
+        if contract_json.len() > MAX_TASK_CONTRACT_JSON_BYTES {
+            return Err(StoreError::Oversized(format!(
+                "task {task_id} contract JSON of {} bytes exceeds MAX_TASK_CONTRACT_JSON_BYTES ({MAX_TASK_CONTRACT_JSON_BYTES})",
+                contract_json.len()
+            )));
+        }
         Ok(Self {
             row,
             criteria_json,
             plan_json,
             state_json,
             attachments_json,
+            contract_json,
         })
     }
 }
@@ -710,8 +720,9 @@ impl Store {
                         tx.execute(
                             "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
                                               max_tokens, max_turns, spent_tokens, spent_turns,
-                                              state, created_ms, updated_ms, revision, attachments)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                              state, created_ms, updated_ms, revision, attachments,
+                                              contract)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                             params![
                                 prepared.row.task_id.raw() as i64,
                                 session_id.raw() as i64,
@@ -727,6 +738,7 @@ impl Store {
                                 prepared.row.updated_ms,
                                 prepared.row.revision.raw() as i64,
                                 prepared.attachments_json.as_str(),
+                                prepared.contract_json.as_str(),
                             ],
                         )?;
                         tx.commit()?;
@@ -1404,6 +1416,7 @@ mod tests {
             acceptance_criteria: Vec::new(),
             plan: Vec::new(),
             attachments,
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,

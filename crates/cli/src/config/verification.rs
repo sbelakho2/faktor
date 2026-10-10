@@ -16,6 +16,72 @@ pub struct VerificationCfg {
     pub unit_max_s: u64,
     #[serde(default = "default_full_as_background")]
     pub full_as_background: bool,
+    /// The OPTIONAL external (Kiwi-shaped) verification provider. Disabled
+    /// by default: an absent subsection — or `enabled = false` — leaves the
+    /// verification registry with the native baseline only.
+    #[serde(default)]
+    pub kiwi: KiwiCfg,
+}
+
+/// The additive `[verification.kiwi]` subsection: the OPTIONAL external
+/// verification provider. DISABLED by default; enabling it requires a
+/// bounded http(s) endpoint, and the optional bearer token is named by
+/// environment variable (the token VALUE never rides config). Bounds are the
+/// kiwi crate's; a hostile subsection refuses the daemon at boot before any
+/// socket exists.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KiwiCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The verification endpoint; required when `enabled` is true.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable holding the bearer token (optional).
+    #[serde(default)]
+    pub auth_env: Option<String>,
+    #[serde(default = "default_kiwi_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for KiwiCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            auth_env: None,
+            timeout_ms: default_kiwi_timeout_ms(),
+        }
+    }
+}
+
+impl KiwiCfg {
+    /// The bounded provider config this subsection resolves to: `None` while
+    /// disabled (the default). An enabled subsection without a valid
+    /// endpoint — or with any hostile field — is a loud typed refusal.
+    pub fn provider_config(&self) -> Result<Option<faktor_kiwi::KiwiProviderConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let endpoint = self
+            .endpoint
+            .clone()
+            .filter(|endpoint| !endpoint.is_empty())
+            .ok_or_else(|| "verification.kiwi.enabled requires an endpoint".to_string())?;
+        let config = faktor_kiwi::KiwiProviderConfig {
+            endpoint,
+            auth_env: self.auth_env.clone(),
+            timeout_ms: self.timeout_ms,
+        };
+        config
+            .validate()
+            .map_err(|error| format!("verification.kiwi: {error}"))?;
+        Ok(Some(config))
+    }
+}
+
+fn default_kiwi_timeout_ms() -> u64 {
+    faktor_kiwi::DEFAULT_KIWI_TIMEOUT_MS
 }
 
 pub(crate) fn default_quick_max_s() -> u64 {
@@ -36,6 +102,7 @@ impl Default for VerificationCfg {
             quick_max_s: default_quick_max_s(),
             unit_max_s: default_unit_max_s(),
             full_as_background: default_full_as_background(),
+            kiwi: KiwiCfg::default(),
         }
     }
 }

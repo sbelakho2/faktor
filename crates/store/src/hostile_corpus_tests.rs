@@ -112,6 +112,7 @@ fn task_row(sid: SessionId, task: u64) -> TaskRow {
         acceptance_criteria: vec!["c".into()],
         plan: vec!["p".into()],
         attachments: vec![],
+        contract: Default::default(),
         max_tokens: Some(1_000_000),
         max_turns: Some(100),
         spent_tokens: 0,
@@ -418,7 +419,7 @@ fn store_per_version_fixture_roundtrip_matrix() {
             "migration-matrix case #{case} (fixture v{version}): every chain must reach the head"
         );
     }
-    assert_eq!(case, 32, "per-version fixture matrix size drifted");
+    assert_eq!(case, 33, "per-version fixture matrix size drifted");
 }
 
 #[test]
@@ -459,7 +460,7 @@ fn store_torn_migration_cursor_never_half_migrates_silently() {
             ),
         }
     }
-    assert_eq!(case, 31, "torn-migration matrix size drifted");
+    assert_eq!(case, 32, "torn-migration matrix size drifted");
 }
 
 #[test]

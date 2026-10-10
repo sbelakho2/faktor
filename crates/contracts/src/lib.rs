@@ -573,6 +573,7 @@ pub fn reason_code_contract() -> Result<ContractFile, String> {
         R::PatchRevertPatch => ("PatchRevertPatch", R::PatchRevertPatch),
         R::RepeatedEvidenceSet => ("RepeatedEvidenceSet", R::RepeatedEvidenceSet),
         R::UnattributedChange => ("UnattributedChange", R::UnattributedChange),
+        R::ProofObligationDisproven => ("ProofObligationDisproven", R::ProofObligationDisproven),
     );
     let order = serde_enum_wire_order::<R>()?;
     let reps = rows

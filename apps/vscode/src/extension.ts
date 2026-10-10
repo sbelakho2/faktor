@@ -112,6 +112,7 @@ import {
   completionContractFromPicks,
   hasCompletionSteps,
   parseCompletionContract,
+  parseContractRows,
   parsePendingSubmission,
   submissionRetryable,
   verificationAuthorityKey,
@@ -1590,6 +1591,9 @@ function taskSummary(
     phase: view.phase,
     progress: view.progress,
     completion: completionSummaryOf(view, runState, submitted),
+    contract: view.contract,
+    contractMalformed: view.contractMalformed,
+    contractDroppedRows: view.contractDroppedRows,
   };
 }
 
@@ -1837,7 +1841,7 @@ async function startTask(
   snapshot: StartSubmissionSnapshot,
   context: vscode.ExtensionContext,
 ): Promise<void> {
-  const { submissionId, pending, files, contract } = snapshot;
+  const { submissionId, pending, files, contract, contractRows } = snapshot;
   const goal = pending.text;
   const restore = (failure: AdmitFailure, enriched: PendingSubmission): void => {
     // Audit 29: the enriched envelope keeps every successful upload, so a
@@ -1921,6 +1925,7 @@ async function startTask(
       maxCostMicro,
       files,
       completionContract: contract,
+      contractRows,
       submissionId,
     };
     const outcome = await admitPendingSubmission({
@@ -2026,6 +2031,9 @@ async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<voi
     pending,
     files: [],
     contract,
+    // The command path authors no contract rows; the composer disclosure
+    // is the only surface that carries them.
+    contractRows: null,
     newId: randomUUID,
   });
   if (decision.action !== 'start') {
@@ -2568,6 +2576,21 @@ async function handleWebviewMessage(
         chatProvider?.postStartResult(goal, false);
         return;
       }
+      // The user-authored contract rows are the same class of user intent as
+      // the completion contract: a malformed/oversized row refuses the START
+      // loudly (silently dropping a stated constraint would claim a contract
+      // the run never recorded). An absent value is the default path.
+      const contractRows = parseContractRows(message.contractRows);
+      if ('reason' in contractRows) {
+        chatProvider?.postUserError(
+          projectError({
+            kind: 'run_failure',
+            message: `task start refused: ${contractRows.reason}`,
+          }),
+        );
+        chatProvider?.postStartResult(goal, false);
+        return;
+      }
       // Binary attachments (pasted/attached images and screenshots) ride the
       // strict pending-submission envelope: the REAL composer path carries
       // HOST-SIDE attachment ids (`sendGoal.attachmentIds`) that resolve into
@@ -2637,6 +2660,7 @@ async function handleWebviewMessage(
         pending,
         files,
         contract: contract.contract,
+        contractRows: contractRows.rows,
         attachmentIds: selectedAttachmentIds,
         newId: randomUUID,
       });

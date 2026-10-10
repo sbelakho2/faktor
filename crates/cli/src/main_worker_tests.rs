@@ -1673,6 +1673,7 @@ async fn worker_transport_round_trip_settles_the_parent_run() {
             plan: vec![],
             attachments: Vec::new(),
             budget: faktor_session::TaskBudget::default(),
+            contract: faktor_core::contract::EngineeringContract::default(),
             state: faktor_core::state::TaskState::Pending,
             created_ms: now,
             updated_ms: now,

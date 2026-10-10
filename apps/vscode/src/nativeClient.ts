@@ -47,6 +47,10 @@ import {
   type ProtocolTaskRunCancelled,
   type ProtocolTaskRunStarted,
 } from './generated/protocolDto.ts';
+import {
+  readEngineeringContract,
+  type EngineeringContractView,
+} from './contract.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -599,6 +603,18 @@ export interface NativeTaskView {
    * `null` when the serving daemon exposes no completion read: the client
    * never fabricates step statuses (a missing read is NOT "all succeeded"). */
   readonly completion: NativeTaskCompletion | null;
+  /**
+   * Additive durable ENGINEERING contract of the task
+   * (`crates/core/src/contract.rs`): constraints, invariants, risks and proof
+   * obligations with provenance/state/confidence. Decoded independently per
+   * entry; `null` only when the serving daemon exposes no contract member
+   * (legacy daemon). `contractMalformed` names a present-but-unreadable
+   * member and `contractDroppedRows` counts entries whose shape was refused:
+   * both are disclosed by the UI, never silently rendered as valid claims.
+   */
+  readonly contract: EngineeringContractView | null;
+  readonly contractMalformed: string | null;
+  readonly contractDroppedRows: number;
 }
 
 /** The strict completion-contract vocabulary (wire snake_case). */
@@ -1478,6 +1494,17 @@ export interface StartTaskRunRequest {
   /** A non-default PR/CI-fix completion contract. The daemon refuses it on
    * the plain-prompt path, so callers pair it with an explicit work item. */
   readonly completion_contract?: NativeCompletionContract;
+  /**
+   * User-authored engineering-contract rows (Task mode): plain non-empty
+   * lines, bounded <=64 entries per array and <=512 UTF-8 bytes per line
+   * (the daemon's own bounds; a violation is its typed 400). The daemon
+   * derives ids/origins itself (origin=user) and merges by id. All four
+   * members are optional and omitted when the composer has no rows.
+   */
+  readonly constraints?: readonly string[];
+  readonly invariants?: readonly string[];
+  readonly risks?: readonly string[];
+  readonly proof_obligations?: readonly string[];
 }
 
 // -------------------------------------------------------------- validators
@@ -2015,6 +2042,17 @@ export function validateTaskViews(json: Json): NativeTaskView[] {
       evidenceRefs: optionalStringArray(object, ['evidenceRefs', 'evidence_refs'], itemPath),
       phase: optionalString(object, ['phase'], itemPath),
       completion: optionalCompletion(object, itemPath),
+      ...(() => {
+        // The engineering contract decodes ADDITIVELY: a legacy daemon
+        // serves no member (null); a present member decodes per entry and
+        // malformed entries are DISCLOSED via droppedRows, never fabricated.
+        const read = readEngineeringContract(optionalField(object, ['contract']));
+        return {
+          contract: read.contract,
+          contractMalformed: read.malformed,
+          contractDroppedRows: read.droppedRows,
+        };
+      })(),
     };
   });
 }

@@ -66,6 +66,7 @@ use faktor_core::authority::{
     DOMAIN_ACCOUNTING_BALANCE, DOMAIN_CHECK_BASIS,
 };
 use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
+use faktor_core::contract::{EngineeringContract, ProofObligation};
 use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
@@ -89,6 +90,17 @@ pub const MAX_TASK_CRITERION_BYTES: usize = 3000;
 pub const MAX_TASK_PLAN_STEPS: usize = 256;
 /// Hard bound on ONE plan step.
 pub const MAX_TASK_STEP_BYTES: usize = 3000;
+
+// ------------------------------------------------ engineering-contract bounds
+
+/// Hard bound on EACH engineering-contract list (constraints, invariants,
+/// risk hypotheses, proof obligations) of one task row.
+pub const MAX_TASK_CONTRACT_ENTRIES: usize = 64;
+/// Hard bound on one contract id / statement / claim / description / evidence
+/// string.
+pub const MAX_TASK_CONTRACT_STRING_BYTES: usize = 512;
+/// Hard bound on the serialized engineering-contract JSON of one task row.
+pub const MAX_TASK_CONTRACT_JSON_BYTES: usize = 256 * 1024;
 
 // -------------------------------------------------- record bounds (P0-8)
 
@@ -778,6 +790,15 @@ pub struct Task {
     /// declared mime/filename/size. Rows written before v24 and every
     /// attachment-free task decode with an empty list.
     pub attachments: Vec<AttachmentId>,
+    /// The task's durable engineering contract (schema v31): constraints,
+    /// invariants, risk hypotheses and proof obligations with their
+    /// per-claim state/confidence/provenance. Empty by default (`{}` on the
+    /// durable column), so rows and payloads written before the contract
+    /// existed decode exactly as before. Additive: a later task start may
+    /// UNION entries in (see [`SessionHandle::merge_task_contract`]) but
+    /// never erases an existing entry.
+    #[serde(default)]
+    pub contract: EngineeringContract,
     pub budget: TaskBudget,
     pub state: TaskState,
     pub created_ms: i64,
@@ -793,6 +814,7 @@ impl Default for Task {
             acceptance_criteria: Vec::new(),
             plan: Vec::new(),
             attachments: Vec::new(),
+            contract: EngineeringContract::default(),
             budget: TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: 0,
@@ -810,6 +832,7 @@ impl From<faktor_store::TaskRow> for Task {
             acceptance_criteria: r.acceptance_criteria,
             plan: r.plan,
             attachments: r.attachments,
+            contract: r.contract,
             budget: TaskBudget {
                 max_tokens: r.max_tokens,
                 max_turns: r.max_turns,
@@ -834,6 +857,7 @@ fn task_row(task: Task, revision: TaskRevision) -> faktor_store::TaskRow {
         acceptance_criteria: task.acceptance_criteria,
         plan: task.plan,
         attachments: task.attachments,
+        contract: task.contract,
         max_tokens: task.budget.max_tokens,
         max_turns: task.budget.max_turns,
         spent_tokens: task.budget.spent_tokens,
@@ -1752,6 +1776,155 @@ impl SessionHandle {
             .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
         let mut out = task_row(next, revision);
         out.updated_ms = self.manager.now_ms();
+        store.upsert_task(&out)?;
+        Ok(Task::from(out))
+    }
+
+    /// Durably merge engineering-contract entries into an EXISTING task row
+    /// (the additive task-start rule). The merge is a union by id: existing
+    /// entries are preserved VERBATIM (a proof obligation keeps its state,
+    /// confidence and evidence refs — a later task start can only ADD
+    /// clauses, never erase or downgrade what an earlier one recorded), and
+    /// additions append in request order with duplicates dropped by id.
+    ///
+    /// Idempotent by construction: a repeat merge that adds nothing writes
+    /// nothing and does NOT bump the revision (so a replayed task start
+    /// cannot invalidate verification records bound to the current
+    /// revision). When entries ARE added the revision bumps exactly once,
+    /// under the same single-write pattern as [`SessionHandle::update_task`].
+    /// Terminal rows stay frozen ([`TaskError::TerminalTask`]), and every
+    /// bound of [`validate_task_contract`] applies before any write.
+    pub fn merge_task_contract(
+        &self,
+        task_id: TaskId,
+        additions: &EngineeringContract,
+    ) -> Result<Task, TaskError> {
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        // Merge ADDITIONS tolerate duplicate ids: the union below dedupes
+        // them, and the merged row is re-validated strictly before the
+        // write (via `validate_task_fields`). Every other bound holds.
+        validate_task_contract_impl(additions, false)?;
+        let _guard = self.command_guard();
+        let store = self.manager.store();
+        let row = store
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        let current = Task::from(row.clone());
+        let (merged, added) = merge_task_contracts(&current.contract, additions);
+        if added == 0 {
+            // Idempotent replay: nothing to add, nothing to write.
+            return Ok(current);
+        }
+        if row.state.is_terminal() {
+            return Err(TaskError::TerminalTask {
+                task_id,
+                state: row.state,
+            });
+        }
+        let mut next = current;
+        next.contract = merged;
+        next.updated_ms = self.manager.now_ms();
+        validate_task_fields(&next)?;
+        let revision = row
+            .revision
+            .checked_next()
+            .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
+        let out = task_row(next, revision);
+        store.upsert_task(&out)?;
+        Ok(Task::from(out))
+    }
+
+    /// Durably record EVALUATED claim states / confidence / evidence for
+    /// proof obligations that ALREADY exist on a task row (the evaluation
+    /// half of the additive contract: `merge_task_contract` only appends
+    /// entries, this only annotates them). Each update matches by obligation
+    /// id; an unknown id is a typed [`TaskError::Malformed`] refusal — the
+    /// API can never add or smuggle entries. `state` and `confidence_bps`
+    /// are replaced, `evidence_refs` are APPENDED with duplicates (by
+    /// kind+source+detail) dropped; the claim, evidence kind and origin are
+    /// never touched. The whole batch is validated before the single write,
+    /// so a hostile update cannot leave a half-applied row.
+    ///
+    /// Idempotent: an update set that changes nothing writes nothing and
+    /// does NOT bump the revision. A changed row bumps the revision exactly
+    /// once through the same single-write path as
+    /// [`SessionHandle::merge_task_contract`]; terminal rows stay frozen and
+    /// every contract bound is re-checked before any write.
+    pub fn apply_task_contract_obligation_states(
+        &self,
+        task_id: TaskId,
+        updates: &[ProofObligation],
+    ) -> Result<Task, TaskError> {
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        if updates.is_empty() {
+            return Err(TaskError::Malformed(
+                "no proof-obligation updates supplied".into(),
+            ));
+        }
+        let _guard = self.command_guard();
+        let store = self.manager.store();
+        let row = store
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        let mut current = Task::from(row.clone());
+        // ALL-OR-NOTHING existence pre-check: every update must name an
+        // obligation already on the row before anything is applied.
+        for update in updates {
+            if !current
+                .contract
+                .proof_obligations
+                .iter()
+                .any(|o| o.id == update.id)
+            {
+                return Err(TaskError::Malformed(format!(
+                    "obligation update names unknown id {:?}: evaluation cannot add entries",
+                    update.id
+                )));
+            }
+        }
+        let mut changed = false;
+        for update in updates {
+            let obligation = current
+                .contract
+                .proof_obligations
+                .iter_mut()
+                .find(|o| o.id == update.id)
+                .expect("existence pre-checked above");
+            if obligation.state != update.state
+                || obligation.confidence_bps != update.confidence_bps
+            {
+                changed = true;
+            }
+            obligation.state = update.state;
+            obligation.confidence_bps = update.confidence_bps;
+            for reference in &update.evidence_refs {
+                if !obligation.evidence_refs.contains(reference) {
+                    obligation.evidence_refs.push(reference.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            // Idempotent replay: nothing to record, nothing to write.
+            return Ok(current);
+        }
+        if row.state.is_terminal() {
+            return Err(TaskError::TerminalTask {
+                task_id,
+                state: row.state,
+            });
+        }
+        current.updated_ms = self.manager.now_ms();
+        validate_task_fields(&current)?;
+        let revision = row
+            .revision
+            .checked_next()
+            .ok_or_else(|| TaskError::Malformed("task revision overflow".into()))?;
+        let out = task_row(current, revision);
         store.upsert_task(&out)?;
         Ok(Task::from(out))
     }
@@ -3305,7 +3478,169 @@ fn validate_task_fields(t: &Task) -> Result<(), TaskError> {
     for a in &t.attachments {
         a.validate().map_err(task_error_from_core)?;
     }
+    validate_task_contract(&t.contract)?;
     Ok(())
+}
+
+/// The deterministic id of one user-authored contract entry
+/// (`constraints` -> `c1:`, `invariants` -> `i1:`, `risks` -> `r1:`; the
+/// proof-obligation kind uses [`EngineeringContract::obligation_id`]). BLAKE3
+/// over a domain-separated `kind` + text, truncated to 16 hex chars: the
+/// same text always yields the same id across requests and restarts, which
+/// is what makes a repeated task start UNION instead of duplicate (see
+/// [`merge_task_contracts`]), and distinct texts virtually never collide.
+pub fn derived_contract_entry_id(kind: &str, text: &str) -> String {
+    let digest = blake3::hash(format!("faktor.contract.{kind}.v1\0{text}").as_bytes());
+    format!("{kind}:{}", &digest.to_hex()[..16])
+}
+
+/// Structural validation of one engineering contract BEFORE any durable
+/// write: per-list count bounds, non-empty and bounded strings, bounded
+/// evidence refs, a sane confidence band and no duplicate entry ids (an
+/// ambiguous contract can never be merged or evaluated deterministically).
+/// Oversized input is refused typed — never truncated.
+pub fn validate_task_contract(contract: &EngineeringContract) -> Result<(), TaskError> {
+    validate_task_contract_impl(contract, true)
+}
+
+/// The shared bounds/shape validation. `reject_duplicate_ids` is FALSE for
+/// merge ADDITIONS: the union dedupes them by id, so only the merged RESULT
+/// must be duplicate-free (the caller re-validates it strictly).
+fn validate_task_contract_impl(
+    contract: &EngineeringContract,
+    reject_duplicate_ids: bool,
+) -> Result<(), TaskError> {
+    let check = |what: &str, text: &str| -> Result<(), TaskError> {
+        if text.is_empty() {
+            return Err(TaskError::Malformed(format!("{what} is empty")));
+        }
+        if text.len() > MAX_TASK_CONTRACT_STRING_BYTES {
+            return Err(TaskError::Oversized(format!(
+                "{what} of {} bytes exceeds MAX_TASK_CONTRACT_STRING_BYTES ({MAX_TASK_CONTRACT_STRING_BYTES})",
+                text.len()
+            )));
+        }
+        Ok(())
+    };
+    for (what, len) in [
+        ("constraints", contract.constraints.len()),
+        ("invariants", contract.invariants.len()),
+        ("risks", contract.risks.len()),
+        ("proof_obligations", contract.proof_obligations.len()),
+    ] {
+        if len > MAX_TASK_CONTRACT_ENTRIES {
+            return Err(TaskError::Oversized(format!(
+                "{len} contract {what} exceed MAX_TASK_CONTRACT_ENTRIES ({MAX_TASK_CONTRACT_ENTRIES})"
+            )));
+        }
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut unique = |id: &str, what: &str| -> Result<(), TaskError> {
+        check(&format!("{what} id"), id)?;
+        if !ids.insert(id.to_string()) && reject_duplicate_ids {
+            return Err(TaskError::Malformed(format!(
+                "duplicate contract entry id {id:?}: the contract is ambiguous"
+            )));
+        }
+        Ok(())
+    };
+    for c in &contract.constraints {
+        unique(&c.id, "constraint")?;
+        check("constraint statement", &c.statement)?;
+    }
+    for i in &contract.invariants {
+        unique(&i.id, "invariant")?;
+        check("invariant statement", &i.statement)?;
+    }
+    for r in &contract.risks {
+        unique(&r.id, "risk")?;
+        check("risk description", &r.description)?;
+    }
+    for o in &contract.proof_obligations {
+        unique(&o.id, "proof obligation")?;
+        check("proof obligation claim", &o.claim)?;
+        if let Some(bps) = o.confidence_bps {
+            if bps > 10_000 {
+                return Err(TaskError::Malformed(format!(
+                    "proof obligation {} carries confidence {bps} bps outside 0..=10000",
+                    o.id
+                )));
+            }
+        }
+        if o.evidence_refs.len() > MAX_TASK_CONTRACT_ENTRIES {
+            return Err(TaskError::Oversized(format!(
+                "proof obligation {} carries {} evidence refs (max {MAX_TASK_CONTRACT_ENTRIES})",
+                o.id,
+                o.evidence_refs.len()
+            )));
+        }
+        for evidence in &o.evidence_refs {
+            check("evidence source", &evidence.source)?;
+            if evidence.detail.len() > MAX_TASK_CONTRACT_STRING_BYTES {
+                return Err(TaskError::Oversized(format!(
+                    "evidence detail of {} bytes exceeds MAX_TASK_CONTRACT_STRING_BYTES ({MAX_TASK_CONTRACT_STRING_BYTES})",
+                    evidence.detail.len()
+                )));
+            }
+        }
+    }
+    let json = serde_json::to_vec(contract)
+        .map_err(|e| TaskError::Malformed(format!("contract json: {e}")))?;
+    if json.len() > MAX_TASK_CONTRACT_JSON_BYTES {
+        return Err(TaskError::Oversized(format!(
+            "contract JSON of {} bytes exceeds MAX_TASK_CONTRACT_JSON_BYTES ({MAX_TASK_CONTRACT_JSON_BYTES})",
+            json.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The durable ADDITIVE merge of two engineering contracts: union by id,
+/// with EXISTING entries always winning (their claim state, confidence and
+/// evidence refs are preserved verbatim); additions append in request order
+/// and duplicates within the additions are dropped by id. Returns the merged
+/// contract and the number of entries actually added (0 = idempotent replay).
+pub fn merge_task_contracts(
+    existing: &EngineeringContract,
+    additions: &EngineeringContract,
+) -> (EngineeringContract, usize) {
+    fn union_by_id<T: Clone>(
+        existing: &[T],
+        additions: &[T],
+        id: impl Fn(&T) -> String,
+    ) -> (Vec<T>, usize) {
+        let mut out = existing.to_vec();
+        let mut seen: std::collections::HashSet<String> = existing.iter().map(&id).collect();
+        let mut added = 0usize;
+        for addition in additions {
+            if seen.insert(id(addition)) {
+                out.push(addition.clone());
+                added += 1;
+            }
+        }
+        (out, added)
+    }
+    let (constraints, c) = union_by_id(&existing.constraints, &additions.constraints, |e| {
+        e.id.clone()
+    });
+    let (invariants, i) = union_by_id(&existing.invariants, &additions.invariants, |e| {
+        e.id.clone()
+    });
+    let (risks, r) = union_by_id(&existing.risks, &additions.risks, |e| e.id.clone());
+    let (proof_obligations, o) = union_by_id(
+        &existing.proof_obligations,
+        &additions.proof_obligations,
+        |e| e.id.clone(),
+    );
+    (
+        EngineeringContract {
+            constraints,
+            invariants,
+            risks,
+            proof_obligations,
+        },
+        c + i + r + o,
+    )
 }
 
 /// Bounded-field contract of one verification record (audit P0-8): every

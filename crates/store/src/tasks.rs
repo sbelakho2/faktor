@@ -54,6 +54,11 @@ pub const MAX_VERIFICATION_JOB_ROOT_BYTES: usize = 4096;
 /// One job execution budget bound (ms).
 pub const MAX_VERIFICATION_JOB_BUDGET_MS: u64 = 3_600_000;
 
+/// One task engineering-contract JSON column bound (mirrors
+/// `faktor_session::MAX_TASK_CONTRACT_JSON_BYTES`): the store backstops the
+/// session layer so a raw write can never outgrow the durable contract.
+pub const MAX_TASK_CONTRACT_JSON_BYTES: usize = 256 * 1024;
+
 /// One environment-fingerprint JSON column bound.
 pub const MAX_VERIFICATION_JOB_FINGERPRINT_JSON_BYTES: usize = 64 * 1024;
 
@@ -88,6 +93,13 @@ pub struct TaskRow {
     /// list (`'[]'` column default) — the attachment-free row stays
     /// byte-identical.
     pub attachments: Vec<AttachmentId>,
+    /// The task's durable engineering contract (schema v31): the frozen
+    /// `faktor_core::contract::EngineeringContract` as a bounded JSON
+    /// column. Rows written before v31 decode to an EMPTY contract (column
+    /// default `'{}'`), so every existing row stays valid and every write is
+    /// additive. A corrupt value is a typed refusal on read, never a
+    /// silently defaulted contract.
+    pub contract: faktor_core::contract::EngineeringContract,
     pub max_tokens: Option<u64>,
     pub max_turns: Option<u32>,
     pub spent_tokens: u64,
@@ -488,6 +500,10 @@ pub(crate) fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> Stor
         attachments: parse_json(
             &format!("task {session_id}/{task_id} attachments"),
             &r.get::<_, String>(13)?,
+        )?,
+        contract: parse_json(
+            &format!("task {session_id}/{task_id} contract"),
+            &r.get::<_, String>(14)?,
         )?,
         max_tokens: r.get::<_, Option<i64>>(5)?.map(|m| m.max(0) as u64),
         max_turns: match r.get::<_, Option<i64>>(6)? {
@@ -1265,6 +1281,17 @@ impl Store {
         let plan_json = durable_json("task plan", &t.plan)?;
         let state_json = durable_json("task state", &t.state)?;
         let attachments_json = durable_json("task attachments", &t.attachments)?;
+        let contract_json = durable_json("task contract", &t.contract)?;
+        // The store backstops the session layer's contract bound: an oversized
+        // column is refused typed BEFORE the write, never persisted/truncated.
+        if contract_json.len() > MAX_TASK_CONTRACT_JSON_BYTES {
+            return Err(StoreError::Oversized(format!(
+                "task {}/{} contract JSON of {} bytes exceeds MAX_TASK_CONTRACT_JSON_BYTES ({MAX_TASK_CONTRACT_JSON_BYTES})",
+                t.session_id,
+                t.task_id,
+                contract_json.len()
+            )));
+        }
         // Preparation BEFORE enqueueing: decode/refusal diagnostics.
         let state_label = format!("task {}/{} state", t.session_id, t.task_id);
         let completion_backstop = format!(
@@ -1317,8 +1344,9 @@ impl Store {
             tx.execute(
                 "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
                               max_tokens, max_turns, spent_tokens, spent_turns,
-                              state, created_ms, updated_ms, revision, attachments)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                              state, created_ms, updated_ms, revision, attachments,
+                              contract)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(session_id, task_id) DO UPDATE SET
                 goal = excluded.goal,
                 acceptance_criteria = excluded.acceptance_criteria,
@@ -1331,7 +1359,8 @@ impl Store {
                 created_ms = excluded.created_ms,
                 updated_ms = excluded.updated_ms,
                 revision = excluded.revision,
-                attachments = excluded.attachments",
+                attachments = excluded.attachments,
+                contract = excluded.contract",
                 params![
                     t.task_id.raw() as i64,
                     t.session_id.raw() as i64,
@@ -1348,6 +1377,7 @@ impl Store {
                     t.updated_ms,
                     t.revision.raw() as i64,
                     attachments_json,
+                    contract_json,
                 ],
             )?;
             tx.commit()?;
@@ -1360,7 +1390,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                     max_tokens, max_turns, spent_tokens, spent_turns,
-                    state, created_ms, updated_ms, revision, attachments
+                    state, created_ms, updated_ms, revision, attachments,
+                    contract
              FROM task WHERE session_id = ?1 AND task_id = ?2",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
@@ -2377,7 +2408,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                     max_tokens, max_turns, spent_tokens, spent_turns,
-                    state, created_ms, updated_ms, revision, attachments
+                    state, created_ms, updated_ms, revision, attachments,
+                    contract
              FROM task WHERE session_id = ?1 ORDER BY created_ms ASC, task_id ASC",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64])?;

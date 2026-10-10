@@ -311,6 +311,16 @@ pub(crate) async fn native_session_tasks(
         Ok(t) => t,
         Err(e) => return api_err(&e),
     };
+    // The additive engineering contract projection (frozen
+    // `faktor_core::contract::EngineeringContract`, schema v31): always
+    // present on the task entry — an empty contract for rows written before
+    // the column existed — so clients can render constraints, invariants,
+    // risks and proof obligations with their state/confidence/provenance
+    // without a second read.
+    let contract = task_row
+        .as_ref()
+        .map(|t| t.contract.clone())
+        .unwrap_or_default();
     if let Some(task) = task_row {
         let cost = match state
             .deps
@@ -373,6 +383,7 @@ pub(crate) async fn native_session_tasks(
         "verification": verification,
         "progress": progress,
         "budget": budget,
+        "contract": contract,
     }]))
     .into_response()
 }

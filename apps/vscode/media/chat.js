@@ -223,6 +223,23 @@
     }
     for (var i = 0; i < sections.length; i++) {
       var section = sections[i];
+      // The "Needs disclosure" block leads the run details: text-first (the
+      // core's own state token plus the summary), never color-only, and it
+      // is rendered as a distinct warning block rather than a quiet section.
+      if (section.key === 'disclosure') {
+        var warning = document.createElement('section');
+        warning.className = 'cockpit-disclosure';
+        warning.setAttribute('role', 'note');
+        var warningHead = document.createElement('h3');
+        warningHead.textContent = section.title;
+        warning.appendChild(warningHead);
+        var warningLines = Array.isArray(section.lines) ? section.lines : [];
+        for (var w = 0; w < warningLines.length; w++) {
+          line(warning, warningLines[w], 'disclosure-line');
+        }
+        node.appendChild(warning);
+        continue;
+      }
       var block = document.createElement('section');
       block.className = 'cockpit-section' + (section.present ? '' : ' cockpit-empty');
       var head = document.createElement('h3');
@@ -236,6 +253,8 @@
         for (var c = 0; c < criteria.length; c++) {
           renderCriterionRow(block, criteria[c]);
         }
+      } else if (section.key === 'contract' && section.contract) {
+        renderContractSection(block, section.contract, section.lines);
       } else {
         var lines = Array.isArray(section.lines) ? section.lines : [];
         for (var j = 0; j < lines.length; j++) {
@@ -451,6 +470,74 @@
       line(card, 'unavailable: ' + unavailable.join(', '), 'warn criterion-unavailable');
     }
     block.appendChild(card);
+  }
+
+  /**
+   * The Contract section: constraints and invariants as statement rows,
+   * risks with a severity chip and an explicit disclosure line for
+   * high/unknown, and proof obligations with claim, evidence kind, a state
+   * chip carrying confidence (`supported · 91%`) and provenance. Every row
+   * carries its origin label; nothing renders color-only.
+   */
+  function renderContractSection(block, contract, noteLines) {
+    function statementGroup(label, rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return;
+      }
+      line(block, label, 'contract-group-label');
+      for (var i = 0; i < rows.length; i++) {
+        var row = document.createElement('div');
+        row.className = 'contract-row';
+        span(row, rows[i].statement, 'contract-statement');
+        span(row, rows[i].origin, 'chip chip-origin');
+        block.appendChild(row);
+      }
+    }
+    statementGroup('Constraints', contract.constraints);
+    statementGroup('Invariants', contract.invariants);
+    var risks = Array.isArray(contract.risks) ? contract.risks : [];
+    if (risks.length > 0) {
+      line(block, 'Risks', 'contract-group-label');
+      for (var r = 0; r < risks.length; r++) {
+        var risk = risks[r];
+        var riskRow = document.createElement('div');
+        riskRow.className = 'contract-row';
+        span(riskRow, risk.description, 'contract-statement');
+        span(riskRow, risk.severity, 'chip chip-severity chip-severity-' + String(risk.severity));
+        span(riskRow, risk.origin, 'chip chip-origin');
+        block.appendChild(riskRow);
+        if (risk.disclosure) {
+          line(block, 'disclosure: ' + String(risk.disclosure), 'contract-disclosure-text');
+        }
+      }
+    }
+    var obligations = Array.isArray(contract.obligations) ? contract.obligations : [];
+    if (obligations.length > 0) {
+      line(block, 'Proof obligations', 'contract-group-label');
+      for (var o = 0; o < obligations.length; o++) {
+        var obligation = obligations[o];
+        var obligationRow = document.createElement('div');
+        obligationRow.className = 'contract-row';
+        span(obligationRow, obligation.claim, 'contract-statement');
+        span(obligationRow, obligation.evidence, 'contract-evidence');
+        span(
+          obligationRow,
+          obligation.stateText,
+          'chip chip-state chip-state-' + String(obligation.state),
+        );
+        span(obligationRow, obligation.origin, 'chip chip-origin');
+        block.appendChild(obligationRow);
+        var refs = Array.isArray(obligation.evidenceRefs) ? obligation.evidenceRefs : [];
+        for (var e = 0; e < refs.length; e++) {
+          line(block, 'evidence: ' + String(refs[e]), 'muted contract-evidence-ref');
+        }
+      }
+    }
+    var lines = Array.isArray(noteLines) ? noteLines : [];
+    // The section's own note lines (dropped/unreadable rows) stay muted.
+    for (var n = 0; n < lines.length; n++) {
+      line(block, lines[n], 'muted');
+    }
   }
 
   function renderTask(task, view, agents) {
@@ -2235,6 +2322,7 @@
         // resets the finish-level radio group; a failure keeps it for the
         // retry.
         clearCompletionControls();
+        clearContractRowControls();
         if (goalNode && typeof goalNode.focus === 'function') {
           goalNode.focus();
         }
@@ -2311,6 +2399,46 @@
   }
 
   /**
+   * The "Acceptance & contract" rows: one entry per non-blank line, bounded
+   * at the host boundary (the host refuses a malformed/oversized envelope
+   * with a typed error rather than silently dropping an entry). All-blank
+   * fields produce no member at all (today's default path).
+   */
+  function contractRowsFromControls() {
+    var ids = ['contract-constraints', 'contract-invariants', 'contract-risks', 'contract-obligations'];
+    var members = ['constraints', 'invariants', 'risks', 'proofObligations'];
+    var rows = {};
+    var any = false;
+    for (var i = 0; i < ids.length; i++) {
+      var node = byId(ids[i]);
+      var raw = node && typeof node.value === 'string' ? node.value.split('\n') : [];
+      var entries = [];
+      for (var j = 0; j < raw.length; j++) {
+        var value = raw[j].trim();
+        if (value.length > 0) {
+          entries.push(value);
+        }
+      }
+      rows[members[i]] = entries;
+      if (entries.length > 0) {
+        any = true;
+      }
+    }
+    return any ? rows : null;
+  }
+
+  /** A successful start clears the per-run contract rows (kept on failure). */
+  function clearContractRowControls() {
+    var ids = ['contract-constraints', 'contract-invariants', 'contract-risks', 'contract-obligations'];
+    for (var i = 0; i < ids.length; i++) {
+      var node = byId(ids[i]);
+      if (node) {
+        node.value = '';
+      }
+    }
+  }
+
+  /**
    * Start one logical submission. Single-flight: the flag gates the composer
    * BEFORE the post, so a double click / Enter+click race can never emit a
    * second sendGoal; it is released ONLY by an explicit host result. The
@@ -2331,6 +2459,7 @@
     // The Task-mode completion contract rides only THIS task start; plain
     // chat never carries it.
     var contract = completionContractFromControls();
+    var contractRows = contractRowsFromControls();
     var message = { type: 'sendGoal', goal: goal };
     if (attachments.length > 0) {
       var ids = [];
@@ -2341,6 +2470,9 @@
     }
     if (contract) {
       message.completionContract = contract;
+    }
+    if (contractRows) {
+      message.contractRows = contractRows;
     }
     transcriptPinRequested = true;
     setSubmitting(true);

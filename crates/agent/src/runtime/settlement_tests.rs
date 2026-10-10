@@ -314,6 +314,7 @@ async fn exhausted_token_budget_blocks_verified_complete() {
         acceptance_criteria: vec![],
         plan: vec![],
         attachments: Vec::new(),
+        contract: Default::default(),
         budget: faktor_session::TaskBudget {
             max_tokens: Some(10),
             max_turns: None,
@@ -467,6 +468,7 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: faktor_session::TaskBudget::default(),
             state: faktor_core::state::TaskState::Pending,
             created_ms: now,
@@ -613,6 +615,7 @@ async fn hard_budget_denies_the_request_before_the_provider() {
             acceptance_criteria: vec![],
             plan: vec![],
             attachments: Vec::new(),
+            contract: Default::default(),
             budget: faktor_session::TaskBudget::default(),
             state: faktor_core::state::TaskState::Pending,
             created_ms: now,

@@ -44,6 +44,7 @@ fn fixture(criteria: &[&str]) -> Fixture {
             acceptance_criteria: criteria.iter().map(|c| (*c).to_string()).collect(),
             plan: Vec::new(),
             attachments: Vec::new(),
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,

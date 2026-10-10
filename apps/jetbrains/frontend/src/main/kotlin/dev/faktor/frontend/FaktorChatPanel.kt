@@ -23,6 +23,7 @@ import dev.faktor.shared.MicroMoney
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeCompletionContract
+import dev.faktor.shared.NativeContractRows
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
@@ -160,6 +161,18 @@ class FaktorChatPanel(
     private val abortButton = secondaryButton("Abort")
 
     private val criteriaField = JTextField(24)
+
+    // The "Acceptance & contract" rows: one entry per line, bounded at
+    // capture time exactly like the daemon (<=64 lines, <=512 UTF-8 bytes).
+    // Blank lines are dropped; a violation refuses the start loudly rather
+    // than silently discarding an authored constraint.
+    private val constraintField = JTextArea(2, 24)
+
+    private val invariantField = JTextArea(2, 24)
+
+    private val riskField = JTextArea(2, 24)
+
+    private val obligationField = JTextArea(2, 24)
 
     private val attachments = AttachmentsPanel(workspaceRoot)
 
@@ -441,6 +454,12 @@ class FaktorChatPanel(
         contractBox.add(completionPr)
         optionsBody.add(sectionHeader("Finish when done", muted = true))
         optionsBody.add(contractBox)
+        for ((label, field, hint) in contractEditors()) {
+            field.toolTipText = hint
+            optionsBody.add(
+                FormGrid().row(label, focusAccentScroll(field)).build()
+            )
+        }
         optionsBody.add(sectionHeader("Attachments (submitted as files)", muted = true))
         optionsBody.add(attachments)
         runOptionsBody.isOpaque = false
@@ -672,6 +691,87 @@ class FaktorChatPanel(
         )
     }
 
+    /** The four line-based editors of the Acceptance & contract disclosure. */
+    private fun contractEditors(): List<Triple<String, JTextArea, String>> = listOf(
+        Triple(
+            "Constraints — conditions that cannot be violated",
+            constraintField,
+            "One constraint per line; at most 64 lines of 512 bytes each"
+        ),
+        Triple(
+            "Invariants — properties that must remain true",
+            invariantField,
+            "One invariant per line; at most 64 lines of 512 bytes each"
+        ),
+        Triple(
+            "Risks — likely ways the change could fail",
+            riskField,
+            "One risk per line; at most 64 lines of 512 bytes each"
+        ),
+        Triple(
+            "Proof obligations — claims verification must evaluate",
+            obligationField,
+            "One claim per line; at most 64 lines of 512 bytes each"
+        )
+    )
+
+    /** Split one editor into bounded rows; `second` is a refusal reason. */
+    private fun parseContractLines(field: JTextArea, label: String): Pair<List<String>, String?> {
+        val rows = ArrayList<String>()
+        for (raw in field.text.split('\n')) {
+            val value = raw.trim()
+            if (value.isEmpty()) continue
+            if (value.length > NativeContractRows.MAX_ROW_CHARS) {
+                return Pair(
+                    emptyList(),
+                    "$label: a line exceeds ${NativeContractRows.MAX_ROW_CHARS} characters"
+                )
+            }
+            if (value.toByteArray(Charsets.UTF_8).size > NativeContractRows.MAX_ROW_BYTES) {
+                return Pair(
+                    emptyList(),
+                    "$label: a line exceeds ${NativeContractRows.MAX_ROW_BYTES} UTF-8 bytes"
+                )
+            }
+            if (rows.size >= NativeContractRows.MAX_ROWS) {
+                return Pair(emptyList(), "$label: more than ${NativeContractRows.MAX_ROWS} lines")
+            }
+            rows.add(value)
+        }
+        return Pair(rows, null)
+    }
+
+    /**
+     * The bounded rows of the Acceptance & contract editors: null rows for
+     * "nothing authored" (the default path). A bound violation returns a
+     * typed refusal and the caller refuses the START loudly.
+     */
+    internal fun contractRowsCapture(): Pair<NativeContractRows?, String?> {
+        val constraints = parseContractLines(constraintField, "constraints")
+        constraints.second?.let { return Pair(null, it) }
+        val invariants = parseContractLines(invariantField, "invariants")
+        invariants.second?.let { return Pair(null, it) }
+        val risks = parseContractLines(riskField, "risks")
+        risks.second?.let { return Pair(null, it) }
+        val obligations = parseContractLines(obligationField, "proof obligations")
+        obligations.second?.let { return Pair(null, it) }
+        val rows = NativeContractRows(
+            constraints = constraints.first,
+            invariants = invariants.first,
+            risks = risks.first,
+            proofObligations = obligations.first
+        )
+        return Pair(if (rows.isEmpty) null else rows, null)
+    }
+
+    /** The contract rows are per task start: reset after a success ack. */
+    private fun resetContractRowControls() {
+        constraintField.text = ""
+        invariantField.text = ""
+        riskField.text = ""
+        obligationField.text = ""
+    }
+
     /** The completion contract is per task start: reset after a success ack. */
     private fun resetCompletionControls() {
         completionCommit.isSelected = false
@@ -715,12 +815,21 @@ class FaktorChatPanel(
             appendSystem("the composer is empty; describe what Faktor should do")
             return
         }
+        // The authored contract rows are captured (and bounded) BEFORE the
+        // in-flight claim: an oversized/malformed editor refuses the START
+        // loudly, exactly like the daemon's typed 400, instead of silently
+        // dropping a constraint the operator stated.
+        val contractRows = contractRowsCapture()
+        contractRows.second?.let { reason ->
+            appendSystem("task start refused: $reason")
+            return
+        }
         if (!startInFlight.compareAndSet(false, true)) {
             appendSystem("a task start is already in flight; this submit was ignored")
             return
         }
         val draft = try {
-            captureTaskStartDraft(goal)
+            captureTaskStartDraft(goal, contractRows.first)
         } catch (e: Throwable) {
             startInFlight.set(false)
             throw e
@@ -753,7 +862,10 @@ class FaktorChatPanel(
         }
     }
 
-    private fun captureTaskStartDraft(goal: String): TaskStartDraft {
+    private fun captureTaskStartDraft(
+        goal: String,
+        contractRows: NativeContractRows?
+    ): TaskStartDraft {
         val criteria = criteriaField.text.split(',')
             .map { it.trim() }
             .filter { it.isNotEmpty() }
@@ -763,7 +875,8 @@ class FaktorChatPanel(
             mutationMode = settingsPanel.mutationMode(),
             files = attachments.files(),
             binaries = attachments.binaryAttachments(),
-            completionContract = completionContractFromControls()
+            completionContract = completionContractFromControls(),
+            contractRows = contractRows
         )
     }
 
@@ -820,7 +933,8 @@ class FaktorChatPanel(
                 files = if (plan.pathFiles.isEmpty()) null else plan.pathFiles,
                 attachments = if (binary.isEmpty()) null else binary,
                 completionContract = draft.completionContract,
-                submissionId = submission.submissionId
+                submissionId = submission.submissionId,
+                contractRows = draft.contractRows
             )
             // Durable acceptance: this submission's retained ids are no longer
             // pending; a later submission uploads from scratch.
@@ -864,7 +978,10 @@ class FaktorChatPanel(
         onEdt {
             setStartControlsEnabled(true)
             appendSystem(message)
-            if (succeededStart) resetCompletionControls()
+            if (succeededStart) {
+                resetCompletionControls()
+                resetContractRowControls()
+            }
         }
         refreshTaskRunsBlocking()
         refreshTaskTreeBlocking()
@@ -2381,6 +2498,30 @@ class FaktorChatPanel(
         criteriaField.text = criteria
     }
 
+    /** Fills the Acceptance & contract editors and expands the disclosure. */
+    internal fun setContractFieldsForTest(
+        constraints: String,
+        invariants: String,
+        risks: String,
+        obligations: String
+    ) {
+        constraintField.text = constraints
+        invariantField.text = invariants
+        riskField.text = risks
+        obligationField.text = obligations
+        runOptionsToggle.isSelected = true
+        runOptionsBody.isVisible = true
+        runOptionsToggle.text = "Run options ▴"
+    }
+
+    /** The four editor rows as the capture sees them (smoke assertions). */
+    internal fun contractEditorsForTest(): List<String> = listOf(
+        constraintField.text,
+        invariantField.text,
+        riskField.text,
+        obligationField.text
+    )
+
     internal fun attachmentsView(): AttachmentsPanel = attachments
 
     /** Selects one agent in the Agents combo (the dialog-path smoke hook). */
@@ -2648,7 +2789,9 @@ private data class TaskStartDraft(
     val mutationMode: String?,
     val files: List<String>,
     val binaries: List<PendingBinaryAttachment>,
-    val completionContract: NativeCompletionContract?
+    val completionContract: NativeCompletionContract?,
+    /** The bounded user-authored engineering-contract rows (null = none). */
+    val contractRows: NativeContractRows?
 ) {
     /** Exact-draft comparison of a retry against the retained submission. */
     fun sameDraftAs(other: TaskStartDraft): Boolean =
@@ -2657,6 +2800,7 @@ private data class TaskStartDraft(
             mutationMode == other.mutationMode &&
             files == other.files &&
             completionContract == other.completionContract &&
+            contractRows == other.contractRows &&
             binaries.size == other.binaries.size &&
             binaries.indices.all { index ->
                 val mine = binaries[index]

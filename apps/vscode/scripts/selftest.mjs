@@ -25,6 +25,7 @@ import * as ts from '../src/taskStart.ts';
 import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
+import * as contract from '../src/contract.ts';
 import * as cpa from '../src/controlPlaneAuth.ts';
 import * as mn from '../src/money.ts';
 import * as dt from '../src/displayText.ts';
@@ -6169,6 +6170,383 @@ async function cockpitTests() {
   });
 }
 
+// ------------------------------------------------- engineering contract
+
+/** The frozen `faktor_core::contract::EngineeringContract` wire shape. */
+const CONTRACT_WIRE = {
+  constraints: [
+    { id: 'c1', statement: 'existing sessions remain valid', origin: 'user' },
+  ],
+  invariants: [
+    {
+      id: 'i1',
+      statement: 'revoked sessions cannot authenticate',
+      origin: { external: { provider: 'example.graph' } },
+    },
+  ],
+  risks: [
+    { id: 'r1', description: 'race conditions', severity: 'high', origin: 'heuristic' },
+    { id: 'r2', description: 'migration corruption', severity: 'low', origin: 'native' },
+    { id: 'r3', description: 'legacy client incompatibility', severity: 'unknown', origin: 'policy' },
+  ],
+  proof_obligations: [
+    {
+      id: 'po1:a',
+      claim: 'concurrent refresh produces one valid result',
+      evidence: 'test_execution',
+      origin: 'user',
+      state: 'supported',
+      confidence_bps: 9100,
+      evidence_refs: [
+        { kind: 'test_execution', source: 'cargo test', detail: 'refresh suite' },
+      ],
+    },
+    {
+      id: 'po1:b',
+      claim: 'replayed refresh tokens fail',
+      evidence: 'contract_check',
+      origin: 'native',
+      state: 'inferred',
+      confidence_bps: 5000,
+      evidence_refs: [],
+    },
+  ],
+};
+
+/** One TaskSummary-shaped task carrying a contract (cockpit input). */
+function contractTask(contract, overrides = {}) {
+  return {
+    ...proofTask(),
+    contract,
+    contractMalformed: null,
+    contractDroppedRows: 0,
+    ...overrides,
+  };
+}
+
+async function contractTests() {
+  await test('native client decodes the additive contract and tolerates a legacy daemon', () => {
+    const served = nc.validateTaskViews([
+      { ...clone(taskViewJson), contract: clone(CONTRACT_WIRE) },
+    ])[0];
+    assert(served.contract !== null, 'a served contract must decode');
+    assertEqual(served.contract.constraints[0].statement, 'existing sessions remain valid');
+    assertEqual(served.contract.constraints[0].origin.kind, 'user');
+    assertEqual(served.contract.invariants[0].origin.kind, 'external');
+    assertEqual(served.contract.invariants[0].origin.provider, 'example.graph');
+    assertEqual(served.contract.risks[0].severity, 'high');
+    assertEqual(served.contract.proofObligations[0].state, 'supported');
+    assertEqual(served.contract.proofObligations[0].confidenceBps, 9100);
+    assertEqual(served.contract.proofObligations[0].evidenceRefs[0].source, 'cargo test');
+    assertEqual(served.contractMalformed, null);
+    assertEqual(served.contractDroppedRows, 0);
+    // A legacy daemon serves no contract member at all: an honest null, never
+    // a fabricated empty contract.
+    const legacy = nc.validateTaskViews([clone(taskViewJson)])[0];
+    assertEqual(legacy.contract, null);
+    assertEqual(legacy.contractMalformed, null);
+    assertEqual(legacy.contractDroppedRows, 0);
+  });
+
+  await test('contract decode is per-entry: malformed rows are disclosed, never rendered as claims', () => {
+    const read = contract.readEngineeringContract({
+      constraints: [
+        { id: 'c1', statement: 'valid', origin: 'user' },
+        { id: 'c2', statement: '', origin: 'user' },
+        { id: 'c3', statement: 'bad origin', origin: 'somewhere' },
+        'not an object',
+      ],
+      risks: [
+        { id: 'r1', description: 'race', severity: 'catastrophic', origin: 'heuristic' },
+      ],
+      proof_obligations: [
+        {
+          id: 'o1',
+          claim: 'ok',
+          evidence: 'not_a_kind',
+          origin: 'native',
+          state: 'maybe',
+          confidence_bps: 12000,
+        },
+      ],
+    });
+    assertEqual(read.contract.constraints.length, 1);
+    assertEqual(read.contract.constraints[0].statement, 'valid');
+    assertEqual(read.droppedRows, 3);
+    // A malformed severity/state falls back to the WEAKEST state so a corrupt
+    // payload can only make the UI disclose more, never claim more.
+    assertEqual(read.contract.risks[0].severity, 'unknown');
+    assertEqual(read.contract.proofObligations[0].state, 'unknown');
+    assertEqual(read.contract.proofObligations[0].evidence, null);
+    assertEqual(read.contract.proofObligations[0].evidenceLabel, 'not_a_kind');
+    assertEqual(read.contract.proofObligations[0].confidenceBps, null);
+    // A present non-object member is an explicit malformed read; absence is
+    // the legacy read (no section at all).
+    const malformed = contract.readEngineeringContract('nope');
+    assertEqual(malformed.contract, null);
+    assert(malformed.malformed !== null, 'a present non-object contract must be malformed');
+    assertEqual(contract.readEngineeringContract(undefined).absent, true);
+    assertEqual(contract.readEngineeringContract(null).contract, null);
+  });
+
+  await test('needs-disclosure follows the core rule: high/unknown risks and unsatisfied claims', () => {
+    const view = contract.readEngineeringContract(clone(CONTRACT_WIRE)).contract;
+    assert(contract.contractNeedsDisclosure(view), 'a high risk and an inferred obligation must disclose');
+    const lines = contract.contractDisclosureLines(view);
+    assertDeepEqual(
+      lines.map((line) => line.state),
+      ['risk:high', 'risk:unknown', 'inferred'],
+    );
+    assertEqual(lines[0].summary, 'race conditions');
+    assertEqual(contract.obligationStateText(view.proofObligations[0]), 'supported · 91%');
+    assertEqual(contract.obligationStateText(view.proofObligations[1]), 'inferred · 50%');
+    const quiet = contract.readEngineeringContract({
+      risks: [{ id: 'r', description: 'minor', severity: 'low', origin: 'native' }],
+      proof_obligations: [
+        {
+          id: 'o',
+          claim: 'compiles',
+          evidence: 'compile',
+          origin: 'policy',
+          state: 'known_true',
+          confidence_bps: 10000,
+        },
+      ],
+    }).contract;
+    assert(!contract.contractNeedsDisclosure(quiet), 'satisfied claims and low risks owe no disclosure');
+  });
+
+  await test('the cockpit renders the Contract section and leads with Needs disclosure', () => {
+    const view = cp.buildCockpit({
+      task: contractTask(contract.readEngineeringContract(clone(CONTRACT_WIRE)).contract),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const sections = cp.cockpitSections(view);
+    assertDeepEqual(
+      sections.slice(0, 3).map((section) => section.key),
+      ['disclosure', 'acceptance', 'contract'],
+    );
+    const disclosure = sections[0];
+    assertEqual(disclosure.title, 'Needs disclosure');
+    assert(
+      disclosure.lines.some((line) => line.includes('risk:high') && line.includes('race conditions')),
+      JSON.stringify(disclosure.lines),
+    );
+    assert(disclosure.lines.some((line) => line.includes('inferred')));
+    const section = sections[2];
+    assertEqual(section.title, 'Contract');
+    assert(section.contract, 'the contract section must carry structured rows');
+    assertEqual(section.contract.constraints[0].origin, 'user');
+    assertEqual(section.contract.invariants[0].origin, 'example.graph');
+    assertEqual(section.contract.risks[0].disclosure, 'risk:high');
+    assertEqual(section.contract.risks[1].disclosure, null);
+    assertEqual(section.contract.obligations[0].stateText, 'supported · 91%');
+    assertEqual(section.contract.obligations[1].state, 'inferred');
+    // A satisfied-only contract renders the section with NO disclosure block.
+    const quiet = cp.buildCockpit({
+      task: contractTask({
+        constraints: [{ id: 'c', statement: 'hold the line', origin: { kind: 'user', provider: null } }],
+        invariants: [],
+        risks: [
+          {
+            id: 'r',
+            description: 'minor',
+            severity: 'low',
+            origin: { kind: 'native', provider: null },
+          },
+        ],
+        proofObligations: [
+          {
+            id: 'o',
+            claim: 'compiles',
+            evidence: 'compile',
+            evidenceLabel: 'compile',
+            origin: { kind: 'policy', provider: null },
+            state: 'supported',
+            confidenceBps: 8000,
+            evidenceRefs: [],
+          },
+        ],
+      }),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const quietSections = cp.cockpitSections(quiet);
+    assert(!quietSections.some((section) => section.key === 'disclosure'), 'no disclosure when nothing is owed');
+    // An empty served contract is an explicit "none recorded" note.
+    const empty = cp.buildCockpit({
+      task: contractTask({ constraints: [], invariants: [], risks: [], proofObligations: [] }),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const emptyContract = cp
+      .cockpitSections(empty)
+      .find((section) => section.key === 'contract');
+    assert(
+      emptyContract && emptyContract.lines[0].includes('no contract entries'),
+      JSON.stringify(emptyContract && emptyContract.lines),
+    );
+    // A present-but-unreadable member is disclosed, never silently skipped.
+    const malformed = cp.buildCockpit({
+      task: contractTask(null, { contractMalformed: 'the contract member is not an object' }),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const malformedSections = cp.cockpitSections(malformed);
+    assertEqual(malformedSections[0].key, 'disclosure');
+    assert(malformedSections[0].lines[0].includes('unreadable'));
+    // A legacy daemon: neither section exists.
+    const legacy = cp.buildCockpit({
+      task: proofTask(),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    assert(
+      !cp
+        .cockpitSections(legacy)
+        .some((section) => section.key === 'contract' || section.key === 'disclosure'),
+      'no contract surface without a served contract',
+    );
+  });
+
+  await test('composer contract rows are strict, bounded and ride the task-start request', () => {
+    assertDeepEqual(ts.parseContractRows(undefined), { rows: null });
+    assertDeepEqual(ts.parseContractRows(null), { rows: null });
+    const valid = ts.parseContractRows({
+      constraints: [' keep sessions valid ', 'never break clients'],
+      invariants: [],
+      risks: [],
+      proofObligations: ['replayed refresh tokens fail'],
+    });
+    assert(!('reason' in valid), 'a valid envelope must parse');
+    assertDeepEqual(valid.rows, {
+      constraints: ['keep sessions valid', 'never break clients'],
+      invariants: [],
+      risks: [],
+      proofObligations: ['replayed refresh tokens fail'],
+    });
+    // Empty textareas produce an all-empty object => the default path.
+    assertDeepEqual(
+      ts.parseContractRows({ constraints: [], invariants: [], risks: [], proofObligations: [] }),
+      { rows: null },
+    );
+    // Bounds and hostile envelopes are typed refusals (never silent drops).
+    assert('reason' in ts.parseContractRows({ nope: [] }));
+    assert('reason' in ts.parseContractRows({ constraints: 'not-an-array' }));
+    assert('reason' in ts.parseContractRows({ risks: [7] }));
+    assert('reason' in ts.parseContractRows({ risks: [''] }));
+    assert('reason' in ts.parseContractRows({ risks: ['x'.repeat(513)] }));
+    assert('reason' in ts.parseContractRows({ invariants: ['é'.repeat(300)] }), '512 UTF-8 bytes is the bound');
+    assert(
+      'reason' in ts.parseContractRows({
+        constraints: Array.from({ length: 65 }, (_, index) => `row ${index}`),
+      }),
+      'more than 64 rows must be refused',
+    );
+    // The request builder sends exactly the non-empty categories.
+    const request = ts.startTaskRequest('goal', {
+      mutationMode: '',
+      maxTokens: 0,
+      maxCostMicro: 0n,
+      contractRows: valid.rows,
+    });
+    assertDeepEqual(request.constraints, ['keep sessions valid', 'never break clients']);
+    assertDeepEqual(request.proof_obligations, ['replayed refresh tokens fail']);
+    assert(!('invariants' in request) && !('risks' in request), 'empty categories are omitted');
+    const bare = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0n });
+    assert(
+      !('constraints' in bare) &&
+        !('invariants' in bare) &&
+        !('risks' in bare) &&
+        !('proof_obligations' in bare),
+      'the default path carries no contract-row fields',
+    );
+    // Body identity is order-sensitive for the retry gate.
+    const a = { constraints: ['x'], invariants: [], risks: [], proofObligations: [] };
+    const b = { constraints: ['y'], invariants: [], risks: [], proofObligations: [] };
+    assert(ts.sameContractRows(a, { ...a }));
+    assert(!ts.sameContractRows(a, b));
+    assert(ts.sameContractRows(null, null));
+  });
+
+  await test('webview: contract rows render with state/confidence/provenance and the disclosure block leads', () => {
+    const view = cp.buildCockpit({
+      task: contractTask(contract.readEngineeringContract(clone(CONTRACT_WIRE)).contract),
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const snapshot = webviewSnapshot([]);
+    snapshot.cockpit = view;
+    snapshot.cockpitSections = cp.cockpitSections(view);
+    const { posted, dom, deliver } = runChatWebview(snapshot);
+    const cockpit = dom.document.getElementById('cockpit');
+    const warning = findFake(cockpit, (node) => String(node.className).includes('cockpit-disclosure'));
+    assert(warning, 'the Needs disclosure block must lead the run details');
+    assert(fakeText(warning).includes('risk:high'), fakeText(warning));
+    assert(fakeText(warning).includes('inferred'));
+    const contractSection = findFake(
+      cockpit,
+      (node) => node.tagName === 'section' && fakeText(node).includes('Contract'),
+    );
+    assert(contractSection, 'the Contract section must render');
+    const chips = [];
+    walkFake(contractSection, (node) => {
+      if (String(node.className).includes('chip-state')) {
+        chips.push(node.textContent);
+      }
+    });
+    assert(chips.includes('supported · 91%'), JSON.stringify(chips));
+    const text = fakeText(contractSection);
+    assert(text.includes('example.graph'), 'external provenance names the provider');
+    assert(text.includes('test execution'), 'the evidence kind is a label, not a token');
+    assert(text.includes('disclosure: risk:high'), 'high risks carry explicit disclosure text');
+    // Composer: non-blank lines become the bounded rows message.
+    const goal = dom.document.getElementById('goal');
+    goal.value = 'contracted composer goal';
+    dom.document.getElementById('contract-constraints').value = ' keep sessions valid \n\n never break clients ';
+    dom.document.getElementById('contract-risks').value = 'race conditions';
+    dom.document.getElementById('contract-obligations').value = '';
+    dom.document.getElementById('contract-invariants').value = '\n  \n';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'sendGoal',
+      goal: 'contracted composer goal',
+      contractRows: {
+        constraints: ['keep sessions valid', 'never break clients'],
+        invariants: [],
+        risks: ['race conditions'],
+        proofObligations: [],
+      },
+    });
+    // A successful acks clears the rows; a failure keeps them for the retry.
+    dom.document.getElementById('goal').value = 'second goal';
+    deliver({ type: 'startResult', goal: 'contracted composer goal', ok: true });
+    assertEqual(dom.document.getElementById('contract-constraints').value, '');
+    dom.document.getElementById('contract-constraints').value = 'retry row';
+    dom.document.getElementById('goal').value = 'third goal';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    deliver({ type: 'startResult', goal: 'third goal', ok: false });
+    assertEqual(
+      dom.document.getElementById('contract-constraints').value,
+      'retry row',
+      'a failed start keeps the authored rows for the retry',
+    );
+  });
+}
+
 // ------------------------------------------- acceptance-criterion proof
 
 function proofDigest(seed) {
@@ -10901,6 +11279,7 @@ async function main() {
   await childInspectionTests();
   await pixelAgentTests();
   await cockpitTests();
+  await contractTests();
   await acceptanceProofTests();
   await proofSummaryTests();
   await usagePanelTests();

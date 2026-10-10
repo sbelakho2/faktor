@@ -278,6 +278,7 @@ fn seed_contract_task(
             plan: vec![],
             attachments: Vec::new(),
             budget: TaskBudget::default(),
+            contract: faktor_core::contract::EngineeringContract::default(),
             state: TaskState::Pending,
             created_ms: now,
             updated_ms: now,

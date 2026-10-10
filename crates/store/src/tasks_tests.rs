@@ -237,6 +237,7 @@ mod typed_ledger_tests {
             acceptance_criteria: criteria,
             plan: vec![],
             attachments: vec![],
+            contract: Default::default(),
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,
@@ -862,6 +863,117 @@ mod typed_ledger_tests {
             store.list_tasks(s.id).unwrap()[0].spent_turns,
             u32::MAX,
             "list_tasks shares the checked mapping"
+        );
+    }
+
+    /// The v31 engineering-contract column round-trips the frozen model
+    /// (every origin/severity/evidence kind plus a supported obligation with
+    /// evidence refs), a legacy/default value decodes to an EMPTY contract,
+    /// a corrupt value is a typed `Corrupt` refusal — never a silently
+    /// defaulted contract — and a valid contract survives a store reopen.
+    #[test]
+    fn contract_round_trips_legacy_defaults_and_corrupt_refuses() {
+        use faktor_core::contract::{
+            ClaimState, Constraint, ContractOrigin, EngineeringContract, EvidenceRef, Invariant,
+            ProofEvidenceKind, RiskHypothesis, RiskSeverity,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let s_id;
+        let mut obligation = EngineeringContract::obligation(
+            "replayed refresh tokens fail",
+            ProofEvidenceKind::TestExecution,
+            ContractOrigin::User,
+        );
+        obligation.state = ClaimState::Supported;
+        obligation.confidence_bps = Some(9_000);
+        obligation.evidence_refs.push(EvidenceRef {
+            kind: ProofEvidenceKind::TestExecution,
+            source: "cargo test -p faktor-store".into(),
+            detail: "contract round trip".into(),
+        });
+        let contract = EngineeringContract {
+            constraints: vec![Constraint {
+                id: "c1:0000000000000000".into(),
+                statement: "existing sessions remain valid".into(),
+                origin: ContractOrigin::Policy,
+            }],
+            invariants: vec![Invariant {
+                id: "i1:0000000000000000".into(),
+                statement: "revoked sessions cannot authenticate".into(),
+                origin: ContractOrigin::External {
+                    provider: "example.graph".into(),
+                },
+            }],
+            risks: vec![RiskHypothesis {
+                id: "r1:0000000000000000".into(),
+                description: "migration corruption".into(),
+                severity: RiskSeverity::High,
+                origin: ContractOrigin::Heuristic,
+            }],
+            proof_obligations: vec![obligation],
+        };
+        {
+            let store = Store::open(dir.path(), true).unwrap();
+            let ws = store.create_workspace("/w").unwrap();
+            let s = store.create_session(ws, "t", "p", "m").unwrap();
+            s_id = s.id;
+            let mut row = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
+            row.contract = contract.clone();
+            store.upsert_task(&row).unwrap();
+            assert_eq!(
+                store.get_task(s.id, TaskId::new(1)).unwrap().unwrap(),
+                row,
+                "every contract member survives the JSON column"
+            );
+            assert_eq!(store.list_tasks(s.id).unwrap()[0].contract, contract);
+            // A legacy row (the pre-v31 column default) decodes EMPTY.
+            store
+                .raw_conn()
+                .execute(
+                    "UPDATE task SET contract = '{}' WHERE session_id = ?1 AND task_id = ?2",
+                    params![s.id.raw() as i64, 1i64],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .get_task(s.id, TaskId::new(1))
+                    .unwrap()
+                    .unwrap()
+                    .contract
+                    .is_empty(),
+                "a legacy/default contract column reads as the empty contract"
+            );
+            // Corrupt JSON is a typed refusal, never a default.
+            store
+                .raw_conn()
+                .execute(
+                    "UPDATE task SET contract = 'not-json{' WHERE session_id = ?1 AND task_id = ?2",
+                    params![s.id.raw() as i64, 1i64],
+                )
+                .unwrap();
+            match store.get_task(s.id, TaskId::new(1)) {
+                Err(StoreError::Corrupt(msgs)) => {
+                    assert!(
+                        msgs.iter().any(|m| m.contains("contract")),
+                        "the refusal must name the contract column: {msgs:?}"
+                    );
+                }
+                other => panic!("corrupt contract must be a typed refusal: {other:?}"),
+            }
+            // Restore a valid contract before the reopen.
+            let mut row = seed_task(&store, s.id, TaskId::new(1), vec![], TaskState::Pending);
+            row.contract = contract.clone();
+            store.upsert_task(&row).unwrap();
+        }
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(
+            store
+                .get_task(s_id, TaskId::new(1))
+                .unwrap()
+                .unwrap()
+                .contract,
+            contract,
+            "the contract survives a store reopen"
         );
     }
 

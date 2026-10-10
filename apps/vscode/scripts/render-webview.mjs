@@ -222,6 +222,88 @@ function harnessSnapshot(empty = false, permissions = false) {
     usage: null,
     cockpit: { state: 'ok' },
     cockpitSections: [
+      // The canned engineering contract + uncertainty state: a high risk, an
+      // unknown risk and an unsatisfied obligation force the "Needs
+      // disclosure" block to lead the run details, and every contract row
+      // exercises the provenance/severity/state/confidence chips.
+      {
+        key: 'disclosure',
+        title: 'Needs disclosure',
+        present: true,
+        lines: [
+          'risk:high · race conditions',
+          'risk:unknown · legacy client incompatibility',
+          'inferred · replayed refresh tokens fail',
+        ],
+        evidence: [],
+        actions: [],
+      },
+      {
+        key: 'contract',
+        title: 'Contract',
+        present: true,
+        lines: [],
+        evidence: [],
+        actions: [],
+        contract: {
+          constraints: [
+            { statement: 'existing sessions remain valid', origin: 'user' },
+            { statement: 'existing API clients cannot break', origin: 'native' },
+          ],
+          invariants: [
+            { statement: 'revoked sessions cannot authenticate', origin: 'example.graph' },
+            { statement: 'refresh tokens cannot be replayed', origin: 'policy' },
+          ],
+          risks: [
+            {
+              description: 'race conditions',
+              severity: 'high',
+              origin: 'heuristic',
+              disclosure: 'risk:high',
+            },
+            {
+              description: 'migration corruption',
+              severity: 'medium',
+              origin: 'native',
+              disclosure: null,
+            },
+            {
+              description: 'legacy client incompatibility',
+              severity: 'unknown',
+              origin: 'policy',
+              disclosure: 'risk:unknown',
+            },
+          ],
+          obligations: [
+            {
+              claim: 'concurrent refresh produces one valid result',
+              evidence: 'test execution',
+              state: 'supported',
+              stateText: 'supported · 91%',
+              origin: 'user',
+              evidenceRefs: ['test execution · cargo test · refresh suite'],
+            },
+            {
+              claim: 'replayed refresh tokens fail',
+              evidence: 'contract check',
+              state: 'inferred',
+              stateText: 'inferred · 50%',
+              origin: 'native',
+              evidenceRefs: [],
+            },
+            {
+              claim: 'legacy sessions survive the migration',
+              evidence: 'review',
+              state: 'uncertain',
+              stateText: 'uncertain',
+              origin: 'example.graph',
+              evidenceRefs: [],
+            },
+          ],
+          droppedRows: 0,
+          malformed: null,
+        },
+      },
       {
         key: 'acceptance',
         title: 'Acceptance criteria',
@@ -627,6 +709,25 @@ async function capture(cdp, file, width) {
 const MAIN_MIN = 28;
 const OTHER_MIN = 24;
 
+/** Open (and optionally fill) the composer's Acceptance & contract rows. */
+async function openContractComposer(cdp, fill) {
+  await cdp.evaluate(`(() => {
+    var details = document.getElementById('contract-options');
+    if (details) { details.open = true; }
+    ${
+      fill
+        ? `var inspect = document.getElementById('btn-inspect');
+    if (inspect && inspect.getAttribute('aria-expanded') !== 'true') { inspect.click(); }
+    document.getElementById('contract-constraints').value = 'existing sessions remain valid\\nexisting API clients cannot break';
+    document.getElementById('contract-invariants').value = 'revoked sessions cannot authenticate';
+    document.getElementById('contract-risks').value = 'race conditions';
+    document.getElementById('contract-obligations').value = 'replayed refresh tokens fail\\nlegacy sessions survive the migration';`
+        : ''
+    }
+    return true;
+  })()`);
+}
+
 function parseArgs(argv) {
   const args = {
     check: false,
@@ -636,6 +737,7 @@ function parseArgs(argv) {
     permissions: false,
     diagnostics: false,
     finish: false,
+    contract: false,
     error: false,
     prefix: 'shot',
     out: SHOT_DIR,
@@ -648,6 +750,7 @@ function parseArgs(argv) {
     else if (argv[i] === '--permissions') args.permissions = true;
     else if (argv[i] === '--diagnostics') args.diagnostics = true;
     else if (argv[i] === '--finish') args.finish = true;
+    else if (argv[i] === '--contract') args.contract = true;
     else if (argv[i] === '--error') args.error = true;
     else if (argv[i] === '--prefix') args.prefix = argv[++i];
     else if (argv[i] === '--out') args.out = argv[++i];
@@ -678,6 +781,9 @@ export async function runHarness(args) {
     if (args.check) {
       for (const width of WIDTHS) {
         await loadPage(cdp, pageUrl, width);
+        if (args.contract === true) {
+          await openContractComposer(cdp, false);
+        }
         const result = await cdp.evaluate(MEASURE_SCRIPT);
         const overflows = result.scrollWidth > result.innerWidth + 1;
         if (overflows) {
@@ -759,6 +865,9 @@ export async function runHarness(args) {
         }
         if (args.finish === true) {
           await cdp.evaluate(`document.getElementById('finish-options').open = true`);
+        }
+        if (args.contract === true) {
+          await openContractComposer(cdp, true);
         }
         if (args.error === true) {
           await cdp.evaluate(`(() => {

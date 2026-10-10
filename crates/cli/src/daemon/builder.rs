@@ -728,6 +728,72 @@ pub(crate) fn daemon_verification(
     }
 }
 
+/// The workspace-root authority of the native verification provider: the
+/// SAME [`SessionManager::resolve_workspace_root`] every session-scoped
+/// filesystem consumer uses (live shadow root while one is active, else the
+/// durable workspace row). A session without a resolvable root is a typed
+/// `Unavailable`, never a guessed path and never the daemon CWD.
+pub(crate) fn daemon_verification_roots(
+    session: &Arc<SessionManager>,
+) -> Arc<dyn faktor_verify::VerificationRootResolver> {
+    let session = session.clone();
+    Arc::new(
+        move |session_id: SessionId, workspace_id: faktor_core::id::WorkspaceId| match session
+            .resolve_workspace_root(session_id)
+        {
+            Ok(Some(root)) => Ok(root),
+            Ok(None) => Err(faktor_verify::VerificationError::Unavailable(format!(
+                "no durable workspace root for session {session_id} (workspace {workspace_id})"
+            ))),
+            Err(error) => Err(faktor_verify::VerificationError::Unavailable(format!(
+                "workspace root read for session {session_id} failed: {error}"
+            ))),
+        },
+    )
+}
+
+/// The daemon's verification provider wiring: the ordered registry the
+/// runtime dispatches through, plus the OPTIONAL concrete Kiwi provider for
+/// provider-specific contract-ful submissions (`KiwiVerificationProvider::submit`).
+pub(crate) struct DaemonVerificationWiring {
+    pub(crate) registry: Arc<faktor_verify::VerificationRegistry>,
+    pub(crate) kiwi: Option<Arc<faktor_kiwi::KiwiVerificationProvider>>,
+}
+
+/// The daemon's verification PROVIDER registry (the generic verification
+/// interface): the native baseline is ALWAYS constructed over the daemon's
+/// ONE supervisor; the OPTIONAL external (Kiwi-shaped) provider is
+/// constructed only when `[verification.kiwi]` is enabled and valid. This is
+/// the seam a later runtime wave consumes (`DaemonGraph::verification_providers`)
+/// while completion behavior stays with the existing VerificationService.
+pub(crate) fn daemon_verification_providers(
+    section: &config::VerificationCfg,
+    roots: Arc<dyn faktor_verify::VerificationRootResolver>,
+    supervisor: &Arc<ProcessSupervisor>,
+    transport: &Arc<dyn HttpTransport>,
+) -> Result<DaemonVerificationWiring, String> {
+    let executor = Arc::new(faktor_verify::exec::AsyncCheckExecutor::from_supervisor(
+        supervisor.clone(),
+    ));
+    let native = Arc::new(faktor_verify::NativeVerificationProvider::new(
+        executor, roots,
+    ));
+    let mut registry = faktor_verify::VerificationRegistry::new();
+    registry.register(native);
+    let mut kiwi = None;
+    if let Some(kiwi_config) = section.kiwi.provider_config()? {
+        let provider = kiwi_config
+            .build(transport.clone())
+            .map_err(|error| format!("verification.kiwi: {error}"))?;
+        registry.register(provider.clone());
+        kiwi = Some(provider);
+    }
+    Ok(DaemonVerificationWiring {
+        registry: Arc::new(registry),
+        kiwi,
+    })
+}
+
 /// Map the parsed `[efficiency]` section onto the agent's flag type
 /// (additive; every flag defaults `false`). The runtime applies
 /// `failure_learning` to the context prior; the remaining flags are carried
@@ -1066,14 +1132,24 @@ pub(crate) fn build_daemon_core(
     // (defaults: quick <= 60 s, unit <= 600 s inline, full = durable
     // background verification jobs; quick_max_s 0 = disabled + fail closed).
     let verification = daemon_verification(&config.verification, &supervisor);
-    // Steps 13-16 — semantic + learning + memory + tokenizers: the ONE
-    // semantic-provider registry built from the strict `[semantic]` section
-    // over THIS daemon's supervisor + checked transport (the SAME Arc flows
-    // to the agent and the server introspection surface); the durable
-    // failure-learning prior handle built once over this daemon's session
-    // store; the project-memory authority over the SAME store; and the
-    // tokenizer registry with the real local backends (unregistered
-    // identities keep their conservative UpperBound label).
+    // The generic verification PROVIDER registry (native baseline always;
+    // the optional external Kiwi provider only when configured) rides the
+    // SAME supervisor and the daemon's checked egress transport. Completion
+    // behavior is unchanged in this wave: the registry is exposed on the
+    // graph for the runtime wave that consumes it.
+    let verification_providers = daemon_verification_providers(
+        &config.verification,
+        daemon_verification_roots(&session),
+        &supervisor,
+        &transport,
+    )?; // Steps 13-16 — semantic + learning + memory + tokenizers: the ONE
+        // semantic-provider registry built from the strict `[semantic]` section
+        // over THIS daemon's supervisor + checked transport (the SAME Arc flows
+        // to the agent and the server introspection surface); the durable
+        // failure-learning prior handle built once over this daemon's session
+        // store; the project-memory authority over the SAME store; and the
+        // tokenizer registry with the real local backends (unregistered
+        // identities keep their conservative UpperBound label).
     let semantic = graph::semantic_registry(&semantic, &supervisor, &transport)?;
     let learning = daemon_context_prior(config.efficiency.failure_learning, &session);
     let memory = graph::DaemonMemory::new(store.clone());
@@ -1328,6 +1404,8 @@ pub(crate) fn build_daemon_core(
         repo_evidence,
         instructions: instructions_resolver,
         verification,
+        verification_providers: verification_providers.registry,
+        kiwi_verification: verification_providers.kiwi,
         semantic,
         learning,
         memory,

@@ -114,6 +114,11 @@ pub enum SemanticError {
     /// this is a recoverable provider fault, so dispatch fails over to the
     /// next compatible provider and the provider enters health cooldown.
     ProviderTimeout { provider: String },
+    /// A provider descriptor declared an intelligence tier outside the
+    /// documented `0..=5` range (`docs/specs/autonomous-engineering.md`,
+    /// [`crate::intelligence::IntelligenceTier`]). Refused at handshake, so
+    /// an out-of-range claim can never drive the status surface.
+    InvalidIntelligenceTier { tier: u8 },
 }
 
 impl SemanticError {
@@ -191,6 +196,10 @@ impl fmt::Display for SemanticError {
                     "semantic provider {provider} internal watchdog timed out"
                 )
             }
+            Self::InvalidIntelligenceTier { tier } => write!(
+                f,
+                "semantic provider descriptor intelligence tier {tier} is outside 0..=5"
+            ),
         }
     }
 }
@@ -744,6 +753,15 @@ pub struct SemanticProviderDescriptor {
     /// complete by default).
     #[serde(default)]
     pub completeness: Option<SemanticCompleteness>,
+    /// Declared intelligence tier (`0..=5`,
+    /// [`crate::intelligence::IntelligenceTier`]). Additive and optional:
+    /// absent = UNKNOWN, never assumed high — confidence is then computed
+    /// without any tier bonus. Validated by
+    /// [`SemanticProviderDescriptor::validate`] at handshake, so an
+    /// out-of-range claim is refused before it can drive selection or
+    /// status.
+    #[serde(default)]
+    pub tier: Option<u8>,
 }
 
 impl SemanticProviderDescriptor {
@@ -760,6 +778,7 @@ impl SemanticProviderDescriptor {
             capabilities,
             fidelity: None,
             completeness: None,
+            tier: None,
         }
     }
 
@@ -774,12 +793,14 @@ impl SemanticProviderDescriptor {
             capabilities: SemanticCapabilities::NONE,
             fidelity: None,
             completeness: None,
+            tier: None,
         }
     }
 
     /// Validate the descriptor before it can drive selection: a version 0
-    /// provider is rejected, and a schema version this build does not speak
-    /// is a typed refusal instead of a guess.
+    /// provider is rejected, a schema version this build does not speak is a
+    /// typed refusal instead of a guess, and a declared intelligence tier
+    /// must lie inside `0..=5`.
     pub fn validate(&self) -> Result<(), SemanticError> {
         if self.version == 0 {
             return Err(SemanticError::Malformed(
@@ -792,7 +813,20 @@ impl SemanticProviderDescriptor {
                 got: self.schema_version,
             });
         }
+        if let Some(tier) = self.tier {
+            crate::intelligence::IntelligenceTier::parse(tier)?;
+        }
         Ok(())
+    }
+
+    /// The declared tier mapped to the validated
+    /// [`crate::intelligence::IntelligenceTier`] newtype. `None` = the
+    /// provider declared NO tier (unknown, never assumed high); an
+    /// out-of-range declaration maps to `None` here and is refused by
+    /// [`SemanticProviderDescriptor::validate`] at handshake.
+    pub fn intelligence_tier(&self) -> Option<crate::intelligence::IntelligenceTier> {
+        self.tier
+            .and_then(|raw| crate::intelligence::IntelligenceTier::parse(raw).ok())
     }
 
     /// True when this descriptor covers a requirement, re-validating first

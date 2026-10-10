@@ -18,6 +18,17 @@
 //! root-aware derivation for the C/C++ builder families (CMake/Make/
 //! Meson/Ninja/Bazel/MSBuild/.csproj/Gradle).
 //!
+//! [`provider`] is the generic VERIFICATION INTERFACE: one provider contract
+//! ([`provider::VerificationProvider`]) returning boxed futures, a native
+//! baseline ([`native::NativeVerificationProvider`]) that maps build/lint/
+//! typecheck/tests onto the derived checks above through the workspace's
+//! process supervisor, and OPTIONAL external providers (the `faktor-kiwi`
+//! crate) dispatched by [`provider::VerificationRegistry`] under the request
+//! deadline, cancellation token and explicit output bounds. Operations the
+//! native baseline cannot honestly serve answer `Unavailable`; a call that
+//! demands independent verification (`require_provider`) is refused typed
+//! when no external provider is configured — never a silent substitution.
+//!
 //! ## Legacy vs typed execution (P0-9/P0-10 migration)
 //!
 //! The items below this header — [`RunFn`], [`Verifier`] and the
@@ -43,7 +54,22 @@ pub mod derive;
 pub mod exec;
 pub mod inventory;
 pub mod manifest;
+pub mod native;
+pub mod provider;
 pub mod review;
+
+pub use native::{
+    native_capabilities, FixedRootResolver, NativeVerificationProvider, VerificationRootResolver,
+    DEFAULT_NATIVE_CHECK_WALL, DEFAULT_NATIVE_INVENTORY_WALL,
+};
+pub use provider::{
+    now_epoch_ms, ArtifactRef, BoxFuture, VerificationCapabilities, VerificationError,
+    VerificationOp, VerificationOutcome, VerificationProvider, VerificationProviderId,
+    VerificationRegistry, VerificationRequest, VerificationResponse, VerificationTarget,
+    DEFAULT_MAX_OUTPUT_BYTES, MAX_ARTIFACT_DETAIL_BYTES, MAX_ARTIFACT_SOURCE_BYTES,
+    MAX_CLAIM_BYTES, MAX_EVIDENCE_REFS, MAX_OUTPUT_BYTES, MAX_PROVIDER_ID_BYTES, MAX_SUMMARY_BYTES,
+    MAX_TARGET_PATHS, MAX_TARGET_PATH_BYTES,
+};
 
 pub use inventory::{
     discover_repo_inventory, discover_repo_inventory_with_budget,

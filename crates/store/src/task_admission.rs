@@ -1377,8 +1377,8 @@ mod task_admission_tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 31,
-            "v30 (admission ownership) is the migration head"
+            version, 32,
+            "v31 (engineering contract) is the migration head"
         );
         // The CHECK vocabulary refuses an unknown state at the SQL level and
         // admits the typed conflict landing.

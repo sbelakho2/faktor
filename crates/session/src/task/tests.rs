@@ -1,6 +1,9 @@
 //! Task tests (mechanically split from `task`).
 
 use super::*;
+
+#[path = "contract_tests.rs"]
+mod contract_tests;
 use crate::budget::BudgetAuthority;
 use crate::handle::tests::{session, test_manager};
 use crate::SessionManager;
@@ -16,6 +19,7 @@ fn task(s: &SessionHandle) -> Task {
         acceptance_criteria: vec!["goal: implement durable tasks".into()],
         plan: vec!["schema".into(), "repo".into()],
         attachments: vec![],
+        contract: Default::default(),
         budget: TaskBudget {
             max_tokens: Some(100_000),
             max_turns: Some(10),
@@ -36,6 +40,7 @@ fn criteria_task(s: &SessionHandle, task_id: TaskId, criteria: Vec<String>) -> T
         acceptance_criteria: criteria,
         plan: vec![],
         attachments: vec![],
+        contract: Default::default(),
         budget: TaskBudget::default(),
         state: TaskState::Pending,
         created_ms: 1,

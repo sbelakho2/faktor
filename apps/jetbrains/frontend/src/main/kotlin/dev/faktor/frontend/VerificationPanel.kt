@@ -5,6 +5,12 @@
 // the shared listener. Exact proof state (verified snapshot, landed
 // snapshot, hashes) stays on the model and is surfaced by the Plan view
 // and Diagnostics rather than as headline copy here.
+//
+// The Contract card frames the criteria: the durable engineering contract
+// (constraints/invariants/risks/proof obligations) with provenance,
+// severity/state text and the "Needs disclosure" line whenever a
+// high/unknown risk or an unsatisfied obligation is owed. A legacy daemon
+// that serves no contract member reads as an explicit empty state.
 package dev.faktor.frontend
 
 import java.awt.BorderLayout
@@ -24,16 +30,23 @@ class VerificationPanel : JPanel(BorderLayout()) {
 
     private val criteriaColumn = ScrollableColumn()
 
+    private val contractColumn = ScrollableColumn()
+
     private var listener: Listener? = null
 
     private var criterionCount = 0
 
     init {
         criteriaColumn.layout = BoxLayout(criteriaColumn, BoxLayout.Y_AXIS)
+        contractColumn.layout = BoxLayout(contractColumn, BoxLayout.Y_AXIS)
         val summaryBody = pageColumn(gap = Spacing.XS, padding = 0)
         summaryBody.add(summary)
+        val contractBody = pageColumn(gap = Spacing.XS, padding = 0)
+        contractBody.add(contractColumn)
         val body = pageColumn()
         body.add(card("Verification summary", summaryBody))
+        body.add(vSpace(Spacing.M))
+        body.add(card("Contract", contractBody))
         body.add(vSpace(Spacing.M))
         body.add(card("Criteria and checks", criteriaColumn))
         add(panelHeader(header), BorderLayout.NORTH)
@@ -48,6 +61,8 @@ class VerificationPanel : JPanel(BorderLayout()) {
     /** Replaces the view with the served model; null is an honest empty state. */
     fun updateModel(model: TaskTreeModel?) {
         criteriaColumn.removeAll()
+        contractColumn.removeAll()
+        renderContract(model?.contract)
         if (model == null) {
             criterionCount = 0
             header.text = "verification: no run yet"
@@ -83,6 +98,102 @@ class VerificationPanel : JPanel(BorderLayout()) {
         criteriaColumn.revalidate()
         revalidate()
         repaint()
+    }
+
+    /**
+     * The Contract card rows. The "Needs disclosure" line is text-first (the
+     * core's own state tokens, e.g. `risk:high`); a malformed member and
+     * refused rows are disclosed too, and a served-but-empty contract stays
+     * an explicit empty state (never a fabricated claim).
+     */
+    private fun renderContract(contract: ContractView?) {
+        if (contract == null) {
+            contractColumn.add(mutedLabel("No contract is served for this run."))
+            contractColumn.revalidate()
+            return
+        }
+        val lines = contract.disclosureLines()
+        if (lines.isNotEmpty()) {
+            contractColumn.add(
+                labelWithTone("Needs disclosure", SemanticState.WARNING, title = true)
+            )
+            for (line in lines) {
+                contractColumn.add(
+                    wrappedLabelWithTone(line, SemanticState.WARNING)
+                )
+            }
+            contractColumn.add(vSpace(Spacing.S))
+        }
+        if (contract.isEmpty) {
+            contractColumn.add(
+                mutedLabel(
+                    if (contract.malformed == null) {
+                        "No contract entries are recorded for this run."
+                    } else {
+                        "No contract entries are rendered for this run."
+                    }
+                )
+            )
+            contractColumn.revalidate()
+            return
+        }
+        statementGroup("Constraints", contract.constraints)
+        statementGroup("Invariants", contract.invariants)
+        if (contract.risks.isNotEmpty()) {
+            contractColumn.add(sectionHeader("Risks", muted = true))
+            for (risk in contract.risks) {
+                contractColumn.add(
+                    wrappedMutedLabel(
+                        "• " + risk.description + " — " + risk.severity + " · " + risk.origin
+                    )
+                )
+                risk.disclosure?.let {
+                    contractColumn.add(
+                        wrappedLabelWithTone("disclosure: " + it, SemanticState.WARNING)
+                    )
+                }
+            }
+        }
+        if (contract.obligations.isNotEmpty()) {
+            contractColumn.add(sectionHeader("Proof obligations", muted = true))
+            for (row in contract.obligations) {
+                contractColumn.add(
+                    wrappedMutedLabel(
+                        "• " + row.claim + " — " + row.evidence + " · " + row.stateText +
+                            " · " + row.origin
+                    )
+                )
+                for (ref in row.evidenceRefs) {
+                    contractColumn.add(wrappedMutedLabel("evidence: " + ref))
+                }
+            }
+        }
+        contractColumn.revalidate()
+    }
+
+    private fun statementGroup(title: String, rows: List<ContractStatementRow>) {
+        if (rows.isEmpty()) return
+        contractColumn.add(sectionHeader(title, muted = true))
+        for (row in rows) {
+            contractColumn.add(wrappedMutedLabel("• " + row.statement + " — " + row.origin))
+        }
+    }
+
+    private fun labelWithTone(
+        text: String,
+        state: SemanticState,
+        title: Boolean = false
+    ): WrappedLabel {
+        val label = WrappedLabel(text)
+        label.foreground = semanticForeground(state)
+        if (title) label.font = sectionTitleFont()
+        return label
+    }
+
+    private fun wrappedLabelWithTone(text: String, state: SemanticState): WrappedLabel {
+        val label = WrappedLabel(text)
+        label.foreground = semanticForeground(state)
+        return label
     }
 
     private fun criterionCard(row: CriterionProofRow): JPanel {
@@ -124,6 +235,22 @@ class VerificationPanel : JPanel(BorderLayout()) {
     fun criterionCount(): Int = criterionCount
 
     fun summaryText(): String = summary.fullText
+
+    /** Every text line the Contract card rendered (smoke assertions). */
+    fun contractLabels(): List<String> {
+        val out = ArrayList<String>()
+        collectLabels(contractColumn, out)
+        return out
+    }
+
+    private fun collectLabels(component: Component, out: MutableList<String>) {
+        if (component is WrappedLabel && component.fullText.isNotEmpty()) {
+            out.add(component.fullText)
+        }
+        if (component is java.awt.Container) {
+            for (child in component.components) collectLabels(child, out)
+        }
+    }
 
     /** The rendered criterion verdict markers (state is never color-only). */
     fun criterionLabels(): List<String> {

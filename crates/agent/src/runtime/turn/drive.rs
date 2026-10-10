@@ -3582,7 +3582,7 @@ impl AgentRuntime {
         // admitted); the raw review value still gates through
         // `review_blocking_reasons` above.
         let review_evidence = admit_review_evidence(review.as_ref());
-        let (proof, completion) = if executed.is_empty() {
+        let (proof, mut completion) = if executed.is_empty() {
             (None, completion)
         } else {
             match verification_proof_from_attempt(
@@ -3614,6 +3614,20 @@ impl AgentRuntime {
                 }
             }
         };
+        // Engineering contract (autonomous-engineering spec): evaluate the
+        // attempt's native evidence against the durable proof obligations.
+        // A DISPROVEN obligation blocks a passing gate with its own reason
+        // code; unsatisfied-but-not-disproven states are persisted and
+        // disclosed, never silently passed. An unevaluable contract never
+        // lets a passing gate stand (authority law).
+        let contract_outcome = crate::runtime::contract_eval::evaluate_and_persist_contract(
+            handle,
+            &executed,
+            review.as_ref(),
+        )
+        .await;
+        completion =
+            crate::runtime::contract_eval::apply_contract_outcome(completion, contract_outcome);
         self.persist_gate_facts(
             handle,
             &completion,

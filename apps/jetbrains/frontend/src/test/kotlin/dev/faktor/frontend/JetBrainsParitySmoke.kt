@@ -830,6 +830,14 @@ object JetBrainsParitySmoke {
                 Files.write(source, "fn main() {}".toByteArray())
                 chat.attachmentsView().addFiles(listOf(source.toString()))
                 chat.setTaskFieldsForTest("parity goal", "criterion A, criterion B")
+                // The Acceptance & contract editors ride the SAME start as the
+                // bounded top-level string arrays; blank lines are dropped.
+                chat.setContractFieldsForTest(
+                    "existing sessions remain valid\nexisting API clients cannot break",
+                    "revoked sessions cannot authenticate",
+                    "race conditions",
+                    "replayed refresh tokens fail"
+                )
                 chat.submitTaskForTest()
                 await("task run routed") {
                     daemon.lastRequest("POST", "/native/session/7/task-runs") != null
@@ -841,6 +849,24 @@ object JetBrainsParitySmoke {
                 )
                 assertTrue(taskBody.contains("\"mutation_mode\":\"shadow\""), taskBody)
                 assertTrue(taskBody.contains("\"completion_contract\":{\"include_commit\":true"), taskBody)
+                assertTrue(
+                    taskBody.contains(
+                        "\"constraints\":[\"existing sessions remain valid\"," +
+                            "\"existing API clients cannot break\"]"
+                    ),
+                    "the authored constraints must ride the task start: $taskBody"
+                )
+                assertTrue(
+                    taskBody.contains(
+                        "\"invariants\":[\"revoked sessions cannot authenticate\"]"
+                    ),
+                    taskBody
+                )
+                assertTrue(taskBody.contains("\"risks\":[\"race conditions\"]"), taskBody)
+                assertTrue(
+                    taskBody.contains("\"proof_obligations\":[\"replayed refresh tokens fail\"]"),
+                    taskBody
+                )
                 assertTrue(
                     taskBody.contains(
                         "\"files\":[\"" + source.fileName.toString() + "\"]"
@@ -859,6 +885,9 @@ object JetBrainsParitySmoke {
                 chat.attachmentsView().clear()
                 await("task refresh after start") {
                     chat.taskTreeView().model()?.steps?.isNotEmpty() ?: false
+                }
+                await("contract rows reset after success") {
+                    chat.contractEditorsForTest().all { it.isEmpty() }
                 }
 
                 // Audit 13: the advertised document contract accepts
@@ -889,6 +918,11 @@ object JetBrainsParitySmoke {
                 assertEquals(
                     listOf("application/pdf", "text/plain"), documentMimes,
                     "the run carries the durable document ids in entry order: $documentRun"
+                )
+                assertTrue(
+                    !documentRun.contains("\"constraints\"") &&
+                        !documentRun.contains("\"proof_obligations\""),
+                    "a start without authored rows sends no contract fields: $documentRun"
                 )
                 assertTrue(
                     !documentRun.contains(pdf.toString()) && !documentRun.contains(txt.toString()),
@@ -954,6 +988,24 @@ object JetBrainsParitySmoke {
                     "a refused document never starts a run"
                 )
                 chat.attachmentsView().clear()
+
+                // An over-bound contract editor refuses the START loudly
+                // before any request (the daemon's own typed 400 mirrored at
+                // the boundary), never a silent drop of an authored row.
+                val overBound = (1..65).joinToString("\n") { "constraint $it" }
+                chat.setContractFieldsForTest(overBound, "", "", "")
+                val runsBeforeContractRefusal =
+                    daemon.requestCount("POST", "/native/session/7/task-runs")
+                chat.submitTaskForTest()
+                await("over-bound contract rows refuse the start") {
+                    chat.transcriptTextForTest().contains("task start refused: constraints")
+                }
+                assertEquals(
+                    runsBeforeContractRefusal,
+                    daemon.requestCount("POST", "/native/session/7/task-runs"),
+                    "a refused contract start sends no request"
+                )
+                chat.setContractFieldsForTest("", "", "", "")
             }
             registry.observables["criterion_proofs"] = {
                 // The verification route's records render every binding kind
@@ -970,6 +1022,43 @@ object JetBrainsParitySmoke {
                     assertEquals("daemon", row.bindingSource, criterion)
                     assertEquals(reference, row.bindingReference, criterion)
                 }
+            }
+            registry.observables["contract_surface"] = {
+                // The served task view's contract renders on the Verification
+                // card with provenance/state/confidence text and the
+                // "Needs disclosure" line (a high + an unknown risk and an
+                // inferred obligation all owe one).
+                val model = chat.taskTreeView().model() ?: fail("the tree must be populated")
+                val contract = model.contract ?: fail("the served contract must decode")
+                assertTrue(
+                    contract.needsDisclosure,
+                    "high/unknown risks and an inferred obligation owe disclosure"
+                )
+                val lines = contract.disclosureLines()
+                assertTrue(
+                    lines.any { it.startsWith("risk:high · race conditions") },
+                    lines.toString()
+                )
+                assertTrue(lines.any { it.startsWith("risk:unknown") }, lines.toString())
+                assertTrue(lines.any { it.startsWith("inferred") }, lines.toString())
+                // A FRESH panel renders the model (the shared panel updates on
+                // its own worker cadence, so the smoke must not race it).
+                val verification = VerificationPanel()
+                verification.updateModel(model)
+                val labels = verification.contractLabels()
+                assertTrue(labels.contains("Needs disclosure"), labels.toString())
+                assertTrue(
+                    labels.any { it.contains("supported · 91%") },
+                    "the obligation state must carry its confidence as text: $labels"
+                )
+                assertTrue(
+                    labels.any { it.contains("example.graph") },
+                    "external provenance must name its provider: $labels"
+                )
+                assertTrue(
+                    labels.any { it.contains("existing sessions remain valid") },
+                    labels.toString()
+                )
             }
             registry.observables["evidence"] = {
                 // Evidence refs from the served verification render on the
@@ -1767,6 +1856,27 @@ object JetBrainsParitySmoke {
         "\"decisions\":[],\"failures\":[],\"changedFiles\":[]," +
         "\"tests\":{\"run\":[],\"failed\":[]},\"preferences\":[],\"verification\":[]," +
         "\"progress\":null,\"budget\":null," +
+        "\"contract\":{" +
+        "\"constraints\":[{\"id\":\"c1\",\"statement\":\"existing sessions remain valid\"," +
+        "\"origin\":\"user\"}]," +
+        "\"invariants\":[{\"id\":\"i1\",\"statement\":\"revoked sessions cannot authenticate\"," +
+        "\"origin\":{\"external\":{\"provider\":\"example.graph\"}}}]," +
+        "\"risks\":[" +
+        "{\"id\":\"r1\",\"description\":\"race conditions\",\"severity\":\"high\"," +
+        "\"origin\":\"heuristic\"}," +
+        "{\"id\":\"r2\",\"description\":\"migration corruption\",\"severity\":\"medium\"," +
+        "\"origin\":\"native\"}," +
+        "{\"id\":\"r3\",\"description\":\"legacy client incompatibility\"," +
+        "\"severity\":\"unknown\",\"origin\":\"policy\"}]," +
+        "\"proof_obligations\":[" +
+        "{\"id\":\"o1\",\"claim\":\"concurrent refresh produces one valid result\"," +
+        "\"evidence\":\"test_execution\",\"origin\":\"user\",\"state\":\"supported\"," +
+        "\"confidence_bps\":9100," +
+        "\"evidence_refs\":[{\"kind\":\"test_execution\",\"source\":\"cargo test\"," +
+        "\"detail\":\"refresh suite\"}]}," +
+        "{\"id\":\"o2\",\"claim\":\"replayed refresh tokens fail\"," +
+        "\"evidence\":\"contract_check\",\"origin\":\"native\",\"state\":\"inferred\"," +
+        "\"confidence_bps\":5000,\"evidence_refs\":[]}]}," +
         "\"plan\":[" +
         "{\"id\":\"step-1\",\"summary\":\"first\",\"state\":\"done\",\"depends_on\":[]}," +
         "{\"id\":\"step-2\",\"summary\":\"second\",\"state\":\"running\"," +

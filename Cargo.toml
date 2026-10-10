@@ -44,6 +44,7 @@ members = [
     "crates/security",
     "crates/sandbox",
     "crates/verify",
+    "crates/kiwi",
     "crates/scm",
     "crates/cloud",
     "crates/worker",
@@ -110,6 +111,7 @@ faktor-git = { path = "crates/git" }
 faktor-router = { path = "crates/router" }
 faktor-acp = { path = "crates/acp" }
 faktor-verify = { path = "crates/verify" }
+faktor-kiwi = { path = "crates/kiwi" }
 faktor-instructions = { path = "crates/instructions" }
 faktor-hooks = { path = "crates/hooks" }
 faktor-pty = { path = "crates/pty" }
