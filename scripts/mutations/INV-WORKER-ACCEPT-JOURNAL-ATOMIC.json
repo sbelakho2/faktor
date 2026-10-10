@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-ACCEPT-JOURNAL-ATOMIC",
+  "file": "crates/worker/src/service.rs",
+  "find": "        if let Some(existing) = self.store.try_accept_lease(&lease, &entries)? {",
+  "replace": "        if let Some(existing) = self.store.try_accept_lease(&lease, &[])? {",
+  "gate": "cargo test -p faktor-worker --lib seeded_model_preserves_identity_and_journal_invariants_memory",
+  "expect": "FAILED",
+  "note": "Committing a lease transition without its lease_accepted journal row breaks state+audit atomicity (an accepted lease with no proof)."
+}

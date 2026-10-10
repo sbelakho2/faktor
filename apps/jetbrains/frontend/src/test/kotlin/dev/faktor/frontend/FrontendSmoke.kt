@@ -1095,17 +1095,20 @@ object FrontendSmoke {
             assertEquals(true, panel.available())
             assertEquals(true, panel.postEnabled())
             assertEquals(true, panel.readEnabled())
-            assertTrue(panel.headerText().contains("unread=2"), panel.headerText())
-            assertTrue(panel.headerText().contains("posts=2"), panel.headerText())
-            assertTrue(panel.postsText().contains("#3 [child:8] handoff"), panel.postsText())
-            assertTrue(panel.postsText().contains("#2 [root] root note"), panel.postsText())
+            assertTrue(panel.headerText().contains("2 unread"), panel.headerText())
+            assertTrue(panel.headerText().contains("2 posts"), panel.headerText())
+            assertTrue(panel.postsText().contains("Agent 8"), panel.postsText())
+            assertTrue(panel.postsText().contains("handoff"), panel.postsText())
+            assertTrue(panel.postsText().contains("Conversation"), panel.postsText())
+            assertTrue(panel.postsText().contains("root note"), panel.postsText())
+            assertTrue(panel.advancedText().contains("revision 3 [child:8]"), panel.advancedText())
             panel.submitComposer()
             assertEquals("status", postedSubject)
             assertEquals("all green", postedBody)
             // An explicit read acknowledges the page; an automatic refresh
             // never moves the watermark.
             panel.setBoard(parseNativeBoardPage(BOARD_PAGE_JSON), acknowledge = true)
-            assertTrue(panel.headerText().contains("unread=0"), panel.headerText())
+            assertTrue(panel.headerText().contains("0 unread"), panel.headerText())
             // Byte-bound parity with the daemon and the VS Code panel: 512
             // emoji is 2048 UTF-8 bytes and must be refused LOCALLY (never
             // accepted and silently truncated), while 340 bytes is inside.
@@ -2820,32 +2823,56 @@ object FrontendSmoke {
                 )
             )
             assertEquals(false, panel.loadOlderEnabled(), "no more pages: control disables")
-            assertTrue(panel.postsText().contains("#3 [child:8] handoff"), panel.postsText())
-            assertTrue(panel.postsText().contains("#1 [root] oldest"), panel.postsText())
+            assertTrue(panel.postsText().contains("Agent 8"), panel.postsText())
+            assertTrue(panel.postsText().contains("handoff"), panel.postsText())
+            assertTrue(panel.postsText().contains("oldest"), panel.postsText())
+            assertTrue(panel.advancedText().contains("revision 1 [root]"), panel.advancedText())
         }
 
-        // Bounded architecture: the 430x600 east inspector is now collapsible
-        // and the default is the single chat content plane.
-        step("chat inspector is a toggle; default layout is one content plane") {
+        // The product model: Work (conversation + current run + ONE
+        // composer) is the default cluster; Inspect and History are peers.
+        // The composer keeps working at 240px because the work plane is the
+        // whole content area rather than a fixed-width split half.
+        step("Work is the default cluster and the composer is one plane at 240px") {
             val service = FaktorFrontendService(
                 Paths.get("unused-binary"),
-                Files.createTempDirectory("faktor-inspector-smoke-")
+                Files.createTempDirectory("faktor-work-model-smoke-")
             )
             val panel = FaktorChatPanel(service)
             try {
-                assertEquals(false, panel.inspectorVisibleForTest(), "inspector must default collapsed")
+                assertEquals(listOf("Work", "Inspect", "History"), panel.clusterTitles())
                 ParityAwt.layout(panel, 240, 600)
-                assertEquals(240, panel.chatPlaneForTest().width, "chat must use the full narrow width")
-                assertEquals(true, panel.toggleInspectorForTest())
-                assertTrue(panel.inspectorVisibleForTest(), "the toolbar action must reveal the inspector")
+                assertTrue(
+                    panel.workPlaneForTest().width >= 230,
+                    "Work must use the full narrow width (tab insets aside): " +
+                        panel.workPlaneForTest().width
+                )
+                assertTrue(
+                    panel.taskComposerPaneForTest() is javax.swing.JComponent,
+                    "the composer pane must be embedded in Work"
+                )
+                assertTrue(
+                    panel.selectPanelForTest("Inspect"),
+                    "the Inspect cluster must be reachable: ${panel.tabTitles()}"
+                )
+                assertTrue(
+                    panel.selectPanelForTest("Overview"),
+                    "the Overview view must be reachable: ${panel.tabTitles()}"
+                )
+                assertTrue(panel.selectPanelForTest("Work"), "Work must stay reachable")
+                assertTrue(panel.openUtilityForTest("Diagnostics"), "Diagnostics must be reachable")
+                assertTrue(panel.utilityOpenForTest(), "the utility view must render")
+                panel.closeUtilityForTest()
+                assertTrue(!panel.utilityOpenForTest(), "Back must return to the clusters")
+                assertTrue(panel.openUtilityForTest("Settings"), "Settings must be reachable")
+                panel.closeUtilityForTest()
+                assertTrue(panel.openUtilityForTest("Usage"), "Usage must be reachable")
+                panel.closeUtilityForTest()
                 ParityAwt.layout(panel, 800, 600)
                 assertTrue(
-                    panel.chatPlaneForTest().width in 1 until 800,
-                    "chat and inspector must share the width in the split"
+                    panel.workPlaneForTest().width >= 790,
+                    "Work must fill the wide content area: " + panel.workPlaneForTest().width
                 )
-                assertEquals(false, panel.toggleInspectorForTest())
-                ParityAwt.layout(panel, 240, 600)
-                assertEquals(240, panel.chatPlaneForTest().width)
             } finally {
                 panel.shutdown()
             }

@@ -658,18 +658,20 @@ impl AgentRuntime {
     /// active WorkItem + criteria + failures + verification state). Rows are
     /// the durable ones: the typed task row's acceptance criteria and state,
     /// the session ledger's goal/failures/changed files. A missing row is
-    /// neutral (empty criteria/failures) — never a synthetic success.
+    /// neutral (empty criteria/failures) — never a synthetic success; an
+    /// UNREADABLE identity/ledger is a typed error (authority law), never
+    /// fabricated facts.
     pub(crate) fn task_facts_for(
         &self,
         handle: &faktor_session::SessionHandle,
         ledger: &TaskLedger,
         task_id: TaskId,
-    ) -> TaskFacts {
-        let workspace_id = handle
-            .identity()
-            .map(|i| i.workspace_id)
-            .unwrap_or_else(|_| WorkspaceId::new(1));
-        let tasks = handle.list_tasks().unwrap_or_default();
+    ) -> faktor_core::Result<TaskFacts> {
+        // Authority law: an unreadable session identity or task ledger is a
+        // TYPED error, never fabricated facts (guessed workspace 1 / empty
+        // tasks); the compiler caller keeps producer evidence on error.
+        let workspace_id = handle.identity()?.workspace_id;
+        let tasks = handle.list_tasks()?;
         let task = tasks
             .iter()
             .find(|t| t.task_id == task_id)
@@ -711,7 +713,7 @@ impl AgentRuntime {
             paths: ledger.changed_files.clone(),
             criteria: Vec::new(),
         });
-        TaskFacts {
+        Ok(TaskFacts {
             session_id: handle.id(),
             workspace_id,
             task_id: Some(task_id.raw()),
@@ -727,7 +729,7 @@ impl AgentRuntime {
             // absence — never a positive mismatch — so no evidence edge is
             // falsely marked stale.
             semantic_snapshot: None,
-        }
+        })
     }
 
     /// Archive this turn's PRODUCER evidence (index/cold retrieval, semantic
@@ -742,10 +744,20 @@ impl AgentRuntime {
         semantic: &[Evidence],
         learning: &[Evidence],
     ) {
-        let workspace_id = handle
-            .identity()
-            .map(|i| i.workspace_id)
-            .unwrap_or_else(|_| WorkspaceId::new(1));
+        // Never archive under a GUESSED workspace: an unreadable session
+        // identity skips the producer archive with a typed warn (the archive
+        // is auxiliary; the turn is unaffected).
+        let workspace_id = match handle.identity() {
+            Ok(identity) => identity.workspace_id,
+            Err(e) => {
+                tracing::warn!(
+                    session = %handle.id(),
+                    error = %e,
+                    "evidence archive skipped: session identity unreadable"
+                );
+                return;
+            }
+        };
         let sources: [(&[Evidence], EvidenceKind, ProvenanceSource); 3] = [
             (repo, EvidenceKind::FileMap, ProvenanceSource::Repository),
             (
@@ -856,7 +868,9 @@ impl AgentRuntime {
         let Some(compiler) = self.context_compiler() else {
             return Ok(None);
         };
-        let facts = self.task_facts_for(handle, ledger, task_id);
+        let facts = self
+            .task_facts_for(handle, ledger, task_id)
+            .map_err(|e| CompilerError::Selection(format!("task facts unreadable: {e}")))?;
         let input = CompilerInput::new(
             facts,
             u32::try_from(budget.context_max()).unwrap_or(u32::MAX),
@@ -959,8 +973,18 @@ impl AgentRuntime {
         if !self.deps.efficiency.failure_learning {
             return Vec::new();
         }
-        let Some(task_id) = handle.task_id().ok() else {
-            return Vec::new();
+        let task_id = match handle.task_id() {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                // Auxiliary corpus: a task-id read failure is logged typed,
+                // never silently equal to "no learning evidence".
+                tracing::warn!(
+                    session = %handle.id(),
+                    %error,
+                    "learning corpus evidence skipped: task id unreadable"
+                );
+                return Vec::new();
+            }
         };
         let records = match handle.list_verification_records(task_id) {
             Ok(records) => records,
@@ -1284,9 +1308,9 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         query: &EvidenceQuery,
     ) -> faktor_core::Result<Option<IndexEvidencePackage>> {
-        let Some(ws) = handle.row().ok().map(|r| r.workspace_id) else {
-            return Ok(None);
-        };
+        // Authority law: a session-row read failure propagates typed; only a
+        // genuinely absent index service is `Ok(None)`.
+        let ws = handle.row()?.workspace_id;
         let Some(service) = self.index_service() else {
             return Ok(None);
         };
@@ -1407,8 +1431,17 @@ impl AgentRuntime {
         handle: &faktor_session::SessionHandle,
         query: &EvidenceQuery,
     ) -> ColdEvidenceOutcome {
-        let Some(ws) = handle.row().ok().map(|r| r.workspace_id) else {
-            return ColdEvidenceOutcome::NotHosted;
+        let ws = match handle.row() {
+            Ok(row) => row.workspace_id,
+            Err(e) => {
+                // Typed warn: the documented legacy scan degrade takes over;
+                // a store failure is never silently equal to "not hosted".
+                tracing::warn!(
+                    error = %e,
+                    "cold evidence skipped: session row unreadable; falling back to the bounded scan"
+                );
+                return ColdEvidenceOutcome::NotHosted;
+            }
         };
         let Some(service) = self.index_service() else {
             return ColdEvidenceOutcome::NotHosted;

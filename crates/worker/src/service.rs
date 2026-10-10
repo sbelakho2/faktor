@@ -358,9 +358,6 @@ impl WorkerPlane {
             last_seen_ms: now,
             revoked_ms: None,
         };
-        self.store.put_worker(&registration)?;
-        token_row.consumed_by = Some(worker_id.as_str().to_string());
-        self.store.put_token(&token_row)?;
         let kind = if existing.is_some() {
             if reconciled {
                 "capabilities_reconciled"
@@ -370,15 +367,20 @@ impl WorkerPlane {
         } else {
             "worker_registered"
         };
-        self.journal(
+        // The ONE authoritative mutation (audit P1): worker row + consumed
+        // token row + journal row commit together, re-reading the durable
+        // token/worker rows under the store's write lock and refusing a token
+        // bound elsewhere. A failure leaves no half-written registration.
+        token_row.consumed_by = Some(worker_id.as_str().to_string());
+        let entry = JournalEntry::new(
             organization.as_str(),
             kind,
             now,
-            Some(worker_id),
-            None,
-            None,
             format!("capabilities_version={capabilities_version} reconciled={reconciled}"),
-        )?;
+        )?
+        .with_worker(worker_id);
+        self.store
+            .register_worker_with_token(&registration, &token_row, &entry)?;
         Ok(RegistrationOutcome {
             worker: WorkerView::from(&registration),
             capabilities_reconciled: reconciled,
@@ -556,6 +558,7 @@ impl WorkerPlane {
                 &job,
                 JobGeneration::FIRST,
                 now,
+                None,
             )?),
             None => None,
         };
@@ -585,7 +588,7 @@ impl WorkerPlane {
         }
         let job = self.require_job(organization, job_id)?;
         let now = self.now_ms();
-        self.accept_lease_inner(&worker, organization, &job, generation, now)
+        self.accept_lease_inner(&worker, organization, &job, generation, now, None)
     }
 
     /// Claim the next eligible job of one worker: scan the organization's
@@ -676,17 +679,18 @@ impl WorkerPlane {
                 if generation_row.state != GenerationState::Assigned {
                     continue;
                 }
-                match self.accept_lease_inner(&worker, organization, &job, generation, now) {
+                match self.accept_lease_inner(
+                    &worker,
+                    organization,
+                    &job,
+                    generation,
+                    now,
+                    Some("long-poll"),
+                ) {
                     Ok(lease) => {
-                        self.journal(
-                            organization.as_str(),
-                            "job_claimed",
-                            now,
-                            Some(&worker.worker_id),
-                            Some(&job.job_id),
-                            Some(generation),
-                            format!("lease={} claimed via long-poll", lease.lease_id),
-                        )?;
+                        // The `lease_accepted` AND `job_claimed` journal rows
+                        // were committed atomically with the lease by
+                        // `accept_lease_inner`.
                         return Ok(Some(ClaimedLease { job, lease }));
                     }
                     // Someone else moved first (a concurrent claim, a
@@ -772,6 +776,7 @@ impl WorkerPlane {
         job: &ExecutionJob,
         generation: JobGeneration,
         now: i64,
+        claimed_via: Option<&str>,
     ) -> Result<WorkerLease, WorkerError> {
         // Trust domain: a worker can only lease jobs of its own org/domain.
         if worker.organization_id != job.organization_id || worker.trust_domain != job.trust_domain
@@ -877,7 +882,35 @@ impl WorkerPlane {
             ended_ms: None,
             reason: None,
         };
-        if let Some(existing) = self.store.try_accept_lease(&lease)? {
+        // Audit P1: the accept journal row is committed in the SAME
+        // transaction as the lease/generation/job/attempt transition; a
+        // journal failure aborts the whole accept (nothing moved) instead of
+        // surfacing after a commit. A claim carries its second entry (the
+        // `job_claimed` row) through the same transaction.
+        let mut entries = Vec::with_capacity(1 + usize::from(claimed_via.is_some()));
+        entries.push(
+            JournalEntry::new(
+                organization.as_str(),
+                "lease_accepted",
+                now,
+                format!("lease={} interval_ms={interval}", lease.lease_id),
+            )?
+            .with_worker(&worker.worker_id)
+            .with_job(&job.job_id, generation),
+        );
+        if let Some(via) = claimed_via {
+            entries.push(
+                JournalEntry::new(
+                    organization.as_str(),
+                    "job_claimed",
+                    now,
+                    format!("lease={} claimed via {via}", lease.lease_id),
+                )?
+                .with_worker(&worker.worker_id)
+                .with_job(&job.job_id, generation),
+            );
+        }
+        if let Some(existing) = self.store.try_accept_lease(&lease, &entries)? {
             // The CAS lost (a concurrent accept won between our read and the
             // atomic insert): report the winner, never a second lease.
             self.journal(
@@ -899,15 +932,6 @@ impl WorkerPlane {
                 lease: existing.lease_id.to_string(),
             });
         }
-        self.journal(
-            organization.as_str(),
-            "lease_accepted",
-            now,
-            Some(&worker.worker_id),
-            Some(&job.job_id),
-            Some(generation),
-            format!("lease={} interval_ms={interval}", lease.lease_id),
-        )?;
         Ok(lease)
     }
 
@@ -1398,6 +1422,7 @@ impl WorkerPlane {
                         &job,
                         job.current_generation,
                         now,
+                        None,
                     ) {
                         Ok(_) => report.reassigned.push(job.job_id.to_string()),
                         Err(e) if e.is_recovery_domain_refusal() => {}
@@ -1513,7 +1538,10 @@ impl WorkerPlane {
     }
 
     /// Authenticate one worker with its registration token. A revoked worker
-    /// or revoked token is refused typed.
+    /// or revoked token is refused typed. Defense-in-depth (audit P1): the
+    /// token must ALSO be consumed by exactly this worker id — a token whose
+    /// durable `consumed_by` is `None` or another worker never authenticates
+    /// anyone, even when the worker row carries the matching hash.
     fn authenticate(
         &self,
         worker_id: &WorkerId,
@@ -1531,10 +1559,27 @@ impl WorkerPlane {
             return Err(WorkerError::UnknownToken);
         }
         match self.store.token(hash.as_str())? {
-            Some(row) if row.revoked => Err(WorkerError::TokenRevoked),
-            Some(_) => Ok(worker),
             None => Err(WorkerError::UnknownToken),
+            Some(row) if row.revoked => Err(WorkerError::TokenRevoked),
+            Some(row) => match &row.consumed_by {
+                Some(consumer) if consumer != worker_id.as_str() => {
+                    Err(WorkerError::TokenAlreadyUsed(consumer.clone()))
+                }
+                None => Err(WorkerError::TokenNotConsumed(worker_id.clone())),
+                Some(_) => Ok(worker),
+            },
         }
+    }
+
+    /// Test-only handle to the private authentication gate (the
+    /// defense-in-depth tests live in this crate's test module).
+    #[cfg(test)]
+    pub(crate) fn authenticate_for_test(
+        &self,
+        worker_id: &WorkerId,
+        token: &SecretToken,
+    ) -> Result<WorkerRegistration, WorkerError> {
+        self.authenticate(worker_id, token)
     }
 
     /// End one lease (CAS) and derive the durable consequences: generation
@@ -1686,7 +1731,14 @@ impl WorkerPlane {
             None => self.find_eligible(&organization, &job.trust_domain, &job.requirements)?,
         };
         if let Some(worker) = target {
-            match self.accept_lease_inner(&worker, &organization, &job_row, next_generation, now) {
+            match self.accept_lease_inner(
+                &worker,
+                &organization,
+                &job_row,
+                next_generation,
+                now,
+                None,
+            ) {
                 Ok(_) => {}
                 Err(e) if e.is_recovery_domain_refusal() => {}
                 Err(e) => return Err(e),

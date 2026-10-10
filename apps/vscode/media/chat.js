@@ -56,6 +56,13 @@
   var attachments = [];
   var currentSessionId = null;
   var streamBlockedReason = null;
+  var streamBlockedCursor = null;
+  /** The last raw snapshot error rendered, so it is not re-announced. */
+  var lastRenderedError = null;
+  /** Technical tails currently displayed; identical errors never stack. */
+  var shownUserErrors = [];
+  var MAX_USER_ERRORS = 3;
+  var MAX_PENDING_PERMISSIONS = 16;
   var WEBVIEW_MAX_ATTACHMENT_BYTES = 7 * 1024 * 1024;
   var WEBVIEW_MAX_ATTACHMENTS = 8;
   var B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -563,6 +570,132 @@
       return;
     }
     setRunMeta('task-agents', count + (count === 1 ? ' agent' : ' agents'), 'neutral');
+  }
+
+  // ---------------------------------------------------------- permissions
+  // A pending permission is an ATTENTION event, not a destination: one
+  // prominent approval card in the main flow, decision-first. The headline
+  // says what the run wants to do and to what; the reply handle, capability
+  // key and owning conversation id stay behind "View details".
+
+  /** Human decision headline: what the agent wants to do, and to what. */
+  function permissionHeadline(permission) {
+    var kind = String(permission.capability == null ? '' : permission.capability).toLowerCase();
+    var what;
+    if (kind.indexOf('shell') !== -1 || kind.indexOf('execute') !== -1) {
+      what = 'Run a shell command';
+    } else if (kind.indexOf('write') !== -1) {
+      what = 'Write files in this workspace';
+    } else if (kind.indexOf('read') !== -1) {
+      what = 'Read files in this workspace';
+    } else if (kind.indexOf('network') !== -1) {
+      what = 'Use the network';
+    } else if (kind.indexOf('browser') !== -1) {
+      what = 'Control the browser';
+    } else if (kind.indexOf('git') !== -1 || kind.indexOf('scm') !== -1) {
+      what = 'Run Git operations';
+    } else if (kind.indexOf('mcp') !== -1) {
+      what = 'Call an external tool service';
+    } else {
+      what = 'Use ' + String(permission.capability == null ? 'a capability' : permission.capability);
+    }
+    var detail = String(permission.detail == null ? '' : permission.detail);
+    // The native detail is often a JSON payload naming the exact tool,
+    // path, command or destination; the most decision-relevant key wins
+    // (command before path/destination before the generic tool name).
+    var target = null;
+    var targetKeys = ['command', 'path', 'destination', 'tool'];
+    for (var k = 0; k < targetKeys.length && target === null; k++) {
+      var match = new RegExp('"' + targetKeys[k] + '"\\s*:\\s*"([^"]+)"').exec(detail);
+      if (match) {
+        target = match[1];
+      }
+    }
+    return {
+      headline: target ? what + ': ' + target : what,
+      target: target,
+      detail: detail,
+    };
+  }
+
+  function permissionButton(permission, decision, label, secondary) {
+    var id = String(permission.id == null ? '' : permission.id);
+    var button = document.createElement('button');
+    button.type = 'button';
+    if (secondary) {
+      button.className = 'secondary';
+    }
+    button.textContent = label;
+    button.setAttribute('aria-label', label + ' permission request ' + id);
+    button.addEventListener('click', function () {
+      vscode.postMessage({
+        type: 'permissionReply',
+        permissionId: id,
+        decision: decision,
+      });
+    });
+    return button;
+  }
+
+  /**
+   * The approval card list. The card is driven by the SAME snapshot data the
+   * reply path resolves against; an empty list hides the card entirely.
+   */
+  function renderPermissions(permissions) {
+    var card = byId('permission-card');
+    var list = byId('permission-list');
+    if (!card || !list) {
+      return;
+    }
+    var focus = captureFocus(list);
+    clear(list);
+    var items = Array.isArray(permissions) ? permissions.slice(0, MAX_PENDING_PERMISSIONS) : [];
+    if (items.length === 0) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    for (var i = 0; i < items.length; i++) {
+      (function (permission) {
+        var info = permissionHeadline(permission);
+        var id = String(permission.id == null ? '' : permission.id);
+        var capability = String(permission.capability == null ? '' : permission.capability);
+        var sessionId = String(permission.sessionId == null ? '' : permission.sessionId);
+        var item = document.createElement('li');
+        item.className = 'permission';
+        item.setAttribute('data-permission-id', id);
+        line(item, info.headline, 'permission-action');
+        line(
+          item,
+          info.target ? 'Needed to verify: ' + info.target : 'Needed to continue this run.',
+          'muted permission-why',
+        );
+        var actions = document.createElement('div');
+        actions.className = 'composer-actions permission-actions';
+        actions.appendChild(permissionButton(permission, 'allow', 'Allow', false));
+        actions.appendChild(permissionButton(permission, 'deny', 'Deny', true));
+        item.appendChild(actions);
+        var details = document.createElement('details');
+        details.className = 'permission-details';
+        var summary = document.createElement('summary');
+        summary.textContent = 'View details';
+        details.appendChild(summary);
+        var disclosure = document.createElement('div');
+        disclosure.className = 'muted permission-diagnostics';
+        disclosure.textContent =
+          'Request #' + id + ' · capability ' + capability + ' · conversation ' + sessionId;
+        details.appendChild(disclosure);
+        if (info.detail.length > 0) {
+          var raw = document.createElement('pre');
+          raw.className = 'excerpt';
+          raw.textContent = info.detail;
+          details.appendChild(raw);
+        }
+        item.appendChild(details);
+        list.appendChild(item);
+      })(items[i]);
+    }
+    restoreFocus(list, focus);
   }
 
   /**
@@ -1403,12 +1536,49 @@
 
   function setDaemon(status, detail) {
     var dot = byId('daemon-dot');
-    dot.className = 'dot dot-' + (status || 'stopped');
-    var text = status || 'stopped';
-    if (detail) {
-      text += ' — ' + detail;
+    if (dot) {
+      dot.className = 'dot dot-' + (status || 'stopped');
     }
-    setText('daemon-text', text);
+    // The service URL/detail is diagnostics: it renders only inside the
+    // Diagnostics card, never in the product header.
+    setText('daemon-url', detail || null);
+  }
+
+  /**
+   * The product status line of the header: `Ready · <model>` while idle,
+   * `Running · <n> agents · <state>` while a run is active. Service
+   * start/stop vocabulary stays in Diagnostics.
+   */
+  function headerStatusText(snapshot) {
+    var daemon = snapshot && snapshot.daemon ? String(snapshot.daemon) : 'stopped';
+    if (daemon === 'starting') {
+      return 'Starting service…';
+    }
+    if (daemon === 'error') {
+      return 'Service unavailable';
+    }
+    if (daemon !== 'running') {
+      return 'Ready';
+    }
+    var task = snapshot.task;
+    var hasActiveRun = snapshot.busy === true || snapshot.activeRunId != null;
+    if (hasActiveRun && task) {
+      var state =
+        typeof task.phase === 'string' && task.phase.length > 0
+          ? task.phase
+          : String(task.state == null ? '' : task.state);
+      var agents = Array.isArray(snapshot.agents) ? snapshot.agents.length : 0;
+      var parts = ['Running'];
+      if (agents > 0) {
+        parts.push(agents + (agents === 1 ? ' agent' : ' agents'));
+      }
+      if (state.length > 0) {
+        parts.push(state);
+      }
+      return parts.join(' · ');
+    }
+    var model = snapshot.session && snapshot.session.model ? String(snapshot.session.model) : '';
+    return model.length > 0 ? 'Ready · ' + model : 'Ready';
   }
 
   // ---------------------------------------------------------- attachments
@@ -1602,13 +1772,16 @@
       })(fileList[i]);
     }
     if (reads.length === 0) {
-      showNotice(
-        'error',
-        'attachment refused: ' +
+      showUserError(
+        localUserError(
+          'Some attachments were refused',
+          'Adjust the files and try again; nothing was sent.',
           refused.join(', ') +
-          ' exceeds the ' +
-          formatBytes(WEBVIEW_MAX_ATTACHMENT_BYTES) +
-          ' bound',
+            ' exceeds the ' +
+            formatBytes(WEBVIEW_MAX_ATTACHMENT_BYTES) +
+            ' bound',
+          { key: 'attachFiles', label: 'Choose files' },
+        ),
       );
       return;
     }
@@ -1621,14 +1794,28 @@
           }
         }
         if (refused.length > 0) {
-          showNotice('error', 'attachment refused: ' + refused.join(', '));
+          showUserError(
+            localUserError(
+              'Some files were left out',
+              'The others were attached; add the refused ones and try again if they matter.',
+              refused.join(', '),
+              { key: 'attachFiles', label: 'Choose files' },
+            ),
+          );
         }
         if (ready.length > 0) {
           vscode.postMessage({ type: 'attachData', items: ready });
         }
       })
       .catch(function (error) {
-        showNotice('error', 'attachment read failed: ' + (error && error.message ? error.message : error));
+        showUserError(
+          localUserError(
+            'That attachment could not be read',
+            'Try attaching it through the files picker instead.',
+            error && error.message ? error.message : String(error),
+            { key: 'attachFiles', label: 'Choose files' },
+          ),
+        );
       });
   }
 
@@ -1643,6 +1830,27 @@
       return;
     }
     section.hidden = true;
+  }
+
+  /**
+   * The RAW resume position is diagnostics vocabulary: it renders only
+   * inside the Diagnostics card, never in the recovery headline.
+   */
+  function renderStreamCursor() {
+    var node = byId('stream-cursor');
+    if (!node) {
+      return;
+    }
+    if (streamBlockedReason === null) {
+      node.hidden = true;
+      node.textContent = '';
+      return;
+    }
+    node.hidden = false;
+    node.textContent =
+      streamBlockedCursor === null
+        ? 'Live updates blocked (the exact position was not reported).'
+        : 'Live updates blocked at journal cursor ' + streamBlockedCursor + '.';
   }
 
   function dismissTransient() {
@@ -1734,19 +1942,40 @@
     }
     currentSessionId = sessionId;
     setDaemon(snapshot.daemon, snapshot.daemonDetail);
+    setText('daemon-text', headerStatusText(snapshot));
     setText('session-title', snapshot.session ? snapshot.session.title : 'none');
     setText('machine-label', snapshot.machineLabel || snapshot.machineState);
     setText('stream-status', streamStatusLabel(snapshot.streamStatus));
     renderComposerModel(snapshot.session);
     renderStreamRecovery(snapshot.streamStatus);
     renderTask(snapshot.task, snapshot.cockpit, snapshot.agents);
+    renderPermissions(snapshot.permissions);
     renderCockpit(snapshot.cockpit, snapshot.cockpitSections);
     renderAgents(snapshot.agents);
     renderBoard(snapshot.board);
     renderWelcome(snapshot.transcript);
     renderTranscript(snapshot.transcript);
-    if (snapshot.lastError) {
-      showNotice('error', snapshot.lastError);
+    // The raw last error lives in Diagnostics; the structured projection
+    // reached the panel through `userError`. A last error with no posted
+    // projection (e.g. a cockpit projection failure) still surfaces ONCE
+    // through the same user-error renderer, with the raw text demoted to
+    // the technical disclosure.
+    var lastError =
+      typeof snapshot.lastError === 'string' && snapshot.lastError.length > 0
+        ? snapshot.lastError
+        : null;
+    if (lastError === null) {
+      lastRenderedError = null;
+    } else if (lastError !== lastRenderedError) {
+      lastRenderedError = lastError;
+      showUserError({
+        kind: 'unexpected',
+        summary: 'Faktor hit a problem',
+        hint: 'Try the action again; open Diagnostics for the raw detail.',
+        action: null,
+        technical: lastError,
+        code: null,
+      });
     }
   }
 
@@ -1784,6 +2013,136 @@
     }, 8000);
   }
 
+  /**
+   * The ONE structured user-error card: human summary + what to do + an
+   * action button when one exists, with the typed code and raw bounded text
+   * demoted behind "Technical details". Identical technical tails never
+   * stack, and the list is bounded. An actionable error is NOT auto-dismissed
+   * (the operator must see the next step); only the identity list is capped.
+   */
+  function dispatchUserErrorAction(key) {
+    if (key === 'startService') {
+      vscode.postMessage({ type: 'startDaemon' });
+    } else if (key === 'reconnectStream') {
+      vscode.postMessage({ type: 'recoverStream' });
+    } else if (key === 'refresh') {
+      vscode.postMessage({ type: 'refresh' });
+    } else if (key === 'attachFiles') {
+      vscode.postMessage({ type: 'attachPick' });
+    } else if (key === 'focusComposer') {
+      var goalNode = byId('goal');
+      if (goalNode && typeof goalNode.focus === 'function') {
+        goalNode.focus();
+      }
+    }
+  }
+
+  function removeUserError(node, technical) {
+    var index = shownUserErrors.indexOf(technical);
+    if (index !== -1) {
+      shownUserErrors.splice(index, 1);
+    }
+    if (node && node.parentNode) {
+      node.parentNode.removeChild(node);
+    }
+  }
+
+  function showUserError(error) {
+    if (!error || typeof error !== 'object') {
+      return;
+    }
+    var notices = byId('notices');
+    if (!notices) {
+      return;
+    }
+    var technical =
+      typeof error.technical === 'string' && error.technical.length > 0
+        ? error.technical
+        : 'no further detail was provided';
+    if (shownUserErrors.indexOf(technical) !== -1) {
+      return;
+    }
+    var node = document.createElement('div');
+    node.className = 'notice error user-error';
+    node.setAttribute('data-error-kind', String(error.kind == null ? 'unexpected' : error.kind));
+    line(
+      node,
+      typeof error.summary === 'string' && error.summary.length > 0
+        ? error.summary
+        : 'Faktor hit a problem',
+      'user-error-summary',
+    );
+    if (typeof error.hint === 'string' && error.hint.length > 0) {
+      line(node, error.hint, 'muted user-error-hint');
+    }
+    var action = error.action;
+    if (
+      action &&
+      typeof action === 'object' &&
+      typeof action.key === 'string' &&
+      typeof action.label === 'string' &&
+      action.label.length > 0
+    ) {
+      var actions = document.createElement('div');
+      actions.className = 'composer-actions';
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'user-error-action';
+      button.textContent = action.label;
+      button.addEventListener('click', function () {
+        dispatchUserErrorAction(action.key);
+      });
+      actions.appendChild(button);
+      node.appendChild(actions);
+    }
+    var details = document.createElement('details');
+    details.className = 'technical-disclosure';
+    var summary = document.createElement('summary');
+    summary.textContent = 'Technical details';
+    details.appendChild(summary);
+    var code = typeof error.code === 'string' && error.code.length > 0 ? error.code : null;
+    var pre = document.createElement('pre');
+    pre.className = 'excerpt user-error-technical';
+    pre.textContent = code !== null ? '[' + code + '] ' + technical : technical;
+    details.appendChild(pre);
+    node.appendChild(details);
+    node.setAttribute('data-error-technical', technical);
+    notices.appendChild(node);
+    shownUserErrors.push(technical);
+    while (shownUserErrors.length > MAX_USER_ERRORS) {
+      var technicalToDrop = shownUserErrors[0];
+      var holders = notices.querySelectorAll('[data-error-technical]');
+      var drop = null;
+      for (var h = 0; h < holders.length; h++) {
+        if (holders[h].getAttribute('data-error-technical') === technicalToDrop) {
+          drop = holders[h];
+          break;
+        }
+      }
+      if (drop) {
+        removeUserError(drop, technicalToDrop);
+      } else {
+        shownUserErrors.shift();
+      }
+    }
+  }
+
+  /**
+   * A webview-local refusal (an oversized clipboard image, a failed byte
+   * read) through the SAME rendering contract the host projections use; the
+   * raw reason is demoted, never the headline.
+   */
+  function localUserError(summary, hint, technical, action) {
+    return {
+      kind: 'attachment_refused',
+      summary: summary,
+      hint: hint,
+      action: action || null,
+      technical: String(technical == null ? 'no further detail was provided' : technical).slice(0, 500),
+      code: null,
+    };
+  }
+
   function deliverEvidence(id, text, truncated) {
     var holders = document.querySelectorAll('[data-evidence="' + id + '"]');
     for (var i = 0; i < holders.length; i++) {
@@ -1814,6 +2173,7 @@
     var ids = [
       'btn-send',
       'btn-new-task',
+      'contract-local',
       'contract-commit',
       'contract-push',
       'contract-pr',
@@ -1891,6 +2251,8 @@
     } else if (message.type === 'streamBlocked') {
       streamBlockedReason =
         typeof message.reason === 'string' && message.reason.length > 0 ? message.reason : null;
+      streamBlockedCursor =
+        typeof message.cursor === 'number' && isFinite(message.cursor) ? message.cursor : null;
       if (streamBlockedReason !== null) {
         var recovery = byId('stream-recovery');
         if (recovery) {
@@ -1898,35 +2260,52 @@
         }
         setText('stream-recovery-reason', streamBlockedReason);
       }
+      renderStreamCursor();
+    } else if (message.type === 'userError') {
+      showUserError(message.error);
     } else if (message.type === 'notice') {
       showNotice(message.level, message.message);
     }
   });
 
+  // The ordered finish choice. The visible control is ONE radio group
+  // (`Leave changes locally` → commit → push → pull request); later options
+  // imply the earlier steps, so the three backend booleans map directly from
+  // the SELECTED LEVEL. The ids the host tests pin stay attached to the
+  // commit/push/PR levels; plain chat never carries a contract.
+  var FINISH_LEVELS = {
+    'contract-commit': { include_commit: true, include_push: false, include_pr: false },
+    'contract-push': { include_commit: true, include_push: true, include_pr: false },
+    'contract-pr': { include_commit: true, include_push: true, include_pr: true },
+  };
+  var FINISH_LEVEL_IDS = ['contract-pr', 'contract-push', 'contract-commit'];
+
   function completionContractFromControls() {
-    var commit = byId('contract-commit');
-    var push = byId('contract-push');
-    var pr = byId('contract-pr');
-    if (!commit || !push || !pr) {
-      return null;
+    for (var i = 0; i < FINISH_LEVEL_IDS.length; i++) {
+      var node = byId(FINISH_LEVEL_IDS[i]);
+      if (node && node.checked === true) {
+        var level = FINISH_LEVELS[FINISH_LEVEL_IDS[i]];
+        return {
+          include_commit: level.include_commit,
+          include_push: level.include_push,
+          include_pr: level.include_pr,
+        };
+      }
     }
-    if (!commit.checked && !push.checked && !pr.checked) {
-      return null;
-    }
-    return {
-      include_commit: commit.checked === true,
-      include_push: push.checked === true,
-      include_pr: pr.checked === true,
-    };
+    return null;
   }
 
   function clearCompletionControls() {
-    var ids = ['contract-commit', 'contract-push', 'contract-pr'];
+    var ids = ['contract-local', 'contract-commit', 'contract-push', 'contract-pr'];
     for (var i = 0; i < ids.length; i++) {
       var node = byId(ids[i]);
       if (node) {
         node.checked = false;
       }
+    }
+    var local = byId('contract-local');
+    if (local) {
+      local.checked = true;
     }
   }
 
@@ -2106,6 +2485,17 @@
     var app = byId('app');
     var collapsed = app.classList.toggle('inspect-collapsed');
     byId('btn-inspect').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  });
+  // The `⋯` overflow holds the service/diagnostics vocabulary: session and
+  // stream metadata, the raw service URL, Refresh/Start/Stop and the raw
+  // stream position. Nothing in it is product copy, so it stays collapsed
+  // until asked for.
+  byId('btn-overflow').addEventListener('click', function () {
+    var panel = byId('diagnostics');
+    var button = byId('btn-overflow');
+    var open = panel.hidden === true;
+    panel.hidden = !open;
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
   });
   byId('btn-refresh-snapshot').addEventListener('click', function () {
     vscode.postMessage({ type: 'refresh' });

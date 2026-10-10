@@ -90,8 +90,11 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PermissionsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/SettingsPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/UsagePanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TerminalPanel.kt
-$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/StatusPanel.kt
-$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AgentsPanel.kt"
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/DiagnosticsPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AgentsPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/ChangesPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/VerificationPanel.kt"
 
 BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 

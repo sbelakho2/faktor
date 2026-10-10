@@ -47,6 +47,8 @@ import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JCheckBox
 import javax.swing.JComboBox
+import javax.swing.JMenuItem
+import javax.swing.JPopupMenu
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JOptionPane
@@ -118,6 +120,7 @@ class FaktorChatPanel(
 
     private val transcript = JTextArea()
 
+    /** The ONE composer input: every request to Faktor starts here. */
     private val input = JTextArea(3, 60)
 
     /** Single-flight for the ordinary prompt path: one logical prompt at a time. */
@@ -131,10 +134,6 @@ class FaktorChatPanel(
     @Volatile
     private var pendingPromptSubmission: PromptSubmission? = null
 
-    private val providerField = JTextField("default", 10)
-
-    private val modelField = JTextField("default", 10)
-
     private val startButton = secondaryButton("Start daemon")
 
     private val stopButton = secondaryButton("Stop daemon")
@@ -143,11 +142,9 @@ class FaktorChatPanel(
 
     private val refreshButton = secondaryButton("Refresh")
 
-    private val sendButton = primaryButton("Send")
+    private val sendButton = secondaryButton("Ask")
 
     private val abortButton = secondaryButton("Abort")
-
-    private val goalField = JTextField(24)
 
     private val criteriaField = JTextField(24)
 
@@ -158,10 +155,10 @@ class FaktorChatPanel(
     // the absent attachments (parity with the VS Code pending envelope).
     private val pendingAttachmentRetry = PendingAttachmentRetry()
 
-    // Task-mode completion contract controls: shown ONLY in the Task tab
-    // (the chat composer never carries a contract). The submitted contract is
-    // tracked so the tree can report durable step provenance. The labels stay
-    // one word so they never clip at 240px; the tooltip carries the nuance.
+    // The composer's run options (finish actions): one disclosure next to
+    // the composer carries them. The submitted contract is tracked so the
+    // tree can report durable step provenance. The labels stay one word so
+    // they never clip at 240px; the tooltip carries the nuance.
     internal val completionCommit = JCheckBox("Commit").apply {
         toolTipText = "Commit the change set once the run is verified"
     }
@@ -176,7 +173,11 @@ class FaktorChatPanel(
 
     private var submittedCompletion: NativeCompletionContract? = null
 
-    private val startTaskButton = primaryButton("Start task")
+    private val startTaskButton = primaryButton("Run task")
+
+    private val runOptionsToggle = secondaryButton("Run options ▾")
+
+    private val runOptionsBody = JPanel(BorderLayout())
 
     private val runsModel = DefaultComboBoxModel<NativeTaskRun>()
 
@@ -184,7 +185,7 @@ class FaktorChatPanel(
 
     private val cancelRunButton = secondaryButton("Cancel run")
 
-    private val taskArea = JTextArea(5, 32)
+    private val taskArea = JTextArea(4, 32)
 
     /**
      * The agent-control input resolver, invoked ON the EDT by
@@ -220,9 +221,20 @@ class FaktorChatPanel(
 
     private val usagePanel = UsagePanel()
 
-    private val statusPanel = StatusPanel()
+    private val diagnosticsPanel = DiagnosticsPanel()
 
     private val agentsPanel = AgentsPanel()
+
+    private val overviewPanel = OverviewPanel()
+
+    private val changesPanel = ChangesPanel()
+
+    private val verificationPanel = VerificationPanel()
+
+    /** The agent roster with its contextual approvals and coordination. */
+    private val agentsTabs = FaktorTabbedPane()
+
+    private val workPlane = JPanel(BorderLayout())
 
     /** The bounded PasswordSafe row watch (no platform change event exists). */
     private val controlPlaneWatcher: ControlPlaneCredentialWatcher?
@@ -240,33 +252,20 @@ class FaktorChatPanel(
     /** The inspector root: 3 top-level cluster destinations (Work/Inspect/History). */
     private val tabs = FaktorTabbedPane()
 
-    /** Work cluster: the task composer, the agent roster and the terminals. */
-    private val workTabs = FaktorTabbedPane()
-
-    /** Inspect cluster: the task tree, evidence, tournaments and permissions. */
+    /** Inspect: Overview / Plan / Changes / Verification / Agents. */
     private val inspectTabs = FaktorTabbedPane()
-
-    /** History cluster: durable sessions, board, usage and diagnostics (Settings/Status). */
-    private val historyTabs = FaktorTabbedPane()
-
-    /**
-     * The inspector is a COLLAPSIBLE secondary plane: the tool window defaults
-     * to the single chat plane (which works at narrow tool-window widths) and
-     * the toolbar toggle reveals the tabbed inspector. There is deliberately
-     * no fixed 430x600 minimum/preferred size forcing the chat out of narrow
-     * layouts.
-     */
-    private val inspectorToggle: JToggleButton = FaktorToggleButton("Inspector")
-
-    private val chatPlane = JPanel(BorderLayout())
 
     private val contentHost = JPanel(BorderLayout())
 
-    private var inspectorSplit: JSplitPane? = null
+    private val utilityHeader = WrappedLabel("")
+
+    private var utilityShown = false
 
     private var renderedSeq: Long = 0
 
     private var currentTree: TaskTreeModel? = null
+
+    private var currentAgents: List<NativeAgent> = emptyList()
 
     private var trackedTournamentId: String? = null
 
@@ -316,221 +315,296 @@ class FaktorChatPanel(
         input.lineWrap = true
         input.wrapStyleWord = true
         input.font = uiPanelFont()
+        // Ctrl+Enter in the composer is the keyboard twin of Run task.
+        input.inputMap.put(
+            javax.swing.KeyStroke.getKeyStroke(
+                java.awt.event.KeyEvent.VK_ENTER,
+                java.awt.event.InputEvent.CTRL_DOWN_MASK
+            ),
+            "faktor.runTask"
+        )
+        input.actionMap.put("faktor.runTask", object : javax.swing.AbstractAction() {
+            override fun actionPerformed(event: java.awt.event.ActionEvent?) {
+                startTaskFromControls()
+            }
+        })
 
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.S, Spacing.XS))
         toolbar.isOpaque = true
         toolbar.background = panelSurface()
-        // One hairline under the toolbar plus the Faktor pixel mark as the
-        // tool window's stable identity; every control stays platform-rendered.
-        toolbar.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, FaktorTheme.separator()),
-            BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
-        )
+        // The toolbar row keeps its preferred single-row height; the enclosing
+        // scroll pane reveals overflow horizontally at 240px instead of
+        // clipping controls out of reach.
+        toolbar.border = BorderFactory.createEmptyBorder(Spacing.XS, Spacing.M, Spacing.XS, Spacing.M)
         toolbar.add(FaktorMark())
         toolbar.add(startButton)
         toolbar.add(stopButton)
         toolbar.add(newSessionButton)
-        toolbar.add(fieldLabel("provider", providerField))
-        toolbar.add(providerField)
-        toolbar.add(fieldLabel("model", modelField))
-        toolbar.add(modelField)
         toolbar.add(refreshButton)
-        toolbar.add(inspectorToggle)
-        inspectorToggle.addActionListener { setInspectorVisible(inspectorToggle.isSelected) }
-
-        val chat = chatPlane
-        val transcriptBody = JPanel(BorderLayout())
-        transcriptBody.isOpaque = false
-        transcriptBody.add(insetScroll(transcript), BorderLayout.CENTER)
-        chat.add(card("Transcript", transcriptBody), BorderLayout.CENTER)
-        val buttons = actionRow(abortButton, sendButton)
-        val inputRow = JPanel(BorderLayout(0, Spacing.S))
-        inputRow.isOpaque = false
-        inputRow.border = BorderFactory.createEmptyBorder(
-            Spacing.S, Spacing.M, Spacing.M, Spacing.M
+        val settingsButton = secondaryButton("Settings")
+        settingsButton.addActionListener { showUtility("Settings", settingsPanel) }
+        toolbar.add(settingsButton)
+        val moreButton = secondaryButton("More ▾")
+        val moreMenu = JPopupMenu()
+        val usageItem = JMenuItem("Usage")
+        usageItem.addActionListener { showUtility("Usage", usagePanel) }
+        moreMenu.add(usageItem)
+        val diagnosticsItem = JMenuItem("Diagnostics")
+        diagnosticsItem.addActionListener { showUtility("Diagnostics", diagnosticsPanel) }
+        moreMenu.add(diagnosticsItem)
+        moreButton.addActionListener { moreMenu.show(moreButton, 0, moreButton.height) }
+        toolbar.add(moreButton)
+        val toolbarScroll = JScrollPane(
+            toolbar,
+            javax.swing.ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER,
+            javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED
         )
-        inputRow.add(focusAccentScroll(input), BorderLayout.CENTER)
-        inputRow.add(buttons, BorderLayout.SOUTH)
-        chat.add(inputRow, BorderLayout.SOUTH)
+        toolbarScroll.border = BorderFactory.createMatteBorder(
+            0, 0, 1, 0, FaktorTheme.separator()
+        )
+        toolbarScroll.viewport.isOpaque = false
+        toolbarScroll.horizontalScrollBar.unitIncrement = 16
 
-        // One top-level row of cluster destinations; the former peer tabs are
-        // now sub-tabs (inner panes) of their cluster, so the tool window
-        // presents the Work / Inspect / History mental model while every panel
-        // stays one click away.
-        workTabs.removeAll()
-        workTabs.addTab("Task", buildTaskTab())
-        workTabs.addTab("Agents", agentsPanel)
-        workTabs.addTab("Terminal", terminalPanel)
-
+        buildWorkPlane()
         inspectTabs.removeAll()
-        inspectTabs.addTab("Task Tree", buildTaskTreeTab())
-        inspectTabs.addTab("Evidence", navigator)
-        inspectTabs.addTab("Tournament", tournamentPanel)
-        inspectTabs.addTab("Permissions", permissionsPanel)
-
-        historyTabs.removeAll()
-        historyTabs.addTab("History", historyPanel)
-        historyTabs.addTab("Board", boardPanel)
-        historyTabs.addTab("Usage", usagePanel)
-        historyTabs.addTab("Settings", settingsPanel)
-        historyTabs.addTab("Status", statusPanel)
+        inspectTabs.addTab("Overview", stackViews(overviewPanel, blockersPanel, terminalPanel))
+        inspectTabs.addTab("Plan", stackViews(treePanel, tournamentPanel))
+        inspectTabs.addTab("Changes", changesPanel)
+        inspectTabs.addTab("Verification", stackViews(verificationPanel, navigator))
+        agentsTabs.removeAll()
+        agentsTabs.addTab("Roster", agentsPanel)
+        agentsTabs.addTab("Approvals", permissionsPanel)
+        agentsTabs.addTab("Coordination", boardPanel)
+        inspectTabs.addTab("Agents", agentsTabs)
 
         val tabs = this.tabs
         tabs.removeAll()
-        tabs.addTab("Work", workTabs)
+        tabs.addTab("Work", workPlane)
         tabs.addTab("Inspect", inspectTabs)
-        tabs.addTab("History", historyTabs)
+        tabs.addTab("History", historyPanel)
 
-        add(toolbar, BorderLayout.NORTH)
+        add(toolbarScroll, BorderLayout.NORTH)
         add(contentHost, BorderLayout.CENTER)
-        setInspectorVisible(false)
+        contentHost.removeAll()
+        contentHost.add(tabs, BorderLayout.CENTER)
     }
 
     /**
-     * Shows/hides the tabbed inspector beside the chat plane. Hiding removes
-     * the whole plane so the tool window stays usable at narrow widths
-     * (no fixed 430x600 floor); showing it embeds one resizable split.
+     * The Work surface: conversation + current run + ONE composer. The
+     * composer carries the task goal and, behind the Run options disclosure,
+     * the acceptance criteria, attachments and finish actions. Ask keeps the
+     * plain-prompt path reachable from the same composer.
      */
-    private fun setInspectorVisible(visible: Boolean) {
-        if (visible) {
-            val split = inspectorSplit ?: JSplitPane(JSplitPane.HORIZONTAL_SPLIT, chatPlane, tabs)
-                .apply {
-                    resizeWeight = 0.62
-                    isContinuousLayout = true
-                }
-                .also { inspectorSplit = it }
-            split.leftComponent = chatPlane
-            split.rightComponent = tabs
-            split.setDividerLocation(0.62)
-            contentHost.removeAll()
-            contentHost.add(split, BorderLayout.CENTER)
-        } else {
-            if (inspectorSplit != null) contentHost.removeAll()
-            contentHost.add(chatPlane, BorderLayout.CENTER)
-        }
-        inspectorToggle.isSelected = visible
-        contentHost.revalidate()
-        contentHost.repaint()
-    }
+    private fun buildWorkPlane() {
+        val transcriptBody = JPanel(BorderLayout())
+        transcriptBody.isOpaque = false
+        transcriptBody.add(insetScroll(transcript), BorderLayout.CENTER)
+        workPlane.add(card("Conversation", transcriptBody), BorderLayout.CENTER)
 
-    internal fun inspectorVisibleForTest(): Boolean = tabs.parent != null
+        val south = pageColumn(gap = Spacing.S, padding = 0)
+        south.border = BorderFactory.createEmptyBorder(Spacing.S, Spacing.M, Spacing.M, Spacing.M)
 
-    internal fun toggleInspectorForTest(): Boolean {
-        if (SwingUtilities.isEventDispatchThread()) {
-            inspectorToggle.doClick(0)
-        } else {
-            SwingUtilities.invokeAndWait { inspectorToggle.doClick(0) }
-        }
-        return inspectorToggle.isSelected
-    }
+        // Current run: the selected run, its bounded readout and Cancel run.
+        taskArea.isEditable = false
+        taskArea.font = uiPanelFont()
+        val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
+        runsBody.add(runsCombo)
+        runsBody.add(insetScroll(taskArea))
+        runsBody.add(actionRow(cancelRunButton))
+        south.add(card("Current run", runsBody))
 
-    internal fun chatPlaneForTest(): JPanel = chatPlane
-
-    internal fun inspectorTabsForTest(): JTabbedPane = tabs
-
-    /** The Work cluster's Task composer pane (host-matrix render hook). */
-    internal fun taskComposerPaneForTest(): java.awt.Component = workTabs.getComponentAt(0)
-
-    /**
-     * Selects the cluster + sub-tab that owns [panel] (used by evidence and
-     * child-transcript navigation, which live in the Inspect cluster).
-     */
-    private fun selectInspectorPanel(panel: java.awt.Component) {
-        for (i in 0 until tabs.tabCount) {
-            val cluster = tabs.getComponentAt(i) as? JTabbedPane ?: continue
-            for (j in 0 until cluster.tabCount) {
-                if (cluster.getComponentAt(j) === panel) {
-                    tabs.selectedIndex = i
-                    cluster.selectedIndex = j
-                    return
-                }
-            }
-        }
-    }
-
-    /** Selects one top-level cluster or sub-tab by title (smoke reachability). */
-    internal fun selectPanelForTest(title: String): Boolean {
-        for (i in 0 until tabs.tabCount) {
-            if (tabs.getTitleAt(i) == title) {
-                tabs.selectedIndex = i
-                return true
-            }
-            val cluster = tabs.getComponentAt(i) as? JTabbedPane ?: continue
-            for (j in 0 until cluster.tabCount) {
-                if (cluster.getTitleAt(j) == title) {
-                    tabs.selectedIndex = i
-                    cluster.selectedIndex = j
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
-    /**
-     * A visually adjacent label PROGRAMMATICALLY associated with its control
-     * (`labelFor`), so screen readers and mnemonic traversal see the pair —
-     * not just two adjacent widgets (INV-JETBRAINS-A11Y).
-     */
-    private fun fieldLabel(text: String, target: JComponent): JLabel =
-        JLabel(text).apply { labelFor = target }
-
-    /**
-     * Whole configuration surfaces scroll instead of clipping: a tall form in
-     * a short JetBrains tool window must remain reachable without resizing.
-     */
-    private fun scrollable(content: JComponent): JScrollPane =
-        JScrollPane(content).apply {
-            border = null
-            verticalScrollBar.unitIncrement = 16
-            horizontalScrollBar.unitIncrement = 16
-        }
-
-    private fun buildTaskTab(): JScrollPane {
-        val startBody = pageColumn(gap = Spacing.S, padding = 0)
+        // The composer: one input, Run task / Ask / Abort, and the run-options
+        // disclosure next to it.
         criteriaField.toolTipText = "Optional: acceptance criteria, comma separated"
-        startBody.add(
-            FormGrid()
-                .row("Goal", goalField)
-                .row("Criteria (comma separated)", criteriaField)
-                .build()
-        )
+        val optionsBody = pageColumn(gap = Spacing.S, padding = 0)
+        optionsBody.add(FormGrid().row("Acceptance criteria (comma separated)", criteriaField).build())
         val contractBox = JPanel(GridLayout(3, 1, Spacing.XS, Spacing.XS))
         contractBox.isOpaque = false
         contractBox.add(completionCommit)
         contractBox.add(completionPush)
         contractBox.add(completionPr)
-        startBody.add(sectionHeader("Finish when done (Task mode only)", muted = true))
-        startBody.add(contractBox)
-        startBody.add(sectionHeader("Attachments (submitted as files)", muted = true))
-        startBody.add(attachments)
-        startBody.add(actionRow(startTaskButton))
-        val runsBody = pageColumn(gap = Spacing.XS, padding = 0)
-        runsBody.add(runsCombo)
-        runsBody.add(vSpace(Spacing.XS))
-        taskArea.isEditable = false
-        taskArea.font = uiPanelFont()
-        runsBody.add(insetScroll(taskArea))
-        runsBody.add(actionRow(cancelRunButton))
-        val page = pageColumn()
-        page.add(card("Start task", startBody))
-        page.add(vSpace(Spacing.M))
-        page.add(card("Task runs", runsBody))
-        // The page column IS the scroll view (it tracks the viewport width),
-        // so a 240px tool window reflows instead of showing a horizontal
-        // scrollbar under a wider intermediate panel.
-        return scrollable(page)
+        optionsBody.add(sectionHeader("Finish when done", muted = true))
+        optionsBody.add(contractBox)
+        optionsBody.add(sectionHeader("Attachments (submitted as files)", muted = true))
+        optionsBody.add(attachments)
+        runOptionsBody.isOpaque = false
+        runOptionsBody.add(optionsBody, BorderLayout.CENTER)
+        runOptionsBody.isVisible = false
+        runOptionsToggle.addActionListener {
+            runOptionsBody.isVisible = runOptionsToggle.isSelected
+            runOptionsToggle.text =
+                if (runOptionsToggle.isSelected) "Run options ▴" else "Run options ▾"
+            revalidate()
+            repaint()
+        }
+        val actions = actionRow(startTaskButton, sendButton, abortButton, runOptionsToggle)
+        val composerBody = pageColumn(gap = Spacing.S, padding = 0)
+        composerBody.add(focusAccentScroll(input))
+        composerBody.add(actions)
+        composerBody.add(runOptionsBody)
+        south.add(card("Ask Faktor", composerBody))
+        workPlane.add(south, BorderLayout.SOUTH)
     }
 
-    private fun buildTaskTreeTab(): JPanel {
-        // Both panes carry their own page scroll (their bodies are bounded),
-        // so the split hosts them directly — no double scroll surface.
-        val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, treePanel, blockersPanel)
-        split.resizeWeight = 0.62
-        split.isContinuousLayout = true
-        val panel = JPanel(BorderLayout())
-        panel.add(split, BorderLayout.CENTER)
-        return panel
+    /** One vertical stack of view panels: each keeps its own scroll. */
+    private fun stackViews(vararg views: JComponent): JPanel {
+        val host = JPanel(BorderLayout())
+        if (views.size == 1) {
+            host.add(views[0], BorderLayout.CENTER)
+            return host
+        }
+        // Nested equal splits: the outer split holds the first view against
+        // the rest, each level weighting its top view 1/(remaining count).
+        fun build(index: Int): JComponent {
+            if (index == views.size - 1) return views[index]
+            val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, views[index], build(index + 1))
+            split.resizeWeight = 1.0 / (views.size - index)
+            split.isContinuousLayout = true
+            return split
+        }
+        host.add(build(0), BorderLayout.CENTER)
+        return host
+    }
+
+    /**
+     * Shows one utility view (Settings, Usage, Diagnostics) over the tabbed
+     * navigator with an explicit Back affordance. The utilities are NOT
+     * destinations: they are opened from the toolbar/overflow and dismissed
+     * back to the Work/Inspect/History model.
+     */
+    private fun showUtility(title: String, panel: java.awt.Component) {
+        val host = JPanel(BorderLayout())
+        host.background = panelSurface()
+        val backButton = secondaryButton("Back")
+        backButton.addActionListener { hideUtility() }
+        val headerRow = JPanel(BorderLayout(Spacing.S, 0))
+        headerRow.isOpaque = true
+        headerRow.background = panelSurface()
+        headerRow.border = BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, FaktorTheme.separator()),
+            BorderFactory.createEmptyBorder(Spacing.S, Spacing.M, Spacing.S, Spacing.M)
+        )
+        val backRow = JPanel(FlowLayout(FlowLayout.LEFT, Spacing.S, 0))
+        backRow.isOpaque = false
+        backRow.add(backButton)
+        headerRow.add(backRow, BorderLayout.WEST)
+        utilityHeader.fullText = title
+        utilityHeader.font = sectionTitleFont()
+        utilityHeader.foreground = textForeground()
+        headerRow.add(utilityHeader, BorderLayout.CENTER)
+        host.add(headerRow, BorderLayout.NORTH)
+        host.add(panel, BorderLayout.CENTER)
+        contentHost.removeAll()
+        contentHost.add(host, BorderLayout.CENTER)
+        utilityShown = true
+        contentHost.revalidate()
+        contentHost.repaint()
+    }
+
+    private fun hideUtility() {
+        contentHost.removeAll()
+        contentHost.add(tabs, BorderLayout.CENTER)
+        utilityShown = false
+        contentHost.revalidate()
+        contentHost.repaint()
+    }
+
+    internal fun utilityOpenForTest(): Boolean = utilityShown
+
+    internal fun openUtilityForTest(title: String): Boolean {
+        when (title) {
+            "Settings" -> showUtility("Settings", settingsPanel)
+            "Usage" -> showUtility("Usage", usagePanel)
+            "Diagnostics" -> showUtility("Diagnostics", diagnosticsPanel)
+            else -> return false
+        }
+        return true
+    }
+
+    internal fun closeUtilityForTest() {
+        hideUtility()
+    }
+
+    internal fun workPlaneForTest(): JPanel = workPlane
+
+    /** The Work composer pane (host-matrix render hook). */
+    internal fun taskComposerPaneForTest(): java.awt.Component = workPlane.getComponent(1)
+
+    /**
+     * Selects the cluster + sub-view that owns [panel] (used by evidence and
+     * child-transcript navigation, which live in the Inspect cluster).
+     */
+    private fun selectInspectorPanel(panel: java.awt.Component) {
+        val chain = findTabChain(tabs, panel) ?: return
+        for ((pane, index) in chain) pane.selectedIndex = index
+    }
+
+    private fun findTabChain(
+        pane: JTabbedPane,
+        target: java.awt.Component
+    ): List<Pair<JTabbedPane, Int>>? {
+        for (i in 0 until pane.tabCount) {
+            val component = pane.getComponentAt(i)
+            if (component === target) return listOf(Pair(pane, i))
+            if (component is JTabbedPane) {
+                val nested = findTabChain(component, target)
+                if (nested != null) return listOf(Pair(pane, i)) + nested
+            }
+            if (component is java.awt.Container) {
+                val nested = findTabChainInChildren(component, target)
+                if (nested != null) return listOf(Pair(pane, i)) + nested
+            }
+        }
+        return null
+    }
+
+    private fun findTabChainInChildren(
+        container: java.awt.Container,
+        target: java.awt.Component
+    ): List<Pair<JTabbedPane, Int>>? {
+        for (child in container.components) {
+            if (child === target) return emptyList()
+            if (child is JTabbedPane) {
+                val nested = findTabChain(child, target)
+                if (nested != null) return nested
+            }
+            if (child is java.awt.Container) {
+                val nested = findTabChainInChildren(child, target)
+                if (nested != null) return nested
+            }
+        }
+        return null
+    }
+
+    /** Selects one reachable view by title (smoke reachability). */
+    internal fun selectPanelForTest(title: String): Boolean {
+        if (tabs.getTitleAt(tabs.selectedIndex) == title) return true
+        for (i in 0 until tabs.tabCount) {
+            if (tabs.getTitleAt(i) == title) {
+                tabs.selectedIndex = i
+                return true
+            }
+            if (selectNestedTitle(tabs.getComponentAt(i), title)) {
+                tabs.selectedIndex = i
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun selectNestedTitle(component: java.awt.Component, title: String): Boolean {
+        if (component !is JTabbedPane) return false
+        for (i in 0 until component.tabCount) {
+            if (component.getTitleAt(i) == title) {
+                component.selectedIndex = i
+                return true
+            }
+            if (selectNestedTitle(component.getComponentAt(i), title)) {
+                component.selectedIndex = i
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -620,9 +694,9 @@ class FaktorChatPanel(
      * idempotency identity the daemon replays after a lost response.
      */
     private fun startTaskFromControls() {
-        val goal = goalField.text.trim()
+        val goal = input.text.trim()
         if (goal.isEmpty()) {
-            appendSystem("task goal must not be empty")
+            appendSystem("the composer is empty; describe what Faktor should do")
             return
         }
         if (!startInFlight.compareAndSet(false, true)) {
@@ -979,9 +1053,6 @@ class FaktorChatPanel(
             }
         }
         startTaskButton.addActionListener { startTaskFromControls() }
-        // Enter in the goal field is the keyboard twin of the Start task
-        // control: both route through the same guarded single-flight path.
-        goalField.addActionListener { startTaskFromControls() }
         cancelRunButton.addActionListener {
             val run = runsCombo.selectedItem as? NativeTaskRun
             if (run == null) {
@@ -1321,6 +1392,7 @@ class FaktorChatPanel(
                 runAsync("spawn terminal") {
                     val spawned = service.spawnTerminal(command, args, cwd)
                     onEdt {
+                        terminalPanel.noteSpawned(spawned.ptyId, command, args, cwd)
                         appendSystem(
                             "terminal ${spawned.ptyId} spawned (pid ${spawned.pid}, " +
                                 "op ${spawned.operationId})"
@@ -1364,12 +1436,8 @@ class FaktorChatPanel(
             }
 
             override fun onProviderSelectionChanged(provider: String, model: String) {
-                // The composer text fields mirror the selection so the
-                // existing new-session path keeps one source of truth.
-                onEdt {
-                    providerField.text = provider
-                    modelField.text = model
-                }
+                // The Settings selection is the single source of truth for the
+                // next session's provider/model; nothing else mirrors it.
             }
 
             override fun onControlPlaneCredential(
@@ -1396,6 +1464,14 @@ class FaktorChatPanel(
                 }
             }
 
+            override fun onRefresh() {
+                runAsync("refresh history") { refreshHistoryBlocking() }
+            }
+        })
+        // The daemon/stream recovery machinery lives on Diagnostics, not on
+        // History: reconnect resumes from the exact cursor, restart adopts a
+        // restarted service, refresh re-reads the whole model.
+        diagnosticsPanel.setListener(object : DiagnosticsPanel.Listener {
             override fun onRestart() {
                 runAsync("restart daemon") {
                     val health = service.restart()
@@ -1413,7 +1489,7 @@ class FaktorChatPanel(
             }
 
             override fun onRefresh() {
-                runAsync("refresh history") { refreshHistoryBlocking() }
+                runAsync("refresh") { refreshAllBlocking() }
             }
         })
     }
@@ -1446,10 +1522,10 @@ class FaktorChatPanel(
     }
 
     private fun selectedProviderOrDefault(): String =
-        settingsPanel.selectedProvider() ?: providerField.text.trim().ifEmpty { "default" }
+        settingsPanel.selectedProvider() ?: "default"
 
     private fun selectedModelOrDefault(): String =
-        settingsPanel.selectedModel() ?: modelField.text.trim().ifEmpty { "default" }
+        settingsPanel.selectedModel() ?: "default"
 
     /**
      * The New-session composer path: the Settings provider selection (or the
@@ -1695,7 +1771,7 @@ class FaktorChatPanel(
         }
     }
 
-    /** Durable session history + the live stream/daemon readout. */
+    /** Durable prior work + the live stream/daemon readout. */
     private fun refreshHistoryBlocking() {
         if (!service.isRunning()) return
         try {
@@ -1705,7 +1781,7 @@ class FaktorChatPanel(
             val stream = service.streamStatus()
             val cursor = service.streamCursor()
             onEdt { historyPanel.update(sessions, current) }
-            onEdt { historyPanel.setConnection(daemon, stream, cursor, current) }
+            onEdt { diagnosticsPanel.setConnection(daemon, stream, cursor, current) }
         } catch (e: NativeApiException) {
             onEdt {
                 historyPanel.setUnavailable("history read refused (status ${e.status} ${e.code})")
@@ -1721,7 +1797,7 @@ class FaktorChatPanel(
 
     private fun refreshStatusBlocking() {
         val projection = service.projection()
-        onEdt { statusPanel.applyProjection(projection) }
+        onEdt { diagnosticsPanel.applyProjection(projection) }
     }
 
     /**
@@ -1734,11 +1810,11 @@ class FaktorChatPanel(
         if (!service.isRunning() || service.currentSessionId() == null) return
         try {
             val response = service.indexCoverage()
-            onEdt { statusPanel.setIndex(indexCoverageLabel(response.snapshot)) }
+            onEdt { diagnosticsPanel.setIndex(indexCoverageLabel(response.snapshot)) }
         } catch (e: NativeApiException) {
-            onEdt { statusPanel.setIndex("index: refused (${e.status} ${e.code})") }
+            onEdt { diagnosticsPanel.setIndex("index: refused (${e.status} ${e.code})") }
         } catch (e: Exception) {
-            onEdt { statusPanel.setIndex("index: read failed") }
+            onEdt { diagnosticsPanel.setIndex("index: read failed") }
         }
     }
 
@@ -1794,14 +1870,16 @@ class FaktorChatPanel(
 
     private fun refreshAgentsBlocking() {
         val agents = service.agents()
-        onEdt { agentsPanel.update(agents) }
+        currentAgents = agents
+        val model = currentTree
+        onEdt { agentsPanel.update(agents, model) }
     }
 
     private fun refreshUsageBlocking() {
         val usage = service.usage()
         val sessionUsage = service.sessionUsage()
         onEdt {
-            statusPanel.setUsage(
+            diagnosticsPanel.setUsage(
                 "usage: sessions=${usage.sessions} tokens=${sessionUsage.tokens} " +
                     "taskCostMicro=${usage.settledCostMicro}"
             )
@@ -1858,7 +1936,7 @@ class FaktorChatPanel(
     private fun refreshVerificationBlocking() {
         val verification = service.verification()
         onEdt {
-            statusPanel.setVerification(
+            diagnosticsPanel.setVerification(
                 "verification: owed=${verification.owed.size} " +
                     "failed=${verification.failedChecks.size}"
             )
@@ -2037,9 +2115,14 @@ class FaktorChatPanel(
         onEdt {
             currentTree = model
             treePanel.update(model)
-            blockersPanel.update(model.blockers, permissions, model.taskBlockers)
+            blockersPanel.update(model.blockers, model.taskBlockers)
             tournamentPanel.setTournament(model.tournament)
             navigator.setEvidence(model.evidence)
+            overviewPanel.updateModel(model)
+            verificationPanel.updateModel(model)
+            val files = task?.changedFiles.orEmpty().ifEmpty { projection.filesChanged }
+            changesPanel.update(files, model.evidence)
+            agentsPanel.update(currentAgents, model)
         }
     }
 
@@ -2132,14 +2215,14 @@ class FaktorChatPanel(
 
     override fun onDaemonStatus(status: String, detail: String?) {
         onEdt {
-            statusPanel.setDaemon("daemon: $status" + (if (detail == null) "" else " ($detail)"))
+            diagnosticsPanel.setDaemon("daemon: $status" + (if (detail == null) "" else " ($detail)"))
         }
     }
 
     override fun onStreamStatus(status: String, detail: String?) {
         onEdt {
-            statusPanel.setStream("stream: $status" + (if (detail == null) "" else " ($detail)"))
-            historyPanel.setConnection(
+            diagnosticsPanel.setStream("stream: $status" + (if (detail == null) "" else " ($detail)"))
+            diagnosticsPanel.setConnection(
                 service.daemonDescription(), status, service.streamCursor(), service.currentSessionId()
             )
         }
@@ -2216,21 +2299,21 @@ class FaktorChatPanel(
         startTaskFromControls()
     }
 
-    /** The keyboard twin of the Start task control (Enter in the goal field). */
+    /** The keyboard twin of Run task (Ctrl+Enter in the composer). */
     internal fun submitTaskViaEnterForTest() {
-        goalField.postActionEvent()
+        startTaskFromControls()
     }
 
     internal fun startTaskEnabledForTest(): Boolean = startTaskButton.isEnabled
 
     internal fun newSessionEnabledForTest(): Boolean = newSessionButton.isEnabled
 
-    internal fun goalTextForTest(): String = goalField.text
+    internal fun goalTextForTest(): String = input.text
 
     internal fun attachmentsCountForTest(): Int = attachments.count()
 
     internal fun setTaskFieldsForTest(goal: String, criteria: String) {
-        goalField.text = goal
+        input.text = goal
         criteriaField.text = criteria
     }
 
@@ -2280,6 +2363,14 @@ class FaktorChatPanel(
 
     internal fun blockersView(): BlockersPanel = blockersPanel
 
+    internal fun diagnosticsView(): DiagnosticsPanel = diagnosticsPanel
+
+    internal fun overviewView(): OverviewPanel = overviewPanel
+
+    internal fun changesView(): ChangesPanel = changesPanel
+
+    internal fun verificationView(): VerificationPanel = verificationPanel
+
     internal fun terminalView(): TerminalPanel = terminalPanel
 
     internal fun settingsView(): SettingsPanel = settingsPanel
@@ -2295,17 +2386,26 @@ class FaktorChatPanel(
     internal fun evidenceView(): EvidenceNavigatorPanel = navigator
 
     /**
-     * Every reachable tab title, clusters first then each cluster's sub-tabs
-     * (the flattening is the smoke's "every panel is still reachable" view).
+     * Every reachable view title: the Work/Inspect/History clusters first,
+     * then each cluster's views (including nested ones such as the Agents
+     * roster/approvals/coordination).
      */
     internal fun tabTitles(): List<String> {
         val out = ArrayList<String>()
         for (i in 0 until tabs.tabCount) {
             out.add(tabs.getTitleAt(i))
-            val cluster = tabs.getComponentAt(i) as? JTabbedPane ?: continue
-            for (j in 0 until cluster.tabCount) out.add(cluster.getTitleAt(j))
+            collectTitles(tabs.getComponentAt(i), out)
         }
         return out
+    }
+
+    private fun collectTitles(component: java.awt.Component, out: MutableList<String>) {
+        if (component is JTabbedPane) {
+            for (i in 0 until component.tabCount) {
+                out.add(component.getTitleAt(i))
+                collectTitles(component.getComponentAt(i), out)
+            }
+        }
     }
 
     /** The top-level cluster destinations only (the Work/Inspect/History model). */
@@ -2449,6 +2549,14 @@ class FaktorChatPanel(
             renderedSeq = 0
             boardPanel.reset()
             navigator.resetSessionView()
+            currentTree = null
+            currentAgents = emptyList()
+            overviewPanel.updateModel(null)
+            verificationPanel.updateModel(null)
+            changesPanel.update(emptyList(), emptyList())
+            blockersPanel.update(emptyList(), emptyList())
+            permissionsPanel.update(emptyList())
+            agentsPanel.update(emptyList(), null)
             // Session-scoped identities and tracked targets never cross a
             // switch: a stale completion contract or tournament id would be
             // rendered (and acted on) as if it belonged to the new session.

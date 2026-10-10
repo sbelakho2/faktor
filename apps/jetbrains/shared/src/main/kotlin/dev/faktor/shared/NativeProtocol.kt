@@ -544,7 +544,10 @@ data class NativeSessionSummary(
     val title: String,
     val provider: String,
     val model: String,
-    val state: String
+    val state: String,
+    /** Additive: the durable creation time when the daemon serves it
+     * (`created_ms`/`createdMs`); absent on a legacy daemon, never fabricated. */
+    val createdMs: Long? = null
 )
 
 data class NativeAttachmentMimeLimit(val mime: String, val maxBytes: Long)
@@ -1439,7 +1442,9 @@ fun parseNativeSessionList(json: String): List<NativeSessionSummary> {
             title = it.field("title").string(),
             provider = it.field("provider").string(),
             model = it.field("model").string(),
-            state = it.field("state").string()
+            state = it.field("state").string(),
+            createdMs = it.optionalField("created_ms")?.long()
+                ?: it.optionalField("createdMs")?.long()
         )
     }
 }

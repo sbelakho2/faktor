@@ -164,6 +164,7 @@ run_cmd "$NODE_BIN" scripts/check-invariant-coverage.mjs selftest
 run_cmd "$NODE_BIN" scripts/check-invariant-coverage.mjs --check
 run_cmd "$NODE_BIN" scripts/check-invariant-coverage.mjs --release
 run_cmd "$NODE_BIN" scripts/check-network-authority-singular.mjs
+run_cmd "$NODE_BIN" scripts/check-authority-collapse.mjs --selftest-then-coverage
 run_cmd "$NODE_BIN" scripts/check-ignored-tests.mjs
 run_cmd "$NODE_BIN" scripts/check-ignored-tests.mjs --selftest
 run_shell "bash scripts/check-docs-sync.sh"

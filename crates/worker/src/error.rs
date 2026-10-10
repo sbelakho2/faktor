@@ -34,6 +34,20 @@ pub enum WorkerError {
     TokenRevoked,
     #[error("worker token was already consumed by worker {0}")]
     TokenAlreadyUsed(String),
+    /// Defense-in-depth (audit P1): a worker claiming a token whose durable
+    /// `consumed_by` is still `None` is NEVER authenticated — the token has
+    /// not been bound to it by an atomic registration.
+    #[error("worker token is not consumed for worker {0}: it was never bound to it")]
+    TokenNotConsumed(WorkerId),
+    /// Audit P1: a legacy/partial registration left another worker row of the
+    /// organization carrying this token hash while the token row itself was
+    /// never consumed. The token is structurally unavailable to any other
+    /// worker.
+    #[error("registration token {token_hash} is already bound to worker {worker}")]
+    TokenBoundElsewhere {
+        worker: WorkerId,
+        token_hash: String,
+    },
     #[error("worker token belongs to organization {owner}, not {requested}")]
     TokenOrgMismatch { owner: String, requested: String },
     #[error("worker {0} is unknown")]
@@ -170,6 +184,8 @@ impl From<WorkerError> for faktor_cloud::ControlPlaneError {
             }
             WorkerError::TokenRevoked
             | WorkerError::TokenAlreadyUsed(_)
+            | WorkerError::TokenNotConsumed(_)
+            | WorkerError::TokenBoundElsewhere { .. }
             | WorkerError::WorkerRevoked(_)
             | WorkerError::AlreadyRevoked(_) => {
                 faktor_cloud::ControlPlaneError::Unauthorized(e.to_string())

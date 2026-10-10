@@ -1919,3 +1919,90 @@ mutation_command = "node scripts/mutation-run.mjs INV-SEMANTIC-CONTEXT-BYTE-BOUN
 mutation_debt = ""
 release_critical = true
 platforms = ["linux"]
+
+[[invariant]]
+id = "INV-AUTHORITY-COLLAPSE-FREE"
+statement = "In the authority-bearing modules, an unreadable authority read never collapses to absence/default: .ok()/unwrap_or_default() on authority receivers and bare Err(_) arms are mechanically rejected unless explicitly reviewed, and stale allowlist entries fail too."
+owner = "scripts/check-authority-collapse.mjs authority law"
+authority = "scripts/check-authority-collapse.mjs + planted mutation scripts/mutations/INV-AUTHORITY-COLLAPSE-FREE.json"
+script_check = "node scripts/check-authority-collapse.mjs --selftest-then-coverage"
+mutation_witness = "node scripts/check-authority-collapse.mjs --selftest-then-coverage"
+mutation_command = "node scripts/mutation-run.mjs INV-AUTHORITY-COLLAPSE-FREE"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-AUTH-REQUIRES-CONSUMPTION"
+statement = "Worker authentication requires the presented token's durable consumed_by to name the authenticating worker; an unconsumed or differently consumed token is a typed refusal."
+owner = "crates/worker authentication"
+authority = "planted mutation scripts/mutations/INV-WORKER-AUTH-REQUIRES-CONSUMPTION.json"
+script_check = ""
+unit_test = "legacy_partial_binding_refuses_a_second_worker_and_never_authenticates"
+production_wiring = "capability_mismatch_and_wrong_token_are_refused"
+fault = ""
+mutation_witness = "legacy_partial_binding_refuses_a_second_worker_and_never_authenticates"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-AUTH-REQUIRES-CONSUMPTION"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-TOKEN-SINGLE-BINDING"
+statement = "Registration commits in one store transaction that refuses any second worker binding a token hash already bound in the organization, including legacy partial states."
+owner = "crates/worker registration transaction"
+authority = "planted mutation scripts/mutations/INV-WORKER-TOKEN-SINGLE-BINDING.json"
+script_check = ""
+unit_test = "parallel_registrations_of_one_token_yield_exactly_one_winner"
+production_wiring = "token_reuse_from_another_worker_is_refused_and_revocation_kills_the_token"
+fault = ""
+mutation_witness = "parallel_registrations_of_one_token_yield_exactly_one_winner"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-TOKEN-SINGLE-BINDING"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-REGISTRATION-ATOMIC-REPAIR"
+statement = "A crash-window partial registration is repaired in the same atomic binding transaction: consumed_by is written together with the worker row."
+owner = "crates/worker registration transaction"
+authority = "planted mutation scripts/mutations/INV-WORKER-REGISTRATION-ATOMIC-REPAIR.json"
+script_check = ""
+unit_test = "crash_window_partial_registration_repairs_the_token_binding"
+production_wiring = "durable_rows_survive_a_store_reopen"
+fault = ""
+mutation_witness = "crash_window_partial_registration_repairs_the_token_binding"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-REGISTRATION-ATOMIC-REPAIR"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-ACCEPT-JOURNAL-ATOMIC"
+statement = "A lease acceptance and its lease_accepted audit row commit in one transaction; a journal failure aborts the whole transition (no accepted lease without its proof)."
+owner = "crates/worker lease acceptance"
+authority = "planted mutation scripts/mutations/INV-WORKER-ACCEPT-JOURNAL-ATOMIC.json"
+script_check = ""
+unit_test = "journal_failure_aborts_the_whole_lease_accept"
+production_wiring = "double_accept_of_one_generation_yields_exactly_one_lease"
+fault = ""
+mutation_witness = "journal_failure_aborts_the_whole_lease_accept"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-ACCEPT-JOURNAL-ATOMIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-WORKER-REGISTER-JOURNAL-ATOMIC"
+statement = "The registration journal row commits inside the identity-binding transaction; a missing row is impossible after a successful registration."
+owner = "crates/worker registration transaction"
+authority = "planted mutation scripts/mutations/INV-WORKER-REGISTER-JOURNAL-ATOMIC.json"
+script_check = ""
+unit_test = "seeded_model_preserves_identity_and_journal_invariants_memory"
+production_wiring = "seeded_model_preserves_identity_and_journal_invariants_across_sqlite_reopen"
+fault = ""
+mutation_witness = "seeded_model_preserves_identity_and_journal_invariants_memory"
+mutation_command = "node scripts/mutation-run.mjs INV-WORKER-REGISTER-JOURNAL-ATOMIC"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux", "macos", "windows"]

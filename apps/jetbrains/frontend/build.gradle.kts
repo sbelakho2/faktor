@@ -11,11 +11,7 @@ intellijPlatform {
         id = "dev.faktor.jetbrains"
         name = "Faktor"
         version = "0.1.0"
-        description = """
-            Faktor split-mode bridge for JetBrains IDEs: chat, task runs,
-            background agents, usage, verification and evidence against a
-            local faktor-cli daemon over Native Protocol v1.
-        """.trimIndent()
+        description = "Faktor — an engineering agent for autonomous code investigation, implementation and verification inside your IDE."
         vendor {
             name = "Faktor"
         }

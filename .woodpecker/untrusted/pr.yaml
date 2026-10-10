@@ -387,6 +387,9 @@ steps:
       # Singular-authority law: the retired raw network matcher must never
       # return; the canonical destination/DNS authority owns egress.
       - node scripts/check-network-authority-singular.mjs
+      # Authority law: unreadable authority reads must never collapse to
+      # absence/default; the checker reviews exceptions explicitly.
+      - node scripts/check-authority-collapse.mjs --selftest-then-coverage
       # The executable planted-mutation campaign (cargo + JDK/gradle + Node)
       # runs in the trusted workflow's jetbrains-smoke lane; this node-only
       # PR image carries no toolchains, so running it here would count

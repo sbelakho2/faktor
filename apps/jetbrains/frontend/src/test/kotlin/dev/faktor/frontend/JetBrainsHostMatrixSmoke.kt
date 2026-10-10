@@ -86,6 +86,10 @@ object JetBrainsHostMatrixSmoke {
     private val panelFactories: List<Pair<String, () -> JComponent>> = listOf(
         "task" to { freshTaskComposerPane() },
         "task-tree" to { cannedTaskTreePanel() },
+        "plan" to { cannedTaskTreePanel() },
+        "overview" to { cannedOverviewPanel() },
+        "changes" to { cannedChangesPanel() },
+        "verification" to { cannedVerificationPanel() },
         "blockers" to { cannedBlockersPanel() },
         "tournament" to { cannedTournamentPanel() },
         "permissions" to { cannedPermissionsPanel() },
@@ -93,7 +97,7 @@ object JetBrainsHostMatrixSmoke {
         "evidence" to { cannedEvidencePanel() },
         "board" to { cannedBoardPanel() },
         "agents" to { cannedAgentsPanel() },
-        "status" to { cannedStatusPanel() },
+        "diagnostics" to { cannedDiagnosticsPanel() },
         "usage" to { cannedUsagePanel() },
         "settings" to { cannedSettingsPanel() },
         "history" to { cannedHistoryPanel() }
@@ -350,6 +354,10 @@ object JetBrainsHostMatrixSmoke {
         val affected = listOf(
             "task" to { freshTaskComposerPane() },
             "task-tree" to { cannedTaskTreePanel() },
+            "plan" to { cannedTaskTreePanel() },
+            "overview" to { cannedOverviewPanel() },
+            "changes" to { cannedChangesPanel() },
+            "verification" to { cannedVerificationPanel() },
             "blockers" to { cannedBlockersPanel() },
             "tournament" to { cannedTournamentPanel() },
             "permissions" to { cannedPermissionsPanel() },
@@ -357,7 +365,7 @@ object JetBrainsHostMatrixSmoke {
             "evidence" to { cannedEvidencePanel() },
             "board" to { cannedBoardPanel() },
             "agents" to { cannedAgentsPanel() },
-            "status" to { cannedStatusPanel() },
+            "diagnostics" to { cannedDiagnosticsPanel() },
             "usage" to { cannedUsagePanel() },
             "settings" to { cannedSettingsPanel() },
             "history" to { cannedHistoryPanel() }
@@ -506,7 +514,11 @@ object JetBrainsHostMatrixSmoke {
                 "evidence" to EvidenceNavigatorPanel(),
                 "board" to BoardPanel(),
                 "settings" to SettingsPanel(),
-                "history" to HistoryPanel()
+                "history" to HistoryPanel(),
+                "diagnostics" to DiagnosticsPanel(),
+                "overview" to OverviewPanel(),
+                "changes" to ChangesPanel(),
+                "verification" to VerificationPanel()
             )
             for ((name, panel) in fresh) {
                 ParityAwt.layout(panel, 320, 600)
@@ -520,13 +532,12 @@ object JetBrainsHostMatrixSmoke {
             requireTrue(panel.count() == 0, "empty history must report zero sessions")
             requireTrue(!panel.openEnabled(), "empty history must not enable open")
         }
-        check("state/loading/history") {
-            val panel = HistoryPanel()
-            panel.update(emptyList(), null)
+        check("state/loading/diagnostics") {
+            val panel = DiagnosticsPanel()
             panel.setConnection("connecting to daemon", "connecting", 0L, null)
             requireTrue(
                 panel.streamText().contains("connecting"),
-                "loading history must render the connecting stream state"
+                "loading diagnostics must render the connecting stream state"
             )
             ParityAwt.layout(panel, 320, 600)
         }
@@ -556,8 +567,8 @@ object JetBrainsHostMatrixSmoke {
             val stats = paint(tree, 320, 600)
             requireTrue(stats.distinctColors >= 2, "blocked task tree degenerate: $stats")
         }
-        check("state/reconnect/history") {
-            val panel = cannedHistoryPanel()
+        check("state/reconnect/diagnostics") {
+            val panel = cannedDiagnosticsPanel()
             requireTrue(panel.restartEnabled(), "restart control must exist for reconnect")
             requireTrue(panel.reconnectEnabled(), "reconnect control must exist")
             panel.setConnection("stopped", "off", 0L, null)

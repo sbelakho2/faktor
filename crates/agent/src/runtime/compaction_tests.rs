@@ -1364,7 +1364,9 @@ async fn malicious_sibling_board_post_retrieved_and_summarized_is_never_instruct
     // The compiler's selected item preserves the provenance: the
     // malicious post can ride the prompt only as DATA.
     let compiler = ContextCompiler::new(Some(runtime.evidence_authority().clone()), None);
-    let mut facts = runtime.task_facts_for(&handle, &TaskLedger::default(), task_id);
+    let mut facts = runtime
+        .task_facts_for(&handle, &TaskLedger::default(), task_id)
+        .expect("session identity and task ledger are readable");
     // A REQUIRED criterion with an explicit typed evidence edge: the
     // board envelope is fetched by id regardless of keyword matching, so
     // the selection is deterministic.

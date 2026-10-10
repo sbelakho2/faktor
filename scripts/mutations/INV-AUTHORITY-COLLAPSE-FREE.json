@@ -1,0 +1,9 @@
+{
+  "id": "INV-AUTHORITY-COLLAPSE-FREE",
+  "file": "crates/agent/src/runtime/retrieval.rs",
+  "find": "        let tasks = handle.list_tasks()?;",
+  "replace": "        let tasks = handle.list_tasks().unwrap_or_default();",
+  "gate": "node scripts/check-authority-collapse.mjs --coverage",
+  "expect": "UNREVIEWED",
+  "note": "Collapsing an unreadable task-ledger read to an empty list is the exact defect class the authority law bans; the static checker must flag the unreviewed collapse."
+}

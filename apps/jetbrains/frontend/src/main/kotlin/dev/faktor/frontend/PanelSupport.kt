@@ -698,7 +698,9 @@ internal fun semanticForeground(state: SemanticState): Color {
  * color only re-enforces it.
  */
 internal fun statusChip(text: String, state: SemanticState): JLabel {
-    val tone = semanticForeground(state)
+    // DIM must stay readable: `Label.disabledForeground` can be nearly the
+    // panel surface color, so dim chips use the muted text tone instead.
+    val tone = if (state == SemanticState.DIM) mutedForeground() else semanticForeground(state)
     return JLabel(text).apply {
         font = sectionTitleFont()
         foreground = tone
@@ -1114,9 +1116,9 @@ internal object RowRhythm {
     private const val HOVER_KEY = "faktor.hoverRowIndex"
 
     /** Applies the row rhythm and the rollover tracker to one list. */
-    fun install(list: JList<*>) {
-        applyHeight(list)
-        list.addPropertyChangeListener("font") { applyHeight(list) }
+    fun install(list: JList<*>, lines: Int = 1) {
+        applyHeight(list, lines)
+        list.addPropertyChangeListener("font") { applyHeight(list, lines) }
         list.addMouseMotionListener(
             object : MouseMotionAdapter() {
                 override fun mouseMoved(e: MouseEvent?) {
@@ -1144,9 +1146,9 @@ internal object RowRhythm {
         return if (hovered == index) FaktorTheme.hover() else null
     }
 
-    private fun applyHeight(list: JList<*>) {
+    private fun applyHeight(list: JList<*>, lines: Int) {
         val metrics = list.getFontMetrics(list.font ?: uiPanelFont())
-        list.fixedCellHeight = Math.max(24, metrics.height + 8)
+        list.fixedCellHeight = Math.max(24, lines * metrics.height + 8)
     }
 
     private fun setHovered(list: JList<*>, index: Int) {

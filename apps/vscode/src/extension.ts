@@ -74,6 +74,7 @@ import {
   nextPixelPresence,
   parseBoardPostRequest,
   parseBoardReadRequest,
+  permissionSummaries,
   summarizeAgents,
   transcriptFromMessages,
   unavailableBoardState,
@@ -123,6 +124,12 @@ import {
   withBinding,
 } from './workspaceBinding';
 import { MAX_STEER_CHARS, normalizeSteerText } from './steer';
+import {
+  attachmentRefusalProjection,
+  projectError,
+  type UserErrorKind,
+  type UserErrorProjection,
+} from './errors';
 import {
   ControlPlaneAuthSession,
   ControlPlaneResolution,
@@ -312,14 +319,39 @@ function messageOf(error: unknown): string {
   return raw.length > 500 ? `${raw.slice(0, 500)}…` : raw;
 }
 
-function reportError(error: unknown): void {
-  const message = messageOf(error);
-  if (store.snapshot().daemon === 'starting') {
-    store.patch({ daemon: 'error', daemonDetail: message });
+function errorCodeOf(error: unknown): string | null {
+  return error instanceof NativeApiError ? error.code : null;
+}
+
+/**
+ * Patch the bounded raw error (Diagnostics) and post ONE structured
+ * projection to the panel. `toast` mirrors the previous `reportError`
+ * behavior for foreground gestures; background reads stay silent in the IDE
+ * chrome and only surface inside the panel.
+ */
+function recordError(projection: UserErrorProjection, toast = false): void {
+  store.patch({ lastError: projection.technical });
+  chatProvider?.postUserError(projection);
+  if (toast) {
+    void vscode.window.showErrorMessage(`Faktor: ${projection.summary}`);
   }
-  store.patch({ lastError: message });
-  chatProvider?.postNotice('error', message);
-  void vscode.window.showErrorMessage(`Faktor: ${message}`);
+}
+
+function projectOf(error: unknown, kind: UserErrorKind = 'unexpected'): UserErrorProjection {
+  return projectError({ kind, message: messageOf(error), code: errorCodeOf(error) });
+}
+
+/** A background read failure: panel-visible, no IDE toast (no user gesture). */
+function recordBackgroundError(error: unknown, kind: UserErrorKind = 'unexpected'): void {
+  recordError(projectOf(error, kind));
+}
+
+function reportError(error: unknown, kind: UserErrorKind = 'unexpected'): void {
+  const projection = projectOf(error, kind);
+  if (store.snapshot().daemon === 'starting') {
+    store.patch({ daemon: 'error', daemonDetail: projection.technical });
+  }
+  recordError(projection, true);
 }
 
 // ------------------------------------------------- control-plane credentials
@@ -775,7 +807,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     await ensureSession(client, context);
     startStream();
     scheduleRefresh(0);
-    chatProvider?.postNotice('info', `daemon ${health.version} ready at ${daemon.baseUrl}`);
+    chatProvider?.postNotice('info', `Faktor ${health.version} is ready`);
   } catch (error) {
     // Never leak a spawned daemon when post-spawn setup fails.
     stopDaemon(daemon);
@@ -831,6 +863,7 @@ function stopServer(): void {
     runs: [],
     activeRunId: null,
     agents: [],
+    permissions: [],
     task: null,
     verification: null,
     usage: null,
@@ -860,7 +893,7 @@ async function ensureSession(
     listed = true;
     store.patch({ sessions });
   } catch (error) {
-    store.patch({ lastError: messageOf(error) });
+    recordBackgroundError(error);
   }
   // Bind against the EXACT canonical workspace identity — never sessions[0].
   let bindings = pruneBindings(readBindings(context), sessions);
@@ -928,7 +961,7 @@ async function ensureSession(
     const page = await client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT });
     store.patch({ transcript: transcriptOf(page) });
   } catch (error) {
-    store.patch({ lastError: messageOf(error) });
+    recordBackgroundError(error);
   }
   return sessionId;
 }
@@ -973,12 +1006,13 @@ function startStream(): void {
       if (status === 'protocol_blocked') {
         // A durable event the client cannot consume is terminal: keep the
         // exact reason, patch the typed unavailable status and surface the
-        // recovery affordances (refresh / reconnect / daemon doctor). No
+        // recovery affordances (refresh / reconnect / service doctor). No
         // automatic reconnect loop replays the offending frame.
         const reason = detail ?? 'the durable event stream is blocked';
-        store.patch({ streamStatus: status, lastError: reason });
-        chatProvider?.postStreamBlocked(reason);
-        chatProvider?.postNotice('error', `event stream blocked: ${reason}`);
+        const projection = projectOf(new Error(reason), 'stream_gap');
+        store.patch({ streamStatus: status, lastError: projection.technical });
+        chatProvider?.postUserError(projection);
+        chatProvider?.postStreamBlocked(reason, active.stream?.blocked?.cursor ?? null);
       } else {
         store.patch({ streamStatus: status });
         if (status === 'open' || status === 'connecting') {
@@ -988,7 +1022,7 @@ function startStream(): void {
       updateStatusBar();
     },
     onError: (error) => {
-      store.patch({ lastError: messageOf(error) });
+      recordBackgroundError(error);
     },
   });
   active.stream = stream;
@@ -1016,10 +1050,7 @@ function scheduleRefresh(delayMs = 250): void {
  */
 async function refreshFromUserGesture(): Promise<void> {
   if (!active.client || !active.sessionId) {
-    chatProvider?.postNotice(
-      'error',
-      'the Faktor daemon is not running; start it before refreshing',
-    );
+    recordError(projectOf(new Error('no active service connection'), 'daemon_down'));
     return;
   }
   if (active.refreshing) {
@@ -1048,20 +1079,37 @@ async function refresh(): Promise<void> {
     // The board read is OPTIONAL and never rejects: an older daemon records
     // an explicit unavailable block instead of blanking the snapshot.
     const boardPromise = boardFor(client, sessionId);
-    const [projection, tasks, verification, usage, agents, runs, sessions, messages, catalog] =
-      await Promise.all([
-        client.projection(sessionId),
-        client.tasks(sessionId),
-        client.verification(sessionId),
-        client.sessionUsage(sessionId),
-        client.agents(sessionId),
-        client.taskRuns(sessionId),
-        client.listSessions(),
-        client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT }),
-        // The catalog only enriches agent metadata; a catalog failure must
-        // not blank the rest of the snapshot.
-        client.modelCatalog().catch(() => [] as NativeModelInfo[]),
-      ]);
+    const [
+      projection,
+      tasks,
+      verification,
+      usage,
+      agents,
+      runs,
+      sessions,
+      messages,
+      catalog,
+      permissionList,
+    ] = await Promise.all([
+      client.projection(sessionId),
+      client.tasks(sessionId),
+      client.verification(sessionId),
+      client.sessionUsage(sessionId),
+      client.agents(sessionId),
+      client.taskRuns(sessionId),
+      client.listSessions(),
+      client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT }),
+      // The catalog only enriches agent metadata; a catalog failure must
+      // not blank the rest of the snapshot.
+      client.modelCatalog().catch(() => [] as NativeModelInfo[]),
+      // The pending-approval read is OPTIONAL: an older daemon or a
+      // transient refusal keeps the last known set instead of hiding a
+      // waiting approval behind a blank snapshot.
+      client.permissions(sessionId).then(
+        (list) => list,
+        () => null,
+      ),
+    ]);
     const board = await boardPromise;
     if (!current()) {
       return;
@@ -1133,6 +1181,8 @@ async function refresh(): Promise<void> {
       verification: verificationView,
       usage: usageView,
       agents: agentSummaries,
+      permissions:
+        permissionList === null ? store.snapshot().permissions : permissionSummaries(permissionList),
       runs: runs.map(runSummary),
       activeRunId,
       busy: activeRunId !== null,
@@ -1155,7 +1205,7 @@ async function refresh(): Promise<void> {
     }
   } catch (error) {
     if (current()) {
-      store.patch({ lastError: messageOf(error) });
+      recordBackgroundError(error);
     }
   } finally {
     // Only the generation that armed the flag may clear it; a transition
@@ -1649,7 +1699,7 @@ async function postHostOwnedViewState(): Promise<void> {
   postComposerAttachments(await composerAttachmentPolicy());
   const blocked = active.stream?.blocked ?? null;
   if (blocked !== null) {
-    chatProvider?.postStreamBlocked(blocked.reason);
+    chatProvider?.postStreamBlocked(blocked.reason, blocked.cursor);
   }
 }
 
@@ -1708,7 +1758,7 @@ async function pickComposerAttachments(): Promise<void> {
   }
   postComposerAttachments(policy);
   if (refused.length > 0) {
-    chatProvider?.postNotice('error', `attachment refused: ${refused.slice(0, 5).join('; ')}`);
+    chatProvider?.postUserError(attachmentRefusalProjection(refused));
   }
 }
 
@@ -1742,7 +1792,7 @@ async function addComposerAttachmentData(message: ChatMessage): Promise<void> {
   }
   postComposerAttachments(policy);
   if (refused.length > 0) {
-    chatProvider?.postNotice('error', `attachment refused: ${refused.slice(0, 5).join('; ')}`);
+    chatProvider?.postUserError(attachmentRefusalProjection(refused));
   }
 }
 
@@ -1778,7 +1828,7 @@ function recoverEventStream(): void {
   chatProvider?.postStreamBlocked(null);
   chatProvider?.postNotice(
     'info',
-    `reconnecting the event stream from cursor ${blocked.cursor}; the blocked frame is replayed, never skipped`,
+    'reconnecting live updates from the paused position; the blocked event is replayed, never skipped',
   );
   scheduleRefresh(0);
 }
@@ -1794,7 +1844,7 @@ async function startTask(
     // retry resolves the durable ids first and uploads only absent
     // attachments. ONLY a durable acceptance may release the retained state.
     pendingSubmissionRetainer.retain(enriched);
-    reportError(new Error(failure.message));
+    reportError(new Error(failure.message), 'run_failure');
     // Audit 32: a failure that may have left a durable receipt (status null,
     // 5xx, 408/429, or the daemon's "submission id still in flight" 409)
     // keeps the logical submission retryable under the SAME submission id;
@@ -1809,7 +1859,7 @@ async function startTask(
   };
   const refuse = (message: string, enriched: PendingSubmission): void => {
     pendingSubmissionRetainer.retain(enriched);
-    reportError(new Error(message));
+    reportError(new Error(message), 'run_failure');
     taskStartGate.settle(submissionId, 'refused');
     chatProvider?.postSendMessageFailed(enriched, message);
   };
@@ -2011,19 +2061,54 @@ async function cancelActiveRun(): Promise<void> {
 }
 
 /**
+ * The single permission-reply path used by BOTH the approval card (webview)
+ * and the `faktor.replyPermission` quick pick: the strict reply body carries
+ * the OWNING session id from the selected entry — never a guessed session.
+ * Typed 409 refusals surface as the structured "no longer live" projection
+ * (`unknown_or_resolved` vs `session_mismatch` demoted to the technical
+ * disclosure) and are NEVER retried blindly; the pending list is refreshed
+ * either way so the operator works from the service's current truth.
+ */
+async function replyPermissionEntry(
+  sessionId: string,
+  permissionId: string,
+  decision: 'allow' | 'deny',
+): Promise<void> {
+  const client = active.client;
+  if (!client) {
+    recordError(projectOf(new Error('no active service connection'), 'daemon_down'));
+    return;
+  }
+  try {
+    await client.replyPermission(sessionId, permissionId, decision);
+    chatProvider?.postNotice('info', `permission #${permissionId}: ${decision}`);
+    scheduleRefresh(0);
+  } catch (error) {
+    const failure = classifyPermissionReplyFailure(error);
+    if (failure === null) {
+      reportError(error);
+      return;
+    }
+    const projection = projectError({
+      kind: 'permission_expired',
+      message: permissionReplyFailureMessage(failure, permissionId),
+      code: errorCodeOf(error),
+    });
+    recordError(projection, true);
+    scheduleRefresh(0);
+  }
+}
+
+/**
  * Reply to ONE live pending permission of the active session
  * (`faktor.replyPermission`). The picker lists exactly the daemon's pending
- * set, and the strict reply body carries the OWNING session id from the
- * selected entry — never a guessed session. Typed 409 refusals surface as an
- * explicit notice/UI state (`unknown_or_resolved` vs `session_mismatch`) and
- * are NEVER retried blindly; the pending list is refreshed either way so the
- * operator works from the daemon's current truth.
+ * set; the reply itself is the shared `replyPermissionEntry` path.
  */
 async function replyPermissionFromCommand(): Promise<void> {
   const client = active.client;
   const sessionId = active.sessionId;
   if (!client || !sessionId) {
-    chatProvider?.postNotice('info', 'start the daemon and open a session first');
+    chatProvider?.postNotice('info', 'start the Faktor service and open a conversation first');
     return;
   }
   let permissions: NativePermissionEntry[];
@@ -2067,21 +2152,7 @@ async function replyPermissionFromCommand(): Promise<void> {
   if (decision === undefined) {
     return;
   }
-  try {
-    await client.replyPermission(picked.permission.sessionId, picked.permission.id, decision.value);
-    chatProvider?.postNotice('info', `permission #${picked.permission.id}: ${decision.value}`);
-    scheduleRefresh(0);
-  } catch (error) {
-    const failure = classifyPermissionReplyFailure(error);
-    if (failure === null) {
-      reportError(error);
-      return;
-    }
-    const text = permissionReplyFailureMessage(failure, picked.permission.id);
-    chatProvider?.postNotice('error', text);
-    void vscode.window.showErrorMessage(`Faktor: ${text}`);
-    scheduleRefresh(0);
-  }
+  await replyPermissionEntry(picked.permission.sessionId, picked.permission.id, decision.value);
 }
 
 /**
@@ -2421,7 +2492,7 @@ async function handleWebviewMessage(
       try {
         await startServer(context);
       } catch (error) {
-        reportError(error);
+        reportError(error, 'daemon_start_failed');
       }
       return;
     case 'stopDaemon':
@@ -2445,6 +2516,19 @@ async function handleWebviewMessage(
     case 'recoverStream':
       recoverEventStream();
       return;
+    // The approval card's Allow/Deny: the SAME session-scoped reply path as
+    // the palette quick pick, driven by the snapshot's pending list.
+    case 'permissionReply': {
+      const permissionId = typeof message.permissionId === 'string' ? message.permissionId : '';
+      const decision =
+        message.decision === 'allow' ? 'allow' : message.decision === 'deny' ? 'deny' : null;
+      const sessionId = active.sessionId;
+      if (permissionId.length === 0 || decision === null || !sessionId) {
+        return;
+      }
+      await replyPermissionEntry(sessionId, permissionId, decision);
+      return;
+    }
     case 'sendGoal': {
       const goal = typeof message.goal === 'string' ? message.goal.trim() : '';
       if (goal.length === 0) {
@@ -2467,18 +2551,19 @@ async function handleWebviewMessage(
       // run never recorded.
       const { files, refused } = boundedWebviewFiles(message.files);
       if (refused.length > 0) {
-        const reasons = refused
-          .slice(0, 5)
-          .map((entry) => `#${entry.index}: ${entry.reason}`)
-          .join('; ');
-        chatProvider?.postNotice(
-          'error',
-          `${refused.length} attachment${refused.length === 1 ? '' : 's'} refused: ${reasons}`,
+        const reasons = refused.map((entry) => `#${entry.index}: ${entry.reason}`);
+        chatProvider?.postUserError(
+          attachmentRefusalProjection(reasons, {
+            summary: 'Some files were left out',
+            hint: 'The run uses the accepted files; add the refused ones and try again if they matter.',
+          }),
         );
       }
       const contract = parseCompletionContract(message.completionContract);
       if ('reason' in contract) {
-        chatProvider?.postNotice('error', `task start refused: ${contract.reason}`);
+        chatProvider?.postUserError(
+          projectError({ kind: 'run_failure', message: `task start refused: ${contract.reason}` }),
+        );
         chatProvider?.postStartResult(goal, false);
         return;
       }
@@ -2500,9 +2585,8 @@ async function handleWebviewMessage(
       if (attachmentIds !== undefined && attachmentIds !== null) {
         const selected = composerAttachments.select(attachmentIds);
         if (selected.reason !== null) {
-          chatProvider?.postNotice(
-            'error',
-            `task start refused: ${selected.reason}; the draft was kept`,
+          chatProvider?.postUserError(
+            attachmentRefusalProjection([`${selected.reason}; the draft was kept`]),
           );
           chatProvider?.postStartResult(goal, false);
           return;
@@ -2517,9 +2601,10 @@ async function handleWebviewMessage(
           attachments: selected.attachments,
         });
         if (parsed === null) {
-          chatProvider?.postNotice(
-            'error',
-            'task start refused: malformed binary attachment envelope; the draft was kept',
+          chatProvider?.postUserError(
+            attachmentRefusalProjection([
+              'the binary attachment envelope was malformed; the draft was kept',
+            ]),
           );
           chatProvider?.postStartResult(goal, false);
           return;
@@ -2537,9 +2622,10 @@ async function handleWebviewMessage(
           attachments: binaryAttachments,
         });
         if (parsed === null) {
-          chatProvider?.postNotice(
-            'error',
-            'task start refused: malformed binary attachment envelope; the draft was kept',
+          chatProvider?.postUserError(
+            attachmentRefusalProjection([
+              'the binary attachment envelope was malformed; the draft was kept',
+            ]),
           );
           chatProvider?.postStartResult(goal, false);
           return;
@@ -2556,11 +2642,14 @@ async function handleWebviewMessage(
       if (decision.action !== 'start') {
         // Unreachable after the in-flight guard; a raced gate is still a
         // loud no-op rather than a second start.
-        chatProvider?.postNotice(
-          'error',
-          decision.action === 'busy'
-            ? decision.reason
-            : 'a task start is already in flight; the duplicate submit was ignored',
+        chatProvider?.postUserError(
+          projectError({
+            kind: 'run_failure',
+            message:
+              decision.action === 'busy'
+                ? decision.reason
+                : 'a task start is already in flight; the duplicate submit was ignored',
+          }),
         );
         return;
       }
@@ -2657,7 +2746,7 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         await startServer(context);
       } catch (error) {
-        reportError(error);
+        reportError(error, 'daemon_start_failed');
       }
     }),
     vscode.commands.registerCommand('faktor.stopServer', () => {
@@ -2692,7 +2781,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   if (config('autoStart', false)) {
-    void startServer(context).catch(reportError);
+    void startServer(context).catch((error) => reportError(error, 'daemon_start_failed'));
   }
 }
 

@@ -1,7 +1,7 @@
 {
   "name": "faktor",
   "displayName": "Faktor",
-  "description": "Faktor daemon client: chat panel, task runs, agent controls and verification over the Faktor Native Protocol.",
+  "description": "An engineering agent in your editor: describe a task, follow the run, approve what it needs, and land verified changes.",
   "version": "0.1.0",
   "publisher": "faktor",
   "license": "SEE LICENSE IN LICENSE",
@@ -121,20 +121,24 @@
               "shadow",
               ""
             ],
+            "enumDescriptions": [
+              "Work in an isolated copy of the workspace and only land verified changes (explicit).",
+              "Use the Faktor default: an isolated copy of the workspace."
+            ],
             "default": "",
-            "description": "Mutation mode for new task runs (informational, shadow-only). Empty (default) inherits the daemon mode; \"shadow\" names the daemon's only mutation mode explicitly. Every mutating run executes in an isolated candidate. \"direct_compat\" was removed and is a typed refusal, never a downgrade."
+            "description": "Where new task runs make their edits. Faktor always works in an isolated copy of the workspace and only lands changes after verification passes; leave the default unless you are diagnosing execution modes."
           },
           "faktor.budgetTokens": {
             "type": "number",
             "default": 0,
             "minimum": 0,
-            "description": "max_tokens for new task runs (0 = daemon default)."
+            "description": "Token budget for a new run (0 = no limit)."
           },
           "faktor.budgetCostMicro": {
             "type": "number",
             "default": 0,
             "minimum": 0,
-            "description": "max_cost_micro for new task runs (0 = daemon default)."
+            "description": "Maximum cost a new run may spend, in millionths of a dollar (0 = no limit)."
           }
         }
       },

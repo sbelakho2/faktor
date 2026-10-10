@@ -153,6 +153,13 @@ pub trait WorkerStore: Send + Sync {
     #[cfg(test)]
     fn inject_workers_read_failure(&self) {}
 
+    /// Test-only fault injection: the next `try_accept_lease` journal insert
+    /// fails with a Backend error (audit P1 lease/journal atomicity
+    /// reproducer): the whole accept must abort with the lease/generation/
+    /// job/attempt rows unchanged. Production stores keep the no-op default.
+    #[cfg(test)]
+    fn inject_next_journal_failure(&self) {}
+
     fn put_worker(&self, worker: &WorkerRegistration) -> Result<(), WorkerError>;
     fn worker(&self, id: &WorkerId) -> Result<Option<WorkerRegistration>, WorkerError>;
     fn workers(
@@ -161,6 +168,30 @@ pub trait WorkerStore: Send + Sync {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<WorkerRegistration>, WorkerError>;
+    /// Every worker row of `organization` carrying `token_hash` (audit P1:
+    /// the two halves of a registration live in `wp_worker.token_hash` and
+    /// `wp_token.consumed_by`, so a partial state must be findable from
+    /// EITHER side).
+    fn workers_by_token_hash(
+        &self,
+        organization: &str,
+        token_hash: &str,
+    ) -> Result<Vec<WorkerRegistration>, WorkerError>;
+    /// The ONE atomic registration mutation (audit P1): under a single
+    /// lock/transaction, re-read the token row by hash and enforce exists /
+    /// not revoked / organization / trust domain / `consumed_by` (`None` or
+    /// this worker), reject any OTHER worker row of the organization already
+    /// carrying this token hash, re-read the worker row and enforce the
+    /// binding rules (not revoked; existing token hash must equal this one),
+    /// then write the worker row, the token row (with `consumed_by` set) and
+    /// the journal row TOGETHER. A failure at any point leaves NO half-written
+    /// registration behind.
+    fn register_worker_with_token(
+        &self,
+        registration: &WorkerRegistration,
+        token: &WorkerTokenRow,
+        journal: &JournalEntry,
+    ) -> Result<(), WorkerError>;
 
     fn put_token(&self, token: &WorkerTokenRow) -> Result<(), WorkerError>;
     fn token(&self, token_hash: &str) -> Result<Option<WorkerTokenRow>, WorkerError>;
@@ -212,10 +243,18 @@ pub trait WorkerStore: Send + Sync {
     /// The atomic CAS accept: if a lease already exists for
     /// `(job_id, generation)` it is returned and nothing is written;
     /// otherwise the lease row is inserted, the generation moves
-    /// `Assigned -> Leased`, the job root moves `Assigned -> Leased` and the
-    /// `(job, generation)` attempt row moves to `Leased` with this worker —
-    /// all in one transaction. `Ok(None)` means this caller won the accept.
-    fn try_accept_lease(&self, lease: &WorkerLease) -> Result<Option<WorkerLease>, WorkerError>;
+    /// `Assigned -> Leased`, the job root moves `Assigned -> Leased`, the
+    /// `(job, generation)` attempt row moves to `Leased` with this worker and
+    /// every `journal` entry is appended — all in one transaction. `Ok(None)`
+    /// means this caller won the accept; `Ok(Some(existing))` means the CAS
+    /// lost and the journal entries were NOT written. Audit P1: the journal
+    /// row is part of the SAME transaction, so a journal failure aborts the
+    /// whole transition (state unchanged) instead of surfacing after commit.
+    fn try_accept_lease(
+        &self,
+        lease: &WorkerLease,
+        journal: &[JournalEntry],
+    ) -> Result<Option<WorkerLease>, WorkerError>;
     fn lease(&self, id: &WorkerLeaseId) -> Result<Option<WorkerLease>, WorkerError>;
     fn lease_for_generation(
         &self,
@@ -314,6 +353,8 @@ pub struct MemoryWorkerStore {
     state: Mutex<MemoryState>,
     /// One-shot `workers()` read fault (audit P1 reproducer).
     fail_next_workers_read: AtomicBool,
+    /// One-shot `try_accept_lease` journal fault (audit P1 reproducer).
+    fail_next_journal: AtomicBool,
 }
 
 impl MemoryWorkerStore {
@@ -357,6 +398,11 @@ impl WorkerStore for MemoryWorkerStore {
         self.fail_next_workers_read.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn inject_next_journal_failure(&self) {
+        self.fail_next_journal.store(true, Ordering::SeqCst);
+    }
+
     fn workers(
         &self,
         organization: &str,
@@ -375,6 +421,100 @@ impl WorkerStore for MemoryWorkerStore {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    fn workers_by_token_hash(
+        &self,
+        organization: &str,
+        token_hash: &str,
+    ) -> Result<Vec<WorkerRegistration>, WorkerError> {
+        let state = self.lock()?;
+        Ok(state
+            .workers
+            .values()
+            .filter(|w| w.organization_id == organization && w.token_hash == token_hash)
+            .cloned()
+            .collect())
+    }
+
+    fn register_worker_with_token(
+        &self,
+        registration: &WorkerRegistration,
+        token: &WorkerTokenRow,
+        journal: &JournalEntry,
+    ) -> Result<(), WorkerError> {
+        if token.token_hash != registration.token_hash {
+            return Err(WorkerError::Malformed(
+                "registration and token row carry different token hashes".into(),
+            ));
+        }
+        let mut state = self.lock()?;
+        // Re-read the token row under the lock: the durable row is the
+        // authority, never the caller's snapshot.
+        let stored = state
+            .tokens
+            .get(registration.token_hash.as_str())
+            .cloned()
+            .ok_or(WorkerError::UnknownToken)?;
+        if stored.revoked {
+            return Err(WorkerError::TokenRevoked);
+        }
+        if stored.organization_id != registration.organization_id {
+            return Err(WorkerError::TokenOrgMismatch {
+                owner: stored.organization_id.clone(),
+                requested: registration.organization_id.clone(),
+            });
+        }
+        if stored.trust_domain != registration.trust_domain
+            || stored.trust_domain != registration.capabilities.trust_domain
+        {
+            return Err(WorkerError::ForeignTrustDomain {
+                requested: registration.capabilities.trust_domain.clone(),
+                actual: stored.trust_domain.clone(),
+            });
+        }
+        match &stored.consumed_by {
+            Some(consumer) if consumer != registration.worker_id.as_str() => {
+                return Err(WorkerError::TokenAlreadyUsed(consumer.clone()));
+            }
+            _ => {}
+        }
+        // A legacy partial state can leave the token unconsumed while a
+        // worker row already carries its hash: that token is structurally
+        // unavailable to any OTHER worker (audit P1).
+        if let Some(other) = state.workers.values().find(|w| {
+            w.organization_id == registration.organization_id
+                && w.token_hash == registration.token_hash
+                && w.worker_id != registration.worker_id
+        }) {
+            return Err(WorkerError::TokenBoundElsewhere {
+                worker: other.worker_id.clone(),
+                token_hash: registration.token_hash.clone(),
+            });
+        }
+        if let Some(existing) = state.workers.get(registration.worker_id.as_str()) {
+            if existing.revoked {
+                return Err(WorkerError::WorkerRevoked(registration.worker_id.clone()));
+            }
+            if existing.token_hash != registration.token_hash {
+                return Err(WorkerError::WorkerAlreadyBound {
+                    worker: registration.worker_id.clone(),
+                    token_hash: existing.token_hash.clone(),
+                });
+            }
+        }
+        state
+            .workers
+            .insert(registration.worker_id.to_string(), registration.clone());
+        // The authoritative token row: consumed_by is set from the
+        // registration and the repaired row is what lands.
+        let mut consumed = stored;
+        consumed.consumed_by = Some(registration.worker_id.to_string());
+        state.tokens.insert(consumed.token_hash.clone(), consumed);
+        let mut entry = journal.clone();
+        entry.seq = state.journal.len() as i64 + 1;
+        state.journal.push(entry);
+        Ok(())
     }
 
     fn put_token(&self, token: &WorkerTokenRow) -> Result<(), WorkerError> {
@@ -525,7 +665,11 @@ impl WorkerStore for MemoryWorkerStore {
         Ok(true)
     }
 
-    fn try_accept_lease(&self, lease: &WorkerLease) -> Result<Option<WorkerLease>, WorkerError> {
+    fn try_accept_lease(
+        &self,
+        lease: &WorkerLease,
+        journal: &[JournalEntry],
+    ) -> Result<Option<WorkerLease>, WorkerError> {
         let mut state = self.lock()?;
         if let Some(existing) = state
             .leases
@@ -533,6 +677,13 @@ impl WorkerStore for MemoryWorkerStore {
             .find(|l| l.job_id == lease.job_id && l.generation == lease.generation)
         {
             return Ok(Some(existing.clone()));
+        }
+        // Audit P1: the journal failure is detected BEFORE any mutation, so
+        // the accepted transition and its journal row are all-or-nothing.
+        if self.fail_next_journal.swap(false, Ordering::SeqCst) {
+            return Err(WorkerError::Backend(
+                "injected journal-insert failure".into(),
+            ));
         }
         state
             .leases
@@ -557,6 +708,11 @@ impl WorkerStore for MemoryWorkerStore {
                 attempt.worker_id = Some(lease.worker_id.clone());
                 attempt.lease_id = Some(lease.lease_id.clone());
             }
+        }
+        for entry in journal {
+            let mut entry = entry.clone();
+            entry.seq = state.journal.len() as i64 + 1;
+            state.journal.push(entry);
         }
         Ok(None)
     }
@@ -857,6 +1013,8 @@ impl WorkerStore for MemoryWorkerStore {
 /// corruption, never a silent wrap).
 pub struct SqliteWorkerStore {
     conn: Mutex<Connection>,
+    /// One-shot `try_accept_lease` journal fault (audit P1 reproducer).
+    fail_next_journal: AtomicBool,
 }
 
 impl SqliteWorkerStore {
@@ -905,6 +1063,7 @@ impl SqliteWorkerStore {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            fail_next_journal: AtomicBool::new(false),
         })
     }
 
@@ -1056,6 +1215,11 @@ fn payload_string(
 }
 
 impl WorkerStore for SqliteWorkerStore {
+    #[cfg(test)]
+    fn inject_next_journal_failure(&self) {
+        self.fail_next_journal.store(true, Ordering::SeqCst);
+    }
+
     fn put_worker(&self, worker: &WorkerRegistration) -> Result<(), WorkerError> {
         let conn = self.lock()?;
         conn.execute(
@@ -1110,6 +1274,182 @@ impl WorkerStore for SqliteWorkerStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
         rows.iter().map(|p| parse(p)).collect()
+    }
+
+    fn workers_by_token_hash(
+        &self,
+        organization: &str,
+        token_hash: &str,
+    ) -> Result<Vec<WorkerRegistration>, WorkerError> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM wp_worker
+                 WHERE organization_id = ?1 AND token_hash = ?2
+                 ORDER BY id",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![organization, token_hash], |r| r.get::<_, String>(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        rows.iter().map(|p| parse(p)).collect()
+    }
+
+    fn register_worker_with_token(
+        &self,
+        registration: &WorkerRegistration,
+        token: &WorkerTokenRow,
+        journal: &JournalEntry,
+    ) -> Result<(), WorkerError> {
+        if token.token_hash != registration.token_hash {
+            return Err(WorkerError::Malformed(
+                "registration and token row carry different token hashes".into(),
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        // Re-read the token row inside the transaction: the durable row is
+        // the authority, never the caller's snapshot.
+        let stored_payload: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM wp_token WHERE token_hash = ?1",
+                params![registration.token_hash.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(stored_payload) = stored_payload else {
+            return Err(WorkerError::UnknownToken);
+        };
+        let stored: WorkerTokenRow = parse(&stored_payload)?;
+        if stored.revoked {
+            return Err(WorkerError::TokenRevoked);
+        }
+        if stored.organization_id != registration.organization_id {
+            return Err(WorkerError::TokenOrgMismatch {
+                owner: stored.organization_id.clone(),
+                requested: registration.organization_id.clone(),
+            });
+        }
+        if stored.trust_domain != registration.trust_domain
+            || stored.trust_domain != registration.capabilities.trust_domain
+        {
+            return Err(WorkerError::ForeignTrustDomain {
+                requested: registration.capabilities.trust_domain.clone(),
+                actual: stored.trust_domain.clone(),
+            });
+        }
+        match &stored.consumed_by {
+            Some(consumer) if consumer != registration.worker_id.as_str() => {
+                return Err(WorkerError::TokenAlreadyUsed(consumer.clone()));
+            }
+            _ => {}
+        }
+        // A legacy partial state can leave the token unconsumed while a
+        // worker row already carries its hash: that token is structurally
+        // unavailable to any OTHER worker (audit P1).
+        let other_payload: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM wp_worker
+                 WHERE organization_id = ?1 AND token_hash = ?2 AND id != ?3
+                 ORDER BY id LIMIT 1",
+                params![
+                    registration.organization_id.as_str(),
+                    registration.token_hash.as_str(),
+                    registration.worker_id.as_str()
+                ],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(payload) = other_payload {
+            let other: WorkerRegistration = parse(&payload)?;
+            return Err(WorkerError::TokenBoundElsewhere {
+                worker: other.worker_id,
+                token_hash: registration.token_hash.clone(),
+            });
+        }
+        let existing_payload: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM wp_worker WHERE id = ?1",
+                params![registration.worker_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(payload) = existing_payload {
+            let existing: WorkerRegistration = parse(&payload)?;
+            if existing.revoked {
+                return Err(WorkerError::WorkerRevoked(registration.worker_id.clone()));
+            }
+            if existing.token_hash != registration.token_hash {
+                return Err(WorkerError::WorkerAlreadyBound {
+                    worker: registration.worker_id.clone(),
+                    token_hash: existing.token_hash.clone(),
+                });
+            }
+        }
+        tx.execute(
+            "INSERT INTO wp_worker (id, organization_id, trust_domain, revoked, token_hash, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                organization_id = excluded.organization_id,
+                trust_domain = excluded.trust_domain,
+                revoked = excluded.revoked,
+                payload = excluded.payload",
+            params![
+                registration.worker_id.as_str(),
+                registration.organization_id,
+                registration.trust_domain,
+                registration.revoked as i64,
+                registration.token_hash,
+                encode(registration)?
+            ],
+        )
+        .map_err(backend)?;
+        // The authoritative token row: consumed_by is set from the
+        // registration (repairing a legacy partial state) and the repaired
+        // row is what lands.
+        let mut consumed = stored;
+        consumed.consumed_by = Some(registration.worker_id.to_string());
+        tx.execute(
+            "INSERT INTO wp_token (token_hash, organization_id, trust_domain, revoked, consumed_by, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(token_hash) DO UPDATE SET
+                revoked = excluded.revoked,
+                consumed_by = excluded.consumed_by,
+                payload = excluded.payload",
+            params![
+                consumed.token_hash,
+                consumed.organization_id,
+                consumed.trust_domain,
+                consumed.revoked as i64,
+                consumed.consumed_by,
+                encode(&consumed)?
+            ],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "INSERT INTO wp_journal
+                (organization_id, kind, job_id, worker_id, generation, at_ms, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                journal.organization_id,
+                journal.kind,
+                journal.job_id,
+                journal.worker_id,
+                journal.generation.map(|g| g.as_i64()),
+                journal.at_ms,
+                journal.detail
+            ],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(())
     }
 
     fn put_token(&self, token: &WorkerTokenRow) -> Result<(), WorkerError> {
@@ -1425,7 +1765,11 @@ impl WorkerStore for SqliteWorkerStore {
         Ok(true)
     }
 
-    fn try_accept_lease(&self, lease: &WorkerLease) -> Result<Option<WorkerLease>, WorkerError> {
+    fn try_accept_lease(
+        &self,
+        lease: &WorkerLease,
+        journal: &[JournalEntry],
+    ) -> Result<Option<WorkerLease>, WorkerError> {
         let mut conn = self.lock()?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1536,6 +1880,31 @@ impl WorkerStore for SqliteWorkerStore {
                 )
                 .map_err(backend)?;
             }
+        }
+        // Audit P1: the journal rows are part of THIS transaction. The
+        // injected failure surfaces before `commit`, so the transaction
+        // rolls back and the lease/generation/job/attempt rows are unchanged.
+        if self.fail_next_journal.swap(false, Ordering::SeqCst) {
+            return Err(WorkerError::Backend(
+                "injected journal-insert failure".into(),
+            ));
+        }
+        for entry in journal {
+            tx.execute(
+                "INSERT INTO wp_journal
+                    (organization_id, kind, job_id, worker_id, generation, at_ms, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    entry.organization_id,
+                    entry.kind,
+                    entry.job_id,
+                    entry.worker_id,
+                    entry.generation.map(|g| g.as_i64()),
+                    entry.at_ms,
+                    entry.detail
+                ],
+            )
+            .map_err(backend)?;
         }
         tx.commit().map_err(backend)?;
         Ok(None)
@@ -2506,8 +2875,8 @@ mod tests {
         let mut other = lease.clone();
         other.lease_id = WorkerLeaseId::try_new("lease_b").unwrap();
         other.worker_id = WorkerId::try_new("wrk_b").unwrap();
-        assert!(store.try_accept_lease(&lease).unwrap().is_none());
-        let loser = store.try_accept_lease(&other).unwrap().unwrap();
+        assert!(store.try_accept_lease(&lease, &[]).unwrap().is_none());
+        let loser = store.try_accept_lease(&other, &[]).unwrap().unwrap();
         assert_eq!(loser.lease_id, lease.lease_id);
         assert_eq!(loser.worker_id, lease.worker_id);
     }

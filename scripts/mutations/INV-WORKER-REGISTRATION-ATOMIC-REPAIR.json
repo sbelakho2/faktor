@@ -1,0 +1,9 @@
+{
+  "id": "INV-WORKER-REGISTRATION-ATOMIC-REPAIR",
+  "file": "crates/worker/src/store.rs",
+  "find": "        consumed.consumed_by = Some(registration.worker_id.to_string());\n        state.tokens.insert(consumed.token_hash.clone(), consumed);",
+  "replace": "        consumed.consumed_by = consumed.consumed_by.take();\n        state.tokens.insert(consumed.token_hash.clone(), consumed);",
+  "gate": "cargo test -p faktor-worker --lib crash_window_partial_registration_repairs_the_token_binding",
+  "expect": "FAILED",
+  "note": "Not repairing consumed_by in the same transaction leaves the crash-window partial binding permanently unconsumed."
+}

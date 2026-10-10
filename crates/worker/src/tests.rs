@@ -9,14 +9,14 @@
 
 use std::sync::Arc;
 
-use faktor_cloud::{Clock, ManualClock, OrganizationId, SecretToken};
+use faktor_cloud::{Clock, ManualClock, OrganizationId, SecretToken, TokenHash};
 
 use crate::error::{WorkerError, WORKER_PROTOCOL_VERSION};
 use crate::ids::{ExecutionJobId, JobGeneration, JobKey, WorkerId, WorkerLeaseId};
 use crate::model::{
     AttemptState, ExecutionJob, GenerationState, JobAttempt, JobGenerationRow, JobRequirements,
     JobResultOutcome, JobState, JobStatus, JournalEntry, LeaseState, NetworkProfile, RequeuePolicy,
-    SandboxCapability, WorkerCapabilities, WorkerLease,
+    SandboxCapability, WorkerCapabilities, WorkerLease, WorkerRegistration,
 };
 use crate::service::{RecoveryReport, ResultOutcome, WorkerPlane};
 use crate::store::{MemoryWorkerStore, ResultAppend, SqliteWorkerStore, WorkerStore};
@@ -137,6 +137,67 @@ impl Harness {
 
 fn harnesses() -> Vec<(&'static str, Harness)> {
     vec![("memory", Harness::memory()), ("sqlite", Harness::sqlite())]
+}
+
+/// The worker-row half of a legacy/partial registration (audit P1): durable
+/// worker row bound to `token_hash`, token row never consumed.
+fn partial_registration(worker: &str, token_hash: &str) -> WorkerRegistration {
+    WorkerRegistration {
+        worker_id: worker_id(worker),
+        organization_id: "org_1".into(),
+        trust_domain: "org_1".into(),
+        display_name: worker.into(),
+        token_hash: token_hash.into(),
+        revoked: false,
+        capabilities: caps("linux", &["rust"]),
+        capabilities_version: 1,
+        registered_ms: 1_000_000,
+        last_seen_ms: 1_000_000,
+        revoked_ms: None,
+    }
+}
+
+/// One durable `assigned` job/generation/attempt triple, written directly
+/// through the store (the scheduler's committed half of a lease accept).
+fn seed_open_job(store: &Arc<dyn WorkerStore>, job_id: &ExecutionJobId, now: i64) {
+    let mut req = requirements();
+    req.normalize().unwrap();
+    let job = ExecutionJob {
+        job_id: job_id.clone(),
+        organization_id: "org_1".into(),
+        trust_domain: "org_1".into(),
+        job_key: JobKey::try_new(format!("key-{job_id}")).unwrap(),
+        requirements: req,
+        payload_digest: digest("atomic"),
+        requeue: RequeuePolicy { max_attempts: 3 },
+        assigned_worker: None,
+        created_ms: now,
+        current_generation: JobGeneration::FIRST,
+        state: JobState::Assigned,
+    };
+    let generation = JobGenerationRow {
+        job_id: job_id.clone(),
+        organization_id: "org_1".into(),
+        generation: JobGeneration::FIRST,
+        state: GenerationState::Assigned,
+        created_ms: now,
+        ended_ms: None,
+        reason: None,
+    };
+    let attempt = JobAttempt {
+        job_id: job_id.clone(),
+        generation: JobGeneration::FIRST,
+        attempt: 1,
+        worker_id: None,
+        lease_id: None,
+        state: AttemptState::Pending,
+        started_ms: now,
+        ended_ms: None,
+        reason: None,
+    };
+    store
+        .insert_generation_and_attempt(&job, &generation, &attempt)
+        .unwrap();
 }
 
 // --------------------------------------------------------------- registration
@@ -439,7 +500,7 @@ fn double_accept_of_one_generation_yields_exactly_one_lease() {
                     ended_ms: None,
                     reason: None,
                 };
-                store.try_accept_lease(&lease).unwrap().is_none()
+                store.try_accept_lease(&lease, &[]).unwrap().is_none()
             }));
         }
         let winners = handles
@@ -1238,4 +1299,676 @@ fn duplicate_landing_is_impossible_at_the_store_layer() {
         .unwrap()
         .is_none());
     let _ = ResultAppend::Landed;
+}
+
+// ---------------------------------------------- audit P1: registration atomicity
+
+/// Audit P1 crash-window reproducer (a): the partial state is worker A's row
+/// durable with token T while `T.consumed_by = None`; re-registering A through
+/// T succeeds through the ONE store transaction and REPAIRS `consumed_by`, and
+/// the repaired binding authenticates.
+#[test]
+fn crash_window_partial_registration_repairs_the_token_binding() {
+    for (label, h) in harnesses() {
+        let issued = h
+            .plane
+            .mint_registration_token(&org("org_1"), "org_1", "wl")
+            .unwrap();
+        let plain = SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+        h.store
+            .put_worker(&partial_registration("wrk_a", &issued.token_hash))
+            .unwrap();
+        assert_eq!(
+            h.store
+                .token(&issued.token_hash)
+                .unwrap()
+                .unwrap()
+                .consumed_by,
+            None,
+            "{label}: the crash window really leaves the token unconsumed"
+        );
+        // (a) A re-registers: the worker row, the consumed token row and the
+        // journal row commit together.
+        let outcome = h
+            .plane
+            .register(
+                &org("org_1"),
+                &worker_id("wrk_a"),
+                &plain,
+                caps("linux", &["rust"]),
+                "a",
+            )
+            .unwrap();
+        assert_eq!(outcome.worker.worker_id, worker_id("wrk_a"), "{label}");
+        assert_eq!(
+            h.store
+                .token(&issued.token_hash)
+                .unwrap()
+                .unwrap()
+                .consumed_by
+                .as_deref(),
+            Some("wrk_a"),
+            "{label}: consumed_by repaired"
+        );
+        assert_eq!(
+            h.store
+                .workers_by_token_hash("org_1", &issued.token_hash)
+                .unwrap()
+                .len(),
+            1,
+            "{label}: exactly one worker row bound"
+        );
+        // (d) after repair, A authenticates with T.
+        assert!(
+            h.plane
+                .authenticate_for_test(&worker_id("wrk_a"), &plain)
+                .is_ok(),
+            "{label}: repaired binding authenticates"
+        );
+        assert!(
+            h.plane
+                .journal_page(&org("org_1"), None, 100)
+                .unwrap()
+                .iter()
+                .any(|e| matches!(
+                    e.kind.as_str(),
+                    "worker_registered" | "registration_refreshed" | "capabilities_reconciled"
+                )),
+            "{label}: the repair journal row committed with the state"
+        );
+    }
+}
+
+/// Audit P1 (b)/(c): while the partial state exists (A's row bound to T,
+/// `T.consumed_by = None`), a DIFFERENT worker can never register T, an
+/// unconsumed token never authenticates anyone (defense-in-depth), and only
+/// A's atomic re-registration repairs the binding.
+#[test]
+fn legacy_partial_binding_refuses_a_second_worker_and_never_authenticates() {
+    for (label, h) in harnesses() {
+        let issued = h
+            .plane
+            .mint_registration_token(&org("org_1"), "org_1", "wl")
+            .unwrap();
+        let plain = SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+        h.store
+            .put_worker(&partial_registration("wrk_a", &issued.token_hash))
+            .unwrap();
+        // (b) B reusing T is refused typed while A's legacy binding exists.
+        let err = h
+            .plane
+            .register(
+                &org("org_1"),
+                &worker_id("wrk_b"),
+                &plain,
+                caps("linux", &["rust"]),
+                "b",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WorkerError::TokenBoundElsewhere { ref worker, .. } if worker.as_str() == "wrk_a"
+            ),
+            "{label}: {err}"
+        );
+        // (c) even the worker row that carries the hash does not authenticate
+        // while the durable token row is unconsumed.
+        let err = h
+            .plane
+            .authenticate_for_test(&worker_id("wrk_a"), &plain)
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::TokenNotConsumed(ref w) if w.as_str() == "wrk_a"),
+            "{label}: {err}"
+        );
+        // The repair: only A, through the token, and only via the one
+        // transactional mutation.
+        h.plane
+            .register(
+                &org("org_1"),
+                &worker_id("wrk_a"),
+                &plain,
+                caps("linux", &["rust"]),
+                "a",
+            )
+            .unwrap();
+        assert!(
+            h.plane
+                .authenticate_for_test(&worker_id("wrk_a"), &plain)
+                .is_ok(),
+            "{label}: repaired binding authenticates"
+        );
+        let err = h
+            .plane
+            .authenticate_for_test(&worker_id("wrk_b"), &plain)
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::UnknownWorker(_)),
+            "{label}: {err}"
+        );
+        let err = h
+            .plane
+            .register(
+                &org("org_1"),
+                &worker_id("wrk_b"),
+                &plain,
+                caps("linux", &["rust"]),
+                "b",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::TokenAlreadyUsed(ref c) if c == "wrk_a"),
+            "{label}: {err}"
+        );
+        assert_eq!(
+            h.store
+                .workers_by_token_hash("org_1", &issued.token_hash)
+                .unwrap()
+                .len(),
+            1,
+            "{label}: exactly one worker row bound"
+        );
+    }
+}
+
+/// Tampered token row: `consumed_by` points at another worker, so neither
+/// authentication nor re-registration of the true holder may pass.
+#[test]
+fn tampered_token_consumption_refuses_auth_and_reregistration() {
+    for (label, h) in harnesses() {
+        let plain = h.register("wrk_a", &["rust"]);
+        let hash = TokenHash::of(plain.expose()).as_str().to_string();
+        let mut row = h.store.token(&hash).unwrap().unwrap();
+        row.consumed_by = Some("wrk_other".into());
+        h.store.put_token(&row).unwrap();
+        let err = h
+            .plane
+            .authenticate_for_test(&worker_id("wrk_a"), &plain)
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::TokenAlreadyUsed(ref c) if c == "wrk_other"),
+            "{label}: {err}"
+        );
+        let err = h
+            .plane
+            .register(
+                &org("org_1"),
+                &worker_id("wrk_a"),
+                &plain,
+                caps("linux", &["rust"]),
+                "a",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::TokenAlreadyUsed(ref c) if c == "wrk_other"),
+            "{label}: {err}"
+        );
+        // The tamper did not move the durable binding either way.
+        assert_eq!(
+            h.store.workers_by_token_hash("org_1", &hash).unwrap().len(),
+            1,
+            "{label}"
+        );
+    }
+}
+
+/// Race: N threads register DIFFERENT worker ids with the SAME token after a
+/// barrier. Exactly one wins; every loser is a typed refusal; exactly one
+/// worker row is ever bound.
+#[test]
+fn parallel_registrations_of_one_token_yield_exactly_one_winner() {
+    for (label, h) in harnesses() {
+        let issued = h
+            .plane
+            .mint_registration_token(&org("org_1"), "org_1", "race")
+            .unwrap();
+        let plain = SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let plane = h.plane.clone();
+            let plain = plain.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                plane.register(
+                    &org("org_1"),
+                    &worker_id(&format!("wrk_race_{i}")),
+                    &plain,
+                    caps("linux", &["rust"]),
+                    "race",
+                )
+            }));
+        }
+        let results: Vec<Result<_, WorkerError>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(winners, 1, "{label}: exactly one winner: {results:?}");
+        for result in &results {
+            if let Err(e) = result {
+                assert!(
+                    matches!(
+                        e,
+                        WorkerError::TokenAlreadyUsed(_) | WorkerError::TokenBoundElsewhere { .. }
+                    ),
+                    "{label}: loser must be a typed refusal: {e}"
+                );
+            }
+        }
+        let bound = h
+            .store
+            .workers_by_token_hash("org_1", &issued.token_hash)
+            .unwrap();
+        assert_eq!(bound.len(), 1, "{label}: exactly one worker row bound");
+        assert_eq!(
+            h.store
+                .token(&issued.token_hash)
+                .unwrap()
+                .unwrap()
+                .consumed_by
+                .as_deref(),
+            Some(bound[0].worker_id.as_str()),
+            "{label}: the consumed binding names the winner"
+        );
+        // The winner authenticates; the losing workers do not.
+        let winner = bound[0].worker_id.clone();
+        assert!(
+            h.plane.authenticate_for_test(&winner, &plain).is_ok(),
+            "{label}"
+        );
+        for i in 0..8 {
+            let w = worker_id(&format!("wrk_race_{i}"));
+            if w != winner {
+                assert!(
+                    h.plane.authenticate_for_test(&w, &plain).is_err(),
+                    "{label}: loser {w} must not authenticate"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------- audit P1: lease/journal atomicity
+
+/// Audit P1: the `lease_accepted` journal row commits in the SAME transaction
+/// as the lease/generation/job/attempt transition. An injected journal failure
+/// returns Err with every row unchanged (no partial transition, no accepted
+/// lease without its journal row).
+#[test]
+fn journal_failure_aborts_the_whole_lease_accept() {
+    for (label, h) in harnesses() {
+        let job_id = ExecutionJobId::try_new(format!("job_atomic_{label}")).unwrap();
+        seed_open_job(&h.store, &job_id, 1_000_000);
+        let lease = WorkerLease {
+            lease_id: WorkerLeaseId::try_new(format!("lease_atomic_{label}")).unwrap(),
+            organization_id: "org_1".into(),
+            job_id: job_id.clone(),
+            generation: JobGeneration::FIRST,
+            worker_id: worker_id("wrk_atomic"),
+            state: LeaseState::Live,
+            heartbeat_interval_ms: 15_000,
+            accepted_ms: 1_000_000,
+            last_heartbeat_ms: 1_000_000,
+            expires_at_ms: 2_000_000,
+            ended_ms: None,
+            reason: None,
+        };
+        let entry = JournalEntry::new(
+            "org_1",
+            "lease_accepted",
+            1_000_000,
+            format!("lease={} interval_ms=15000", lease.lease_id),
+        )
+        .unwrap()
+        .with_worker(&lease.worker_id)
+        .with_job(&job_id, JobGeneration::FIRST);
+
+        h.store.inject_next_journal_failure();
+        let err = h
+            .store
+            .try_accept_lease(&lease, std::slice::from_ref(&entry))
+            .unwrap_err();
+        assert!(matches!(err, WorkerError::Backend(_)), "{label}: {err}");
+        // The whole transition rolled back: no lease row, the generation/job
+        // stay `assigned`, the attempt stays `pending`.
+        assert!(
+            h.store
+                .lease_for_generation(&job_id, JobGeneration::FIRST)
+                .unwrap()
+                .is_none(),
+            "{label}: no lease row survives the aborted accept"
+        );
+        assert_eq!(
+            h.store
+                .generation(&job_id, JobGeneration::FIRST)
+                .unwrap()
+                .unwrap()
+                .state,
+            GenerationState::Assigned,
+            "{label}"
+        );
+        assert_eq!(
+            h.store.job(&job_id).unwrap().unwrap().state,
+            JobState::Assigned,
+            "{label}"
+        );
+        assert_eq!(
+            h.store
+                .attempt(&job_id, JobGeneration::FIRST, 1)
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Pending,
+            "{label}"
+        );
+        assert!(
+            !h.store
+                .journal("org_1", None, 500)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "lease_accepted"),
+            "{label}: no journal row from the aborted accept"
+        );
+        // The retry (no injection) accepts and commits the journal row with
+        // the state: an accepted lease always has its row.
+        assert!(
+            h.store
+                .try_accept_lease(&lease, std::slice::from_ref(&entry))
+                .unwrap()
+                .is_none(),
+            "{label}"
+        );
+        let lease_row = h
+            .store
+            .lease_for_generation(&job_id, JobGeneration::FIRST)
+            .unwrap()
+            .expect("the retry accepted");
+        assert_eq!(lease_row.state, LeaseState::Live, "{label}");
+        assert!(
+            h.store
+                .journal("org_1", None, 500)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "lease_accepted" && e.detail.contains(lease.lease_id.as_str())),
+            "{label}: the journal row committed with the lease"
+        );
+    }
+}
+
+// ------------------------------------------ audit P1: seeded state-machine model
+
+/// A tiny deterministic LCG (no new deps): the same seed replays the same
+/// operation sequence, so a counterexample is reproducible byte-for-byte.
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self, modulo: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % modulo
+    }
+}
+
+/// The model's store+plane pair plus the token plaintexts it minted and the
+/// leases it observed accepted. Invariants are re-checked after EVERY step;
+/// the journal cursor keeps the "accepted lease has its journal row" check
+/// incremental (bounded work per step).
+struct ModelHarness {
+    plane: Arc<WorkerPlane>,
+    store: Arc<dyn WorkerStore>,
+    clock: Arc<ManualClock>,
+    tokens: Vec<(SecretToken, String)>,
+    accepted_leases: std::collections::BTreeSet<String>,
+    journal_cursor: Option<i64>,
+    lease_entries: std::collections::BTreeSet<String>,
+    next_job: u64,
+    rng: Lcg,
+}
+
+impl ModelHarness {
+    fn new(store: Arc<dyn WorkerStore>, seed: u64) -> Self {
+        let clock = Arc::new(ManualClock::new(1_000_000));
+        let plane = WorkerPlane::new(store.clone(), clock.clone());
+        Self {
+            plane,
+            store,
+            clock,
+            tokens: Vec::new(),
+            accepted_leases: Default::default(),
+            journal_cursor: None,
+            lease_entries: Default::default(),
+            next_job: 0,
+            rng: Lcg::new(seed),
+        }
+    }
+
+    fn memory(seed: u64) -> Self {
+        Self::new(Arc::new(MemoryWorkerStore::new()), seed)
+    }
+
+    fn sqlite(path: &std::path::Path, seed: u64) -> Self {
+        Self::new(Arc::new(SqliteWorkerStore::open(path).unwrap()), seed)
+    }
+
+    fn mint_token(&mut self) {
+        let issued = self
+            .plane
+            .mint_registration_token(&org("org_1"), "org_1", "model")
+            .unwrap();
+        let plain = SecretToken::try_new(issued.token.expose().to_string()).unwrap();
+        self.tokens.push((plain, issued.token_hash));
+    }
+
+    fn step(&mut self) {
+        match self.rng.next(6) {
+            // register(worker, token)
+            0 | 1 => {
+                let worker = worker_id(&format!("wrk_{}", self.rng.next(3)));
+                let token = self.tokens[self.rng.next(3) as usize].0.clone();
+                let tool = if self.rng.next(2) == 0 {
+                    "rust"
+                } else {
+                    "node"
+                };
+                let _ = self.plane.register(
+                    &org("org_1"),
+                    &worker,
+                    &token,
+                    caps("linux", &[tool]),
+                    "model",
+                );
+            }
+            // authenticate(worker, token) — refusals are expected and typed;
+            // the invariant below is about what SUCCEEDS.
+            2 => {
+                let worker = worker_id(&format!("wrk_{}", self.rng.next(4)));
+                let token = self.tokens[self.rng.next(3) as usize].0.clone();
+                let _ = self.plane.authenticate_for_test(&worker, &token);
+            }
+            // accept_lease: a fresh open job; the scheduler auto-accepts when
+            // an eligible worker exists (every accepted lease must carry its
+            // committed journal row).
+            3 => {
+                self.next_job += 1;
+                let key = JobKey::try_new(format!("model-{}", self.next_job)).unwrap();
+                let payload = digest(&format!("m{}", self.next_job));
+                if let Ok(scheduled) = self.plane.schedule_job(
+                    &org("org_1"),
+                    "org_1",
+                    &key,
+                    requirements(),
+                    &payload,
+                    RequeuePolicy { max_attempts: 3 },
+                    None,
+                ) {
+                    if let Some(lease) = scheduled.lease {
+                        self.accepted_leases.insert(lease.lease_id.to_string());
+                    }
+                }
+            }
+            // tamper_token: point consumed_by at an existing or bogus worker.
+            4 => {
+                let hash = self.tokens[self.rng.next(3) as usize].1.clone();
+                if let Some(mut row) = self.store.token(&hash).unwrap() {
+                    row.consumed_by = if self.rng.next(2) == 0 {
+                        Some("wrk_ghost".into())
+                    } else {
+                        Some(format!("wrk_{}", self.rng.next(3)))
+                    };
+                    self.store.put_token(&row).unwrap();
+                }
+            }
+            // crash_partial_register: worker row durable, token never consumed
+            // (only into a token hash no worker holds, so the harness itself
+            // never creates the double-binding the system must prevent).
+            _ => {
+                let tidx = self.rng.next(self.tokens.len() as u64) as usize;
+                let hash = self.tokens[tidx].1.clone();
+                if self
+                    .store
+                    .workers_by_token_hash("org_1", &hash)
+                    .unwrap()
+                    .is_empty()
+                {
+                    self.next_job += 1;
+                    let worker = format!("wrk_partial_{}", self.next_job);
+                    self.store
+                        .put_worker(&partial_registration(&worker, &hash))
+                        .unwrap();
+                }
+            }
+        }
+        self.check_invariants();
+    }
+
+    fn check_invariants(&mut self) {
+        let workers = self.store.workers("org_1", None, 1000).unwrap();
+
+        // Invariant A: at most one worker row per token hash per organization.
+        let mut by_hash: std::collections::BTreeMap<&str, Vec<&WorkerRegistration>> =
+            Default::default();
+        for worker in &workers {
+            by_hash
+                .entry(worker.token_hash.as_str())
+                .or_default()
+                .push(worker);
+        }
+        for (hash, bound) in &by_hash {
+            assert!(
+                bound.len() <= 1,
+                "at most one worker per token hash {hash}: {:?}",
+                bound
+                    .iter()
+                    .map(|w| w.worker_id.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Invariant B: a token authenticates exactly the worker its durable
+        // `consumed_by` names AND that carries the hash; no other worker ever
+        // authenticates, and an unconsumed token authenticates NO ONE.
+        for (plain, hash) in &self.tokens {
+            let token_row = self.store.token(hash).unwrap();
+            for worker in &workers {
+                let expected = token_row.as_ref().is_some_and(|row| {
+                    row.consumed_by.as_deref() == Some(worker.worker_id.as_str())
+                        && worker.token_hash == *hash
+                });
+                let succeeded = self
+                    .plane
+                    .authenticate_for_test(&worker.worker_id, plain)
+                    .is_ok();
+                assert_eq!(
+                    succeeded,
+                    expected,
+                    "auth mismatch for {} with token {hash}: consumed_by={:?}",
+                    worker.worker_id,
+                    token_row.as_ref().and_then(|row| row.consumed_by.clone())
+                );
+            }
+        }
+
+        // Invariant C: every accepted lease has its committed journal row.
+        self.drain_journal();
+        assert_eq!(
+            self.lease_entries, self.accepted_leases,
+            "every accepted lease must have its lease_accepted journal row"
+        );
+    }
+
+    fn drain_journal(&mut self) {
+        loop {
+            let page = self
+                .store
+                .journal("org_1", self.journal_cursor, 500)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            self.journal_cursor = page.last().map(|e| e.seq);
+            let short_page = page.len() < 500;
+            for entry in &page {
+                if entry.kind == "lease_accepted" {
+                    if let Some(rest) = entry.detail.strip_prefix("lease=") {
+                        if let Some(lease) = rest.split_whitespace().next() {
+                            self.lease_entries.insert(lease.to_string());
+                        }
+                    }
+                }
+            }
+            if short_page {
+                break;
+            }
+        }
+    }
+}
+
+/// Deterministic state machine over both store twins: 10k seeded ops
+/// (register / authenticate / accept_lease / tamper_token /
+/// crash_partial_register) with the identity and journal invariants checked
+/// after EVERY step; the memory "reopen" rebuilds the plane over the same
+/// state.
+#[test]
+fn seeded_model_preserves_identity_and_journal_invariants_memory() {
+    let mut model = ModelHarness::memory(0x5eed_0001);
+    for _ in 0..4 {
+        model.mint_token();
+    }
+    for _ in 0..10_000 {
+        model.step();
+    }
+    model.check_invariants();
+    model.plane = WorkerPlane::new(model.store.clone(), model.clock.clone());
+    model.check_invariants();
+}
+
+/// The same seeded model over the SQLite file: after 10k ops the store is
+/// dropped and reopened (a new store AND a new plane over the same file) and
+/// the invariants must still hold — including the journal/lease pairing.
+#[test]
+fn seeded_model_preserves_identity_and_journal_invariants_across_sqlite_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.db");
+    let mut model = ModelHarness::sqlite(&path, 0x5eed_0002);
+    for _ in 0..4 {
+        model.mint_token();
+    }
+    for _ in 0..10_000 {
+        model.step();
+    }
+    model.check_invariants();
+    let tokens = model.tokens.clone();
+    let accepted = model.accepted_leases.clone();
+    drop(model);
+    let mut reopened = ModelHarness::sqlite(&path, 0x5eed_0003);
+    reopened.tokens = tokens;
+    reopened.accepted_leases = accepted;
+    reopened.check_invariants();
 }
