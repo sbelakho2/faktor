@@ -1,0 +1,12 @@
+{
+  "id": "INV-KIWI-OPTIONAL-ADAPTER",
+  "file": "crates/kiwi/src/client.rs",
+  "find": "    fn capabilities(&self) -> VerificationCapabilities {\n        VerificationCapabilities::ALL\n    }",
+  "replace": "    fn capabilities(&self) -> VerificationCapabilities {\n        VerificationCapabilities::NONE\n    }",
+  "gate": "cargo test -p faktor-kiwi --test loopback require_provider_dispatch_reaches_the_configured_kiwi",
+  "expect": "FAILED",
+  "note": "An optional Kiwi adapter that declares no capabilities can never be selected for a require_provider claim, so the registry must refuse rather than silently substitute the native baseline.",
+  "capabilities": [
+    "kiwi.optional-provider"
+  ]
+}

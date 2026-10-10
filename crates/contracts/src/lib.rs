@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(task.variants[7].wire, "verified_complete");
 
         let reason = reason_code_contract().unwrap();
-        assert_eq!(reason.variants.len(), 14);
+        assert_eq!(reason.variants.len(), 15);
         assert!(reason
             .variants
             .iter()

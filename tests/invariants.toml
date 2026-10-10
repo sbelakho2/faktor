@@ -2126,3 +2126,18 @@ mutation_command = "node scripts/mutation-run.mjs INV-CONTRACT-MERGE-ADDITIVE"
 mutation_debt = ""
 release_critical = true
 platforms = ["linux", "macos", "windows"]
+
+[[invariant]]
+id = "INV-KIWI-OPTIONAL-ADAPTER"
+statement = "The optional faktor-kiwi verification adapter is config-gated and selection-driven: when configured and capable it serves require_provider claims, when absent or incapable the registry refuses typed instead of substituting the native baseline."
+owner = "crates/kiwi optional verification adapter"
+authority = "planted mutation scripts/mutations/INV-KIWI-OPTIONAL-ADAPTER.json"
+script_check = ""
+unit_test = "require_provider_dispatch_reaches_the_configured_kiwi"
+production_wiring = "a_registry_without_a_kiwi_provider_refuses_a_require_provider_claim"
+fault = ""
+mutation_witness = "require_provider_dispatch_reaches_the_configured_kiwi"
+mutation_command = "node scripts/mutation-run.mjs INV-KIWI-OPTIONAL-ADAPTER"
+mutation_debt = ""
+release_critical = true
+platforms = ["linux"]
