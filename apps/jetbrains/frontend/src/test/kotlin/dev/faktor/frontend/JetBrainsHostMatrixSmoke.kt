@@ -214,6 +214,11 @@ object JetBrainsHostMatrixSmoke {
             kotlin.system.exitProcess(1)
         }
         println("JETBRAINS HOST MATRIX PASS")
+        // An offscreen Swing smoke leaves non-daemon AWT threads alive, so
+        // returning from main would hang the caller forever (the smoke script
+        // runs this JVM in the foreground). Exit explicitly like every other
+        // smoke: the PASS line above is the verdict, the code is the gate.
+        kotlin.system.exitProcess(0)
     }
 
     // ---------------------------------------------------------------- widths

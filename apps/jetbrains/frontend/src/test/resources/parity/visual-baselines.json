@@ -6,11 +6,7 @@
     "linux": "bash apps/jetbrains/compile-and-smoke.sh --write-baselines (or ./gradlew :frontend:smoke -PwriteBaselines=true) on the Linux host, under the pinned core-fonts fontconfig",
     "fonts": "apps/jetbrains/frontend/src/test/resources/parity/fonts/core-fonts.conf (FONTCONFIG_FILE); digest bounds derive from resolved font metrics"
   },
-  "requiredPlatforms": [
-    "linux",
-    "macos",
-    "windows"
-  ],
+  "requiredPlatforms": ["linux", "macos", "windows"],
   "platforms": {
     "linux": {
       "environment": "linux-amd64-jvm17-f29cb65792a65",
@@ -26,16 +22,16 @@
       }
     },
     "macos": {
-      "environment": "mac-os-x-aarch64-jvm17",
+      "environment": "mac-os-x-aarch64-jvm17-f9f93b9e02d24",
       "digests": {
-        "task-tree": "19d1bc64873b1cfa71151ffdabc829ba2ab888a4820b33515f74478c84164fb6",
-        "blockers": "0a6ba6d1e0fcee4361bec7f6a4f070903b5743f9aee7ca2257468634ac67ca7e",
-        "tournament": "821c50021cdcd169de64e3bc7b1b21d8d3d3827574376ec50cb4b4c31f31a6cf",
-        "permissions": "8f99988c6225bbf446a24856cd15b599095a59124a36dc6da4b766738cd28886",
-        "terminal": "4838a7fb9fe768f85a6c94842d1cca25d4954f7487a624bb37c7648bab54c15d",
-        "evidence": "00ae5b99832cbe0ab234c2eec966b845811315a7db9656061a33f8bc70ed7fc1",
-        "settings": "e449733f9f69479dd26abf194aebb53943d3ac982141b394bb6577fcb2bac852",
-        "history": "875d2e25a94ad5fa09a0760d5551197d97c8029fd18d449dff0e08e051db738e"
+        "task-tree": "15d6024a6a5d1cc4d815372d62b0c5791460ecbd212ee93d6b33ea2e5695b078",
+        "blockers": "d5a322a78ede181679451701ea309fa6997efae985b2a69bcac75499b98accd2",
+        "tournament": "40edbc240556eff6e6566146e58b9acec7c6798f75574354b7c247a4e860a3bd",
+        "permissions": "6f937185f157a3d23beee91158addc0e0afaf36a49b41ac59e87be19d5ba58a4",
+        "terminal": "d4d0137e48fcee939c401b0804d37c67e11d45a1296a1229a1795897e9c4e8c6",
+        "evidence": "a9019db97f66e8a66d624575fcb45e8e6a35d23d953032eb4e52ee8e18fd2743",
+        "settings": "1bc17c30d6a7a2b3379afbb3b574143676e268bd09e667ec712efc60e121d5d8",
+        "history": "2aa560b7454f7ad5d0b1db409605abf430f08c56d1ad861991c35c01e931e917"
       }
     }
   }

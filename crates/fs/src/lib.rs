@@ -1341,6 +1341,7 @@ mod tests {
 
     #[test]
     fn ephemeral_candidate_roots_open_alongside_a_durable_workspace() {
+        let _guard = lock_watch_tests();
         let live = tempfile::tempdir().unwrap();
         let candidate = tempfile::tempdir().unwrap();
         let service = WorkspaceFileService::default();
@@ -1383,7 +1384,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn fixture() -> (
+    fn fixture_unlocked() -> (
         tempfile::TempDir,
         Arc<WorkspaceFileService>,
         WorkspaceHandle,
@@ -1398,6 +1399,21 @@ mod tests {
         (dir, service, handle)
     }
 
+    /// The default fixture. Watcher registration is process-global (one
+    /// bounded singleton worker, a spawn cap, and the wedge/overdue test
+    /// seams), so the `open` here is serialized against every other
+    /// watcher-state test; the lock spans only the registration, never an
+    /// event wait. Tests that already hold [`WATCH_TEST_SERIAL`] use
+    /// [`fixture_unlocked`] to avoid re-entering it.
+    fn fixture() -> (
+        tempfile::TempDir,
+        Arc<WorkspaceFileService>,
+        WorkspaceHandle,
+    ) {
+        let _guard = lock_watch_tests();
+        fixture_unlocked()
+    }
+
     #[test]
     fn filesystem_root_opens_degraded_instead_of_walking_the_world() {
         // Fault case that wedged the trusted linux lane: a session whose
@@ -1405,6 +1421,7 @@ mod tests {
         // inotify walk and never answer the attach. The root must open
         // immediately, loudly watcher-less.
         let service = WorkspaceFileService::new();
+        let _guard = lock_watch_tests();
         let handle = service
             .open(WorkspaceId::new(9), PathBuf::from("/"))
             .expect("the filesystem root opens in degraded mode");
@@ -1417,7 +1434,6 @@ mod tests {
 
     #[test]
     fn ordinary_workspace_keeps_its_watcher() {
-        let _guard = lock_watch_tests();
         let (_d, _service, handle) = fixture();
         assert!(
             handle.watcher_attached(),
@@ -1428,11 +1444,17 @@ mod tests {
     #[test]
     fn watcher_registration_uses_exactly_one_worker_thread() {
         let _guard = lock_watch_tests();
+        // Warm the singleton first: the COUNTED window starts once a worker
+        // exists, so what is asserted below is REUSE — a fresh process is
+        // allowed exactly one first spawn, and no later registration may
+        // grow the thread count.
+        let (_warm_dir, _warm_service, warm) = fixture_unlocked();
+        assert!(warm.watcher_attached());
         let workers_before = crate::workspace_service::watch_registration_worker_spawns();
         // P2-FS: every registration (including deadline-degraded ones) funnels
         // through one bounded singleton worker, so live registration threads
         // cannot grow per root.
-        let (_d, _service, handle) = fixture();
+        let (_d, _service, handle) = fixture_unlocked();
         assert!(handle.watcher_attached());
         let mut handles = Vec::new();
         let mut roots = Vec::new();
@@ -1493,7 +1515,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let extra = dir.path().join("extra");
         fs::create_dir_all(&extra).unwrap();
-        service.open(WorkspaceId::new(2), extra.clone()).unwrap();
+        {
+            let _guard = lock_watch_tests();
+            service.open(WorkspaceId::new(2), extra.clone()).unwrap();
+        }
         assert_eq!(service.open_count(), 2);
         service.close(WorkspaceId::new(2));
         assert_eq!(service.open_count(), 1);
@@ -1848,6 +1873,7 @@ mod tests {
 
     #[test]
     fn open_is_idempotent_and_close_unloads() {
+        let _guard = lock_watch_tests();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
         fs::create_dir_all(&root).unwrap();
@@ -1871,6 +1897,7 @@ mod tests {
 
     #[test]
     fn missing_root_not_found() {
+        let _guard = lock_watch_tests();
         let service = WorkspaceFileService::new();
         assert!(service
             .open(WorkspaceId::new(1), "/definitely/not/here".into())
@@ -2375,7 +2402,10 @@ mod tests {
         let payload_a = format!("AAAAAAAA-{}", "x".repeat(4096));
         let payload_b = format!("BBBBBBBB-{}", "y".repeat(4096));
         let service = WorkspaceFileService::new();
-        let h = service.open(WorkspaceId::new(1), src.clone()).unwrap();
+        let h = {
+            let _guard = lock_watch_tests();
+            service.open(WorkspaceId::new(1), src.clone()).unwrap()
+        };
         h.write_atomic(Path::new("f1.bin"), payload_a.as_bytes())
             .unwrap();
         h.write_atomic(Path::new("f2.bin"), payload_a.as_bytes())
@@ -3584,10 +3614,22 @@ mod tests {
     /// takes over (bounded to MAX_WATCH_WORKERS), and growth stops at the cap.
     #[test]
     fn a_wedged_registration_never_starves_later_workspaces() {
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = SERIAL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The shared watcher-test lock, not a private one: the seams below
+        // are PROCESS-global, so every registration-driving test must be
+        // excluded for the whole wedge window or a concurrent registration
+        // steals the bounded replacement budget this test counts.
+        let _guard = lock_watch_tests();
+        // Seam cleanup runs via Drop so even a failing assertion can never
+        // leak the wedge/overdue overrides into later watcher tests.
+        struct ResetSeams;
+        impl Drop for ResetSeams {
+            fn drop(&mut self) {
+                crate::workspace_service::wedge_watch_registration_for_test(None);
+                crate::workspace_service::set_watch_worker_overdue_for_test(0);
+                crate::workspace_service::reset_watch_worker_for_test();
+            }
+        }
+        let _reset = ResetSeams;
         crate::workspace_service::set_watch_worker_overdue_for_test(1);
         let wedged = tempfile::tempdir().unwrap();
         crate::workspace_service::wedge_watch_registration_for_test(Some(
@@ -3644,9 +3686,6 @@ mod tests {
             spawns_at_cap,
             "the worker count must never grow past the cap"
         );
-        crate::workspace_service::wedge_watch_registration_for_test(None);
-        crate::workspace_service::set_watch_worker_overdue_for_test(0);
-        crate::workspace_service::reset_watch_worker_for_test();
     }
 
     /// P2-FS: the anchored root identity proves the pathname the watcher

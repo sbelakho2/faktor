@@ -69,6 +69,15 @@ impl FakeKiwi {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((socket, _)) => {
+                        // macOS accept(2) inherits the listener's O_NONBLOCK,
+                        // so a handler that reads a request whose bytes have
+                        // not landed yet gets EAGAIN and drops the connection
+                        // (RST to the client). Handlers must block normally so
+                        // the read timeout governs. Linux accept() returns a
+                        // blocking socket regardless of the listener flag.
+                        socket
+                            .set_nonblocking(false)
+                            .expect("blocking handler socket");
                         let state = thread_state.clone();
                         // One short-lived handler per connection so a scripted
                         // hang never blocks the accept loop.

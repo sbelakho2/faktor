@@ -2793,10 +2793,14 @@ mod tests {
     /// The verify->exec race, deterministically, on both platforms. Unix
     /// replaces the path (different inode, different bytes) after a successful
     /// digest check and before the exec: the launched process must be the
-    /// verified bytes. Windows attempts the same replacement after the object
-    /// is pinned and before creation: the pinned share mode must refuse it, so
-    /// the launch path is still bound to the verified object and the attacker
-    /// stand-in can never execute.
+    /// verified bytes where an fd-exec exists (Linux/Android/FreeBSD/
+    /// DragonFly) or where the Darwin `/dev/fd/<n>` link is permitted; where
+    /// the OS denies fd-exec (observed EACCES on macOS 26) the launcher fails
+    /// CLOSED with the typed digest-change refusal instead — the attacker
+    /// stand-in can never execute on either outcome. Windows attempts the
+    /// same replacement after the object is pinned and before creation: the
+    /// pinned share mode must refuse it, so the launch path is still bound to
+    /// the verified object and the attacker stand-in can never execute.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_binary_swapped_between_verification_and_exec_never_executes() {
@@ -2831,15 +2835,41 @@ mod tests {
             .expect("spawn the seam launcher test process");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "the seam launcher process failed (status {:?}):\nstdout: {stdout}\nstderr: {stderr}",
-            output.status.code()
-        );
-        assert!(
-            stdout.contains(&format!("{SEAM_VERIFIED_MARKER}{token}")),
-            "the VERIFIED bytes must be the launched process:\nstdout: {stdout}\nstderr: {stderr}"
-        );
+        // Platforms with a real fd-exec (or the Windows pinned object) must
+        // launch the verified bytes. Elsewhere (Darwin/BSD `/dev/fd` fallback)
+        // either the descriptor exec was permitted (verified marker) or the
+        // OS denied it and the launcher refused CLOSED with the typed
+        // digest-change error. The attacker bytes never execute in any case.
+        let fd_exec_available = cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            windows
+        ));
+        if fd_exec_available {
+            assert!(
+                output.status.success(),
+                "the seam launcher process failed (status {:?}):\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            );
+            assert!(
+                stdout.contains(&format!("{SEAM_VERIFIED_MARKER}{token}")),
+                "the VERIFIED bytes must be the launched process:\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        } else if output.status.success() {
+            assert!(
+                stdout.contains(&format!("{SEAM_VERIFIED_MARKER}{token}")),
+                "a successful fallback launch must still be the VERIFIED bytes:\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("release digest changed between verification and exec"),
+                "the only permitted non-fd-exec failure is the typed fail-closed refusal \
+                 (status {:?}):\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            );
+        }
         assert!(
             !stdout.contains(SEAM_EVIL_MARKER),
             "the swapped-in binary must never execute:\nstdout: {stdout}\nstderr: {stderr}"
