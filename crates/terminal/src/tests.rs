@@ -3504,9 +3504,13 @@ fn rapid_spawn_kill_storm_leaves_no_zombies_or_guardians() {
 
 // ---- end-to-end daemon SIGKILL: a re-exec'd helper is the daemon -------
 
+#[cfg(target_os = "linux")]
 const SIM_REPORT_ENV: &str = "FAKTOR_TERMINAL_SIM_REPORT_FILE";
+#[cfg(target_os = "linux")]
 const SIM_MARKER_ENV: &str = "FAKTOR_TERMINAL_SIM_MARKER";
+#[cfg(target_os = "linux")]
 const SIM_LEADER_EXITS_ENV: &str = "FAKTOR_TERMINAL_SIM_LEADER_EXITS";
+#[cfg(target_os = "linux")]
 const SIM_DIR_ENV: &str = "FAKTOR_TERMINAL_SIM_DIR";
 
 /// `pgrep -af <marker>` output: the live-tree evidence a test can print

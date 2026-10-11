@@ -235,7 +235,7 @@ pub(crate) async fn native_worker_register(
         Err(_) => {
             return wire_status(malformed_body(
                 "invalid worker registration body (strict DTO)",
-            ))
+            ));
         }
     };
     let plane = match plane(&state) {

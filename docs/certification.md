@@ -184,7 +184,9 @@ certificate; branch protection requires the resulting
 `ci/woodpecker/pr/pr` workflow status. The
 `.woodpecker/trusted/nightly.yaml` cron workflow owns the campaigns that are
 too long for push/PR: the ignored `[fault]` campaign at scale, the longrun
-suite, efficiency, economy, the coding-benchmark smoke, the provider-key
+suite, efficiency, economy (its synthetic policy gates plus the
+economic certification against real verified tasks, audit item 9), the
+coding-benchmark smoke, the provider-key
 real-model run (an explicit recorded skip unless keys are supplied
 out-of-band) and supply-chain evidence. Its `soak` lane drives
 `scripts/soak.sh` in **realtime** mode (`FAKTOR_SOAK_MODE=realtime`,
@@ -416,6 +418,21 @@ be green:
 | Escalation discipline | naive cheapest-always loses the hard mix; the router escalates and still holds the frontier gate |
 | Hard budget | routing never overshoots a task's remaining budget |
 | Efficiency KPI | exact deterministic derivation from durable rows (no double counting of prefix rows, corrupt shapes rejected, reopen stable) |
+
+Real verified-task economic certification (`tests/economic-certification`,
+nightly `economy` lane): a frozen 12-task coding corpus whose planted defects
+are verified by real `sh verify.sh` subprocess runs (pristine repos fail,
+scripted fixes pass at the documented attempt, unsolvable patches never
+pass), driven through the real `RouterService` + `EconomicRoutingPolicy` and
+the real verified-outcome learning channel (`record_call_outcome`). The
+cheap-first lane is compared against an always-frontier control on verified
+completion, total rework cost, Verified Cost per Successful Change, frontier
+escalation rate and local substitution rate, under GENEROUS bounds (cost ≤
+65% of frontier, completion within 15 points of frontier, ≥ 25% local
+substitution, unsolvable verified = 0). The machine-readable artifact is
+`target/certification/economic-certification.json`, hashed into the nightly
+lane marker. Deterministic across runs; an always-frontier regression still
+runs the harness but fails the cost/substitution bounds.
 
 Real-model coding-benchmark runs (`--test real -- --ignored`) need provider
 keys and are **always recorded as skipped** by the local profile. A release

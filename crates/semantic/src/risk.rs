@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Risk computation over semantic proposals (audit 54/58/59).
 //!
 //! Risk data is provider DATA like everything else: a provider may say what

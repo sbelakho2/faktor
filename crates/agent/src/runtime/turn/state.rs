@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! `runtime::turn::state`: cohesive slice of the turn module.
 
 use super::*;
@@ -579,6 +581,15 @@ pub struct AgentRuntime {
     /// error retries the SAME planned request (media parts included) without
     /// duplication.
     pub(crate) retry_policy_override: std::sync::Mutex<Option<faktor_core::retry::RetryPolicy>>,
+    /// The OPTIONAL neutral verification provider registry (audit item 6:
+    /// the completion spine). `None` (the default, and any host that never
+    /// installs one) keeps every contract evaluation byte-identical to the
+    /// executed-check-only path. Installed by the daemon after construction
+    /// through [`AgentRuntime::set_verification_providers`]; the registry
+    /// always carries the native baseline and optionally external
+    /// (Kiwi-shaped) providers.
+    pub(crate) verification_providers:
+        std::sync::Mutex<Option<Arc<faktor_verify::VerificationRegistry>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1896,7 +1907,29 @@ impl AgentRuntime {
             evidence_authority,
             provider_debits: std::sync::Mutex::new(None),
             retry_policy_override: std::sync::Mutex::new(None),
+            verification_providers: std::sync::Mutex::new(None),
         }))
+    }
+
+    /// Install the neutral verification provider registry (the completion
+    /// spine). Additive: a runtime without one evaluates contracts from the
+    /// attempt's executed checks exactly as before; a registry whose only
+    /// provider is the native baseline adds no provider evidence either
+    /// (claims route to external providers only), so the default daemon
+    /// behavior is byte-identical.
+    pub fn set_verification_providers(&self, registry: Arc<faktor_verify::VerificationRegistry>) {
+        *self
+            .verification_providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(registry);
+    }
+
+    /// The installed neutral verification registry, when one was installed.
+    pub(crate) fn verification_registry(&self) -> Option<Arc<faktor_verify::VerificationRegistry>> {
+        self.verification_providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// THE durable evidence authority of this runtime (schema v21).

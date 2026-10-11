@@ -1,6 +1,7 @@
 //! Task tests (mechanically split from `task`).
 
 use super::*;
+use faktor_core::state::ToolVersion;
 
 #[path = "contract_tests.rs"]
 mod contract_tests;

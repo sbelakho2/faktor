@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! THE bounded, rooted build-manifest reader (audit finding 4).
 //!
 //! `manifest_has_target()` and `default_preset_name()` used to read build

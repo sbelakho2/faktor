@@ -1886,10 +1886,10 @@ async fn strict_criteria_divergence_refuses_claims_then_converges_deterministica
     }
     let h2 = manager.get_session(session).unwrap().unwrap();
     assert_eq!(
-            h2.list_tasks().unwrap()[0].state,
-            TaskState::NeedsVerification,
-            "a NeedsVerification row has no legal edge to Blocked: the machine keeps the claim awaiting re-verification"
-        );
+        h2.list_tasks().unwrap()[0].state,
+        TaskState::NeedsVerification,
+        "a NeedsVerification row has no legal edge to Blocked: the machine keeps the claim awaiting re-verification"
+    );
     drop(h2);
     // The divergence healed at that drive boundary: a FAILING turn now
     // carries only its own verdict (kind preserved, no stale reason).
@@ -2464,9 +2464,9 @@ async fn slow_or_panicking_legacy_provider_cannot_block_the_turn() {
     runtime.run_turn(sid, "inspect", &[]).await.unwrap();
     let panic_elapsed = started.elapsed();
     assert!(
-            panic_elapsed < Duration::from_secs(240),
-            "a panicking evidence provider must degrade, not stall or abort; the turn took {panic_elapsed:?}"
-        );
+        panic_elapsed < Duration::from_secs(240),
+        "a panicking evidence provider must degrade, not stall or abort; the turn took {panic_elapsed:?}"
+    );
     assert!(
         panic_started.load(std::sync::atomic::Ordering::SeqCst),
         "the panicking provider was never even polled: the degrade ladder under attack did not run"

@@ -223,10 +223,9 @@ async fn task_rows_survive_five_compactions_byte_identical() {
         }
         let fact = criteria_fact(&h).expect("criteria fact must exist after every compaction");
         assert!(
-                fact.contains("required check: cargo check")
-                    && !fact.contains("goal: gating task"),
-                "the criteria fact carries the canonical typed check entries (the goal stays human): {fact:?}"
-            );
+            fact.contains("required check: cargo check") && !fact.contains("goal: gating task"),
+            "the criteria fact carries the canonical typed check entries (the goal stays human): {fact:?}"
+        );
         match &expected_fact {
             Some(e) => assert_eq!(
                 &fact, e,

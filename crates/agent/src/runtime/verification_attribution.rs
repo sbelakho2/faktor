@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! `runtime::verification_attribution`: cohesive slice of the agent runtime.
 
 use super::*;
@@ -265,7 +267,7 @@ pub(crate) fn review_fetch_changed_files(
                         "checkpoint rows of session {} are unreadable ({e}); the review diff base cannot be established",
                         handle.id()
                     )),
-                )
+                );
             }
         },
     };
@@ -293,7 +295,7 @@ pub(crate) fn review_fetch_changed_files(
                                     Some(format!(
                                         "{path}: before content exceeds the {REVIEW_SIDE_BOUND} byte review bound"
                                     )),
-                                )
+                                );
                             }
                         },
                         None => None,
@@ -322,7 +324,7 @@ pub(crate) fn review_fetch_changed_files(
                                         Some(format!(
                                             "{path}: after content exceeds the {REVIEW_SIDE_BOUND} byte review bound"
                                         )),
-                                    )
+                                    );
                                 }
                                 Err(_) => {
                                     // Authority law: neither the CAS blob nor
@@ -388,7 +390,7 @@ pub(crate) fn review_fetch_changed_files(
                     Some(format!(
                         "{path}: content exceeds the {REVIEW_SIDE_BOUND} byte review bound"
                     )),
-                )
+                );
             }
             // Unreadable = deleted (or unresolved hostile path).
             Err(_) => faktor_verify::review::FileChange {
@@ -1042,7 +1044,7 @@ pub(crate) async fn run_independent_review_call(
                 &provider_id,
                 &model,
                 format!("op-id allocation failed for the review call: {e}"),
-            )
+            );
         }
     };
     // Attempt identity (attempt-accounting audit): the review call is ONE
@@ -1057,7 +1059,7 @@ pub(crate) async fn run_independent_review_call(
                 &provider_id,
                 &model,
                 format!("op-id allocation failed for the review attempt: {e}"),
-            )
+            );
         }
     };
     let attempt_identity = match ModelCallAttempt::new(op_id, attempt_op_id, 0) {
@@ -1067,7 +1069,7 @@ pub(crate) async fn run_independent_review_call(
                 &provider_id,
                 &model,
                 "the review attempt op id collided with the review op id",
-            )
+            );
         }
     };
     let predicted = (prompt.len() as u64 / 3)
@@ -1090,14 +1092,14 @@ pub(crate) async fn run_independent_review_call(
                 &provider_id,
                 &model,
                 "budget exceeded: cannot afford the independent review call",
-            )
+            );
         }
         Err(e) => {
             return IndependentReviewOutcome::refused(
                 &provider_id,
                 &model,
                 format!("budget unavailable for the review call: {e:?}"),
-            )
+            );
         }
     };
     // The review attempt's durable provider-call START row is not written:
@@ -1758,7 +1760,7 @@ impl IndependentReviewer for RecordedReviewPort {
                 other => {
                     return Err(format!(
                         "reviewer verdict {other:?} is not a recognized structured verdict"
-                    ))
+                    ));
                 }
             };
             let strings = |key: &str| -> Vec<String> {
@@ -3136,7 +3138,7 @@ impl AgentRuntime {
             Err(refusal) => {
                 return Err(format!(
                     "the no-op reviewer output was refused by the trust gate: {refusal}"
-                ))
+                ));
             }
         };
         let criteria_rows = criterion_verdicts_from_attempt(

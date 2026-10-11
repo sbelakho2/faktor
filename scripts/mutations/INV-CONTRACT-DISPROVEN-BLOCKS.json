@@ -1,8 +1,8 @@
 {
   "id": "INV-CONTRACT-DISPROVEN-BLOCKS",
   "file": "crates/agent/src/runtime/contract_eval.rs",
-  "find": "ContractGateOutcome::Evaluated { disproven, .. } if !disproven.is_empty() => {",
-  "replace": "ContractGateOutcome::Evaluated { disproven, .. } if false && !disproven.is_empty() => {",
+  "find": "            if !disproven.is_empty() {",
+  "replace": "            if false && !disproven.is_empty() {",
   "gate": "cargo test -p faktor-agent --lib disproven_obligation_blocks_and_persists_evaluated_states",
   "expect": "FAILED",
   "note": "Ignoring disproven proof obligations lets a passing gate stand on an established falsehood."

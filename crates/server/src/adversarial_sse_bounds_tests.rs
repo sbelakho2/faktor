@@ -571,7 +571,11 @@ async fn raw_post(
         let _ = stream.shutdown().await;
     }
     let mut out = Vec::new();
-    let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await;
+    let read = timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await;
+    assert!(
+        read.is_ok(),
+        "no HTTP response within the 5s bounded deadline for {path} ({content_type})"
+    );
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -697,7 +701,13 @@ async fn body_bounds_content_type_truncation_and_utf8_splits() {
     );
 
     // UTF-8 split at EVERY byte boundary of a multibyte body: the JSON is
-    // assembled across multiple TCP writes and parsed identically.
+    // assembled across multiple TCP writes, the client half-closes its write
+    // side after the final byte (a normal HTTP/1.1 pattern: all request bytes
+    // are sent, only the read side stays open), and the request must still be
+    // parsed identically and answered within the bounded deadline. The
+    // half-close must never race the response away (hyper's default
+    // `half_close = false` aborted the in-flight request and closed the
+    // connection with an empty body; see `serve_with_half_close`).
     let payload = r#"{"provider":"féké","model":"módel"}"#;
     for split in 0..=payload.len() {
         let (a, b) = payload.as_bytes().split_at(split);
@@ -713,7 +723,12 @@ async fn body_bounds_content_type_truncation_and_utf8_splits() {
         stream.write_all(b).await.unwrap();
         let _ = stream.shutdown().await;
         let mut out = Vec::new();
-        let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await;
+        let read = timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await;
+        assert!(
+            read.is_ok(),
+            "UTF-8 split at byte {split}: no HTTP response within the 5s bounded deadline \
+             (the half-closed connection was dropped without answering)"
+        );
         let response = String::from_utf8_lossy(&out);
         assert!(
             response.starts_with("HTTP/1.1 4") || response.starts_with("HTTP/1.1 2"),

@@ -958,7 +958,15 @@ mod legacy_verification_import_tests {
                 sid,
                 LEGACY_VERIFICATION_JOB_FACT_KIND,
                 &format!("vj:{TASK}:make_lint"),
-                &job_json(4242, TASK, "make_lint", "passed", Some("{\"status\":\"Passed\",\"exit\":0,\"started_ms\":1,\"finished_ms\":2,\"summary\":null,\"truncated\":false}")),
+                &job_json(
+                    4242,
+                    TASK,
+                    "make_lint",
+                    "passed",
+                    Some(
+                        "{\"status\":\"Passed\",\"exit\":0,\"started_ms\":1,\"finished_ms\":2,\"summary\":null,\"truncated\":false}",
+                    ),
+                ),
             );
         }
         // The next OPEN is the upgrade: migration completion runs the

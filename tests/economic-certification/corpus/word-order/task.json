@@ -1,0 +1,9 @@
+{
+  "id": "word-order",
+  "task_class": "easy",
+  "phase": "implement",
+  "input_tokens": 12500,
+  "output_tokens": 950,
+  "fix_at_attempt": 1,
+  "order": 2
+}

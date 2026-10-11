@@ -57,6 +57,7 @@ members = [
     "tests/streams",
     "tests/benchmark",
     "tests/economy",
+    "tests/economic-certification",
     "tests/efficiency",
     "tests/coding-benchmark",
     "tests/soak",

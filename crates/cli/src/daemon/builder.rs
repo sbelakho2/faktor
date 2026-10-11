@@ -764,8 +764,10 @@ pub(crate) struct DaemonVerificationWiring {
 /// interface): the native baseline is ALWAYS constructed over the daemon's
 /// ONE supervisor; the OPTIONAL external (Kiwi-shaped) provider is
 /// constructed only when `[verification.kiwi]` is enabled and valid. This is
-/// the seam a later runtime wave consumes (`DaemonGraph::verification_providers`)
-/// while completion behavior stays with the existing VerificationService.
+/// the completion spine the runtime consumes and the server introspects:
+/// unresolved contract claims dispatch through it (native baseline always;
+/// external providers optional), while executed-check completion behavior is
+/// byte-identical when no external provider is configured.
 pub(crate) fn daemon_verification_providers(
     section: &config::VerificationCfg,
     roots: Arc<dyn faktor_verify::VerificationRootResolver>,
@@ -1134,9 +1136,11 @@ pub(crate) fn build_daemon_core(
     let verification = daemon_verification(&config.verification, &supervisor);
     // The generic verification PROVIDER registry (native baseline always;
     // the optional external Kiwi provider only when configured) rides the
-    // SAME supervisor and the daemon's checked egress transport. Completion
-    // behavior is unchanged in this wave: the registry is exposed on the
-    // graph for the runtime wave that consumes it.
+    // SAME supervisor and the daemon's checked egress transport. It is
+    // installed on the AgentRuntime below (the completion spine: unresolved
+    // contract claims dispatch through it) and exposed on the graph for the
+    // server introspection surface. A native-only registry dispatches
+    // nothing, so default completion behavior is unchanged.
     let verification_providers = daemon_verification_providers(
         &config.verification,
         daemon_verification_roots(&session),
@@ -1315,6 +1319,12 @@ pub(crate) fn build_daemon_core(
         secret_registry: Some(secret_registry.clone()),
     })
     .map_err(|e| e.to_string())?;
+    // The completion spine (audit item 6): install the ONE daemon registry on
+    // the runtime so unresolved contract claims dispatch through the same
+    // neutral surface the graph exposes. A native-only registry (the default
+    // when `[verification.kiwi]` is disabled) dispatches nothing, so default
+    // completion behavior is unchanged.
+    agent.set_verification_providers(verification_providers.registry.clone());
     for ollama in ollama_warmers {
         warm_ollama(ollama);
     }

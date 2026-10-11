@@ -1538,3 +1538,119 @@ fn doctor_deep_flags_orphan_child_rows_and_a_missing_worktree_dir() {
     );
     let _ = wt_row_id;
 }
+
+/// Economic audit item 7: the doctor's engineering-outcome ledger section is
+/// a truthful read-only fold — an empty ledger says so, and a recorded run
+/// is summarized with the durable metrics (never invented).
+#[test]
+fn doctor_reports_the_engineering_outcome_ledger_honestly() {
+    use faktor_agent::{
+        ChangedCodeScale, FinalVerificationBasis, OutcomeLedger, ProofCoverage, RunModelStep,
+        RunOutcomeRecord,
+    };
+    use faktor_core::model::{RiskBucket, TaskClass};
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        session
+            .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+            .unwrap();
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l == "outcomes: no completed runs recorded"),
+        "{:?}",
+        report.lines
+    );
+    let record = RunOutcomeRecord {
+        schema_version: faktor_agent::OUTCOME_RECORD_SCHEMA_V,
+        run_id: "doctor-run-1".into(),
+        session_id: 1,
+        task_id: 1,
+        task_class: TaskClass::Medium,
+        risk_class: RiskBucket::Low,
+        candidate_snapshot: None,
+        final_snapshot: "tm1:final".into(),
+        accepted: true,
+        integrated: true,
+        verified_first_attempt: true,
+        repair_attempts: 0,
+        model_sequence: vec![RunModelStep {
+            provider: "ollama".into(),
+            model: "local-7b".into(),
+            local: true,
+            spend_micro: 0,
+        }],
+        model_spend_micro: 0,
+        verification_spend_micro: 40_000,
+        rework_spend_micro: 0,
+        avoided_hosted_micro: 250_000,
+        wall_time_ms: 900,
+        human_interventions: 0,
+        proof: ProofCoverage {
+            checks_passed: 3,
+            checks_required: 3,
+        },
+        change_scale: ChangedCodeScale {
+            files: 1,
+            added_lines: 5,
+            removed_lines: 1,
+        },
+        rollback_events: 0,
+        recovery_events: 0,
+        final_basis: FinalVerificationBasis::DeterministicChecks,
+        frontier_escalations: 0,
+        completed_at_ms: 1_700_000_000_000,
+        verified_samples: vec![],
+    };
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        OutcomeLedger::new(session.store())
+            .record(&record)
+            .expect("a valid fixture record records exactly once");
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("outcomes: "))
+        .expect("ledger line");
+    assert!(line.contains("1 run(s), 1 verified"), "{line}");
+    assert!(line.contains("first-pass 100.0%"), "{line}");
+    assert!(
+        line.contains("verified cost/change 40000 microUSD"),
+        "{line}"
+    );
+}
+
+/// Audit item 5: the doctor certifies the native engineering-contract
+/// compiler with a deterministic self-check (non-empty contract, bound
+/// selector obligation, byte-identical repeated compile). A broken compiler
+/// is an ISSUE, never silence.
+#[test]
+fn doctor_certifies_the_native_contract_compiler_deterministically() {
+    let mut lines: Vec<String> = Vec::new();
+    let mut issues = 0usize;
+    doctor_contract_compiler_line(&mut lines, &mut issues);
+    assert_eq!(issues, 0, "{lines:?}");
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with("engineering-contract compiler:"))
+        .expect("the compiler line");
+    assert!(line.contains("state=verified"), "{line}");
+    assert!(line.contains("determinism=byte_identical"), "{line}");
+    // The line is stable across runs (the compile is deterministic).
+    let mut again: Vec<String> = Vec::new();
+    let mut again_issues = 0usize;
+    doctor_contract_compiler_line(&mut again, &mut again_issues);
+    assert_eq!(again_issues, 0);
+    assert_eq!(lines, again);
+}

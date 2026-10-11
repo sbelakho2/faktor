@@ -501,17 +501,17 @@ impl fmt::Display for ExecutionDenial {
                 f,
                 "session {session:?} resolved to no candidate root ({root:?}): {reason}"
             ),
-            ExecutionDenial::CwdOutsideCandidate { cwd, candidate_root } => write!(
+            ExecutionDenial::CwdOutsideCandidate {
+                cwd,
+                candidate_root,
+            } => write!(
                 f,
                 "cwd {cwd:?} is outside the candidate root {candidate_root:?} and no explicit grant covers it"
             ),
             ExecutionDenial::CwdUnavailable { cwd, reason } => {
                 write!(f, "cwd {cwd:?} is unavailable: {reason}")
             }
-            ExecutionDenial::CapabilityDenied {
-                capability,
-                reason,
-            } => write!(
+            ExecutionDenial::CapabilityDenied { capability, reason } => write!(
                 f,
                 "capability {capability:?} denied for this spawn: {reason}"
             ),
@@ -882,7 +882,7 @@ impl ExecutionAuthority for SessionExecutionAuthority {
                 return Err(ExecutionDenial::CapabilityDenied {
                     capability: "execute_shell".into(),
                     reason: "the sandbox policy denies ExecuteShell".into(),
-                })
+                });
             }
             PermissionDecision::Ask => {
                 return Err(ExecutionDenial::CapabilityDenied {
@@ -890,7 +890,7 @@ impl ExecutionAuthority for SessionExecutionAuthority {
                     reason: "the sandbox policy requires interactive approval the terminal \
                              authority cannot obtain"
                         .into(),
-                })
+                });
             }
         }
         // cwd authority: candidate root by default, external only with an
@@ -2179,14 +2179,14 @@ impl TerminalService {
                 return Err(TerminalServiceError::Lost {
                     terminal_id: terminal_id.to_string(),
                     detail: entry.detail.clone(),
-                })
+                });
             }
             other => {
                 return Err(TerminalServiceError::State {
                     terminal_id: terminal_id.to_string(),
                     state: other.state_tag(),
                     message: "only a running terminal accepts input".into(),
-                })
+                });
             }
         };
         if live.session_id != sid {
@@ -2250,14 +2250,14 @@ impl TerminalService {
                 return Err(TerminalServiceError::Lost {
                     terminal_id: terminal_id.to_string(),
                     detail: entry.detail.clone(),
-                })
+                });
             }
             other => {
                 return Err(TerminalServiceError::State {
                     terminal_id: terminal_id.to_string(),
                     state: other.state_tag(),
                     message: "only a running terminal exposes output".into(),
-                })
+                });
             }
         };
         if live.session_id != sid {
@@ -2316,14 +2316,14 @@ impl TerminalService {
                 return Err(TerminalServiceError::Lost {
                     terminal_id: terminal_id.to_string(),
                     detail: entry.detail.clone(),
-                })
+                });
             }
             other => {
                 return Err(TerminalServiceError::State {
                     terminal_id: terminal_id.to_string(),
                     state: other.state_tag(),
                     message: "only a running terminal accepts a resize".into(),
-                })
+                });
             }
         };
         if live.session_id != sid {
@@ -2858,7 +2858,7 @@ fn spawn_pty_under_isolation(
                          `{}` BEFORE spawn: no per-process network-isolation backend; never \
                          running the child unenforced",
                         cfg.command
-                    )))
+                    )));
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -2881,7 +2881,7 @@ fn spawn_pty_under_isolation(
                  BEFORE spawn: the interactive terminal authority never brokers a child; never \
                  running it unconfined",
                 cfg.command
-            )))
+            )));
         }
     }
     if let FilesystemIsolation::Workspace { required, .. } = filesystem {

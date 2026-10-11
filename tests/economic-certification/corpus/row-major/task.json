@@ -1,0 +1,9 @@
+{
+  "id": "row-major",
+  "task_class": "hard",
+  "phase": "review",
+  "input_tokens": 26000,
+  "output_tokens": 2100,
+  "fix_at_attempt": 4,
+  "order": 10
+}

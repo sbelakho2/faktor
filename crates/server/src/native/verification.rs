@@ -273,7 +273,7 @@ pub(crate) async fn native_task_verification(
             return wire_status(malformed_body(&format!(
                 "invalid task id {task_id:?} for session {}",
                 handle.id()
-            )))
+            )));
         }
     };
     let requested = faktor_core::id::TaskId::new(raw);

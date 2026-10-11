@@ -1,0 +1,27 @@
+[package]
+name = "faktor-tests-economic-certification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Test-only crate (audit item 9 follow-up): economic certification against a
+# frozen corpus of real, objectively verified coding tasks. A scripted fake
+# coding model applies deterministic patches; verification is a real
+# subprocess run of each task's own test script; routing, escalation and
+# outcome learning come from the real faktor-router RouterService and
+# faktor-agent EconomicRoutingPolicy. The suite writes
+# target/certification/economic-certification.json and is wired additively
+# into the nightly economy lane.
+[dependencies]
+faktor-agent.workspace = true
+faktor-core.workspace = true
+faktor-router.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

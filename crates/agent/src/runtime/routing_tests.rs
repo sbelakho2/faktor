@@ -529,9 +529,9 @@ async fn risky_change_routing_refusal_is_a_fail_closed_block_under_strict() {
     let structured = review_evidence_structured(&review);
     assert_eq!(structured["risk"]["level"], "high", "{structured}");
     assert_eq!(
-            structured["review_model"]["status"], "refused",
-            "a routing refusal must be a documented refusal, never an unavailable degradation: {structured}"
-        );
+        structured["review_model"]["status"], "refused",
+        "a routing refusal must be a documented refusal, never an unavailable degradation: {structured}"
+    );
     assert_eq!(
         structured["review_model"]["fallback"],
         serde_json::Value::Null,

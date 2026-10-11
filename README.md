@@ -54,8 +54,13 @@ LLM used only where reasoning is actually needed
 
 The normative product direction — the autonomous engineering pipeline
 (objective → criteria → invariants → risks → proof obligations → change DAG
-→ execution → Kiwi verification → replan or finish) — lives in
+→ implementation → claim-bound verification via the provider registry →
+proof or counterexample → replan or finish) — lives in
 [`docs/specs/autonomous-engineering.md`](docs/specs/autonomous-engineering.md).
+Faktor is standalone by definition: native system intelligence and native
+verification are always available, and Tangerine and Kiwi are optional
+implementations of the neutral `SystemIntelligenceProvider` and
+`VerificationProvider` interfaces.
 
 ## Architecture at a glance
 

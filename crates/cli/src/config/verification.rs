@@ -42,6 +42,14 @@ pub struct KiwiCfg {
     pub auth_env: Option<String>,
     #[serde(default = "default_kiwi_timeout_ms")]
     pub timeout_ms: u64,
+    /// The explicitly NEGOTIATED operation set. Absent = the kiwi crate's
+    /// conservative default set (claim verification, contracts/compatibility,
+    /// generated tests, security/performance/runtime checks); the
+    /// native-owned build/lint/typecheck/tests operations are never claimed
+    /// implicitly. Every operation outside the negotiated set is refused
+    /// typed by the adapter before any request is sent.
+    #[serde(default)]
+    pub operations: Option<Vec<faktor_verify::VerificationOp>>,
 }
 
 impl Default for KiwiCfg {
@@ -51,6 +59,7 @@ impl Default for KiwiCfg {
             endpoint: None,
             auth_env: None,
             timeout_ms: default_kiwi_timeout_ms(),
+            operations: None,
         }
     }
 }
@@ -72,6 +81,7 @@ impl KiwiCfg {
             endpoint,
             auth_env: self.auth_env.clone(),
             timeout_ms: self.timeout_ms,
+            operations: self.operations.clone(),
         };
         config
             .validate()

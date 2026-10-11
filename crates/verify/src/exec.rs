@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Typed, async, project-aware verification (P0-9/P0-10/P0-11).
 //!
 //! This module is the modernization target for the legacy string-command

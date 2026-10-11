@@ -1,8 +1,8 @@
 {
   "id": "INV-CONTRACT-EVIDENCE-PERSISTED",
   "file": "crates/agent/src/runtime/contract_eval.rs",
-  "find": "            obligation.state = state;\n            obligation.confidence_bps = Some(confidence);",
-  "replace": "            obligation.state = ClaimState::Unknown;\n            obligation.confidence_bps = Some(confidence);",
+  "find": "        obligation.state = state;\n        obligation.confidence_bps = Some(confidence_for(state));",
+  "replace": "        obligation.state = ClaimState::Unknown;\n        obligation.confidence_bps = Some(confidence_for(state));",
   "gate": "cargo test -p faktor-agent --lib disproven_obligation_blocks_and_persists_evaluated_states",
   "expect": "FAILED",
   "note": "Not persisting the evaluated claim state erases the evidence-backed truth the gate depends on."

@@ -1,0 +1,9 @@
+{
+  "id": "even-filter",
+  "task_class": "easy",
+  "phase": "implement",
+  "input_tokens": 13500,
+  "output_tokens": 1050,
+  "fix_at_attempt": 1,
+  "order": 4
+}

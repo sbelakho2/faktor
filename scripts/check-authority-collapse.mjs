@@ -13,29 +13,53 @@
 //   2. an `Err(_)` arm whose body is bare `None`/`{}`/empty (a swallowed
 //      infrastructure error) in the same modules.
 //
+// DISCOVERY IS MECHANICAL — there is no manual file array:
+//
+//   * every production Rust file under `crates/*/src/**` (tests excluded)
+//     that carries the required module annotation
+//     `@authority-collapse: authority-bearing` is an authority module and is
+//     scanned. New authority modules enter coverage automatically by
+//     carrying the annotation; the verification/contract/semantic surfaces
+//     (contract_eval, crates/verify, crates/kiwi, crates/semantic) are
+//     annotated, so they can never silently leave coverage;
+//   * a production file that DECLARES an authority surface (verification
+//     provider trait/registry, claim-batch dispatch, contract evaluation/
+//     outcome functions, semantic provider trait/registry) but does NOT
+//     carry the annotation is itself a failure — an unannotated authority
+//     module is a discovered-but-unreviewed hole.
+//
 // Every remaining hit must be listed in ALLOWLIST with a reason; a stale
 // allowlist entry (no longer matching) is itself a failure so reviews stay
-// honest. Matcher fixtures in --selftest prove both patterns are detected.
+// honest. The --selftest fixtures prove both collapse patterns are detected,
+// that a NEW annotated authority file is discovered by the scan alone, and
+// that an unannotated authority file fails discovery.
 //
-// Exit codes: 0 pass; 1 violations/stale allowlist; 2 usage.
-import { readFileSync } from 'node:fs';
-import { dirname, relative, resolve } from 'node:path';
+// Exit codes: 0 pass; 1 violations/stale allowlist/unannotated authority;
+// 2 usage.
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-const AUTHORITY_FILES = [
-  'crates/agent/src/runtime/turn/drive.rs',
-  'crates/agent/src/runtime/verification_attribution.rs',
-  'crates/agent/src/runtime/retrieval.rs',
-  'crates/agent/src/runtime/compaction.rs',
-  'crates/agent/src/semantic_tool.rs',
-  'crates/instructions/src/lib.rs',
-  'crates/git/src/guard.rs',
-  'crates/orchestrator/src/merge_semantic.rs',
-  'crates/worker/src/service.rs',
-  'crates/session/src/child.rs',
-  'crates/session/src/manager.rs',
+// The required annotation of every authority-bearing production module.
+const AUTHORITY_ANNOTATION = /@authority-collapse:\s*authority-bearing/;
+
+// Authority-SURFACE declarations: a production module that defines or
+// dispatches one of these must carry the annotation (or discovery refuses
+// it as unannotated). This is a pattern list, not a file list: a new
+// provider/registry/dispatch module is caught the day it lands.
+const REQUIRED_ANNOTATION_PATTERNS = [
+  /trait\s+VerificationProvider\b/,
+  /struct\s+VerificationRegistry\b/,
+  /impl\s+VerificationProvider\s+for\b/,
+  /\bfn\s+verify_claims\b/,
+  /\bfn\s+evaluate_and_persist_contract\b/,
+  /\bfn\s+apply_contract_outcome\b/,
+  /\bfn\s+set_verification_providers\b/,
+  /trait\s+SemanticProvider\b/,
+  /struct\s+SemanticProviderRegistry\b/,
+  /impl\s+SemanticProviderRegistry\b/,
 ];
 
 // Reviewed exceptions. `line_contains` is a literal substring of the source
@@ -59,6 +83,34 @@ const ALLOWLIST = [
     line_contains: 'handle.title().unwrap_or_default()',
     count: 1,
     reason: 'prompt hint title: display-only context, never an authority or identity input.',
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/state.rs',
+    line_contains: 'let mut tasks = handle.list_tasks().unwrap_or_default();',
+    count: 1,
+    reason:
+      'review-context support read: an unreadable durable task list yields no durable criteria; the caller still carries criteria_rows and the goal text, so the reviewer never receives a silently empty package when a goal exists (this helper never gates completion).',
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/state.rs',
+    line_contains: 'let preferred = handle.task_id().ok();',
+    count: 1,
+    reason:
+      "advisory task preference for the review package: an unreadable task id falls back to the session's first task; the value never gates completion, rebinds a task or feeds a proof.",
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/state.rs',
+    line_contains: '.unwrap_or_default()',
+    count: 1,
+    reason:
+      'Option::unwrap_or_default after a positive position selection on a non-empty task list: unreachable default kept for the total function shape.',
+  },
+  {
+    file: 'crates/agent/src/runtime/turn/state.rs',
+    line_contains: 'let last = handle.last_event_seq().ok()??;',
+    count: 1,
+    reason:
+      'last_event_kind diagnostic: an unreadable event sequence is explicit absence (None), never a fabricated event, and the value only classifies a display/telemetry decision.',
   },
   {
     file: 'crates/agent/src/runtime/verification_attribution.rs',
@@ -155,15 +207,90 @@ function scanText(text, file) {
   return hits;
 }
 
+// ------------------------------------------------- mechanical discovery
+
+function isTestPath(rel) {
+  const segments = rel.split('/');
+  return (
+    rel.endsWith('_tests.rs') ||
+    rel.endsWith('/tests.rs') ||
+    segments.includes('tests') ||
+    segments.includes('test')
+  );
+}
+
+function walkProductionRust(dir, out) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkProductionRust(path, out);
+    } else if (entry.name.endsWith('.rs')) {
+      out.push(relative(ROOT, path));
+    }
+  }
+}
+
+function productionFiles() {
+  const cratesDir = resolve(ROOT, 'crates');
+  const found = [];
+  for (const entry of readdirSync(cratesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    walkProductionRust(join(cratesDir, entry.name, 'src'), found);
+  }
+  return found;
+}
+
+/**
+ * Mechanical authority discovery over a list of { path, text } production
+ * files: annotated modules are covered; surface-declaring modules without
+ * the annotation are refused. No file list exists anywhere.
+ */
+function discoverAuthorityFiles(files) {
+  const covered = [];
+  const unannotated = [];
+  for (const file of files) {
+    if (isTestPath(file.path)) continue;
+    const annotated = AUTHORITY_ANNOTATION.test(file.text);
+    if (annotated) {
+      covered.push(file.path);
+      continue;
+    }
+    if (REQUIRED_ANNOTATION_PATTERNS.some((pattern) => pattern.test(file.text))) {
+      unannotated.push(file.path);
+    }
+  }
+  return { covered, unannotated };
+}
+
+function readTree(files) {
+  return files.map((path) => ({ path, text: readFileSync(resolve(ROOT, path), 'utf8') }));
+}
+
+// --------------------------------------------------------------- coverage
+
 function runCoverage() {
-  const scanned = [];
-  for (const file of AUTHORITY_FILES) {
-    const text = readFileSync(resolve(ROOT, file), 'utf8');
-    for (const hit of scanText(text, file)) scanned.push(hit);
+  const tree = readTree(productionFiles());
+  const { covered, unannotated } = discoverAuthorityFiles(tree);
+  const problems = [];
+  let scanned = 0;
+  for (const path of covered) {
+    const { text } = tree.find((file) => file.path === path);
+    for (const hit of scanText(text, path)) scanned += 1, problems.push(hit);
+  }
+  for (const path of unannotated) {
+    console.error(
+      `authority-collapse: ${path}: UNANNOTATED-AUTHORITY: file declares an authority surface without the //! @authority-collapse: authority-bearing annotation`,
+    );
   }
   const used = new Map();
-  const problems = [];
-  for (const hit of scanned) {
+  const unreviewed = [];
+  for (const hit of problems) {
     const entry = ALLOWLIST.find(
       (a) => a.file === hit.file && hit.text.includes(a.line_contains),
     );
@@ -171,12 +298,12 @@ function runCoverage() {
       used.set(entry, (used.get(entry) ?? 0) + 1);
       continue;
     }
-    problems.push({ ...hit, kind: `UNREVIEWED ${hit.kind}` });
+    unreviewed.push({ ...hit, kind: `UNREVIEWED ${hit.kind}` });
   }
   for (const entry of ALLOWLIST) {
     const count = used.get(entry) ?? 0;
     if (count !== entry.count) {
-      problems.push({
+      unreviewed.push({
         file: entry.file,
         line: 0,
         kind: 'STALE-ALLOWLIST',
@@ -184,19 +311,21 @@ function runCoverage() {
       });
     }
   }
-  if (problems.length > 0) {
-    for (const p of problems) {
-      console.error(`authority-collapse: ${p.file}:${p.line}: ${p.kind}: ${p.text}`);
-    }
+  for (const p of unreviewed) {
+    console.error(`authority-collapse: ${p.file}:${p.line}: ${p.kind}: ${p.text}`);
+  }
+  if (unannotated.length > 0 || unreviewed.length > 0) {
     process.exit(1);
   }
   console.log(
-    `authority-collapse: PASS (${AUTHORITY_FILES.length} files; ${ALLOWLIST.length} reviewed exception(s); 0 unreviewed collapses)`,
+    `authority-collapse: PASS (${covered.length} authority module(s) discovered mechanically of ${tree.length} production file(s); ${ALLOWLIST.length} reviewed exception(s); 0 unreviewed collapses)`,
   );
 }
 
+// --------------------------------------------------------------- selftest
+
 function selftest() {
-  const fixtures = [
+  const patternFixtures = [
     {
       name: 'collapse on a task read',
       hit: true,
@@ -250,7 +379,7 @@ function selftest() {
     },
   ];
   let failed = 0;
-  for (const fixture of fixtures) {
+  for (const fixture of patternFixtures) {
     const found = scanText(fixture.text, 'fixture.rs').length > 0;
     if (found !== fixture.hit) {
       console.error(
@@ -259,11 +388,109 @@ function selftest() {
       failed += 1;
     }
   }
-  // The real tree must pass too (zero unreviewed collapses).
-  const moduleDir = dirname(fileURLToPath(import.meta.url));
-  void moduleDir;
+
+  // Discovery fixtures: a NEW authority file is found by the scan alone
+  // (annotation registry), and an unannotated authority surface is refused.
+  const newAuthorityWithAnnotation = {
+    path: 'crates/agent/src/runtime/brand_new_authority.rs',
+    text: [
+      '//! A brand-new authority module added after the checker shipped.',
+      '//! @authority-collapse: authority-bearing',
+      'impl VerificationProvider for NewProvider {',
+      '    fn ask(&self) {',
+      '        let task = handle.get_task(id).ok();',
+      '    }',
+      '}',
+    ].join('\n'),
+  };
+  const newAuthorityUnannotated = {
+    path: 'crates/agent/src/runtime/brand_new_authority.rs',
+    text: [
+      'impl VerificationProvider for NewProvider {',
+      '    fn ask(&self) {',
+      '        let task = handle.get_task(id).ok();',
+      '    }',
+      '}',
+    ].join('\n'),
+  };
+  const annotatedWithoutSurfacePatterns = {
+    path: 'crates/agent/src/runtime/annotated_only.rs',
+    text: [
+      '//! @authority-collapse: authority-bearing',
+      'pub fn peek() {',
+      '    let facts = handle.memory_facts().unwrap_or_default();',
+      '}',
+    ].join('\n'),
+  };
+  const plainModule = {
+    path: 'crates/util/src/helpers.rs',
+    text: 'pub fn add(a, b) {\n    a + b\n}\n',
+  };
+  const discoveryCases = [
+    {
+      name: 'a NEW annotated authority file is discovered and scanned',
+      files: [newAuthorityWithAnnotation],
+      covered: 1,
+      unannotated: 0,
+      hits: 1,
+    },
+    {
+      name: 'an unannotated authority file fails discovery',
+      files: [newAuthorityUnannotated],
+      covered: 0,
+      unannotated: 1,
+      hits: 0,
+    },
+    {
+      name: 'an annotated module is covered even without surface declarations',
+      files: [annotatedWithoutSurfacePatterns],
+      covered: 1,
+      unannotated: 0,
+      hits: 1,
+    },
+    {
+      name: 'a plain module without authority patterns is not required to annotate',
+      files: [plainModule],
+      covered: 0,
+      unannotated: 0,
+      hits: 0,
+    },
+    {
+      name: 'test files are excluded from discovery',
+      files: [
+        {
+          path: 'crates/agent/src/runtime/authority_tests.rs',
+          text: 'impl VerificationProvider for TestProvider {}\n',
+        },
+      ],
+      covered: 0,
+      unannotated: 0,
+      hits: 0,
+    },
+  ];
+  for (const fixture of discoveryCases) {
+    const { covered, unannotated } = discoverAuthorityFiles(fixture.files);
+    const hits = covered.reduce(
+      (total, path) =>
+        total + scanText(fixture.files.find((f) => f.path === path).text, path).length,
+      0,
+    );
+    if (
+      covered.length !== fixture.covered ||
+      unannotated.length !== fixture.unannotated ||
+      hits !== fixture.hits
+    ) {
+      console.error(
+        `authority-collapse selftest: ${fixture.name}: expected covered=${fixture.covered} unannotated=${fixture.unannotated} hits=${fixture.hits}, got covered=${covered.length} unannotated=${unannotated.length} hits=${hits}`,
+      );
+      failed += 1;
+    }
+  }
+
   if (failed > 0) process.exit(1);
-  console.log('authority-collapse selftest: PASS (patterns detected, exemptions respected)');
+  console.log(
+    'authority-collapse selftest: PASS (patterns detected, mechanical discovery finds new authority files, unannotated authority refused)',
+  );
 }
 
 const mode = process.argv[2] ?? '--coverage';

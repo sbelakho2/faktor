@@ -1086,7 +1086,25 @@ async fn read_only_shell_has_kernel_write_denial_and_no_change_manifest() {
         .run_turn(session, "read-only verification shell", &[])
         .await
         .unwrap();
-    assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+    // Platform split: only Linux installs the per-process filesystem
+    // backend. There the required read-only isolation confines the child and
+    // the turn completes; elsewhere the Required demand is a TYPED spawn
+    // refusal (fail closed, never an unconfined run), so the tool fails and
+    // the turn ends recoverable — but a write still never lands and there is
+    // still no change accounting.
+    if cfg!(target_os = "linux") {
+        assert_eq!(outcome.final_state, AgentState::ReadyForNextTurn);
+        assert!(
+            root.join("target/scratch.txt").exists(),
+            "the explicit build root stays writable"
+        );
+    } else {
+        assert_eq!(
+            outcome.final_state,
+            AgentState::FailedRecoverable,
+            "without a filesystem backend the required isolation must refuse the spawn"
+        );
+    }
     assert!(
         !root.join("src/blocked.rs").exists(),
         "the kernel must deny the workspace write (file must never exist)"
@@ -1094,10 +1112,6 @@ async fn read_only_shell_has_kernel_write_denial_and_no_change_manifest() {
     assert!(
         !root.join("root-escape.txt").exists(),
         "a workspace-root write is denied too"
-    );
-    assert!(
-        root.join("target/scratch.txt").exists(),
-        "the explicit build root stays writable"
     );
     let handle = manager.get_session(session).unwrap().unwrap();
     let (rows, _truncated) = changed_rows(&handle);
@@ -1230,7 +1244,12 @@ fn read_only_writable_roots_are_derived_in_every_authority() {
 #[test]
 fn hostile_git_pointers_are_refused_without_authority_keys() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("ws");
+    // Canonicalize the fixture root: macOS tempdirs live behind a /var ->
+    // /private/var symlink, and a synthetic pointer written with the raw
+    // path would never reciprocate a workspace root resolved through the
+    // canonical one (real `git worktree` writes canonical paths itself).
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("ws");
     std::fs::create_dir_all(&root).unwrap();
     let handle =
         WorkspaceHandle::open_scoped(faktor_core::id::WorkspaceId::new(402), root.clone()).unwrap();
@@ -1248,7 +1267,7 @@ fn hostile_git_pointers_are_refused_without_authority_keys() {
 
     // Shape-valid but unbound: a foreign `worktrees/<name>` whose reciprocal
     // `gitdir` file does not point back at THIS workspace is refused.
-    let foreign = dir.path().join("foreign/worktrees/evil");
+    let foreign = base.join("foreign/worktrees/evil");
     std::fs::create_dir_all(&foreign).unwrap();
     std::fs::write(foreign.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::write(foreign.join("gitdir"), "/somewhere/else/.git\n").unwrap();
@@ -1266,7 +1285,7 @@ fn hostile_git_pointers_are_refused_without_authority_keys() {
 
     // Bound gitdir but a commondir traversal outside the git layout: the
     // lexical ancestor guard refuses before any stat of `/home`.
-    let bound = dir.path().join("common/worktrees/evil");
+    let bound = base.join("common/worktrees/evil");
     std::fs::create_dir_all(&bound).unwrap();
     std::fs::write(bound.join("HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::write(bound.join("index"), b"i").unwrap();
@@ -1572,7 +1591,7 @@ async fn disproven_obligation_blocks_and_persists_evaluated_states() {
         started_ms: now,
         finished_ms: now + 1,
     };
-    let outcome = evaluate_and_persist_contract(&handle, &[failing], None).await;
+    let outcome = evaluate_and_persist_contract(&handle, &[failing], None, None, None).await;
     let super::contract_eval::ContractGateOutcome::Evaluated { disproven, .. } = &outcome else {
         panic!("expected an evaluated outcome, got {outcome:?}");
     };
@@ -1665,7 +1684,7 @@ async fn supported_obligation_persists_and_keeps_the_passing_gate() {
         started_ms: now,
         finished_ms: now + 1,
     };
-    let outcome = evaluate_and_persist_contract(&handle, &[passing], None).await;
+    let outcome = evaluate_and_persist_contract(&handle, &[passing], None, None, None).await;
     let super::contract_eval::ContractGateOutcome::Evaluated { disproven, .. } = &outcome else {
         panic!("expected an evaluated outcome, got {outcome:?}");
     };
@@ -1679,4 +1698,332 @@ async fn supported_obligation_persists_and_keeps_the_passing_gate() {
         apply_contract_outcome(super::CompletionGate::VerifiedComplete, outcome),
         super::CompletionGate::VerifiedComplete
     ));
+}
+
+/// End-to-end completion spine (audit items 6 + 10): a fake EXTERNAL verifier
+/// installed in the neutral registry drives per-claim states into the durable
+/// engineering contract — A disproven, B supported, C explicitly unknown each
+/// land on the RIGHT obligation — and one disproven claim re-opens work
+/// (typed replan cause + blocked passing gate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_provider_claim_batch_drives_the_contract_and_reopens_work() {
+    use super::contract_eval::{
+        apply_contract_outcome, evaluate_and_persist_contract, replan_detail,
+        ContractProviderDispatch,
+    };
+    use faktor_core::contract::{
+        AcceptedStrength, ClaimState, ContractOrigin, EngineeringContract, EvidenceBinding,
+        ProofEvidenceKind, Requirement,
+    };
+    use faktor_verify::{
+        ArtifactRef, BoxFuture, ClaimVerificationResult, EvidenceStrength,
+        VerificationCapabilities, VerificationError, VerificationOp, VerificationOutcome,
+        VerificationProvider, VerificationProviderId, VerificationRegistry, VerificationRequest,
+        VerificationResponse,
+    };
+
+    // The scripted external verifier: A -> disproven (counterexample),
+    // B -> supported (evidence), C -> explicit unknown. Every claim comes
+    // back; nothing is silently omitted.
+    struct ExternalVerifier {
+        alpha: String,
+        beta: String,
+    }
+    impl VerificationProvider for ExternalVerifier {
+        fn id(&self) -> VerificationProviderId {
+            VerificationProviderId::parse("external").unwrap()
+        }
+
+        fn capabilities(&self) -> VerificationCapabilities {
+            VerificationCapabilities::of_many(&VerificationOp::ALL)
+        }
+
+        fn verify(
+            &self,
+            request: VerificationRequest,
+        ) -> BoxFuture<'_, Result<VerificationResponse, VerificationError>> {
+            let provider = self.id();
+            let mut claims = Vec::new();
+            for asked in &request.claims {
+                if asked.obligation_id == self.alpha {
+                    claims.push(ClaimVerificationResult::verdict(
+                        provider.clone(),
+                        asked.obligation_id.clone(),
+                        ClaimState::Disproven,
+                        EvidenceStrength::Observed,
+                        Vec::new(),
+                        vec!["refresh token replay succeeded".to_string()],
+                    ));
+                } else if asked.obligation_id == self.beta {
+                    claims.push(ClaimVerificationResult::verdict(
+                        provider.clone(),
+                        asked.obligation_id.clone(),
+                        ClaimState::Supported,
+                        EvidenceStrength::Observed,
+                        vec![ArtifactRef::new(
+                            ProofEvidenceKind::RuntimeTrace,
+                            "external.trace",
+                            "assertion observed in the attack run",
+                        )
+                        .unwrap()],
+                        Vec::new(),
+                    ));
+                } else {
+                    claims.push(ClaimVerificationResult::unavailable_unknown(
+                        provider.clone(),
+                        asked.obligation_id.clone(),
+                    ));
+                }
+            }
+            let op = request.op;
+            Box::pin(async move {
+                Ok(
+                    VerificationResponse::new(provider, op, VerificationOutcome::Failed)
+                        .with_claims(claims),
+                )
+            })
+        }
+    }
+
+    let env = shell_env(vec![ScriptedResponse::End]);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    let alpha = EngineeringContract::obligation_bound(
+        "alpha contract holds",
+        ProofEvidenceKind::ContractCheck,
+        ContractOrigin::User,
+        Requirement::Required,
+        EvidenceBinding::ContractIds(vec!["c-alpha".into()]),
+        AcceptedStrength::Supported,
+    );
+    let beta = EngineeringContract::obligation_bound(
+        "beta runtime assertion holds",
+        ProofEvidenceKind::RuntimeTrace,
+        ContractOrigin::User,
+        Requirement::Required,
+        EvidenceBinding::RuntimeAssertions(vec!["a1".into()]),
+        AcceptedStrength::Supported,
+    );
+    let gamma = EngineeringContract::obligation_bound(
+        "gamma review claim holds",
+        ProofEvidenceKind::Review,
+        ContractOrigin::User,
+        Requirement::Required,
+        EvidenceBinding::Category,
+        AcceptedStrength::Supported,
+    );
+    let contract = EngineeringContract {
+        proof_obligations: vec![alpha.clone(), beta.clone(), gamma.clone()],
+        ..Default::default()
+    };
+    handle
+        .create_task(faktor_session::Task {
+            task_id,
+            session_id: env.session,
+            goal: "spine".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+            contract,
+        })
+        .unwrap();
+
+    let mut registry = VerificationRegistry::new();
+    registry.register(Arc::new(ExternalVerifier {
+        alpha: alpha.id.clone(),
+        beta: beta.id.clone(),
+    }));
+    let dispatch = ContractProviderDispatch {
+        registry: &registry,
+        op_id: OpId::new(77),
+        cancellation: faktor_core::CancellationToken::new(),
+    };
+    let outcome = evaluate_and_persist_contract(&handle, &[], None, None, Some(&dispatch)).await;
+    let super::contract_eval::ContractGateOutcome::Evaluated {
+        disproven, replan, ..
+    } = &outcome
+    else {
+        panic!("expected an evaluated outcome, got {outcome:?}");
+    };
+    assert_eq!(disproven.len(), 1, "{disproven:?}");
+    assert_eq!(disproven[0].id, alpha.id);
+    assert_eq!(replan.len(), 1, "the counterexample re-opens work");
+    assert_eq!(replan[0].obligation_id, alpha.id);
+    assert!(replan[0]
+        .counterexample
+        .as_deref()
+        .is_some_and(|c| c.contains("replay succeeded")));
+
+    // The per-claim states were written back onto the RIGHT obligations.
+    let row = handle.get_task(task_id).unwrap().unwrap();
+    let state_of = |id: &str| {
+        row.contract
+            .proof_obligations
+            .iter()
+            .find(|obligation| obligation.id == id)
+            .unwrap()
+            .state
+    };
+    assert_eq!(state_of(&alpha.id), ClaimState::Disproven);
+    assert_eq!(state_of(&beta.id), ClaimState::Supported);
+    assert_eq!(
+        state_of(&gamma.id),
+        ClaimState::Unknown,
+        "an explicit unknown verdict leaves the claim unresolved, never resolved"
+    );
+    let beta_row = row
+        .contract
+        .proof_obligations
+        .iter()
+        .find(|obligation| obligation.id == beta.id)
+        .unwrap();
+    assert!(
+        beta_row.proofs.iter().any(|proof| proof
+            .reference
+            .as_ref()
+            .and_then(|r| r.provider.as_deref())
+            == Some("external")),
+        "the provider identity rides the proof record: {beta_row:?}"
+    );
+
+    // The disproven claim blocks a passing gate and the replan is disclosed.
+    assert!(replan_detail(&outcome)
+        .expect("replan detail")
+        .contains("refresh token replay succeeded"));
+    match apply_contract_outcome(super::CompletionGate::VerifiedComplete, outcome) {
+        super::CompletionGate::BlockedVerification { reasons } => {
+            assert!(reasons.iter().any(|reason| {
+                reason.code == faktor_core::state::ReasonCode::ProofObligationDisproven
+            }));
+        }
+        other => panic!("expected a blocked gate, got {other:?}"),
+    }
+}
+
+/// A provider that silently omits a required claim never lets a passing gate
+/// stand: the typed refusal folds into the unevaluable-contract outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_omission_blocks_a_passing_gate_typed() {
+    use super::contract_eval::{
+        apply_contract_outcome, evaluate_and_persist_contract, ContractProviderDispatch,
+    };
+    use faktor_core::contract::{
+        AcceptedStrength, ContractOrigin, EngineeringContract, EvidenceBinding, ProofEvidenceKind,
+        Requirement,
+    };
+    use faktor_verify::{
+        ArtifactRef, BoxFuture, ClaimVerificationResult, EvidenceStrength,
+        VerificationCapabilities, VerificationError, VerificationOp, VerificationOutcome,
+        VerificationProvider, VerificationProviderId, VerificationRegistry, VerificationRequest,
+        VerificationResponse,
+    };
+
+    struct OmittingVerifier;
+    impl VerificationProvider for OmittingVerifier {
+        fn id(&self) -> VerificationProviderId {
+            VerificationProviderId::parse("external").unwrap()
+        }
+
+        fn capabilities(&self) -> VerificationCapabilities {
+            VerificationCapabilities::of_many(&VerificationOp::ALL)
+        }
+
+        fn verify(
+            &self,
+            request: VerificationRequest,
+        ) -> BoxFuture<'_, Result<VerificationResponse, VerificationError>> {
+            let provider = self.id();
+            // "Passes" the batch while answering only its first claim.
+            let first = request.claims[0].obligation_id.clone();
+            let op = request.op;
+            Box::pin(async move {
+                Ok(
+                    VerificationResponse::new(provider.clone(), op, VerificationOutcome::Passed)
+                        .with_claims(vec![ClaimVerificationResult::verdict(
+                            provider,
+                            first,
+                            faktor_core::contract::ClaimState::Supported,
+                            EvidenceStrength::Observed,
+                            vec![ArtifactRef::new(
+                                ProofEvidenceKind::ContractCheck,
+                                "external",
+                                "claimed pass",
+                            )
+                            .unwrap()],
+                            Vec::new(),
+                        )]),
+                )
+            })
+        }
+    }
+
+    let env = shell_env(vec![ScriptedResponse::End]);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    let first = EngineeringContract::obligation_bound(
+        "first required claim",
+        ProofEvidenceKind::ContractCheck,
+        ContractOrigin::User,
+        Requirement::Required,
+        EvidenceBinding::ContractIds(vec!["c-first".into()]),
+        AcceptedStrength::Supported,
+    );
+    let second = EngineeringContract::obligation_bound(
+        "second required claim",
+        ProofEvidenceKind::ContractCheck,
+        ContractOrigin::User,
+        Requirement::Required,
+        EvidenceBinding::ContractIds(vec!["c-second".into()]),
+        AcceptedStrength::Supported,
+    );
+    handle
+        .create_task(faktor_session::Task {
+            task_id,
+            session_id: env.session,
+            goal: "omission".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+            contract: EngineeringContract {
+                proof_obligations: vec![first, second],
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+    let mut registry = VerificationRegistry::new();
+    registry.register(Arc::new(OmittingVerifier));
+    let dispatch = ContractProviderDispatch {
+        registry: &registry,
+        op_id: OpId::new(78),
+        cancellation: faktor_core::CancellationToken::new(),
+    };
+    let outcome = evaluate_and_persist_contract(&handle, &[], None, None, Some(&dispatch)).await;
+    // The omission is a typed refusal: the contract must not be treated as
+    // evaluated, and a passing gate is refused with the unavailable reason.
+    let super::contract_eval::ContractGateOutcome::Unavailable(detail) = &outcome else {
+        panic!("expected an unavailable outcome, got {outcome:?}");
+    };
+    assert!(
+        detail.contains("silently omitted required claim"),
+        "{detail}"
+    );
+    match apply_contract_outcome(super::CompletionGate::VerifiedComplete, outcome) {
+        super::CompletionGate::BlockedVerification { reasons } => {
+            assert!(reasons
+                .iter()
+                .any(|reason| reason.code == faktor_core::state::ReasonCode::CheckUnavailable));
+        }
+        other => panic!("expected a blocked gate, got {other:?}"),
+    }
 }

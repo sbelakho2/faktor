@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Provider registry, capability-driven selection and guarded dispatch
 //! (audit 48-54/58/59).
 //!

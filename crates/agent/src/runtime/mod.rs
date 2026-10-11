@@ -110,6 +110,7 @@ mod retry;
 mod settlement;
 pub(crate) use settlement::*;
 mod compaction;
+mod contract_compiler;
 mod contract_eval;
 pub(crate) use compaction::*;
 mod verification_attribution;
@@ -147,6 +148,10 @@ mod provider_loop_tests;
 #[cfg(test)]
 #[path = "tool_loop_tests.rs"]
 mod tool_loop_tests;
+
+#[cfg(test)]
+#[path = "contract_compiler_tests.rs"]
+mod contract_compiler_tests;
 
 #[cfg(test)]
 #[path = "shell_changes_tests.rs"]

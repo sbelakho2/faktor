@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! The real `semantic_query` tool (audit Tangerine-10): the model's explicit
 //! escape hatch into the semantic provider. It is NOT synthesized from model
 //! capabilities (embedding support is irrelevant): the runtime injects the

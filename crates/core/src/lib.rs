@@ -22,6 +22,7 @@ pub mod capability;
 pub mod command;
 pub mod completion;
 pub mod contract;
+pub mod contract_compile;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -62,8 +63,16 @@ pub use command::{
 };
 pub use completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 pub use contract::{
-    ClaimState, Constraint, ContractDisclosure, ContractOrigin, EngineeringContract, EvidenceRef,
-    Invariant, ProofEvidenceKind, ProofObligation, RiskHypothesis, RiskSeverity,
+    AcceptedStrength, ClaimState, Constraint, ContractDisclosure, ContractOrigin,
+    EngineeringContract, EvidenceBinding, EvidenceRef, Invariant, ProofBasis, ProofEvidenceKind,
+    ProofEvidenceRef, ProofObligation, ProofRecord, ProofScope, ProofStaleness, ProofSurvival,
+    Requirement, RiskHypothesis, RiskSeverity, SubjectSnapshot, VerificationDepth,
+};
+pub use contract_compile::{
+    compile_contract, compile_contract_with, intent_tokens, CompiledContract,
+    ContractCompileRequest, ContractUncertainty, EnrichmentKind, EnrichmentOutcome,
+    EnrichmentRequest, EnrichmentStatement, RepositoryFile, RepositorySnapshot, StatementKind,
+    StatementOrigin, StatementProvenance, SystemIntelligenceProvider,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};

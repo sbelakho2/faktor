@@ -982,7 +982,7 @@ pub(crate) async fn native_permission_reply(
             return wire_status(malformed_body(&format!(
                 "invalid permission id {:?}",
                 req.permission_id
-            )))
+            )));
         }
     };
     let decision = match req.decision.as_str() {
@@ -998,7 +998,7 @@ pub(crate) async fn native_permission_reply(
                 message: format!("permission {pid} unknown or already resolved"),
                 http_status: 409,
                 retryable: false,
-            })
+            });
         }
         Err(mismatch) => {
             return wire_status(ApiError {
@@ -1006,7 +1006,7 @@ pub(crate) async fn native_permission_reply(
                 message: mismatch.to_string(),
                 http_status: 409,
                 retryable: false,
-            })
+            });
         }
     }
     Json(serde_json::json!({ "ok": true })).into_response()

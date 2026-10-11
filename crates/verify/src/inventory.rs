@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Repository discovery that scales to real repositories without losing the
 //! fail-closed completeness verdict (audit: verification must not depend on
 //! a partial view of the repo).

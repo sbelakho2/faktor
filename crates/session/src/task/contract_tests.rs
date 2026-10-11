@@ -520,3 +520,124 @@ fn obligation_state_updates_are_idempotent_evidence_preserving_and_bounded() {
         TaskError::TerminalTask { .. }
     ));
 }
+
+/// Snapshot-bound proof records are part of the durable obligation state:
+/// the evaluation's record set is persisted verbatim, idempotent replays
+/// write nothing, the row survives a store reopen, and hostile proof shapes
+/// (claim mismatch, count overflow, oversized counterexample, hostile
+/// binding) are refused typed before any write.
+#[test]
+fn snapshot_bound_proof_records_are_durable_and_hostile_shapes_refused() {
+    use faktor_core::contract::{
+        ClaimState, ContractOrigin, EvidenceBinding, ProofBasis, ProofEvidenceKind, ProofRecord,
+        SubjectSnapshot, MAX_PROOF_RECORDS,
+    };
+    use faktor_core::{AcceptedStrength, Requirement};
+    let (dir, m) = test_manager();
+    let s = session(&m);
+    let task_id = s.task_id().unwrap();
+    let mut seed = task(&s);
+    seed.contract = EngineeringContract {
+        proof_obligations: vec![EngineeringContract::obligation_bound(
+            "auth replay is rejected",
+            ProofEvidenceKind::TestExecution,
+            ContractOrigin::User,
+            Requirement::Required,
+            EvidenceBinding::TestSelector("auth::refresh::replay_is_rejected".into()),
+            AcceptedStrength::Supported,
+        )],
+        ..Default::default()
+    };
+    let created = s.create_task(seed).unwrap();
+    let revision = s.task_revision(task_id).unwrap();
+    let mut update = created.contract.proof_obligations[0].clone();
+    update.state = ClaimState::Supported;
+    update.confidence_bps = Some(8_000);
+    update.record_proof(ProofRecord {
+        claim: update.claim.clone(),
+        state: ClaimState::Supported,
+        confidence_bps: 8_000,
+        basis: ProofBasis::snapshot_bound(
+            SubjectSnapshot::new("tm1:aaaa").with_environment("env-1"),
+        ),
+        evidence: vec![],
+        reference: None,
+        counterexample: None,
+    });
+    let updated = s
+        .apply_task_contract_obligation_states(task_id, std::slice::from_ref(&update))
+        .unwrap();
+    assert_eq!(s.task_revision(task_id).unwrap().raw(), revision.raw() + 1);
+    let record = &updated.contract.proof_obligations[0].proofs[0];
+    assert_eq!(
+        record
+            .basis
+            .subject
+            .as_ref()
+            .and_then(|s| s.environment.as_deref()),
+        Some("env-1")
+    );
+    // Idempotent replay: no write, no revision bump.
+    let replayed = s
+        .apply_task_contract_obligation_states(task_id, std::slice::from_ref(&update))
+        .unwrap();
+    assert_eq!(s.task_revision(task_id).unwrap().raw(), revision.raw() + 1);
+    assert_eq!(replayed.contract, updated.contract);
+
+    // Hostile proof claim mismatch: refused typed, zero writes.
+    let mut hostile = update.clone();
+    hostile.proofs[0].claim = "another claim".into();
+    assert!(matches!(
+        s.apply_task_contract_obligation_states(task_id, &[hostile])
+            .unwrap_err(),
+        TaskError::Malformed(_)
+    ));
+    assert_eq!(s.get_task(task_id).unwrap().unwrap(), updated);
+    // Hostile proof count overflow.
+    let mut hostile = update.clone();
+    hostile.proofs = (0..=MAX_PROOF_RECORDS)
+        .map(|i| ProofRecord {
+            claim: hostile.claim.clone(),
+            state: ClaimState::Supported,
+            confidence_bps: 8_000,
+            basis: ProofBasis::snapshot_bound(SubjectSnapshot::new(format!("tm1:{i:04}"))),
+            evidence: vec![],
+            reference: None,
+            counterexample: None,
+        })
+        .collect();
+    assert!(matches!(
+        s.apply_task_contract_obligation_states(task_id, &[hostile])
+            .unwrap_err(),
+        TaskError::Oversized(_)
+    ));
+    // Hostile oversized counterexample.
+    let mut hostile = update.clone();
+    hostile.proofs[0].counterexample = Some("x".repeat(MAX_TASK_CONTRACT_STRING_BYTES + 1));
+    assert!(matches!(
+        s.apply_task_contract_obligation_states(task_id, &[hostile])
+            .unwrap_err(),
+        TaskError::Oversized(_)
+    ));
+    // Hostile binding (empty target) is refused at contract validation too.
+    let mut hostile_contract = updated.contract.clone();
+    hostile_contract.proof_obligations[0].evidence_binding =
+        EvidenceBinding::CheckIds(vec![String::new()]);
+    let mut hostile_task = task(&s);
+    hostile_task.task_id = TaskId::new(99);
+    hostile_task.contract = hostile_contract;
+    assert!(matches!(
+        s.create_task(hostile_task).unwrap_err().kind,
+        ErrorKind::Malformed
+    ));
+
+    // The proof record is DURABLE: a fresh manager reads it back.
+    drop(m);
+    let m2 = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let s2 = m2.get_session(s.id).unwrap().unwrap();
+    assert_eq!(
+        s2.get_task(task_id).unwrap().unwrap().contract,
+        updated.contract,
+        "snapshot-bound proof records survive a store reopen"
+    );
+}

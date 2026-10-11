@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Multi-component project profiles (audit: single-project verification).
 //!
 //! A repository is not one project. Detection returns EVERY project

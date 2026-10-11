@@ -495,10 +495,10 @@ async fn usage_settlement_persists_reported_cost_and_route_json_on_the_reservati
         "the provider-reported cost rides the reservation row"
     );
     assert_eq!(
-            row.provider_cost_micro,
-            Some(49),
-            "the locally calculated cost (40 in + 9 out at the frozen 1 microUSD/token lines) is recorded too"
-        );
+        row.provider_cost_micro,
+        Some(49),
+        "the locally calculated cost (40 in + 9 out at the frozen 1 microUSD/token lines) is recorded too"
+    );
     assert_eq!(
         row.pricing_snapshot.as_ref().map(|s| s.authority),
         Some(faktor_core::model::PriceAuthority::Exact),

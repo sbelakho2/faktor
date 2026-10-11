@@ -114,7 +114,7 @@ fn evidence_context(
         Some(other) => {
             return Err(Box::new(wire_status(malformed_body(&format!(
                 "unknown evidence scope {other:?}; expected `admin`"
-            )))))
+            )))));
         }
     };
     Ok(EvidenceAccessContext::scoped(

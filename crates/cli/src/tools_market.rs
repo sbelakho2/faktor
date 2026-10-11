@@ -610,7 +610,7 @@ fn parse_packaging(args: &serde_json::Value) -> Result<Option<PackagingType>, Er
             return Err(Error::malformed(format!(
                 "source_market packaging {other:?} is not one of {}",
                 PACKAGING_LABELS.join(", ")
-            )))
+            )));
         }
     };
     Ok(Some(packaging))
@@ -731,7 +731,7 @@ fn parse_bom(args: &serde_json::Value) -> Result<Bom, Error> {
             Err(error) => {
                 return Err(Error::malformed(format!(
                     "source_market bom item {index}: {error}"
-                )))
+                )));
             }
         };
         let packaging = match parse_packaging(item) {
@@ -740,7 +740,7 @@ fn parse_bom(args: &serde_json::Value) -> Result<Bom, Error> {
             Err(error) => {
                 return Err(Error::malformed(format!(
                     "source_market bom item {index}: {error}"
-                )))
+                )));
             }
         };
         // The line's selection is folded into the commerce line itself (and

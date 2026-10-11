@@ -13,12 +13,14 @@ use faktor_core::{
     CancellationToken, ClaimState, Constraint, ContractOrigin, EngineeringContract, EvidenceRef,
     Invariant, OpId, ProofEvidenceKind, RiskHypothesis, RiskSeverity, SessionId, WorkspaceId,
 };
-use faktor_kiwi::{KiwiJob, KiwiProviderConfig, KiwiVerificationProvider, KIWI_SCHEMA_VERSION};
+use faktor_kiwi::{
+    job_id_for, KiwiJob, KiwiProviderConfig, KiwiVerificationProvider, KIWI_SCHEMA_VERSION,
+};
 use faktor_provider::egress::{HttpTransport, PolicyCheckedHttpTransport};
 use faktor_security::destination::DestinationPolicy;
 use faktor_verify::{
-    now_epoch_ms, VerificationError, VerificationOp, VerificationOutcome, VerificationProvider,
-    VerificationRegistry, VerificationRequest,
+    now_epoch_ms, ClaimRequest, VerificationError, VerificationOp, VerificationOutcome,
+    VerificationProvider, VerificationRegistry, VerificationRequest,
 };
 use support::{FakeKiwi, Reply};
 
@@ -33,6 +35,7 @@ fn provider(server: &FakeKiwi, timeout_ms: u64) -> Arc<KiwiVerificationProvider>
         endpoint: server.endpoint(),
         auth_env: None,
         timeout_ms,
+        operations: None,
     }
     .build(transport_for(server))
     .expect("kiwi provider builds")
@@ -62,6 +65,18 @@ fn valid_reply(job: &KiwiJob, claim_state: ClaimState) -> serde_json::Value {
     });
     if claim_state == ClaimState::Disproven {
         claim["counterexample"] = serde_json::json!("replay succeeded");
+    }
+    if matches!(claim_state, ClaimState::Supported | ClaimState::KnownTrue) {
+        // A positive verdict carries evidence (the neutral evidence-adequacy
+        // law); known_true must additionally be proof-grade.
+        claim["evidence"] = serde_json::json!([{
+            "kind": "review",
+            "source": "kiwi.attack",
+            "detail": "attack suite clean",
+        }]);
+        if claim_state == ClaimState::KnownTrue {
+            claim["evidence_strength"] = serde_json::json!("proof");
+        }
     }
     serde_json::json!({
         "v": KIWI_SCHEMA_VERSION,
@@ -448,6 +463,7 @@ async fn bearer_auth_env_is_read_at_call_time_and_absence_is_unavailable() {
         endpoint: server.endpoint(),
         auth_env: Some(var.to_string()),
         timeout_ms: 5_000,
+        operations: None,
     }
     .build(transport_for(&server))
     .unwrap();
@@ -510,4 +526,203 @@ fn evidence_ref_bridge_is_available() {
         faktor_verify::ArtifactRef::new(ProofEvidenceKind::Review, "kiwi", "counterexample")
             .unwrap();
     let _: EvidenceRef = artifact.to_evidence_ref();
+}
+
+// ------------------------------------------------- claim-batch round trip
+
+/// The end-to-end round trip through the registry: A -> disproven,
+/// B -> supported, C -> unknown each land on the RIGHT obligation, keyed by
+/// the obligation id Faktor submitted — never a Kiwi-private id.
+#[tokio::test]
+async fn claim_round_trip_preserves_obligation_identity() {
+    use faktor_core::contract::{AcceptedStrength, EvidenceBinding, Requirement};
+
+    let server = FakeKiwi::start();
+    let provider = provider(&server, 5_000);
+    let mut registry = VerificationRegistry::new();
+    registry.register(provider);
+
+    let claim = |id: &str, contract: &str| ClaimRequest {
+        obligation_id: id.to_string(),
+        claim: format!("claim {id} holds"),
+        evidence_kind: ProofEvidenceKind::ContractCheck,
+        requirement: Requirement::Required,
+        binding: EvidenceBinding::ContractIds(vec![contract.to_string()]),
+        accepted_strength: AcceptedStrength::Supported,
+    };
+    let claims = vec![
+        claim("po1:alpha", "c-alpha"),
+        claim("po1:beta", "c-beta"),
+        claim("po1:gamma", "c-gamma"),
+    ];
+    let batch = request(VerificationOp::CheckContracts);
+    server.push(http_reply(serde_json::json!({
+        "v": KIWI_SCHEMA_VERSION,
+        "op": "check_contracts",
+        "job_id": job_id_for(&batch),
+        "outcome": "failed",
+        "summary": "one counterexample, one support, one unknown",
+        "claims": [
+            {"claim_id": "po1:alpha", "state": "disproven",
+             "evidence": [], "counterexample": "contract c-alpha was violated"},
+            {"claim_id": "po1:beta", "state": "supported",
+             "evidence": [{"kind": "contract_check", "source": "kiwi",
+                           "detail": "contract c-beta observed"}], "counterexample": null},
+            {"claim_id": "po1:gamma", "state": "unknown", "evidence": []}
+        ],
+        "evidence": [],
+    })));
+    let results = registry
+        .verify_claims(batch.clone(), claims.clone())
+        .await
+        .expect("claim batch round trip");
+    assert_eq!(results.len(), 3, "{results:?}");
+    let by_id = |id: &str| {
+        results
+            .iter()
+            .find(|result| result.obligation_id == id)
+            .unwrap_or_else(|| panic!("no result for {id}: {results:?}"))
+    };
+    assert_eq!(by_id("po1:alpha").state, ClaimState::Disproven);
+    assert_eq!(
+        by_id("po1:alpha").counterexample,
+        vec!["contract c-alpha was violated".to_string()]
+    );
+    assert_eq!(by_id("po1:beta").state, ClaimState::Supported);
+    assert!(by_id("po1:beta")
+        .evidence
+        .iter()
+        .any(|artifact| artifact.detail.contains("c-beta")));
+    assert_eq!(by_id("po1:gamma").state, ClaimState::Unknown);
+    assert!(by_id("po1:gamma").evidence.is_empty());
+    for result in &results {
+        assert_eq!(result.provider.as_str(), "kiwi");
+    }
+
+    // The submitted frame carried exactly the obligation ids, verbatim.
+    let recorded = server.requests();
+    let frame: serde_json::Value = serde_json::from_str(&recorded[0].body).unwrap();
+    let ids: Vec<&str> = frame["job"]["proof_obligations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|obligation| obligation["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["po1:alpha", "po1:beta", "po1:gamma"]);
+    assert_eq!(
+        frame["job"]["acceptance_criteria"][0],
+        "claim po1:alpha holds"
+    );
+    // The submitted obligation carries required behavior, no prior verdict.
+    assert_eq!(frame["job"]["proof_obligations"][0]["state"], "unknown");
+    assert_eq!(
+        frame["job"]["proof_obligations"][0]["confidence_bps"],
+        serde_json::Value::Null
+    );
+
+    // A reply that silently omits a required obligation is refused typed.
+    server.push(http_reply(serde_json::json!({
+        "v": KIWI_SCHEMA_VERSION,
+        "op": "check_contracts",
+        "job_id": job_id_for(&batch),
+        "outcome": "passed",
+        "summary": "supposedly complete",
+        "claims": [
+            {"claim_id": "po1:alpha", "state": "supported",
+             "evidence": [{"kind": "contract_check", "source": "kiwi", "detail": "a"}]},
+            {"claim_id": "po1:beta", "state": "supported",
+             "evidence": [{"kind": "contract_check", "source": "kiwi", "detail": "b"}]}
+        ],
+        "evidence": [],
+    })));
+    let err = registry
+        .verify_claims(batch, claims)
+        .await
+        .expect_err("the omitted required claim must be refused typed");
+    match err {
+        VerificationError::Malformed(detail) => {
+            assert!(detail.contains("po1:gamma"), "{detail}");
+        }
+        other => panic!("expected typed Malformed, got {other:?}"),
+    }
+}
+
+/// A positive verdict without evidence is refused by the neutral import even
+/// when the provider claims a whole batch is fine.
+#[tokio::test]
+async fn unevidenced_positive_verdicts_are_refused_typed() {
+    use faktor_core::contract::{AcceptedStrength, EvidenceBinding, Requirement};
+
+    let server = FakeKiwi::start();
+    let provider = provider(&server, 5_000);
+    let mut registry = VerificationRegistry::new();
+    registry.register(provider);
+    let claims = vec![ClaimRequest {
+        obligation_id: "po1:naked".to_string(),
+        claim: "something holds".to_string(),
+        evidence_kind: ProofEvidenceKind::ContractCheck,
+        requirement: Requirement::Required,
+        binding: EvidenceBinding::ContractIds(vec!["c1".to_string()]),
+        accepted_strength: AcceptedStrength::Supported,
+    }];
+    let batch = request(VerificationOp::CheckContracts);
+    server.push(http_reply(serde_json::json!({
+        "v": KIWI_SCHEMA_VERSION,
+        "op": "check_contracts",
+        "job_id": job_id_for(&batch),
+        "outcome": "passed",
+        "summary": "supported without any ground",
+        "claims": [{"claim_id": "po1:naked", "state": "supported", "evidence": []}],
+        "evidence": [],
+    })));
+    let err = registry
+        .verify_claims(batch, claims)
+        .await
+        .expect_err("a supported verdict without evidence is refused");
+    assert!(matches!(err, VerificationError::Malformed(_)), "{err:?}");
+}
+
+/// Capability negotiation: an operation outside the negotiated subset is
+/// refused typed before any request is framed, and the registry reports no
+/// capable provider instead of silently substituting.
+#[tokio::test]
+async fn operations_outside_the_negotiated_subset_are_refused_typed() {
+    let server = FakeKiwi::start();
+    let provider = provider(&server, 5_000);
+    assert!(
+        !VerificationProvider::capabilities(provider.as_ref()).supports(VerificationOp::RunTests),
+        "the conservative default never claims the native-owned test op"
+    );
+    let err = provider
+        .verify(request(VerificationOp::RunTests))
+        .await
+        .expect_err("RunTests is outside the negotiated default");
+    assert!(matches!(err, VerificationError::Unavailable(_)), "{err:?}");
+    assert!(
+        server.requests().is_empty(),
+        "an unsupported operation must never reach the network"
+    );
+
+    // An explicit negotiation can serve it; then the request is framed.
+    let server = FakeKiwi::start();
+    let provider = KiwiProviderConfig {
+        endpoint: server.endpoint(),
+        auth_env: None,
+        timeout_ms: 5_000,
+        operations: Some(vec![VerificationOp::RunTests]),
+    }
+    .build(transport_for(&server))
+    .unwrap();
+    assert!(
+        VerificationProvider::capabilities(provider.as_ref()).supports(VerificationOp::RunTests)
+    );
+    assert!(!VerificationProvider::capabilities(provider.as_ref())
+        .supports(VerificationOp::VerifyClaim));
+    let mut registry = VerificationRegistry::new();
+    registry.register(provider);
+    let req = request(VerificationOp::RunTests);
+    let job = KiwiJob::for_request(&req).unwrap();
+    server.push(http_reply(valid_reply(&job, ClaimState::Supported)));
+    let response = registry.verify(req).await.unwrap();
+    assert_eq!(response.provider.as_str(), "kiwi");
 }

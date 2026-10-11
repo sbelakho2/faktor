@@ -17,7 +17,9 @@
 # do not fight over a target-dir lock.
 #
 # Coverage: [fault] campaigns at scale, the longrun suite (release), the
-# efficiency harness, the economy suite, the coding-benchmark smoke, the
+# efficiency harness, the economy suite (synthetic policy gates) plus the
+# economic certification against real verified tasks, the
+# coding-benchmark smoke, the
 # provider-key real-model run (recorded as an explicit skip unless keys are
 # supplied out-of-band — CI requires NO secrets by default), and the
 # supply-chain evidence job (missing advisory tools stay loud recorded skips
@@ -222,16 +224,25 @@ steps:
       - faktor-nightly-cargo-git:/usr/local/cargo/git
       - faktor-nightly-target-economy:/woodpecker-cache/target
     commands:
+      # The synthetic economic-policy suite plus the real-verified-task
+      # economic certification (audit item 9): a frozen coding corpus, a
+      # scripted fake coding model, real subprocess verification, and the
+      # real router/outcome-learning loop; the certification writes
+      # target/certification/economic-certification.json, bound into the
+      # lane marker below.
       - cargo test -p faktor-tests-economy
+      - cargo test -p faktor-tests-economic-certification
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
         cargo test -p faktor-tests-economy
+        cargo test -p faktor-tests-economic-certification
         CMDS
         )"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane economy --status passed \
+          --artifact target/certification/economic-certification.json \
           --out target/certification/lanes/economy.json
   - name: coding-benchmark
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative

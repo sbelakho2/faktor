@@ -1,0 +1,9 @@
+{
+  "id": "repeat-char",
+  "task_class": "easy",
+  "phase": "implement",
+  "input_tokens": 14000,
+  "output_tokens": 1100,
+  "fix_at_attempt": 1,
+  "order": 5
+}

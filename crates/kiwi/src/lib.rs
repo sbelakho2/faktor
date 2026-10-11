@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! faktor-kiwi — the OPTIONAL external (Kiwi-shaped) verification provider.
 //!
 //! Kiwi is external INDEPENDENT verification (`docs/specs/autonomous-engineering.md`):
@@ -31,8 +33,9 @@ pub mod client;
 pub mod wire;
 
 pub use client::{
-    KiwiProviderConfig, KiwiVerificationProvider, DEFAULT_KIWI_TIMEOUT_MS, KIWI_PROVIDER_ID,
-    MAX_KIWI_AUTH_ENV_BYTES, MAX_KIWI_ENDPOINT_BYTES, MAX_KIWI_RESPONSE_BYTES, MAX_KIWI_TIMEOUT_MS,
+    KiwiProviderConfig, KiwiVerificationProvider, DEFAULT_KIWI_OPERATIONS, DEFAULT_KIWI_TIMEOUT_MS,
+    KIWI_PROVIDER_ID, MAX_KIWI_AUTH_ENV_BYTES, MAX_KIWI_ENDPOINT_BYTES, MAX_KIWI_RESPONSE_BYTES,
+    MAX_KIWI_TIMEOUT_MS,
 };
 pub use wire::{
     job_id_for, KiwiEvidence, KiwiJob, KiwiReply, KIWI_SCHEMA_VERSION,

@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! The ONE worker-plane service: registration/reconciliation, immutable
 //! generation scheduling, CAS lease acceptance, heartbeat renewal with
 //! bounded staleness, generation-checked result landing, revocation and

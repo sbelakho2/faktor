@@ -207,6 +207,8 @@ mod index;
 pub use index::*;
 mod billing;
 pub use billing::*;
+mod outcome_ledger;
+pub use outcome_ledger::*;
 
 #[cfg(test)]
 #[path = "hostile_corpus_tests.rs"]

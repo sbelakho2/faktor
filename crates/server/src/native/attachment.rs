@@ -592,7 +592,7 @@ pub(crate) async fn native_attachment_bytes(
             return wire_status(not_found(&format!(
                 "attachment ref {ref_id} in session {}",
                 handle.id()
-            )))
+            )));
         }
         Err(e) => return api_err(&e),
     };
@@ -634,7 +634,7 @@ pub(crate) async fn native_attachment_blob_bytes(
             return wire_status(not_found(&format!(
                 "attachment blob {digest} in session {}",
                 handle.id()
-            )))
+            )));
         }
         Err(e) => return api_err(&e),
     };
