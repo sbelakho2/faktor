@@ -34,6 +34,11 @@ enum Expect {
     Legal,
     /// The path is refused by the OS (name/path length) with any typed error.
     RejectAny,
+    /// The OS cannot represent the name at all (APFS + non-UTF-8 bytes):
+    /// every creation/read/list/walk op must refuse typed, while the
+    /// presence probe may truthfully report `Ok(None)` where the platform
+    /// answers ENOENT on lookup.
+    RejectAnyOrAbsent,
 }
 
 fn raw(bytes: &[u8]) -> PathBuf {
@@ -42,6 +47,30 @@ fn raw(bytes: &[u8]) -> PathBuf {
 
 fn kind(err: &faktor_core::error::Error) -> ErrorKind {
     err.kind.clone()
+}
+
+/// True when the test filesystem folds case at LOOKUP time (macOS APFS
+/// default): a case-flipped spelling resolves to the same directory entry.
+/// The authority itself never folds; this only detects the platform.
+fn filesystem_is_case_insensitive(root: &Path) -> bool {
+    let probe = root.join("FaktorCaseProbe.tmp");
+    std::fs::write(&probe, b"probe").unwrap();
+    let insensitive = std::fs::symlink_metadata(root.join("faktorcaseprobe.tmp")).is_ok();
+    std::fs::remove_file(&probe).unwrap();
+    insensitive
+}
+
+/// True when the filesystem can represent arbitrary non-UTF-8 byte names
+/// (linux ext4/tmpfs). APFS requires valid UTF-8 and refuses with EILSEQ.
+fn filesystem_allows_non_utf8_names(root: &Path) -> bool {
+    let raw = root.join(OsString::from_vec(b"faktor-probe-\xff\xfe".to_vec()));
+    match std::fs::write(&raw, b"probe") {
+        Ok(()) => {
+            std::fs::remove_file(&raw).unwrap();
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn corpus() -> Vec<Case> {
@@ -205,7 +234,13 @@ fn corpus() -> Vec<Case> {
     cases
 }
 
-fn run_reject_case(dir: &RootedDir, outside: &Path, case: &Case, want_kind: Option<ErrorKind>) {
+fn run_reject_case(
+    dir: &RootedDir,
+    outside: &Path,
+    case: &Case,
+    want_kind: Option<ErrorKind>,
+    meta_may_be_absent: bool,
+) {
     let path = case.path.as_path();
     let assert_refused = |result: Result<(), faktor_core::error::Error>, op: &str| match &want_kind
     {
@@ -236,10 +271,28 @@ fn run_reject_case(dir: &RootedDir, outside: &Path, case: &Case, want_kind: Opti
     assert_refused(dir.open_create_new(path).map(|_| ()), "open_create_new");
     assert_refused(dir.read(path, 64).map(|_| ()), "read");
     assert_refused(dir.read_link(path).map(|_| ()), "read_link");
-    assert_refused(dir.entry_meta(path).map(|_| ()), "entry_meta");
+    let meta = dir.entry_meta(path);
+    if meta_may_be_absent && matches!(meta, Ok(None)) {
+        // An OS-unrepresentable name cannot be resolved; the platform may
+        // answer ENOENT on lookup, and the presence probe then truthfully
+        // reports "absent" instead of an error. Every mutating/reading op
+        // must still refuse typed, and containment is asserted after.
+    } else {
+        assert_refused(meta.map(|_| ()), "entry_meta");
+    }
     assert_refused(dir.list_entries(path, 8).map(|_| ()), "list_entries");
-    assert_refused(dir.remove_file(path), "remove_file");
-    assert_refused(dir.remove_tree(path), "remove_tree");
+    // Removal is idempotent ("a missing entry is Ok(())"): for a name the OS
+    // cannot represent, "already absent" is the truthful answer, so a no-op
+    // Ok is accepted only in this flavor; anything else must be a typed
+    // error.
+    match dir.remove_file(path) {
+        Ok(()) if meta_may_be_absent => {}
+        other => assert_refused(other, "remove_file"),
+    }
+    match dir.remove_tree(path) {
+        Ok(()) if meta_may_be_absent => {}
+        other => assert_refused(other, "remove_tree"),
+    }
     assert_refused(
         dir.create_symlink(Path::new("target"), path),
         "create_symlink",
@@ -377,16 +430,31 @@ fn rooted_path_corpus_is_refused_or_contained_literally() {
     let root = tmp.path().join("root");
     let dir = RootedDir::create(&root).unwrap();
 
-    let cases = corpus();
+    let mut cases = corpus();
     assert!(
         cases.len() >= 50,
         "the hostile path corpus must keep at least 50 rows, found {}",
         cases.len()
     );
+    // Non-UTF-8 byte names are legal on byte-based filesystems (linux
+    // ext4/tmpfs) and must create literally; APFS refuses them with EILSEQ,
+    // where the row's outcome is an OS-level typed refusal instead. The
+    // containment teeth (every op typed, outside sentinel untouched) are
+    // identical on both.
+    if !filesystem_allows_non_utf8_names(&root) {
+        for case in cases.iter_mut() {
+            if case.label == "invalid-utf8" {
+                case.expect = Expect::RejectAnyOrAbsent;
+            }
+        }
+    }
     for (index, case) in cases.iter().enumerate() {
         match &case.expect {
-            Expect::Reject(kind) => run_reject_case(&dir, &outside, case, Some(kind.clone())),
-            Expect::RejectAny => run_reject_case(&dir, &outside, case, None),
+            Expect::Reject(kind) => {
+                run_reject_case(&dir, &outside, case, Some(kind.clone()), false)
+            }
+            Expect::RejectAny => run_reject_case(&dir, &outside, case, None, false),
+            Expect::RejectAnyOrAbsent => run_reject_case(&dir, &outside, case, None, true),
             Expect::Legal => run_legal_case(&dir, &outside, index, case),
         }
     }
@@ -398,25 +466,62 @@ fn rooted_path_corpus_is_refused_or_contained_literally() {
     );
 }
 
-/// Case-fold handling: unix is byte-exact, so `README` and `readme` are two
-/// distinct entries (no implicit case folding, no collision).
+/// Case-fold handling: the authority never folds case itself. On a
+/// byte-exact filesystem (linux ext4/tmpfs) `README` and `readme` must be two
+/// distinct entries with distinct bytes; on a case-insensitive one (macOS
+/// APFS default) the platform folds at lookup, and the security contract is
+/// that the authority must never ALIAS through that fold: a create-new of
+/// the other spelling refuses typed instead of re-opening (and later
+/// overwriting) the existing entry, the original bytes stay intact, and the
+/// fold does not double the enumeration.
 #[test]
 fn case_variants_are_distinct_entries_and_never_alias() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = RootedDir::create(&tmp.path().join("root")).unwrap();
+    let root = tmp.path().join("root");
+    let dir = RootedDir::create(&root).unwrap();
     use std::io::Write as _;
-    for (label, name) in [("upper", "README"), ("lower", "readme")] {
-        let mut f = dir
-            .open_create_new(Path::new(name))
-            .unwrap_or_else(|e| panic!("{label}: create failed: {e}"));
-        f.write_all(label.as_bytes()).unwrap();
-        f.sync_all().unwrap();
+    let mut f = dir
+        .open_create_new(Path::new("README"))
+        .unwrap_or_else(|e| panic!("upper: create failed: {e}"));
+    f.write_all(b"upper").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    if filesystem_is_case_insensitive(&root) {
+        // The platform folds the names; the authority must refuse to create
+        // through the alias rather than silently returning README's handle.
+        dir.open_create_new(Path::new("readme"))
+            .expect_err("create_new must refuse a case-aliased existing entry");
+        assert_eq!(
+            dir.read(Path::new("README"), 16).unwrap().bytes,
+            b"upper",
+            "the original entry must never be clobbered through a case alias"
+        );
+        assert_eq!(
+            dir.read(Path::new("readme"), 16).unwrap().bytes,
+            b"upper",
+            "the OS fold resolves both spellings to ONE entry; the authority \
+             must surface those bytes, never fabricate a distinct entry"
+        );
+        assert_eq!(
+            dir.list_entries(Path::new(""), 16).unwrap().entries.len(),
+            1,
+            "a case fold must not double the enumeration"
+        );
+        return;
     }
+
+    let mut f = dir
+        .open_create_new(Path::new("readme"))
+        .unwrap_or_else(|e| panic!("lower: create failed: {e}"));
+    f.write_all(b"lower").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
     let listing = dir.list_entries(Path::new(""), 16).unwrap();
     assert_eq!(
         listing.entries.len(),
         2,
-        "case folding must not collapse README/readme on unix"
+        "case folding must not collapse README/readme on a byte-exact filesystem"
     );
     assert_eq!(dir.read(Path::new("README"), 16).unwrap().bytes, b"upper");
     assert_eq!(dir.read(Path::new("readme"), 16).unwrap().bytes, b"lower");

@@ -1308,17 +1308,25 @@ mod tests {
         assert_eq!(profile.filesystem, "workspace+external:ask-ask");
         assert_eq!(profile.network, "required");
         assert_eq!(profile.shell, "os_isolated");
-        // Deny-everything external ⇒ workspace-only.
+        // Deny-everything external ⇒ workspace-only where the OS backend
+        // exists; on builds without one (non-Linux) the Required demand
+        // projects the honest application-policy-only tag, never a claimed
+        // jail (parity with the adversarial projection matrix).
         let locked = SandboxPolicy {
             read_external: Rule::Deny,
             write_external: Rule::Deny,
             network_guarantee: SandboxGuarantee::Required,
             ..Default::default()
         };
+        let expected_fs = if filesystem_backend_available() {
+            "workspace"
+        } else {
+            "application-policy-only"
+        };
         assert_eq!(
             locked.spawn_profile(),
             SpawnProfile {
-                filesystem: "workspace".into(),
+                filesystem: expected_fs.into(),
                 network: "required".into(),
                 shell: "os_isolated".into(),
             }
