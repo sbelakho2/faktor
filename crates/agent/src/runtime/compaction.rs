@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! `runtime::compaction`: cohesive slice of the agent runtime.
 
 use super::*;
@@ -518,12 +520,12 @@ impl AgentRuntime {
                         }),
                         None => {
                             return Err(Error::new(
-                                    ErrorKind::Internal,
-                                    format!(
-                                        "routing chose compaction provider {:?} which is not registered",
-                                        d.provider
-                                    ),
-                                ));
+                                ErrorKind::Internal,
+                                format!(
+                                    "routing chose compaction provider {:?} which is not registered",
+                                    d.provider
+                                ),
+                            ));
                         }
                     };
                     // P0-1: the routed compaction call freezes the route

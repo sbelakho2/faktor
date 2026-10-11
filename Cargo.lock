@@ -1296,6 +1296,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1600,6 +1601,8 @@ dependencies = [
  "faktor-updater",
  "faktor-worker",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "rand",
  "reqwest",
  "serde",
@@ -1721,6 +1724,19 @@ dependencies = [
  "faktor-cli",
  "libc",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "faktor-tests-economic-certification"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-agent",
+ "faktor-core",
+ "faktor-router",
  "serde",
  "serde_json",
  "tempfile",

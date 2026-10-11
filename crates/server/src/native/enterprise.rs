@@ -689,7 +689,7 @@ pub(crate) async fn native_enterprise_deletion_jobs_create(
         other => {
             return wire_status(malformed_body(&format!(
                 "scope must be organization|account, got {other:?}"
-            )))
+            )));
         }
     };
     match service.start_deletion(&principal, scope) {

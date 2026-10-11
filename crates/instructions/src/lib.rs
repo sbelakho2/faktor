@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Lazy instructions + skills (audit: import rules WITHOUT dumping every
 //! rule into every prompt; conditional activation; instruction-epoch
 //! detection; skills that cost zero prompt tokens until loaded).

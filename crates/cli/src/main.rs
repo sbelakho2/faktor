@@ -1405,6 +1405,7 @@ pub(crate) fn doctor_run_with_config(
     doctor_sandbox_shell_line(config_path, &mut lines, &mut issues);
     doctor_network_isolation_line(&mut lines);
     doctor_tokenizer_certification_line(config_path, &mut lines, &mut issues);
+    doctor_contract_compiler_line(&mut lines, &mut issues);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
             lines.push("store: ok".into());
@@ -1451,6 +1452,10 @@ pub(crate) fn doctor_run_with_config(
             // state names. Never opens a service, never builds, never
             // repairs.
             index_embedding_doctor(&store, &mut lines, &mut issues);
+            // The additive engineering-outcome ledger section (economic
+            // audit item 7): the durable completed-run metrics aggregate,
+            // read-only. A ledger read failure is an ISSUE, never silence.
+            doctor_outcome_ledger_line(store.clone(), &mut lines, &mut issues);
         }
         Err(e) => {
             lines.push(format!("store: FAILED ({e})"));
@@ -1740,6 +1745,55 @@ pub(crate) struct DoctorGenerationEmbeddings {
     pub(crate) format: u32,
     #[serde(default)]
     pub(crate) build: faktor_index::embedding::EmbeddingBuildRecord,
+}
+
+/// The Engineering Outcome Ledger doctor section (economic audit item 7):
+/// one bounded read-only line over the durable completed-run ledger
+/// aggregates (`faktor-agent`'s `OutcomeLedger` metrics fold; the same fold
+/// `GET /native/outcomes` serves). An empty ledger is a truthful zero line;
+/// a read/parse failure is an ISSUE — doctor never repairs and never
+/// fabricates a number.
+pub(crate) fn doctor_outcome_ledger_line(
+    store: Arc<faktor_store::Store>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let ledger = faktor_agent::OutcomeLedger::new(store);
+    match ledger.metrics() {
+        Ok(report) => {
+            let m = &report.metrics;
+            if m.runs == 0 {
+                lines.push("outcomes: no completed runs recorded".into());
+                return;
+            }
+            lines.push(format!(
+                "outcomes: {} run(s), {} verified, first-pass {}%, verified cost/change {} \
+                 microUSD, rework ratio {}%, rollback {}%{}",
+                m.runs,
+                m.verified_changes,
+                doctor_ppm_percent(m.verified_first_pass_ppm),
+                m.verified_cost_per_change_micro,
+                doctor_ppm_percent(m.rework_cost_ratio_ppm),
+                doctor_ppm_percent(m.regression_rollback_ppm),
+                if report.truncated {
+                    format!(" (metrics folded the newest {} runs)", report.scanned)
+                } else {
+                    String::new()
+                },
+            ));
+        }
+        Err(e) => {
+            lines.push(format!("outcomes: FAILED ({e})"));
+            *issues += 1;
+        }
+    }
+}
+
+/// One ppm rate as a one-decimal percent string (`750000 -> "75.0"`).
+pub(crate) fn doctor_ppm_percent(ppm: u32) -> String {
+    let whole = ppm / 10_000;
+    let tenth = (ppm % 10_000) / 1_000;
+    format!("{whole}.{tenth}")
 }
 
 /// The `index embeddings` doctor section: the TYPED build outcome
@@ -2349,6 +2403,74 @@ pub(crate) fn doctor_tokenizer_certification_line(
             lines.push(format!("tokenizers: FAILED {e}"));
             *issues += 1;
         }
+    }
+}
+
+/// The additive engineering-contract compiler self-check (audit item 5): a
+/// deterministic compile of a fixture goal + repository snapshot must yield a
+/// NON-EMPTY contract with at least one BOUND proof obligation and a
+/// byte-identical contract across repeated compiles. A failure is an ISSUE
+/// (the daemon's autonomous baseline would be broken), never silence.
+pub(crate) fn doctor_contract_compiler_line(lines: &mut Vec<String>, issues: &mut usize) {
+    use faktor_core::contract_compile::{
+        compile_contract, intent_tokens, ContractCompileRequest, RepositoryFile, RepositorySnapshot,
+    };
+    use faktor_core::EvidenceBinding;
+    let repository = RepositorySnapshot::from_files(vec![
+        RepositoryFile::with_content("Cargo.toml", "[package]\nname = \"doctor\"\n"),
+        RepositoryFile::with_content(
+            "src/auth/refresh.rs",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn replay_is_rejected() {}\n}\n",
+        ),
+    ]);
+    let goal = "Fix the refresh-token race";
+    let request = ContractCompileRequest {
+        goal: goal.to_string(),
+        repository,
+    };
+    let first = compile_contract(&request);
+    let mut files = vec![
+        RepositoryFile::with_content("Cargo.toml", "[package]\nname = \"doctor\"\n"),
+        RepositoryFile::with_content(
+            "src/auth/refresh.rs",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn replay_is_rejected() {}\n}\n",
+        ),
+    ];
+    files.reverse();
+    let second = compile_contract(&ContractCompileRequest {
+        goal: goal.to_string(),
+        repository: RepositorySnapshot::from_files(files),
+    });
+    let bound_obligations = first
+        .contract
+        .proof_obligations
+        .iter()
+        .filter(|obligation| obligation.evidence_binding.is_bound())
+        .count();
+    let selector_bound = first.contract.proof_obligations.iter().any(|obligation| {
+        matches!(
+            &obligation.evidence_binding,
+            EvidenceBinding::TestSelector(_) | EvidenceBinding::TestSelectors(_)
+        )
+    });
+    let deterministic =
+        serde_json::to_vec(&first.contract).ok() == serde_json::to_vec(&second.contract).ok();
+    let tokens = intent_tokens(goal);
+    if !first.contract.is_empty()
+        && bound_obligations > 0
+        && selector_bound
+        && deterministic
+        && tokens.contains(&"refresh".to_string())
+    {
+        lines.push(format!(
+            "engineering-contract compiler: native baseline OK state=verified obligations={bound_obligations} selectors_bound=true tokens={} determinism=byte_identical",
+            tokens.join(",")
+        ));
+    } else {
+        lines.push(format!(
+            "engineering-contract compiler: FAILED state=broken obligations={bound_obligations} selector_bound={selector_bound} determinism={deterministic}"
+        ));
+        *issues += 1;
     }
 }
 

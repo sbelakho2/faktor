@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Generic semantic fallback and constrained edit proposals (audit
 //! 48-54/58/59).
 //!

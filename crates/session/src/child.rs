@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Durable rows for orchestrated child agents (audits 20-24 wiring).
 //!
 //! Everything a child drive needs to be crash-safe lives as durable

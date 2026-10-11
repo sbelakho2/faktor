@@ -35,6 +35,10 @@ pub(crate) mod control_plane;
 pub mod enterprise;
 pub(crate) mod evidence;
 pub(crate) mod models;
+/// The Engineering Outcome Ledger read surface (economic audit item 7,
+/// additive): `GET /native/outcomes` — durable completed-run metrics and a
+/// bounded run page.
+pub(crate) mod outcomes;
 /// The ONE product execution entry for ordinary prompts + task starts
 /// (public: the daemon's ACP host constructs it too).
 pub mod prompt;
@@ -80,6 +84,7 @@ pub(crate) use control_plane::*;
 pub(crate) use enterprise::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;
+pub(crate) use outcomes::*;
 pub use prompt::*;
 pub(crate) use proof::*;
 pub(crate) use scm_webhook::*;

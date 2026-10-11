@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Semantic-provider contract types (audit 48-54/58/59).
 //!
 //! A semantic provider is an optional acceleration surface: embeddings,

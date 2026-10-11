@@ -351,10 +351,10 @@ pub(crate) async fn native_task_proof(
         DurableRead::Missing => None,
         DurableRead::PresentValid(row) => Some(row),
         DurableRead::PresentMalformed(detail) => {
-            return proof_corrupt("integration record", &detail)
+            return proof_corrupt("integration record", &detail);
         }
         DurableRead::StoreFailure(detail) => {
-            return proof_store_failure("integration record", &detail)
+            return proof_store_failure("integration record", &detail);
         }
     };
 
@@ -364,10 +364,10 @@ pub(crate) async fn native_task_proof(
             DurableRead::Missing => None,
             DurableRead::PresentValid(row) => Some(row),
             DurableRead::PresentMalformed(detail) => {
-                return proof_corrupt("run base record", &detail)
+                return proof_corrupt("run base record", &detail);
             }
             DurableRead::StoreFailure(detail) => {
-                return proof_store_failure("run base record", &detail)
+                return proof_store_failure("run base record", &detail);
             }
         },
         None => None,
@@ -480,10 +480,10 @@ pub(crate) async fn native_task_proof(
             DurableRead::Missing => None,
             DurableRead::PresentValid(row) => Some(row),
             DurableRead::PresentMalformed(detail) => {
-                return proof_corrupt("integration transaction", &detail)
+                return proof_corrupt("integration transaction", &detail);
             }
             DurableRead::StoreFailure(detail) => {
-                return proof_store_failure("integration transaction", &detail)
+                return proof_store_failure("integration transaction", &detail);
             }
         },
         None => None,
@@ -699,7 +699,7 @@ fn resolve_scoped_task(
             return Err(Box::new(wire_status(malformed_body(&format!(
                 "invalid task id {task_id:?} for session {}",
                 handle.id()
-            )))))
+            )))));
         }
     };
     let requested = TaskId::new(raw);
@@ -1014,13 +1014,13 @@ fn completion_block(
     let contract = match handle.completion_contract(task_id) {
         Ok(c) => c,
         Err(TaskError::CorruptDurableState { detail, .. }) => {
-            return Err(Box::new(proof_corrupt("completion contract", &detail)))
+            return Err(Box::new(proof_corrupt("completion contract", &detail)));
         }
         Err(e @ TaskError::Store(_)) => {
             return Err(Box::new(proof_store_failure(
                 "completion contract",
                 &e.to_string(),
-            )))
+            )));
         }
         Err(_) => None,
     };
@@ -1032,7 +1032,7 @@ fn completion_block(
                 return Err(Box::new(proof_store_failure(
                     "completion step statuses",
                     &e.to_string(),
-                )))
+                )));
             }
         }
     }
@@ -1070,13 +1070,13 @@ fn completion_block(
             reason: Some(e.to_string()),
         },
         Err(TaskError::CorruptDurableState { detail, .. }) => {
-            return Err(Box::new(proof_corrupt("completion gate", &detail)))
+            return Err(Box::new(proof_corrupt("completion gate", &detail)));
         }
         Err(e) => {
             return Err(Box::new(proof_store_failure(
                 "completion gate",
                 &e.to_string(),
-            )))
+            )));
         }
     };
     let truncated = records.len() > MAX_PROOF_STEPS;

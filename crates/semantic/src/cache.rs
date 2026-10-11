@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Snapshot/pack cache with hard bounds and delta-scoped invalidation
 //! (audit 48-54/58/59).
 //!

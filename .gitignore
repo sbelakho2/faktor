@@ -15,6 +15,12 @@ fuzz/Cargo.lock
 # OS core dumps (crash artifacts; never source)
 core
 core.*
+# The `core` dump rule also matches the workspace's REAL source directory
+# `crates/core/`, and git cannot re-include files under an excluded
+# directory: without this negation every NEW file under crates/core (e.g.
+# the contract model, contract.rs) is silently dropped on `git add` while
+# tracked files keep working — a clean checkout then fails to compile.
+!crates/core/
 # Explicit source exception: the `config` module's core slice is real source
 # (`crates/cli/src/config.rs` declares `mod core;`). Without this negation the
 # `core.*` dump rule silently drops it and the CLI no longer compiles from a

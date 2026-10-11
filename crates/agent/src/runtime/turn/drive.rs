@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! `runtime::turn::drive`: cohesive slice of the turn module.
 
 use super::*;
@@ -1128,6 +1130,23 @@ impl AgentRuntime {
                 } else {
                     10
                 };
+                // Engineering contract (audit item 4): a high/unknown risk
+                // contract raises the routing quality floor and the semantic
+                // risk floor observably; a required proof that is still
+                // unresolved escalates intelligence/retrieval on this next
+                // turn. Empty contracts keep the floors byte-identical.
+                let contract_policy = self.contract_policy(handle)?;
+                let risk_floor = if contract_policy.intelligence_escalation {
+                    contract_policy.semantic_risk_floor.max(70)
+                } else {
+                    contract_policy.semantic_risk_floor
+                };
+                intent.semantic_risk = intent.semantic_risk.max(risk_floor);
+                if contract_policy.routing_quality_floor > intent.quality.minimum() {
+                    intent.quality = crate::QualityRequirement::Hard {
+                        minimum: contract_policy.routing_quality_floor,
+                    };
+                }
                 drive_semantic_risk = intent.semantic_risk;
                 // Budget view (audit 13): the durable monetary picture is
                 // read through the session manager's bounded read pool —
@@ -2452,6 +2471,14 @@ impl AgentRuntime {
             outcome.semantic_risk,
             self.quality_for_turn(!turn_summary.files_changed.is_empty()),
         );
+        // Engineering contract (audit item 4): a high/unknown risk contract
+        // raises the end-of-turn verification depth to Strict — its risk
+        // hypotheses demand the deeper review bar before completion.
+        let quality = if self.contract_policy(handle)?.quality_strict {
+            VerificationQuality::Strict
+        } else {
+            quality
+        };
         let verdict = self
             .run_turn_verification(
                 handle,
@@ -3096,7 +3123,7 @@ impl AgentRuntime {
         let row = match handle.row() {
             Ok(r) => r,
             Err(_) => {
-                return self.unverified_verdict(handle, changed, None, "session row unresolvable")
+                return self.unverified_verdict(handle, changed, None, "session row unresolvable");
             }
         };
         // P0-48 root re-pointing: the turn's verification runs against the
@@ -3112,7 +3139,7 @@ impl AgentRuntime {
                     changed,
                     None,
                     "session workspace root unresolvable",
-                )
+                );
             }
         };
         let ws = match self.deps.workspaces.open(row.workspace_id, root.clone()) {
@@ -3123,7 +3150,7 @@ impl AgentRuntime {
                     changed,
                     None,
                     "workspace could not be opened for verification",
-                )
+                );
             }
         };
         // Bounded repository discovery with an EXPLICIT completeness verdict
@@ -3614,18 +3641,57 @@ impl AgentRuntime {
                 }
             }
         };
-        // Engineering contract (autonomous-engineering spec): evaluate the
-        // attempt's native evidence against the durable proof obligations.
-        // A DISPROVEN obligation blocks a passing gate with its own reason
-        // code; unsatisfied-but-not-disproven states are persisted and
-        // disclosed, never silently passed. An unevaluable contract never
-        // lets a passing gate stand (authority law).
+        // Engineering contract (autonomous-engineering spec + audit items
+        // 2-4): evaluate the attempt's CLAIM-BOUND evidence against the
+        // durable proof obligations at the CURRENT candidate snapshot. A
+        // DISPROVEN obligation (or a violated constraint) blocks a passing
+        // gate with its typed reason; the snapshot law stales prior support
+        // whose proof basis did not survive; unsupported-but-not-disproven
+        // states are persisted and disclosed, never silently passed. An
+        // unevaluable contract never lets a passing gate stand (authority
+        // law). A counterexample or invalidated assumption records a durable
+        // replan decision.
+        let candidate_snapshot =
+            root_snapshot_best_effort(&ws).map(faktor_core::SubjectSnapshot::new);
+        // The completion spine (audit item 6): when the daemon installed a
+        // neutral verification registry, unresolved contract claims are
+        // dispatched through it under this turn's op identity/cancellation.
+        let verification_registry = self.verification_registry();
+        let provider_dispatch = verification_registry.as_ref().map(|registry| {
+            crate::runtime::contract_eval::ContractProviderDispatch {
+                registry: registry.as_ref(),
+                op_id,
+                cancellation: cancel.clone(),
+            }
+        });
         let contract_outcome = crate::runtime::contract_eval::evaluate_and_persist_contract(
             handle,
             &executed,
             review.as_ref(),
+            candidate_snapshot.as_ref(),
+            provider_dispatch.as_ref(),
         )
         .await;
+        if let Some(detail) = crate::runtime::contract_eval::replan_detail(&contract_outcome) {
+            self.dw_note_ledger_decision(
+                handle,
+                "replan",
+                "counterexample invalidates the assumption; re-open the work",
+                &detail,
+                DW_SITE_CONTRACT_REPLAN_DECISION,
+            );
+        }
+        if let Some(detail) =
+            crate::runtime::contract_eval::needs_verification_detail(&contract_outcome)
+        {
+            self.dw_note_ledger_decision(
+                handle,
+                "completion gate",
+                "refuse VerifiedComplete",
+                &detail,
+                DW_SITE_CONTRACT_UNRESOLVED_DECISION,
+            );
+        }
         completion =
             crate::runtime::contract_eval::apply_contract_outcome(completion, contract_outcome);
         self.persist_gate_facts(
@@ -3644,5 +3710,24 @@ impl AgentRuntime {
             criteria,
             proof,
         }
+    }
+
+    /// The engineering contract's verification policy for the session's
+    /// CURRENT durable task row (audit item 4): high/unknown risk raises the
+    /// depth, the end-of-turn quality and the routing quality floor; an
+    /// unresolved required proof escalates intelligence/retrieval. FALLIBLE:
+    /// a store read failure refuses the turn rather than silently skipping a
+    /// high-risk floor. No task row = the empty contract = neutral policy.
+    pub(crate) fn contract_policy(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<crate::runtime::contract_eval::ContractVerificationPolicy> {
+        let contract = self
+            .session_task(handle)?
+            .map(|task| task.contract)
+            .unwrap_or_default();
+        Ok(crate::runtime::contract_eval::contract_verification_policy(
+            &contract,
+        ))
     }
 }

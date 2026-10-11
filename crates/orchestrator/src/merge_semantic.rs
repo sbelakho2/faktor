@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Tangerine merge-time semantic preflight (audits 99 / Tangerine-11).
 //!
 //! The preflight runs on the ASYNC merge path with the descriptor handshake

@@ -427,6 +427,33 @@ pub struct ModelOutcomeSample {
     pub rework_turns: u64,
 }
 
+/// One verified sample bound to its full outcome-registry key: the unit the
+/// Engineering Outcome Ledger's atomic append writes into
+/// `model_outcome_stats` in the SAME transaction that inserts the run's
+/// ledger row (exactly-once record AND exactly-once router feed). Samples
+/// enter only with the explicit verified attribution, exactly like
+/// [`Store::model_outcome_stats_append`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOutcomeIncrement {
+    pub provider: String,
+    pub model: String,
+    pub phase: RouterPhase,
+    pub task_class: TaskClass,
+    pub risk_bucket: RiskBucket,
+    pub sample: ModelOutcomeSample,
+}
+
+/// One outcome-registry key with every enum dimension already encoded as
+/// its durable text (prepared on the caller's thread; the writer job binds
+/// the borrows as-is).
+pub(crate) struct PreparedOutcomeKey<'a> {
+    pub(crate) provider: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) phase: &'a str,
+    pub(crate) task_class: &'a str,
+    pub(crate) risk_bucket: &'a str,
+}
+
 /// SQLite INTEGER is signed 64-bit: a u64 accumulator above `i64::MAX`
 /// cannot be stored as one integer, so every column clamps at `i64::MAX`
 /// (a count of rework beyond 9.22e18 samples is unrepresentable, and the
@@ -958,7 +985,7 @@ impl Store {
                 None => {
                     return Err(StoreError::Malformed(
                         "provider_call prefix row has NULL prompt_tokens".into(),
-                    ))
+                    ));
                 }
                 Some(t) => u32::try_from(t).map_err(|_| {
                     StoreError::Malformed(format!(
@@ -2299,6 +2326,92 @@ impl Store {
         })
     }
 
+    /// Absorb ONE verified sample into one `model_outcome_stats` key inside
+    /// an OPEN immediate transaction (the shared body of
+    /// [`Store::model_outcome_stats_append`] and the Engineering Outcome
+    /// Ledger's atomic record+feed append). The caller prepared every enum
+    /// dimension string BEFORE enqueueing (audit item 8: writer jobs execute
+    /// SQL only) and owns the transaction/commit.
+    pub(crate) fn absorb_model_outcome_sample_tx(
+        tx: &rusqlite::Transaction<'_>,
+        key: &PreparedOutcomeKey<'_>,
+        sample: ModelOutcomeSample,
+        updated_ms: i64,
+    ) -> StoreResult<()> {
+        let current = tx
+            .query_row(
+                "SELECT successes_first_pass, failures_first_pass, rework_cost_micro_sum,
+                        rework_turns_sum, sample_count
+                 FROM model_outcome_stats
+                 WHERE provider = ?1 AND model = ?2 AND phase = ?3 AND task_class = ?4
+                   AND risk_bucket = ?5",
+                params![
+                    key.provider,
+                    key.model,
+                    key.phase,
+                    key.task_class,
+                    key.risk_bucket
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (mut successes, mut failures, mut cost_sum, mut turns_sum, mut count) = match current {
+            Some((s, f, c, t, n)) => (
+                s.max(0) as u64,
+                f.max(0) as u64,
+                c.max(0) as u64,
+                t.max(0) as u64,
+                n.max(0) as u64,
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
+        count = count.saturating_add(1);
+        if sample.verified_success {
+            successes = successes.saturating_add(1);
+        } else {
+            failures = failures.saturating_add(1);
+            cost_sum = cost_sum.saturating_add(sample.rework_cost_micro);
+            turns_sum = turns_sum.saturating_add(sample.rework_turns);
+        }
+        tx.execute(
+            "INSERT INTO model_outcome_stats (
+                provider, model, phase, task_class, risk_bucket,
+                successes_first_pass, failures_first_pass, rework_cost_micro_sum,
+                rework_turns_sum, sample_count, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(provider, model, phase, task_class, risk_bucket)
+             DO UPDATE SET
+                successes_first_pass = ?6,
+                failures_first_pass = ?7,
+                rework_cost_micro_sum = ?8,
+                rework_turns_sum = ?9,
+                sample_count = ?10,
+                updated_ms = ?11",
+            params![
+                key.provider,
+                key.model,
+                key.phase,
+                key.task_class,
+                key.risk_bucket,
+                outcome_clamp_i64(successes),
+                outcome_clamp_i64(failures),
+                outcome_clamp_i64(cost_sum),
+                outcome_clamp_i64(turns_sum),
+                outcome_clamp_i64(count),
+                updated_ms
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Append ONE verified sample to a key's durable projection (migration
     /// v18). The write is a single immediate transaction: the projection
     /// row is read, absorbed with the router registry's saturating rule,
@@ -2328,71 +2441,17 @@ impl Store {
         self.writer
             .execute("model_outcome_stats_append", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let current = tx
-                    .query_row(
-                        "SELECT successes_first_pass, failures_first_pass, rework_cost_micro_sum,
-                        rework_turns_sum, sample_count
-                 FROM model_outcome_stats
-                 WHERE provider = ?1 AND model = ?2 AND phase = ?3 AND task_class = ?4
-                   AND risk_bucket = ?5",
-                        params![provider, model, phase_json, class_json, bucket_json],
-                        |r| {
-                            Ok((
-                                r.get::<_, i64>(0)?,
-                                r.get::<_, i64>(1)?,
-                                r.get::<_, i64>(2)?,
-                                r.get::<_, i64>(3)?,
-                                r.get::<_, i64>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
-                let (mut successes, mut failures, mut cost_sum, mut turns_sum, mut count) =
-                    match current {
-                        Some((s, f, c, t, n)) => (
-                            s.max(0) as u64,
-                            f.max(0) as u64,
-                            c.max(0) as u64,
-                            t.max(0) as u64,
-                            n.max(0) as u64,
-                        ),
-                        None => (0, 0, 0, 0, 0),
-                    };
-                count = count.saturating_add(1);
-                if sample.verified_success {
-                    successes = successes.saturating_add(1);
-                } else {
-                    failures = failures.saturating_add(1);
-                    cost_sum = cost_sum.saturating_add(sample.rework_cost_micro);
-                    turns_sum = turns_sum.saturating_add(sample.rework_turns);
-                }
-                tx.execute(
-                    "INSERT INTO model_outcome_stats (
-                provider, model, phase, task_class, risk_bucket,
-                successes_first_pass, failures_first_pass, rework_cost_micro_sum,
-                rework_turns_sum, sample_count, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(provider, model, phase, task_class, risk_bucket)
-             DO UPDATE SET
-                successes_first_pass = ?6,
-                failures_first_pass = ?7,
-                rework_cost_micro_sum = ?8,
-                rework_turns_sum = ?9,
-                sample_count = ?10,
-                updated_ms = ?11",
-                    params![
-                        provider,
-                        model,
-                        phase_json,
-                        class_json,
-                        bucket_json,
-                        outcome_clamp_i64(successes),
-                        outcome_clamp_i64(failures),
-                        outcome_clamp_i64(cost_sum),
-                        outcome_clamp_i64(turns_sum),
-                        outcome_clamp_i64(count),
-                        updated_ms
-                    ],
+                Self::absorb_model_outcome_sample_tx(
+                    &tx,
+                    &PreparedOutcomeKey {
+                        provider: &provider,
+                        model: &model,
+                        phase: &phase_json,
+                        task_class: &class_json,
+                        risk_bucket: &bucket_json,
+                    },
+                    sample,
+                    updated_ms,
                 )?;
                 tx.commit()?;
                 Ok(())
@@ -3591,7 +3650,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(v, 32, "schema target 32 after the v29/v30/v31 migrations");
+        assert_eq!(v, 33, "schema target 33 after the v30/v31/v32 migrations");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()

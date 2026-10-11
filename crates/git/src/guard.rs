@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Repository mutation guard: ONE logical repository operation (commit /
 //! exact-tree build / push preparation / worktree mutation) holds BOTH
 //!

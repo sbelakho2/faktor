@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! faktor-verify — the verification engine (audit: verification must not
 //! depend on the model's discretion).
 //!
@@ -49,6 +51,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod claims;
 pub mod criteria;
 pub mod derive;
 pub mod exec;
@@ -58,6 +61,10 @@ pub mod native;
 pub mod provider;
 pub mod review;
 
+pub use claims::{
+    evidence_adequacy, op_for_claim, ClaimRequest, ClaimVerificationResult, EvidenceStrength,
+    MAX_CLAIM_ID_BYTES, MAX_COUNTEREXAMPLES,
+};
 pub use native::{
     native_capabilities, FixedRootResolver, NativeVerificationProvider, VerificationRootResolver,
     DEFAULT_NATIVE_CHECK_WALL, DEFAULT_NATIVE_INVENTORY_WALL,

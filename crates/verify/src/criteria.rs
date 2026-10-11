@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Typed criterion evaluation (P0 criteria mandate): a criterion is PASSED
 //! only through its OWN [`CriterionBinding`] — never through a global suite
 //! status.

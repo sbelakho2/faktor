@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! The session manager: opens the durable store + CAS, owns the per-session
 //! resource registries, and is the factory for `SessionHandle`s.
 

@@ -231,7 +231,7 @@ pub(crate) async fn native_updater_downgrade(
         Err(_) => {
             return wire_status(malformed_body(
                 "invalid updater downgrade body (strict DTO)",
-            ))
+            ));
         }
     };
     if !body.confirm {

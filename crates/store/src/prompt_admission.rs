@@ -934,7 +934,7 @@ mod prompt_admission_tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 32,
+            version, 33,
             "v31 (engineering contract) is the migration head"
         );
         // The CHECK vocabulary refuses an unknown state at the SQL level.

@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Strict external semantic-provider configuration and clients (audit
 //! 48-54/58/59/83).
 //!

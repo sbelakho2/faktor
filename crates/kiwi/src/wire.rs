@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! The bounded Kiwi wire contract.
 //!
 //! Wire schema version [`KIWI_SCHEMA_VERSION`] (v1):
@@ -56,17 +58,23 @@
 //! - Every string, list and claim id is bounded; a job or reply that exceeds
 //!   a bound is a typed refusal, never silently cut by the wire layer.
 //! - Evidence must reference obligation ids the job actually submitted;
-//!   unknown or duplicated claim ids are [`VerificationError::Malformed`].
+//!   unknown or duplicated claim ids are [`VerificationError::Malformed`],
+//!   and every REQUIRED submitted obligation must come back with a result
+//!   (or an explicit unknown) — a silently omitted required claim is a typed
+//!   refusal.
+//! - A positive verdict (`supported`/`known_true`) must carry evidence (at
+//!   least the ground a `disproven` verdict needs), and `known_true` must
+//!   declare proof-grade evidence.
 
 use std::collections::BTreeSet;
 
 use faktor_core::{
     ClaimState, Constraint, ContractOrigin, EngineeringContract, Invariant, ProofEvidenceKind,
-    ProofObligation, RiskHypothesis, SessionId, WorkspaceId,
+    ProofObligation, Requirement, RiskHypothesis, SessionId, WorkspaceId,
 };
 use faktor_verify::{
-    ArtifactRef, VerificationError, VerificationOp, VerificationOutcome, VerificationRequest,
-    VerificationTarget,
+    evidence_adequacy, ArtifactRef, EvidenceStrength, VerificationError, VerificationOp,
+    VerificationOutcome, VerificationRequest, VerificationTarget,
 };
 use serde::{Deserialize, Serialize};
 
@@ -203,11 +211,74 @@ impl KiwiJob {
         Ok(job)
     }
 
+    /// The full-contract claim-batch job: every claim the neutral request
+    /// named rides as a proof obligation with the SAME obligation id (claim
+    /// identity is preserved end to end), the same evidence kind, requirement,
+    /// binding and accepted strength, and every prior evaluation state
+    /// stripped.
+    pub fn for_claims(request: &VerificationRequest) -> Result<Self, VerificationError> {
+        if request.claims.is_empty() {
+            return Err(VerificationError::Malformed(
+                "a claim-batch job requires at least one claim".to_string(),
+            ));
+        }
+        let obligations: Vec<ProofObligation> = request
+            .claims
+            .iter()
+            .map(|claim| ProofObligation {
+                id: claim.obligation_id.clone(),
+                claim: claim.claim.clone(),
+                requirement: claim.requirement,
+                evidence: claim.evidence_kind,
+                evidence_binding: claim.binding.clone(),
+                accepted_strength: claim.accepted_strength,
+                state: ClaimState::Unknown,
+                origin: ContractOrigin::Policy,
+                confidence_bps: None,
+                evidence_refs: Vec::new(),
+                proofs: Vec::new(),
+            })
+            .collect();
+        let job = Self {
+            job_id: job_id_for(request),
+            op: request.op,
+            workspace_id: request.workspace_id,
+            session_id: request.session_id,
+            objective: derived_objective(request.op, request.claim.as_deref()),
+            acceptance_criteria: request
+                .claims
+                .iter()
+                .map(|claim| claim.claim.clone())
+                .collect(),
+            constraints: Vec::new(),
+            invariants: Vec::new(),
+            risks: Vec::new(),
+            proof_obligations: obligations,
+            target: request.target.clone(),
+            claim: request.claim.clone(),
+            max_output_bytes: request.max_output_bytes as u64,
+            deadline_ms: request.deadline_ms,
+        };
+        job.validate()?;
+        Ok(job)
+    }
+
     /// The obligation ids this job submitted: the only claim ids a reply may
     /// reference.
     pub fn obligation_ids(&self) -> BTreeSet<&str> {
         self.proof_obligations
             .iter()
+            .map(|obligation| obligation.id.as_str())
+            .collect()
+    }
+
+    /// The REQUIRED obligation ids this job submitted: every one of them must
+    /// come back with a result (or an explicit unknown), never silently
+    /// omitted.
+    pub fn required_obligation_ids(&self) -> BTreeSet<&str> {
+        self.proof_obligations
+            .iter()
+            .filter(|obligation| obligation.requirement == Requirement::Required)
             .map(|obligation| obligation.id.as_str())
             .collect()
     }
@@ -304,12 +375,18 @@ impl KiwiJob {
 }
 
 /// One claim verdict from the external verifier: evidence and/or a
-/// counterexample per claim id. Strictly bounded.
+/// counterexample per claim id. Strictly bounded. `evidence_strength` is the
+/// provider's declared strength; when absent it is derived from the state
+/// (proof-grade truth implies proof-grade evidence).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KiwiEvidence {
     pub claim_id: String,
     /// The evaluated state, using the frozen contract taxonomy.
     pub state: ClaimState,
+    /// The provider's declared evidence strength; absent = derived from the
+    /// state ([`EvidenceStrength::for_state`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_strength: Option<EvidenceStrength>,
     #[serde(default)]
     pub evidence: Vec<ArtifactRef>,
     #[serde(default)]
@@ -317,6 +394,12 @@ pub struct KiwiEvidence {
 }
 
 impl KiwiEvidence {
+    /// The effective evidence strength of this verdict.
+    pub fn effective_strength(&self) -> EvidenceStrength {
+        self.evidence_strength
+            .unwrap_or_else(|| EvidenceStrength::for_state(self.state))
+    }
+
     pub fn validate(&self) -> Result<(), VerificationError> {
         validate_id("claim_id", &self.claim_id)?;
         if self.evidence.len() > MAX_KIWI_EVIDENCE_PER_CLAIM {
@@ -329,13 +412,21 @@ impl KiwiEvidence {
         if let Some(counterexample) = &self.counterexample {
             validate_text("counterexample", counterexample, true, MAX_KIWI_TEXT_BYTES)?;
         }
-        if self.state == ClaimState::Disproven
-            && self.counterexample.is_none()
-            && self.evidence.is_empty()
+        // The neutral evidence-adequacy law: a positive verdict needs at
+        // least the evidence a negative one does; a disproof needs a ground.
+        evidence_adequacy(
+            self.state,
+            self.evidence.len(),
+            usize::from(self.counterexample.is_some()),
+        )
+        .map_err(VerificationError::Malformed)?;
+        if self.state == ClaimState::KnownTrue
+            && self.effective_strength() != EvidenceStrength::Proof
         {
             return Err(VerificationError::Malformed(format!(
-                "claim {} is disproven without a counterexample or evidence",
-                self.claim_id
+                "claim {} is known_true with {} evidence; proof-grade evidence is required",
+                self.claim_id,
+                self.effective_strength().as_str()
             )));
         }
         Ok(())
@@ -375,9 +466,10 @@ impl KiwiReply {
         Ok(())
     }
 
-    /// Every claim id must be an obligation the job submitted, exactly once.
-    /// Evidence for a claim Faktor never asked about is refused, never
-    /// accepted into the registry's response.
+    /// Every claim id must be an obligation the job submitted, exactly once,
+    /// and every REQUIRED obligation the job submitted must come back with a
+    /// result (or an explicit unknown) — a silently omitted required claim is
+    /// a typed refusal, never accepted data.
     pub fn validate_claims_for(&self, job: &KiwiJob) -> Result<(), VerificationError> {
         let known = job.obligation_ids();
         let mut seen = BTreeSet::new();
@@ -395,6 +487,13 @@ impl KiwiReply {
                 )));
             }
         }
+        for required in job.required_obligation_ids() {
+            if !seen.contains(required) {
+                return Err(VerificationError::Malformed(format!(
+                    "reply silently omitted required claim {required} which the submitted job carries"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -404,15 +503,7 @@ impl KiwiReply {
 fn sanitize_obligations(obligations: &[ProofObligation]) -> Vec<ProofObligation> {
     obligations
         .iter()
-        .map(|obligation| ProofObligation {
-            id: obligation.id.clone(),
-            claim: obligation.claim.clone(),
-            evidence: obligation.evidence,
-            origin: obligation.origin.clone(),
-            state: ClaimState::Unknown,
-            confidence_bps: None,
-            evidence_refs: Vec::new(),
-        })
+        .map(ProofObligation::without_evaluation_state)
         .collect()
 }
 
@@ -663,6 +754,7 @@ mod tests {
             claims: vec![KiwiEvidence {
                 claim_id: "po1:not-asked".into(),
                 state: ClaimState::Disproven,
+                evidence_strength: None,
                 evidence: Vec::new(),
                 counterexample: Some("token replay succeeded".into()),
             }],
@@ -684,6 +776,7 @@ mod tests {
         let mut disproof = KiwiEvidence {
             claim_id: "po1:x".into(),
             state: ClaimState::Disproven,
+            evidence_strength: None,
             evidence: Vec::new(),
             counterexample: None,
         };

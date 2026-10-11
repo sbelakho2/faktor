@@ -610,7 +610,7 @@ pub(crate) async fn native_terminal_reconcile(
         _ => {
             return wire_status(malformed_body(
                 "terminal reconcile disposition must be killed|collected",
-            ))
+            ));
         }
     };
     let observed = match (body.observed_pid, body.observed_start_time_ms) {
@@ -619,7 +619,7 @@ pub(crate) async fn native_terminal_reconcile(
         _ => {
             return wire_status(malformed_body(
                 "observed_pid and observed_start_time_ms must be provided together",
-            ))
+            ));
         }
     };
     let handle = match native_resolve_session(&state, &id) {

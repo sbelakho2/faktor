@@ -245,7 +245,7 @@ pub(crate) async fn native_orchestrator_graph(
                     &facts,
                     ORCH_PLAN_KIND,
                     &run,
-                )))
+                )));
             }
         }
     };
@@ -262,7 +262,7 @@ pub(crate) async fn native_orchestrator_graph(
         Err(m) => {
             return wire_status(internal_graph_err(format!(
                 "stored plan row of run {run} is invalid: {m}"
-            )))
+            )));
         }
     };
     // ---- registry rows: children (parse errors are loud).
@@ -285,7 +285,7 @@ pub(crate) async fn native_orchestrator_graph(
             Err(e) => {
                 return wire_status(internal_graph_err(format!(
                     "stored row {ORCH_REGISTRY_KIND}/{key} is not a valid child runtime row: {e}"
-                )))
+                )));
             }
         }
     }
@@ -350,7 +350,7 @@ pub(crate) async fn native_orchestrator_graph(
                             return wire_status(internal_graph_err(format!(
                                 "steering rows of child {child_id}: {}",
                                 e.message
-                            )))
+                            )));
                         }
                     };
                     presentation = Some(match ch.child_presentation(&row.child_id) {
@@ -359,7 +359,7 @@ pub(crate) async fn native_orchestrator_graph(
                             return wire_status(internal_graph_err(format!(
                                 "presentation of child {child_id}: {}",
                                 e.message
-                            )))
+                            )));
                         }
                     });
                     events
@@ -367,7 +367,7 @@ pub(crate) async fn native_orchestrator_graph(
                 Ok(None) => {
                     return wire_status(internal_graph_err(format!(
                         "graph assembly: child {child_id} names missing session {sid_raw}"
-                    )))
+                    )));
                 }
                 Err(e) => return api_err(&e),
             }
@@ -722,7 +722,7 @@ pub(crate) fn native_child_entry(
             return Err(internal_graph_err(format!(
                 "agents listing: child {} names missing session {}",
                 row.child_id, row.session_id
-            )))
+            )));
         }
         Err(e) => return Err(faktor_protocol::error::from_core(&e)),
     };
@@ -852,7 +852,7 @@ pub(crate) fn native_agents_body(
             Err(m) => {
                 return Err(internal_graph_err(format!(
                     "stored taskexec run row {TASK_RUN_ROW_KIND}/{key}: {m}"
-                )))
+                )));
             }
         };
         let session_row = handle
@@ -895,7 +895,7 @@ pub(crate) fn native_agents_body(
                     Err(_) => {
                         return Err(internal_graph_err(format!(
                         "stored row {ORCH_PLAN_KIND}/{run} of session {parent} is not valid JSON"
-                    )))
+                    )));
                     }
                 },
                 Ok(None) => None,
@@ -921,7 +921,7 @@ pub(crate) fn native_agents_body(
                 Err(m) => {
                     return Err(internal_graph_err(format!(
                         "stored plan row {ORCH_PLAN_KIND}/{run} of session {parent} is invalid: {m}"
-                    )))
+                    )));
                 }
             },
             None => faktor_orchestrator::TaskPlan {
@@ -1269,7 +1269,7 @@ pub(crate) async fn native_agent_budget(
         _ => {
             return wire_status(malformed_body(
                 "send exactly one of max_tokens or max_cost_micro",
-            ))
+            ));
         }
     };
     if let Err(e) = change.validate() {
@@ -1469,7 +1469,7 @@ pub(crate) fn child_cost_cap_change(
                 message: format!("child session {}", row.session_id),
                 http_status: 404,
                 retryable: false,
-            })
+            });
         }
         Err(e) => return api_err(&e),
     };

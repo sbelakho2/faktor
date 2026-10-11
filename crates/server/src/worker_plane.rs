@@ -638,11 +638,10 @@ pub async fn serve_worker_plane(
     // The handle OWNS this task: its result is recorded in `shared` and
     // returned to `shutdown()`; nothing is discarded here.
     let task = spawn_worker_plane_task(addr, Arc::clone(&shared), async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        crate::api::serve_with_half_close(listener, app, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
     });
     Ok(WorkerPlaneHandle {
         addr,

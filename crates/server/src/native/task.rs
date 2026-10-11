@@ -477,7 +477,7 @@ pub(crate) async fn native_task_run_start(
                 message: "invalid native task-run start body".into(),
                 http_status: 400,
                 retryable: false,
-            })
+            });
         }
     };
     if let Err(e) = validate_submission_id(&req.submission_id) {
@@ -815,7 +815,7 @@ pub(crate) async fn native_tournament_start(
                 message: "invalid native tournament start body".into(),
                 http_status: 400,
                 retryable: false,
-            })
+            });
         }
     };
     let handle = match native_resolve_session(&state, &id) {

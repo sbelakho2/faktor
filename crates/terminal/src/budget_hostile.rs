@@ -321,6 +321,9 @@ fn rlimit_plan_matrix_is_exact() {
     ];
     for row in rows {
         let plan = rlimit_plan(&row.b);
+        // `expected` is only extended on Linux (the AddressSpace rlimit);
+        // on other platforms the plain clone is final.
+        #[allow(unused_mut)]
         let mut expected = row.expect.clone();
         #[cfg(target_os = "linux")]
         if row.b.memory_bytes > 0 {

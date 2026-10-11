@@ -895,6 +895,63 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // before any write; a corrupt value is a typed `StoreError::Corrupt`,
     // never a silently defaulted contract.
     "ALTER TABLE task ADD COLUMN contract TEXT NOT NULL DEFAULT '{}';",
+    // v32 — the Engineering Outcome Ledger (economic audit item 7; schema
+    // target 33; array index 32). ONE new append-only table, no other table
+    // changes: one row per COMPLETED run, keyed by the durable run identity
+    // (`run_id` PRIMARY KEY). The row carries the bounded, strict record
+    // payload (owned by `faktor-agent`'s `outcome_ledger` module: task
+    // identity, candidate/final snapshot digests, accepted/integrated,
+    // verified-first-attempt, repair attempts, the provider/model sequence,
+    // local-vs-hosted, model/verification/rework/avoided-hosted spend,
+    // wall time, human interventions, proof coverage, risk class,
+    // changed-code scale, rollback/recovery events, the final verification
+    // basis and the per-call verified samples) plus the metric projection
+    // columns every aggregate folds without re-parsing the payload. The
+    // store owns the row's structural bounds and consistency CHECKs
+    // (checks_passed <= checks_required, verified_first_pass => verified,
+    // non-negative counters, a bounded payload byte length); the payload
+    // schema is validated loudly by the owning module on both write and
+    // read. Exactly-once semantics: `Store::engineering_outcome_append`
+    // inserts with `ON CONFLICT(run_id) DO NOTHING` inside one immediate
+    // transaction, returns `Appended` only when a row was actually inserted
+    // and absorbs the record's verified samples into `model_outcome_stats`
+    // in the SAME transaction — a crash/replay can therefore never write a
+    // second record nor double-count a router sample. A re-append with a
+    // different row under the same run id is a typed Conflict, never a
+    // silent overwrite.
+    "CREATE TABLE IF NOT EXISTS engineering_outcome (
+        run_id TEXT PRIMARY KEY,
+        session_id INTEGER NOT NULL CHECK (session_id >= 0),
+        task_id INTEGER NOT NULL CHECK (task_id >= 0),
+        payload TEXT NOT NULL,
+        payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
+        completed_at_ms INTEGER NOT NULL,
+        verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+        verified_first_pass INTEGER NOT NULL CHECK (verified_first_pass IN (0, 1)),
+        integrated INTEGER NOT NULL CHECK (integrated IN (0, 1)),
+        local_used INTEGER NOT NULL CHECK (local_used IN (0, 1)),
+        frontier_used INTEGER NOT NULL CHECK (frontier_used IN (0, 1)),
+        model_spend_micro INTEGER NOT NULL CHECK (model_spend_micro >= 0),
+        verification_spend_micro INTEGER NOT NULL CHECK (verification_spend_micro >= 0),
+        rework_spend_micro INTEGER NOT NULL CHECK (rework_spend_micro >= 0),
+        avoided_hosted_micro INTEGER NOT NULL CHECK (avoided_hosted_micro >= 0),
+        wall_time_ms INTEGER NOT NULL CHECK (wall_time_ms >= 0),
+        human_interventions INTEGER NOT NULL CHECK (human_interventions >= 0),
+        rollback_events INTEGER NOT NULL CHECK (rollback_events >= 0),
+        recovery_events INTEGER NOT NULL CHECK (recovery_events >= 0),
+        repair_attempts INTEGER NOT NULL CHECK (repair_attempts >= 0),
+        risk_class TEXT NOT NULL,
+        changed_files INTEGER NOT NULL CHECK (changed_files >= 0),
+        changed_lines INTEGER NOT NULL CHECK (changed_lines >= 0),
+        checks_passed INTEGER NOT NULL CHECK (checks_passed >= 0),
+        checks_required INTEGER NOT NULL CHECK (checks_required >= 0),
+        CHECK (verified_first_pass <= verified),
+        CHECK (checks_passed <= checks_required)
+     );
+     CREATE INDEX IF NOT EXISTS idx_engineering_outcome_task
+        ON engineering_outcome(task_id, completed_at_ms);
+     CREATE INDEX IF NOT EXISTS idx_engineering_outcome_completed
+        ON engineering_outcome(completed_at_ms, run_id);",
 ];
 
 /// Array index of the v9 block above (migration list position, not the

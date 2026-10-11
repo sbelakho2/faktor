@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! `runtime::retrieval`: cohesive slice of the agent runtime.
 
 use super::*;
@@ -549,7 +551,7 @@ pub(crate) fn require_edit_evidence_hashes_for_store(
             Err(e) => {
                 return Err(EditEvidenceRefusal::ExpectationsUnavailable {
                     reason: e.to_string(),
-                })
+                });
             }
         },
     };
@@ -1715,7 +1717,7 @@ impl AgentRuntime {
                     return ToolActivationLoad {
                         set: ToolActivationSet::new(),
                         scan: ToolActivationScan::Absent,
-                    }
+                    };
                 }
             }
         }

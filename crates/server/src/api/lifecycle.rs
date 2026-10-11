@@ -448,6 +448,99 @@ async fn native_not_found() -> axum::response::Response {
     })
 }
 
+/// Serve one axum router with HTTP/1 half-close support enabled.
+///
+/// `axum::serve` builds hyper's auto-connection builder with hyper's default
+/// `half_close = false`: a client that sends a COMPLETE request and then
+/// half-closes its write side (FIN — a normal HTTP/1.1 pattern; all bytes
+/// are sent, only the read side stays open) races the response, and if the
+/// dispatcher observes the EOF before the handler completes it aborts the
+/// in-flight request and closes the connection WITHOUT a response. Clients
+/// then see a silent empty body instead of the typed refusal this surface
+/// contracts on (the adversarial body-bounds corpus pins exactly that: a
+/// declared/oversized body must answer a typed 413/400 under a bounded
+/// deadline, never an empty close). `axum::serve` exposes no configuration
+/// hook, so the daemon drives the same auto builder itself with half-close
+/// enabled for HTTP/1; protocol detection, upgrades (websockets), the
+/// graceful-shutdown signal, the accept-error retry policy and the
+/// completion-after-drain semantics stay identical to `axum::serve`'s loop.
+pub(crate) async fn serve_with_half_close<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use futures_util::FutureExt as _;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use tokio::sync::watch;
+    use tower::ServiceExt as _;
+
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder.http1().half_close(true);
+    let service = app.map_request(|req: axum::extract::Request<hyper::body::Incoming>| {
+        req.map(axum::body::Body::new)
+    });
+
+    let (signal_tx, signal_rx) = watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(signal_rx);
+    });
+    let (close_tx, close_rx) = watch::channel(());
+
+    loop {
+        let accepted = tokio::select! {
+            conn = listener.accept() => conn,
+            _ = signal_tx.closed() => break,
+        };
+        let (io, remote_addr) = match accepted {
+            Ok(pair) => pair,
+            Err(err) => {
+                // axum's listener contract: a transient accept error never
+                // ends the serve loop; drain for a moment and retry.
+                tracing::error!(error = %err, "native listener accept failed; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        tracing::trace!(?remote_addr, "connection accepted");
+        let builder = builder.clone();
+        let service = service.clone();
+        let signal_tx = signal_tx.clone();
+        let close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(io);
+            let hyper_service = TowerToHyperService::new(service);
+            let mut conn =
+                std::pin::pin!(builder.serve_connection_with_upgrades(io, hyper_service));
+            let mut signal_closed = std::pin::pin!(signal_tx.closed().fuse());
+            loop {
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(err) = result {
+                            tracing::debug!(error = %err, "native connection ended");
+                        }
+                        break;
+                    }
+                    _ = &mut signal_closed => {
+                        conn.as_mut().graceful_shutdown();
+                    }
+                }
+            }
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    close_tx.closed().await;
+    Ok(())
+}
+
 pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<ServerHandle> {
     // Bind first, then compute the line (needs the bound address) and
     // finally move the deps into the router.
@@ -477,6 +570,9 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
         .route("/native/health", get(native_health))
         .route("/native/ready", get(native_ready))
         .route("/native/usage", get(native_usage))
+        // Engineering Outcome Ledger (economic audit item 7, additive):
+        // durable completed-run metrics aggregates plus one bounded run page.
+        .route("/native/outcomes", get(native_outcomes))
         // Wave 3 commercial metering (additive): the per-organization usage
         // fold + cursor page (the `?org=` branch of /native/usage above),
         // the derived entitlement snapshot, and the admin-only credit grant.
@@ -835,11 +931,10 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
     // The handle OWNS this task: its result is recorded in `shared` and
     // returned to `shutdown()`; nothing is discarded here.
     let task = spawn_server_task(addr, Arc::clone(&shared), async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        serve_with_half_close(listener, app, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
     });
     Ok(ServerHandle {
         addr,

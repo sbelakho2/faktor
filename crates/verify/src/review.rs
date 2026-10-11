@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Structured completion-review support (audit round 15: P0-12/80 + P0-13).
 //!
 //! Pure, deterministic, bounded building blocks for the independent

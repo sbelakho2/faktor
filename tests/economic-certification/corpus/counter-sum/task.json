@@ -1,0 +1,9 @@
+{
+  "id": "counter-sum",
+  "task_class": "easy",
+  "phase": "implement",
+  "input_tokens": 12000,
+  "output_tokens": 900,
+  "fix_at_attempt": 1,
+  "order": 1
+}

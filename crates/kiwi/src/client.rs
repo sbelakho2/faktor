@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! The bounded HTTP/JSON-wire Kiwi client.
 //!
 //! The client executes through the daemon's checked egress
@@ -14,8 +16,15 @@
 //!   body is refused typed BEFORE any allocation past the bound and before
 //!   parsing;
 //! - strict wire validation: schema version, op echo, job id echo, reply
-//!   bounds, and claim ids that must be obligations the submitted job
-//!   actually carried.
+//!   bounds, claim ids that must be obligations the submitted job actually
+//!   carried, and required obligations that must all come back;
+//! - a NEGOTIATED capability set: the adapter serves exactly the operations
+//!   its explicit configuration (or the conservative default set) declares
+//!   and refuses every other operation typed before any socket exists —
+//!   capability truth is never a blanket claim;
+//! - the bearer token is read through the [`SecretValue`] discipline at call
+//!   time and the Authorization header is assembled without any
+//!   whole-credential string formatting.
 //!
 //! An unconfigured host simply never constructs this provider
 //! ([`KiwiProviderConfig`] is only built by the daemon when the section is
@@ -24,15 +33,19 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use faktor_core::contract::{ProofBasis, ProofScope};
 use faktor_provider::egress::{
     execute_post_json, BudgetComponent, EgressError, HttpTransport, ResponseBudget,
 };
+use faktor_security::secret::SecretValue;
 use faktor_verify::{
-    ArtifactRef, BoxFuture, VerificationCapabilities, VerificationError, VerificationProvider,
-    VerificationProviderId, VerificationRequest, VerificationResponse,
+    ArtifactRef, BoxFuture, ClaimVerificationResult, VerificationCapabilities, VerificationError,
+    VerificationOp, VerificationProvider, VerificationProviderId, VerificationRequest,
+    VerificationResponse,
 };
 use http::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::wire::{evidence_kind_for, KiwiJob, WireRequest, WireResponse, KIWI_SCHEMA_VERSION};
 
@@ -49,6 +62,22 @@ pub const DEFAULT_KIWI_TIMEOUT_MS: u64 = 30_000;
 /// Absolute hard ceiling on one wire response body (defense in depth).
 pub const MAX_KIWI_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The conservative DEFAULT negotiated operation set of the Kiwi adapter:
+/// the operations an external independent verifier adds to the native
+/// baseline (claim verification, contract/compatibility checks, generated
+/// tests, security/performance/runtime checks). The native-owned operations
+/// (build/lint/typecheck/tests) are available only when explicit
+/// configuration adds them — capability truth is never a blanket claim.
+pub const DEFAULT_KIWI_OPERATIONS: [VerificationOp; 7] = [
+    VerificationOp::VerifyClaim,
+    VerificationOp::RunGeneratedTests,
+    VerificationOp::CheckContracts,
+    VerificationOp::CheckCompatibility,
+    VerificationOp::RunSecurityChecks,
+    VerificationOp::RunPerformanceChecks,
+    VerificationOp::RunRuntimeChecks,
+];
+
 /// Slack above the request output bound for framing/JSON overhead.
 const WIRE_FRAME_SLACK_BYTES: usize = 64 * 1024;
 
@@ -58,7 +87,9 @@ fn default_timeout_ms() -> u64 {
 
 /// Strict external-provider configuration (the daemon maps its
 /// `[verification.kiwi]` section onto this): endpoint plus optional bearer
-/// token by env-var NAME (the token value never rides config).
+/// token by env-var NAME (the token value never rides config) plus the
+/// explicitly NEGOTIATED operation set (absent = the conservative
+/// [`DEFAULT_KIWI_OPERATIONS`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KiwiProviderConfig {
@@ -69,12 +100,17 @@ pub struct KiwiProviderConfig {
     pub auth_env: Option<String>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// The operations this deployment negotiates with the provider. Absent =
+    /// [`DEFAULT_KIWI_OPERATIONS`]. Every operation outside the negotiated
+    /// set is refused typed before any request is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<VerificationOp>>,
 }
 
 impl KiwiProviderConfig {
     /// Typed validation: bounded endpoint, http(s) scheme, safe env-var name,
-    /// bounded non-zero watchdog. A hostile section is refused before any
-    /// socket exists.
+    /// bounded non-zero watchdog, and a non-empty, duplicate-free negotiated
+    /// operation set. A hostile section is refused before any socket exists.
     pub fn validate(&self) -> Result<(), VerificationError> {
         if self.endpoint.is_empty() || self.endpoint.len() > MAX_KIWI_ENDPOINT_BYTES {
             return Err(VerificationError::Malformed(format!(
@@ -102,7 +138,30 @@ impl KiwiProviderConfig {
                 "kiwi timeout_ms must be 1..={MAX_KIWI_TIMEOUT_MS}"
             )));
         }
+        if let Some(operations) = &self.operations {
+            if operations.is_empty() {
+                return Err(VerificationError::Malformed(
+                    "kiwi operations must name at least one operation".to_string(),
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for op in operations {
+                if !seen.insert(*op) {
+                    return Err(VerificationError::Malformed(format!(
+                        "kiwi operations carry {} more than once",
+                        op.as_str()
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The negotiated operation set of this configuration.
+    pub fn negotiated_operations(&self) -> Vec<VerificationOp> {
+        self.operations
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KIWI_OPERATIONS.to_vec())
     }
 
     /// Build the provider over the daemon's checked egress transport.
@@ -111,6 +170,8 @@ impl KiwiProviderConfig {
         transport: Arc<dyn HttpTransport>,
     ) -> Result<Arc<KiwiVerificationProvider>, VerificationError> {
         self.validate()?;
+        let operations = self.negotiated_operations();
+        let capabilities = VerificationCapabilities::of_many(&operations);
         Ok(Arc::new(KiwiVerificationProvider {
             id: VerificationProviderId::parse(KIWI_PROVIDER_ID)
                 .expect("the static kiwi provider id is valid"),
@@ -119,6 +180,8 @@ impl KiwiProviderConfig {
             timeout: Duration::from_millis(self.timeout_ms),
             transport,
             max_response_bytes: MAX_KIWI_RESPONSE_BYTES,
+            operations,
+            capabilities,
         }))
     }
 }
@@ -131,11 +194,35 @@ pub struct KiwiVerificationProvider {
     timeout: Duration,
     transport: Arc<dyn HttpTransport>,
     max_response_bytes: usize,
+    /// The NEGOTIATED operation set (explicit config or the conservative
+    /// default); every other operation is refused typed.
+    operations: Vec<VerificationOp>,
+    capabilities: VerificationCapabilities,
+}
+
+impl std::fmt::Debug for KiwiVerificationProvider {
+    /// Redacted by construction: identity, endpoint, watchdog and the
+    /// negotiated set only — never auth material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KiwiVerificationProvider")
+            .field("id", &self.id)
+            .field("endpoint", &self.endpoint)
+            .field("auth_env", &self.auth_env)
+            .field("timeout", &self.timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("operations", &self.operations)
+            .finish_non_exhaustive()
+    }
 }
 
 impl KiwiVerificationProvider {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// The negotiated operation set (observability / tests).
+    pub fn operations(&self) -> &[VerificationOp] {
+        &self.operations
     }
 
     /// Identity of the transport this provider executes through (endpoint),
@@ -163,6 +250,19 @@ impl KiwiVerificationProvider {
     ) -> Result<VerificationResponse, VerificationError> {
         request.validate()?;
         job.validate()?;
+        if !self.capabilities.supports(request.op) {
+            // Capability truth is the negotiated subset: an operation outside
+            // it is refused typed before any request is ever framed.
+            return Err(VerificationError::Unavailable(format!(
+                "kiwi adapter does not serve operation {} (negotiated: {})",
+                request.op.as_str(),
+                self.operations
+                    .iter()
+                    .map(|op| op.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         if job.op != request.op {
             return Err(VerificationError::Malformed(format!(
                 "kiwi job op {} does not match the request op {}",
@@ -174,6 +274,20 @@ impl KiwiVerificationProvider {
             return Err(VerificationError::Malformed(
                 "kiwi job max_output_bytes must equal the request max_output_bytes".to_string(),
             ));
+        }
+        if !request.claims.is_empty() {
+            // Claim identity is structural: the job may carry exactly the
+            // obligations the request named, nothing else.
+            let requested: std::collections::BTreeSet<&str> = request
+                .claims
+                .iter()
+                .map(|claim| claim.obligation_id.as_str())
+                .collect();
+            if job.obligation_ids() != requested {
+                return Err(VerificationError::Malformed(
+                    "kiwi job obligations must match the request claim ids exactly".to_string(),
+                ));
+            }
         }
         if request.cancellation.is_cancelled() {
             return Err(VerificationError::Timeout(
@@ -239,6 +353,7 @@ impl KiwiVerificationProvider {
         frame.reply.validate_claims_for(&job)?;
 
         let mut evidence: Vec<ArtifactRef> = Vec::new();
+        let mut claim_results: Vec<ClaimVerificationResult> = Vec::new();
         for claim in &frame.reply.claims {
             evidence.extend(claim.evidence.iter().cloned());
             if let Some(counterexample) = &claim.counterexample {
@@ -255,6 +370,26 @@ impl KiwiVerificationProvider {
                     })?,
                 );
             }
+            if !request.claims.is_empty() {
+                // The neutral per-claim result: the obligation id is the SAME
+                // id Faktor submitted (never a Kiwi-private syntax), and the
+                // declared strength is validated by the neutral import.
+                let result = ClaimVerificationResult {
+                    obligation_id: claim.claim_id.clone(),
+                    subject_snapshot: request.subject_snapshot.clone(),
+                    state: claim.state,
+                    evidence_strength: claim.effective_strength(),
+                    evidence: claim.evidence.clone(),
+                    counterexample: claim.counterexample.iter().cloned().collect(),
+                    provider: self.id.clone(),
+                    basis: ProofBasis {
+                        subject: request.subject_snapshot.clone(),
+                        scope: ProofScope::SnapshotBound,
+                    },
+                };
+                result.validate()?;
+                claim_results.push(result);
+            }
         }
         evidence.extend(frame.reply.evidence.iter().cloned());
 
@@ -262,6 +397,7 @@ impl KiwiVerificationProvider {
             VerificationResponse::new(self.id.clone(), request.op, frame.reply.outcome)
                 .with_summary(frame.reply.summary)
                 .with_evidence(evidence)
+                .with_claims(claim_results)
                 .with_duration_ms(started.elapsed().as_millis() as u64);
         response.fit_output(request.max_output_bytes);
         response.validate(&request)?;
@@ -271,10 +407,17 @@ impl KiwiVerificationProvider {
     fn auth_headers(&self) -> Result<HeaderMap, VerificationError> {
         let mut headers = HeaderMap::new();
         if let Some(var) = &self.auth_env {
-            let secret = std::env::var(var).map_err(|_| {
+            // The SecretValue discipline: the env value is moved straight
+            // into the zeroizing wrapper, the Authorization header is
+            // assembled over ONE zeroizing buffer, and no whole-credential
+            // string is ever formatted.
+            let secret = SecretValue::new(std::env::var(var).map_err(|_| {
                 VerificationError::Unavailable(format!("kiwi auth env {var} is not set"))
-            })?;
-            let value = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|_| {
+            })?);
+            let mut value_bytes = Zeroizing::new(Vec::with_capacity(7 + secret.len()));
+            value_bytes.extend_from_slice(b"Bearer ");
+            value_bytes.extend_from_slice(secret.expose().as_bytes());
+            let value = HeaderValue::from_bytes(&value_bytes).map_err(|_| {
                 VerificationError::Malformed(format!(
                     "kiwi auth env {var} is not a valid header value"
                 ))
@@ -381,14 +524,32 @@ impl VerificationProvider for KiwiVerificationProvider {
     }
 
     fn capabilities(&self) -> VerificationCapabilities {
-        VerificationCapabilities::ALL
+        self.capabilities
     }
 
     fn verify(
         &self,
         request: VerificationRequest,
     ) -> BoxFuture<'_, Result<VerificationResponse, VerificationError>> {
-        let job = KiwiJob::for_request(&request);
+        if !self.capabilities.supports(request.op) {
+            // Refused typed, before any job is framed: the negotiated subset
+            // is the adapter's capability truth.
+            let message = format!(
+                "kiwi adapter does not serve operation {} (negotiated: {})",
+                request.op.as_str(),
+                self.operations
+                    .iter()
+                    .map(|op| op.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Box::pin(async move { Err(VerificationError::Unavailable(message)) });
+        }
+        let job = if request.claims.is_empty() {
+            KiwiJob::for_request(&request)
+        } else {
+            KiwiJob::for_claims(&request)
+        };
         match job {
             Ok(job) => self.submit(request, job),
             Err(err) => Box::pin(async move { Err(err) }),
@@ -400,13 +561,29 @@ impl VerificationProvider for KiwiVerificationProvider {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hostile_configs_are_refused_typed() {
-        let base = KiwiProviderConfig {
+    fn base_config() -> KiwiProviderConfig {
+        KiwiProviderConfig {
             endpoint: "http://127.0.0.1:1/verify".to_string(),
             auth_env: None,
             timeout_ms: 1_000,
-        };
+            operations: None,
+        }
+    }
+
+    fn test_transport() -> Arc<dyn HttpTransport> {
+        Arc::new(
+            faktor_provider::egress::PolicyCheckedHttpTransport::with_policy_for_tests(
+                faktor_security::destination::DestinationPolicy::parse_lines([
+                    "http://127.0.0.1:1",
+                ])
+                .unwrap(),
+            ),
+        )
+    }
+
+    #[test]
+    fn hostile_configs_are_refused_typed() {
+        let base = base_config();
         base.validate().unwrap();
         for endpoint in ["", "not-a-url", "ftp://example", "file:///etc/passwd"] {
             let cfg = KiwiProviderConfig {
@@ -434,5 +611,108 @@ mod tests {
             };
             assert!(cfg.validate().is_err(), "{timeout_ms} must be refused");
         }
+        // A hostile negotiation is refused: empty or duplicate operations.
+        let cfg = KiwiProviderConfig {
+            operations: Some(Vec::new()),
+            ..base.clone()
+        };
+        assert!(cfg.validate().is_err());
+        let cfg = KiwiProviderConfig {
+            operations: Some(vec![
+                VerificationOp::VerifyClaim,
+                VerificationOp::VerifyClaim,
+            ]),
+            ..base
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn capability_truth_is_the_negotiated_subset_never_a_blanket_claim() {
+        // The absent-operations default is the conservative explicit set,
+        // which does NOT include the native-owned operations.
+        let cfg = base_config();
+        let operations = cfg.negotiated_operations();
+        assert_eq!(operations, DEFAULT_KIWI_OPERATIONS.to_vec());
+        assert!(!operations.contains(&VerificationOp::RunTests));
+        assert!(!operations.contains(&VerificationOp::Build));
+        assert!(operations.contains(&VerificationOp::VerifyClaim));
+        let built = cfg.build(test_transport()).unwrap();
+        let capabilities = VerificationProvider::capabilities(built.as_ref());
+        assert!(capabilities.supports(VerificationOp::VerifyClaim));
+        assert!(!capabilities.supports(VerificationOp::RunTests));
+        assert!(!capabilities.supports(VerificationOp::Build));
+
+        // An explicit negotiation both narrows and extends, and the adapter
+        // DECLARES exactly that set.
+        let cfg = KiwiProviderConfig {
+            operations: Some(vec![VerificationOp::RunTests, VerificationOp::Lint]),
+            ..base_config()
+        };
+        let built = cfg.build(test_transport()).unwrap();
+        let capabilities = VerificationProvider::capabilities(built.as_ref());
+        assert!(capabilities.supports(VerificationOp::RunTests));
+        assert!(capabilities.supports(VerificationOp::Lint));
+        assert!(!capabilities.supports(VerificationOp::VerifyClaim));
+        assert_eq!(
+            built.operations(),
+            [VerificationOp::RunTests, VerificationOp::Lint]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_operation_is_refused_typed_before_any_request() {
+        let built = base_config().build(test_transport()).unwrap();
+        let request = VerificationRequest::new(
+            faktor_core::OpId::new(1),
+            faktor_core::SessionId::new(1),
+            faktor_core::WorkspaceId::new(1),
+            faktor_verify::now_epoch_ms(),
+            faktor_core::CancellationToken::new(),
+            VerificationOp::RunTests,
+        );
+        let err = built
+            .verify(request)
+            .await
+            .expect_err("RunTests is outside the negotiated default set");
+        match err {
+            VerificationError::Unavailable(detail) => {
+                assert!(detail.contains("run_tests"), "{detail}");
+                assert!(detail.contains("negotiated"), "{detail}");
+            }
+            other => panic!("expected typed Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bearer_token_never_leaks_into_debug_or_errors() {
+        const PLANTED: &str = "PLANTED-KIWI-TOKEN-do-not-leak-0123456789";
+        const VAR: &str = "FAKTOR_KIWI_CLIENT_TEST_TOKEN_TRAP";
+        std::env::set_var(VAR, PLANTED);
+        let cfg = KiwiProviderConfig {
+            auth_env: Some(VAR.to_string()),
+            ..base_config()
+        };
+        let built = cfg.build(test_transport()).unwrap();
+        let debug = format!("{built:?}");
+        assert!(!debug.contains(PLANTED), "provider Debug leaked: {debug}");
+        // The header carries exactly the bearer credential...
+        let headers = built.auth_headers().unwrap();
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            format!("Bearer {PLANTED}")
+        );
+        // ...while a refusal never carries the value, only the env NAME.
+        std::env::set_var(VAR, "bad\nvalue");
+        let err = built.auth_headers().unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PLANTED), "error leaked: {rendered}");
+        assert!(!rendered.contains("bad"), "error leaked bytes: {rendered}");
+        assert!(rendered.contains(VAR), "{rendered}");
+        std::env::remove_var(VAR);
+        // A missing env is a recoverable unavailable naming only the var.
+        let err = built.auth_headers().unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(rendered.contains(VAR), "{rendered}");
     }
 }

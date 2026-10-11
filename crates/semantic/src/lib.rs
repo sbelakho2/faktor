@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Faktor semantic-provider abstraction (audit 48-54/58/59).
 //!
 //! A semantic provider is optional acceleration: coverage, context, deltas,

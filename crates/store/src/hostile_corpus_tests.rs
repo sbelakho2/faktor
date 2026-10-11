@@ -327,7 +327,9 @@ fn store_hostile_ledger_entry_type_and_schema_bounds() {
                 m.contains("1..=64"),
                 "hostile-sql case #{case} (entry_type len {len}): wrong refusal {m}"
             ),
-            other => panic!("hostile-sql case #{case} (entry_type len {len}): expected typed refusal, got {other:?}"),
+            other => panic!(
+                "hostile-sql case #{case} (entry_type len {len}): expected typed refusal, got {other:?}"
+            ),
         }
     }
     case += 1;
@@ -344,7 +346,9 @@ fn store_hostile_ledger_entry_type_and_schema_bounds() {
                 m.contains("schema_ver"),
                 "hostile-sql case #{case} (schema_ver {bad_ver}): wrong refusal {m}"
             ),
-            other => panic!("hostile-sql case #{case} (schema_ver {bad_ver}): expected typed refusal, got {other:?}"),
+            other => panic!(
+                "hostile-sql case #{case} (schema_ver {bad_ver}): expected typed refusal, got {other:?}"
+            ),
         }
     }
     case += 1;
@@ -402,7 +406,9 @@ fn store_per_version_fixture_roundtrip_matrix() {
         store
             .put_message(s.id, 1, "user", serde_json::json!({"v": version}))
             .unwrap_or_else(|e| {
-                panic!("migration-matrix case #{case} (fixture v{version}): write after migration: {e}")
+                panic!(
+                    "migration-matrix case #{case} (fixture v{version}): write after migration: {e}"
+                )
             });
         let back = store.messages_before(s.id, None, 10).unwrap();
         assert_eq!(
@@ -419,7 +425,7 @@ fn store_per_version_fixture_roundtrip_matrix() {
             "migration-matrix case #{case} (fixture v{version}): every chain must reach the head"
         );
     }
-    assert_eq!(case, 33, "per-version fixture matrix size drifted");
+    assert_eq!(case, head + 1, "per-version fixture matrix size drifted");
 }
 
 #[test]
@@ -442,7 +448,8 @@ fn store_torn_migration_cursor_never_half_migrates_silently() {
                     .query_row("PRAGMA user_version", [], |r| r.get(0))
                     .unwrap();
                 assert_eq!(
-                    cursor, head as i64,
+                    cursor,
+                    head as i64,
                     "torn-migration case #{case} (schema v{applied}, cursor v{}): a successful reopen must complete the chain",
                     applied - 1
                 );
@@ -460,7 +467,7 @@ fn store_torn_migration_cursor_never_half_migrates_silently() {
             ),
         }
     }
-    assert_eq!(case, 32, "torn-migration matrix size drifted");
+    assert_eq!(case, head, "torn-migration matrix size drifted");
 }
 
 #[test]
@@ -2438,7 +2445,11 @@ fn store_cost_money_i64_boundaries_and_caps() {
         &[(sid.raw() as i64).into(), (clean_task.raw() as i64).into()],
     );
     assert_eq!(
-        store.cost_task_row(sid, clean_task).unwrap().unwrap().spent_cost_micro,
+        store
+            .cost_task_row(sid, clean_task)
+            .unwrap()
+            .unwrap()
+            .spent_cost_micro,
         u64::MAX,
         "money case #{case}: a negative spent column is loud saturation, never a wrapped small number"
     );

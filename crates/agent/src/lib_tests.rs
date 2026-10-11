@@ -1329,7 +1329,10 @@ mod bounded_evidence_executor_tests {
         // Documented physical bound: workers + cap = 8 evidence threads.
         let live_now = EVIDENCE_WORKERS_LIVE.load(Ordering::SeqCst);
         assert!(
-            live_now <= live_before + EVIDENCE_EXECUTOR_WORKERS + EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS,
+            live_now
+                <= live_before
+                    + EVIDENCE_EXECUTOR_WORKERS
+                    + EVIDENCE_EXECUTOR_MAX_ABANDONED_THREADS,
             "physical evidence threads must stay within workers + cap: before={live_before} now={live_now}"
         );
 
@@ -3278,10 +3281,7 @@ mod hard_quality_floor_tests {
         );
         let req = ModelCallIntent::implement_main().route_request(4_000, 2_048, 0);
         assert!(
-            matches!(
-                policy.route(&req),
-                Err(RouteFailure::NoCapableModel)
-            ),
+            matches!(policy.route(&req), Err(RouteFailure::NoCapableModel)),
             "hard 60 with a best available 50 must be a typed NoCapableModel, never a lowered floor"
         );
         let policy2 = EconomicRoutingPolicy::new(

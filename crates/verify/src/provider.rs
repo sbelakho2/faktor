@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Provider-based verification interface (`docs/specs/autonomous-engineering.md`).
 //!
 //! Verification is not one engine: it is an interface with a NATIVE baseline
@@ -37,9 +39,11 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use faktor_core::contract::{EvidenceRef, ProofEvidenceKind};
+use faktor_core::contract::{EvidenceRef, ProofEvidenceKind, SubjectSnapshot};
 use faktor_core::{CancellationToken, Deadline, OpId, SessionId, WorkspaceId};
 use serde::{Deserialize, Serialize};
+
+use crate::claims::{op_for_claim, ClaimRequest, ClaimVerificationResult};
 
 /// Boxed future returned by every [`VerificationProvider`] async method.
 /// Standard library only: this crate carries no async runtime of its own.
@@ -165,12 +169,29 @@ pub struct VerificationCapabilities {
 
 impl VerificationCapabilities {
     pub const NONE: Self = Self { ops: 0 };
-    pub const ALL: Self = Self {
-        ops: 0b111_1111_1111,
-    };
 
     pub const fn of(op: VerificationOp) -> Self {
         Self { ops: op.bit() }
+    }
+
+    /// The union of an explicit operation set. There is deliberately no
+    /// [`Self::ALL`]-style constant: capability truth comes from a handshake,
+    /// a versioned descriptor or explicit configuration, never from a
+    /// blanket claim.
+    pub fn of_many(ops: &[VerificationOp]) -> Self {
+        let mut capabilities = Self::NONE;
+        for op in ops {
+            capabilities = capabilities.union(Self::of(*op));
+        }
+        capabilities
+    }
+
+    /// The operations this capability value covers, in canonical order.
+    pub fn ops(self) -> Vec<VerificationOp> {
+        VerificationOp::ALL
+            .into_iter()
+            .filter(|op| self.supports(*op))
+            .collect()
     }
 
     /// The minimal capability value covering one op (selection comparison).
@@ -431,6 +452,14 @@ pub struct VerificationRequest {
     /// The claim to evaluate (required for [`VerificationOp::VerifyClaim`],
     /// optional context elsewhere).
     pub claim: Option<String>,
+    /// The full contract claim batch (empty for ordinary op requests). A
+    /// request carrying claims is dispatched through
+    /// [`VerificationRegistry::verify_claims`]; every claim routes to exactly
+    /// the request's operation ([`crate::claims::op_for_claim`]).
+    pub claims: Vec<ClaimRequest>,
+    /// The candidate subject snapshot the caller declares the verification
+    /// is requested against (stamped onto provider claim results).
+    pub subject_snapshot: Option<SubjectSnapshot>,
     pub max_output_bytes: usize,
     /// Demand INDEPENDENT verification: dispatch skips the native baseline
     /// and refuses typed when no external provider is configured.
@@ -456,6 +485,8 @@ impl VerificationRequest {
             op,
             target: VerificationTarget::Workspace,
             claim: None,
+            claims: Vec::new(),
+            subject_snapshot: None,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             require_provider: false,
         }
@@ -468,6 +499,18 @@ impl VerificationRequest {
 
     pub fn with_claim(mut self, claim: impl Into<String>) -> Self {
         self.claim = Some(claim.into());
+        self
+    }
+
+    /// Carry the full contract claim batch this request asks about.
+    pub fn with_claims(mut self, claims: Vec<ClaimRequest>) -> Self {
+        self.claims = claims;
+        self
+    }
+
+    /// Declare the candidate subject snapshot the request is asked against.
+    pub fn with_subject_snapshot(mut self, snapshot: SubjectSnapshot) -> Self {
+        self.subject_snapshot = Some(snapshot);
         self
     }
 
@@ -511,10 +554,36 @@ impl VerificationRequest {
                 )));
             }
         }
-        if self.op == VerificationOp::VerifyClaim && self.claim.is_none() {
+        if self.op == VerificationOp::VerifyClaim && self.claim.is_none() && self.claims.is_empty()
+        {
             return Err(VerificationError::Malformed(
                 "VerifyClaim requires a claim".to_string(),
             ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for claim in &self.claims {
+            claim.validate()?;
+            if !seen.insert(claim.obligation_id.as_str()) {
+                return Err(VerificationError::Malformed(format!(
+                    "verification request carries duplicate claim id {:?}",
+                    claim.obligation_id
+                )));
+            }
+            if op_for_claim(claim) != self.op {
+                return Err(VerificationError::Malformed(format!(
+                    "claim {} routes to operation {} but the request asks for {}",
+                    claim.obligation_id,
+                    op_for_claim(claim).as_str(),
+                    self.op.as_str()
+                )));
+            }
+        }
+        if let Some(snapshot) = &self.subject_snapshot {
+            if snapshot.candidate.is_empty() {
+                return Err(VerificationError::Malformed(
+                    "verification subject_snapshot candidate must not be empty".to_string(),
+                ));
+            }
         }
         if self.max_output_bytes == 0 {
             return Err(VerificationError::Malformed(
@@ -567,6 +636,10 @@ pub struct VerificationResponse {
     pub exit_code: Option<i32>,
     pub summary: String,
     pub evidence: Vec<ArtifactRef>,
+    /// The per-claim verdicts of a claim-batch request, keyed by the
+    /// obligation ids the request named. Empty for ordinary op requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<ClaimVerificationResult>,
     pub duration_ms: u64,
 }
 
@@ -583,6 +656,7 @@ impl VerificationResponse {
             exit_code: None,
             summary: String::new(),
             evidence: Vec::new(),
+            claims: Vec::new(),
             duration_ms: 0,
         }
     }
@@ -599,6 +673,11 @@ impl VerificationResponse {
 
     pub fn with_evidence(mut self, evidence: Vec<ArtifactRef>) -> Self {
         self.evidence = evidence;
+        self
+    }
+
+    pub fn with_claims(mut self, claims: Vec<ClaimVerificationResult>) -> Self {
+        self.claims = claims;
         self
     }
 
@@ -659,7 +738,8 @@ impl VerificationResponse {
     }
 
     /// Validate the response against its request: op identity, per-field
-    /// bounds and the request's total output bound. Every failure is typed.
+    /// bounds, claim identity/completeness and the request's total output
+    /// bound. Every failure is typed.
     pub fn validate(&self, request: &VerificationRequest) -> Result<(), VerificationError> {
         if self.op != request.op {
             return Err(VerificationError::Malformed(format!(
@@ -693,7 +773,56 @@ impl VerificationResponse {
                 });
             }
         }
-        let total = self.output_bytes();
+        // Claim identity is structural: a response may answer only claims
+        // the request actually named, at most once each, and must answer
+        // every REQUIRED claim (unless it declared the whole batch
+        // unavailable with no claim detail at all). A silently omitted
+        // required claim is a typed refusal, never accepted data.
+        if !self.claims.is_empty() && request.claims.is_empty() {
+            return Err(VerificationError::Malformed(
+                "verification response carries claims for a request without a claim batch"
+                    .to_string(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for claim in &self.claims {
+            claim.validate()?;
+            if !request
+                .claims
+                .iter()
+                .any(|asked| asked.obligation_id == claim.obligation_id)
+            {
+                return Err(VerificationError::Malformed(format!(
+                    "verification response answers claim {} which the request never named",
+                    claim.obligation_id
+                )));
+            }
+            if !seen.insert(claim.obligation_id.as_str()) {
+                return Err(VerificationError::Malformed(format!(
+                    "verification response answers claim {} more than once",
+                    claim.obligation_id
+                )));
+            }
+        }
+        if !request.claims.is_empty()
+            && (self.outcome != VerificationOutcome::Unavailable || !self.claims.is_empty())
+        {
+            for asked in request
+                .claims
+                .iter()
+                .filter(|asked| asked.requirement == faktor_core::contract::Requirement::Required)
+            {
+                if !seen.contains(asked.obligation_id.as_str()) {
+                    return Err(VerificationError::Malformed(format!(
+                        "verification response silently omitted required claim {}",
+                        asked.obligation_id
+                    )));
+                }
+            }
+        }
+        let total = self
+            .output_bytes()
+            .saturating_add(self.claims_output_bytes());
         if total > request.max_output_bytes {
             return Err(VerificationError::OutputTooLarge {
                 max: request.max_output_bytes,
@@ -701,6 +830,21 @@ impl VerificationResponse {
             });
         }
         Ok(())
+    }
+
+    /// The bounded bytes the per-claim verdicts carry (evidence + text).
+    pub fn claims_output_bytes(&self) -> usize {
+        self.claims
+            .iter()
+            .map(|claim| {
+                claim
+                    .evidence
+                    .iter()
+                    .map(ArtifactRef::byte_len)
+                    .sum::<usize>()
+                    + claim.counterexample.iter().map(String::len).sum::<usize>()
+            })
+            .sum()
     }
 }
 
@@ -920,6 +1064,82 @@ impl VerificationRegistry {
             request.op.as_str()
         )))
     }
+
+    /// Dispatch the FULL contract claim batch through the neutral operation
+    /// vocabulary — the completion spine. Claims are grouped by the
+    /// operation they route to ([`op_for_claim`]), each group is dispatched
+    /// through [`Self::verify`], and the per-claim verdicts are collected in
+    /// request order.
+    ///
+    /// Laws:
+    /// - every returned result is keyed by an obligation id the request
+    ///   named (enforced by [`VerificationResponse::validate`]);
+    /// - every REQUIRED claim comes back with a result or an explicit
+    ///   `Unknown` no-verdict — a provider that silently omits one is a
+    ///   typed refusal (never accepted data);
+    /// - a group no provider can serve (or a batch that `require_provider`
+    ///   routes to a missing external) is the typed
+    ///   [`VerificationError::Unavailable`], never a silent substitution.
+    pub async fn verify_claims(
+        &self,
+        request: VerificationRequest,
+        claims: Vec<ClaimRequest>,
+    ) -> Result<Vec<ClaimVerificationResult>, VerificationError> {
+        if claims.is_empty() {
+            return Err(VerificationError::Malformed(
+                "verify_claims requires at least one claim".to_string(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for claim in &claims {
+            claim.validate()?;
+            if !seen.insert(claim.obligation_id.as_str()) {
+                return Err(VerificationError::Malformed(format!(
+                    "claim batch carries duplicate obligation id {:?}",
+                    claim.obligation_id
+                )));
+            }
+        }
+        // Group by routed operation, preserving claim order.
+        let mut groups: Vec<(VerificationOp, Vec<ClaimRequest>)> = Vec::new();
+        for claim in claims {
+            let op = op_for_claim(&claim);
+            match groups.iter_mut().find(|(group_op, _)| *group_op == op) {
+                Some((_, group)) => group.push(claim),
+                None => groups.push((op, vec![claim])),
+            }
+        }
+        let mut results: Vec<ClaimVerificationResult> = Vec::new();
+        for (op, group) in groups {
+            let mut sub = request.clone();
+            sub.op = op;
+            sub.claim = None;
+            sub.claims = group;
+            sub.validate()?;
+            match self.verify(sub.clone()).await {
+                Ok(response) => {
+                    if response.claims.is_empty()
+                        && response.outcome == VerificationOutcome::Unavailable
+                    {
+                        // The provider declared the whole batch unverifiable:
+                        // answer every claim EXPLICITLY as Unknown.
+                        for claim in &sub.claims {
+                            results.push(ClaimVerificationResult::unavailable_unknown(
+                                response.provider.clone(),
+                                claim.obligation_id.clone(),
+                            ));
+                        }
+                    } else {
+                        results.extend(response.claims.iter().cloned());
+                    }
+                }
+                // No capable provider for a routed operation: typed, never a
+                // silent native substitution or a vanished claim.
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(results)
+    }
 }
 
 /// The current epoch in milliseconds (the request envelope's clock).
@@ -973,7 +1193,7 @@ mod tests {
             Self {
                 id,
                 native,
-                ops: VerificationCapabilities::ALL,
+                ops: VerificationCapabilities::of_many(&VerificationOp::ALL),
                 outcome,
                 error: None,
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1320,5 +1540,275 @@ mod tests {
         // A per-field bound still holds after fitting.
         let request = request(VerificationOp::Build).with_max_output_bytes(1024);
         response.validate(&request).unwrap();
+    }
+
+    // ------------------------------------------------- claim batch spine
+
+    use crate::claims::{ClaimRequest, ClaimVerificationResult, EvidenceStrength};
+    use faktor_core::contract::{AcceptedStrength, ClaimState, EvidenceBinding, Requirement};
+
+    fn batch_claim(
+        id: &str,
+        kind: ProofEvidenceKind,
+        binding: EvidenceBinding,
+        requirement: Requirement,
+    ) -> ClaimRequest {
+        ClaimRequest {
+            obligation_id: id.to_string(),
+            claim: format!("claim {id}"),
+            evidence_kind: kind,
+            requirement,
+            binding,
+            accepted_strength: AcceptedStrength::Supported,
+        }
+    }
+
+    /// A provider whose verdict function the test scripts per request.
+    struct BatchProvider {
+        id: &'static str,
+        native: bool,
+        capability: VerificationCapabilities,
+        #[allow(clippy::type_complexity)]
+        verdict: Box<
+            dyn Fn(&VerificationRequest) -> Result<VerificationResponse, VerificationError>
+                + Send
+                + Sync,
+        >,
+    }
+
+    impl VerificationProvider for BatchProvider {
+        fn id(&self) -> VerificationProviderId {
+            VerificationProviderId::parse(self.id).unwrap()
+        }
+
+        fn is_native(&self) -> bool {
+            self.native
+        }
+
+        fn capabilities(&self) -> VerificationCapabilities {
+            self.capability
+        }
+
+        fn verify(
+            &self,
+            request: VerificationRequest,
+        ) -> BoxFuture<'_, Result<VerificationResponse, VerificationError>> {
+            let result = (self.verdict)(&request);
+            Box::pin(async move { result })
+        }
+    }
+
+    fn claim_batch_request() -> VerificationRequest {
+        request(VerificationOp::CheckContracts)
+    }
+
+    #[tokio::test]
+    async fn claim_batch_round_trip_lands_every_state_on_the_right_obligation() {
+        // A (contract-bound) -> disproven, B (runtime-bound) -> supported,
+        // C (provider-claim-bound) -> unknown, across three routed ops.
+        let a = batch_claim(
+            "po1:a",
+            ProofEvidenceKind::ContractCheck,
+            EvidenceBinding::ContractIds(vec!["c1".into()]),
+            Requirement::Required,
+        );
+        let b = batch_claim(
+            "po1:b",
+            ProofEvidenceKind::RuntimeTrace,
+            EvidenceBinding::RuntimeAssertions(vec!["a1".into()]),
+            Requirement::Required,
+        );
+        let c = batch_claim(
+            "po1:c",
+            ProofEvidenceKind::Review,
+            EvidenceBinding::ProviderClaim("po1:c".into()),
+            Requirement::Required,
+        );
+        let provider = Arc::new(BatchProvider {
+            id: "external",
+            native: false,
+            capability: VerificationCapabilities::of_many(&VerificationOp::ALL),
+            verdict: Box::new(|request: &VerificationRequest| {
+                let mut claims = Vec::new();
+                for asked in &request.claims {
+                    match asked.obligation_id.as_str() {
+                        "po1:a" => claims.push(ClaimVerificationResult::verdict(
+                            VerificationProviderId::parse("external").unwrap(),
+                            "po1:a",
+                            ClaimState::Disproven,
+                            EvidenceStrength::Observed,
+                            Vec::new(),
+                            vec!["constraint c1 was violated".to_string()],
+                        )),
+                        "po1:b" => claims.push(ClaimVerificationResult::verdict(
+                            VerificationProviderId::parse("external").unwrap(),
+                            "po1:b",
+                            ClaimState::Supported,
+                            EvidenceStrength::Observed,
+                            vec![ArtifactRef::new(
+                                ProofEvidenceKind::RuntimeTrace,
+                                "external.trace",
+                                "assertion a1 observed",
+                            )
+                            .unwrap()],
+                            Vec::new(),
+                        )),
+                        _ => claims.push(ClaimVerificationResult::unavailable_unknown(
+                            VerificationProviderId::parse("external").unwrap(),
+                            &asked.obligation_id,
+                        )),
+                    }
+                }
+                Ok(VerificationResponse::new(
+                    VerificationProviderId::parse("external").unwrap(),
+                    request.op,
+                    VerificationOutcome::Failed,
+                )
+                .with_claims(claims))
+            }),
+        });
+        let mut registry = VerificationRegistry::new();
+        registry.register(provider);
+        let results = registry
+            .verify_claims(claim_batch_request(), vec![a.clone(), b.clone(), c.clone()])
+            .await
+            .expect("claim batch dispatch");
+        assert_eq!(results.len(), 3, "one result per claim: {results:?}");
+        let by_id = |id: &str| {
+            results
+                .iter()
+                .find(|result| result.obligation_id == id)
+                .unwrap_or_else(|| panic!("no result for {id}: {results:?}"))
+        };
+        assert_eq!(by_id("po1:a").state, ClaimState::Disproven);
+        assert_eq!(
+            by_id("po1:a").counterexample,
+            vec!["constraint c1 was violated".to_string()]
+        );
+        assert_eq!(by_id("po1:b").state, ClaimState::Supported);
+        assert!(!by_id("po1:b").evidence.is_empty());
+        assert_eq!(by_id("po1:c").state, ClaimState::Unknown);
+        assert!(by_id("po1:c").evidence.is_empty());
+        assert_eq!(by_id("po1:c").provider.as_str(), "external");
+    }
+
+    #[tokio::test]
+    async fn a_silently_omitted_required_claim_is_refused_typed() {
+        let a = batch_claim(
+            "po1:a",
+            ProofEvidenceKind::ContractCheck,
+            EvidenceBinding::ContractIds(vec!["c1".into()]),
+            Requirement::Required,
+        );
+        let b = batch_claim(
+            "po1:b",
+            ProofEvidenceKind::ContractCheck,
+            EvidenceBinding::ContractIds(vec!["c2".into()]),
+            Requirement::Required,
+        );
+        let provider = Arc::new(BatchProvider {
+            id: "external",
+            native: false,
+            capability: VerificationCapabilities::of_many(&VerificationOp::ALL),
+            verdict: Box::new(|request: &VerificationRequest| {
+                // Answers only the first claim with a PASS verdict: the
+                // omitted required claim must never be silently dropped.
+                let claim = &request.claims[0];
+                Ok(VerificationResponse::new(
+                    VerificationProviderId::parse("external").unwrap(),
+                    request.op,
+                    VerificationOutcome::Passed,
+                )
+                .with_claims(vec![ClaimVerificationResult::verdict(
+                    VerificationProviderId::parse("external").unwrap(),
+                    &claim.obligation_id,
+                    ClaimState::Supported,
+                    EvidenceStrength::Observed,
+                    vec![ArtifactRef::new(ProofEvidenceKind::ContractCheck, "ext", "ok").unwrap()],
+                    Vec::new(),
+                )]))
+            }),
+        });
+        let mut registry = VerificationRegistry::new();
+        registry.register(provider);
+        let err = registry
+            .verify_claims(claim_batch_request(), vec![a, b])
+            .await
+            .expect_err("a provider that omits a required claim must refuse typed");
+        match err {
+            VerificationError::Malformed(detail) => assert!(detail.contains("po1:b"), "{detail}"),
+            other => panic!("expected typed Malformed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_declaring_a_batch_unavailable_yields_explicit_unknowns() {
+        let a = batch_claim(
+            "po1:a",
+            ProofEvidenceKind::ContractCheck,
+            EvidenceBinding::ContractIds(vec!["c1".into()]),
+            Requirement::Required,
+        );
+        let provider = Arc::new(FakeProvider::new(
+            "external",
+            false,
+            VerificationOutcome::Unavailable,
+        ));
+        let mut registry = VerificationRegistry::new();
+        registry.register(provider);
+        let results = registry
+            .verify_claims(claim_batch_request(), vec![a])
+            .await
+            .expect("an honestly unavailable batch is not an error");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].state, ClaimState::Unknown);
+        assert_eq!(results[0].evidence_strength, EvidenceStrength::None);
+        assert_eq!(results[0].provider.as_str(), "external");
+    }
+
+    #[tokio::test]
+    async fn a_claim_route_without_a_provider_or_with_unsolicited_claims_refuses_typed() {
+        let routed = batch_claim(
+            "po1:c",
+            ProofEvidenceKind::Review,
+            EvidenceBinding::ProviderClaim("po1:c".into()),
+            Requirement::Required,
+        );
+        // Capability negotiation: a native-only registry that serves Lint
+        // can never silently answer a VerifyClaim-routed claim.
+        let mut registry = VerificationRegistry::new();
+        let mut limited = FakeProvider::new("native", true, VerificationOutcome::Passed);
+        limited.ops = VerificationCapabilities::of(VerificationOp::Lint);
+        registry.register(Arc::new(limited));
+        let err = registry
+            .verify_claims(request(VerificationOp::VerifyClaim), vec![routed.clone()])
+            .await
+            .expect_err("no provider serves the routed op");
+        assert!(matches!(err, VerificationError::Unavailable(_)), "{err:?}");
+
+        // A provider answering a claim nobody asked about is refused.
+        let provider = Arc::new(BatchProvider {
+            id: "external",
+            native: false,
+            capability: VerificationCapabilities::of_many(&VerificationOp::ALL),
+            verdict: Box::new(|request: &VerificationRequest| {
+                Ok(VerificationResponse::new(
+                    VerificationProviderId::parse("external").unwrap(),
+                    request.op,
+                    VerificationOutcome::Passed,
+                )
+                .with_claims(vec![ClaimVerificationResult::unavailable_unknown(
+                    VerificationProviderId::parse("external").unwrap(),
+                    "po1:never-asked",
+                )]))
+            }),
+        });
+        let mut registry = VerificationRegistry::new();
+        registry.register(provider);
+        let err = registry
+            .verify_claims(request(VerificationOp::VerifyClaim), vec![routed])
+            .await
+            .expect_err("unsolicited claims must be refused");
+        assert!(matches!(err, VerificationError::Malformed(_)), "{err:?}");
     }
 }

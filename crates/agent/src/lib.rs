@@ -23,6 +23,7 @@ use faktor_verify::exec::{BudgetDecision, CheckOutcome, CheckRunStatus};
 pub mod activation;
 pub mod credits;
 pub mod loop_detect;
+pub mod outcome_ledger;
 pub mod runtime;
 pub mod semantic_tool;
 pub mod stall;
@@ -47,6 +48,12 @@ pub use faktor_core::state::{
 pub use faktor_session::VerificationRecord;
 pub use faktor_verify::Acceptance;
 pub use loop_detect::LoopDetector;
+pub use outcome_ledger::{
+    ChangedCodeScale, FinalVerificationBasis, LedgerAppend, OutcomeCursor, OutcomeLedger,
+    OutcomeLedgerError, OutcomeLedgerMetrics, OutcomeLedgerMetricsReport, OutcomeLedgerPage,
+    ProofCoverage, RunModelStep, RunOutcomeRecord, RunVerifiedSample, MAX_LEDGER_PAGE,
+    MAX_METRICS_RECORDS, OUTCOME_RECORD_SCHEMA_V,
+};
 pub use runtime::{
     review_model_identity_of, AgentCard, AgentDeps, AgentRuntime, ChunkEvent, ChunkSink,
     CompletionGate, EvidenceProvider, EvidenceQuery, IntegratedRootVerification, NoEvidence,

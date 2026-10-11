@@ -270,6 +270,55 @@ else
     echo "SKIPPED: node is unavailable; the capability-axes claims were not re-derived on this host" >&2
 fi
 
+# 7. Neutral provider boundaries (Faktor is standalone by definition): system
+#    intelligence and verification are consumed through the neutral
+#    `SystemIntelligenceProvider` / `VerificationProvider` interfaces, and
+#    Tangerine and Kiwi are OPTIONAL implementations of those interfaces —
+#    never required dependencies
+#    (docs/specs/autonomous-engineering.md). No NORMATIVE document (every
+#    docs/**.md that declares itself normative, plus README.md) may mandate
+#    either product unconditionally. Detection runs on the whitespace-
+#    normalized text so line wrapping cannot hide a mandate; only the
+#    unconditional-mandate phrasings are forbidden, so sanctioned opt-in
+#    wording ("may be configured", "a task or organization policy may
+#    explicitly require an external verifier") never matches.
+SPEC=docs/specs/autonomous-engineering.md
+if ! grep -q 'SystemIntelligenceProvider' "$SPEC"; then
+    echo "MISSING: $SPEC does not name the neutral SystemIntelligenceProvider interface" >&2
+    fail=1
+fi
+if ! grep -q 'VerificationProvider' "$SPEC"; then
+    echo "MISSING: $SPEC does not name the neutral VerificationProvider interface" >&2
+    fail=1
+fi
+
+NEUTRALITY_DOCS=(README.md)
+while IFS= read -r doc; do
+    [ "$doc" = "$SPEC" ] && continue
+    NEUTRALITY_DOCS+=("$doc")
+done < <(grep -rli 'normative' docs --include='*.md' 2>/dev/null | sort)
+NEUTRALITY_DOCS+=("$SPEC")
+
+UNCONDITIONAL_MANDATES=(
+    'must (query|consult|ask)[^.]{0,40}Tangerine'
+    'must (send|submit)[^.]{0,40}Kiwi'
+    'Kiwi must verify'
+    'Kiwi evidence'
+    'Kiwi [Vv]erification'
+    '(→|->)[[:space:]]*Kiwi'
+)
+for doc in "${NEUTRALITY_DOCS[@]}"; do
+    [ -f "$doc" ] || continue
+    for re in "${UNCONDITIONAL_MANDATES[@]}"; do
+        if normalized "$doc" | grep -Eqi "$re"; then
+            echo "MANDATE: $doc mandates Tangerine/Kiwi unconditionally (matched '$re'); Faktor is standalone and Tangerine/Kiwi are OPTIONAL implementations of neutral interfaces" >&2
+            echo "  exact line(s):" >&2
+            raw_lines "$doc" "$re" >&2
+            fail=1
+        fi
+    done
+done
+
 if [ "$fail" -ne 0 ]; then
     echo "$DOC / ${TRUTH_DOCS[*]} are out of sync with the code — fix the items listed above before merging." >&2
     exit 1
@@ -277,3 +326,4 @@ fi
 
 echo "docs/architecture.md is in sync: no stale identifiers, current API names present."
 echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, Faktor-owned UI, real apps/ panels, capability axes)."
+echo "normative docs + README.md are provider-neutral: no unconditional Tangerine/Kiwi mandate (neutral SystemIntelligenceProvider/VerificationProvider interfaces present)."

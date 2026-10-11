@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! The NATIVE verification provider: a real baseline over the existing
 //! verification machinery (`exec.rs`, `derive.rs`, `inventory.rs`).
 //!
@@ -27,9 +29,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use faktor_core::contract::ProofEvidenceKind;
+use faktor_core::contract::{ClaimState, ProofBasis, ProofEvidenceKind, ProofScope};
 use faktor_core::{SessionId, WorkspaceId};
 
+use crate::claims::{
+    evidence_binding_for_check, ClaimVerificationResult, EvidenceStrength, MAX_COUNTEREXAMPLES,
+};
 use crate::derive::{
     component_id, derive_checks, detect_project_profile, BuildSystem, ProjectProfile,
 };
@@ -315,6 +320,16 @@ impl NativeVerificationProvider {
             }
         }
 
+        // Claim batch (the completion spine): answer EVERY claim with an
+        // explicit per-claim verdict derived from the claim-bound checks this
+        // op executed — never a silent omission, never a fabricated verdict.
+        if !request.claims.is_empty() {
+            return finish(
+                &request,
+                aggregate_claims(&request, started, &specs, &executed),
+            );
+        }
+
         finish(&request, aggregate(&request, started, &executed))
     }
 }
@@ -407,6 +422,141 @@ fn lint_specs(profile: &ProjectProfile, selection: &[PathBuf]) -> Vec<CheckSpec>
         });
     }
     specs
+}
+
+/// One claim-bound native verdict derived from the checks this op executed.
+/// Matching is structural: the claim's evidence kind must equal the check's
+/// taxonomy kind and the claim's binding must intersect the check's binding
+/// (its id, plus its test selectors). Unmatched or unavailable checks are an
+/// explicit `Unknown`, never a fabricated verdict.
+fn adjudicate_claim(
+    claim: &crate::claims::ClaimRequest,
+    request: &VerificationRequest,
+    specs: &[CheckSpec],
+    executed: &[ExecutedCheck],
+) -> ClaimVerificationResult {
+    let mut evidence: Vec<ArtifactRef> = Vec::new();
+    let mut counterexamples: Vec<String> = Vec::new();
+    let mut saw_pass = false;
+    let mut saw_fail = false;
+    for spec in specs {
+        let Some(run) = executed.iter().find(|run| run.id == spec.id) else {
+            continue;
+        };
+        if evidence_kind(spec.kind) != claim.evidence_kind {
+            continue;
+        }
+        let program = spec.program.to_string_lossy();
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let bindings =
+            evidence_binding_for_check(&spec.id, &program, &args, spec.kind == CheckKind::Test);
+        let matched = !claim.binding.is_bound()
+            || bindings
+                .iter()
+                .any(|binding| claim.binding.intersects(binding));
+        if !matched {
+            continue;
+        }
+        match run.status {
+            CheckRunStatus::Passed => saw_pass = true,
+            CheckRunStatus::Failed => {
+                saw_fail = true;
+                if counterexamples.len() < MAX_COUNTEREXAMPLES {
+                    let detail = run.detail.as_deref().unwrap_or("check failed");
+                    counterexamples.push(tail_bytes(detail, EVIDENCE_DETAIL_BYTES));
+                }
+            }
+            CheckRunStatus::Unavailable => continue,
+        }
+        let detail = run
+            .detail
+            .as_deref()
+            .map(|detail| tail_bytes(detail, EVIDENCE_DETAIL_BYTES))
+            .unwrap_or_else(|| match run.status {
+                CheckRunStatus::Passed => "passed".to_string(),
+                CheckRunStatus::Failed => "failed".to_string(),
+                CheckRunStatus::Unavailable => "unavailable".to_string(),
+            });
+        evidence.push(ArtifactRef {
+            kind: evidence_kind(spec.kind),
+            source: run.id.clone(),
+            detail,
+        });
+    }
+    let (state, strength) = if saw_fail {
+        (ClaimState::Disproven, EvidenceStrength::Observed)
+    } else if saw_pass {
+        (ClaimState::Supported, EvidenceStrength::Observed)
+    } else {
+        (ClaimState::Unknown, EvidenceStrength::None)
+    };
+    let mut result = ClaimVerificationResult::verdict(
+        VerificationProviderId::native(),
+        claim.obligation_id.clone(),
+        state,
+        strength,
+        evidence,
+        counterexamples,
+    );
+    result.basis = ProofBasis {
+        subject: request.subject_snapshot.clone(),
+        scope: ProofScope::SnapshotBound,
+    };
+    if let Some(snapshot) = &request.subject_snapshot {
+        result.subject_snapshot = Some(snapshot.clone());
+    }
+    result
+}
+
+/// Aggregate the per-claim verdicts of a claim batch: one result per claim,
+/// `Failed` when any claim is disproven, `Passed` only when every claim is
+/// adjudicated, `Unavailable` otherwise (honest partial — the explicit
+/// per-claim states still ride the response).
+fn aggregate_claims(
+    request: &VerificationRequest,
+    started: Instant,
+    specs: &[CheckSpec],
+    executed: &[ExecutedCheck],
+) -> VerificationResponse {
+    let claims: Vec<ClaimVerificationResult> = request
+        .claims
+        .iter()
+        .map(|claim| adjudicate_claim(claim, request, specs, executed))
+        .collect();
+    let disproven = claims.iter().filter(|c| c.state.is_disproven()).count();
+    let adjudicated = claims
+        .iter()
+        .filter(|c| c.state != ClaimState::Unknown)
+        .count();
+    let outcome = if disproven > 0 {
+        VerificationOutcome::Failed
+    } else if adjudicated == claims.len() {
+        VerificationOutcome::Passed
+    } else {
+        VerificationOutcome::Unavailable
+    };
+    let summary = format!(
+        "native {} claim batch: {} claim(s): {} adjudicated, {} disproven, {} explicitly unknown",
+        request.op.as_str(),
+        claims.len(),
+        adjudicated,
+        disproven,
+        claims.len() - adjudicated
+    );
+    let mut response =
+        VerificationResponse::new(VerificationProviderId::native(), request.op, outcome)
+            .with_summary(summary)
+            .with_claims(claims)
+            .with_duration_ms(started.elapsed().as_millis() as u64);
+    response.summary = tail_bytes(
+        &response.summary,
+        MAX_SUMMARY_BYTES.min(request.max_output_bytes),
+    );
+    response
 }
 
 /// Aggregate executed checks into the bounded response.
@@ -834,5 +984,65 @@ mod tests {
             "{response:?}"
         );
         assert!(response.summary.contains("derived no build checks"));
+    }
+
+    #[tokio::test]
+    async fn native_claim_batch_is_answered_per_claim_never_omitted() {
+        use crate::claims::ClaimRequest;
+        use faktor_core::contract::{AcceptedStrength, EvidenceBinding, Requirement};
+
+        let claim = |id: &str, check_id: &str| ClaimRequest {
+            obligation_id: id.to_string(),
+            claim: format!("claim {id}"),
+            evidence_kind: ProofEvidenceKind::Compile,
+            requirement: Requirement::Required,
+            binding: EvidenceBinding::CheckIds(vec![check_id.to_string()]),
+            accepted_strength: AcceptedStrength::Supported,
+        };
+        let dir = cargo_fixture("verify_native_claims", "pub fn f() {}\n");
+        let ok_provider = provider(dir.path());
+        let batch = request(VerificationOp::Build).with_claims(vec![
+            claim("po1:builds", "rust_check"),
+            claim("po1:unrelated", "check_that_never_ran"),
+        ]);
+        let response = ok_provider.verify(batch).await.expect("claim batch");
+        // One explicit result per claim; the batch is honestly Unavailable
+        // overall because one claim could not be adjudicated.
+        assert_eq!(
+            response.outcome,
+            VerificationOutcome::Unavailable,
+            "{response:?}"
+        );
+        assert_eq!(response.claims.len(), 2, "{:?}", response.claims);
+        let builds = response
+            .claims
+            .iter()
+            .find(|claim| claim.obligation_id == "po1:builds")
+            .unwrap();
+        assert_eq!(builds.state, ClaimState::Supported);
+        assert!(builds.evidence.iter().any(|e| e.source == "rust_check"));
+        let unrelated = response
+            .claims
+            .iter()
+            .find(|claim| claim.obligation_id == "po1:unrelated")
+            .unwrap();
+        assert_eq!(unrelated.state, ClaimState::Unknown);
+        assert!(unrelated.evidence.is_empty());
+        assert_eq!(unrelated.evidence_strength, EvidenceStrength::None);
+
+        // The broken fixture disproves the same claim with a bounded
+        // counterexample.
+        let broken = cargo_fixture("verify_native_claims_bad", "pub fn f() -> i32 { nope }\n");
+        let broken_provider = provider(broken.path());
+        let batch =
+            request(VerificationOp::Build).with_claims(vec![claim("po1:builds", "rust_check")]);
+        let response = broken_provider.verify(batch).await.expect("claim batch");
+        assert_eq!(response.outcome, VerificationOutcome::Failed);
+        assert_eq!(response.claims[0].state, ClaimState::Disproven);
+        assert_eq!(
+            response.claims[0].evidence_strength,
+            EvidenceStrength::Observed
+        );
+        assert!(!response.claims[0].counterexample.is_empty());
     }
 }

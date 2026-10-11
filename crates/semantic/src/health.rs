@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Bounded per-provider health for capability-driven failover
 //! (audit 48-54/58/59).
 //!

@@ -1,11 +1,11 @@
 {
   "id": "INV-KIWI-OPTIONAL-ADAPTER",
   "file": "crates/kiwi/src/client.rs",
-  "find": "    fn capabilities(&self) -> VerificationCapabilities {\n        VerificationCapabilities::ALL\n    }",
-  "replace": "    fn capabilities(&self) -> VerificationCapabilities {\n        VerificationCapabilities::NONE\n    }",
-  "gate": "cargo test -p faktor-kiwi --test loopback require_provider_dispatch_reaches_the_configured_kiwi",
+  "find": "        let capabilities = VerificationCapabilities::of_many(&operations);",
+  "replace": "        let capabilities = VerificationCapabilities::of_many(&VerificationOp::ALL);",
+  "gate": "cargo test -p faktor-kiwi --test loopback operations_outside_the_negotiated_subset_are_refused_typed",
   "expect": "FAILED",
-  "note": "An optional Kiwi adapter that declares no capabilities can never be selected for a require_provider claim, so the registry must refuse rather than silently substitute the native baseline.",
+  "note": "Capability truth is the NEGOTIATED subset (explicit config or the conservative default), never a blanket claim: an adapter that over-claims the whole operation vocabulary must fail the negotiation test before any request is framed.",
   "capabilities": [
     "kiwi.optional-provider"
   ]

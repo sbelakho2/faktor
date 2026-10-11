@@ -1036,7 +1036,7 @@
    "capabilities": [
     {
      "id": "kiwi.optional-provider",
-     "unit": "require_provider_dispatch_reaches_the_configured_kiwi",
+     "unit": "operations_outside_the_negotiated_subset_are_refused_typed",
      "mutation": "INV-KIWI-OPTIONAL-ADAPTER"
     }
    ]
@@ -1301,6 +1301,11 @@
    "class": "delegated",
    "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
    "reason": "native.get.native.orgs.id.members is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
+  },
+  "native.get.native.outcomes": {
+   "class": "delegated",
+   "delegate": "INV-NATIVE-ROUTE-BEHAVIOR",
+   "reason": "native.get.native.outcomes is discovered on a real native surface; every method the production router sources register is exercised over a served socket by INV-NATIVE-ROUTE-BEHAVIOR (unauthenticated refusal, chained methods included)."
   },
   "native.get.native.permissions": {
    "class": "delegated",

@@ -276,7 +276,7 @@ pub(crate) fn billing_usage(
         Some(l) if l as usize > MAX_BILLING_PAGE => {
             return wire_status(malformed_body(&format!(
                 "limit {l} exceeds the billing page bound {MAX_BILLING_PAGE}"
-            )))
+            )));
         }
         Some(l) => l as usize,
     };
@@ -393,7 +393,7 @@ pub(crate) async fn native_credits_grant(
                             message: "billing account not found".into(),
                             http_status: 404,
                             retryable: false,
-                        })
+                        });
                     }
                     Err(e) => return wire_status(e),
                 }
@@ -411,7 +411,7 @@ pub(crate) async fn native_credits_grant(
                     message: "the organization has no billing account".into(),
                     http_status: 404,
                     retryable: false,
-                })
+                });
             }
             Err(e) => return wire_status(e),
         },

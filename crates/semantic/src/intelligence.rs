@@ -1,3 +1,5 @@
+//! @authority-collapse: authority-bearing
+//!
 //! Intelligence-tier model (`docs/specs/autonomous-engineering.md`).
 //!
 //! Faktor is STANDALONE: it always knows which intelligence tier is

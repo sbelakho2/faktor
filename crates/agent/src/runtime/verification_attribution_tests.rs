@@ -457,8 +457,7 @@ async fn completion_proof_spec_sections_map_to_code_paths() {
     // ---- 4. Rule 3: test weakening/deletion without justification
     // fails review ----
     spec_probe!("Rule 3", {
-        let hollow =
-                "describe(\"x\", () => {\n    it(\"adds\", () => {\n        const got = calc.add(1, 2);\n    });\n});\n";
+        let hollow = "describe(\"x\", () => {\n    it(\"adds\", () => {\n        const got = calc.add(1, 2);\n    });\n});\n";
         let evidence = review_signals(
             &["tests/calc_spec.js".to_string()],
             &[("tests/calc_spec.js".to_string(), hollow.to_string())],
@@ -707,8 +706,8 @@ async fn completion_proof_spec_sections_map_to_code_paths() {
         ] {
             if src.contains(&gone) {
                 return Err(format!(
-                        "legacy cap anchor {gone:?} must NOT be present in the runtime verification path"
-                    ));
+                    "legacy cap anchor {gone:?} must NOT be present in the runtime verification path"
+                ));
             }
         }
         if !SPEC.contains("supervisor-backed runner") {
@@ -955,9 +954,9 @@ async fn verification_runs_in_the_session_root_never_the_daemon_cwd() {
     assert_eq!(gradle_row.exit, Some(0));
     let summary = gradle_row.summary.as_deref().unwrap_or_default();
     assert!(
-            summary.contains(&marker_text),
-            "the check's captured output must name the session root it ran in: {summary:?} vs {marker_text:?}"
-        );
+        summary.contains(&marker_text),
+        "the check's captured output must name the session root it ran in: {summary:?} vs {marker_text:?}"
+    );
     assert!(
         gradle_row
             .finished_ms
@@ -1331,10 +1330,10 @@ async fn task_row_reaches_verified_complete_and_mirrors_gate_rows() {
     );
     let criteria_text = criteria_canonical_text(&t.acceptance_criteria);
     assert!(
-            criteria_text.contains("required check: cargo check")
-                && !criteria_text.contains("goal: gating task"),
-            "the canonical typed criteria row carries the derived check entries (never an automatic goal obligation): {criteria_text}"
-        );
+        criteria_text.contains("required check: cargo check")
+            && !criteria_text.contains("goal: gating task"),
+        "the canonical typed criteria row carries the derived check entries (never an automatic goal obligation): {criteria_text}"
+    );
     assert_eq!(
         criteria_fact(&handle).as_deref(),
         Some(criteria_text.as_str())
@@ -1389,11 +1388,11 @@ async fn task_row_reaches_verified_complete_and_mirrors_gate_rows() {
         "the goal stays stable across gates"
     );
     assert_eq!(
-            tasks[0].plan.len(),
-            1,
-            "the terminal row's plan is FROZEN at the certified steps: the second step lives in the ledger, never on the frozen row: {:?}",
-            tasks[0].plan
-        );
+        tasks[0].plan.len(),
+        1,
+        "the terminal row's plan is FROZEN at the certified steps: the second step lives in the ledger, never on the frozen row: {:?}",
+        tasks[0].plan
+    );
     assert_eq!(
         tasks[0].plan[0], first_step,
         "steps are never evicted or rewritten"
@@ -1483,10 +1482,10 @@ async fn review_block_never_claims_completion_and_lands_no_linked_record() {
         "the machine lands Blocked (Running -> Blocked) for a review-blocked claim"
     );
     assert_eq!(
-            h.list_verification_records(task_id).unwrap().len(),
-            0,
-            "a blocked gate links NO completion proof: records only exist for attempts that certify or fail verification"
-        );
+        h.list_verification_records(task_id).unwrap().len(),
+        0,
+        "a blocked gate links NO completion proof: records only exist for attempts that certify or fail verification"
+    );
     let facts = h.memory_facts().unwrap();
     assert!(
         facts
@@ -1571,10 +1570,10 @@ async fn task_row_records_failed_verification_as_retryable_needs_verification() 
     let tasks = handle.list_tasks().unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(
-            tasks[0].state,
-            TaskState::NeedsVerification,
-            "the row carries the retryable machine state, never the terminal Failed a patch used to write"
-        );
+        tasks[0].state,
+        TaskState::NeedsVerification,
+        "the row carries the retryable machine state, never the terminal Failed a patch used to write"
+    );
     let records = handle.list_verification_records(tasks[0].task_id).unwrap();
     assert_eq!(
         records.len(),
@@ -1683,11 +1682,11 @@ async fn spend_over_budget_and_review_block_precedence_is_identical_after_restar
                     "review precedence: {reasons:?}"
                 );
             assert!(
-                    !reasons
-                        .iter()
-                        .any(|r| r.code == ReasonCode::SpendOverBudget),
-                    "the budget refusal only downgrades a PASSING gate; the review already blocks: {reasons:?}"
-                );
+                !reasons
+                    .iter()
+                    .any(|r| r.code == ReasonCode::SpendOverBudget),
+                "the budget refusal only downgrades a PASSING gate; the review already blocks: {reasons:?}"
+            );
             reasons.iter().map(|r| r.code).collect()
         }
         other => panic!("review block must gate, got {other:?}"),
@@ -1935,10 +1934,10 @@ async fn crash_between_durable_criteria_and_gate_write_converges_after_restart()
     let tasks = h3.list_tasks().unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(
-            tasks[0].state,
-            TaskState::VerifiedComplete,
-            "turn 1's certification is TERMINAL under audit P0-7: the later Failed gates land on the facts + records, never on the frozen row (the old patch rewrote the row to Failed and back; the machine freezes it at VerifiedComplete)"
-        );
+        tasks[0].state,
+        TaskState::VerifiedComplete,
+        "turn 1's certification is TERMINAL under audit P0-7: the later Failed gates land on the facts + records, never on the frozen row (the old patch rewrote the row to Failed and back; the machine freezes it at VerifiedComplete)"
+    );
     assert!(
         tasks[0]
             .acceptance_criteria
@@ -2771,9 +2770,9 @@ fn review_model_identity_extraction_is_honest_about_absence() {
 #[tokio::test]
 async fn integrated_root_exposes_the_actual_review_model_identity() {
     let (manager, session, cas, snapshots, dir) = snapshot_review_env(&[(
-            "src/security.rs",
-            "pub fn authenticate(user: u32, secret: u32) -> u32 {\n    user.checked_add(secret).unwrap_or(0)\n}\n",
-        )]);
+        "src/security.rs",
+        "pub fn authenticate(user: u32, secret: u32) -> u32 {\n    user.checked_add(secret).unwrap_or(0)\n}\n",
+    )]);
     let (routing, review_calls) = PhasePinnedRouting::review_to("reviewmock", "rev");
     let (deps, _d) = snapshot_review_deps(
         &manager,
@@ -3008,9 +3007,9 @@ async fn review_model_request_is_isolated_and_carries_the_diff_package() {
         "{rendered:?}"
     );
     assert!(
-            !rendered.contains("goal: gating task"),
-            "the review package carries the typed criteria, not an automatic goal obligation: {rendered:?}"
-        );
+        !rendered.contains("goal: gating task"),
+        "the review package carries the typed criteria, not an automatic goal obligation: {rendered:?}"
+    );
     // ... and NO implementation context does (the marker rode the drive
     // transcript of THIS very turn).
     assert!(
@@ -3108,12 +3107,10 @@ async fn ci_workflow_change_rides_the_package_and_triggers_independent_review() 
     // P0-12 row 3 + (f): a CI workflow change appears in
     // ci_build_files_changed and the inventory's ci_workflow_changes,
     // and classifies the change risky (independent review runs).
-    let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[
-            (
-                ".github/workflows/ci.yml",
-                "name: ci\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
-            ),
-        ]);
+    let (manager, session, cas, snapshots, _dir) = snapshot_review_env(&[(
+        ".github/workflows/ci.yml",
+        "name: ci\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+    )]);
     let script = vec![
         ScriptedResponse::ToolCall {
             id: "c1".into(),

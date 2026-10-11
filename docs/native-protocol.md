@@ -290,6 +290,21 @@ The create-session contract validates BOTH the provider and the model against th
   pretending to be exact. With `?org=` the route serves the org-isolated
   Wave 3 billing fold (`since` and `limit` are its strict query
   parameters; unknown query keys are a 400).
+- `GET /native/outcomes` — the Engineering Outcome Ledger (economic audit
+  item 7): the durable completed-run metrics aggregate plus one bounded
+  newest-first page of run records. `metrics` carries the ten first-class
+  metrics (`verifiedCostPerChangeMicro`, `verifiedFirstPassPpm`,
+  `reworkCostRatioPpm`, `localSubstitutionPpm`,
+  `avoidedHostedInferenceMicro`, `meanTimeToVerifiedChangeMs`,
+  `humanInterventionPpm`, `regressionRollbackPpm`, `proofCoveragePpm`,
+  `frontierEscalationPpm`) plus their exact totals and the fold's scan
+  honesty (`scanned`/`truncated`); `runs` is a page of the ledger rows
+  with the full record shape; `nextCursor` is the composite
+  `{completedAtMs, runId}` continuation. Query (strict DTO): `limit`
+  (1..=200, oversized rejected), `before_ms` + `before_run` given
+  together. Money fields are decimal strings (`*Micro`); rates are
+  integer ppm. A corrupt or payload/projection-drifted ledger row is a
+  typed 500, never a fabricated metric. See `docs/outcome-ledger.md`.
 - `GET /native/session/{id}/turns` — the session's durable turn records,
   newest first: `[{opId, status, provider, model, variant?, toolMode?,
   startedAt, updatedMs, queueSeq?, promptMessageId?}]` (`status` =

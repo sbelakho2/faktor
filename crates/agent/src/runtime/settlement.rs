@@ -142,6 +142,12 @@ pub(crate) const DW_SITE_GATE_DOWNGRADE_FACT: &str = "finish_logical_turn.downgr
 pub(crate) const DW_SITE_GATE_DOWNGRADE_DECISION: &str =
     "finish_logical_turn.downgrade_refusal_decision";
 
+pub(crate) const DW_SITE_CONTRACT_REPLAN_DECISION: &str =
+    "run_turn_verification.contract_replan_decision";
+
+pub(crate) const DW_SITE_CONTRACT_UNRESOLVED_DECISION: &str =
+    "run_turn_verification.contract_unresolved_decision";
+
 pub(crate) const DW_SITE_JOB_RESOLVE_CORRUPT: &str = "execute_attempt_jobs.resolve_corrupt_spec";
 
 pub(crate) const DW_SITE_JOB_RESOLVE: &str = "execute_attempt_jobs.resolve_job";
@@ -692,7 +698,7 @@ impl AgentRuntime {
                     handle,
                     &[],
                     &format!("session row unresolvable: {e}"),
-                )
+                );
             }
         };
         let root = match self.deps.session.resolve_workspace_root(handle.id()) {
@@ -702,7 +708,7 @@ impl AgentRuntime {
                     handle,
                     &[],
                     "session workspace root unresolvable; background jobs stay open",
-                )
+                );
             }
         };
 
@@ -713,7 +719,7 @@ impl AgentRuntime {
                     handle,
                     &[],
                     "workspace could not be opened; background jobs stay open",
-                )
+                );
             }
         };
         let task_id = row.task_id;
@@ -732,14 +738,14 @@ impl AgentRuntime {
                     &[],
                     "open verification jobs have no attempt record (crash residue); \
                      recovery resolved them; nothing to settle",
-                )
+                );
             }
             Err(e) => {
                 return self.verification_pending_verdict(
                     handle,
                     &[],
                     &format!("verification attempt read failed: {e}"),
-                )
+                );
             }
         };
         let base_ctx = faktor_verify::exec::VerificationContext {
@@ -763,7 +769,7 @@ impl AgentRuntime {
                     handle,
                     &[],
                     &format!("job rows unreadable after settlement: {e}"),
-                )
+                );
             }
         };
         if rows.iter().any(|j| j.state.is_open()) {
@@ -901,13 +907,52 @@ impl AgentRuntime {
                 }
             }
         };
-        // Engineering contract (autonomous-engineering spec): the background
-        // settlement path evaluates the same durable proof obligations from
-        // the attempt's executed checks (no review value exists on this
-        // path, so Review obligations keep their prior state).
-        let contract_outcome =
-            crate::runtime::contract_eval::evaluate_and_persist_contract(handle, &executed, None)
-                .await;
+        // Engineering contract (autonomous-engineering spec + audit items
+        // 2-4): the background settlement path evaluates the same durable
+        // proof obligations from the attempt's executed checks at the
+        // attempt's candidate snapshot (no review value exists on this path,
+        // so Review obligations keep their prior state).
+        let candidate_snapshot =
+            root_snapshot_best_effort(&ws).map(faktor_core::SubjectSnapshot::new);
+        // The completion spine (audit item 6): unresolved contract claims are
+        // dispatched through the installed neutral verification registry
+        // under the attempt's operation identity (background settlement path).
+        let verification_registry = self.verification_registry();
+        let provider_dispatch = verification_registry.as_ref().map(|registry| {
+            crate::runtime::contract_eval::ContractProviderDispatch {
+                registry: registry.as_ref(),
+                op_id: faktor_core::OpId::new(attempt.op_id),
+                cancellation: cancel.clone(),
+            }
+        });
+        let contract_outcome = crate::runtime::contract_eval::evaluate_and_persist_contract(
+            handle,
+            &executed,
+            None,
+            candidate_snapshot.as_ref(),
+            provider_dispatch.as_ref(),
+        )
+        .await;
+        if let Some(detail) = crate::runtime::contract_eval::replan_detail(&contract_outcome) {
+            self.dw_note_ledger_decision(
+                handle,
+                "replan",
+                "counterexample invalidates the assumption; re-open the work",
+                &detail,
+                DW_SITE_CONTRACT_REPLAN_DECISION,
+            );
+        }
+        if let Some(detail) =
+            crate::runtime::contract_eval::needs_verification_detail(&contract_outcome)
+        {
+            self.dw_note_ledger_decision(
+                handle,
+                "completion gate",
+                "refuse VerifiedComplete",
+                &detail,
+                DW_SITE_CONTRACT_UNRESOLVED_DECISION,
+            );
+        }
         completion =
             crate::runtime::contract_eval::apply_contract_outcome(completion, contract_outcome);
         self.persist_gate_facts(
@@ -1109,21 +1154,26 @@ impl AgentRuntime {
                 // caps — an existing row is NEVER re-created here.
                 let task_id = handle.task_id()?;
                 let now = handle.now_ms();
-                return handle
-                    .create_task(Task {
-                        task_id,
-                        session_id: handle.id(),
-                        goal: ledger.goal.clone(),
-                        acceptance_criteria: Vec::new(),
-                        plan: Vec::new(),
-                        attachments: Vec::new(),
-                        contract: Default::default(),
-                        budget: Default::default(),
-                        state: faktor_core::state::TaskState::Pending,
-                        created_ms: now,
-                        updated_ms: now,
-                    })
-                    .map(|_| ());
+                let created = handle.create_task(Task {
+                    task_id,
+                    session_id: handle.id(),
+                    goal: ledger.goal.clone(),
+                    acceptance_criteria: Vec::new(),
+                    plan: Vec::new(),
+                    attachments: Vec::new(),
+                    contract: Default::default(),
+                    budget: Default::default(),
+                    state: faktor_core::state::TaskState::Pending,
+                    created_ms: now,
+                    updated_ms: now,
+                })?;
+                // Native baseline engineering contract (audit item 5) on
+                // the row-creation path too: a fresh row compiles from the
+                // goal + bounded repository state before the first turn.
+                if created.contract.is_empty() && !created.state.is_terminal() {
+                    self.compile_baseline_contract(handle, &created);
+                }
+                return Ok(());
             }
         };
         // Heal spend from durable sources (a crash between a provider call
@@ -1144,6 +1194,14 @@ impl AgentRuntime {
         let healed = handle
             .update_task(task.task_id, patch)
             .unwrap_or(task.clone());
+        // Native baseline engineering contract (audit item 5): a row that
+        // still carries NO contract gets one compiled from the goal + bounded
+        // repository state, durably merged (union by deterministic id, so a
+        // replay is a no-op). Best-effort by contract: every failure is
+        // logged and retried on the next drive; it never fails the turn.
+        if healed.contract.is_empty() && !healed.state.is_terminal() {
+            self.compile_baseline_contract(handle, &healed);
+        }
         let state_str = serde_json::to_value(healed.state)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
