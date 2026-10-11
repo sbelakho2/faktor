@@ -1185,15 +1185,31 @@ async fn large_tool_output_is_archived_through_the_durable_evidence_store() {
             }
         },
     ));
-    let (mut deps, _dir) = deps_with(inspected, vec![tool]);
+    let (mut deps, dir) = deps_with(inspected, vec![tool]);
     // The CCR flag is the documented switch for routing large outputs
     // through the evidence store.
     deps.efficiency = EfficiencyFlags {
         ccr: true,
         ..Default::default()
     };
+    // HERMETIC workspace root: the shared `new_session` fixture anchors the
+    // session at the SYSTEM temp dir, where parallel tests (and any other
+    // process on a loaded CI host) leave files that the retrieval ladder
+    // would archive into this session's evidence scope — observed as
+    // "envelopes 5 != 1" under CI load. The evidence math is unchanged; the
+    // test just owns all the bytes it can see.
+    let workspace_root = dir.path().join("repo");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let ws = deps
+        .session
+        .create_workspace(workspace_root.to_str().unwrap())
+        .unwrap();
+    let session = deps
+        .session
+        .create_session(ws, "test session", "fake", "m")
+        .unwrap()
+        .id();
     let runtime = AgentRuntime::new(deps).unwrap();
-    let session = new_session(runtime.deps());
     let handle = runtime.deps.session.get_session(session).unwrap().unwrap();
     let task_id = handle.task_id().unwrap();
     runtime
@@ -1211,15 +1227,45 @@ async fn large_tool_output_is_archived_through_the_durable_evidence_store() {
         .evidence_authority()
         .list_scoped_envelopes(&ctx, 16)
         .unwrap();
-    assert_eq!(envelopes.len(), 1, "one archived evidence envelope");
-    assert_eq!(envelopes[0].kind, EvidenceKind::ProcessLog);
+    // Exactly ONE envelope archives THIS tool output. Under load the scope
+    // may additionally carry typed degradation diagnostics (an evidence-poll
+    // status when the off-turn bridge degrades): those are explicit
+    // GenericText `evidence-poll:` rows — never a second copy of the raw
+    // output, so the one-envelope teeth are preserved.
+    let tool_envelopes: Vec<_> = envelopes
+        .iter()
+        .filter(|env| env.kind == EvidenceKind::ProcessLog)
+        .collect();
+    assert_eq!(
+        tool_envelopes.len(),
+        1,
+        "one archived evidence envelope: {envelopes:?}"
+    );
+    for other in envelopes
+        .iter()
+        .filter(|env| env.kind != EvidenceKind::ProcessLog)
+    {
+        assert_eq!(
+            other.kind,
+            EvidenceKind::GenericText,
+            "unexpected evidence kind in scope: {other:?}"
+        );
+        assert!(
+            other
+                .source_revision
+                .as_deref()
+                .is_some_and(|revision| revision.starts_with("evidence-poll:")),
+            "only typed poll diagnostics may share the scope: {other:?}"
+        );
+    }
+    let envelope = tool_envelopes[0];
     assert!(
-        envelopes[0].compact.body.len() < big.len(),
+        envelope.compact.body.len() < big.len(),
         "the compact body must be bounded below the raw output"
     );
     let stored = runtime
         .evidence_authority()
-        .get_scoped(envelopes[0].id, &ctx)
+        .get_scoped(envelope.id, &ctx)
         .unwrap();
     assert_eq!(
         stored.backing.as_deref(),

@@ -926,6 +926,77 @@ mod bounded_evidence_executor_tests {
         }
     }
 
+    /// Bounded observable-condition wait: drive retirement passes until the
+    /// executor's stats satisfy `cond` (or fail loudly with the last
+    /// snapshot). Replaces fixed sleeps: on a loaded host a transition can
+    /// take arbitrary wall time, but the transition itself is observable and
+    /// monotone, so waiting for it keeps every assertion's teeth without
+    /// depending on a scheduler window.
+    async fn maintain_until(
+        executor: &Arc<EvidenceExecutor>,
+        what: &str,
+        cond: impl Fn(&EvidenceExecutorStats) -> bool,
+    ) -> EvidenceExecutorStats {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            executor.maintain();
+            let stats = executor.stats();
+            if cond(&stats) {
+                return stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Wedge ONE worker with a synchronously blocking provider and return
+    /// only once the provider was actually ENTERED (the gate counter grew).
+    /// A loaded worker may dequeue the job only after the caller's budget
+    /// fired, in which case the cancelled job is skipped cooperatively and
+    /// the worker stays healthy; the next poll wedges it. The poll that
+    /// wedges always returns the typed timeout.
+    async fn wedge_worker(
+        executor: &Arc<EvidenceExecutor>,
+        gate: &Arc<BlockGate>,
+        budget: Duration,
+    ) -> EvidencePollOutcome {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let entered_before = gate.entered();
+            let outcome = poll_on_executor(
+                executor.clone(),
+                Arc::new(GatedBlockingProvider { gate: gate.clone() }),
+                session(),
+                query(),
+                budget,
+            )
+            .await;
+            // A worker that dequeued the job at the cancellation boundary
+            // may still enter the provider right after the poll returned:
+            // a short grace window observes that (the gate stays blocked,
+            // so the wedged worker never returns early).
+            let grace = Instant::now() + Duration::from_millis(200);
+            while gate.entered() == entered_before && Instant::now() < grace {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            if gate.entered() > entered_before {
+                assert!(
+                    matches!(outcome.status, EvidencePollStatus::TimedOut { .. }),
+                    "a wedging poll must time out typed: {:?}",
+                    outcome.status
+                );
+                return outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "could not wedge an evidence worker (the provider was never entered)"
+            );
+        }
+    }
+
     /// P1: a stuck provider is quarantined after the hard retirement
     /// deadline, its physical thread is abandoned after the grace and its
     /// logical slot is REPLACED — evidence stays available AT the absolute
@@ -934,6 +1005,10 @@ mod bounded_evidence_executor_tests {
     /// abandonment the exhausted budget refuses. The physical thread count
     /// never exceeds `workers + cap`, and a released provider drains the
     /// abandoned threads so capacity recovers.
+    ///
+    /// All waits are observable-condition waits (quarantine/abandon/serve
+    /// transitions driven by `maintain`), never fixed sleeps: the CI load
+    /// failures came from asserting transient snapshots at fixed offsets.
     #[tokio::test]
     async fn stuck_workers_are_quarantined_replaced_and_capped_by_the_circuit() {
         let _guard = HEAVY_TESTS.lock().await;
@@ -960,48 +1035,38 @@ mod bounded_evidence_executor_tests {
 
         // Wedge both workers with providers that block their OS thread.
         for _ in 0..2 {
-            let outcome = poll_on_executor(
-                executor.clone(),
-                Arc::new(GatedBlockingProvider { gate: gate.clone() }),
-                session(),
-                query(),
-                Duration::from_millis(20),
-            )
-            .await;
-            assert!(
-                matches!(outcome.status, EvidencePollStatus::TimedOut { .. }),
-                "a synchronously blocked poll times out typed: {:?}",
-                outcome.status
-            );
+            wedge_worker(&executor, &gate, Duration::from_millis(20)).await;
         }
         assert_eq!(gate.entered(), 2, "both workers reached the provider");
 
-        // Hard retirement deadline exceeded -> QUARANTINED (no early
-        // abandonment: the grace has not expired).
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        executor.maintain();
-        let stats = executor.stats();
-        assert_eq!(stats.workers_quarantined, 2, "{stats:?}");
-        assert_eq!(stats.workers_healthy, 0, "{stats:?}");
+        // Hard retirement deadline exceeded -> QUARANTINED. Wait for the
+        // FIRST observable quarantine and prove it did not come with an
+        // early abandonment: the grace clock starts when the quarantine is
+        // recorded, so the pass that first quarantines can never abandon.
+        let first = maintain_until(&executor, "the first quarantine", |stats| {
+            stats.workers_quarantined >= 1
+        })
+        .await;
         assert_eq!(
-            stats.runtime_abandoned, 0,
-            "quarantine never abandons early: {stats:?}"
+            first.runtime_abandoned, 0,
+            "quarantine never abandons early: {first:?}"
         );
-        assert_eq!(stats.circuit, EvidenceCircuitState::Closed, "{stats:?}");
+        assert_eq!(first.circuit, EvidenceCircuitState::Closed, "{first:?}");
 
         // Grace expiry -> the blocked physical threads are ABANDONED and
         // their logical slots replaced: evidence stays available.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        executor.maintain();
-        let stats = executor.stats();
-        assert_eq!(
-            stats.runtime_abandoned, 2,
-            "one abandoned physical thread per wedged worker: {stats:?}"
-        );
+        let stats = maintain_until(
+            &executor,
+            "two abandoned workers with two healthy replacements",
+            |stats| {
+                stats.runtime_abandoned == 2
+                    && stats.workers == 2
+                    && stats.workers_quarantined == 0
+                    && stats.workers_healthy == 2
+            },
+        )
+        .await;
         assert_eq!(stats.runtime_abandoned_total, 2, "{stats:?}");
-        assert_eq!(stats.workers, 2, "replacement logical slots: {stats:?}");
-        assert_eq!(stats.workers_healthy, 2, "{stats:?}");
-        assert_eq!(stats.workers_quarantined, 0, "{stats:?}");
         assert_eq!(
             stats.circuit,
             EvidenceCircuitState::Closed,
@@ -1031,33 +1096,16 @@ mod bounded_evidence_executor_tests {
         // awaiting an abandonment the budget refuses, and healthy slots keep
         // serving.
         for _ in 0..2 {
-            let outcome = poll_on_executor(
-                executor.clone(),
-                Arc::new(GatedBlockingProvider { gate: gate.clone() }),
-                session(),
-                query(),
-                Duration::from_millis(20),
-            )
-            .await;
-            assert!(matches!(
-                outcome.status,
-                EvidencePollStatus::TimedOut { .. }
-            ));
+            wedge_worker(&executor, &gate, Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        executor.maintain();
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        executor.maintain();
-        let stats = executor.stats();
-        assert_eq!(
-            stats.runtime_abandoned, 4,
-            "the absolute runtime cap is reached: {stats:?}"
-        );
+        let stats = maintain_until(&executor, "the absolute runtime cap", |stats| {
+            stats.runtime_abandoned == 4
+                && stats.workers == 2
+                && stats.workers_quarantined == 0
+                && stats.workers_healthy == 2
+        })
+        .await;
         assert_eq!(stats.runtime_abandoned_total, 4, "{stats:?}");
-        assert_eq!(
-            stats.workers, 2,
-            "the two replacement logical slots are restored AT the cap: {stats:?}"
-        );
         assert_eq!(
             stats.circuit,
             EvidenceCircuitState::Closed,
@@ -1081,37 +1129,27 @@ mod bounded_evidence_executor_tests {
         // is exhausted, so it CANNOT be abandoned — the degraded/open
         // circuit, naming the blocked stuck worker. Healthy slots still
         // serve.
-        let outcome = poll_on_executor(
-            executor.clone(),
-            Arc::new(GatedBlockingProvider { gate: gate.clone() }),
-            session(),
-            query(),
-            Duration::from_millis(20),
+        wedge_worker(&executor, &gate, Duration::from_millis(20)).await;
+        let stats = maintain_until(
+            &executor,
+            "the open circuit at the exhausted cap",
+            |stats| {
+                matches!(
+                    stats.circuit,
+                    EvidenceCircuitState::Open {
+                        abandoned: 4,
+                        cap: 4,
+                        blocked: 1
+                    }
+                )
+            },
         )
         .await;
-        assert!(matches!(
-            outcome.status,
-            EvidencePollStatus::TimedOut { .. }
-        ));
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        executor.maintain();
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        executor.maintain();
-        let stats = executor.stats();
         assert_eq!(
             stats.runtime_abandoned, 4,
             "no fifth physical thread may be abandoned: {stats:?}"
         );
         assert_eq!(stats.runtime_abandoned_total, 4, "{stats:?}");
-        assert_eq!(
-            stats.circuit,
-            EvidenceCircuitState::Open {
-                abandoned: 4,
-                cap: 4,
-                blocked: 1
-            },
-            "{stats:?}"
-        );
         assert_eq!(
             stats.workers, 2,
             "the stuck slot is not silently dropped: {stats:?}"
@@ -1151,13 +1189,15 @@ mod bounded_evidence_executor_tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while executor.stats().runtime_abandoned > 0 {
             assert!(Instant::now() < deadline, "abandoned threads never drained");
+            executor.maintain();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        executor.maintain();
-        let stats = executor.stats();
-        assert_eq!(stats.circuit, EvidenceCircuitState::Closed, "{stats:?}");
-        assert_eq!(stats.workers, 2, "capacity restored: {stats:?}");
-        assert_eq!(stats.workers_healthy, 2, "{stats:?}");
+        let stats = maintain_until(&executor, "restored healthy capacity", |stats| {
+            stats.circuit == EvidenceCircuitState::Closed
+                && stats.workers == 2
+                && stats.workers_healthy == 2
+        })
+        .await;
         assert_eq!(
             stats.runtime_abandoned_total, 4,
             "the abandonment history stays observable: {stats:?}"
