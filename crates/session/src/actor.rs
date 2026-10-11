@@ -483,6 +483,26 @@ pub struct DbActor {
     shared: Arc<ActorShared>,
 }
 
+/// Zero orphans: the last handle dropping must stop the bridge task and the
+/// actor thread even when no explicit [`DbActor::shutdown`] ran (an
+/// in-process daemon restart drops the manager — the soak churn's reopen
+/// path). Closing the caller queue lets the bridge drain everything already
+/// enqueued, drop the rendezvous relay, and the actor thread then exits on
+/// relay disconnect; both threads release their `Arc<Store>` (SQLite fds)
+/// as they go. Without this, every reopen orphaned a thread and a
+/// connection (a linear fd ramp caught by the soak's `fds_bounded`).
+impl Drop for DbActor {
+    fn drop(&mut self) {
+        let sender = self
+            .shared
+            .tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+    }
+}
+
 impl std::fmt::Debug for DbActor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DbActor").finish_non_exhaustive()
@@ -1858,6 +1878,42 @@ mod tests {
         assert_eq!(actor.stats().completed, 300, "pending work drained");
         let rows = msg_rows(&store, sid);
         assert_eq!(rows.len(), 300, "unawaited appends were still flushed");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_stops_the_actor_without_explicit_shutdown() {
+        let _serial = serial_lock().await;
+        // FAULT REPRODUCER (soak fds_bounded): the soak churn simulates a
+        // daemon restart by dropping the manager and reopening the SAME data
+        // dir. That path never calls `DbActor::shutdown`, so the last-handle
+        // drop itself must stop the bridge task AND the actor thread and
+        // release their `Arc<Store>` (SQLite fds). When it did not, every
+        // reopen orphaned a thread + connection (+4 fds per 15s reconnect,
+        // a linear fd ramp the soak lane flagged).
+        let (_d, store, actor) = tmp_actor(DbActorConfig {
+            capacity: 8,
+            max_batch: 4,
+            flush_tick: Duration::from_millis(1),
+            ..Default::default()
+        });
+        let handle = actor.handle();
+        let sid = new_session(&store);
+        handle
+            .append_message(sid, 1, "assistant", serde_json::json!({}))
+            .await
+            .expect("append starts the bridge and the actor thread");
+        drop(handle);
+        drop(actor);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&store) > 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "the bridge task and the actor thread must exit and release the store \
+             after the last handle drops (no explicit shutdown)"
+        );
     }
 
     #[tokio::test]

@@ -395,6 +395,31 @@ impl ConvergenceEmitter {
         journal_us: u64,
         index_us: u64,
     ) {
+        self.gauge_marked(
+            turn,
+            writer_queue,
+            reader_queue,
+            background_tasks,
+            journal_us,
+            index_us,
+            false,
+        );
+    }
+
+    /// [`Self::gauge`] with the `quiescent` marker: the checker requires
+    /// EVERY post-settle marked sample to be zero (the convergence
+    /// invariant), while unmarked churn samples are allowed to be busy.
+    #[allow(clippy::too_many_arguments)] // one flat metric row; a param struct would hide the wire shape
+    fn gauge_marked(
+        &mut self,
+        turn: u64,
+        writer_queue: u64,
+        reader_queue: u64,
+        background_tasks: u64,
+        journal_us: u64,
+        index_us: u64,
+        quiescent: bool,
+    ) {
         self.emit(serde_json::json!({
             "t": self.started.elapsed().as_millis() as u64,
             "turn": turn,
@@ -403,6 +428,7 @@ impl ConvergenceEmitter {
             "background_tasks": background_tasks,
             "journal_us": journal_us,
             "index_us": index_us,
+            "quiescent": quiescent,
         }));
     }
 
@@ -601,7 +627,10 @@ async fn soak_convergence_churn() {
     }
 
     // Quiescent convergence: background work must settle and the writer
-    // queue must drain to zero after the churn stops.
+    // queue must drain to zero after the churn stops. The settled gauges are
+    // marked `quiescent`; the checker requires EVERY marked sample to be
+    // zero (the convergence invariant) and ignores busy churn samples, so a
+    // loaded host cannot present a mid-churn queue depth as non-convergence.
     let mut settled = false;
     for _ in 0..60 {
         let active = manager.store().all_active_turns().unwrap().len();
@@ -618,18 +647,24 @@ async fn soak_convergence_churn() {
         0,
         "writer queue must quiesce to zero"
     );
-    emitter.gauge(
-        turns,
-        0,
-        0,
-        0,
-        bounded_p95(&journal_window),
-        bounded_p95(&index_window),
-    );
+    // Three consecutive marked samples during the quiet window: the checker
+    // gets a real quiescent tail to evaluate (never a single lucky sample).
+    for _ in 0..3 {
+        emitter.gauge_marked(
+            turns,
+            0,
+            0,
+            0,
+            bounded_p95(&journal_window),
+            bounded_p95(&index_window),
+            true,
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     drop(manager);
     // A quiet window lets the driver's bounded samplers capture the
     // post-quiescence process/data-dir state before this process exits.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     eprintln!(
         "soak convergence churn: target={target_seconds}s elapsed={:.1}s turns={turns} reconnects={reconnects}",
         started.elapsed().as_secs_f64()

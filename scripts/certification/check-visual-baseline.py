@@ -19,12 +19,25 @@ requested platform whose:
   * digest differs from every OTHER platform record (a copied file is not a
     separately produced render).
 
+Classes (`--class`):
+
+  * `release` (the default): a MISSING record is a hard refusal — a release
+    claim may never cover a platform that was not rendered.
+  * `ci-evidence`: a missing platform is a typed, visible
+    `not_certified-on-platform` boundary (exit 3) for CI-evidence
+    certificates, which record it and never render it green. A record that
+    EXISTS but is unfingerprinted/foreign/copied is NEVER a boundary: it is
+    a hard refusal in both classes. The release class stays refused.
+
 Usage:
   python3 scripts/certification/check-visual-baseline.py --platform macos \
       --file apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json
+  python3 scripts/certification/check-visual-baseline.py --class ci-evidence \
+      --platform windows --file <baseline>
   python3 scripts/certification/check-visual-baseline.py selftest
 
-Exit codes: 0 pass; 1 refusal; 2 usage/parse.
+Exit codes: 0 pass; 1 refusal; 2 usage/parse; 3 CI-evidence platform boundary
+(missing record only, only under --class ci-evidence).
 """
 import json
 import os
@@ -32,6 +45,11 @@ import re
 import sys
 
 FINGERPRINT = re.compile(r"-f[0-9a-f]{8,}$")
+
+CLASS_RELEASE = "release"
+CLASS_CI_EVIDENCE = "ci-evidence"
+CLASSES = (CLASS_RELEASE, CLASS_CI_EVIDENCE)
+BOUNDARY_EXIT = 3
 
 # The environment prefixes the Kotlin visualEnvironment() writer produces per
 # host (os.name slug): Linux -> `linux-…`, macOS -> `mac-os-x-…`, Windows ->
@@ -182,6 +200,37 @@ def selftest():
         "an unknown platform refuses",
         any("unknown-platform" in problem for problem in check(good, "freebsd")),
     )
+    # CI-evidence vs release class (the certificate's platform boundary):
+    # a MISSING record is a typed boundary only for CI evidence; release
+    # refuses. A record that EXISTS but is malformed is a hard failure in
+    # BOTH classes — a boundary is never a mask for a broken record.
+    kind, _ = classify({"platforms": {}}, "windows", CLASS_CI_EVIDENCE)
+    check_case(
+        "ci-evidence: a missing platform is a typed boundary",
+        kind == "not_certified-on-platform",
+    )
+    kind, _ = classify({"platforms": {}}, "windows", CLASS_RELEASE)
+    check_case("release: a missing platform refuses", kind == "failure")
+    kind, _ = classify(
+        {"platforms": {"windows": {"environment": "windows-amd64-jvm17", "digests": {"a": "b" * 64}}}},
+        "windows",
+        CLASS_CI_EVIDENCE,
+    )
+    check_case(
+        "ci-evidence: an unfingerprinted record is a hard failure, never a boundary",
+        kind == "failure",
+    )
+    kind, _ = classify(good, "windows", CLASS_CI_EVIDENCE)
+    check_case("ci-evidence: a certified record stays certified", kind == "certified")
+    kind, _ = classify(
+        {"schema": "faktor-parity-visual-baselines/v2", "panelDigests": {}},
+        "windows",
+        CLASS_CI_EVIDENCE,
+    )
+    check_case(
+        "ci-evidence: a v2 baseline without platform records is not a boundary",
+        kind == "failure",
+    )
     if failures:
         print(f"visual-baseline selftest: FAIL ({failures})", file=sys.stderr)
         return 1
@@ -189,9 +238,37 @@ def selftest():
     return 0
 
 
+def classify(document, platform, class_name):
+    """Classify one platform's record for one gate class.
+
+    Returns `(kind, problems)` with `kind` in:
+
+      * `"certified"` — no problems;
+      * `"not_certified-on-platform"` — the record is MISSING and the class
+        is CI-evidence: a typed platform boundary, never a green result;
+      * `"failure"` — every other problem (including a missing record in the
+        release class, and ANY malformed/unfingerprinted/foreign/copied
+        record in every class).
+    """
+    problems = check(document, platform)
+    if not problems:
+        return ("certified", [])
+    missing_record = (
+        class_name == CLASS_CI_EVIDENCE
+        and platform in PLATFORM_ENVIRONMENT_PREFIXES
+        and isinstance(document.get("platforms"), dict)
+        and record_for(document, platform) is None
+        and all(problem.startswith(f"{platform}=missing") for problem in problems)
+    )
+    if missing_record:
+        return ("not_certified-on-platform", problems)
+    return ("failure", problems)
+
+
 def main(args):
     platform = ""
     path = ""
+    class_name = CLASS_RELEASE
     at = 0
     while at < len(args):
         if args[at] == "--platform" and at + 1 < len(args):
@@ -202,9 +279,23 @@ def main(args):
             path = args[at + 1]
             at += 2
             continue
+        if args[at] == "--class" and at + 1 < len(args):
+            class_name = args[at + 1]
+            at += 2
+            continue
         at += 1
     if not platform or not path:
-        print("usage: check-visual-baseline.py --platform NAME --file FILE | selftest", file=sys.stderr)
+        print(
+            "usage: check-visual-baseline.py --platform NAME --file FILE "
+            "[--class release|ci-evidence] | selftest",
+            file=sys.stderr,
+        )
+        return 2
+    if class_name not in CLASSES:
+        print(
+            f"usage: --class must be one of {', '.join(CLASSES)} (got {class_name!r})",
+            file=sys.stderr,
+        )
         return 2
     if not os.path.isfile(path):
         fail(f"{path} does not exist")
@@ -212,13 +303,22 @@ def main(args):
         document = json.load(open(path, encoding="utf-8"))
     except Exception as error:  # noqa: BLE001 - any parse failure is a refusal
         fail(f"{path} is not valid JSON: {error}")
-    problems = check(document, platform)
-    if problems:
-        for problem in problems:
-            print(f"visual-baseline: {problem}", file=sys.stderr)
-        fail(f"{platform} visual proof incomplete")
-    print(f"visual-baseline: PASS ({platform} record fingerprinted and distinct)")
-    return 0
+    kind, problems = classify(document, platform, class_name)
+    if kind == "certified":
+        print(f"visual-baseline: PASS ({platform} record fingerprinted and distinct)")
+        return 0
+    if kind == "not_certified-on-platform":
+        print(
+            f"visual-baseline: {platform}=not_certified-on-platform "
+            "(CI-evidence platform boundary: no committed record for this "
+            "platform; the release class still refuses via "
+            "scripts/check-visual-platforms.mjs --release)"
+        )
+        return BOUNDARY_EXIT
+    for problem in problems:
+        print(f"visual-baseline: {problem}", file=sys.stderr)
+    fail(f"{platform} visual proof incomplete")
+    return 1  # unreachable (fail exits); kept for clarity
 
 
 if __name__ == "__main__":
