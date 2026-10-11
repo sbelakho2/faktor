@@ -713,15 +713,24 @@ pub(crate) fn preflight_daemon_config(config: &config::Config) -> Result<DaemonP
 /// instead of spawning a second process layer. The graph core calls this
 /// at step 12 of the construction order with a FIELD borrow of the config
 /// (the provider loop has consumed the rest of the config by then).
+///
+/// `network_requirement` is the daemon sandbox policy's own spawn demand
+/// (audit item 17): the secure default makes every verification check
+/// `DenyAll` — refused typed on platforms without a kernel backend — and
+/// only an explicit operator choice (config or the recorded first-run
+/// grant) relaxes it to `Inherit`. The executor never invents a requirement
+/// of its own.
 pub(crate) fn daemon_verification(
     section: &config::VerificationCfg,
     supervisor: &Arc<ProcessSupervisor>,
+    network_requirement: faktor_terminal::NetworkIsolationRequirement,
 ) -> Arc<faktor_agent::VerificationService> {
     match section.policy() {
         Some(policy) => faktor_agent::VerificationService::new(
-            Arc::new(faktor_verify::exec::AsyncCheckExecutor::from_supervisor(
-                supervisor.clone(),
-            )),
+            Arc::new(
+                faktor_verify::exec::AsyncCheckExecutor::from_supervisor(supervisor.clone())
+                    .with_network_requirement(network_requirement),
+            ),
             policy,
         ),
         None => faktor_agent::VerificationService::disabled(),
@@ -773,10 +782,12 @@ pub(crate) fn daemon_verification_providers(
     roots: Arc<dyn faktor_verify::VerificationRootResolver>,
     supervisor: &Arc<ProcessSupervisor>,
     transport: &Arc<dyn HttpTransport>,
+    network_requirement: faktor_terminal::NetworkIsolationRequirement,
 ) -> Result<DaemonVerificationWiring, String> {
-    let executor = Arc::new(faktor_verify::exec::AsyncCheckExecutor::from_supervisor(
-        supervisor.clone(),
-    ));
+    let executor = Arc::new(
+        faktor_verify::exec::AsyncCheckExecutor::from_supervisor(supervisor.clone())
+            .with_network_requirement(network_requirement),
+    );
     let native = Arc::new(faktor_verify::NativeVerificationProvider::new(
         executor, roots,
     ));
@@ -1014,6 +1025,16 @@ pub(crate) fn build_daemon_core(
     let sandbox_policy = config
         .sandbox_policy()
         .map_err(|e| format!("sandbox config: {e}"))?;
+    // Agent-child HOME contract (audit item 6): the ONE supervisor points
+    // every Session/Verification child at a per-session SCRATCH home under
+    // the data dir (HOME/USERPROFILE/XDG_* rewritten; credential discovery
+    // finds nothing) unless the operator explicitly granted the real HOME
+    // via `[sandbox] home = "operator_real_home"`. The scratch path is
+    // created no-follow per spawn and a refusal fails the spawn typed.
+    supervisor.configure_agent_home(
+        data_dir.join(faktor_terminal::AGENT_HOME_DIR),
+        config.sandbox.home,
+    );
     // ONE configured-secret registry for the WHOLE daemon (built here,
     // step 4): the outbound egress scan, the process supervisor's artifact
     // scrub (every command spill is filtered BEFORE its CAS put) and the
@@ -1133,7 +1154,11 @@ pub(crate) fn build_daemon_core(
     // runtime. Budgets come from the configured [verification] section
     // (defaults: quick <= 60 s, unit <= 600 s inline, full = durable
     // background verification jobs; quick_max_s 0 = disabled + fail closed).
-    let verification = daemon_verification(&config.verification, &supervisor);
+    let verification = daemon_verification(
+        &config.verification,
+        &supervisor,
+        sandbox_policy.spawn_network_requirement(),
+    );
     // The generic verification PROVIDER registry (native baseline always;
     // the optional external Kiwi provider only when configured) rides the
     // SAME supervisor and the daemon's checked egress transport. It is
@@ -1146,6 +1171,7 @@ pub(crate) fn build_daemon_core(
         daemon_verification_roots(&session),
         &supervisor,
         &transport,
+        sandbox_policy.spawn_network_requirement(),
     )?; // Steps 13-16 — semantic + learning + memory + tokenizers: the ONE
         // semantic-provider registry built from the strict `[semantic]` section
         // over THIS daemon's supervisor + checked transport (the SAME Arc flows

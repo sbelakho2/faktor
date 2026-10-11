@@ -45,9 +45,12 @@
 //!   [`NetworkOidcConfig::allowed_algorithms`]. The header `alg` must equal
 //!   the algorithm actually used to verify; a mismatch is the typed
 //!   [`OidcError::AlgorithmRefused`] naming each set. `none` is never
-//!   accepted, and symmetric `HS*` is accepted only when the operator lists
-//!   it explicitly AND the JWK is an `oct` key with `use = "sig"` (the
-//!   verifiable implementations are `HS256` and `RS256`);
+//!   accepted. Signature verification is delegated to the audited
+//!   `jsonwebtoken` crate under an allowlist of exactly ONE algorithm — the
+//!   policy winner — never a caller- or header-supplied algorithm.
+//!   `RS256` (the default) and `ES256` are the asymmetric algorithms;
+//!   symmetric `HS256` is accepted only when the operator lists it
+//!   explicitly AND the JWK is an `oct` key with `use = "sig"`;
 //! - `aud`/`azp` follow OpenID Connect: a multi-valued `aud` requires
 //!   `azp == client_id`, and an `azp` that is present must always match —
 //!   a client id merely occurring somewhere in a multi-valued `aud` is
@@ -59,6 +62,8 @@
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use jsonwebtoken::errors::ErrorKind as JwtErrorKind;
+use jsonwebtoken::{decode as jwt_decode, Algorithm as JwtAlgorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
 use faktor_provider::egress::{
@@ -68,9 +73,8 @@ use faktor_provider::egress::{
 use faktor_security::secret::SecretValue;
 
 use crate::oidc::{
-    constant_time_eq, hmac_sha256, map_membership_claims, ClaimMapping, CodeExchangeRequest,
-    IdTokenExpectations, OidcAdapter, OidcClaims, OidcDiscovery, OidcError, OidcMembership,
-    OidcNonce, OidcTokenSet,
+    map_membership_claims, ClaimMapping, CodeExchangeRequest, IdTokenExpectations, OidcAdapter,
+    OidcClaims, OidcDiscovery, OidcError, OidcMembership, OidcNonce, OidcTokenSet,
 };
 
 /// Default discovery cache TTL when the provider sends no `Cache-Control`.
@@ -87,10 +91,10 @@ pub const MAX_CLIENT_SECRET_BYTES: usize = 4096;
 /// Hard cap on one authorization-code exchange input field.
 pub const MAX_CODE_EXCHANGE_INPUT_BYTES: usize = 1024 * 1024;
 /// The signing algorithms this adapter can verify at all. `none` is not an
-/// algorithm and is never verifiable; symmetric `HS*` is verifiable here
-/// only under the explicit conditions of
-/// [`NetworkOidcConfig::allowed_algorithms`].
-pub const SUPPORTED_ALGORITHMS: &[&str] = &["HS256", "RS256"];
+/// algorithm and is never verifiable; `RS256`/`ES256` are the asymmetric
+/// algorithms; symmetric `HS256` is verifiable here only under the explicit
+/// conditions of [`NetworkOidcConfig::allowed_algorithms`].
+pub const SUPPORTED_ALGORITHMS: &[&str] = &["HS256", "RS256", "ES256"];
 /// The default deployment policy: asymmetric signatures only.
 pub const DEFAULT_ALLOWED_ALGORITHMS: &[&str] = &["RS256"];
 /// Hard cap on the configured allowed-algorithm list.
@@ -415,6 +419,10 @@ struct JwkKey {
     /// `RSA` modulus/exponent (base64url).
     n: Option<Vec<u8>>,
     e: Option<Vec<u8>>,
+    /// `EC` curve name and affine point coordinates (base64url).
+    crv: Option<String>,
+    x: Option<Vec<u8>>,
+    y: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -599,6 +607,9 @@ impl NetworkOidcAdapter {
                 k: decode(raw.k, "k")?,
                 n: decode(raw.n, "n")?,
                 e: decode(raw.e, "e")?,
+                crv: raw.crv,
+                x: decode(raw.x, "x")?,
+                y: decode(raw.y, "y")?,
             });
         }
         let max_age = response
@@ -665,6 +676,9 @@ impl NetworkOidcAdapter {
 fn jwk_permitted_algorithms(key: &JwkKey) -> Vec<String> {
     let candidate = match key.kty.as_str() {
         "RSA" if key.n.is_some() && key.e.is_some() => "RS256",
+        "EC" if key.crv.as_deref() == Some("P-256") && key.x.is_some() && key.y.is_some() => {
+            "ES256"
+        }
         "oct" if key.k.is_some() => "HS256",
         _ => return Vec::new(),
     };
@@ -716,6 +730,89 @@ fn check_algorithm_policy(
         jwk,
         configured: configured.to_vec(),
     })
+}
+
+/// The audited verifier's algorithm enum for one policy-accepted name.
+/// `none` has no representation in `jsonwebtoken` (and is refused by the
+/// policy before this is reached); every other name is a defensive `None`.
+fn jwt_algorithm(alg: &str) -> Option<JwtAlgorithm> {
+    match alg {
+        "HS256" => Some(JwtAlgorithm::HS256),
+        "RS256" => Some(JwtAlgorithm::RS256),
+        "ES256" => Some(JwtAlgorithm::ES256),
+        _ => None,
+    }
+}
+
+/// Build the vetted verifier's key from the policy-accepted JWK — the ONLY
+/// place key material is handed to `jsonwebtoken`, and only after
+/// [`check_algorithm_policy`] has accepted the header `alg`. A key missing
+/// the components its accepted algorithm needs is malformed, never a silent
+/// verification with different material.
+fn decoding_key(key: &JwkKey, alg: JwtAlgorithm) -> Result<DecodingKey, OidcError> {
+    match alg {
+        JwtAlgorithm::HS256 => {
+            let secret = key.k.as_deref().ok_or_else(|| {
+                OidcError::Malformed(format!("kid {:?} carries no oct secret for HS256", key.kid))
+            })?;
+            Ok(DecodingKey::from_secret(secret))
+        }
+        JwtAlgorithm::RS256 => match (&key.n, &key.e) {
+            (Some(n), Some(e)) => Ok(DecodingKey::from_rsa_raw_components(n, e)),
+            _ => Err(OidcError::Malformed(format!(
+                "kid {:?} carries no RSA n/e components for RS256",
+                key.kid
+            ))),
+        },
+        JwtAlgorithm::ES256 => match (&key.x, &key.y) {
+            (Some(x), Some(y)) => {
+                let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                DecodingKey::from_ec_components(&engine.encode(x), &engine.encode(y)).map_err(|e| {
+                    OidcError::Malformed(format!(
+                        "kid {:?} carries no EC P-256 point: {e}",
+                        key.kid
+                    ))
+                })
+            }
+            _ => Err(OidcError::Malformed(format!(
+                "kid {:?} carries no EC x/y components for ES256",
+                key.kid
+            ))),
+        },
+        // Unreachable by construction: the policy only maps the algorithms
+        // this adapter supports, and the enum has no `none`.
+        other => Err(OidcError::Malformed(format!(
+            "kid {:?} cannot verify with {other:?}",
+            key.kid
+        ))),
+    }
+}
+
+/// Map one audited-verifier failure onto the adapter's typed refusals — the
+/// error TYPING is preserved (`BadSignature` for any signature/key-material
+/// failure, `AlgorithmRefused` naming each policy set, `Malformed` for every
+/// shape failure) and no payload is ever echoed.
+fn map_jwt_error(
+    error: jsonwebtoken::errors::Error,
+    alg: &str,
+    discovery: &OidcDiscovery,
+    key: &JwkKey,
+    configured: &[String],
+) -> OidcError {
+    match error.kind() {
+        JwtErrorKind::InvalidSignature
+        | JwtErrorKind::InvalidRsaKey(_)
+        | JwtErrorKind::InvalidEcdsaKey
+        | JwtErrorKind::Crypto(_)
+        | JwtErrorKind::RsaFailedSigning => OidcError::BadSignature,
+        JwtErrorKind::InvalidAlgorithm => OidcError::AlgorithmRefused {
+            alg: alg.to_string(),
+            discovery: discovery.supported_algorithms.clone(),
+            jwk: jwk_permitted_algorithms(key),
+            configured: configured.to_vec(),
+        },
+        _ => OidcError::Malformed(format!("id token: {error}")),
+    }
 }
 
 #[async_trait::async_trait]
@@ -840,7 +937,7 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
     ) -> Result<OidcClaims, OidcError> {
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut segments = id_token.split('.');
-        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) = (
+        let (Some(header_b64), Some(_payload_b64), Some(_signature_b64), None) = (
             segments.next(),
             segments.next(),
             segments.next(),
@@ -864,68 +961,39 @@ impl AsyncOidcAdapter for NetworkOidcAdapter {
             .get("alg")
             .and_then(|value| value.as_str())
             .ok_or_else(|| OidcError::Malformed("header carries no alg".into()))?;
-        let signature = engine
-            .decode(signature_b64)
-            .map_err(|e| OidcError::Malformed(format!("signature base64: {e}")))?;
-        let signing_input = format!("{header_b64}.{payload_b64}");
         // The algorithm policy is decided BEFORE any key material is used to
         // verify: the header `alg` must be in the intersection of the
         // discovery set, the JWK's own constraints and the configured
-        // allowed algorithms, and the dispatch below is an exact match (no
-        // case folding, no alias). `none`/unknown algorithms never reach a
-        // verifier.
+        // allowed algorithms. The vetted verifier below then runs under an
+        // allowlist of exactly the ONE policy-accepted algorithm (no case
+        // folding, no alias); `none`/unknown algorithms never reach it.
         let discovery = self.discovery(&self.config.issuer).await?;
         let key = self.signing_key(kid).await?;
         check_algorithm_policy(alg, &discovery, &key, &self.config.allowed_algorithms)?;
-        match alg {
-            "HS256" => {
-                let secret = key.k.as_deref().ok_or_else(|| {
-                    OidcError::Malformed(format!("kid {kid:?} carries no oct secret for HS256"))
-                })?;
-                let expected_signature = hmac_sha256(secret, signing_input.as_bytes());
-                if !constant_time_eq(&signature, &expected_signature) {
-                    return Err(OidcError::BadSignature);
-                }
-            }
-            "RS256" => {
-                let (n, e) = match (&key.n, &key.e) {
-                    (Some(n), Some(e)) => (n.clone(), e.clone()),
-                    _ => {
-                        return Err(OidcError::Malformed(format!(
-                            "kid {kid:?} carries no RSA n/e components for RS256"
-                        )));
-                    }
-                };
-                let components = ring::signature::RsaPublicKeyComponents {
-                    n: n.as_slice(),
-                    e: e.as_slice(),
-                };
-                components
-                    .verify(
-                        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-                        signing_input.as_bytes(),
-                        &signature,
-                    )
-                    .map_err(|_| OidcError::BadSignature)?;
-            }
-            other => {
-                // Unreachable by construction (the policy above only lets
-                // SUPPORTED_ALGORITHMS through); kept as a defensive typed
-                // refusal, never a silent acceptance.
-                return Err(OidcError::AlgorithmRefused {
-                    alg: other.to_string(),
-                    discovery: discovery.supported_algorithms,
-                    jwk: jwk_permitted_algorithms(&key),
-                    configured: self.config.allowed_algorithms.clone(),
-                });
-            }
-        }
-        let payload: serde_json::Value = serde_json::from_slice(
-            &engine
-                .decode(payload_b64)
-                .map_err(|e| OidcError::Malformed(format!("payload base64: {e}")))?,
-        )
-        .map_err(|e| OidcError::Malformed(format!("payload json: {e}")))?;
+        let jwt_alg = jwt_algorithm(alg).ok_or_else(|| OidcError::AlgorithmRefused {
+            alg: alg.to_string(),
+            discovery: discovery.supported_algorithms.clone(),
+            jwk: jwk_permitted_algorithms(&key),
+            configured: self.config.allowed_algorithms.clone(),
+        })?;
+        let decoding = decoding_key(&key, jwt_alg)?;
+        // Signature verification is delegated to `jsonwebtoken`; claim
+        // validation stays in this adapter so the i128-exact typed time
+        // errors (and the exact refusal precedence) are preserved, so the
+        // verifier validates ONLY the signature over the compact
+        // serialization.
+        let mut validation = Validation::new(jwt_alg);
+        validation.algorithms = vec![jwt_alg];
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
+        validation.validate_aud = false;
+        validation.required_spec_claims.clear();
+        validation.leeway = 0;
+        let token =
+            jwt_decode::<serde_json::Value>(id_token, &decoding, &validation).map_err(|e| {
+                map_jwt_error(e, alg, &discovery, &key, &self.config.allowed_algorithms)
+            })?;
+        let payload: serde_json::Value = token.claims;
         let text = |field: &str| -> Result<String, OidcError> {
             payload
                 .get(field)
@@ -1107,6 +1175,12 @@ struct RawJwk {
     n: Option<String>,
     #[serde(default)]
     e: Option<String>,
+    #[serde(default)]
+    crv: Option<String>,
+    #[serde(default)]
+    x: Option<String>,
+    #[serde(default)]
+    y: Option<String>,
 }
 
 /// The OIDC token-endpoint WIRE response (a provider payload). Its

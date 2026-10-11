@@ -499,7 +499,7 @@ mod evidence_store_tests {
             .unwrap();
             conn.execute("DELETE FROM sqlite_sequence WHERE name = 'evidence'", [])
                 .unwrap();
-            migrate(&mut conn).unwrap();
+            migrate(&mut conn, Some(dir.path().join("faktor-plus.db").as_path())).unwrap();
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();

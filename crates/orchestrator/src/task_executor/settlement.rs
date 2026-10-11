@@ -380,6 +380,7 @@ impl TaskExecutor {
         }
         // (1) PREPARE from the immutable shadow run base.
         let prepared = self.prepare_shadow_integration(handle, parent, &run_id, task_id, &row)?;
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::AfterCandidatePrepared)?;
         // (2) VERIFY the CANDIDATE (the shadow tree), under the run's no-op
         // policy: an empty change set completes only through the reviewer's
@@ -433,6 +434,7 @@ impl TaskExecutor {
                 None
             }
         };
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::BeforeTaskCompletion)?;
         let mut completed = false;
         match handle.completion_contract_gate(task_id) {
@@ -797,6 +799,7 @@ impl TaskExecutor {
         let candidate_ids: Vec<String> = eligible.iter().map(|r| r.child_id.clone()).collect();
         let prepared =
             self.prepare_run_integration(&handle, parent, &run_id, task_id, &candidate_ids)?;
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::AfterCandidatePrepared)?;
         // (2) VERIFY the CANDIDATE (never the owner) under the run's durable
         // no-op policy: an empty aggregate change set completes only through
@@ -824,6 +827,7 @@ impl TaskExecutor {
                 None
             }
         };
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::BeforeTaskCompletion)?;
         // (5) Completion gate: the durable contract gate must be satisfied
         // (all requested step rows Succeeded) before the record is consumed.
@@ -1357,6 +1361,7 @@ impl TaskExecutor {
         if composed != VerificationStatus::Passed {
             return Ok(None);
         }
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::AfterPreparedVerification)?;
         let proof = VerifiedRunIntegration::from_composed_verdict(
             prepared.clone(),
@@ -1508,6 +1513,7 @@ impl TaskExecutor {
         handle
             .ledger_integration_txn_set(&txn)
             .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::AfterIntegrationTxnRecord)?;
         self.apply_landing_loop(handle, proof, &mut txn)
     }
@@ -1570,6 +1576,7 @@ impl TaskExecutor {
                     )));
                 }
             }
+            #[cfg(any(test, feature = "fault-injection"))]
             self.check_settlement_seam(CrashSeam::IntegrationApply { after: i + 1 })?;
         }
         // Final equality (point 6): the landed owner root must EXACTLY
@@ -1590,6 +1597,7 @@ impl TaskExecutor {
             txn.conflicts.push(truncate_bytes(&reason, 256));
             return Err(ExecError::WorkspaceDrift(reason));
         }
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_settlement_seam(CrashSeam::AfterFinalOwnerSnapshot)?;
         txn.phase = faktor_session::ledger::IntegrationTxnPhase::Landed;
         txn.at_ms = handle.now_ms();

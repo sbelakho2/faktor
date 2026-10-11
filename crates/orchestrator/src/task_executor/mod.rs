@@ -77,9 +77,11 @@ use super::completion_steps::{
     EgressPolicy,
 };
 use super::shadow::ShadowRoots;
+#[cfg(any(test, feature = "fault-injection"))]
+use super::CrashSeam;
 use super::{
-    parent_facts, ChildSpec, CrashSeam, ExecConfig, ExecError, OrchestratorRuntime,
-    ASSIGNMENT_ROW_KIND, MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
+    parent_facts, ChildSpec, ExecConfig, ExecError, OrchestratorRuntime, ASSIGNMENT_ROW_KIND,
+    MAX_RUN_ID_CHARS, PLAN_ROW_KIND, REGISTRY_ROW_KIND,
 };
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
 use crate::placement::{PlacementDecision, PlacementSpec, WorkerPlacement};
@@ -529,6 +531,7 @@ pub struct TaskRunRequest {
     /// first spawn, so a re-settled run applies the byte-identical policy.
     pub no_op_disposition: Option<NoOpDisposition>,
     /// Deterministic crash seam (adversarial tests only).
+    #[cfg(any(test, feature = "fault-injection"))]
     pub crash_seam: Option<CrashSeam>,
 }
 
@@ -555,6 +558,7 @@ impl Default for TaskRunRequest {
             completion_contract: None,
             isolated_root: PathBuf::new(),
             no_op_disposition: None,
+            #[cfg(any(test, feature = "fault-injection"))]
             crash_seam: None,
         }
     }
@@ -1535,6 +1539,7 @@ pub struct TaskExecutor {
     /// NEXT settlement (or run-base creation) returns
     /// [`ExecError::InjectedCrashSeam`] at the FIRST matching boundary,
     /// leaving every durable row exactly as a real crash would. One-shot.
+    #[cfg(any(test, feature = "fault-injection"))]
     settlement_seam: Mutex<Option<(CrashSeam, bool)>>,
     /// The additive worker-plane placement seam. Default
     /// [`WorkerPlacement::disabled`]: every placement decision is local and
@@ -1676,6 +1681,7 @@ impl TaskExecutor {
             shadows,
             run_roots,
             completion_steps: Mutex::new(CompletionStepsWiring::default()),
+            #[cfg(any(test, feature = "fault-injection"))]
             settlement_seam: Mutex::new(None),
             placement: Mutex::new(WorkerPlacement::disabled()),
             drives: Arc::new(TaskDriveRegistry::new()),
@@ -1685,6 +1691,7 @@ impl TaskExecutor {
     /// Install (or clear) the ONE-SHOT settlement crash seam (tests). The
     /// seam fires at the FIRST matching boundary of the next settlement and
     /// is consumed; clearing it lets the recovery pass run.
+    #[cfg(any(test, feature = "fault-injection"))]
     pub fn set_settlement_crash_seam(&self, seam: Option<CrashSeam>) {
         *self.lock_settlement_seam() = seam.map(|s| (s, false));
     }
@@ -1755,15 +1762,14 @@ impl TaskExecutor {
     /// test-only DERIVED flag (the durable rows it simulates a crash across
     /// remain the authority), so a poisoned guard is recovered with the
     /// poison flag cleared rather than wedging the recovery pass.
+    #[cfg(any(test, feature = "fault-injection"))]
     fn lock_settlement_seam(&self) -> std::sync::MutexGuard<'_, Option<(CrashSeam, bool)>> {
-        self.settlement_seam.lock().unwrap_or_else(|poisoned| {
-            self.settlement_seam.clear_poison();
-            poisoned.into_inner()
-        })
+        faktor_core::lock::recover(&self.settlement_seam)
     }
 
     /// Consume the configured settlement seam when `seam` matches it. The
     /// first match fires exactly once; later calls (the recovery pass) pass.
+    #[cfg(any(test, feature = "fault-injection"))]
     fn check_settlement_seam(&self, seam: CrashSeam) -> Result<(), ExecError> {
         let mut guard = self.lock_settlement_seam();
         if let Some((configured, fired)) = guard.as_mut() {
@@ -2235,7 +2241,7 @@ impl TaskExecutor {
         run_id: &str,
         ceilings: super::Ceilings,
         parent_caps: CapabilitySet,
-        crash_seam: Option<CrashSeam>,
+        #[cfg(any(test, feature = "fault-injection"))] crash_seam: Option<CrashSeam>,
     ) -> Result<TaskRunReceipt, ExecError> {
         ceilings.validate().map_err(ExecError::InvalidPlan)?;
         // The durable plan row must exist and name the run.
@@ -2283,6 +2289,7 @@ impl TaskExecutor {
                         parent_caps,
                         String::new(),
                         PathBuf::new(),
+                        #[cfg(any(test, feature = "fault-injection"))]
                         crash_seam,
                     )
                     .await
@@ -3108,6 +3115,7 @@ impl TaskExecutor {
             self.clear_active_if(parent, &run_id);
             return Err(e);
         }
+        #[cfg(any(test, feature = "fault-injection"))]
         if let Err(e) = self.check_settlement_seam(CrashSeam::AfterRunBaseRecorded) {
             self.clear_active_if(parent, &run_id);
             return Err(e);
@@ -3127,6 +3135,7 @@ impl TaskExecutor {
             provider,
             default_model,
             isolated_root,
+            #[cfg(any(test, feature = "fault-injection"))]
             crash_seam: req.crash_seam,
         };
         let run_id2 = run_id.clone();

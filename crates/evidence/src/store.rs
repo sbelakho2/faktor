@@ -249,6 +249,10 @@ pub struct EvidencePage {
 
 /// One-shot evidence-insert fault target: panic at the `ordinal`-th
 /// crossing (0-based) of durability boundary `point`.
+///
+/// Compiled only for the crate's own tests or with the `fault-injection`
+/// feature (fault campaigns); the production profile has no arming API.
+#[cfg(any(test, feature = "fault-injection"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceCrashArm {
@@ -258,6 +262,7 @@ pub struct EvidenceCrashArm {
     pub ordinal: u64,
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 #[derive(Default)]
 struct EvidenceSeamState {
     armed: Option<EvidenceCrashArm>,
@@ -267,12 +272,24 @@ struct EvidenceSeamState {
 /// Per-authority deterministic evidence-insert crash seam. Additive and
 /// default-off: while unarmed every `trip` is a single uncontended mutex
 /// check.
+#[cfg(any(test, feature = "fault-injection"))]
 #[doc(hidden)]
 #[derive(Default)]
 pub struct EvidenceCrashSeam {
     state: std::sync::Mutex<EvidenceSeamState>,
 }
 
+/// Production profile: the seam payload is compiled out; the no-op keeps
+/// the surrounding plumbing (an authority field, `trip` call sites) uniform
+/// at zero runtime cost.
+#[cfg(not(any(test, feature = "fault-injection")))]
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct EvidenceCrashSeam {
+    _compiled_out: (),
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
 impl std::fmt::Debug for EvidenceCrashSeam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let armed = self.state.lock().map(|s| s.armed).unwrap_or(None);
@@ -282,6 +299,7 @@ impl std::fmt::Debug for EvidenceCrashSeam {
     }
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 impl EvidenceCrashSeam {
     /// Arm ONE crossing, replacing any previous arm and resetting the
     /// crossing counter.
@@ -313,6 +331,12 @@ impl EvidenceCrashSeam {
             arm.ordinal
         );
     }
+}
+
+#[cfg(not(any(test, feature = "fault-injection")))]
+impl EvidenceCrashSeam {
+    #[inline(always)]
+    fn trip(&self, _point: &'static str) {}
 }
 
 /// In-memory [`EvidenceStore`] with a hard per-envelope backing cap.
@@ -1108,6 +1132,7 @@ impl DurableEvidenceAuthority {
 
     /// Arm the deterministic evidence-insert crash seam (fault
     /// certification only; see [`EvidenceCrashArm`]). Inert when unarmed.
+    #[cfg(any(test, feature = "fault-injection"))]
     #[doc(hidden)]
     pub fn crash_arm(&self, arm: EvidenceCrashArm) {
         self.seam.arm(arm);

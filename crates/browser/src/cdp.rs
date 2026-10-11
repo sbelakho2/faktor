@@ -159,13 +159,13 @@ impl CriticalQueue {
     /// Register the immediate overflow consumer. One page owns one session's
     /// queue; the last registration wins by design.
     pub(crate) fn set_overflow_hook(&self, hook: OverflowHook) {
-        *self.overflow_hook.lock().unwrap() = Some(hook);
+        *faktor_core::lock::recover(&self.overflow_hook) = Some(hook);
     }
 
     fn push(&self, event: CdpEvent) {
         let mut overflowed = None;
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = faktor_core::lock::recover(&self.state);
             if state.failed {
                 return;
             }
@@ -182,11 +182,7 @@ impl CriticalQueue {
         }
         self.notify.notify_one();
         if let Some(skipped) = overflowed {
-            let hook = self
-                .overflow_hook
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let hook = faktor_core::lock::recover(&self.overflow_hook).clone();
             if let Some(hook) = hook {
                 hook(skipped);
             }
@@ -194,7 +190,7 @@ impl CriticalQueue {
     }
 
     fn close(&self) {
-        self.state.lock().unwrap().closed = true;
+        faktor_core::lock::recover(&self.state).closed = true;
         self.notify.notify_one();
     }
 
@@ -204,7 +200,7 @@ impl CriticalQueue {
             // and the await can never be lost.
             let notified = self.notify.notified();
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = faktor_core::lock::recover(&self.state);
                 if state.failed {
                     return Err(EventStreamError::Lagged {
                         skipped: state.skipped.max(1),
@@ -266,16 +262,16 @@ impl CdpInner {
             return;
         }
         {
-            let mut slot = self.closed_reason.lock().unwrap();
+            let mut slot = faktor_core::lock::recover(&self.closed_reason);
             if slot.is_none() {
                 *slot = Some(reason);
             }
         }
-        for queue in self.session_critical.lock().unwrap().values() {
+        for queue in faktor_core::lock::recover(&self.session_critical).values() {
             queue.close();
         }
         let pending: Vec<(u64, oneshot::Sender<CdpOutcome>)> = {
-            let mut map = self.pending.lock().unwrap();
+            let mut map = faktor_core::lock::recover(&self.pending);
             map.drain().collect()
         };
         for (_, tx) in pending {
@@ -287,9 +283,7 @@ impl CdpInner {
     }
 
     fn critical_queue(&self, session: &str) -> Arc<CriticalQueue> {
-        self.session_critical
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.session_critical)
             .entry(session.to_string())
             .or_insert_with(|| Arc::new(CriticalQueue::new(self.config.critical_event_capacity)))
             .clone()
@@ -306,7 +300,10 @@ impl std::fmt::Debug for CdpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CdpClient")
             .field("closed", &self.is_closed())
-            .field("pending", &self.inner.pending.lock().unwrap().len())
+            .field(
+                "pending",
+                &faktor_core::lock::recover(&self.inner.pending).len(),
+            )
             .finish()
     }
 }
@@ -396,7 +393,7 @@ impl CdpClient {
             });
         }
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id, tx);
+        faktor_core::lock::recover(&self.inner.pending).insert(id, tx);
         let write_result = {
             let mut writer = self.inner.writer.lock().await;
             match writer.as_mut() {
@@ -407,14 +404,14 @@ impl CdpClient {
             }
         };
         if let Err(error) = write_result {
-            self.inner.pending.lock().unwrap().remove(&id);
+            faktor_core::lock::recover(&self.inner.pending).remove(&id);
             return Err(error);
         }
         tokio::pin!(rx);
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                self.inner.pending.lock().unwrap().remove(&id);
+                faktor_core::lock::recover(&self.inner.pending).remove(&id);
                 Err(BrowserError::Cancelled)
             }
             result = tokio::time::timeout_at(deadline_instant(deadline), &mut rx) => {
@@ -435,11 +432,11 @@ impl CdpClient {
                         }
                     }
                     Ok(Err(_recv)) => {
-                        self.inner.pending.lock().unwrap().remove(&id);
+                        faktor_core::lock::recover(&self.inner.pending).remove(&id);
                         Err(self.closed_error())
                     }
                     Err(_) => {
-                        self.inner.pending.lock().unwrap().remove(&id);
+                        faktor_core::lock::recover(&self.inner.pending).remove(&id);
                         Err(BrowserError::Deadline { detail: format!("cdp command {method}") })
                     }
                 }
@@ -471,7 +468,7 @@ impl CdpClient {
     }
 
     pub fn closed_reason(&self) -> Option<String> {
-        self.inner.closed_reason.lock().unwrap().clone()
+        faktor_core::lock::recover(&self.inner.closed_reason).clone()
     }
 
     fn closed_error(&self) -> BrowserError {
@@ -553,7 +550,7 @@ fn route_message(value: Value, inner: &Arc<CdpInner>) {
             },
             None => CdpOutcome::Ok(value.get("result").cloned().unwrap_or(Value::Null)),
         };
-        if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
+        if let Some(tx) = faktor_core::lock::recover(&inner.pending).remove(&id) {
             let _ = tx.send(outcome);
         }
         return;
@@ -647,7 +644,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         queue.set_overflow_hook(std::sync::Arc::new(move |skipped| {
-            sink.lock().unwrap().push(skipped);
+            faktor_core::lock::recover(&sink).push(skipped);
         }));
         for index in 0..5u64 {
             queue.push(CdpEvent {
@@ -657,7 +654,7 @@ mod tests {
             });
         }
         assert_eq!(
-            *seen.lock().unwrap(),
+            *faktor_core::lock::recover(&seen),
             vec![3],
             "overflow on the 3rd push (capacity 2) must call the hook exactly once"
         );
@@ -667,7 +664,7 @@ mod tests {
             method: "Fetch.requestPaused".into(),
             params: serde_json::json!({ "requestId": "late" }),
         });
-        assert_eq!(*seen.lock().unwrap(), vec![3]);
+        assert_eq!(*faktor_core::lock::recover(&seen), vec![3]);
     }
 
     #[test]

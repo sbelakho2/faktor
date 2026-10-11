@@ -684,7 +684,7 @@ mod broker_only {
             if self.stop.load(Ordering::SeqCst) {
                 return None;
             }
-            let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slots = faktor_core::lock::recover(&self.slots);
             if self.active.load(Ordering::SeqCst) >= MAX_RELAYS {
                 return None;
             }
@@ -719,7 +719,7 @@ mod broker_only {
         /// Stop every live relay and the listeners (idempotent).
         pub(crate) fn stop(&self) {
             self.stop.store(true, Ordering::SeqCst);
-            let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+            let slots = faktor_core::lock::recover(&self.slots);
             for end in slots.iter().flatten() {
                 end.shutdown();
             }
@@ -735,7 +735,7 @@ mod broker_only {
 
     impl Drop for RelayGuard {
         fn drop(&mut self) {
-            let mut slots = self.state.slots.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slots = faktor_core::lock::recover(&self.state.slots);
             for idx in &self.indices {
                 slots[*idx] = None;
             }
@@ -1991,6 +1991,17 @@ struct LandlockPathBeneathAttr {
 
 /// Install the workspace-confinement pre-exec hook on `cmd`.
 ///
+/// `credential_paths` are the real-home credential stores
+/// (see [`faktor_core::command::CREDENTIAL_HOME_SUBPATHS`]) the confinement
+/// policy must NEVER grant: a configured root that equals, contains, or
+/// lies beneath one of them is dropped from the rule table here, in the
+/// parent, so the kernel keeps denying that subtree for the whole process
+/// tree. A `required` demand with such a root fails closed in the pre-exec
+/// (the pre-spawn gate normally refuses even earlier, typed and named);
+/// a `BestEffort` demand still installs the remaining rules, so the child
+/// stays confined and the credential subtree is denied — the fallback never
+/// silently runs unconfined.
+///
 /// # Safety
 ///
 /// The installed closure runs in the forked child between fork and exec: it
@@ -2004,6 +2015,7 @@ pub(crate) unsafe fn apply_workspace_isolation(
     writable_roots: &[std::path::PathBuf],
     read_only: bool,
     required: bool,
+    credential_paths: &[std::path::PathBuf],
 ) {
     use std::os::unix::ffi::OsStrExt;
     let mut rules: Vec<FsRule> = Vec::new();
@@ -2016,7 +2028,30 @@ pub(crate) unsafe fn apply_workspace_isolation(
     } else {
         ACCESS_WORKSPACE_ROOT
     };
+    let grants_credential = |root: &std::path::Path| {
+        credential_paths
+            .iter()
+            .any(|credential| faktor_core::command::paths_overlap(root, credential))
+    };
     for root in roots {
+        if grants_credential(root) {
+            // Never grant a credential store: the root is dropped and the
+            // kernel denies every path beneath it for the whole child. A
+            // `required` demand treats this like a missing root and fails
+            // closed in the pre-exec (the pre-spawn gate normally refuses
+            // even earlier with a clearer message); `BestEffort` installs
+            // the remaining rules — the credential subtree AND that root's
+            // workspace access stay kernel-denied, never unconfined.
+            tracing::warn!(
+                root = %root.display(),
+                "workspace confinement root covers a home credential store; \
+                 the credential subtree is denied, never granted"
+            );
+            if required {
+                invalid_root = true;
+            }
+            continue;
+        }
         if !root.is_dir() {
             invalid_root = true;
             continue;
@@ -2035,6 +2070,17 @@ pub(crate) unsafe fn apply_workspace_isolation(
         // Explicit build/scratch roots stay fully writable; everything else
         // beneath the workspace roots is kernel-read-only.
         for root in writable_roots {
+            if grants_credential(root) {
+                tracing::warn!(
+                    root = %root.display(),
+                    "writable confinement root covers a home credential store; \
+                     the credential subtree is denied, never granted"
+                );
+                if required {
+                    invalid_root = true;
+                }
+                continue;
+            }
             if !root.is_dir() {
                 invalid_root = true;
                 continue;

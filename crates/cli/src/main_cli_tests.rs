@@ -1373,7 +1373,11 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
     .unwrap();
     let cfg = serve_config(Some(path.clone())).expect("explicit sane config");
     let supervisor = ProcessSupervisor::try_shared().expect("standalone supervisor");
-    let service = daemon_verification(&cfg.verification, &supervisor);
+    let service = daemon_verification(
+        &cfg.verification,
+        &supervisor,
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
+    );
     assert!(!service.is_disabled());
     let policy = service.policy();
     assert_eq!(policy.quick_max, std::time::Duration::from_secs(30));
@@ -1405,7 +1409,11 @@ fn verification_config_unknown_fields_fail_and_zero_disables_the_service() {
     .unwrap();
     let cfg = serve_config(Some(path)).expect("zero quick budget is a valid config");
     let supervisor = ProcessSupervisor::try_shared().expect("standalone supervisor");
-    let service = daemon_verification(&cfg.verification, &supervisor);
+    let service = daemon_verification(
+        &cfg.verification,
+        &supervisor,
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
+    );
     assert!(
         service.is_disabled(),
         "quick_max_s = 0 must disable verification (fail closed)"
@@ -1426,6 +1434,7 @@ fn verification_provider_registry_is_native_by_default_and_kiwi_only_when_config
         roots.clone(),
         &supervisor,
         &permissive_transport(),
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
     )
     .expect("native-only registry builds");
     let registry = &wiring.registry;
@@ -1446,6 +1455,7 @@ fn verification_provider_registry_is_native_by_default_and_kiwi_only_when_config
         roots.clone(),
         &supervisor,
         &permissive_transport(),
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
     )
     .expect("configured kiwi registry builds");
     let registry = &wiring.registry;
@@ -1461,10 +1471,14 @@ fn verification_provider_registry_is_native_by_default_and_kiwi_only_when_config
     // half-configured registry).
     let mut hostile = section.clone();
     hostile.kiwi.endpoint = Some("ftp://nope".to_string());
-    assert!(
-        daemon_verification_providers(&hostile, roots, &supervisor, &permissive_transport())
-            .is_err()
-    );
+    assert!(daemon_verification_providers(
+        &hostile,
+        roots,
+        &supervisor,
+        &permissive_transport(),
+        faktor_terminal::NetworkIsolationRequirement::Inherit,
+    )
+    .is_err());
 }
 
 #[test]

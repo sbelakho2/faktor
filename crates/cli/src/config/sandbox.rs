@@ -36,6 +36,14 @@ use super::*;
 /// explicit grant, never a silent default, and the two modes are never
 /// presented as equivalent strength. Unknown keys inside the section are
 /// parse errors.
+///
+/// `home` is the agent-child HOME contract (audit item 6): `"scratch"` (the
+/// default when unset) gives every agent shell/verification child a
+/// per-session scratch HOME under the data dir so `$HOME`-relative
+/// credential discovery finds nothing; `"operator_real_home"` is the
+/// explicit operator grant that passes the real HOME through (credential
+/// directories remain denied by OS-level confinement wherever a backend is
+/// installed). The default is never widened silently.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCfg {
@@ -45,6 +53,9 @@ pub struct SandboxCfg {
     pub network_guarantee: SandboxGuarantee,
     #[serde(default)]
     pub shell: Option<faktor_sandbox::ShellExecutionMode>,
+    /// The agent-child HOME contract (default `scratch`).
+    #[serde(default)]
+    pub home: faktor_sandbox::AgentHomePolicy,
 }
 
 /// Omitted scalar keys inherit `Config::default()` (a partial file must mean

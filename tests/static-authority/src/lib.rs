@@ -1,6 +1,6 @@
 //! Static source-authority certification (audit 31/107-109).
 //!
-//! Sixteen structural invariants are locked by scanning the repository's
+//! Seventeen structural invariants are locked by scanning the repository's
 //! *production* Rust sources (`crates/*/src`, test modules and out-of-line
 //! `#[cfg(test)] mod` bodies excluded):
 //!
@@ -145,6 +145,17 @@
 //!     `fs::read(` / `read_to_end(` there allocates up to a hostile, sparse
 //!     or growing manifest size before any length check runs; the allowlist
 //!     is empty and a planted raw read fails the scan.
+//! 17. **Production function length** (the turn-loop phase split) — no
+//!     production function may exceed [`FUNCTION_LINE_CAP`] lines except the
+//!     exact entries of the SHRINK-ONLY grandfather list: a listed function
+//!     may shrink but never grow past its recorded size, and reaching the
+//!     cap retires the entry (a stale entry is red). Function spans are
+//!     measured on the same comment/string mask and `#[cfg(test)]`-stripped
+//!     ranges as every other scan; `fn` signatures without a body and
+//!     function-pointer types are not functions. The seven remaining giants
+//!     (turn verification, tool loop, serve, index build, protocol schema,
+//!     compaction, independent review) are grandfathered with their exact
+//!     sizes; a planted giant fails the scan.
 //!
 //! Scanning methodology: per file, comments and string literals are masked
 //! out and every `#[cfg(...)]`-gated item that can never compile in a
@@ -3779,17 +3790,115 @@ fn prod_only() {}
     }
 
     // ------------------------------------------------------------------
+    // scan: fault-injection crash seams are feature-gated
+    // ------------------------------------------------------------------
+
+    /// The exact gate every `crash_arm` definition/call site must carry:
+    /// `test` for the crate's own unit tests, the `fault-injection` cargo
+    /// feature for fault campaigns. Production builds must contain neither
+    /// the payload nor an arming API (the seam crates compile a zero-sized
+    /// no-op `CrashSeam` instead).
+    const SEAM_GATE: &str = "#[cfg(any(test, feature = \"fault-injection\"))]";
+
+    /// Offenders are `crash_arm` occurrences in production ranges whose
+    /// enclosing item/statement does not carry [`SEAM_GATE`] on one of the
+    /// three physical lines above. Test-only ranges (in-file
+    /// `#[cfg(test)] mod` blocks and out-of-line `*_tests.rs` modules) are
+    /// already excluded by the production-region masking, so anything seen
+    /// here is production code that must be gated.
+    fn crash_arm_gate_offenders(f: &File<'_>) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for at in find_marker_offsets(f, "crash_arm") {
+            let line_start = f.src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let mut window_start = line_start;
+            for _ in 0..3 {
+                if window_start == 0 {
+                    break;
+                }
+                window_start = f.src[..window_start - 1]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+            }
+            if !f.src[window_start..at].contains(SEAM_GATE) {
+                offenders.push(format!(
+                    "{}:{}: {}  [crash_arm outside `{SEAM_GATE}`]",
+                    f.rel,
+                    line_of(f.src, at),
+                    trim_line(f.src, at)
+                ));
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        offenders
+    }
+
+    #[test]
+    fn crash_arm_is_feature_gated_in_every_production_crate() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for rel in walk_crate_sources() {
+            let Some(f) = load(&rel) else { continue };
+            scanned += 1;
+            offenders.extend(crash_arm_gate_offenders(&f));
+        }
+        assert_no_offenders("crash-seam feature gating", &offenders, scanned, 300);
+    }
+
+    #[test]
+    fn crash_arm_scan_detects_ungated_sites_and_exempts_gated_shapes() {
+        // An ungated production call site fires.
+        let raw = synthetic_file(
+            "crates/store/src/connection.rs",
+            "fn f(store: &Store, a: CrashArm) { store.crash_arm(a); }\n",
+        );
+        assert_eq!(crash_arm_gate_offenders(&raw).len(), 1);
+        // The exact gate above the item (with #[doc(hidden)] between) passes.
+        let gated = synthetic_file(
+            "crates/store/src/connection.rs",
+            "#[cfg(any(test, feature = \"fault-injection\"))]\n#[doc(hidden)]\npub fn crash_arm(&self, a: CrashArm) { self.seam.arm(a); }\n",
+        );
+        assert!(crash_arm_gate_offenders(&gated).is_empty());
+        // A same-line gate passes (statement attribute form).
+        let stmt = synthetic_file(
+            "crates/store/src/connection.rs",
+            "fn f(store: &Store) {\n  #[cfg(any(test, feature = \"fault-injection\"))]\n  store.crash_arm(a);\n}\n",
+        );
+        assert!(crash_arm_gate_offenders(&stmt).is_empty());
+        // Mentions in comments/doc text never fire.
+        let doc = synthetic_file(
+            "crates/store/src/connection.rs",
+            "/// call crash_arm to arm the seam\nfn ok() {}\n",
+        );
+        assert!(crash_arm_gate_offenders(&doc).is_empty());
+    }
+
+    // ------------------------------------------------------------------
     // scan: authority-path lock poison discipline
     // ------------------------------------------------------------------
 
     /// Production files whose locks sit on the authority path (fs registries,
     /// session ownership registries, permissions-adjacent caches, MCP/LSP
     /// process ownership, search/router caches, PTY rings, hooks, git lock
-    /// maps). Raw `.lock().unwrap()` / `.lock().expect(..)` is forbidden on
-    /// every one: each lock carries a classified disposition
-    /// (cache/ring => rebuild; authority/policy => typed refusal;
-    /// ownership/process => reconcile against the durable authority).
+    /// maps, and the browser/terminal/scheduler runtime registries). Raw
+    /// `.lock().unwrap()` / `.lock().expect(..)` is forbidden on every one:
+    /// each lock carries a classified disposition (cache/ring => rebuild;
+    /// authority/policy => typed refusal; ownership/process => reconcile
+    /// against the durable authority). Ephemeral runtime registries recover
+    /// through `faktor_core::lock::recover`; durable authorities use
+    /// `faktor_core::lock::acquire` and surface the typed refusal.
     const AUTHORITY_LOCK_FILES: &[&str] = &[
+        "crates/browser/src/bin/fake_chromium.rs",
+        "crates/browser/src/cdp.rs",
+        "crates/browser/src/download.rs",
+        "crates/browser/src/egress.rs",
+        "crates/browser/src/interception.rs",
+        "crates/browser/src/manager.rs",
+        "crates/browser/src/page.rs",
+        "crates/scheduler/src/lib.rs",
+        "crates/terminal/src/lib.rs",
+        "crates/terminal/src/sandbox/linux.rs",
         "crates/fs/src/lib.rs",
         "crates/fs/src/atomic.rs",
         "crates/fs/src/platform/unix.rs",
@@ -8610,5 +8719,332 @@ agent-alias = { package = "faktor-agent", path = "crates/agent" }
             violations.is_empty(),
             "durable serialization must fail typed, never default to an empty value: {violations:#?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 17. production function-length gate (turn-loop phase split)
+    // ------------------------------------------------------------------
+
+    /// Initial production function-length cap. The logical-turn drive was
+    /// decomposed by `AgentState` phase (`drive_turn_inner` skeleton plus the
+    /// phase bodies in `turn/drive_phases.rs` / `turn/drive_call.rs`), and
+    /// every one of those units is under this cap; a NEW production function
+    /// above it fails. The remaining pre-existing giants are listed in
+    /// [`FUNCTION_GRANDFATHERS`], which is SHRINK-ONLY: a listed function may
+    /// shrink but never grow past its recorded size, and once it reaches the
+    /// cap the entry MUST be deleted (a stale entry is a red test).
+    const FUNCTION_LINE_CAP: usize = 500;
+
+    /// One production `fn` above the cap; the span runs from the `fn`
+    /// keyword's line through the brace-matched closing brace's line.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LongFunction {
+        rel: String,
+        name: String,
+        start_line: usize,
+        end_line: usize,
+        lines: usize,
+    }
+
+    /// One grandfathered giant. `max_lines` is the size recorded when it was
+    /// grandfathered: the function may shrink below it but never grow past
+    /// it, and reaching [`FUNCTION_LINE_CAP`] retires the entry.
+    struct Grandfathered {
+        rel: &'static str,
+        name: &'static str,
+        max_lines: usize,
+    }
+
+    /// THE shrink-only grandfather list (seven giants recorded when the
+    /// 500-line gate landed). Removing an entry is progress; editing
+    /// `max_lines` upward is forbidden by the gate's own growth check.
+    const FUNCTION_GRANDFATHERS: &[Grandfathered] = &[
+        Grandfathered {
+            rel: "crates/agent/src/runtime/tool_loop.rs",
+            name: "run_tool_calls",
+            max_lines: 818,
+        },
+        Grandfathered {
+            rel: "crates/agent/src/runtime/turn/drive.rs",
+            name: "run_turn_verification",
+            max_lines: 752,
+        },
+        Grandfathered {
+            rel: "crates/cli/src/daemon/serve.rs",
+            name: "serve_impl",
+            max_lines: 688,
+        },
+        Grandfathered {
+            rel: "crates/index/src/service/mod.rs",
+            name: "run_build",
+            max_lines: 546,
+        },
+        Grandfathered {
+            rel: "crates/protocol/src/schema.rs",
+            name: "type_defs",
+            max_lines: 527,
+        },
+        Grandfathered {
+            rel: "crates/agent/src/runtime/compaction.rs",
+            name: "try_compact",
+            max_lines: 521,
+        },
+        Grandfathered {
+            rel: "crates/agent/src/runtime/verification_attribution.rs",
+            name: "run_independent_review_call",
+            max_lines: 516,
+        },
+    ];
+
+    /// Every production `fn` longer than `cap` in one source: the `fn` token
+    /// must sit in a kept (non-test) code range, carry a real identifier and
+    /// a brace-matched body (trait/`extern` signatures without a body are
+    /// skipped, and the `fn(…)` function-pointer type has no name and is
+    /// skipped too). Nested functions are reported on their own spans; the
+    /// enclosing function's span still includes them.
+    fn long_functions(
+        src: &str,
+        code: &[bool],
+        kept: &[(usize, usize)],
+        cap: usize,
+    ) -> Vec<LongFunction> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 2 <= bytes.len() {
+            if code[i] && bytes[i..].starts_with(b"fn") {
+                let prev_ok = i == 0 || {
+                    let p = bytes[i - 1];
+                    !(p.is_ascii_alphanumeric() || p == b'_')
+                };
+                let after = i + 2;
+                let next_ok = after < bytes.len()
+                    && !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                let in_kept = kept.iter().any(|(a, z)| i >= *a && i < *z);
+                if prev_ok && next_ok && in_kept {
+                    let mut k = after;
+                    while k < bytes.len() && (bytes[k] as char).is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    let name_start = k;
+                    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                    {
+                        k += 1;
+                    }
+                    let name = std::str::from_utf8(&bytes[name_start..k]).unwrap_or("");
+                    if !name.is_empty() {
+                        // Opening body brace at delimiter depth 0 (a `;` at
+                        // depth 0 is a body-less declaration).
+                        let mut depth = 0i32;
+                        let mut body = None;
+                        let mut m = k;
+                        while m < bytes.len() {
+                            if !code[m] {
+                                m += 1;
+                                continue;
+                            }
+                            match bytes[m] {
+                                b'(' | b'[' => depth += 1,
+                                b')' | b']' => depth -= 1,
+                                b';' if depth == 0 => break,
+                                b'{' if depth == 0 => {
+                                    body = Some(m);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                            m += 1;
+                        }
+                        if let Some(open) = body {
+                            let mut d = 0i32;
+                            let mut close = None;
+                            let mut m2 = open;
+                            while m2 < bytes.len() {
+                                if code[m2] {
+                                    if bytes[m2] == b'{' {
+                                        d += 1;
+                                    } else if bytes[m2] == b'}' {
+                                        d -= 1;
+                                        if d == 0 {
+                                            close = Some(m2);
+                                            break;
+                                        }
+                                    }
+                                }
+                                m2 += 1;
+                            }
+                            if let Some(end) = close {
+                                let start_line = line_of(src, i);
+                                let end_line = line_of(src, end);
+                                let lines = end_line + 1 - start_line;
+                                if lines > cap {
+                                    out.push(LongFunction {
+                                        rel: String::new(),
+                                        name: name.to_string(),
+                                        start_line,
+                                        end_line,
+                                        lines,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The full production inventory across `crates/*/src`.
+    fn long_function_inventory() -> Vec<LongFunction> {
+        let mut out = Vec::new();
+        for rel in walk_crate_sources() {
+            let Some(f) = load(&rel) else {
+                continue;
+            };
+            let mut hits = long_functions(f.src, &f.code, &f.kept, FUNCTION_LINE_CAP);
+            for hit in &mut hits {
+                hit.rel = f.rel.clone();
+            }
+            out.extend(hits);
+        }
+        out
+    }
+
+    /// The gate's verdict over an inventory: an unlisted function above the
+    /// cap is an offender, a grandfathered function that grew past its
+    /// recorded size is an offender, and a grandfathered entry that is no
+    /// longer above the cap is a STALE offender (the list is shrink-only).
+    fn long_function_offenders(
+        inventory: &[LongFunction],
+        grandfathers: &[Grandfathered],
+    ) -> Vec<String> {
+        let mut offenders = Vec::new();
+        for f in inventory {
+            match grandfathers
+                .iter()
+                .find(|g| g.rel == f.rel && g.name == f.name)
+            {
+                None => offenders.push(format!(
+                    "{}:{}: fn {} is {} lines (> cap {FUNCTION_LINE_CAP}); \
+                     split it along a phase boundary or shrink it",
+                    f.rel, f.start_line, f.name, f.lines
+                )),
+                Some(g) if f.lines > g.max_lines => offenders.push(format!(
+                    "{}:{}: grandfathered fn {} GREW to {} lines (recorded max {}); \
+                     the grandfather list is shrink-only",
+                    f.rel, f.start_line, f.name, f.lines, g.max_lines
+                )),
+                Some(_) => {}
+            }
+        }
+        for g in grandfathers {
+            let found = inventory
+                .iter()
+                .find(|f| f.rel == g.rel && f.name == g.name);
+            match found {
+                None => offenders.push(format!(
+                    "{}: grandfathered fn {} is no longer above the {FUNCTION_LINE_CAP}-line \
+                     cap (or vanished): remove the entry — the list is shrink-only",
+                    g.rel, g.name
+                )),
+                Some(f) if f.lines <= FUNCTION_LINE_CAP => offenders.push(format!(
+                    "{}: grandfathered fn {} shrank to {} lines: remove the entry — \
+                     the list is shrink-only",
+                    g.rel, g.name, f.lines
+                )),
+                Some(_) => {}
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn no_production_function_exceeds_the_cap_outside_the_shrink_only_grandfathers() {
+        let inventory = long_function_inventory();
+        // Liveness: the seven recorded giants must be FOUND by the scanner —
+        // the exact-list check below fails loudly if the mask/swing logic
+        // silently stops detecting functions, so an empty scan can never
+        // pass as "no offenders".
+        let offenders = long_function_offenders(&inventory, FUNCTION_GRANDFATHERS);
+        assert!(
+            offenders.is_empty(),
+            "function-length gate — violations:\n  {}\n",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn function_length_scan_fires_on_a_planted_giant_and_holds_the_cap_boundary() {
+        let exact = format!(
+            "fn exact() {{\n{}    let _ = 1;\n}}\n",
+            "    let _ = 1;\n".repeat(FUNCTION_LINE_CAP.saturating_sub(3))
+        );
+        let f = synthetic_file("crates/x/src/lib.rs", &exact);
+        assert_eq!(line_of(f.src, f.src.len() - 1), FUNCTION_LINE_CAP);
+        assert!(long_functions(f.src, &f.code, &f.kept, FUNCTION_LINE_CAP).is_empty());
+        let giant = format!(
+            "{exact}fn giant() {{\n{}    let _ = 1;\n}}\n",
+            "    let _ = 1;\n".repeat(FUNCTION_LINE_CAP - 2)
+        );
+        let f = synthetic_file("crates/x/src/lib.rs", &giant);
+        let hits = long_functions(f.src, &f.code, &f.kept, FUNCTION_LINE_CAP);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "giant");
+        assert_eq!(hits[0].lines, FUNCTION_LINE_CAP + 1);
+        // A body-less declaration is not a function body.
+        let declaration = "trait T {\n    fn declared(&self) -> u32;\n}\n";
+        let f = synthetic_file("crates/x/src/lib.rs", declaration);
+        assert!(long_functions(f.src, &f.code, &f.kept, FUNCTION_LINE_CAP).is_empty());
+        // A test-gated giant can never certify or fail production.
+        let gated = format!(
+            "#[cfg(test)]\nmod tests {{\n    fn gated() {{\n{}    }}\n}}\n",
+            "        let _ = 1;\n".repeat(FUNCTION_LINE_CAP + 1)
+        );
+        let f = synthetic_file("crates/x/src/lib.rs", &gated);
+        assert!(long_functions(f.src, &f.code, &f.kept, FUNCTION_LINE_CAP).is_empty());
+    }
+
+    #[test]
+    fn function_length_grandfather_list_is_exact_and_shrink_only() {
+        let giant = |rel: &str, name: &str, lines: usize| LongFunction {
+            rel: rel.to_string(),
+            name: name.to_string(),
+            start_line: 1,
+            end_line: lines,
+            lines,
+        };
+        let grandfathers = &[Grandfathered {
+            rel: "a.rs",
+            name: "big",
+            max_lines: 900,
+        }];
+        // A listed giant at its recorded size passes...
+        assert!(long_function_offenders(&[giant("a.rs", "big", 900)], grandfathers).is_empty());
+        // ...and may shrink (but stays listed while above the cap).
+        assert!(long_function_offenders(&[giant("a.rs", "big", 600)], grandfathers).is_empty());
+        // Growth past the recorded size fails.
+        let grew = long_function_offenders(&[giant("a.rs", "big", 901)], grandfathers);
+        assert_eq!(grew.len(), 1);
+        assert!(grew[0].contains("GREW"), "{grew:?}");
+        // An unlisted giant fails (the listed giant stays present, so the
+        // only offender is the new one).
+        let new = long_function_offenders(
+            &[giant("a.rs", "big", 600), giant("a.rs", "other", 700)],
+            grandfathers,
+        );
+        assert_eq!(new.len(), 1);
+        assert!(new[0].contains("fn other"), "{new:?}");
+        // A listed giant that reached the cap is a stale entry.
+        let retired = long_function_offenders(&[giant("a.rs", "big", 500)], grandfathers);
+        assert_eq!(retired.len(), 1);
+        assert!(retired[0].contains("shrink-only"), "{retired:?}");
+        // A vanished/renamed listed giant is a stale entry too.
+        let vanished = long_function_offenders(&[], grandfathers);
+        assert_eq!(vanished.len(), 1);
+        assert!(vanished[0].contains("no longer above"), "{vanished:?}");
     }
 }

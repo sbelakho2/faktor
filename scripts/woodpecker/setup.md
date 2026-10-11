@@ -240,21 +240,62 @@ secret. This is what makes a marker attributable to the lane that produced
 it, instead of self-asserted evidence any lane sharing the workspace could
 fabricate.
 
-The release attestation (`trusted.yaml`, step `attestation`) is signed or it
-does not exist: `scripts/certification/attestation.mjs create` exits 3 with
-the typed `signing-key-missing` refusal and writes no artifact when the key
-is absent, and `scripts/certify.sh` refuses unsigned objects anyway. To sign
-it: generate an ed25519 pair with `node scripts/certification/attestation.mjs
-keygen --out-key release.pem --out-keys release-keys.json --key-id
-faktor-ci-release`, store the private key as the trusted-project secret
-`faktor_attest_signing_key` (`activate.sh --secret
-faktor_attest_signing_key="$(cat release.pem)"`), add
-`environment: {FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
-faktor_attest_signing_key}, FAKTOR_ATTEST_SIGN_KEY_ID: faktor-ci-release}`
-to the step, and hand operators `release-keys.json` as `FAKTOR_ATTEST_KEYS`
-— never the private key. Sigstore/keyless signing of the same payload is the
-documented alternative when the instance can mint OIDC tokens
-(`docs/certification.md` §2.12).
+### 4.1 Build-attestation role (`faktor-ci-build`)
+
+The trusted workflow's `attestation` step signs the build artifact class
+(`faktor-build-attestation/v1`) with the BUILD identity `faktor-ci-build`.
+Register exactly one key for this role on the TRUSTED project:
+
+```sh
+node scripts/certification/attestation.mjs keygen \
+  --role build-attestation --out-key build.pem \
+  --out-keys build-keys.json --key-id faktor-ci-build
+bash scripts/woodpecker/activate.sh <owner/repo> \
+  --secret "faktor_attest_signing_key=$(cat build.pem)"
+# then commit build-keys.json's public key into
+# scripts/certification/attestation-keys.json under `faktor-ci-build`
+```
+
+The step maps the secret as `FAKTOR_ATTEST_SIGN_KEY_PEM` and sets
+`FAKTOR_ATTEST_SIGN_KEY_ID=faktor-ci-build`. Signing is fail-closed: without
+the secret the step exits 3 with the typed `signing-key-missing` refusal and
+writes no attestation. The build key MUST NOT sign release signatures:
+`verify-release` refuses that with the typed `signature-role-mismatch`.
+
+### 4.2 Release-signing role (`faktor-release-signing`) — operator runbook
+
+The trusted workflow's `release-signature` step signs the release
+artifact/certificate class (`faktor-release-signature/v1`), binding the
+exact build-attestation payload plus the release artifact digests, with the
+RELEASE identity `faktor-release-signing`. The pipeline mapping ships
+commented out because a `from_secret` reference to a not-yet-registered
+secret is a Woodpecker config compile error. Provision it in order:
+
+```sh
+# 1. generate the release keypair (on the operator machine, never in CI logs)
+node scripts/certification/attestation.mjs keygen \
+  --role release-signing --out-key release.pem \
+  --out-keys release-keys.json --key-id faktor-release-signing
+# 2. register the private key as its OWN trusted-project secret
+bash scripts/woodpecker/activate.sh <owner/repo> \
+  --secret "faktor_release_signing_key=$(cat release.pem)"
+# 3. paste only the PUBLIC key from release-keys.json into
+#    scripts/certification/attestation-keys.json under identity
+#    `faktor-release-signing`, and uncomment the
+#    FAKTOR_RELEASE_SIGN_KEY_PEM mapping in .woodpecker/trusted/trusted.yaml
+# 4. re-run the trusted pipeline; certify.sh then fetches the
+#    release-signature log block and verifies it with the release role
+```
+
+FAIL-CLOSED split (this checkout): the operator key registration above
+cannot be completed non-interactively from here, so the distinct release
+role is present in the allowlist with an EMPTY public key and
+`status: unprovisioned`. Until steps 1-3 are done, `release-signature`
+exits 3 with the typed `signing-key-missing` refusal, no release signature
+is published, and certification refuses the release class with the typed
+denial `release-signing role (release-signing) signature: absent` — a
+build attestation alone can never print a RELEASE CERTIFICATE. Never reuse
+`faktor_attest_signing_key` for this role.
 
 The same `attestation` step resolves the OBSERVED Woodpecker pipeline id
 before signing: certification binds `pipeline_id` to the API's own id for
@@ -267,6 +308,34 @@ project's environment/step `environment:` mapping; they are not secrets
 readable by PR code (untrusted projects get no such mapping). Without them
 the attestation step fails typed by design, exactly like the missing signing
 key.
+
+### 4.3 Signing-key rotation and revocation
+
+Each identity carries `role`, `status` and `valid_from` in
+`scripts/certification/attestation-keys.json`; verifiers require the role
+for the artifact class, so a key can only ever do the job its role names.
+
+- **Rotation (either role, same procedure).** Generate a new role keypair
+  (`keygen --role ...`), register it as the SAME secret name on the trusted
+  project (`activate.sh --secret NAME=VALUE` overwrites), paste the new
+  public key into the allowlist in the SAME commit, and set the retired
+  entry's `status` to `retired` (keep it until every artifact signed by it
+  has been superseded). Re-run the trusted pipeline and re-certify; old
+  attestations/release signatures then fail "identity is not on the
+  allowlist" — releases must be re-cut from the new pipeline, never
+  re-verified with the old key.
+- **Revocation (compromise).** Remove the identity entry from the allowlist
+  (or set `ed25519_public_key` to `""`) and delete/rotate the secret via
+  `PATCH /api/repos/<trusted_id>/secrets/<name>` (or Project settings →
+  Secrets). Removal is immediate and fail-closed: attestation/release
+  verification refuses the identity as not allowlisted, and an empty key
+  refuses with the typed `signature-role-key-missing`. Re-provision a fresh
+  keypair per §4.1/§4.2 before certifying again.
+- **Validity.** Record `valid_from` (and optionally `retired_at` in the
+  entry notes) with each rotation; a signed artifact is only as fresh as the
+  pipeline run it binds, so re-certify after every rotation rather than
+  trusting an old signature.
+
 
 Secrets are registered on the **trusted project only** (`activate.sh` targets
 it): a secret that exists for the untrusted PR project would be readable by

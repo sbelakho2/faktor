@@ -38,7 +38,7 @@
     "live-paid": {
       "workflow": "nightly",
       "step": "coding-benchmark-real-model",
-      "command": "cargo test -p faktor-tests-coding-benchmark --test real -- --ignored"
+      "command": "cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored"
     },
     "contention": {
       "workflow": "nightly",
@@ -156,6 +156,31 @@
       "file": "tests/performance/tests/contention.rs",
       "fn": "perf_multi_agent_contention_32_sessions",
       "lane": "contention"
+    },
+    {
+      "file": "crates/commerce-connectors/tests/live_canary.rs",
+      "fn": "live_paid_mouser_canary",
+      "lane": "live-paid"
+    },
+    {
+      "file": "crates/commerce-connectors/tests/live_canary.rs",
+      "fn": "live_paid_digikey_canary",
+      "lane": "live-paid"
+    },
+    {
+      "file": "crates/commerce-connectors/tests/live_canary.rs",
+      "fn": "live_paid_lcsc_canary",
+      "lane": "live-paid"
+    },
+    {
+      "file": "crates/commerce-connectors/tests/live_canary.rs",
+      "fn": "soak_live_china1688_browser_canary",
+      "lane": "live-paid"
+    },
+    {
+      "file": "crates/commerce-connectors/tests/live_canary.rs",
+      "fn": "soak_live_alibaba_browser_canary",
+      "lane": "live-paid"
     }
   ],
   "manual": [
@@ -170,12 +195,6 @@
       "fn": "soak_acquire_cache_breaker_and_quota_storm",
       "tag": "soak",
       "reason": "opt-in acquire cache/connector storm; the source file marks it 'never run in CI' \u2014 operator-run only"
-    },
-    {
-      "file": "crates/commerce-connectors/tests/security_certification.rs",
-      "fn": "soak_live_mouser_canary",
-      "tag": "soak",
-      "reason": "live network canary gated by FAKTOR_LIVE_MOUSER_KEY (live-paid class); never in CI"
     },
     {
       "file": "crates/fs/src/lib.rs",
@@ -230,12 +249,6 @@
       "fn": "soak_12h_scale",
       "tag": "soak",
       "reason": "legacy accelerated 10k-op scale shape; the nightly real-time convergence lane (scripts/soak.sh --mode realtime, exact-SHA) is the promoted acceptance run and skips this test; run explicitly only for the legacy synthetic shape"
-    },
-    {
-      "file": "tests/visual/tests/gen_fixtures.rs",
-      "fn": "gen_fixtures",
-      "tag": "visual",
-      "reason": "visual fixture regeneration (AGENTS.md [visual] category); run explicitly to regenerate"
     }
   ],
   "non_test": [

@@ -2,9 +2,11 @@
 // Assert that a packaged VSIX is self-contained: the Faktor-owned chat panel
 // (out/*.js + media/chat.js, media/chat.css, media/composer-state.js,
 // media/faktor.svg) must be inside the archive, and NO vendored upstream
-// closure / message-ABI bridge may ship. When an extraction directory is
-// given, the packaged panel files are checked for the strict-CSP and
-// marker invariants the runtime relies on.
+// closure / message-ABI bridge may ship. The archive must also carry the
+// license file the manifest's `license` field names (LICENSE.txt) and the
+// third-party notices (NOTICE) — an archive missing them is refused. When an
+// extraction directory is given, the packaged panel files are checked for
+// the strict-CSP and marker invariants the runtime relies on.
 //
 // Usage:
 //   node scripts/verify-vsix.mjs <vsix> [--min-media-files N]
@@ -134,10 +136,35 @@ function listEntries(vsix) {
   return entries;
 }
 
+/**
+ * The packaged extension must ship its license and third-party notices. The
+ * manifest's `license` field ("SEE LICENSE IN <file>") must name a file the
+ * archive actually contains — the historical defect was a pointer at a file
+ * the VSIX did not ship.
+ */
+const REQUIRED_LEGAL_FILES = ['LICENSE.txt', 'NOTICE'];
+
+function manifestLicenseTarget() {
+  const manifest = JSON.parse(readFileSync(APP_MANIFEST, 'utf8'));
+  const match = /^SEE LICENSE IN (.*)$/.exec(manifest.license || '');
+  return match && match[1] ? match[1] : null;
+}
+
 function archiveChecks(vsix, minMediaFiles) {
   const entries = listEntries(vsix);
   const names = new Set(entries.map((entry) => entry.name));
   check(names.has('extension/out/extension.js'), 'VSIX contains extension/out/extension.js');
+  const licenseTarget = manifestLicenseTarget();
+  check(licenseTarget !== null, 'package.json license field is a SEE LICENSE IN <file> pointer');
+  if (licenseTarget !== null) {
+    check(
+      names.has(`extension/${licenseTarget}`),
+      `VSIX contains the manifest license target extension/${licenseTarget}`,
+    );
+  }
+  for (const legal of REQUIRED_LEGAL_FILES) {
+    check(names.has(`extension/${legal}`), `VSIX contains extension/${legal}`);
+  }
   for (const relative of PANEL_FILES) {
     check(names.has(`extension/${relative}`), `VSIX contains ${relative}`);
   }
@@ -161,6 +188,20 @@ function archiveChecks(vsix, minMediaFiles) {
 }
 
 function extractedChecks(extensionDir) {
+  for (const legal of REQUIRED_LEGAL_FILES) {
+    const path = join(extensionDir, legal);
+    check(existsSync(path), `packaged extension has ${legal}`);
+    if (existsSync(path)) {
+      check(readFileSync(path, 'utf8').trim().length > 0, `packaged ${legal} must not be empty`);
+    }
+  }
+  const licenseTarget = manifestLicenseTarget();
+  if (licenseTarget !== null && existsSync(join(extensionDir, licenseTarget))) {
+    check(
+      readFileSync(join(extensionDir, licenseTarget), 'utf8').includes('Apache License'),
+      'the manifest license target carries the Apache-2.0 text',
+    );
+  }
   for (const relative of PANEL_FILES) {
     check(existsSync(join(extensionDir, relative)), `packaged extension has ${relative}`);
   }

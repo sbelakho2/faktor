@@ -13,6 +13,7 @@ package dev.faktor.frontend
 import dev.faktor.backend.BackendConnection
 import dev.faktor.backend.BackendException
 import dev.faktor.backend.BackendProcessManager
+import dev.faktor.backend.DaemonBinary
 import dev.faktor.backend.NativeClient
 import dev.faktor.backend.NativeEventStream
 import dev.faktor.backend.NativeSseEvent
@@ -69,9 +70,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Bridge facade over one daemon. All mutating calls are synchronized on the
  * lifecycle lock; a stopped service refuses every other call loudly.
+ *
+ * [resolveBinary] is invoked at every start (never at construction), so a
+ * missing daemon is an actionable refusal ON THE EXPLICIT START ACTION — the
+ * host can report it, offer "Locate daemon…", and retry — instead of a
+ * failure while the tool window is created. A fixed [Path] constructor is
+ * kept for embedders/tests that already hold an executable.
  */
 class FaktorFrontendService(
-    private val binaryPath: Path,
+    private val resolveBinary: () -> Path,
     private val dataDir: Path,
     /** The control-plane credential (`x-faktor-control-token`), when the
      * operator provisioned one; absent = the usage/credits panel renders the
@@ -80,6 +87,8 @@ class FaktorFrontendService(
      * from a product setting. */
     private var controlToken: String? = null
 ) {
+    constructor(binaryPath: Path, dataDir: Path, controlToken: String? = null) :
+        this({ binaryPath }, dataDir, controlToken)
     interface Listener {
         fun onDaemonStatus(status: String, detail: String?) {}
         fun onStreamStatus(status: String, detail: String?) {}
@@ -222,6 +231,15 @@ class FaktorFrontendService(
                     "a daemon is already live at ${existing.baseUrl}; refusing to spawn a second one"
                 )
             }
+        }
+        // Resolve on the explicit start action only: a missing daemon or a
+        // workspace/target path can never reach the spawn, and the resolved
+        // path is reported before anything starts.
+        val binaryPath = resolveBinary()
+        when (val trust = DaemonBinary.checksumTrust(binaryPath)) {
+            is DaemonBinary.Trust.Refused ->
+                throw BackendException("refusing to start the daemon: ${trust.detail}")
+            else -> {}
         }
         val mgr = BackendProcessManager(binaryPath, dataDir)
         listener?.onDaemonStatus("starting", binaryPath.toString())

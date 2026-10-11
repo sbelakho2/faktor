@@ -2823,11 +2823,21 @@ private data class TaskStartSubmission(
 object FaktorFrontendApp {
     @JvmStatic
     fun main(args: Array<String>) {
+        // Machine-scoped resolution only: an explicit CLI path, FAKTOR_BIN or
+        // the app-level signed install layout (~/.faktor/install). A
+        // repository target/ build is never a fallback.
         val binary = if (args.isNotEmpty()) {
             args[0]
         } else {
-            val env = System.getenv("FAKTOR_BIN")
-            if (env != null && env.isNotEmpty()) env else "target/debug/faktor-cli"
+            try {
+                dev.faktor.backend.DaemonBinary.resolve(
+                    null,
+                    java.nio.file.Paths.get(System.getProperty("user.home", "."))
+                ).executable.toString()
+            } catch (e: dev.faktor.backend.DaemonBinary.MissingDaemonException) {
+                System.err.println("[faktor] ${e.message}")
+                kotlin.system.exitProcess(2)
+            }
         }
         val dataDir = if (args.size > 1) {
             args[1]

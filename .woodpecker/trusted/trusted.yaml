@@ -108,9 +108,12 @@
 # Named volumes (cargo/gradle/npm/playwright caches) require the trusted
 # PROJECT (not just the repository) to be marked Trusted (volumes) by a
 # server admin; delete the `volumes:` lines if your instance cannot grant
-# that. The build/test lanes need no secrets; the final `attestation` step is
-# fail-closed and needs the `faktor_attest_signing_key` secret (see its
-# comment below) or it fails without writing an attestation.
+# that. The build/test lanes need no secrets; the two role-split signing
+# steps are fail-closed: `attestation` needs the build-role
+# `faktor_attest_signing_key` secret, and `release-signature` needs the
+# separate release-role `faktor_release_signing_key` secret (see each step's
+# comment below and scripts/woodpecker/setup.md §4). The two roles must
+# never share a key: a cross-role signature is refused typed.
 #
 # Bootstrap audit: the JetBrains smoke toolchain is installed from the pinned
 # rustup-init binary after verifying its published SHA-256; no step pipes a
@@ -254,6 +257,12 @@ steps:
       - rustup show active-toolchain
       - rustup component add rustfmt clippy
       - cargo fmt --check
+      # Both seam profiles: the fault campaign package enables
+      # `fault-injection` by default, so the production profile is the
+      # workspace WITHOUT it; the artifact proof asserts seam payloads are
+      # absent there and present under the feature.
+      - cargo check --workspace --exclude faktor-tests-fault
+      - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
       - cargo test --workspace --all-features
@@ -270,6 +279,8 @@ steps:
         rustup show active-toolchain
         rustup component add rustfmt clippy
         cargo fmt --check
+        cargo check --workspace --exclude faktor-tests-fault
+        sh scripts/check-fault-seams.sh
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo test --workspace --all-features
@@ -1037,20 +1048,26 @@ steps:
   # lookup FAILS CLOSED with the typed `observed-pipeline-id-lookup-failed`
   # error — the pipeline number is never copied into the id field.
   #
-  # FAIL-CLOSED SIGNING (operator): the ed25519 private key is registered on
-  # the TRUSTED project as the secret `faktor_attest_signing_key` and mapped
-  # into this step below. Without the secret the step FAILS with the typed
-  # `signing-key-missing` error and writes NO attestation artifact — an
-  # unsigned attestation cannot be produced. Generate the keypair with
-  # `node scripts/certification/attestation.mjs keygen --out-key release.pem
-  # --out-keys release-keys.json --key-id faktor-ci`, store the private key
-  # only in the Woodpecker secret, and keep the public key in the repo
-  # allowlist `scripts/certification/attestation-keys.json` (identities
-  # `faktor-ci` and `faktor`); certify.sh verifies against that allowlist
-  # (FAKTOR_ATTEST_KEYS). The documented alternative path is Sigstore/keyless
-  # signing of the same payload with the pipeline's OIDC identity
-  # (docs/certification.md §2.12); this step then stays unconfigured and
-  # certify.sh keeps requiring the allowlisted ed25519 path.
+  # ROLE SPLIT (build role): this step signs the BUILD artifact class only,
+  # with the BUILD identity `faktor-ci-build` (role `build-attestation`).
+  # FAIL-CLOSED SIGNING (operator): the build ed25519 private key is
+  # registered on the TRUSTED project as the secret
+  # `faktor_attest_signing_key` and mapped into this step below. Without the
+  # secret the step FAILS with the typed `signing-key-missing` error and
+  # writes NO attestation artifact — an unsigned attestation cannot be
+  # produced. Generate the keypair with `node
+  # scripts/certification/attestation.mjs keygen --role build-attestation
+  # --out-key build.pem --out-keys build-keys.json --key-id faktor-ci-build`,
+  # store the private key only in the Woodpecker secret, and keep the public
+  # key in the repo allowlist `scripts/certification/attestation-keys.json`
+  # (identity `faktor-ci-build`); certify.sh verifies against that allowlist
+  # (FAKTOR_ATTEST_KEYS) and REQUIRES the build role for this class. NEVER
+  # reuse the release-signing key here: a build attestation signed by the
+  # release key is refused typed (`signature-role-mismatch`). The documented
+  # alternative path is Sigstore/keyless signing of the same payload with the
+  # pipeline's OIDC identity (docs/certification.md §2.12); this step then
+  # stays unconfigured and certify.sh keeps requiring the allowlisted ed25519
+  # path.
   - name: attestation
     image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
     depends_on:
@@ -1060,8 +1077,11 @@ steps:
         platform: linux/amd64
       status: [success]
     environment:
+      # Build role only: the secret holds the `faktor-ci-build` private key
+      # (role build-attestation). The release-signing key is a SEPARATE
+      # secret used only by the `release-signature` step below.
       FAKTOR_ATTEST_SIGN_KEY_PEM: { from_secret: faktor_attest_signing_key }
-      FAKTOR_ATTEST_SIGN_KEY_ID: faktor-ci
+      FAKTOR_ATTEST_SIGN_KEY_ID: faktor-ci-build
       WOODPECKER_HOST: { from_secret: faktor_woodpecker_host }
       WOODPECKER_TOKEN: { from_secret: faktor_woodpecker_token }
     commands:
@@ -1111,6 +1131,59 @@ steps:
           --ci-image-ref "ghcr.io/sbelakho2/faktor-ci@$(grep -oE 'sha256:[0-9a-f]{64}' docker/faktor-ci/image-digest.txt | head -n 1)" \
           --from-lanes target/certification/lanes \
           --key-id "$FAKTOR_ATTEST_SIGN_KEY_ID" \
+          --emit-log-block
+
+  # Release-signing role (role split, fail-closed): signs the RELEASE
+  # artifact/certificate class (`faktor-release-signature/v1`) with the
+  # separate RELEASE identity `faktor-release-signing` (role
+  # `release-signing`). The object binds the EXACT build attestation produced
+  # above (canonical-payload digest + every binding field) and the release
+  # artifact digests; scripts/certify.sh fetches it from this step's log and
+  # verifies it with the release role — a release signature made with the
+  # build key, or a build attestation made with the release key, is refused
+  # typed (`signature-role-mismatch`), and without a verified release
+  # signature no RELEASE CERTIFICATE can be printed (source class only).
+  #
+  # OPERATOR RUNBOOK (scripts/woodpecker/setup.md §4, release-signing role):
+  #   1. node scripts/certification/attestation.mjs keygen \
+  #        --role release-signing --out-key release.pem \
+  #        --out-keys release-keys.json --key-id faktor-release-signing
+  #   2. bash scripts/woodpecker/activate.sh <owner/repo> \
+  #        --secret "faktor_release_signing_key=$(cat release.pem)"
+  #   3. paste release-keys.json's public key into the allowlist
+  #      `scripts/certification/attestation-keys.json` under identity
+  #      `faktor-release-signing`, and UNCOMMENT the mapping below.
+  #
+  # FAIL-CLOSED: the mapping ships commented because a `from_secret` to a
+  # not-yet-registered secret is a Woodpecker config compile error; until the
+  # operator completes steps 1-3 this step exits 3 with the typed
+  # `signing-key-missing` refusal, publishes NO release signature, and
+  # certify.sh refuses the release class (the build/test lanes and the build
+  # attestation are unaffected). Never store the release private key in the
+  # `faktor_attest_signing_key` secret.
+  - name: release-signature
+    image: node:24@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 # node:24 @ 2026-09-23
+    depends_on:
+      - attestation
+    when:
+      matrix:
+        platform: linux/amd64
+      status: [success]
+    environment:
+      # FAKTOR_RELEASE_SIGN_KEY_PEM: { from_secret: faktor_release_signing_key }
+      FAKTOR_RELEASE_SIGN_KEY_ID: faktor-release-signing
+    commands:
+      - |
+        set -eu
+        if [ -z "${FAKTOR_RELEASE_SIGN_KEY_PEM:-}" ]; then
+          echo "signing-key-missing: the release-signing role key is not configured (FAKTOR_RELEASE_SIGN_KEY_PEM from the trusted-project secret faktor_release_signing_key); releasing is refused fail-closed. Register the secret and enable the mapping per scripts/woodpecker/setup.md §4 (release-signing role)." >&2
+          exit 3
+        fi
+        node scripts/certification/attestation.mjs create-release \
+          --out target/certification/release-signature.json \
+          --attestation target/certification/attestation/trusted-build-attestation.json \
+          --repo "$CI_REPO" \
+          --key-id "$FAKTOR_RELEASE_SIGN_KEY_ID" \
           --emit-log-block
   - name: certificate-darwin
     image: bash # digest-exempt: local-backend darwin agent executes the macOS host shell directly; no container image is pulled

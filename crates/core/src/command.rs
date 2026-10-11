@@ -16,6 +16,7 @@
 //! `cmd.exe` on Windows (a configured platform shell overrides that).
 
 use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::Error;
@@ -24,6 +25,124 @@ use crate::error::Error;
 /// interactive credential input. It is only added when the spec does not set
 /// its own value.
 pub const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
+
+/// Every environment name that anchors credential discovery to a HOME: the
+/// unix `HOME`, the Windows `USERPROFILE`, and the XDG base directories.
+/// Agent children get these pointed at a per-session SCRATCH home by default
+/// (see [`EnvSpec::toolchain_with_home`] and the terminal supervisor's
+/// `prepare_agent_home`); only an explicit operator grant passes the real
+/// HOME through.
+pub const HOME_ENV_NAMES: &[&str] = &[
+    "HOME",
+    "USERPROFILE",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
+
+/// The credential stores a real HOME carries — relative subpaths of the
+/// well-known secret-bearing locations a granted shell would harvest first:
+/// SSH keys, AWS credentials, gcloud application-default credentials, netrc
+/// and git credential stores. OS-level confinement must never grant any of
+/// these (they are denied by default for the whole process tree wherever a
+/// confinement backend is installed); platforms without a backend rely on
+/// the scratch HOME keeping them off `$HOME` and document that limitation.
+pub const CREDENTIAL_HOME_SUBPATHS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".config/gcloud",
+    ".netrc",
+    ".git-credentials",
+];
+
+/// The typed HOME contract of agent children: a per-session scratch HOME by
+/// default, or the real HOME ONLY through an explicit operator grant.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHomePolicy {
+    /// The default: agent children (shell tools, verification checks) see a
+    /// per-session scratch HOME under the daemon data dir. `$HOME`-relative
+    /// credential discovery finds nothing; the real home is not passed.
+    #[default]
+    Scratch,
+    /// The explicit operator grant: the daemon passes its real HOME (and
+    /// USERPROFILE/XDG) through. Never selected implicitly; recorded as an
+    /// explicit operator choice. Credential directories are still denied by
+    /// OS-level confinement wherever a confinement backend is installed.
+    OperatorRealHome,
+}
+
+impl AgentHomePolicy {
+    /// The stable snake_case tag (also the serde tag).
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            AgentHomePolicy::Scratch => "scratch",
+            AgentHomePolicy::OperatorRealHome => "operator_real_home",
+        }
+    }
+
+    /// True when the real daemon HOME passes through (explicit grant only).
+    pub const fn passes_real_home(self) -> bool {
+        matches!(self, AgentHomePolicy::OperatorRealHome)
+    }
+}
+
+/// The exact scratch values for every [`HOME_ENV_NAMES`] anchor under
+/// `home`: HOME/USERPROFILE are the scratch home itself, the XDG dirs are
+/// the conventional subdirectories (empty at session start).
+pub fn scratch_home_env(home: &Path) -> Vec<(OsString, OsString)> {
+    vec![
+        ("HOME".into(), home.as_os_str().to_os_string()),
+        ("USERPROFILE".into(), home.as_os_str().to_os_string()),
+        ("XDG_CONFIG_HOME".into(), home.join(".config").into()),
+        ("XDG_CACHE_HOME".into(), home.join(".cache").into()),
+        (
+            "XDG_DATA_HOME".into(),
+            home.join(".local").join("share").into(),
+        ),
+        (
+            "XDG_STATE_HOME".into(),
+            home.join(".local").join("state").into(),
+        ),
+    ]
+}
+
+/// Overlay the scratch-home anchors onto an already-resolved environment:
+/// every existing [`HOME_ENV_NAMES`] entry (case-insensitive, matching the
+/// [`EnvSpec::resolve`] dedupe rule) is replaced in place and absent anchors
+/// are appended. Values of every other name are untouched.
+pub fn apply_scratch_home(env: &mut Vec<(OsString, OsString)>, home: &Path) {
+    for (name, value) in scratch_home_env(home) {
+        match env
+            .iter_mut()
+            .find(|(existing, _)| env_name_eq(existing, &name))
+        {
+            Some(slot) => slot.1 = value,
+            None => env.push((name, value)),
+        }
+    }
+}
+
+/// The credential paths a real `home` carries (see
+/// [`CREDENTIAL_HOME_SUBPATHS`]). Callers hand these to the confinement
+/// policy so no granted root can ever cover them.
+pub fn credential_paths_for_home(home: &Path) -> Vec<PathBuf> {
+    CREDENTIAL_HOME_SUBPATHS
+        .iter()
+        .map(|subpath| home.join(subpath))
+        .collect()
+}
+
+/// True when path components of `outer` and `inner` overlap in either
+/// direction: `outer == inner`, `inner` is beneath `outer`, or `outer` is
+/// beneath `inner`. Pure lexical comparison over `Path::components`, so it
+/// never touches the filesystem and cannot be fooled by spelling (`a/./b`).
+pub fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
 
 /// Environment names copied from the daemon for ordinary tool children
 /// (PATH resolution and the platform bits tools need). Nothing secret-shaped
@@ -122,6 +241,12 @@ impl EnvSpec {
     /// platform bits (TMPDIR/TEMP/TMP, locale, terminal). The deny-set
     /// still removes secret-shaped names. This is the default environment
     /// for verification checks and generated toolchain commands.
+    ///
+    /// CAUTION: this passes the DAEMON's real HOME through. Agent children
+    /// (shell tools, verification) must use [`EnvSpec::toolchain_with_home`]
+    /// (the scratch-HOME form) instead — the terminal supervisor rewrites
+    /// the anchors at spawn; this raw form exists for trusted non-agent
+    /// callers.
     pub fn toolchain() -> EnvSpec {
         EnvSpec::Allowlisted(
             TOOLCHAIN_ENV_ALLOWLIST
@@ -129,6 +254,23 @@ impl EnvSpec {
                 .map(|s| (*s).to_string())
                 .collect(),
         )
+    }
+
+    /// The SCRATCH-HOME agent-child baseline: exactly [`EnvSpec::toolchain`]
+    /// except every [`HOME_ENV_NAMES`] anchor (HOME, USERPROFILE, XDG_*) is
+    /// set to the caller's scratch home instead of being copied from the
+    /// daemon. A granted shell's `$HOME`-relative credential discovery
+    /// (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.netrc`,
+    /// `~/.git-credentials`) therefore finds nothing. PATH, the approved
+    /// toolchain homes and the platform bits are unchanged.
+    pub fn toolchain_with_home(home: &Path) -> EnvSpec {
+        let mut entries: Vec<(OsString, OsString)> = TOOLCHAIN_ENV_ALLOWLIST
+            .iter()
+            .filter(|name| !HOME_ENV_NAMES.contains(name))
+            .map(|name| ((*name).into(), OsString::new()))
+            .collect();
+        entries.extend(scratch_home_env(home));
+        EnvSpec::Explicit(entries)
     }
 
     /// The entries as DECLARED by the spec, before deny-set filtering and
@@ -653,6 +795,121 @@ mod tests {
         declared.retain(|(k, _)| k.as_os_str() != OsStr::new("nope"));
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].0.as_os_str(), OsStr::new("KEY"));
+    }
+
+    #[test]
+    fn scratch_home_replaces_every_anchor_and_never_passes_the_real_home() {
+        let home = Path::new("/tmp/faktor-scratch-home-test");
+        let spec = EnvSpec::toolchain_with_home(home);
+        let resolved = spec.resolve();
+        let value = |name: &str| {
+            resolved
+                .iter()
+                .find(|(k, _)| k == OsStr::new(name))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(value("HOME"), Some(home.as_os_str().to_os_string()));
+        assert_eq!(value("USERPROFILE"), Some(home.as_os_str().to_os_string()));
+        assert_eq!(
+            value("XDG_CONFIG_HOME"),
+            Some(home.join(".config").into_os_string())
+        );
+        assert_eq!(
+            value("XDG_CACHE_HOME"),
+            Some(home.join(".cache").into_os_string())
+        );
+        assert_eq!(
+            value("XDG_DATA_HOME"),
+            Some(home.join(".local").join("share").into_os_string())
+        );
+        assert_eq!(
+            value("XDG_STATE_HOME"),
+            Some(home.join(".local").join("state").into_os_string())
+        );
+        assert_eq!(value("PATH"), std::env::var_os("PATH"));
+        assert!(
+            !resolved
+                .iter()
+                .any(|(k, v)| k == OsStr::new("HOME") && v == OsStr::new("/daemon/real/home")),
+            "the real daemon HOME must never resolve into the scratch spec: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn apply_scratch_home_replaces_in_place_and_appends_missing_anchors() {
+        let mut env: Vec<(OsString, OsString)> = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/real/home".into()),
+            ("XDG_CONFIG_HOME".into(), "/real/config".into()),
+        ];
+        apply_scratch_home(&mut env, Path::new("/scratch/home"));
+        let value = |name: &str| {
+            env.iter()
+                .find(|(k, _)| k == OsStr::new(name))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(value("PATH"), Some(OsString::from("/usr/bin")));
+        assert_eq!(value("HOME"), Some(OsString::from("/scratch/home")));
+        assert_eq!(
+            value("XDG_CONFIG_HOME"),
+            Some(OsString::from("/scratch/home/.config"))
+        );
+        assert_eq!(
+            value("USERPROFILE"),
+            Some(OsString::from("/scratch/home")),
+            "absent anchors are appended"
+        );
+        assert_eq!(env.len(), 7, "no duplicate anchors: {env:?}");
+    }
+
+    #[test]
+    fn credential_paths_and_overlap_are_pure_component_math() {
+        let paths = credential_paths_for_home(Path::new("/home/op"));
+        assert!(paths.contains(&PathBuf::from("/home/op/.ssh")));
+        assert!(paths.contains(&PathBuf::from("/home/op/.aws")));
+        assert!(paths.contains(&PathBuf::from("/home/op/.config/gcloud")));
+        assert!(paths.contains(&PathBuf::from("/home/op/.netrc")));
+        assert!(paths.contains(&PathBuf::from("/home/op/.git-credentials")));
+        // A workspace root covering the credential dir overlaps; a sibling
+        // that merely shares a string prefix does not.
+        assert!(paths_overlap(
+            Path::new("/home/op"),
+            Path::new("/home/op/.ssh")
+        ));
+        assert!(paths_overlap(
+            Path::new("/home/op/.ssh"),
+            Path::new("/home/op/.ssh/keys")
+        ));
+        assert!(paths_overlap(
+            Path::new("/home/op/.ssh"),
+            Path::new("/home/op/.ssh")
+        ));
+        assert!(!paths_overlap(
+            Path::new("/home/op/project"),
+            Path::new("/home/op/.ssh")
+        ));
+        assert!(
+            !paths_overlap(Path::new("/home/op/.ssh2"), Path::new("/home/op/.ssh")),
+            "component-wise, never substring"
+        );
+    }
+
+    #[test]
+    fn agent_home_policy_defaults_to_scratch_and_serializes_typed() {
+        assert_eq!(AgentHomePolicy::default(), AgentHomePolicy::Scratch);
+        assert_eq!(AgentHomePolicy::Scratch.as_tag(), "scratch");
+        assert_eq!(
+            AgentHomePolicy::OperatorRealHome.as_tag(),
+            "operator_real_home"
+        );
+        assert!(!AgentHomePolicy::Scratch.passes_real_home());
+        assert!(AgentHomePolicy::OperatorRealHome.passes_real_home());
+        let json = serde_json::to_string(&AgentHomePolicy::OperatorRealHome).unwrap();
+        assert_eq!(json, "\"operator_real_home\"");
+        let back: AgentHomePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, AgentHomePolicy::OperatorRealHome);
+        // A hostile/unknown spelling is a parse error, never a silent grant.
+        assert!(serde_json::from_str::<AgentHomePolicy>("\"real_home\"").is_err());
     }
 
     #[test]

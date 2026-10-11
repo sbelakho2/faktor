@@ -213,6 +213,7 @@ pub enum ExecError {
     /// safely retried (which is why `let _ =` on these paths is forbidden).
     #[error("retriable persistence failure during {operation}: {message}")]
     RetriablePersistence { operation: String, message: String },
+    #[cfg(any(test, feature = "fault-injection"))]
     #[error("injected crash seam {0} (test seam; durable state left as-is for re-attach)")]
     InjectedCrashSeam(String),
     /// The commercial admission gate refused a NEW task/child/attempt at a
@@ -291,52 +292,10 @@ impl From<faktor_core::Error> for ExecError {
     }
 }
 
-/// Deterministic crash seams (adversarial tests only): execution returns
-/// [`ExecError::InjectedCrashSeam`] at the FIRST matching point, leaving
-/// every durable row exactly as a real crash would.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrashSeam {
-    /// After the child session + registry rows exist, before its first
-    /// drive is submitted.
-    BeforeDrive,
-    /// After a child reached its terminal state and its durable rows were
-    /// settled, before the parent continuation admits further work.
-    AfterChildTerminal,
-    /// Controlled merge: fires after the durable in-flight merge record was
-    /// written, before any file apply (approve_and_merge crash window).
-    AfterMergeRecord,
-    /// Controlled merge: fires once `after` files of the apply loop were
-    /// processed (any outcome), leaving a partially applied merge that a
-    /// replay must reconcile through the CAS.
-    MergeApply { after: usize },
-    /// Wave A3: fires right after the run's work-item → child assignment
-    /// rows committed, BEFORE any child spawn. Re-open must resume with the
-    /// SAME child ids (the assignment rows are durable; nothing was minted
-    /// at spawn).
-    AfterAssignmentsPersisted,
-    /// Settlement: fires after the immutable run base was recorded, BEFORE
-    /// any child spawn (the run is re-openable from the durable base row).
-    AfterRunBaseRecorded,
-    /// Settlement: fires after the child change sets were staged and the
-    /// candidate was composed, before any verification runs.
-    AfterCandidatePrepared,
-    /// Settlement: fires after a passing verification record + fact landed,
-    /// before the landing transaction's first durable row.
-    AfterPreparedVerification,
-    /// Settlement: fires after the landing transaction's record-first row
-    /// committed, before the first owner write.
-    AfterIntegrationTxnRecord,
-    /// Settlement: fires once `after` owner paths of the landing apply loop
-    /// were processed (any outcome), leaving a recoverable partial landing.
-    IntegrationApply { after: usize },
-    /// Settlement: fires while a rollback loop is running.
-    DuringRollback,
-    /// Settlement: fires after the landed owner digest was computed, before
-    /// the overall integration record is finalized.
-    AfterFinalOwnerSnapshot,
-    /// Settlement: fires before `complete_verified_task` is consumed.
-    BeforeTaskCompletion,
-}
+/// Deterministic crash seams (adversarial tests / `fault-injection` builds
+/// only) re-exported at their historical path; see [`crate::seam::CrashSeam`].
+#[cfg(any(test, feature = "fault-injection"))]
+pub use crate::seam::CrashSeam;
 
 /// Directories the immutable run-base copy never walks (VCS bookkeeping is
 /// daemon/owner bookkeeping, never content the root snapshot digests).
@@ -749,6 +708,7 @@ pub struct ExecConfig {
     pub default_model: String,
     /// Root under which isolated child workspaces are created.
     pub isolated_root: PathBuf,
+    #[cfg(any(test, feature = "fault-injection"))]
     pub crash_seam: Option<CrashSeam>,
 }
 
@@ -780,6 +740,7 @@ struct ExecState {
     /// Outcomes written by the drive closures, keyed by scheduler op id.
     outcomes: Arc<Mutex<HashMap<OpId, DriveResult>>>,
     next_child_seq: u64,
+    #[cfg(any(test, feature = "fault-injection"))]
     crash_fired: bool,
     /// The IMMUTABLE run-base generation of the run (its snapshot hash),
     /// loaded from the durable record before any spawn; every isolated
@@ -802,10 +763,7 @@ struct ExecState {
 /// guard is recovered with the poison flag cleared so one panicking caller
 /// can never wedge child execution; the durable rows remain the authority.
 pub(crate) fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    lock.lock().unwrap_or_else(|poisoned| {
-        lock.clear_poison();
-        poisoned.into_inner()
-    })
+    faktor_core::lock::recover(lock)
 }
 
 /// The orchestration runtime: the manager + agent it drives children with,
@@ -1636,6 +1594,7 @@ impl OrchestratorRuntime {
         self.install_run(state)?;
         // Crash seam: this exact window — assignments durable, no child
         // spawned yet — must re-open with the SAME child ids.
+        #[cfg(any(test, feature = "fault-injection"))]
         {
             let mut guard = recover_lock(&self.exec);
             let exec = guard.get_mut(&run_id).expect("execution installed above");
@@ -1657,7 +1616,7 @@ impl OrchestratorRuntime {
         parent_caps: CapabilitySet,
         default_model: String,
         isolated_root: PathBuf,
-        crash_seam: Option<CrashSeam>,
+        #[cfg(any(test, feature = "fault-injection"))] crash_seam: Option<CrashSeam>,
     ) -> Result<PlanOutcome, ExecError> {
         ceilings.validate().map_err(ExecError::InvalidPlan)?;
         let DurablePlanRow {
@@ -1698,6 +1657,7 @@ impl OrchestratorRuntime {
                 default_model
             },
             isolated_root: durable_root,
+            #[cfg(any(test, feature = "fault-injection"))]
             crash_seam,
         };
         let mut state = self.build_exec_state(plan, owner, config, specs);
@@ -2046,6 +2006,7 @@ impl OrchestratorRuntime {
             drive_ops: HashMap::new(),
             outcomes: Arc::new(Mutex::new(HashMap::new())),
             next_child_seq,
+            #[cfg(any(test, feature = "fault-injection"))]
             crash_fired: false,
             run_base_snapshot: None,
             run_base_root: None,
@@ -2210,6 +2171,7 @@ impl OrchestratorRuntime {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "fault-injection"))]
     fn check_crash(&self, exec: &mut ExecState, seam: CrashSeam) -> Result<(), ExecError> {
         if exec.crash_fired || exec.config.crash_seam != Some(seam) {
             return Ok(());
@@ -2338,7 +2300,10 @@ impl OrchestratorRuntime {
         state.item_states = item_states;
         state.next_child_seq = max_seq;
         state.drive_ops = HashMap::new();
-        state.crash_fired = false;
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            state.crash_fired = false;
+        }
         Ok(())
     }
 
@@ -2516,6 +2481,7 @@ impl OrchestratorRuntime {
             self.advance_item(run_id, &child_id, &row)?;
         }
         // Crash seam: a child just reached terminal state.
+        #[cfg(any(test, feature = "fault-injection"))]
         {
             let terminal_child = {
                 let guard = recover_lock(&self.exec);
@@ -2717,6 +2683,7 @@ impl OrchestratorRuntime {
         // Crash seam BeforeDrive fires per spawned child BEFORE its drive is
         // submitted (the child session + registry rows already exist).
         for child in &newly_spawned {
+            #[cfg(any(test, feature = "fault-injection"))]
             self.check_crash_seam_before_drive(run_id)?;
             self.submit_drive_op(run_id, scheduler, child)?;
         }
@@ -2823,6 +2790,7 @@ impl OrchestratorRuntime {
         Ok(admitted)
     }
 
+    #[cfg(any(test, feature = "fault-injection"))]
     fn check_crash_seam_before_drive(&self, run_id: &str) -> Result<(), ExecError> {
         let mut guard = recover_lock(&self.exec);
         let exec = guard

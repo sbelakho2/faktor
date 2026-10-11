@@ -13,6 +13,10 @@
 #         UI corpus or pin manifest, no bridge, no VSIX staging step) =>
 #         the docs may not claim a vendored/upstream UI or a compatibility
 #         bundle; README.md must state the Faktor-owned panel;
+#   - crate-level `//!` headers contradict the tree: an explicit list of
+#     known-stale header phrases (I/O posture, compatibility surfaces, API
+#     shape) is refused, and every rule's code anchor is re-checked so a
+#     stale rule is loud rather than silently rotting.
 # Stale/contradicting docs are a review-rejected artifact: drift must be
 # loud, never silent.
 #
@@ -319,6 +323,58 @@ for doc in "${NEUTRALITY_DOCS[@]}"; do
     done
 done
 
+# ------------------------------------------------------- crate doc headers
+#
+# A crate's leading `//!` header is a claim surface too: when it describes
+# the crate's I/O posture, API shape or compatibility surface, the claim must
+# match the tree. Every rule below is an EXPLICIT known-stale phrase pinned to
+# the code fact that made it false:
+#
+#   * the phrase is refused when it reappears in the crate's header;
+#   * the anchor is re-checked, so a rule whose reality changed again fails as
+#     STALE RULE and gets re-reviewed instead of rotting silently.
+#
+# The list is deliberately narrow and phrase-exact. A keyword scan for words
+# like "pure", "no I/O" or "synchronous" would flag honest prose in other
+# crates that still holds; only contradictions are listed here.
+crate_header() {
+    awk 'NR == 1 && $0 !~ /^\/\// { exit } /^\/\// { print; next } { exit }' "$1"
+}
+
+header_claim_rule() {
+    local file="$1" stale="$2" anchor_file="$3" anchor="$4" why="$5" header
+    [ -f "$file" ] || return 0
+    header="$(crate_header "$file")"
+    if printf '%s\n' "$header" | grep -Fqi "$stale"; then
+        echo "STALE HEADER: $file still claims '$stale' ($why)" >&2
+        printf '%s\n' "$header" | grep -Fn -i "$stale" >&2 || true
+        fail=1
+    fi
+    if ! grep -Fq "$anchor" "$anchor_file" 2>/dev/null; then
+        echo "STALE RULE: anchor '$anchor' for header claim '$stale' is gone from $anchor_file — re-review the header and this rule" >&2
+        fail=1
+    fi
+}
+
+header_claim_rule crates/core/src/lib.rs \
+    'and no I/O' crates/core/src/command.rs 'std::fs::write' \
+    'core materializes the Windows cmd script under the system temp dir'
+header_claim_rule crates/orchestrator/src/lib.rs \
+    'never spawns processes' crates/orchestrator/src/completion_steps.rs 'ProcessSupervisor' \
+    'completion steps run supervised git/PR children through faktor-terminal'
+header_claim_rule crates/orchestrator/src/lib.rs \
+    'never touches sessions or files' crates/orchestrator/src/runtime.rs 'std::fs::create_dir_all' \
+    'the orchestrator runtime creates isolated child worktree directories'
+header_claim_rule crates/orchestrator/src/lib.rs \
+    'holds no I/O' crates/orchestrator/src/graph.rs 'SessionManager' \
+    'the runtime layer drives real child sessions and processes'
+header_claim_rule crates/acp/src/lib.rs \
+    'legacy compat surface' crates/acp/src/protocol.rs 'Framing::ContentLength' \
+    'the only legacy surface is wire framing, described separately in the header'
+header_claim_rule crates/session/src/lib.rs \
+    'deliberately **synchronous**' crates/session/src/actor.rs 'pub async fn append_message' \
+    'the hot append path awaits the supervised async DbActor'
+
 if [ "$fail" -ne 0 ]; then
     echo "$DOC / ${TRUTH_DOCS[*]} are out of sync with the code — fix the items listed above before merging." >&2
     exit 1
@@ -326,4 +382,5 @@ fi
 
 echo "docs/architecture.md is in sync: no stale identifiers, current API names present."
 echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, Faktor-owned UI, real apps/ panels, capability axes)."
+echo "crate doc headers match the tree: no known-stale claim phrase, every header rule's code anchor present."
 echo "normative docs + README.md are provider-neutral: no unconditional Tangerine/Kiwi mandate (neutral SystemIntelligenceProvider/VerificationProvider interfaces present)."

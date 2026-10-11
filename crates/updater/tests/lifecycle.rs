@@ -12,10 +12,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use faktor_updater::{
-    manifest, ApplyOutcome, Artifact, Channel, Compatibility, InstallLayout, InstallPointer,
-    ManifestRefusal, MemoryUpdaterStore, RecoveryOutcome, RunningComponents, TrustedKey,
-    TrustedKeys, UpdateError, UpdateOpKind, UpdateOpStatus, UpdateOperation, UpdateStoreError,
-    Updater, UpdaterConfig, UpdaterStore, VersionRange,
+    manifest, ApplyOutcome, Artifact, Channel, Compatibility, DataStoreSchema, InstallLayout,
+    InstallPointer, ManifestRefusal, MemoryUpdaterStore, RecoveryOutcome, RunningComponents,
+    TrustedKey, TrustedKeys, UpdateError, UpdateOpKind, UpdateOpStatus, UpdateOperation,
+    UpdateStoreError, Updater, UpdaterConfig, UpdaterStore, VersionRange,
 };
 
 // ------------------------------------------------------------- test harness
@@ -92,13 +92,21 @@ impl faktor_updater::ArtifactFetcher for FakeFetcher {
 #[derive(Default)]
 struct ScriptedProbe {
     results: Mutex<VecDeque<Result<(), String>>>,
+    schema: Mutex<Option<DataStoreSchema>>,
 }
 
 impl ScriptedProbe {
     fn scripted(results: impl IntoIterator<Item = Result<(), String>>) -> Self {
         ScriptedProbe {
             results: Mutex::new(results.into_iter().collect()),
+            schema: Mutex::new(None),
         }
+    }
+
+    /// Set the data-store schema observation the probe reports (the default
+    /// is `None`: the rollback schema guard stays inert).
+    fn set_schema(&self, schema: Option<DataStoreSchema>) {
+        *self.schema.lock().unwrap() = schema;
     }
 }
 
@@ -108,6 +116,10 @@ impl faktor_updater::HealthProbe for ScriptedProbe {
             Some(Err(detail)) => Err(UpdateError::HealthFailed { detail }),
             Some(Ok(())) | None => Ok(()),
         }
+    }
+
+    fn data_store_schema(&self) -> Option<DataStoreSchema> {
+        *self.schema.lock().unwrap()
     }
 }
 
@@ -145,6 +157,7 @@ struct HostFixture {
     updater: Arc<Updater>,
     fetcher: Arc<FakeFetcher>,
     store: Arc<MemoryUpdaterStore>,
+    probe: Arc<ScriptedProbe>,
 }
 
 fn fixture(probe_results: impl IntoIterator<Item = Result<(), String>>) -> HostFixture {
@@ -178,6 +191,7 @@ fn fixture(probe_results: impl IntoIterator<Item = Result<(), String>>) -> HostF
         updater,
         fetcher,
         store,
+        probe,
     }
 }
 
@@ -699,6 +713,97 @@ async fn an_explicit_rollback_restores_the_previous_artifact_and_is_refused_twic
     // A second rollback has no applied operation with a previous artifact.
     let err = host.updater.rollback(NOW + 5).unwrap_err();
     assert_eq!(err.code(), "conflict");
+}
+
+/// A rollback must never hand the previous binary a data store a NEWER binary
+/// already migrated past its schema head: the pointer stays on the newer
+/// release, the refusal is typed (both versions named + the restore guidance)
+/// and durably recorded, and the documented rollback flow still works once
+/// the store is no longer ahead.
+#[tokio::test]
+async fn a_rollback_after_a_newer_migration_refuses_and_keeps_the_newer_release() {
+    let host = fixture([]);
+    // The running binary supports schema head 7 and the store is at 7 when
+    // the applies happen: every apply row records head 7.
+    host.probe.set_schema(Some(DataStoreSchema {
+        head: 7,
+        live: Some(7),
+    }));
+    let key = keypair();
+    let (v1, v1_digest) = signed_manifest(&key, "0.1.0", b"v1", |_| {});
+    host.fetcher.serve(
+        "https://mirror.test/0.1.0/faktor-cli-0.1.0-darwin-arm64.tar.gz",
+        b"v1",
+    );
+    host.updater
+        .stage(&v1, &components(), None, NOW)
+        .await
+        .unwrap();
+    host.updater.apply(NOW + 1).unwrap();
+
+    let (v2, v2_digest) = signed_manifest(&key, "0.2.0", b"v2", |_| {});
+    host.fetcher.serve(
+        "https://mirror.test/0.2.0/faktor-cli-0.2.0-darwin-arm64.tar.gz",
+        b"v2",
+    );
+    host.updater
+        .stage(&v2, &components(), None, NOW + 2)
+        .await
+        .unwrap();
+    host.updater.apply(NOW + 3).unwrap();
+
+    // The newer binary ran and migrated the store to v9 (> the rollback
+    // target's recorded head of 7).
+    host.probe.set_schema(Some(DataStoreSchema {
+        head: 7,
+        live: Some(9),
+    }));
+    let err = host.updater.rollback(NOW + 4).unwrap_err();
+    assert_eq!(err.code(), "schema_ahead");
+    assert_eq!(err.http_status(), 409);
+    assert!(!err.retryable());
+    let rendered = err.to_string();
+    for needle in [
+        "0.1.0",
+        "v9",
+        "v7",
+        "newer binary",
+        "pre-migration snapshot",
+    ] {
+        assert!(rendered.contains(needle), "{rendered}");
+    }
+    // The pointer was NOT moved: the install still names v2.
+    let pointer = host.updater.layout().read_pointer().unwrap().unwrap();
+    assert_eq!(pointer.digest, v2_digest);
+    assert_eq!(pointer.version, "0.2.0");
+    // The refusal itself is durable: a Failed rollback row naming the target
+    // and carrying the recovery guidance.
+    let refusals = operations(&host.store, UpdateOpKind::Rollback);
+    let refusal = refusals
+        .iter()
+        .find(|op| op.status == UpdateOpStatus::Failed)
+        .unwrap_or_else(|| panic!("a refused rollback is recorded: {refusals:?}"));
+    assert_eq!(refusal.after_version.as_deref(), Some("0.1.0"));
+    assert_eq!(refusal.after_digest.as_deref(), Some(v1_digest.as_str()));
+    let detail = refusal.detail.clone().unwrap_or_default();
+    assert!(detail.contains("v9"), "{detail}");
+    assert!(detail.contains("v7"), "{detail}");
+    assert!(detail.contains("pre-migration snapshot"), "{detail}");
+    // No successful rollback row was written.
+    assert!(refusals
+        .iter()
+        .all(|op| op.status != UpdateOpStatus::RolledBack));
+    // Once the observed store is no longer ahead, the documented explicit
+    // rollback flow works unchanged.
+    host.probe.set_schema(Some(DataStoreSchema {
+        head: 7,
+        live: Some(7),
+    }));
+    let outcome = host.updater.rollback(NOW + 5).unwrap();
+    let ApplyOutcome::RolledBack { digest, .. } = outcome else {
+        panic!("expected rollback after the store observation normalizes");
+    };
+    assert_eq!(digest, v1_digest);
 }
 
 // ----------------------------------------------------------------- crash safety

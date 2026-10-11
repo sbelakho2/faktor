@@ -329,6 +329,19 @@ impl SandboxPolicy {
         }
     }
 
+    /// The typed spawn requirement this policy imposes (audit P0-39):
+    /// `Required` → `DenyAll`, `BestEffort`/`None` → `Inherit`. The spawn
+    /// site converts it through the terminal crate's `NetworkIsolation`
+    /// and the spawn layer owns all enforcement honesty: no platform probe
+    /// or preflight guessing happens here. A `DenyAll` spawn either runs
+    /// isolated or refuses typed before exec. The symmetric accessor of
+    /// [`SandboxPolicy::spawn_filesystem_requirement`], used by the daemon
+    /// wiring so verification carries the SAME policy demand as agent
+    /// shells (audit item 17).
+    pub fn spawn_network_requirement(&self) -> NetworkIsolationRequirement {
+        self.network_guarantee.network_requirement()
+    }
+
     /// Validate the policy's internal contract: `OsIsolated` requires the
     /// `Required` guarantee (so a spawn either isolates or refuses typed),
     /// and the user-granted network-capable shell requires a non-`Required`
@@ -837,6 +850,79 @@ fn resolve_within(root: &Path, path: &Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// HOME-credential confinement policy (audit item 6).
+//
+// A granted agent shell could read the operator's home-directory credential
+// stores (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.netrc`,
+// `~/.git-credentials`) whenever its `$HOME` is the real home AND no OS-level
+// confinement applies. The policy is therefore two-pronged:
+//
+//  1. Agent children run with a per-session SCRATCH HOME by default
+//     ([`faktor_core::command::AgentHomePolicy::Scratch`]): the terminal
+//     supervisor rewrites every HOME anchor (HOME/USERPROFILE/XDG_*) to the
+//     scratch home, so `$HOME`-relative credential discovery finds nothing
+//     on EVERY platform. Only an explicit operator grant
+//     ([`AgentHomePolicy::OperatorRealHome`] in the daemon config) passes the
+//     real HOME through.
+//
+//  2. Where an OS-level filesystem-confinement backend exists (Linux
+//     Landlock), the confinement policy never grants a credential path: the
+//     kernel denies every path outside the granted workspace roots, and the
+//     spawn layer additionally refuses (Required) or strips (BestEffort) any
+//     granted root that would cover a credential store. On platforms with
+//     no backend this is an honest, documented limitation (the scratch HOME
+//     is the remaining protection) — never a fabricated claim.
+// ---------------------------------------------------------------------------
+
+/// The credential-store subpaths of a real HOME whose access the confinement
+/// policy denies by default (see the module section above). Re-exported from
+/// the command authority so policy and spawn layer share one vocabulary.
+pub use faktor_core::command::CREDENTIAL_HOME_SUBPATHS;
+
+/// The typed HOME contract of agent children: scratch (default) or the
+/// explicit operator real-home grant. Re-exported from the command
+/// authority (one definition, never a forked copy).
+pub use faktor_core::command::AgentHomePolicy;
+
+/// The exact credential paths under `home` (see
+/// [`CREDENTIAL_HOME_SUBPATHS`]).
+pub use faktor_core::command::credential_paths_for_home;
+
+/// Lexical component-wise path overlap (`a` under `b`, `b` under `a`, or
+/// equal); the confinement guard uses it to prove no granted root covers a
+/// credential path.
+pub use faktor_core::command::paths_overlap;
+
+/// The canonical documentation sentence for the credential-confinement
+/// limitation on builds without an OS backend (asserted by tests).
+pub const CREDENTIAL_CONFINEMENT_NOTE: &str =
+    "credential directories are denied by the OS-level confinement wherever a backend is \
+     installed (the kernel grants nothing outside the workspace roots); on builds without a \
+     confinement backend this is an honest limitation — the per-session scratch HOME still \
+     keeps $HOME-relative credential discovery empty";
+
+/// The credential paths a confinement over `roots` would transitively grant,
+/// computed purely (never touching the filesystem). Each configured root is
+/// checked against `credentials`: a root that equals, contains, or lies
+/// beneath a credential path must never be granted. Returns the offending
+/// `(root, credential)` pairs; empty means the confinement grants no
+/// credential store.
+pub fn roots_granting_credentials(
+    roots: &[PathBuf],
+    credentials: &[PathBuf],
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut offenders = Vec::new();
+    for root in roots {
+        for credential in credentials {
+            if paths_overlap(root, credential) {
+                offenders.push((root.clone(), credential.clone()));
+            }
+        }
+    }
+    offenders
 }
 
 #[cfg(test)]

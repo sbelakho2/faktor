@@ -4,6 +4,13 @@
 // NativeClient / NativeEventStream. This class is the only IntelliJ-platform
 // dependency in the frontend module; the kotlinc fallback smoke compiles
 // FaktorChatPanel/FaktorFrontendService without it.
+//
+// Daemon resolution is MACHINE-scoped only (FaktorDaemonSettings ->
+// DaemonBinary): the application-level Faktor binary path, FAKTOR_BIN or the
+// app-level signed install layout (~/.faktor/install). A project/repository
+// target/ build is never consulted. The daemon starts ONLY on the explicit
+// "Start service" action, and that action resolves (with "Locate daemon…"
+// on a miss) and reports the exact executable before spawning.
 package dev.faktor.frontend
 
 import com.intellij.openapi.Disposable
@@ -12,6 +19,8 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
 import com.intellij.ui.content.ContentFactory
+import dev.faktor.backend.BackendException
+import dev.faktor.backend.DaemonBinary
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -29,7 +38,7 @@ class FaktorToolWindowFactory : ToolWindowFactory {
         val scopeStore = IntelliJControlPlaneScopeStore(project)
         val sessionStore = IntelliJControlPlaneSessionStore(project)
         val service = FaktorFrontendService(
-            resolveBinary(project),
+            daemonBinaryResolver(project),
             dataDir,
             controlToken = credentialStore.resolve(scopeStore.read())
         )
@@ -48,26 +57,36 @@ class FaktorToolWindowFactory : ToolWindowFactory {
             }
         )
         toolWindow.contentManager.addContent(content)
-        panel.startDaemon()
+        // NO automatic daemon start: the daemon starts only on the explicit
+        // "Start service" action (the resolver below then reports the
+        // resolved executable and refuses anything unverified).
     }
 
     companion object {
-        private val BINARY_CANDIDATES = listOf(
-            "target/debug/faktor-cli",
-            "target/release/faktor-cli"
-        )
 
-        fun resolveBinary(project: Project): Path {
-            val env = System.getenv("FAKTOR_BIN")
-            if (!env.isNullOrBlank()) return Paths.get(env)
-            val base = project.basePath
-            if (base != null) {
-                for (relative in BINARY_CANDIDATES) {
-                    val candidate = Paths.get(base, relative)
-                    if (Files.isExecutable(candidate)) return candidate
+        /**
+         * The lazy daemon resolver handed to the service: runs on the
+         * explicit start action, resolves machine-scoped only, offers
+         * "Locate daemon…" when nothing is found, and refuses a checksum
+         * mismatch. An unverified executable (no checksum record) requires
+         * the operator's explicit confirmation before the spawn.
+         */
+        fun daemonBinaryResolver(project: Project?): () -> Path = {
+            val resolution = FaktorDaemonSettings.resolve(project)
+            when (val trust = DaemonBinary.checksumTrust(resolution.executable)) {
+                is DaemonBinary.Trust.Refused ->
+                    throw BackendException("refusing to start the daemon: ${trust.detail}")
+                is DaemonBinary.Trust.Unverified -> {
+                    if (!FaktorDaemonSettings.confirmUnverified(resolution.executable, trust.detail)) {
+                        throw BackendException(
+                            "daemon start cancelled: ${resolution.executable} was not confirmed " +
+                                "(${trust.detail})"
+                        )
+                    }
                 }
+                is DaemonBinary.Trust.Verified -> {}
             }
-            return Paths.get(BINARY_CANDIDATES[0])
+            resolution.executable
         }
 
         fun resolveDataDir(): Path {

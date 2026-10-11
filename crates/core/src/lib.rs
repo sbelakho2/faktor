@@ -1,7 +1,10 @@
 //! faktor-core — pure core types for the Faktor runtime.
 //!
-//! This crate has **no workspace dependencies** and no I/O. Every other crate
-//! depends on these types; dependencies point inward. It provides:
+//! This crate has **no workspace dependencies** and holds no durable state.
+//! The sole I/O is the bounded Windows `cmd.exe` script materialization in
+//! `command.rs` (a unique file under the system temp dir, deleted by the
+//! supervisor or swept once abandoned) — never application state. Every other
+//! crate depends on these types; dependencies point inward. It provides:
 //!
 //! - IDs (`SessionId`, `WorkspaceId`, `WorktreeId`, `TaskId`, `OpId`, `EventSeq`)
 //! - typed errors with retryability classification
@@ -27,6 +30,7 @@ pub mod error;
 pub mod event;
 pub mod hash;
 pub mod id;
+pub mod lock;
 pub mod model;
 pub mod op;
 pub mod path;

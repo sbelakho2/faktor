@@ -9,9 +9,15 @@
 # Covered:
 #   scripts/certification/attestation.mjs   create/verify binding + refusal matrix
 #                                           incl. fail-closed signing (no key -> typed
-#                                           refusal, no artifact)
+#                                           refusal, no artifact) and the role split:
+#                                           build-attestation vs release-signing keys,
+#                                           cross-role signatures rejected typed,
+#                                           unprovisioned role key refused fail-closed
 #   scripts/certify.sh --selftest           immutable context registry, observed-value
 #                                           recording, attestation fetch/verification,
+#                                           release-signature role split (release
+#                                           artifact class requires the release-signing
+#                                           role; absent step => source class only),
 #                                           ReleaseArtifactSet matrix, canonical-gate
 #                                           parity, fault-campaign release gate,
 #                                           certificate classes, temp-name migration

@@ -1,10 +1,35 @@
 {
-  "identities": {
-    "faktor-ci": {
-      "ed25519_public_key": "NLjw6YR8jxJL39avmya9ELc+mK6KLCz6bpCBa6MWLJM="
+  "schema": "faktor-signing-allowlist/v2",
+  "roles": {
+    "build-attestation": {
+      "identity": "faktor-ci-build",
+      "secret": "faktor_attest_signing_key",
+      "env": "FAKTOR_ATTEST_SIGN_KEY_PEM",
+      "artifact_class": "faktor-build-attestation/v1",
+      "signed_by": "trusted workflow step `attestation` (CI build facts + artifact digests)"
     },
-    "faktor": {
-      "ed25519_public_key": "NLjw6YR8jxJL39avmya9ELc+mK6KLCz6bpCBa6MWLJM="
+    "release-signing": {
+      "identity": "faktor-release-signing",
+      "secret": "faktor_release_signing_key",
+      "env": "FAKTOR_RELEASE_SIGN_KEY_PEM",
+      "artifact_class": "faktor-release-signature/v1",
+      "signed_by": "trusted workflow step `release-signature` (release artifact/certificate class; binds the build-attestation bytes)"
+    }
+  },
+  "identities": {
+    "faktor-ci-build": {
+      "ed25519_public_key": "NLjw6YR8jxJL39avmya9ELc+mK6KLCz6bpCBa6MWLJM=",
+      "role": "build-attestation",
+      "status": "active",
+      "valid_from": "2025-09-25",
+      "notes": "Build role only. This is the pre-existing build key migrated off the shared `faktor-ci`/`faktor` identity names; it MUST NOT sign release signatures or be reused as the release key. Rotated by replacing the `faktor_attest_signing_key` secret and this public key in one commit (scripts/woodpecker/setup.md §4.3)."
+    },
+    "faktor-release-signing": {
+      "ed25519_public_key": "",
+      "role": "release-signing",
+      "status": "unprovisioned",
+      "valid_from": "",
+      "notes": "Operator-provisioned release role. No private key exists in the repository; generate it on the operator machine with `node scripts/certification/attestation.mjs keygen --role release-signing --out-key release.pem --out-keys release-keys.json`, register the private key as the trusted-project secret `faktor_release_signing_key`, and paste ONLY the public key here per scripts/woodpecker/setup.md §4.2. Until then every release-class verification fails closed with the typed `signature-role-key-missing` refusal."
     }
   }
 }

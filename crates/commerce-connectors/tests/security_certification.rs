@@ -1,11 +1,12 @@
 //! Security + robustness certification for the site connectors
-//! (`docs/acquire.md` §2/§16): hostile input is bounded and typed, acquired
-//! text is DATA with a data origin (never an instruction), and the live
-//! canary is opt-in and `#[ignore]`-gated (never runs in CI).
+//! (`docs/acquire.md` §2/§16): hostile input is bounded and typed and
+//! acquired text is DATA with a data origin (never an instruction).
 //!
-//! Every case is offline: the injected fixture transport replays the exact
-//! hostile bytes. Only the `[soak]` canary touches the network, and only
-//! when an operator explicitly runs it with a live key.
+//! Every case here is offline: the injected fixture transport replays the
+//! exact hostile bytes and no test in this file touches the network. The
+//! opt-in live canaries (network, operator credentials only) live in
+//! `tests/live_canary.rs` and are `#[ignore]`-gated; see
+//! `docs/legal/marketplace-acquisition.md`.
 
 use std::sync::Arc;
 
@@ -330,129 +331,4 @@ async fn planted_api_key_never_surfaces_and_url_queries_are_scanned() {
         !format!("{:?}", harness.transport.requests()).contains(MOUSER_KEY),
         "HttpRequest Debug leaked the key"
     );
-}
-
-/// The live canary is OPT-IN and network-only: it requires an explicit
-/// operator key, is `#[ignore]`-gated, and never runs in CI. It drives the
-/// REAL Mouser connector over a curl-backed transport, with the same
-/// credential discipline as production (the key is registered with the
-/// secret scanner before use).
-#[tokio::test]
-#[ignore = "[soak] live Mouser canary (network; set FAKTOR_LIVE_MOUSER_KEY to run)"]
-async fn soak_live_mouser_canary() {
-    let Ok(key) = std::env::var("FAKTOR_LIVE_MOUSER_KEY") else {
-        eprintln!("[soak] live canary skipped: FAKTOR_LIVE_MOUSER_KEY is not set");
-        return;
-    };
-    if key.trim().is_empty() {
-        eprintln!("[soak] live canary skipped: FAKTOR_LIVE_MOUSER_KEY is empty");
-        return;
-    }
-    let secrets = Arc::new(SecretGuard::new());
-    secrets.register(&key);
-    let connector = MouserConnector::new(
-        &MouserConnectorConfig {
-            enabled: true,
-            api_key_env: Some(text("FAKTOR_LIVE_MOUSER_KEY")),
-        },
-        Arc::new(MapCredentials::new().with("FAKTOR_LIVE_MOUSER_KEY", &key)),
-        &secrets,
-    )
-    .expect("live connector");
-    let ctx = AcquireCtx::builder(
-        Arc::new(CurlTransport),
-        Arc::new(QuotaState::new()),
-        secrets.clone(),
-    )
-    .clock(Arc::new(ManualClock::new(1_700_000_000_000)))
-    .diagnostics(Arc::new(MemoryDiagnostics::new()))
-    .browser(Arc::new(RecordingBrowser::failing()))
-    .build();
-    let result = connector
-        .discover(&ctx, Harness::search("STM32F407VGT6"))
-        .await;
-    match result {
-        Ok(discoveries) => {
-            assert!(
-                !discoveries.is_empty(),
-                "the live canary found no STM32F407VGT6 listing"
-            );
-            assert!(
-                !format!("{discoveries:?}").contains(&key),
-                "the live key must never surface in acquired data"
-            );
-        }
-        Err(error) => panic!("live Mouser canary failed: {error:?}"),
-    }
-}
-
-/// A minimal curl-backed transport for the opt-in live canary only. It is
-/// never compiled into the library and performs no I/O unless the canary is
-/// explicitly run with an operator key.
-struct CurlTransport;
-
-#[async_trait::async_trait]
-impl faktor_commerce_connectors::http::HttpTransport for CurlTransport {
-    async fn execute(
-        &self,
-        request: faktor_commerce_connectors::http::HttpRequest,
-        _budget: faktor_commerce_connectors::http::ResponseBudget,
-    ) -> Result<
-        faktor_commerce_connectors::http::HttpResponse,
-        faktor_commerce_connectors::http::TransportError,
-    > {
-        use std::io::Write as _;
-        let method = match request.method() {
-            faktor_commerce_connectors::http::HttpMethod::Get => "GET",
-            faktor_commerce_connectors::http::HttpMethod::Post => "POST",
-        };
-        let mut command = std::process::Command::new("curl");
-        command
-            .arg("-sS")
-            .arg("--max-time")
-            .arg("30")
-            .arg("-X")
-            .arg(method)
-            .arg("-w")
-            .arg("\n%{http_code}")
-            .arg(request.url().as_str());
-        for header in request.headers() {
-            command
-                .arg("-H")
-                .arg(format!("{}: {}", header.name(), header.value()));
-        }
-        if request.body().is_some() {
-            command.arg("--data-binary").arg("@-");
-            command.stdin(std::process::Stdio::piped());
-        }
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        let mut child = command
-            .spawn()
-            .map_err(|_| faktor_commerce_connectors::http::TransportError::EgressUnavailable)?;
-        if let Some(body) = request.body() {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(body).map_err(|_| {
-                    faktor_commerce_connectors::http::TransportError::EgressUnavailable
-                })?;
-            }
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|_| faktor_commerce_connectors::http::TransportError::EgressUnavailable)?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let (body, status) = stdout
-            .rsplit_once('\n')
-            .ok_or(faktor_commerce_connectors::http::TransportError::EgressUnavailable)?;
-        let status: u16 = status
-            .trim()
-            .parse()
-            .map_err(|_| faktor_commerce_connectors::http::TransportError::EgressUnavailable)?;
-        faktor_commerce_connectors::http::HttpResponse::new(
-            status,
-            Vec::new(),
-            body.as_bytes().to_vec(),
-        )
-        .map_err(|_| faktor_commerce_connectors::http::TransportError::ResponseTooLarge)
-    }
 }

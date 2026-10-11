@@ -569,7 +569,9 @@ fn storm_payload(
                     })
                     .collect();
                 let _ = started_tx.send((id, snap));
-                let mut rx = rel_rx.lock().unwrap().take().expect("runnable ran twice");
+                let mut rx = faktor_core::lock::recover(&rel_rx)
+                    .take()
+                    .expect("runnable ran twice");
                 tokio::select! {
                     _ = rx.recv() => Ok(()),
                     _ = token.cancelled() => Err(Error::cancelled()),

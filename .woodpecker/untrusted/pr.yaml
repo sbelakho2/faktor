@@ -134,6 +134,12 @@ steps:
       - rustup show active-toolchain
       - rustup component add rustfmt clippy
       - cargo fmt --check
+      # Both seam profiles: the fault campaign package enables
+      # `fault-injection` by default, so the production profile is the
+      # workspace WITHOUT it; the artifact proof asserts seam payloads are
+      # absent there and present under the feature.
+      - cargo check --workspace --exclude faktor-tests-fault
+      - sh scripts/check-fault-seams.sh
       - cargo check --workspace --all-features
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
       - cargo test --workspace --all-features
@@ -145,6 +151,8 @@ steps:
         rustup show active-toolchain
         rustup component add rustfmt clippy
         cargo fmt --check
+        cargo check --workspace --exclude faktor-tests-fault
+        sh scripts/check-fault-seams.sh
         cargo check --workspace --all-features
         cargo clippy --workspace --all-targets --all-features -- -D warnings
         cargo test --workspace --all-features

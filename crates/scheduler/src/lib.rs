@@ -36,7 +36,6 @@ pub struct OwnershipSet(Vec<String>);
 
 #[path = "path_identity.rs"]
 mod path_identity;
-mod unicode_data;
 
 impl OwnershipSet {
     pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
@@ -654,7 +653,7 @@ impl CircuitBoard {
     /// refreshes the key's LRU recency; inserting a new key past the cap
     /// evicts the least recently consulted key first.
     pub fn breaker(&self, resource: &ResourceKey) -> Arc<CircuitBreaker> {
-        let mut guard = self.inner.state.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.inner.state);
         guard.tick += 1;
         let tick = guard.tick;
         if let Some((breaker, last_used)) = guard.map.get_mut(resource) {
@@ -706,7 +705,7 @@ impl CircuitBoard {
 
     /// Number of breakers currently cached (bounded by `max_keys`).
     pub fn len(&self) -> usize {
-        self.inner.state.lock().unwrap().map.len()
+        faktor_core::lock::recover(&self.inner.state).map.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -715,7 +714,7 @@ impl CircuitBoard {
 
     /// The configured cap on cached breakers.
     pub fn max_keys(&self) -> usize {
-        self.inner.state.lock().unwrap().max_keys
+        faktor_core::lock::recover(&self.inner.state).max_keys
     }
 }
 
@@ -752,7 +751,7 @@ struct GaugeLease {
 impl GaugeLease {
     /// Take a permit for `class`, or `None` when the class budget is full.
     fn acquire(scheduler: &Scheduler, class: ResourceClass) -> Option<Self> {
-        let mut guard = scheduler.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&scheduler.inner);
         if guard.gauge.try_acquire(class, &scheduler.limits).is_err() {
             return None;
         }
@@ -830,7 +829,7 @@ impl RunningLease {
             return;
         }
         self.armed = false;
-        let mut guard = self.scheduler.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.scheduler.inner);
         let released = self.permit.armed;
         if released {
             self.permit.disarm();
@@ -954,7 +953,7 @@ impl Scheduler {
         let id = op.meta.operation_id;
         if let Err(e) = self.try_submit(op) {
             tracing::error!(op = %id, %e, "scheduled op rejected via legacy submit()");
-            let mut ring = self.rejections.lock().unwrap();
+            let mut ring = faktor_core::lock::recover(&self.rejections);
             if ring.len() == MAX_RECORDED_REJECTIONS {
                 ring.pop_front();
             }
@@ -967,7 +966,10 @@ impl Scheduler {
     /// last. Production code that calls `try_submit` and propagates errors
     /// never produces entries here.
     pub fn rejections(&self) -> Vec<(OpId, String)> {
-        self.rejections.lock().unwrap().iter().cloned().collect()
+        faktor_core::lock::recover(&self.rejections)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// The audited submission API. Conflict semantics: registering the SAME
@@ -993,7 +995,7 @@ impl Scheduler {
             )));
         }
         let id = op.meta.operation_id;
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.inner);
         if let Some(existing) = guard.tasks.get(&id) {
             if same_registration(&existing.op, &op) {
                 // Idempotent re-registration of an identical op is safe:
@@ -1058,14 +1060,17 @@ impl Scheduler {
     }
 
     pub fn status(&self, id: OpId) -> Option<TaskStatus> {
-        self.inner.lock().unwrap().tasks.get(&id).map(|t| t.status)
+        faktor_core::lock::recover(&self.inner)
+            .tasks
+            .get(&id)
+            .map(|t| t.status)
     }
 
     /// Validate the DAG before running: structural bounds (hostile DAGs),
     /// unknown dependencies and cycles are loud errors, never silent
     /// deadlocks. Per-op bounds are enforced at submit time as well.
     pub fn validate(&self) -> Result<(), Error> {
-        let tasks = &self.inner.lock().unwrap().tasks;
+        let tasks = &faktor_core::lock::recover(&self.inner).tasks;
         if tasks.len() > MAX_TASKS_PER_DAG {
             return Err(Error::oversized(format!(
                 "dag holds {} tasks; cap is {MAX_TASKS_PER_DAG}",
@@ -1117,10 +1122,7 @@ impl Scheduler {
             permit_released.as_mut().enable();
             self.schedule_ready(&mut set);
             if set.is_empty() {
-                let any_pending = self
-                    .inner
-                    .lock()
-                    .unwrap()
+                let any_pending = faktor_core::lock::recover(&self.inner)
                     .tasks
                     .values()
                     .any(|t| t.status == TaskStatus::Pending);
@@ -1134,10 +1136,7 @@ impl Scheduler {
                     self.rebuild_graph();
                     continue;
                 }
-                let ready_stuck = self
-                    .inner
-                    .lock()
-                    .unwrap()
+                let ready_stuck = faktor_core::lock::recover(&self.inner)
                     .tasks
                     .values()
                     .any(|t| t.status == TaskStatus::Pending && t.remaining == 0);
@@ -1174,7 +1173,7 @@ impl Scheduler {
             }
         }
         let mut done: Vec<OpId> = {
-            let guard = self.inner.lock().unwrap();
+            let guard = faktor_core::lock::recover(&self.inner);
             guard
                 .tasks
                 .iter()
@@ -1195,7 +1194,7 @@ impl Scheduler {
         loop {
             let mut to_spawn: Vec<(OpId, ScheduledOp, RunningLease)> = Vec::new();
             {
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = faktor_core::lock::recover(&self.inner);
                 let n = guard.ready.len();
                 let mut deferred = 0usize;
                 while deferred < n && !guard.ready.is_empty() {
@@ -1287,7 +1286,7 @@ impl Scheduler {
     /// the result is independent of iteration order; tasks that become
     /// `Blocked` here propagate to their own dependents afterwards.
     fn rebuild_graph(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.inner);
         guard.ready.clear();
         let statuses: HashMap<OpId, TaskStatus> =
             guard.tasks.iter().map(|(id, t)| (*id, t.status)).collect();
@@ -1362,10 +1361,7 @@ impl Scheduler {
         op: ScheduledOp,
         resource: &ResourceKey,
     ) -> Result<(), ExecuteError> {
-        let terminal = self
-            .inner
-            .lock()
-            .unwrap()
+        let terminal = faktor_core::lock::recover(&self.inner)
             .tasks
             .get(&id)
             .map(|t| status_is_terminal(t.status))
@@ -1537,7 +1533,7 @@ impl Scheduler {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let acquired = {
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = faktor_core::lock::recover(&self.inner);
                 guard.gauge.try_acquire(permit.class, &self.limits).is_ok()
             };
             if acquired {
@@ -1584,7 +1580,7 @@ impl Scheduler {
     ///   it at its next poll point and terminalizes `Cancelled` exactly
     ///   once.
     pub fn try_cancel(&self, id: OpId) -> Result<(), Error> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.inner);
         let Some(t) = guard.tasks.get(&id) else {
             return Err(Error::not_found(format!("op {id} is not registered")));
         };
@@ -1605,10 +1601,7 @@ impl Scheduler {
     }
 
     pub fn statuses(&self) -> Vec<(OpId, TaskStatus)> {
-        let mut v: Vec<_> = self
-            .inner
-            .lock()
-            .unwrap()
+        let mut v: Vec<_> = faktor_core::lock::recover(&self.inner)
             .tasks
             .iter()
             .map(|(id, t)| (*id, t.status))
@@ -1625,7 +1618,7 @@ impl Scheduler {
     /// bookkeeping is done in `schedule_ready`; error/end-time updates on a
     /// live task) are unaffected.
     fn mark(&self, id: OpId, status: TaskStatus, error: Option<String>) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.inner);
         if let Some(t) = guard.tasks.get_mut(&id) {
             if status_is_terminal(t.status) {
                 tracing::warn!(
@@ -1643,7 +1636,7 @@ impl Scheduler {
     }
 
     fn release(&self, class: ResourceClass) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = faktor_core::lock::recover(&self.inner);
         guard.gauge.release(class);
         drop(guard);
         self.permit_notify.notify_waiters();
@@ -1653,9 +1646,7 @@ impl Scheduler {
     /// terminalization attempts `id` has received (1 = healthy).
     #[cfg(test)]
     fn terminalize_count(&self, id: OpId) -> u32 {
-        self.inner
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.inner)
             .terminalized
             .get(&id)
             .copied()
@@ -2164,7 +2155,7 @@ mod tests {
         t.meta.deadline = Deadline::at(SystemClock.now_ms() + 20);
         submit(&s, t);
         let spec = {
-            let guard = s.inner.lock().unwrap();
+            let guard = faktor_core::lock::recover(&s.inner);
             guard.tasks[&OpId::new(1)].op.clone()
         };
         let err = s
@@ -3108,7 +3099,7 @@ mod tests {
         submit(&s, op);
         s.run_to_completion().await.unwrap();
         {
-            let guard = s.inner.lock().unwrap();
+            let guard = faktor_core::lock::recover(&s.inner);
             let stored = &guard.tasks[&OpId::new(1)].op.meta;
             assert_eq!(
                 stored.recovery, recovery,
@@ -3124,7 +3115,7 @@ mod tests {
         submit(&s, failing);
         s.run_to_completion().await.unwrap();
         {
-            let guard = s.inner.lock().unwrap();
+            let guard = faktor_core::lock::recover(&s.inner);
             assert_eq!(
                 guard.tasks[&OpId::new(2)].op.meta.recovery,
                 RecoveryStrategy::MarkUnknown
@@ -3145,7 +3136,7 @@ mod tests {
         s.cancel(OpId::new(3));
         s.run_to_completion().await.unwrap();
         {
-            let guard = s.inner.lock().unwrap();
+            let guard = faktor_core::lock::recover(&s.inner);
             assert_eq!(
                 guard.tasks[&OpId::new(3)].op.meta.recovery,
                 RecoveryStrategy::Manual
@@ -3757,7 +3748,7 @@ mod tests {
         // ...and validate() is the last line of defense against corrupted
         // state: inject one task past the cap directly and it must fire.
         {
-            let mut guard = s.inner.lock().unwrap();
+            let mut guard = faktor_core::lock::recover(&s.inner);
             let op = task(
                 MAX_TASKS_PER_DAG as u64 + 1,
                 vec![],
@@ -3795,12 +3786,12 @@ mod tests {
 
     /// Permit usage for one class (test evidence for lease release).
     fn gauge_used(s: &Scheduler, class: ResourceClass) -> usize {
-        s.inner.lock().unwrap().gauge.usage(class)
+        faktor_core::lock::recover(&s.inner).gauge.usage(class)
     }
 
     /// Number of live `running` ownership entries.
     fn running_count(s: &Scheduler) -> usize {
-        s.inner.lock().unwrap().running.len()
+        faktor_core::lock::recover(&s.inner).running.len()
     }
 
     fn all_terminal(s: &Scheduler) -> bool {
@@ -4081,7 +4072,7 @@ mod tests {
             let attempts = attempts.clone();
             Box::pin(async move {
                 let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                log.lock().unwrap().push(format!("A{n}"));
+                faktor_core::lock::recover(&log).push(format!("A{n}"));
                 Err(Error::new(ErrorKind::Network, "flaky"))
             })
         });
@@ -4116,7 +4107,7 @@ mod tests {
             run: Arc::new(move || {
                 let log = bl.clone();
                 Box::pin(async move {
-                    log.lock().unwrap().push("B".into());
+                    faktor_core::lock::recover(&log).push("B".into());
                     Ok(())
                 })
             }),
@@ -4125,7 +4116,7 @@ mod tests {
         submit(&s, b);
         let done = s.run_to_completion().await.unwrap();
         assert_eq!(
-            *log.lock().unwrap(),
+            *faktor_core::lock::recover(&log),
             vec!["A1".to_string(), "B".to_string(), "A2".to_string()],
             "B must run while A is backing off (permit released)"
         );

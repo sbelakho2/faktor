@@ -3,9 +3,8 @@
 - `providers/` — provider behavior fixtures (capability probes, wire shapes);
   locked by `tests/integration/tests/provider_fixtures.rs`; see
   `providers/README.md` for the consuming adapter tests
-- `screenshots/` — frozen client screenshots for the visual compatibility
-  suite (VS Code light/dark, JetBrains light/dark; zero-pixel-diff outside
-  branding masks), plus `manifest.json` locking each case's mask and
-  OS font-rendering tolerance zone; verified by
-  `tests/visual/tests/pixel_regression.rs`
+- no screenshot corpus is committed: the visual compatibility suite renders
+  its panel corpus at test time (`tests/visual` `render_panel`, bounded
+  `PANEL_WIDTH`x`PANEL_HEIGHT`) and verifies the zero-pixel-diff contract
+  outside branding masks in `tests/visual/tests/pixel_regression.rs`
 - `repositories/` — synthetic fixture repositories for indexing/search tests

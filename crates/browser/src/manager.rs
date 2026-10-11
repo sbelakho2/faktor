@@ -448,22 +448,18 @@ impl BrowserInstance {
     }
 
     fn stop_signal(&self) -> Option<VerificationSignal> {
-        *self.stop.lock().unwrap()
+        *faktor_core::lock::recover(&self.stop)
     }
 
     fn pages_snapshot(&self) -> Vec<Page> {
-        self.pages
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.pages)
             .values()
             .filter_map(Page::upgrade)
             .collect()
     }
 
     fn page_count(&self) -> usize {
-        self.pages
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.pages)
             .values()
             .filter(|weak| weak.strong_count() > 0)
             .count()
@@ -513,11 +509,11 @@ impl BrowserInstance {
 
 impl PageHost for BrowserInstance {
     fn release_page(&self, target_id: &str) {
-        self.pages.lock().unwrap().remove(target_id);
+        faktor_core::lock::recover(&self.pages).remove(target_id);
     }
 
     fn stop_automation(&self, signal: VerificationSignal) {
-        let mut stop = self.stop.lock().unwrap();
+        let mut stop = faktor_core::lock::recover(&self.stop);
         if stop.is_none() {
             *stop = Some(signal);
         }
@@ -530,7 +526,7 @@ impl PageHost for BrowserInstance {
         // Release the profile's page slots immediately (bounded work), then
         // close the targets in the background.
         let pages: Vec<Page> = {
-            let mut map = self.pages.lock().unwrap();
+            let mut map = faktor_core::lock::recover(&self.pages);
             map.drain()
                 .filter_map(|(_, weak)| Page::upgrade(&weak))
                 .collect()
@@ -563,7 +559,10 @@ pub struct BrowserManager {
 impl std::fmt::Debug for BrowserManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserManager")
-            .field("browsers", &self.browsers.lock().unwrap().len())
+            .field(
+                "browsers",
+                &faktor_core::lock::recover(&self.browsers).len(),
+            )
             .field("config", &self.config)
             .finish()
     }
@@ -611,11 +610,11 @@ impl BrowserManager {
     /// Install (or clear) the deterministic lifecycle seam.
     #[doc(hidden)]
     pub fn set_lifecycle_seam(&self, seam: Option<LifecycleSeam>) {
-        *self.lifecycle_seam.lock().unwrap() = seam;
+        *faktor_core::lock::recover(&self.lifecycle_seam) = seam;
     }
 
     async fn pause_seam(&self, profile: &str, point: &'static str) {
-        let seam = self.lifecycle_seam.lock().unwrap().clone();
+        let seam = faktor_core::lock::recover(&self.lifecycle_seam).clone();
         if let Some(seam) = seam {
             seam.pause(profile, point).await;
         }
@@ -629,10 +628,7 @@ impl BrowserManager {
         selector: UpstreamSelector,
     ) -> Result<(), BrowserError> {
         validate_egress_name(name)?;
-        self.egress_routes
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), selector);
+        faktor_core::lock::recover(&self.egress_routes).insert(name.to_string(), selector);
         Ok(())
     }
 
@@ -792,11 +788,7 @@ impl BrowserManager {
         .await;
         match initialized {
             Ok(page) => {
-                instance
-                    .pages
-                    .lock()
-                    .unwrap()
-                    .insert(target_id, page.downgrade());
+                faktor_core::lock::recover(&instance.pages).insert(target_id, page.downgrade());
                 Ok(page)
             }
             Err(error) => {
@@ -838,7 +830,7 @@ impl BrowserManager {
                 BrowserMode::Persistent
             },
         };
-        if let Some(instance) = self.browsers.lock().unwrap().get(&id).cloned() {
+        if let Some(instance) = faktor_core::lock::recover(&self.browsers).get(&id).cloned() {
             if instance.policy != *policy {
                 return Err(BrowserError::invalid_config(
                     "destination policy changed for a live browser identity; retire the browser \
@@ -862,7 +854,7 @@ impl BrowserManager {
             return Ok(instance);
         }
         {
-            let live = self.browsers.lock().unwrap().len();
+            let live = faktor_core::lock::recover(&self.browsers).len();
             if live >= self.config.max_browsers {
                 return Err(BrowserError::bound(format!(
                     "max_browsers ({}) reached; refusing to start another browser",
@@ -873,7 +865,7 @@ impl BrowserManager {
         let instance = self
             .launch_instance(source, &id, policy, purpose, deadline, cancel)
             .await?;
-        self.browsers.lock().unwrap().insert(id, instance.clone());
+        faktor_core::lock::recover(&self.browsers).insert(id, instance.clone());
         Ok(instance)
     }
 
@@ -888,7 +880,7 @@ impl BrowserManager {
     ) -> Result<Arc<BrowserInstance>, BrowserError> {
         let identity = &id.identity;
         let upstream = {
-            let routes = self.egress_routes.lock().unwrap();
+            let routes = faktor_core::lock::recover(&self.egress_routes);
             match routes.get(&identity.egress).cloned() {
                 Some(selector) => selector,
                 None if identity.egress == "direct" => UpstreamSelector::default(),
@@ -1100,7 +1092,7 @@ impl BrowserManager {
             downloads,
         });
         let task = spawn_root_event_pump(&instance);
-        *instance.event_task.lock().unwrap() = Some(task);
+        *faktor_core::lock::recover(&instance.event_task) = Some(task);
         Ok(instance)
     }
 
@@ -1189,8 +1181,10 @@ impl BrowserManager {
     pub async fn shutdown_idle(&self) -> Vec<String> {
         let now = self.clock.now_ms();
         let idle_ms = (self.config.idle_shutdown_s as i64).saturating_mul(1000);
-        let candidates: Vec<Arc<BrowserInstance>> =
-            self.browsers.lock().unwrap().values().cloned().collect();
+        let candidates: Vec<Arc<BrowserInstance>> = faktor_core::lock::recover(&self.browsers)
+            .values()
+            .cloned()
+            .collect();
         let mut stopped = Vec::new();
         for instance in candidates {
             let profile = instance.identity().profile.clone();
@@ -1223,8 +1217,10 @@ impl BrowserManager {
 
     /// Stop every browser (daemon teardown).
     pub async fn shutdown_all(&self) {
-        let instances: Vec<Arc<BrowserInstance>> =
-            self.browsers.lock().unwrap().values().cloned().collect();
+        let instances: Vec<Arc<BrowserInstance>> = faktor_core::lock::recover(&self.browsers)
+            .values()
+            .cloned()
+            .collect();
         for instance in instances {
             self.shutdown_instance(&instance).await;
         }
@@ -1233,7 +1229,7 @@ impl BrowserManager {
     /// Remove the map entry only when it still points at this exact
     /// instance (never evict a replacement launched in the meantime).
     fn remove_exact_instance(&self, instance: &Arc<BrowserInstance>) {
-        let mut map = self.browsers.lock().unwrap();
+        let mut map = faktor_core::lock::recover(&self.browsers);
         if let Some(existing) = map.get(&instance.id) {
             if Arc::ptr_eq(existing, instance) {
                 map.remove(&instance.id);
@@ -1249,7 +1245,7 @@ impl BrowserManager {
             }
         }
         self.remove_exact_instance(instance);
-        if let Some(task) = instance.event_task.lock().unwrap().take() {
+        if let Some(task) = faktor_core::lock::recover(&instance.event_task).take() {
             task.abort();
         }
         let pages = instance.pages_snapshot();
@@ -1287,10 +1283,7 @@ impl BrowserManager {
     /// operational reasons (egress change, profile reset). The next
     /// acquisition starts a fresh child.
     pub async fn retire(&self, identity: &BrowserIdentity) -> Result<(), BrowserError> {
-        let ids: Vec<BrowserInstanceId> = self
-            .browsers
-            .lock()
-            .unwrap()
+        let ids: Vec<BrowserInstanceId> = faktor_core::lock::recover(&self.browsers)
             .keys()
             .filter(|id| id.identity == *identity)
             .cloned()
@@ -1301,7 +1294,7 @@ impl BrowserManager {
             });
         }
         for id in ids {
-            let instance = self.browsers.lock().unwrap().get(&id).cloned();
+            let instance = faktor_core::lock::recover(&self.browsers).get(&id).cloned();
             if let Some(instance) = instance {
                 self.shutdown_instance(&instance).await;
             }
@@ -1312,7 +1305,7 @@ impl BrowserManager {
     /// Retire one exact instance (mode-qualified). The next acquisition for
     /// that id starts a fresh child.
     pub async fn retire_instance(&self, id: &BrowserInstanceId) -> Result<(), BrowserError> {
-        let instance = self.browsers.lock().unwrap().get(id).cloned();
+        let instance = faktor_core::lock::recover(&self.browsers).get(id).cloned();
         match instance {
             Some(instance) => {
                 self.shutdown_instance(&instance).await;
@@ -1332,9 +1325,9 @@ impl BrowserManager {
     pub fn resume_profile(&self, profile: &str) -> Result<(), BrowserError> {
         validate_profile_name(profile)?;
         let mut resumed = false;
-        for instance in self.browsers.lock().unwrap().values() {
+        for instance in faktor_core::lock::recover(&self.browsers).values() {
             if instance.identity().profile == profile {
-                *instance.stop.lock().unwrap() = None;
+                *faktor_core::lock::recover(&instance.stop) = None;
                 resumed = true;
             }
         }
@@ -1349,9 +1342,7 @@ impl BrowserManager {
 
     /// Typed health for every live browser.
     pub fn health(&self) -> Vec<BrowserHealth> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .values()
             .map(|instance| {
                 let alive = instance.child_is_alive(&self.supervisor);
@@ -1386,16 +1377,14 @@ impl BrowserManager {
 
     /// Live browser count (bounded by `max_browsers`).
     pub fn browser_count(&self) -> usize {
-        self.browsers.lock().unwrap().len()
+        faktor_core::lock::recover(&self.browsers).len()
     }
 
     /// Every live instance for an identity, mode-qualified. Never an
     /// arbitrary single browser: a persistent and an incognito instance
     /// share the identity label and are distinct results.
     pub fn instances_for(&self, identity: &BrowserIdentity) -> Vec<BrowserInstanceId> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .keys()
             .filter(|id| id.identity == *identity)
             .cloned()
@@ -1405,9 +1394,7 @@ impl BrowserManager {
     /// The proxy URL(s) a live browser (or browsers) for this identity is
     /// using, mode-qualified and multi-valued.
     pub fn proxy_url_for(&self, identity: &BrowserIdentity) -> Vec<(BrowserInstanceId, String)> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .iter()
             .filter(|(id, _)| id.identity == *identity)
             .map(|(id, instance)| (id.clone(), instance.broker.proxy_url()))
@@ -1416,18 +1403,14 @@ impl BrowserManager {
 
     /// Page count for one exact (mode-qualified) instance.
     pub fn page_count_for(&self, id: &BrowserInstanceId) -> Option<usize> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .get(id)
             .map(|instance| instance.page_count())
     }
 
     /// True when the exact instance's child is still registered live.
     pub fn is_live(&self, id: &BrowserInstanceId) -> bool {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .get(id)
             .map(|instance| instance.child_is_alive(&self.supervisor))
             .unwrap_or(false)
@@ -1443,9 +1426,7 @@ impl BrowserManager {
 
     /// The source label a live browser was launched with, if any.
     pub fn source_for(&self, id: &BrowserInstanceId) -> Option<String> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .get(id)
             .map(|instance| instance.source.clone())
     }
@@ -1456,9 +1437,7 @@ impl BrowserManager {
         &self,
         id: &BrowserInstanceId,
     ) -> Option<Vec<crate::download::DownloadRecord>> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .get(id)
             .map(|instance| instance.downloads.records())
     }
@@ -1468,9 +1447,7 @@ impl BrowserManager {
         &self,
         id: &BrowserInstanceId,
     ) -> Option<crate::download::DownloadStats> {
-        self.browsers
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.browsers)
             .get(id)
             .map(|instance| instance.downloads.stats())
     }
@@ -1566,7 +1543,7 @@ impl Drop for BrowserManager {
     /// not cover is killed synchronously by owner through the supervisor.
     fn drop(&mut self) {
         let instances: Vec<Arc<BrowserInstance>> = {
-            let mut browsers = self.browsers.lock().unwrap();
+            let mut browsers = faktor_core::lock::recover(&self.browsers);
             browsers.drain().map(|(_, instance)| instance).collect()
         };
         for instance in instances {

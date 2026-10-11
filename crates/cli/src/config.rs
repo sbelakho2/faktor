@@ -44,6 +44,8 @@ mod verification;
 pub use verification::*;
 mod sandbox;
 pub use sandbox::*;
+mod first_run;
+pub use first_run::*;
 mod mcp;
 pub use mcp::*;
 mod provider;
@@ -51,5 +53,8 @@ pub use provider::*;
 mod commerce;
 pub use commerce::*;
 
+#[cfg(test)]
+#[path = "config/first_run_tests.rs"]
+mod first_run_tests;
 #[cfg(test)]
 mod tests;

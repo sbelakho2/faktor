@@ -128,6 +128,17 @@ pub enum StoreError {
     Busy(String),
     #[error("migration failed: {0}")]
     Migration(String),
+    /// A database written by a NEWER binary's schema ladder must never be
+    /// silently opened by an older one: the newer ladder may have changed
+    /// semantics this binary cannot honour. The refusal names the version
+    /// found and this binary's known head; NOTHING is snapshotted or
+    /// written. The recovery path is running the newer binary or restoring
+    /// the pre-migration snapshot.
+    #[error(
+        "store schema v{found} is newer than this binary's known head v{maximum_supported}: \
+         downgrade refused (run the newer binary or restore the pre-migration snapshot)"
+    )]
+    UnsupportedSchema { found: i64, maximum_supported: i64 },
     #[error("oversized value rejected: {0}")]
     Oversized(String),
     #[error("malformed value rejected: {0}")]
@@ -185,6 +196,7 @@ pub type StoreResult<T> = Result<T, StoreError>;
 mod connection;
 pub use connection::*;
 mod schema;
+pub use schema::SCHEMA_HEAD;
 pub(crate) use schema::*;
 mod migration;
 pub use migration::*;

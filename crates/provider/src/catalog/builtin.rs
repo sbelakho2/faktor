@@ -1,8 +1,25 @@
-//! Versioned built-in list-price table (audit wave-B item C, billing-origin
-//! audit, and the hard-budget-safe pricing audit): documented list prices of
-//! officially-known models ONLY — nothing invented, nothing extrapolated.
+//! Vendored built-in list-price catalog (audit wave-B item C, billing-origin
+//! audit, hard-budget-safe pricing audit, catalog-refresh item): documented
+//! list prices of officially-known models ONLY — nothing invented, nothing
+//! extrapolated.
+//!
+//! # The prices live in a checked-in vendored data file
+//!
+//! The rows are NOT hard-coded in Rust. They are transcribed in
+//! `crates/provider/data/builtin_prices.json` (compiled in with
+//! `include_str!`), which carries the table's provenance (`catalog_version`,
+//! `source_id`, `source`), its dates (`effective_at_ms`, `observed_at_ms`,
+//! `valid_until_ms`) and one `source` string per row. [`TABLE`] / [`table()`]
+//! load and VALIDATE the file once at startup (a single lazy parse): an
+//! unknown schema key, a non-official origin, a duplicate `(origin, model)`,
+//! an empty model, a zero/omitted price line, an inconsistent date window or
+//! an Anthropic row without its billed cache-write tariff is a hard failure —
+//! the process refuses to serve a catalog it cannot trust instead of
+//! fabricating a price. The unit test module re-parses the same vendored
+//! bytes and drives the rejection matrix adversarially.
+//!
 //! Prices are microUSD per MILLION tokens (the published $/M reading x 1e6)
-//! so sub-$1/M list prices ($0.15/M gpt-4o-mini input, $0.10/M gemini flash
+//! so sub-$1/M list prices ($0.15/M gpt-4o-mini input, $0.05/M gpt-5-nano
 //! input, ...) stay exact and can never truncate to a free lie.
 //!
 //! Rows are keyed by [`BillingOrigin`] + model, NOT by transport family id:
@@ -13,15 +30,24 @@
 //! daemon graph); the daemon resolves the real origin in config and uses
 //! [`lookup_by_origin`].
 //!
-//! # builtin-v2: metadata, validity windows and conditional tariffs
+//! # Unknown models and retired rows
 //!
-//! Every row carries its own `effective_at_ms` / `observed_at_ms` /
-//! `valid_until_ms`, `source_id` and `catalog_version`
-//! ([`BUILTIN_CATALOG_VERSION`] = `"builtin-v2"`): a price statement is
-//! dated, and a quote past `valid_until_ms` stops being exact at route time
-//! (see `PricingState::effective_at`). Rows whose official model ID was
-//! RETIRED carry `retired_at_ms` and are excluded from every Exact lookup —
-//! a withdrawn ID never routes at its last-known price.
+//! A `(origin, model)` miss yields NO price at all: [`lookup_by_origin`]
+//! returns `None` and callers stay [`PricingState::Unknown`] with the
+//! [`QualityAuthority::ConservativeUnknown`] quality placeholder — never a
+//! free/zero or 1-microUSD fabricated number. Rows whose official model ID
+//! was RETIRED carry an explicit `retired_at_ms` in the file and are
+//! excluded from every Exact lookup: a withdrawn ID never routes at its
+//! last-known price.
+//!
+//! # builtin-v3: metadata, validity windows and conditional tariffs
+//!
+//! Every row carries `effective_at_ms` / `observed_at_ms` /
+//! `valid_until_ms` (file defaults unless the row overrides them),
+//! `source_id` and `catalog_version` ([`BUILTIN_CATALOG_VERSION`] =
+//! `"builtin-v3"`, [`BUILTIN_SOURCE_ID`] = `"faktor-builtin-v3"`): a price
+//! statement is dated, and a quote past `valid_until_ms` stops being exact
+//! at route time (see `PricingState::effective_at`).
 //!
 //! Tariffs are conditional, not a single number:
 //!
@@ -31,7 +57,8 @@
 //!   applies the known TTL exactly, or the MAXIMUM of the two for a hard
 //!   budget whose applicable tariff is unknown (never the minimum);
 //! - cache-read rows are included where documented; `cache_write` is never
-//!   zero-by-omission on a provider that bills writes;
+//!   zero-by-omission on a provider that bills writes (the loader refuses an
+//!   Anthropic row without a nonzero TTL-dependent write tariff);
 //! - DeepSeek moved to V4-era schedules the audited table does not document
 //!   as exact: [`BuiltinPriceClass::ConservativeSchedule`] marks a row whose
 //!   numbers are a documented CONSERVATIVE BOUND (a ceiling), never a
@@ -47,6 +74,8 @@
 //! [`PERFORMANCE_PRIOR_VERSION`] benchmark string, and durable verified
 //! outcomes dominate them whenever verified history exists.
 
+use std::sync::LazyLock;
+
 use faktor_core::model::{
     unix_now_ms, BillingOrigin, CacheWriteTtl, MicroUsdPerMillionTokens, ModelPerformance,
     ModelPerformanceProfile, PriceAuthority, PriceQuote, PriceSchedule, PriceUnavailable,
@@ -55,39 +84,53 @@ use faktor_core::model::{
 
 use crate::catalog::PricingProvenance;
 
-/// Version of the frozen built-in table (bump the table AND this string
-/// whenever a price changes, so old snapshots never claim a new version).
-pub const BUILTIN_CATALOG_VERSION: &str = "builtin-v2";
+/// Version of the loaded built-in table (must equal the vendored data file's
+/// `catalog_version`; the loader refuses a mismatch, so old snapshots never
+/// claim a new version).
+pub const BUILTIN_CATALOG_VERSION: &str = "builtin-v3";
 
-/// Source id stamped on every built-in row's snapshot.
-pub const BUILTIN_SOURCE_ID: &str = "faktor-builtin-v2";
+/// Source id stamped on every built-in row's snapshot (must equal the
+/// vendored data file's `source_id`).
+pub const BUILTIN_SOURCE_ID: &str = "faktor-builtin-v3";
 
-/// Documented effective date of the builtin-v2 rows (2026-08-01T00:00:00Z).
-pub const BUILTIN_EFFECTIVE_AT_MS: u64 = 1_785_542_400_000;
+/// The vendored catalog file the table is loaded from (compiled in at build
+/// time). Path is repo-relative for documentation; the loader reads the
+/// compile-time contents.
+pub const BUILTIN_CATALOG_FILE: &str = "crates/provider/data/builtin_prices.json";
 
-/// Documented observation date of the builtin-v2 rows (2026-09-01T00:00:00Z).
-pub const BUILTIN_OBSERVED_AT_MS: u64 = 1_788_220_800_000;
+/// The compile-time contents of the vendored catalog file.
+const BUILTIN_CATALOG_JSON: &str = include_str!("../../data/builtin_prices.json");
 
-/// Validity window of the builtin-v2 rows (2027-02-01T00:00:00Z): after
-/// this instant a row's exact quote stops being authoritative at route time
-/// and must be re-observed or treated as Unknown / a declared ceiling.
-pub const BUILTIN_VALID_UNTIL_MS: u64 = 1_801_440_000_000;
-
-/// Version string of the built-in Faktor routing priors (the performance
-/// profiles below). Bump whenever a prior changes.
-pub const PERFORMANCE_PRIOR_VERSION: &str = "faktor-routing-priors-v1";
-
-/// Source id of the built-in performance priors (inspectable identity of a
-/// conservative-unknown prior).
-pub const PERFORMANCE_PRIOR_SOURCE_ID: &str = "faktor-builtin-priors-v1";
+/// The file-level provenance and date window of the vendored catalog: who
+/// published the prices, when they took effect, when they were observed and
+/// until when they stay authoritative. A row may override the dates (a
+/// retired row's window ends at its retirement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinCatalogMeta {
+    /// Catalog version string (`"builtin-v3"`).
+    pub catalog_version: &'static str,
+    /// Source id stamped on snapshots (`"faktor-builtin-v3"`).
+    pub source_id: &'static str,
+    /// Free-text provenance of the whole file (per-row URLs live on each
+    /// row's `source`).
+    pub source: &'static str,
+    /// Wall-clock ms the file's prices took effect.
+    pub effective_at_ms: u64,
+    /// Wall-clock ms the file's prices were observed.
+    pub observed_at_ms: u64,
+    /// Wall-clock ms after which the file's exact quotes stop being
+    /// authoritative (a row's override can end earlier).
+    pub valid_until_ms: u64,
+}
 
 /// How a row's cache-write line is billed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BuiltinCacheWrite {
     /// The provider publishes no cache-write charge.
     NotBilled,
     /// One published write rate (microUSD per million tokens).
-    Fixed(u64),
+    Fixed { rate: u64 },
     /// TTL-dependent published write rates (the Anthropic shape).
     TtlDependent { five_minutes: u64, one_hour: u64 },
 }
@@ -98,7 +141,7 @@ impl BuiltinCacheWrite {
     pub const fn max_rate(self) -> u64 {
         match self {
             BuiltinCacheWrite::NotBilled => 0,
-            BuiltinCacheWrite::Fixed(v) => v,
+            BuiltinCacheWrite::Fixed { rate } => rate,
             BuiltinCacheWrite::TtlDependent {
                 five_minutes,
                 one_hour,
@@ -117,7 +160,7 @@ impl BuiltinCacheWrite {
     pub const fn rate_for(self, ttl: Option<CacheWriteTtl>, hard_budget: bool) -> Option<u64> {
         match self {
             BuiltinCacheWrite::NotBilled => Some(0),
-            BuiltinCacheWrite::Fixed(v) => Some(v),
+            BuiltinCacheWrite::Fixed { rate } => Some(rate),
             BuiltinCacheWrite::TtlDependent {
                 five_minutes,
                 one_hour,
@@ -133,10 +176,24 @@ impl BuiltinCacheWrite {
             },
         }
     }
+
+    /// Every documented rate is nonzero on a row that bills writes (the
+    /// loader's zero-by-omission refusal).
+    const fn has_nonzero_rates(self) -> bool {
+        match self {
+            BuiltinCacheWrite::NotBilled => true,
+            BuiltinCacheWrite::Fixed { rate } => rate > 0,
+            BuiltinCacheWrite::TtlDependent {
+                five_minutes,
+                one_hour,
+            } => five_minutes > 0 && one_hour > 0,
+        }
+    }
 }
 
 /// What a row's numbers REST on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BuiltinPriceClass {
     /// Documented current list prices (exact statement with a validity
     /// window).
@@ -181,6 +238,9 @@ pub struct BuiltinPrice {
     pub source_id: &'static str,
     /// Catalog version of this row.
     pub catalog_version: &'static str,
+    /// The row's own provenance: the vendor/source URL or the documented
+    /// bound note the numbers are transcribed from.
+    pub source: &'static str,
 }
 
 impl BuiltinPrice {
@@ -199,167 +259,279 @@ impl BuiltinPrice {
     }
 }
 
-/// The frozen, versioned price table.
-pub const TABLE: &[BuiltinPrice] = &[
-    // Official OpenAI.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialOpenAi,
-        model: "gpt-4o",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 2_500_000,
-        output_micro_usd_per_million: 10_000_000,
-        cache_read_micro_usd_per_million: Some(1_250_000),
-        cache_write: BuiltinCacheWrite::NotBilled,
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialOpenAi,
-        model: "gpt-4o-mini",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 150_000,
-        output_micro_usd_per_million: 600_000,
-        cache_read_micro_usd_per_million: Some(75_000),
-        cache_write: BuiltinCacheWrite::NotBilled,
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // o3 was repriced: $2/M input, $0.50/M cached input, $8/M output.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialOpenAi,
-        model: "o3",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 2_000_000,
-        output_micro_usd_per_million: 8_000_000,
-        cache_read_micro_usd_per_million: Some(500_000),
-        cache_write: BuiltinCacheWrite::NotBilled,
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // o4-mini has a separate published cached-input rate ($0.275/M).
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialOpenAi,
-        model: "o4-mini",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 1_100_000,
-        output_micro_usd_per_million: 4_400_000,
-        cache_read_micro_usd_per_million: Some(275_000),
-        cache_write: BuiltinCacheWrite::NotBilled,
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // Official Anthropic. Cache writes are billed: 1.25x input for the
-    // 5-minute TTL, 2x input for the 1-hour TTL; cache reads are 0.1x.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialAnthropic,
-        model: "claude-opus-4",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 15_000_000,
-        output_micro_usd_per_million: 75_000_000,
-        cache_read_micro_usd_per_million: Some(1_500_000),
-        cache_write: BuiltinCacheWrite::TtlDependent {
-            five_minutes: 18_750_000,
-            one_hour: 30_000_000,
+// ------------------------------------------------------------------- loader
+
+/// One catalog row exactly as transcribed in the vendored file. Unknown
+/// keys are rejected so a typo (`input_micro_usd_per_millionn`, ...) can
+/// never be silently ignored into a default.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogRowFile {
+    origin: BillingOrigin,
+    model: String,
+    class: BuiltinPriceClass,
+    input_micro_usd_per_million: u64,
+    output_micro_usd_per_million: u64,
+    #[serde(default)]
+    cache_read_micro_usd_per_million: Option<u64>,
+    cache_write: BuiltinCacheWrite,
+    /// The row's own provenance (vendor pricing URL or bound note).
+    source: String,
+    #[serde(default)]
+    effective_at_ms: Option<u64>,
+    #[serde(default)]
+    observed_at_ms: Option<u64>,
+    #[serde(default)]
+    valid_until_ms: Option<u64>,
+    #[serde(default)]
+    retired_at_ms: Option<u64>,
+}
+
+/// The vendored file's schema: file-level provenance + dates, then rows.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogFile {
+    catalog_version: String,
+    source_id: String,
+    source: String,
+    effective_at_ms: u64,
+    observed_at_ms: u64,
+    valid_until_ms: u64,
+    rows: Vec<CatalogRowFile>,
+}
+
+/// One parsed-and-validated catalog generation: the file's provenance plus
+/// the row table.
+#[derive(Debug)]
+struct LoadedCatalog {
+    meta: BuiltinCatalogMeta,
+    rows: Vec<BuiltinPrice>,
+}
+
+/// Leak a parsed string into the `&'static str` a [`BuiltinPrice`] carries.
+/// Bounded one-time cost: the loader runs once per process for the vendored
+/// table (and a handful of times in the validation tests).
+fn leak(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+/// Parse and VALIDATE the vendored catalog bytes. Every failure is a typed
+/// string naming the offending row; a production call site turns it into a
+/// hard startup failure, never a partial/zero-priced table.
+fn load_catalog(json: &str) -> Result<LoadedCatalog, String> {
+    let file: CatalogFile =
+        serde_json::from_str(json).map_err(|e| format!("catalog JSON does not parse: {e}"))?;
+    if file.catalog_version != BUILTIN_CATALOG_VERSION {
+        return Err(format!(
+            "catalog_version {:?} does not match {BUILTIN_CATALOG_VERSION:?}",
+            file.catalog_version
+        ));
+    }
+    if file.source_id != BUILTIN_SOURCE_ID {
+        return Err(format!(
+            "source_id {:?} does not match {BUILTIN_SOURCE_ID:?}",
+            file.source_id
+        ));
+    }
+    if file.source.trim().is_empty() {
+        return Err("file-level source must name where the prices came from".to_string());
+    }
+    if file.effective_at_ms == 0
+        || file.observed_at_ms < file.effective_at_ms
+        || file.valid_until_ms <= file.observed_at_ms
+    {
+        return Err(format!(
+            "file date window is inconsistent: effective={} observed={} valid_until={}",
+            file.effective_at_ms, file.observed_at_ms, file.valid_until_ms
+        ));
+    }
+    if file.rows.is_empty() {
+        return Err("catalog must document at least one row".to_string());
+    }
+    let mut rows: Vec<BuiltinPrice> = Vec::with_capacity(file.rows.len());
+    let mut seen: Vec<(BillingOrigin, String)> = Vec::with_capacity(file.rows.len());
+    for row in &file.rows {
+        let where_ = format!("{}:{}", origin_label(row.origin), row.model);
+        if !row.origin.is_official() {
+            return Err(format!(
+                "{where_}: built-in rows must name an OFFICIAL billing origin"
+            ));
+        }
+        let model = row.model.trim();
+        if model.is_empty() || model.chars().any(char::is_whitespace) {
+            return Err(format!("{where_}: model must be a non-empty single token"));
+        }
+        if row.input_micro_usd_per_million == 0 || row.output_micro_usd_per_million == 0 {
+            return Err(format!(
+                "{where_}: input/output list prices must be nonzero (a zero reading is a \
+                 transcription failure, never a free model)"
+            ));
+        }
+        if row.cache_read_micro_usd_per_million == Some(0) {
+            return Err(format!(
+                "{where_}: a published cache-read line of zero must be omitted, not recorded"
+            ));
+        }
+        if !row.cache_write.has_nonzero_rates() {
+            return Err(format!(
+                "{where_}: a billed cache-write tariff must be nonzero"
+            ));
+        }
+        if row.origin == BillingOrigin::OfficialAnthropic
+            && !matches!(row.cache_write, BuiltinCacheWrite::TtlDependent { .. })
+        {
+            return Err(format!(
+                "{where_}: Anthropic bills cache writes, so its rows must carry the \
+                 TTL-dependent write tariff"
+            ));
+        }
+        if row.origin == BillingOrigin::OfficialAnthropic
+            && row.cache_read_micro_usd_per_million.is_none()
+        {
+            return Err(format!(
+                "{where_}: Anthropic documents cache reads (0.1x input); the line must be \
+                 recorded"
+            ));
+        }
+        let model_key = model.to_ascii_lowercase();
+        if seen
+            .iter()
+            .any(|(origin, existing)| *origin == row.origin && *existing == model_key)
+        {
+            return Err(format!("{where_}: duplicate (origin, model) row"));
+        }
+        if row.source.trim().is_empty() {
+            return Err(format!(
+                "{where_}: row source must name where the price came from"
+            ));
+        }
+        let effective_at_ms = row.effective_at_ms.unwrap_or(file.effective_at_ms);
+        let observed_at_ms = row.observed_at_ms.unwrap_or(file.observed_at_ms);
+        let valid_until_ms = row.valid_until_ms.unwrap_or(file.valid_until_ms);
+        if observed_at_ms < effective_at_ms || valid_until_ms <= effective_at_ms {
+            return Err(format!(
+                "{where_}: date window is inconsistent: effective={effective_at_ms} \
+                 observed={observed_at_ms} valid_until={valid_until_ms}"
+            ));
+        }
+        match row.retired_at_ms {
+            Some(retired_at_ms) => {
+                if retired_at_ms < effective_at_ms || retired_at_ms > valid_until_ms {
+                    return Err(format!(
+                        "{where_}: retired_at_ms={retired_at_ms} outside the row's \
+                         [effective, valid_until] window"
+                    ));
+                }
+            }
+            // An ACTIVE row's window must still be open at observation time.
+            None if valid_until_ms <= observed_at_ms => {
+                return Err(format!(
+                    "{where_}: an active row cannot already be expired at observation time \
+                     (mark it retired explicitly instead)"
+                ));
+            }
+            None => {}
+        }
+        seen.push((row.origin, model_key));
+        rows.push(BuiltinPrice {
+            origin: row.origin,
+            model: leak(model.to_string()),
+            class: row.class,
+            input_micro_usd_per_million: row.input_micro_usd_per_million,
+            output_micro_usd_per_million: row.output_micro_usd_per_million,
+            cache_read_micro_usd_per_million: row.cache_read_micro_usd_per_million,
+            cache_write: row.cache_write,
+            effective_at_ms,
+            observed_at_ms,
+            valid_until_ms: Some(valid_until_ms),
+            retired_at_ms: row.retired_at_ms,
+            source_id: BUILTIN_SOURCE_ID,
+            catalog_version: BUILTIN_CATALOG_VERSION,
+            source: leak(row.source.trim().to_string()),
+        });
+    }
+    // Every official origin must keep at least one ACTIVE documented row:
+    // a refresh that retires an origin's last row would silently strip the
+    // origin of all exact pricing.
+    for origin in [
+        BillingOrigin::OfficialOpenAi,
+        BillingOrigin::OfficialAnthropic,
+        BillingOrigin::OfficialGoogle,
+        BillingOrigin::OfficialDeepSeek,
+    ] {
+        if !rows
+            .iter()
+            .any(|row| row.origin == origin && !row.is_retired())
+        {
+            return Err(format!(
+                "{}: no active documented row remains",
+                origin_label(origin)
+            ));
+        }
+    }
+    Ok(LoadedCatalog {
+        meta: BuiltinCatalogMeta {
+            catalog_version: BUILTIN_CATALOG_VERSION,
+            source_id: BUILTIN_SOURCE_ID,
+            source: leak(file.source.trim().to_string()),
+            effective_at_ms: file.effective_at_ms,
+            observed_at_ms: file.observed_at_ms,
+            valid_until_ms: file.valid_until_ms,
         },
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // Retired 2026-06-01; documented, never routed at the old price.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialAnthropic,
-        model: "claude-sonnet-4",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 3_000_000,
-        output_micro_usd_per_million: 15_000_000,
-        cache_read_micro_usd_per_million: Some(300_000),
-        cache_write: BuiltinCacheWrite::TtlDependent {
-            five_minutes: 3_750_000,
-            one_hour: 6_000_000,
-        },
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(1_780_272_000_000),
-        retired_at_ms: Some(1_780_272_000_000),
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // Retired 2026-02-01; documented, never routed at the old price.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialAnthropic,
-        model: "claude-haiku-3.5",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 800_000,
-        output_micro_usd_per_million: 4_000_000,
-        cache_read_micro_usd_per_million: Some(80_000),
-        cache_write: BuiltinCacheWrite::TtlDependent {
-            five_minutes: 1_000_000,
-            one_hour: 1_600_000,
-        },
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(1_769_904_000_000),
-        retired_at_ms: Some(1_769_904_000_000),
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // Official Google.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialGoogle,
-        model: "gemini-2.0-flash",
-        class: BuiltinPriceClass::Exact,
-        input_micro_usd_per_million: 100_000,
-        output_micro_usd_per_million: 400_000,
-        cache_read_micro_usd_per_million: None,
-        cache_write: BuiltinCacheWrite::NotBilled,
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-    // Official DeepSeek. The V4-era schedule is not documented as exact in
-    // this table: the row is a CONSERVATIVE BOUND (2x the greatest last
-    // published cache-miss/output rates across the audited V3-era schedules,
-    // with write tokens bounded at the cache-miss rate) and resolves to a
-    // ConservativeCeiling state. A hard cap may use the bound; no caller may
-    // read it as a list price.
-    BuiltinPrice {
-        origin: BillingOrigin::OfficialDeepSeek,
-        model: "deepseek-chat",
-        class: BuiltinPriceClass::ConservativeSchedule,
-        input_micro_usd_per_million: 560_000,
-        output_micro_usd_per_million: 2_200_000,
-        cache_read_micro_usd_per_million: Some(140_000),
-        cache_write: BuiltinCacheWrite::Fixed(560_000),
-        effective_at_ms: BUILTIN_EFFECTIVE_AT_MS,
-        observed_at_ms: BUILTIN_OBSERVED_AT_MS,
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        retired_at_ms: None,
-        source_id: BUILTIN_SOURCE_ID,
-        catalog_version: BUILTIN_CATALOG_VERSION,
-    },
-];
+        rows,
+    })
+}
+
+/// A stable human label for one origin (error messages only).
+fn origin_label(origin: BillingOrigin) -> &'static str {
+    match origin {
+        BillingOrigin::OfficialOpenAi => "openai",
+        BillingOrigin::OfficialAnthropic => "anthropic",
+        BillingOrigin::OfficialGoogle => "google",
+        BillingOrigin::OfficialDeepSeek => "deepseek",
+        BillingOrigin::CustomEndpoint => "custom-endpoint",
+        BillingOrigin::Gateway => "gateway",
+        BillingOrigin::Local => "local",
+    }
+}
+
+/// The one loaded catalog generation (the vendored file parsed and
+/// validated exactly once). A failure is a hard process-startup refusal:
+/// serving Unknown prices because the shipped table is corrupt would hide a
+/// real configuration defect.
+static CATALOG: LazyLock<LoadedCatalog> = LazyLock::new(|| {
+    load_catalog(BUILTIN_CATALOG_JSON).unwrap_or_else(|error| {
+        panic!("vendored builtin price catalog ({BUILTIN_CATALOG_FILE}) is invalid: {error}")
+    })
+});
+
+/// The frozen, versioned price table (the vendored file's validated rows).
+pub static TABLE: LazyLock<Vec<BuiltinPrice>> = LazyLock::new(|| CATALOG.rows.clone());
+
+/// The frozen, versioned price table as a slice.
+pub fn table() -> &'static [BuiltinPrice] {
+    &CATALOG.rows
+}
+
+/// The file-level provenance and date window of the loaded table.
+pub fn meta() -> &'static BuiltinCatalogMeta {
+    &CATALOG.meta
+}
+
+/// The documented effective date of the loaded rows.
+pub fn effective_at_ms() -> u64 {
+    meta().effective_at_ms
+}
+
+/// The documented observation date of the loaded rows.
+pub fn observed_at_ms() -> u64 {
+    meta().observed_at_ms
+}
+
+/// The validity window of the loaded rows (row overrides can end earlier).
+pub fn valid_until_ms() -> u64 {
+    meta().valid_until_ms
+}
 
 /// One documented FAKTOR ROUTING PRIOR row (not a vendor claim).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +542,14 @@ pub struct BuiltinPerformance {
     pub coding_reliability: u8,
     pub estimated_latency_ms: u64,
 }
+
+/// Version string of the built-in Faktor routing priors (the performance
+/// profiles below). Bump whenever a prior changes.
+pub const PERFORMANCE_PRIOR_VERSION: &str = "faktor-routing-priors-v2";
+
+/// Source id of the built-in performance priors (inspectable identity of a
+/// conservative-unknown prior).
+pub const PERFORMANCE_PRIOR_SOURCE_ID: &str = "faktor-builtin-priors-v2";
 
 /// The documented Faktor routing priors. Values are conservative relative
 /// ordering estimates: frontier coding models sit in the high 80s/90s, small
@@ -407,11 +587,53 @@ pub const PERFORMANCE_TABLE: &[BuiltinPerformance] = &[
         estimated_latency_ms: 1_200,
     },
     BuiltinPerformance {
+        origin: BillingOrigin::OfficialOpenAi,
+        model: "gpt-5",
+        context_reliability: 94,
+        coding_reliability: 95,
+        estimated_latency_ms: 1_500,
+    },
+    BuiltinPerformance {
+        origin: BillingOrigin::OfficialOpenAi,
+        model: "gpt-5-mini",
+        context_reliability: 86,
+        coding_reliability: 85,
+        estimated_latency_ms: 800,
+    },
+    BuiltinPerformance {
+        origin: BillingOrigin::OfficialOpenAi,
+        model: "gpt-5-nano",
+        context_reliability: 74,
+        coding_reliability: 70,
+        estimated_latency_ms: 400,
+    },
+    BuiltinPerformance {
         origin: BillingOrigin::OfficialAnthropic,
         model: "claude-opus-4",
         context_reliability: 92,
         coding_reliability: 95,
         estimated_latency_ms: 1_500,
+    },
+    BuiltinPerformance {
+        origin: BillingOrigin::OfficialAnthropic,
+        model: "claude-opus-4-1",
+        context_reliability: 93,
+        coding_reliability: 96,
+        estimated_latency_ms: 1_600,
+    },
+    BuiltinPerformance {
+        origin: BillingOrigin::OfficialAnthropic,
+        model: "claude-sonnet-4-5",
+        context_reliability: 93,
+        coding_reliability: 94,
+        estimated_latency_ms: 900,
+    },
+    BuiltinPerformance {
+        origin: BillingOrigin::OfficialAnthropic,
+        model: "claude-haiku-4-5",
+        context_reliability: 84,
+        coding_reliability: 80,
+        estimated_latency_ms: 450,
     },
     BuiltinPerformance {
         origin: BillingOrigin::OfficialAnthropic,
@@ -435,6 +657,13 @@ pub const PERFORMANCE_TABLE: &[BuiltinPerformance] = &[
         estimated_latency_ms: 350,
     },
     BuiltinPerformance {
+        origin: BillingOrigin::OfficialGoogle,
+        model: "gemini-2.5-flash",
+        context_reliability: 88,
+        coding_reliability: 84,
+        estimated_latency_ms: 300,
+    },
+    BuiltinPerformance {
         origin: BillingOrigin::OfficialDeepSeek,
         model: "deepseek-chat",
         context_reliability: 88,
@@ -443,14 +672,14 @@ pub const PERFORMANCE_TABLE: &[BuiltinPerformance] = &[
     },
 ];
 
-/// The provenance of the whole frozen table (the table's own dates).
+/// The provenance of the whole loaded table (the file's own dates).
 pub fn provenance() -> PricingProvenance {
     PricingProvenance {
-        source_id: BUILTIN_SOURCE_ID.to_string(),
-        effective_at_ms: Some(BUILTIN_EFFECTIVE_AT_MS),
-        observed_at_ms: Some(BUILTIN_OBSERVED_AT_MS),
-        valid_until_ms: Some(BUILTIN_VALID_UNTIL_MS),
-        catalog_version: BUILTIN_CATALOG_VERSION.to_string(),
+        source_id: meta().source_id.to_string(),
+        effective_at_ms: Some(meta().effective_at_ms),
+        observed_at_ms: Some(meta().observed_at_ms),
+        valid_until_ms: Some(meta().valid_until_ms),
+        catalog_version: meta().catalog_version.to_string(),
     }
 }
 
@@ -561,7 +790,7 @@ pub fn lookup_by_origin(origin: BillingOrigin, model: &str) -> Option<BuiltinPri
 /// routing paths use [`lookup_by_origin`]).
 pub fn lookup_documented_by_origin(origin: BillingOrigin, model: &str) -> Option<BuiltinPrice> {
     let model = model.trim().to_ascii_lowercase();
-    TABLE
+    table()
         .iter()
         .copied()
         .find(|row| row.origin == origin && row.model.to_ascii_lowercase() == model)
@@ -660,15 +889,248 @@ pub fn performance_prior(origin: BillingOrigin, model: &str) -> Option<ModelPerf
 mod tests {
     use super::*;
 
+    /// The vendored file is the source of truth: the loaded table must
+    /// match it byte-for-row, and the file must carry its provenance, dates
+    /// and per-row sources.
+    #[test]
+    fn vendored_file_loads_with_provenance_dates_and_per_row_sources() {
+        let file: serde_json::Value =
+            serde_json::from_str(BUILTIN_CATALOG_JSON).expect("vendored catalog parses");
+        assert_eq!(file["catalog_version"], BUILTIN_CATALOG_VERSION);
+        assert_eq!(file["source_id"], BUILTIN_SOURCE_ID);
+        assert!(
+            file["source"].as_str().expect("file source").len() > 40,
+            "file-level source must describe the provenance"
+        );
+        assert_eq!(
+            meta().effective_at_ms,
+            file["effective_at_ms"].as_u64().unwrap()
+        );
+        assert_eq!(
+            meta().observed_at_ms,
+            file["observed_at_ms"].as_u64().unwrap()
+        );
+        assert_eq!(
+            meta().valid_until_ms,
+            file["valid_until_ms"].as_u64().unwrap()
+        );
+        assert!(meta().effective_at_ms < meta().observed_at_ms);
+        assert!(meta().observed_at_ms < meta().valid_until_ms);
+        assert_eq!(table().len(), TABLE.len());
+        let file_rows = file["rows"].as_array().expect("rows array");
+        assert_eq!(table().len(), file_rows.len(), "loaded count == file count");
+        for (loaded, raw) in table().iter().zip(file_rows) {
+            assert_eq!(loaded.model, raw["model"].as_str().unwrap());
+            assert_eq!(
+                loaded.input_micro_usd_per_million,
+                raw["input_micro_usd_per_million"].as_u64().unwrap()
+            );
+            assert_eq!(
+                loaded.output_micro_usd_per_million,
+                raw["output_micro_usd_per_million"].as_u64().unwrap()
+            );
+            assert_eq!(
+                loaded.cache_read_micro_usd_per_million,
+                raw["cache_read_micro_usd_per_million"].as_u64()
+            );
+            assert_eq!(loaded.retired_at_ms, raw["retired_at_ms"].as_u64());
+            assert!(loaded.origin.is_official(), "official origin only");
+            assert!(
+                !loaded.source.trim().is_empty(),
+                "{} row source",
+                loaded.model
+            );
+            assert!(loaded.source.contains("http") || loaded.source.contains("bound"));
+            assert!(loaded.input_micro_usd_per_million > 0);
+            assert!(loaded.output_micro_usd_per_million > 0);
+            assert_eq!(loaded.source_id, BUILTIN_SOURCE_ID);
+            assert_eq!(loaded.catalog_version, BUILTIN_CATALOG_VERSION);
+        }
+    }
+
+    /// The loader's rejection matrix: a corrupted vendored file must NEVER
+    /// load as a partial/zero-priced table. Each mutation is applied to the
+    /// real checked-in bytes.
+    #[test]
+    fn loader_rejects_corrupted_catalog_data_adversarially() {
+        let base: serde_json::Value =
+            serde_json::from_str(BUILTIN_CATALOG_JSON).expect("vendored catalog parses");
+        let mutate = |f: &dyn Fn(&mut serde_json::Value)| -> String {
+            let mut copy = base.clone();
+            f(&mut copy);
+            load_catalog(&copy.to_string()).expect_err("corrupt catalog must not load")
+        };
+
+        // Unknown key: a typo can never be silently ignored.
+        let err = mutate(&|doc| {
+            doc["rows"][0]["input_micro_usd_per_millionn"] = serde_json::json!(1);
+        });
+        assert!(err.contains("input_micro_usd_per_millionn"), "{err}");
+        // Zero input price (the free-model lie).
+        let err = mutate(&|doc| {
+            doc["rows"][0]["input_micro_usd_per_million"] = serde_json::json!(0);
+        });
+        assert!(err.contains("nonzero"), "{err}");
+        // Zero output price.
+        let err = mutate(&|doc| {
+            doc["rows"][0]["output_micro_usd_per_million"] = serde_json::json!(0);
+        });
+        assert!(err.contains("nonzero"), "{err}");
+        // A recorded cache-read zero instead of an omitted line.
+        let err = mutate(&|doc| {
+            doc["rows"][0]["cache_read_micro_usd_per_million"] = serde_json::json!(0);
+        });
+        assert!(err.contains("cache-read"), "{err}");
+        // A duplicate (origin, model) row.
+        let err = mutate(&|doc| {
+            let row = doc["rows"][0].clone();
+            doc["rows"].as_array_mut().unwrap().push(row);
+        });
+        assert!(err.contains("duplicate"), "{err}");
+        // A non-official origin.
+        let err = mutate(&|doc| {
+            doc["rows"][0]["origin"] = serde_json::json!("custom_endpoint");
+        });
+        assert!(err.contains("OFFICIAL"), "{err}");
+        // A retired row without the explicit retirement date (its window is
+        // closed at observation time, so it cannot pass as active).
+        let err = mutate(&|doc| {
+            for row in doc["rows"].as_array_mut().unwrap() {
+                if row["model"] == "claude-sonnet-4" {
+                    row.as_object_mut().unwrap().remove("retired_at_ms");
+                }
+            }
+        });
+        assert!(err.contains("retired") || err.contains("expired"), "{err}");
+        // A retirement date outside the row's window.
+        let err = mutate(&|doc| {
+            for row in doc["rows"].as_array_mut().unwrap() {
+                if row["model"] == "gpt-4o" {
+                    row["retired_at_ms"] = serde_json::json!(u64::MAX);
+                }
+            }
+        });
+        assert!(err.contains("retired_at_ms"), "{err}");
+        // A catalog-version drift.
+        let err = mutate(&|doc| {
+            doc["catalog_version"] = serde_json::json!("builtin-other");
+        });
+        assert!(err.contains("catalog_version"), "{err}");
+        // An empty model.
+        let err = mutate(&|doc| {
+            doc["rows"][0]["model"] = serde_json::json!("  ");
+        });
+        assert!(err.contains("model"), "{err}");
+        // File-level source omitted.
+        let err = mutate(&|doc| {
+            doc.as_object_mut().unwrap().remove("source");
+        });
+        assert!(err.contains("source"), "{err}");
+        // The untouched vendored bytes DO load and validate.
+        load_catalog(BUILTIN_CATALOG_JSON).expect("the checked-in catalog is valid");
+    }
+
+    /// An unknown model gets NO price: no lookup entry exists (so callers
+    /// stay `PricingState::Unknown` with the ConservativeUnknown quality
+    /// placeholder — never a fabricated free/zero row), while retired rows
+    /// stay documented-but-excluded and explicit.
+    #[test]
+    fn unknown_models_get_no_row_and_retired_rows_are_explicit() {
+        // No row can ever match an unlisted model under any official
+        // origin, through either the origin-keyed or the family shim path.
+        for model in [
+            "",
+            "default",
+            "gpt-6",
+            "gpt-5-turbo",
+            "o9",
+            "claude-opus-9",
+            "claude-sonnet-9",
+            "gemini-9.0-flash",
+            "deepseek-v9",
+        ] {
+            for origin in [
+                BillingOrigin::OfficialOpenAi,
+                BillingOrigin::OfficialAnthropic,
+                BillingOrigin::OfficialGoogle,
+                BillingOrigin::OfficialDeepSeek,
+            ] {
+                assert_eq!(
+                    lookup_by_origin(origin, model),
+                    None,
+                    "{model:?} must have no documented row for {origin:?}"
+                );
+            }
+            for family in ["openai", "anthropic", "google", "deepseek"] {
+                assert_eq!(lookup(family, model), None, "{family}/{model:?}");
+            }
+        }
+        // The table has no wildcard/inheritance row: every row names a
+        // concrete model token.
+        for row in table() {
+            assert!(!row.model.is_empty());
+            assert!(!row.model.contains('*'));
+            assert_eq!(row.model.trim(), row.model);
+        }
+        // Retired rows are EXPLICIT in the file: exactly the two documented
+        // retirements, each carrying its `retired_at_ms`, each excluded
+        // from the exact lookup while remaining inspectable.
+        let retired: Vec<(&str, u64)> = table()
+            .iter()
+            .filter(|row| row.is_retired())
+            .map(|row| (row.model, row.retired_at_ms.unwrap()))
+            .collect();
+        assert_eq!(
+            retired,
+            vec![
+                ("claude-sonnet-4", 1_780_272_000_000),
+                ("claude-haiku-3.5", 1_769_904_000_000),
+            ],
+            "retired rows are explicit and frozen"
+        );
+        for (model, retired_at) in retired {
+            let row = lookup_documented_by_origin(BillingOrigin::OfficialAnthropic, model)
+                .expect("retired row is documented");
+            assert_eq!(row.retired_at_ms, Some(retired_at));
+            assert_eq!(
+                lookup_by_origin(BillingOrigin::OfficialAnthropic, model),
+                None
+            );
+            assert_eq!(
+                lookup_by_origin(
+                    BillingOrigin::OfficialAnthropic,
+                    &model.to_ascii_uppercase()
+                ),
+                None
+            );
+            assert_eq!(
+                pricing_state_at(&row, observed_at_ms()),
+                PricingState::Unknown,
+                "{model} retired must never resolve a price"
+            );
+            assert_eq!(row.valid_until_ms, Some(retired_at));
+        }
+        // Every ACTIVE row lacks a retirement date (explicitness is
+        // bidirectional: no silent retirement by window expiry).
+        for row in table().iter().filter(|row| !row.is_retired()) {
+            assert_eq!(row.retired_at_ms, None);
+            assert!(
+                row.valid_until_ms
+                    .is_some_and(|until| until > observed_at_ms()),
+                "{} active row window must be open at observation",
+                row.model
+            );
+        }
+    }
+
     #[test]
     fn builtin_rows_are_locked_with_quote_provenance_and_never_free() {
         // Every documented row: exact input/output lines, cache lines only
         // where published, cache_write never silently zero on a
         // write-billing provider, sub-$1/M prices kept exact (no
         // truncation to zero), metadata dated, provenance frozen.
-        assert_eq!(TABLE.len(), 9);
         let mut seen: Vec<(BillingOrigin, &str)> = Vec::new();
-        for row in TABLE {
+        for row in table() {
             assert!(!seen.contains(&(row.origin, row.model)), "duplicate row");
             seen.push((row.origin, row.model));
             let q = quote_of(row);
@@ -694,10 +1156,11 @@ mod tests {
             // Every row carries its metadata dates + source identity.
             assert_eq!(row.source_id, BUILTIN_SOURCE_ID);
             assert_eq!(row.catalog_version, BUILTIN_CATALOG_VERSION);
-            assert_eq!(row.catalog_version, "builtin-v2");
+            assert_eq!(row.catalog_version, "builtin-v3");
             assert!(row.effective_at_ms > 0);
             assert!(row.observed_at_ms >= row.effective_at_ms);
             assert!(row.valid_until_ms.is_some());
+            assert!(!row.source.trim().is_empty());
             let p = provenance_of(row);
             assert_eq!(p.effective_at_ms, Some(row.effective_at_ms));
             assert_eq!(p.observed_at_ms, Some(row.observed_at_ms));
@@ -747,22 +1210,51 @@ mod tests {
                 }
             }
         }
+        // Every documented Anthropic row bills cache writes (never
+        // zero-by-omission) and documents its cache reads.
+        for row in table()
+            .iter()
+            .filter(|row| row.origin == BillingOrigin::OfficialAnthropic)
+        {
+            assert!(
+                matches!(row.cache_write, BuiltinCacheWrite::TtlDependent { .. }),
+                "{} must carry the TTL-dependent write tariff",
+                row.model
+            );
+            assert!(
+                row.cache_read_micro_usd_per_million.is_some_and(|r| r > 0),
+                "{} must document its cache-read line",
+                row.model
+            );
+        }
         // The audited goldens settle exactly from the stored rows.
-        let gpt4o = quote_of(TABLE.iter().find(|r| r.model == "gpt-4o").unwrap());
+        let gpt4o = quote_of(table().iter().find(|r| r.model == "gpt-4o").unwrap());
         assert_eq!(gpt4o.input.0, 2_500_000, "$2.50/M input, exact");
         assert_eq!(gpt4o.cache_read.0, 1_250_000, "$1.25/M cache read");
-        let mini = quote_of(TABLE.iter().find(|r| r.model == "gpt-4o-mini").unwrap());
+        let mini = quote_of(table().iter().find(|r| r.model == "gpt-4o-mini").unwrap());
         assert_eq!(mini.input.0, 150_000, "$0.15/M must NOT truncate to zero");
         assert_eq!(mini.output.0, 600_000, "$0.60/M must NOT truncate to zero");
         // o3's CURRENT repricing is locked (was $10/$40, then $2/$8 with a
         // $0.50/M cached-input line).
-        let o3 = quote_of(TABLE.iter().find(|r| r.model == "o3").unwrap());
+        let o3 = quote_of(table().iter().find(|r| r.model == "o3").unwrap());
         assert_eq!(o3.input.0, 2_000_000);
         assert_eq!(o3.output.0, 8_000_000);
         assert_eq!(o3.cache_read.0, 500_000);
         // o4-mini has its separate published cached rate, never zero.
-        let o4 = quote_of(TABLE.iter().find(|r| r.model == "o4-mini").unwrap());
+        let o4 = quote_of(table().iter().find(|r| r.model == "o4-mini").unwrap());
         assert_eq!(o4.cache_read.0, 275_000);
+        // The refreshed GPT-5 family is priced exactly, sub-cent lines
+        // included (nano input $0.05/M, cached $0.005/M).
+        let gpt5 = quote_of(table().iter().find(|r| r.model == "gpt-5").unwrap());
+        assert_eq!(gpt5.input.0, 1_250_000);
+        assert_eq!(gpt5.output.0, 10_000_000);
+        assert_eq!(gpt5.cache_read.0, 125_000);
+        let nano = quote_of(table().iter().find(|r| r.model == "gpt-5-nano").unwrap());
+        assert_eq!(nano.input.0, 50_000, "$0.05/M must NOT truncate to zero");
+        assert_eq!(
+            nano.cache_read.0, 5_000,
+            "$0.005/M must NOT truncate to zero"
+        );
     }
 
     fn family_of(origin: BillingOrigin) -> &'static str {
@@ -782,13 +1274,13 @@ mod tests {
         // cached rate bills 275_000. Zero cache pricing (the builtin-v1
         // lie) would understate both.
         let mut o3 = PricingSnapshot::exact(
-            quote_of(TABLE.iter().find(|r| r.model == "o3").unwrap()),
+            quote_of(table().iter().find(|r| r.model == "o3").unwrap()),
             2,
             BUILTIN_SOURCE_ID.into(),
         );
-        o3.valid_until_ms = Some(BUILTIN_VALID_UNTIL_MS);
+        o3.valid_until_ms = Some(valid_until_ms());
         assert_eq!(o3.settle_cost(0, 1_000_000, 0, 0), Some(500_000));
-        let o4 = quote_of(TABLE.iter().find(|r| r.model == "o4-mini").unwrap());
+        let o4 = quote_of(table().iter().find(|r| r.model == "o4-mini").unwrap());
         assert_eq!(o4.cache_read.0, 275_000);
         assert_eq!(
             PricingSnapshot::exact(o4, 2, BUILTIN_SOURCE_ID.into()).settle_cost(0, 1_000_000, 0, 0),
@@ -800,12 +1292,12 @@ mod tests {
     fn anthropic_cache_write_is_priced_ttl_dependent_and_max_under_hard_budget() {
         // Anthropic bills cache CREATION. claude-opus-4: 5m write 1.25x
         // input ($18.75/M), 1h write 2x input ($30/M); read 0.1x.
-        let row = *TABLE
+        let row = *table()
             .iter()
             .find(|r| r.model == "claude-opus-4")
             .expect("documented row");
         let sched = BuiltinRowSchedule::new(row, 1);
-        let ctx = PricingContext::at(BUILTIN_OBSERVED_AT_MS);
+        let ctx = PricingContext::at(observed_at_ms());
         // A plain quote with an unknown TTL cannot pick a tariff.
         assert_eq!(
             sched.quote(&ctx).unwrap_err(),
@@ -838,7 +1330,7 @@ mod tests {
             "cache creation must never reserve zero or the cheaper TTL"
         );
         // The catalog state reserves the same conservative write tariff.
-        let state = pricing_state_at(&row, BUILTIN_OBSERVED_AT_MS);
+        let state = pricing_state_at(&row, observed_at_ms());
         assert_eq!(state.authority(), PriceAuthority::Exact);
         let snap = state.snapshot();
         assert_eq!(
@@ -859,17 +1351,17 @@ mod tests {
     #[test]
     fn retired_rows_and_expired_rows_are_unknown() {
         for model in ["claude-sonnet-4", "claude-haiku-3.5"] {
-            let row = *TABLE.iter().find(|r| r.model == model).unwrap();
+            let row = *table().iter().find(|r| r.model == model).unwrap();
             assert!(row.is_retired());
             assert_eq!(
-                pricing_state_at(&row, BUILTIN_OBSERVED_AT_MS),
+                pricing_state_at(&row, observed_at_ms()),
                 PricingState::Unknown,
                 "{model} retired in 2026 must never resolve exact"
             );
         }
         // An ACTIVE row past its window is Unknown too (no ceiling on
         // exact rows: a stale exact quote is not a bound).
-        let row = *TABLE.iter().find(|r| r.model == "gpt-4o").unwrap();
+        let row = *table().iter().find(|r| r.model == "gpt-4o").unwrap();
         assert_eq!(
             pricing_state_at(&row, row.valid_until_ms.unwrap()),
             PricingState::Unknown
@@ -882,10 +1374,10 @@ mod tests {
 
     #[test]
     fn deepseek_v4_row_is_a_conservative_bound_not_an_exact_claim() {
-        let row = *TABLE.iter().find(|r| r.model == "deepseek-chat").unwrap();
+        let row = *table().iter().find(|r| r.model == "deepseek-chat").unwrap();
         assert_eq!(row.class, BuiltinPriceClass::ConservativeSchedule);
         assert_eq!(
-            pricing_state_at(&row, BUILTIN_OBSERVED_AT_MS).authority(),
+            pricing_state_at(&row, observed_at_ms()).authority(),
             PriceAuthority::ConservativeCeiling,
             "an undocumented V4-era schedule never claims Exact"
         );
@@ -907,7 +1399,7 @@ mod tests {
     #[test]
     fn lookup_never_invents_rows_and_origin_scoping_is_exact() {
         for (family, model) in [
-            ("openai", "gpt-5"),
+            ("openai", "gpt-6"),
             ("openai", "gpt-4o-2024-08-06"), // dated snapshots are not rows
             ("ollama", "gpt-4o"),
             ("openai", "my-private-model"),
@@ -999,11 +1491,11 @@ mod tests {
         let back: PricingProvenance =
             serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
         assert_eq!(back, p);
-        assert_eq!(back.catalog_version, "builtin-v2");
-        assert_eq!(back.source_id, "faktor-builtin-v2");
-        assert_eq!(back.effective_at_ms, Some(BUILTIN_EFFECTIVE_AT_MS));
-        assert_eq!(back.observed_at_ms, Some(BUILTIN_OBSERVED_AT_MS));
-        assert_eq!(back.valid_until_ms, Some(BUILTIN_VALID_UNTIL_MS));
+        assert_eq!(back.catalog_version, "builtin-v3");
+        assert_eq!(back.source_id, "faktor-builtin-v3");
+        assert_eq!(back.effective_at_ms, Some(effective_at_ms()));
+        assert_eq!(back.observed_at_ms, Some(observed_at_ms()));
+        assert_eq!(back.valid_until_ms, Some(valid_until_ms()));
         assert!(back.observed_at_ms >= back.effective_at_ms);
         // Legacy provenance JSON without the new/optional fields still
         // decodes (Option defaults).

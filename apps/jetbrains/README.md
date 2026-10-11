@@ -34,6 +34,34 @@ were removed by the Faktor-owned-UI migration).
 - `stop()` is SIGTERM first, `destroyForcibly()` only after a 3s grace;
   the stdout drainer and the SSE thread stop with the process.
 
+## Daemon discovery and the app-level install layout
+
+The daemon executable is resolved from MACHINE-scoped inputs only
+(`dev.faktor.backend.DaemonBinary`, which has no project/workspace input by
+construction):
+
+1. the APPLICATION-level Faktor binary path (`faktor.daemon.binaryPath` in
+   the IDE's application properties store, written by the "Locate daemon…"
+   action in the missing-daemon dialog),
+2. `FAKTOR_BIN`,
+3. the app-level signed install layout `~/.faktor/install/launcher` — the
+   location the `faktor-cli` installer/updater manages; the launcher
+   authenticates the activated release through the signed pointer before
+   exec.
+
+A project/repository `target/debug|release` build is never consulted or
+executed, and no workspace-scoped setting exists for the daemon. When nothing
+is found, the explicit "Start service" action reports the clear, actionable
+error ("install into ~/.faktor/install or use \"Locate daemon…\"") and opens
+that dialog with a **Locate daemon…** button; the picked executable is stored
+at application scope only. The daemon starts ONLY on that explicit action —
+creating the tool window never spawns anything.
+
+Where a checksum record exists beside the resolved executable
+(`<binary>.sha256`), `BackendProcessManager.start()` refuses a mismatch or a
+malformed record before spawn; a missing record is the explicit unverified
+state the host warns about and requires the operator to confirm.
+
 ## Native protocol routing
 
 | UI action | Endpoint |

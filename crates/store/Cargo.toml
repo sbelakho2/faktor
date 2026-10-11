@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+# Fault-certification seam payloads (CrashArm/CrashSeam arming + panics).
+# OFF in production builds: the crate then compiles a zero-sized no-op.
+fault-injection = []
+
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "backup", "hooks"] }
 faktor-core.workspace = true

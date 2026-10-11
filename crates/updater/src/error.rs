@@ -104,6 +104,22 @@ pub enum UpdateError {
     /// target).
     #[error("legacy manifest refused on channel {channel:?}: {detail}")]
     LegacyManifestRefused { channel: String, detail: String },
+    /// The DATA store was migrated by a newer binary's schema ladder than the
+    /// release being rolled back to understands: the pointer was NOT moved,
+    /// because handing the previous binary a database it must refuse to open
+    /// would leave the daemon unable to start. Both versions are named; the
+    /// recovery path is restoring the newer binary or the pre-migration
+    /// snapshot (taken before the schema transition).
+    #[error(
+        "rollback to {target_version} refused: the data store schema v{found} is newer than \
+         that binary's schema head v{head}; the install was left on the newer release \
+         (restore the newer binary or the pre-migration snapshot)"
+    )]
+    SchemaAhead {
+        target_version: String,
+        found: i64,
+        head: i64,
+    },
     /// The bootstrap launcher refused to run the activated release (no
     /// pointer, legacy pointer, empty trust anchor, unsigned/unknown-key/
     /// tampered release manifest, or a digest mismatch). The running process
@@ -148,6 +164,7 @@ impl UpdateError {
             UpdateError::Conflict(_) => "conflict",
             UpdateError::RollbackRefused { .. } => "rollback_refused",
             UpdateError::LegacyManifestRefused { .. } => "legacy_manifest_refused",
+            UpdateError::SchemaAhead { .. } => "schema_ahead",
             UpdateError::LaunchRefused { .. } => "launch_refused",
             UpdateError::RestartFailed { .. } => "restart_failed",
             UpdateError::RefusalUnrecorded { refusal, .. } => refusal.code(),
@@ -173,6 +190,7 @@ impl UpdateError {
             UpdateError::Conflict(_) => 409,
             UpdateError::RollbackRefused { .. } => 409,
             UpdateError::LegacyManifestRefused { .. } => 409,
+            UpdateError::SchemaAhead { .. } => 409,
             UpdateError::LaunchRefused { .. } => 409,
             UpdateError::RestartFailed { .. } => 500,
             UpdateError::RefusalUnrecorded { refusal, .. } => refusal.http_status(),
@@ -294,5 +312,27 @@ mod tests {
         assert_eq!(legacy.code(), "legacy_manifest_refused");
         assert_eq!(legacy.http_status(), 409);
         assert!(!legacy.retryable());
+    }
+
+    #[test]
+    fn schema_ahead_refusals_name_both_versions_and_are_never_retryable() {
+        let refusal = UpdateError::SchemaAhead {
+            target_version: "0.1.0".into(),
+            found: 40,
+            head: 33,
+        };
+        assert_eq!(refusal.code(), "schema_ahead");
+        assert_eq!(refusal.http_status(), 409);
+        assert!(!refusal.retryable());
+        let rendered = refusal.to_string();
+        for needle in [
+            "0.1.0",
+            "v40",
+            "v33",
+            "newer binary",
+            "pre-migration snapshot",
+        ] {
+            assert!(rendered.contains(needle), "{rendered}");
+        }
     }
 }

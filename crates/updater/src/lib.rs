@@ -80,7 +80,9 @@ pub use compat::{
     Verdict,
 };
 pub use error::{ManifestRefusal, UpdateError};
-pub use install::{DigestProbe, HealthProbe, InstallLayout, InstallPointer};
+pub use install::{
+    DataStoreSchema, DataStoreSchemaProbe, DigestProbe, HealthProbe, InstallLayout, InstallPointer,
+};
 pub use keys::{TrustedKey, TrustedKeys};
 pub use manifest::{
     verify_manifest, verify_manifest_at_launch, Artifact, Compatibility, UpdateManifest,

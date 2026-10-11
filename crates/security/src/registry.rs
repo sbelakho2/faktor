@@ -7,10 +7,9 @@
 //! ## Fingerprints, not plaintext
 //!
 //! The registry stores only a **non-reversible digest** per secret plus
-//! its length. The task brief names blake3; this crate is std-only (no
-//! `Cargo.toml` dependency additions are permitted for this crate), so the
-//! registry uses a from-scratch, known-answer-tested SHA-256
-//! ([`sha256`]). SHA-256 and blake3 are interchangeable here: both are
+//! its length. The task brief names blake3; the fingerprint is instead
+//! SHA-256 from the audited [`sha2`] crate ([`sha256`] is a thin wrapper).
+//! SHA-256 and blake3 are interchangeable here: both are
 //! deterministic, collision-resistant, non-reversible digests whose only
 //! role is exact look-up, and neither is a MAC — **an offline attacker who
 //! guesses a low-entropy secret can confirm the guess against the
@@ -41,6 +40,8 @@
 
 use std::fmt;
 use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 use crate::SecretHit;
 
@@ -75,13 +76,10 @@ pub struct SecretRegistry {
     active: Option<Arc<dyn ExactSecretSource>>,
 }
 
-/// Deterministic, collision-resistant, non-reversible fingerprint. The
-/// task brief names blake3; this crate cannot add dependencies, so a
-/// compact, known-answer-tested SHA-256 is used instead (see module docs).
+/// Deterministic, collision-resistant, non-reversible fingerprint: SHA-256
+/// from the audited [`sha2`] crate over the secret bytes (see module docs).
 fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut ctx = Sha256::new();
-    ctx.update(data);
-    ctx.finalize()
+    Sha256::digest(data).into()
 }
 
 impl SecretRegistry {
@@ -348,139 +346,6 @@ fn scan_exact_impl(payload: &[u8], fps: &[Fingerprint]) -> Vec<(usize, usize)> {
     hits
 }
 
-// ---------------------------------------------------------------------------
-// std-only SHA-256 (compact, known-answer tested)
-// ---------------------------------------------------------------------------
-
-/// Incremental SHA-256 state.
-struct Sha256 {
-    h: [u32; 8],
-    buf: [u8; 64],
-    buf_len: usize,
-    total: u64,
-}
-
-impl Sha256 {
-    fn new() -> Sha256 {
-        Sha256 {
-            h: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            buf: [0u8; 64],
-            buf_len: 0,
-            total: 0,
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.total = self.total.wrapping_add(data.len() as u64);
-        if self.buf_len > 0 {
-            let take = (64 - self.buf_len).min(data.len());
-            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
-            self.buf_len += take;
-            data = &data[take..];
-            if self.buf_len == 64 {
-                let block = self.buf;
-                compress(&mut self.h, &block);
-                self.buf_len = 0;
-            }
-        }
-        while data.len() >= 64 {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[..64]);
-            compress(&mut self.h, &block);
-            data = &data[64..];
-        }
-        if !data.is_empty() {
-            self.buf[..data.len()].copy_from_slice(data);
-            self.buf_len = data.len();
-        }
-    }
-
-    fn finalize(mut self) -> [u8; 32] {
-        let bit_len = self.total.wrapping_mul(8);
-        // Padding: 0x80 then zeros then the 8-byte big-endian bit length.
-        let pad_len = if self.buf_len < 56 {
-            56 - self.buf_len
-        } else {
-            120 - self.buf_len
-        };
-        let mut pad = vec![0u8; pad_len];
-        pad[0] = 0x80;
-        self.update(&pad);
-        let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&bit_len.to_be_bytes());
-        self.update(&len_bytes);
-        debug_assert_eq!(self.buf_len, 0);
-        let mut out = [0u8; 32];
-        for (i, word) in self.h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
-}
-
-const K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
-    let mut w = [0u32; 64];
-    for i in 0..16 {
-        w[i] = u32::from_be_bytes([
-            block[i * 4],
-            block[i * 4 + 1],
-            block[i * 4 + 2],
-            block[i * 4 + 3],
-        ]);
-    }
-    for i in 16..64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
-    }
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
-    for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ (!e & g);
-        let t1 = hh
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(K[i])
-            .wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let t2 = s0.wrapping_add(maj);
-        hh = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(t1);
-        d = c;
-        c = b;
-        b = a;
-        a = t1.wrapping_add(t2);
-    }
-    h[0] = h[0].wrapping_add(a);
-    h[1] = h[1].wrapping_add(b);
-    h[2] = h[2].wrapping_add(c);
-    h[3] = h[3].wrapping_add(d);
-    h[4] = h[4].wrapping_add(e);
-    h[5] = h[5].wrapping_add(f);
-    h[6] = h[6].wrapping_add(g);
-    h[7] = h[7].wrapping_add(hh);
-}
-
 impl fmt::Debug for SecretRegistry {
     /// Redacted: prints counts and lengths only — never secret values,
     /// never digest material that could confirm an offline guess faster.
@@ -525,6 +390,11 @@ mod tests {
             hex(&sha256(big)),
             "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
         );
+        // FIPS 180-4 long-message vector: one million repetitions of 'a'.
+        assert_eq!(
+            hex(&sha256(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     #[test]
@@ -535,14 +405,197 @@ mod tests {
         for chunk in data.chunks(7) {
             ctx.update(chunk);
         }
-        let incr = ctx.finalize();
+        let incr: [u8; 32] = ctx.finalize().into();
         assert_eq!(whole, incr);
         // Odd boundary: single byte at a time.
         let mut ctx = Sha256::new();
         for b in &data {
-            ctx.update(&[*b]);
+            ctx.update([*b]);
         }
-        assert_eq!(whole, ctx.finalize());
+        assert_eq!(whole, <[u8; 32]>::from(ctx.finalize()));
+    }
+
+    // -----------------------------------------------------------------
+    // SHA-256 parity oracle: the deleted hand-rolled implementation,
+    // kept verbatim (test-only) so the adopted `sha2` digest is proven
+    // byte-identical to the old output across every block/padding
+    // boundary and over real payload shapes.
+    // -----------------------------------------------------------------
+    mod legacy_sha256 {
+        /// The pre-`sha2` incremental SHA-256 state, copied verbatim from
+        /// this module before deletion.
+        pub struct Sha256 {
+            h: [u32; 8],
+            buf: [u8; 64],
+            buf_len: usize,
+            total: u64,
+        }
+
+        impl Sha256 {
+            pub fn new() -> Sha256 {
+                Sha256 {
+                    h: [
+                        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+                        0x1f83d9ab, 0x5be0cd19,
+                    ],
+                    buf: [0u8; 64],
+                    buf_len: 0,
+                    total: 0,
+                }
+            }
+        }
+
+        impl Sha256 {
+            pub fn update(&mut self, data: &[u8]) {
+                let mut data = data;
+                self.total = self.total.wrapping_add(data.len() as u64);
+                if self.buf_len > 0 {
+                    let take = (64 - self.buf_len).min(data.len());
+                    self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+                    self.buf_len += take;
+                    data = &data[take..];
+                    if self.buf_len == 64 {
+                        let block = self.buf;
+                        compress(&mut self.h, &block);
+                        self.buf_len = 0;
+                    }
+                }
+                while data.len() >= 64 {
+                    let mut block = [0u8; 64];
+                    block.copy_from_slice(&data[..64]);
+                    compress(&mut self.h, &block);
+                    data = &data[64..];
+                }
+                if !data.is_empty() {
+                    self.buf[..data.len()].copy_from_slice(data);
+                    self.buf_len = data.len();
+                }
+            }
+
+            pub fn finalize(mut self) -> [u8; 32] {
+                let bit_len = self.total.wrapping_mul(8);
+                let pad_len = if self.buf_len < 56 {
+                    56 - self.buf_len
+                } else {
+                    120 - self.buf_len
+                };
+                let mut pad = vec![0u8; pad_len];
+                pad[0] = 0x80;
+                self.update(&pad);
+                self.update(&bit_len.to_be_bytes());
+                let mut out = [0u8; 32];
+                for (i, word) in self.h.iter().enumerate() {
+                    out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+                }
+                out
+            }
+        }
+
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+
+        fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([
+                    block[i * 4],
+                    block[i * 4 + 1],
+                    block[i * 4 + 2],
+                    block[i * 4 + 3],
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ (!e & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
+        }
+
+        pub fn digest(data: &[u8]) -> [u8; 32] {
+            let mut ctx = Sha256::new();
+            ctx.update(data);
+            ctx.finalize()
+        }
+    }
+
+    #[test]
+    fn sha2_adoption_parity_matches_the_deleted_handrolled_implementation() {
+        // Every length across several block/padding boundaries (0..=200
+        // covers 0/55/56/63/64/65, 119/120/127/128/129 and 191/192).
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=200usize {
+            cases.push(
+                (0..len)
+                    .map(|i| ((i as u64 * 31 + 7) & 0xff) as u8)
+                    .collect(),
+            );
+        }
+        // The RFC vectors and a deterministic 1 MiB pseudo-random body.
+        cases.extend_from_slice(&[
+            Vec::new(),
+            b"abc".to_vec(),
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".to_vec(),
+            b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu".to_vec(),
+        ]);
+        let mut state = 0x0123_4567_89ab_cdefu64;
+        let mut big = Vec::with_capacity(1 << 20);
+        for _ in 0..(1 << 20) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            big.push((state & 0xff) as u8);
+        }
+        cases.push(big);
+        for case in &cases {
+            assert_eq!(
+                sha256(case),
+                legacy_sha256::digest(case),
+                "SHA-256 divergence at len {}",
+                case.len()
+            );
+        }
     }
 
     #[test]

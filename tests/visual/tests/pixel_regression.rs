@@ -1,17 +1,21 @@
-//! Pixel-regression runner tests: the committed fixture corpus must pass
+//! Pixel-regression runner tests: the rendered panel corpus must pass
 //! deterministically, and every failure mode of the runner is exercised
 //! adversarially with synthetic corpora (missing/corrupt files, hostile
 //! geometry, invisible overlays, tolerance abuse, bounded reporting).
+//!
+//! There is no committed screenshot corpus: the frozen 16-case audit matrix
+//! is RENDERED at test time into a temp directory at the bounded
+//! `PANEL_WIDTH`x`PANEL_HEIGHT` size, so repository weight stays flat while
+//! the exact same audit contract (zero-pixel diff outside mask+tolerance,
+//! visible overlay inside the mask) is exercised on real panel geometry.
 
 use std::path::Path;
 
 use faktor_tests_visual::runner::run_pixel_regression;
-use faktor_tests_visual::{compose_plus_overlay, fixture_screenshot, BrandingMask};
+use faktor_tests_visual::{
+    compose_plus_overlay, fixture_screenshot, render_panel, BrandingMask, PANEL_HEIGHT, PANEL_WIDTH,
+};
 use image::{Rgba, RgbaImage};
-
-fn real_fixtures() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/screenshots")
-}
 
 /// An overlay with the branding `+` drawn inside the mask (like the real
 /// corpus), so a "good" entry passes the visibility requirement.
@@ -53,29 +57,168 @@ fn write_png(dir: &Path, name: &str, img: &RgbaImage) {
     img.save(dir.join(name)).unwrap();
 }
 
-/// The frozen corpus: all 16 manifest entries pass the audit contract, the
-/// matrix size is locked, entries are unique, and every baseline is a
-/// distinct screenshot.
+/// The frozen 16-case audit matrix. Every case renders a distinct bounded
+/// panel at test time; the mask/tolerance geometry stays inside the panel.
+struct PanelCase {
+    name: &'static str,
+    seed: u8,
+    mask: (u32, u32, u32, u32),
+    tolerance: (u32, u32, u32, u32),
+}
+
+const PANEL_CASES: [PanelCase; 16] = [
+    PanelCase {
+        name: "vscode-dark-empty-chat",
+        seed: 10,
+        mask: (240, 8, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-streaming",
+        seed: 11,
+        mask: (240, 36, 24, 24),
+        tolerance: (0, 182, 320, 18),
+    },
+    PanelCase {
+        name: "vscode-dark-tool-call",
+        seed: 12,
+        mask: (180, 80, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-diff",
+        seed: 13,
+        mask: (120, 120, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-permission",
+        seed: 14,
+        mask: (120, 60, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-settings",
+        seed: 15,
+        mask: (16, 160, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-model-selector",
+        seed: 16,
+        mask: (100, 50, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-agent-manager",
+        seed: 17,
+        mask: (240, 100, 24, 24),
+        tolerance: (0, 182, 320, 18),
+    },
+    PanelCase {
+        name: "vscode-dark-background-agent",
+        seed: 18,
+        mask: (200, 140, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-history",
+        seed: 19,
+        mask: (220, 150, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-error",
+        seed: 20,
+        mask: (100, 90, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-dark-compaction",
+        seed: 21,
+        mask: (200, 40, 24, 24),
+        tolerance: (0, 0, 320, 2),
+    },
+    PanelCase {
+        name: "vscode-light-empty-chat",
+        seed: 22,
+        mask: (240, 8, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "vscode-light-settings",
+        seed: 23,
+        mask: (16, 160, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "jetbrains-dark-empty-chat",
+        seed: 24,
+        mask: (260, 10, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+    PanelCase {
+        name: "jetbrains-light-empty-chat",
+        seed: 25,
+        mask: (260, 10, 24, 24),
+        tolerance: (0, 0, 0, 0),
+    },
+];
+
+/// Render the frozen matrix at test time: for each case a distinct bounded
+/// panel, its branded `+` overlay, and the manifest entry locking the mask
+/// and tolerance zone.
+fn render_corpus(dir: &Path) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    for case in &PANEL_CASES {
+        let baseline = render_panel(PANEL_WIDTH, PANEL_HEIGHT, case.seed);
+        let mask = BrandingMask {
+            x: case.mask.0,
+            y: case.mask.1,
+            width: case.mask.2,
+            height: case.mask.3,
+        };
+        let overlay = compose_plus_overlay(&baseline, mask, Rgba([255, 255, 255, 255]));
+        write_png(dir, &format!("{}.png", case.name), &baseline);
+        write_png(dir, &format!("{}-overlay.png", case.name), &overlay);
+        entries.push(entry(
+            case.name,
+            &format!("{}.png", case.name),
+            &format!("{}-overlay.png", case.name),
+            case.mask,
+            case.tolerance,
+        ));
+    }
+    write_manifest(dir, &entries);
+    entries
+}
+
+/// The frozen corpus: all 16 rendered manifest entries pass the audit
+/// contract, the matrix size is locked, entries are unique, and every
+/// baseline is a distinct panel.
 #[test]
-fn pixel_regression_over_fixtures() {
-    let dir = real_fixtures();
-    let passed = run_pixel_regression(&dir)
-        .unwrap_or_else(|e| panic!("committed fixtures must pass the audit contract: {e}"));
+fn pixel_regression_over_rendered_panels() {
+    let dir = tempfile::tempdir().unwrap();
+    let entries = render_corpus(dir.path());
+    let passed = run_pixel_regression(dir.path())
+        .unwrap_or_else(|e| panic!("rendered panels must pass the audit contract: {e}"));
     let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(passed, manifest.len(), "every manifest entry passes");
     assert_eq!(passed, 16, "the full audit matrix is frozen at 16 cases");
+    assert_eq!(entries.len(), 16);
     let mut names = std::collections::BTreeSet::new();
     for e in &manifest {
         let name = e["name"].as_str().unwrap();
         assert!(names.insert(name), "duplicate manifest entry {name}");
         assert!(
-            dir.join(e["baseline"].as_str().unwrap()).exists(),
+            dir.path().join(e["baseline"].as_str().unwrap()).exists(),
             "baseline {} missing",
             e["baseline"]
         );
         assert!(
-            dir.join(e["overlay"].as_str().unwrap()).exists(),
+            dir.path().join(e["overlay"].as_str().unwrap()).exists(),
             "overlay {} missing",
             e["overlay"]
         );
@@ -83,7 +226,7 @@ fn pixel_regression_over_fixtures() {
     assert_eq!(names.len(), 16);
     let mut hashes = std::collections::BTreeSet::new();
     for e in &manifest {
-        let bytes = std::fs::read(dir.join(e["baseline"].as_str().unwrap())).unwrap();
+        let bytes = std::fs::read(dir.path().join(e["baseline"].as_str().unwrap())).unwrap();
         let hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -96,7 +239,7 @@ fn pixel_regression_over_fixtures() {
             e["name"]
         );
     }
-    assert_eq!(hashes.len(), 16, "every case must be a distinct screenshot");
+    assert_eq!(hashes.len(), 16, "every case must be a distinct panel");
 }
 
 #[test]

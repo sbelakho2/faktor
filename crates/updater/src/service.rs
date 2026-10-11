@@ -1060,6 +1060,9 @@ impl Updater {
         op.release_generation = staged.release_generation;
         op.identity = staged.identity.clone();
         op.certification_level = staged.certification_level.clone();
+        // The head of the binary PERFORMING this apply is what a later
+        // rollback target can still open (see `rollback`'s guard).
+        op.store_schema_head = self.probe.data_store_schema().map(|schema| schema.head);
         // Durable BEFORE the swap: a crash after this row exists is
         // recoverable from the pointer alone.
         self.store.insert(&op)?;
@@ -1404,6 +1407,49 @@ impl Updater {
             ));
         };
         let previous_artifact = last.before_artifact.clone().unwrap_or_default();
+        // A rollback hands the PREVIOUS binary its data store back. That
+        // binary can only open a store whose cursor is at or below the head
+        // it supported when it performed the apply (recorded on the apply
+        // row then). If a newer binary already migrated the store beyond
+        // that head, moving the pointer would leave the daemon unable to
+        // open its own store: REFUSE typed BEFORE any effect, leave the
+        // newer release installed, and record the refusal durably. The
+        // recovery path is restoring the newer binary or the pre-migration
+        // snapshot the store took before its schema transition.
+        if let (Some(target_head), Some(found)) = (
+            last.store_schema_head,
+            self.probe
+                .data_store_schema()
+                .and_then(|schema| schema.live),
+        ) {
+            if found > target_head {
+                let reason = format!(
+                    "data store schema v{found} is newer than {previous_version}'s schema head \
+                     v{target_head}"
+                );
+                let mut refused = UpdateOperation::new(
+                    UpdateOpKind::Rollback,
+                    now_ms,
+                    Some(format!(
+                        "refused: {reason}; restore the newer binary or the pre-migration snapshot"
+                    )),
+                );
+                refused.status = UpdateOpStatus::Failed;
+                refused.channel = last.channel.clone();
+                refused.before_version = Some(current.version.clone());
+                refused.before_digest = Some(current.digest.clone());
+                refused.before_artifact = Some(current.artifact.clone());
+                refused.after_version = Some(previous_version.clone());
+                refused.after_digest = Some(previous_digest.clone());
+                refused.artifact = Some(previous_artifact.clone());
+                self.store.insert(&refused)?;
+                return Err(UpdateError::SchemaAhead {
+                    target_version: previous_version,
+                    found,
+                    head: target_head,
+                });
+            }
+        }
         let target = InstallPointer::new(
             &previous_artifact,
             &previous_digest,
@@ -1646,6 +1692,9 @@ impl Updater {
         op.release_generation = staged.release_generation;
         op.identity = staged.identity.clone();
         op.certification_level = staged.certification_level.clone();
+        // The head of the binary PERFORMING this activation is what a later
+        // rollback target can still open (see `rollback`'s guard).
+        op.store_schema_head = self.probe.data_store_schema().map(|schema| schema.head);
         // Durable BEFORE the swap: a crash after this row exists is
         // recoverable from the pointer alone.
         self.store.insert(&op)?;

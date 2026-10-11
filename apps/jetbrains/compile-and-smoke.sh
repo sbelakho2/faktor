@@ -63,6 +63,7 @@ SHARED_SRC="$JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/Protocol.kt
 $JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt
 $JETBRAINS/shared/src/main/kotlin/dev/faktor/shared/GeneratedProtocolDto.kt"
 BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProcessManager.kt
+$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/DaemonBinary.kt
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt"
 TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt

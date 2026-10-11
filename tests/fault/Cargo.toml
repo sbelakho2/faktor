@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[features]
+default = ["fault-injection"]
+# The campaigns arm the deterministic CAS/store crash seams; enabling this
+# forwards to the crates whose seam payloads the campaign binary compiles
+# against. Production builds never select this package.
+fault-injection = ["faktor-cas/fault-injection", "faktor-store/fault-injection"]
+
 [dependencies]
 faktor-core.workspace = true
 blake3.workspace = true
