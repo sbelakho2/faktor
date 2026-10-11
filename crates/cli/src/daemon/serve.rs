@@ -922,6 +922,11 @@ pub(crate) async fn serve_impl(
         Ok(loaded) => loaded,
         Err(e) => return Err(format!("config error: {e}")),
     };
+    // Present the typed first-run sandbox choice (audit item 17) BEFORE any
+    // child can spawn: on platforms with no network-isolation backend the
+    // notice names both options and their exact commands; the EFFECTIVE
+    // state never changes without the operator's explicit recorded choice.
+    crate::config::announce_startup(&data_dir, &config);
     // The INTERACTIVE session-terminal execution-authority policy — the
     // user-initiated trust class — resolved BEFORE the config is consumed
     // and injected EXPLICITLY into the server surface below. An unset
@@ -1035,7 +1040,12 @@ pub(crate) async fn serve_impl(
             local_version: faktor_core::VERSION.to_string(),
             allow_legacy_manifests_once: config.updater.allow_legacy_manifests_once_resolved(),
         };
-        let updater = faktor_updater::Updater::with_default_probe(updater_config, store, fetcher)
+        let probe = faktor_updater::DataStoreSchemaProbe::new(
+            faktor_updater::DigestProbe,
+            data_dir.join("store").join("faktor-plus.db"),
+            faktor_store::SCHEMA_HEAD,
+        );
+        let updater = faktor_updater::Updater::new(updater_config, store, fetcher, Arc::new(probe))
             .map_err(|e| format!("updater init: {e}"))?;
         Some(Arc::new(updater))
     } else {
@@ -1597,6 +1607,9 @@ pub(crate) async fn serve_impl(
 /// ACP wire protocol on stdin/stdout until EOF or `shutdown`.
 pub(crate) async fn acp(data_dir: PathBuf) {
     let config = load_acp_config(&data_dir);
+    // Same typed first-run presentation as serve (audit item 17): stderr
+    // only, never the ACP stdout wire.
+    crate::config::announce_startup(&data_dir, &config);
     // The interactive session-terminal execution-authority policy — the
     // user-initiated trust class, resolved BEFORE the config is consumed —
     // so the ACP terminal authority receives it at construction (explicit

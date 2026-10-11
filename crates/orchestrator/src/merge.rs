@@ -2264,15 +2264,20 @@ impl OrchestratorRuntime {
                 &[],
             )?;
         }
+        #[cfg(any(test, feature = "fault-injection"))]
         self.check_merge_seam(&run, CrashSeam::AfterMergeRecord)?;
 
         // ---- apply phase (deterministic order = staged path order).
         let mut merged: Vec<PathBuf> = Vec::new();
         let mut conflicts: Vec<(PathBuf, String)> = Vec::new();
+        #[cfg(any(test, feature = "fault-injection"))]
         let mut processed = 0usize;
         for entry in &cs.files {
             if rejected_v.contains(&entry.path) {
-                processed += 1;
+                #[cfg(any(test, feature = "fault-injection"))]
+                {
+                    processed += 1;
+                }
                 continue;
             }
             let outcome = self.apply_one_merge(&owner_root, &child_dir, entry);
@@ -2285,8 +2290,11 @@ impl OrchestratorRuntime {
                     return Err(e);
                 }
             }
-            processed += 1;
-            self.check_merge_seam(&run, CrashSeam::MergeApply { after: processed })?;
+            #[cfg(any(test, feature = "fault-injection"))]
+            {
+                processed += 1;
+                self.check_merge_seam(&run, CrashSeam::MergeApply { after: processed })?;
+            }
         }
         merged.sort();
         // ---- durable outcome rows, then the FINAL envelope: the parent is
@@ -2403,6 +2411,7 @@ impl OrchestratorRuntime {
         }
     }
 
+    #[cfg(any(test, feature = "fault-injection"))]
     fn check_merge_seam(&self, run: &str, seam: CrashSeam) -> Result<(), ExecError> {
         let mut guard = recover_lock(&self.exec);
         let Some(exec) = guard.get_mut(run) else {

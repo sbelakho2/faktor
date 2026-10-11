@@ -251,6 +251,10 @@ Respect documented API limits (Mouser 30/min, 1000/day; LCSC 200/min,
 headers). Browser fallback is for legitimate field availability/resilience,
 never quota evasion; API and browser fallback are independently
 circuit-broken. API-first: do not scrape around official interfaces.
+The binding legal/compliance posture (ToS, robots, stored sessions, human
+verification, per-source disable, opt-in live canaries) is
+`docs/legal/marketplace-acquisition.md`; the daemon's `doctor` reports the
+per-source live-canary status (configured/absent).
 
 API credentials live outside the model: config references env var names;
 values registered with the outbound secret scanner; never in schema, args,
@@ -378,7 +382,8 @@ calls, 0 HTTP calls, 0 browser launches; a Mouser price question ⇒ exactly
 one `source_market` invocation, 0 internal model calls; a 500-line BOM ⇒
 one initiating interaction, deterministic job, full result in artifact,
 compact context result, no hidden summarizer. Long-run soak, live canary
-(opt-in, `[soak]`/ignored per repo convention) and browser-crash/quota
+(opt-in, `[live-paid]`/`[soak]` ignored lane per repo convention,
+`crates/commerce-connectors/tests/live_canary.rs`) and browser-crash/quota
 exhaustion/restart-recovery suites.
 
 ## 17. Build order (normative)

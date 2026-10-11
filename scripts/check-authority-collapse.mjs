@@ -73,7 +73,7 @@ const ALLOWLIST = [
       'cancellation-parent lookup for an ADMITTED operation: absence of a parent token is a legal root state (not a store failure).',
   },
   {
-    file: 'crates/agent/src/runtime/turn/drive.rs',
+    file: 'crates/agent/src/runtime/turn/drive_phases.rs',
     line_contains: 'handle.title().unwrap_or_default()',
     count: 1,
     reason: 'prompt hint title: display-only context, never an authority or identity input.',

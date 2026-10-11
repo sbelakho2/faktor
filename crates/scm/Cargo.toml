@@ -12,6 +12,7 @@ faktor-security.workspace = true
 async-trait = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
+jsonwebtoken = "9"
 base64 = "0.22"
 ring = "0.17"
 serde.workspace = true

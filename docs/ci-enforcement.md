@@ -250,16 +250,27 @@ CI change is pushed.
   `WOODPECKER_HOST`/`WOODPECKER_TOKEN` available to trusted lanes and passes
   it as `--pipeline-id`; that lookup fails closed with the typed
   `observed-pipeline-id-lookup-failed` error instead of copying the pipeline
-  number into the id field. Signing is **fail-closed**: register an ed25519
-  key on the trusted project and add `FAKTOR_ATTEST_SIGN_KEY_PEM: {from_secret:
-  faktor_attest_signing_key}` to the step (a `from_secret` to a missing
-  secret is a Woodpecker config error, so it is documented, not hardcoded).
-  Generate the pair with `node scripts/certification/attestation.mjs keygen
-  --out-key release.pem --out-keys release-keys.json --key-id
-  faktor-ci-release` and give operators `release-keys.json` as
+  number into the id field. Signing is **fail-closed** under the split
+  allowlist (`faktor-signing-allowlist/v2`, `scripts/certification/
+  attestation-keys.json`): the `attestation` step signs with the build role
+  `faktor-ci-build` / `build-attestation` from the trusted project's
+  `faktor_attest_signing_key` secret mapped to
+  `FAKTOR_ATTEST_SIGN_KEY_PEM`, while the separate `release-signature` step
+  signs `faktor-release-signature/v1` with the release role
+  `faktor-release-signing` / `release-signing` from
+  `faktor_release_signing_key` / `FAKTOR_RELEASE_SIGN_KEY_PEM` (a
+  `from_secret` to a missing secret is a Woodpecker config error, so those
+  mappings are documented, not hardcoded). Provision the release role on the
+  operator machine with `node scripts/certification/attestation.mjs keygen
+  --role release-signing --out-key release.pem --out-keys release-keys.json`
+  and paste ONLY the public key into the allowlist; until then every
+  release-class verification fails closed with the typed
+  `signature-role-key-missing`, and a verifier asked for one role refuses a
+  signature bound to the other with the typed `signature-role-mismatch`
+  (`scripts/woodpecker/setup.md` §4.2). Operators receive the allowlist as
   `FAKTOR_ATTEST_KEYS`. WITHOUT the secret the step exits 3 with the typed
-  `signing-key-missing` error and writes NO attestation — there is no
-  unsigned code path. The documented alternative is Sigstore/keyless
+  `signing-key-missing` error and writes NO artifact — there is no unsigned
+  code path. The documented alternative is Sigstore/keyless
   signing of the same payload against the pipeline OIDC identity
   (`docs/certification.md` §2.12). Preferred release model: distribute the
   CI-built artifacts the attestation covers, not local rebuilds.

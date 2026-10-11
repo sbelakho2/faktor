@@ -225,6 +225,78 @@ fn decode_pem_body(pem: &str) -> Vec<u8> {
         .unwrap()
 }
 
+/// Minimal DER reader for `RSAPublicKey ::= SEQUENCE { modulus INTEGER,
+/// publicExponent INTEGER }` (the PKCS#1 body of TEST_PUBLIC_KEY).
+fn parse_rsa_public_key_der(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn read_len(bytes: &[u8]) -> (usize, usize) {
+        if bytes[0] & 0x80 == 0 {
+            (bytes[0] as usize, 1)
+        } else {
+            let count = (bytes[0] & 0x7f) as usize;
+            let mut value = 0usize;
+            for byte in &bytes[1..=count] {
+                value = (value << 8) | *byte as usize;
+            }
+            (value, 1 + count)
+        }
+    }
+    let mut at = 0;
+    assert_eq!(der[at], 0x30, "SEQUENCE");
+    at += 1;
+    let (_total, used) = read_len(&der[at..]);
+    at += used;
+    let mut integers: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..2 {
+        assert_eq!(der[at], 0x02, "INTEGER");
+        at += 1;
+        let (len, used) = read_len(&der[at..]);
+        at += used;
+        let mut value = der[at..at + len].to_vec();
+        at += len;
+        while value.first() == Some(&0) {
+            value.remove(0);
+        }
+        integers.push(value);
+    }
+    (integers[0].clone(), integers[1].clone())
+}
+
+/// The byte-deterministic golden app JWT for [`APP_ID`] and [`NOW_MS`]
+/// (RS256 over the fixed test key: PKCS#1 v1.5 signatures have no nonce),
+/// produced by the audited `jsonwebtoken` signer that now mints it.
+const GOLDEN_APP_JWT: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpYXQiOjE3ODk1OTk5NDAsImV4cCI6MTc4OTYwMDQ4MCwiaXNzIjoiMTIzNDUifQ.jYZJFxcXGa8W4tl0uwnGynPh3pn_Gm4_fHfYXurASll0RW4xviDo1EjwpeHe88eIxtTDDMecoVroCq8mb87P7-gTFWIXORcV1R7hbSqH5JnrbuQK-6clw3PM5WcYDmXbUt71-6WcSg28sLPosMvU2ZDersw_g6HV6qk3GiwdiGULrK4WbRg1EuGBoxBjgVTVjTvEDVVO7aoyJNFtaah9vcDVdFRpfVPHN49PDA2Rl_6Lz6kU1dJig9xhslt2Bp73VSAxubAlx2qNoSm_a3rDNz_dEta7ElXswkkzZOS5o9OdlsYsEpNOQTRI2C6A0aurlW7kE2vFYQaJ6tDS6jZ2Kw";
+
+/// The minted app JWT is the golden vector (byte-deterministic) AND
+/// verifies through the vetted `jsonwebtoken` decoder with the test
+/// public key — the new path is pinned end-to-end.
+#[tokio::test]
+async fn golden_app_jwt_is_minted_by_the_vetted_signer_and_verifies() {
+    let transport = ScriptedTransport::new(vec![]);
+    let (source, _clock) = token_source(&transport, 3);
+    let token = source.app_token().await.unwrap();
+    assert_eq!(
+        token.expose(),
+        GOLDEN_APP_JWT,
+        "byte-deterministic RS256 mint"
+    );
+
+    let (n, e) = parse_rsa_public_key_der(&decode_pem_body(TEST_PUBLIC_KEY));
+    let decoding = jsonwebtoken::DecodingKey::from_rsa_raw_components(&n, &e);
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.algorithms = vec![jsonwebtoken::Algorithm::RS256];
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+    let data = jsonwebtoken::decode::<serde_json::Value>(token.expose(), &decoding, &validation)
+        .expect("the minted app JWT verifies under the vetted path");
+    assert_eq!(data.header.alg, jsonwebtoken::Algorithm::RS256);
+    assert_eq!(data.header.typ.as_deref(), Some("JWT"));
+    assert_eq!(data.claims["iss"], APP_ID.to_string());
+    let iat = data.claims["iat"].as_i64().unwrap();
+    assert_eq!(iat, NOW_MS / 1000 - 60);
+    assert_eq!(data.claims["exp"].as_i64().unwrap(), iat + 540);
+}
+
 fn token_reply(token: &str, permissions: &str) -> Reply {
     Reply::json(
         201,

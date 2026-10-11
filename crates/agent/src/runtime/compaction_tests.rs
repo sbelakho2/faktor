@@ -1336,7 +1336,7 @@ async fn malicious_sibling_board_post_retrieved_and_summarized_is_never_instruct
             }
         },
     ));
-    let (mut deps, _dir) = deps_with(inspected, vec![]);
+    let (mut deps, dir) = deps_with(inspected, vec![]);
     deps.efficiency = EfficiencyFlags {
         ccr: true,
         ..Default::default()
@@ -1346,7 +1346,25 @@ async fn malicious_sibling_board_post_retrieved_and_summarized_is_never_instruct
     tools.register(crate::board_read_tool(gateway));
     deps.tools = Arc::new(tools);
     let runtime = AgentRuntime::new(deps).unwrap();
-    let session = new_session(runtime.deps());
+    // HERMETIC workspace root: `new_session` anchors the session at the
+    // SYSTEM temp dir, where other tests (or any other process on a loaded
+    // host) leave files the retrieval ladder would archive into this
+    // session's evidence scope — observed as "board page archived exactly
+    // once" failing under load. The evidence math is unchanged; this test
+    // owns an empty workspace root.
+    let workspace_root = dir.path().join("repo");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let ws = runtime
+        .deps()
+        .session
+        .create_workspace(workspace_root.to_str().unwrap())
+        .unwrap();
+    let session = runtime
+        .deps()
+        .session
+        .create_session(ws, "test session", "fake", "m")
+        .unwrap()
+        .id();
     let handle = runtime
         .deps()
         .session

@@ -1,7 +1,13 @@
 //! Visual compatibility suite (spec §3, §40): the branding overlay layer
 //! must leave every original pixel untouched outside the explicit mask.
-//! Screenshot fixtures are PNGs; the diff is zero-pixel outside masked
-//! branding regions.
+//!
+//! There is no committed screenshot corpus: the pixel-regression test
+//! RENDERS its panel corpus at test time ([`render_panel`], bounded
+//! [`PANEL_WIDTH`]x[`PANEL_HEIGHT`]) into a temp directory, so the audit
+//! contract (zero-pixel diff outside masked branding regions) is exercised
+//! against real panel geometry without shipping generated images in the
+//! repository. The diff itself is zero-pixel outside masked branding
+//! regions.
 
 use image::{GenericImageView, Rgba, RgbaImage};
 
@@ -108,8 +114,109 @@ pub fn compose_plus_overlay(
     out
 }
 
-/// Generate a deterministic fixture screenshot (used by the fixtures dir and
-/// by tests that need a stable before-image).
+/// The bounded panel width the visual suite renders at test time.
+pub const PANEL_WIDTH: u32 = 320;
+/// The bounded panel height the visual suite renders at test time.
+pub const PANEL_HEIGHT: u32 = 200;
+
+/// Render one deterministic UI-panel-like image: window chrome, sidebar,
+/// message rows and an input area, with per-seed variation. This is the
+/// test-time renderer for the pixel-regression corpus (no committed
+/// screenshots): the same seed always yields byte-identical pixels, and the
+/// output is bounded to the requested dimensions.
+pub fn render_panel(width: u32, height: u32, seed: u8) -> RgbaImage {
+    let mut img = RgbaImage::new(width, height);
+    let background = Rgba([24, 24, 28, 255]);
+    for y in 0..height {
+        for x in 0..width {
+            img.put_pixel(x, y, background);
+        }
+    }
+    let header_height = (height / 16).max(10).min(height);
+    fill_rect(
+        &mut img,
+        0,
+        0,
+        width,
+        header_height,
+        Rgba([38, 38, 44, 255]),
+    );
+    // Window controls.
+    for index in 0..3u32 {
+        fill_rect(&mut img, 6 + index * 8, 4, 4, 4, Rgba([200, 80, 80, 255]));
+    }
+    // The per-seed badge: seeds 0..16 occupy distinct slots, so two
+    // different seeds can never render byte-identical panels.
+    let badge_x = 2 + (seed as u32 % 16) * 19;
+    fill_rect(&mut img, badge_x, 4, 12, 4, Rgba([90, 120, 200, 255]));
+    let sidebar_width = (width / 7).max(24).min(width);
+    fill_rect(
+        &mut img,
+        0,
+        header_height,
+        sidebar_width,
+        height.saturating_sub(header_height),
+        Rgba([30, 30, 36, 255]),
+    );
+    // Message rows: alternating bubble widths derived from the seed.
+    let row_height = 14u32;
+    let rows = 6u32;
+    for row in 0..rows {
+        let y = header_height + 8 + row * (row_height + 4);
+        if y + row_height > height.saturating_sub(18) {
+            break;
+        }
+        let bubble_width = sidebar_width + 24 + (((row * 37 + seed as u32 * 11) % 5) * 24);
+        let bubble_width = bubble_width.min(width.saturating_sub(sidebar_width + 12));
+        let color = if (row + seed as u32).is_multiple_of(2) {
+            Rgba([48, 48, 58, 255])
+        } else {
+            Rgba([40, 52, 68, 255])
+        };
+        fill_rect(
+            &mut img,
+            sidebar_width + 8,
+            y,
+            bubble_width,
+            row_height,
+            color,
+        );
+        // A lighter "text" strip inside the bubble.
+        fill_rect(
+            &mut img,
+            sidebar_width + 14,
+            y + 4,
+            bubble_width.saturating_sub(12).max(4).min(bubble_width),
+            3,
+            Rgba([180, 180, 190, 255]),
+        );
+    }
+    // Input area at the bottom.
+    if height > 24 {
+        let input_top = height - 18;
+        fill_rect(
+            &mut img,
+            sidebar_width + 8,
+            input_top,
+            width.saturating_sub(sidebar_width + 16),
+            12,
+            Rgba([34, 34, 40, 255]),
+        );
+    }
+    img
+}
+
+fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, width: u32, height: u32, color: Rgba<u8>) {
+    let (img_width, img_height) = img.dimensions();
+    for yy in y..(y.saturating_add(height)).min(img_height) {
+        for xx in x..(x.saturating_add(width)).min(img_width) {
+            img.put_pixel(xx, yy, color);
+        }
+    }
+}
+
+/// Generate a deterministic fixture screenshot (used by tests that need a
+/// stable before-image).
 pub fn fixture_screenshot(width: u32, height: u32, seed: u8) -> RgbaImage {
     let mut img = RgbaImage::new(width, height);
     for y in 0..height {
@@ -260,5 +367,33 @@ mod tests {
     #[test]
     fn fixture_screenshots_are_deterministic() {
         assert_eq!(fixture_screenshot(16, 16, 5), fixture_screenshot(16, 16, 5));
+    }
+
+    #[test]
+    fn rendered_panels_are_deterministic_and_bounded() {
+        let panel = render_panel(PANEL_WIDTH, PANEL_HEIGHT, 10);
+        assert_eq!(panel.dimensions(), (PANEL_WIDTH, PANEL_HEIGHT));
+        assert_eq!(panel, render_panel(PANEL_WIDTH, PANEL_HEIGHT, 10));
+        assert_ne!(panel, render_panel(PANEL_WIDTH, PANEL_HEIGHT, 11));
+        // Tiny dimensions must not panic or overflow.
+        let tiny = render_panel(1, 1, 0);
+        assert_eq!(tiny.dimensions(), (1, 1));
+        let narrow = render_panel(48, 24, 255);
+        assert_eq!(narrow.dimensions(), (48, 24));
+    }
+
+    #[test]
+    fn rendered_panels_pass_the_overlay_contract() {
+        let panel = render_panel(PANEL_WIDTH, PANEL_HEIGHT, 12);
+        let mask = BrandingMask {
+            x: 100,
+            y: 60,
+            width: 24,
+            height: 24,
+        };
+        let overlay = compose_plus_overlay(&panel, mask, Rgba([255, 255, 255, 255]));
+        let diff = diff_images(&panel, &overlay, Some(mask)).unwrap();
+        assert!(diff.zero_pixel_difference_outside_mask());
+        assert!(!diff.changed_inside_mask.is_empty());
     }
 }

@@ -958,6 +958,15 @@ pub(crate) const MIGRATIONS: &[&str] = &[
 /// schema target — targets are 1-based).
 pub(crate) const OP_ID_SEQ_MIGRATION_INDEX: usize = 9;
 
+/// The known schema head of this binary: the `PRAGMA user_version` every
+/// open drives a database to, and the FIRST version an older binary may no
+/// longer write. A database whose cursor is ABOVE this value was migrated by
+/// a NEWER binary: opening it refuses typed (`StoreError::UnsupportedSchema`)
+/// instead of silently replaying an older ladder over newer semantics. The
+/// refusal is also the updater's rollback guard: an update that would hand
+/// the previous binary a database beyond this head must not be applied.
+pub const SCHEMA_HEAD: i64 = MIGRATIONS.len() as i64;
+
 #[cfg(test)]
 mod tests {
     use super::*;

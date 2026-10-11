@@ -436,7 +436,7 @@ fn handle_command(
                 .unwrap_or_default()
                 .to_string();
             let handle = format!("io-{request_id}");
-            server.streams.lock().unwrap().insert(
+            faktor_core::lock::recover(&server.streams).insert(
                 handle.clone(),
                 StreamState {
                     bytes: server.scenario.stream_bytes(),
@@ -455,7 +455,7 @@ fn handle_command(
                 .get("size")
                 .and_then(Value::as_u64)
                 .unwrap_or(64 * 1024) as usize;
-            let mut streams = server.streams.lock().unwrap();
+            let mut streams = faktor_core::lock::recover(&server.streams);
             let Some(stream) = streams.get_mut(&handle) else {
                 return Err((-32000, format!("unknown stream handle: {handle}")));
             };
@@ -474,7 +474,7 @@ fn handle_command(
         }
         "IO.close" => {
             if let Some(handle) = params.get("handle").and_then(Value::as_str) {
-                server.streams.lock().unwrap().remove(handle);
+                faktor_core::lock::recover(&server.streams).remove(handle);
             }
             Ok(json!({}))
         }
@@ -486,11 +486,7 @@ fn handle_command(
         "Target.disposeBrowserContext" => Ok(json!({})),
         "Target.createTarget" => {
             let target = format!("t{}", server.next_target.fetch_add(1, Ordering::SeqCst));
-            server
-                .targets
-                .lock()
-                .unwrap()
-                .insert(target.clone(), String::new());
+            faktor_core::lock::recover(&server.targets).insert(target.clone(), String::new());
             Ok(json!({ "targetId": target }))
         }
         "Target.attachToTarget" => {
@@ -500,16 +496,12 @@ fn handle_command(
                 .unwrap_or_default()
                 .to_string();
             let session_id = format!("s{}", server.next_session.fetch_add(1, Ordering::SeqCst));
-            server
-                .sessions
-                .lock()
-                .unwrap()
-                .insert(session_id.clone(), target);
+            faktor_core::lock::recover(&server.sessions).insert(session_id.clone(), target);
             Ok(json!({ "sessionId": session_id }))
         }
         "Target.closeTarget" => {
             if let Some(target) = params.get("targetId").and_then(Value::as_str) {
-                server.targets.lock().unwrap().remove(target);
+                faktor_core::lock::recover(&server.targets).remove(target);
             }
             Ok(json!({}))
         }

@@ -24,7 +24,14 @@ function hostMessageId(raw: unknown): string {
   }
   return randomUUID();
 }
-import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
+import {
+  DaemonHandle,
+  binaryTrust,
+  machineScopedSetting,
+  resolveDaemon,
+  startDaemon,
+  stopDaemon,
+} from './daemon';
 import { LifecycleFence } from './lifecycleFence';
 import {
   FetchLike,
@@ -152,10 +159,16 @@ const SESSION_BINDINGS_KEY = 'faktor.sessionBindings';
 const BOARD_PAGE_LIMIT = 100;
 /** One bounded billing usage page per read (the daemon caps at 200). */
 const BILLING_PAGE_LIMIT = 50;
-/** Default cloud control-plane coordinates; both are non-secret. */
-const DEFAULT_CONTROL_PLANE_ENDPOINT = 'https://api.faktor.dev';
+/**
+ * The control-plane endpoint has NO default: cloud control-plane calls stay
+ * disabled until the operator explicitly configures an endpoint (machine
+ * scope; see the Faktor settings docs). The coordinates are non-secret.
+ */
+const DEFAULT_CONTROL_PLANE_ENDPOINT = '';
 /** The last control-plane notice, so a repeated refusal never spams the chat. */
 let lastControlPlaneNotice: string | null = null;
+/** The last workspace-scope refusal, deduped like the control-plane notice. */
+let lastDaemonSettingNotice: string | null = null;
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -254,6 +267,24 @@ let composerAttachmentsSessionId: string | null = null;
 
 function config<T>(key: string, fallback: T): T {
   return vscode.workspace.getConfiguration('faktor').get<T>(key, fallback);
+}
+
+/**
+ * A daemon-affecting setting read MACHINE-SCOPED only: the global (user/
+ * machine) value is returned and any workspace/workspace-folder value is
+ * ignored and surfaced once as a typed refusal. The settings are declared
+ * `"scope": "machine"` in package.json; this inspect-based gate is the
+ * defence-in-depth that also reports a repo-supplied value instead of
+ * silently ignoring it.
+ */
+function daemonSetting<T>(key: string, fallback: T): T {
+  const inspected = vscode.workspace.getConfiguration('faktor').inspect<T>(key);
+  const outcome = machineScopedSetting(key, inspected ?? undefined, fallback);
+  if (outcome.refusal !== null && outcome.refusal.message !== lastDaemonSettingNotice) {
+    lastDaemonSettingNotice = outcome.refusal.message;
+    chatProvider?.postNotice('error', outcome.refusal.message);
+  }
+  return outcome.value;
 }
 
 function workspaceRoot(context: vscode.ExtensionContext): string {
@@ -452,8 +483,9 @@ async function ensureControlPlaneScope(hasLegacy: boolean): Promise<ControlPlane
   }
   const endpoint = await vscode.window.showInputBox({
     title: 'Faktor: migrate control-plane credential',
-    prompt: 'Cloud control-plane endpoint the credential belongs to',
-    value: config('controlPlaneEndpoint', '') || DEFAULT_CONTROL_PLANE_ENDPOINT,
+    prompt:
+      'Cloud control-plane endpoint the credential belongs to (required; there is no default endpoint)',
+    value: config('controlPlaneEndpoint', ''),
     ignoreFocusOut: true,
   });
   if (endpoint === undefined || endpoint.trim().length === 0) {
@@ -536,7 +568,9 @@ async function controlPlaneSignIn(context: vscode.ExtensionContext): Promise<voi
   const current = controlPlaneScope();
   const endpoint = await vscode.window.showInputBox({
     title: 'Faktor: control-plane sign-in',
-    prompt: 'Cloud control-plane endpoint (non-secret; keys the stored credential)',
+    prompt:
+      'Cloud control-plane endpoint (required; there is no default endpoint; non-secret and keys the ' +
+      'stored credential)',
     value: current?.endpoint ?? DEFAULT_CONTROL_PLANE_ENDPOINT,
     ignoreFocusOut: true,
   });
@@ -763,22 +797,72 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     }
     return;
   }
-  store.patch({ daemon: 'starting', daemonDetail: 'locating faktor-cli', lastError: null });
-  const binaryPath = config('binaryPath', '');
-  const dataDir = config('dataDir', '');
-  const installRoot = config('installRoot', '');
-  const extraArgs = config<string[]>('extraArgs', []);
+  store.patch({ daemon: 'starting', daemonDetail: 'resolving the daemon', lastError: null });
+  // Machine-scoped daemon inputs only: a workspace/workspace-folder value is
+  // ignored and surfaced typed (never silently honoured).
+  const binaryPath = daemonSetting('binaryPath', '');
+  const dataDir = daemonSetting('dataDir', '');
+  const installRoot = daemonSetting('installRoot', '');
+  const extraArgs = daemonSetting<string[]>('extraArgs', []);
   // The default exceeds the bootstrap launcher's ~30 s launch window: the
   // supervisor must not declare failure while the updater launcher may still
   // be bringing the release to readiness (and may still be adoptable).
   const startupTimeoutMs = config('startupTimeoutMs', 45_000);
-  const daemon = await startDaemon({
+  // Resolve FIRST and show exactly which executable would run. The
+  // resolution never consults the workspace (no target/ lookup); a missing
+  // daemon is the actionable refusal below.
+  const resolved = resolveDaemon({
     workspaceRoot: workspaceRoot(context),
     binaryPath: binaryPath.length > 0 ? binaryPath : undefined,
     dataDir: dataDir.length > 0 ? dataDir : undefined,
+    installRoot: installRoot.length > 0 ? installRoot : undefined,
+    extraArgs,
+    startupTimeoutMs,
+  });
+  const trust = binaryTrust(resolved);
+  if (trust.state === 'refused') {
+    store.patch({ daemon: 'error', daemonDetail: trust.detail, baseUrl: null });
+    throw new Error(`refusing to start the daemon: ${trust.detail}`);
+  }
+  if (trust.state === 'unverified') {
+    // No checksum/signature record exists: documented warn + explicit
+    // confirm naming the exact resolved path (never a silent execution of a
+    // path the operator did not confirm).
+    const choice = await vscode.window.showWarningMessage(
+      `Faktor: unverified daemon binary ${resolved.executable}`,
+      {
+        modal: true,
+        detail: `${trust.detail}\n\nStart this exact executable anyway?`,
+      },
+      'Start anyway',
+    );
+    if (choice !== 'Start anyway') {
+      store.patch({ daemon: 'stopped', daemonDetail: '', baseUrl: null, lastError: null });
+      chatProvider?.postNotice(
+        'info',
+        `daemon start cancelled: ${resolved.executable} was not confirmed`,
+      );
+      return;
+    }
+  }
+  store.patch({
+    daemon: 'starting',
+    daemonDetail: `starting ${resolved.executable} (${resolved.source})`,
+    lastError: null,
+  });
+  chatProvider?.postNotice(
+    'info',
+    `daemon start requested: ${resolved.executable} (${resolved.source}) — ${trust.detail}`,
+  );
+  const daemon = await startDaemon({
+    workspaceRoot: workspaceRoot(context),
+    // The confirmed path is passed explicitly so the spawn can never
+    // re-resolve to a different file between confirmation and launch.
+    binaryPath: resolved.executable,
+    dataDir: dataDir.length > 0 ? dataDir : undefined,
     // When an immutable install layout exists at this root, the daemon is
     // spawned through its stable bootstrap launcher so the activated release
-    // (and only that release) runs. No layout => legacy resolution.
+    // (and only that release) runs.
     installRoot: installRoot.length > 0 ? installRoot : undefined,
     extraArgs,
     startupTimeoutMs,
@@ -2805,9 +2889,9 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => stopServer() },
   );
 
-  if (config('autoStart', false)) {
-    void startServer(context).catch((error) => reportError(error, 'daemon_start_failed'));
-  }
+  // No daemon start on activation: the daemon starts ONLY on an explicit
+  // user action (Start Service command/panel gesture or a task submission),
+  // and that path resolves and shows the exact machine-scoped binary first.
 }
 
 export function deactivate(): void {

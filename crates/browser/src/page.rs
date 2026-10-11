@@ -150,11 +150,7 @@ pub(crate) struct PageInner {
 impl Drop for PageInner {
     fn drop(&mut self) {
         let was_closed = self.closed.swap(true, Ordering::SeqCst);
-        let pump = self
-            .pump
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        let pump = faktor_core::lock::recover(&self.pump).take();
         if let Some(pump) = pump {
             pump.abort();
         }
@@ -249,7 +245,7 @@ impl Page {
             }
         }));
         let handle = tokio::spawn(pump_events(pump_inner, events));
-        *inner.pump.lock().unwrap() = Some(handle);
+        *faktor_core::lock::recover(&inner.pump) = Some(handle);
         Self { inner }
     }
 
@@ -275,7 +271,7 @@ impl Page {
     }
 
     pub fn state(&self) -> PageState {
-        *self.inner.state.lock().unwrap()
+        *faktor_core::lock::recover(&self.inner.state)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -291,16 +287,16 @@ impl Page {
     /// presented as a complete one.
     pub fn network(&self) -> Result<Vec<crate::network::NetworkRequest>, BrowserError> {
         self.ensure_history_complete()?;
-        Ok(self.inner.tracker.lock().unwrap().requests())
+        Ok(faktor_core::lock::recover(&self.inner.tracker).requests())
     }
 
     /// The typed error to surface when this page's event history is
     /// incomplete (critical stream failure, or a lost observation event).
     fn history_error(&self) -> Option<BrowserError> {
-        if let Some(skipped) = *self.inner.critical_failure.lock().unwrap() {
+        if let Some(skipped) = *faktor_core::lock::recover(&self.inner.critical_failure) {
             return Some(BrowserError::EventStreamLagged { skipped });
         }
-        let skipped = self.inner.tracker.lock().unwrap().event_gap();
+        let skipped = faktor_core::lock::recover(&self.inner.tracker).event_gap();
         (skipped > 0).then_some(BrowserError::EventStreamLagged { skipped })
     }
 
@@ -332,7 +328,7 @@ impl Page {
     ) -> Result<NavigationOutcome, BrowserError> {
         self.ensure_open()?;
         self.set_state(PageState::Navigating);
-        *self.inner.last_navigation_error.lock().unwrap() = None;
+        *faktor_core::lock::recover(&self.inner.last_navigation_error) = None;
         // Reset the observable lifecycle for THIS navigation and hold a live
         // subscription across the command. `watch::Sender::send` silently
         // drops values whenever no receiver exists, and the browser may emit
@@ -371,7 +367,8 @@ impl Page {
             .and_then(Value::as_str)
             .map(str::to_string);
         if let Some(error_text) = &error_text {
-            *self.inner.last_navigation_error.lock().unwrap() = Some(error_text.clone());
+            *faktor_core::lock::recover(&self.inner.last_navigation_error) =
+                Some(error_text.clone());
         }
         loop {
             match *lifecycle.borrow_and_update() {
@@ -587,11 +584,7 @@ impl Page {
         cancel: &CancellationToken,
     ) -> Result<CapturedBody, BrowserError> {
         self.ensure_history_complete()?;
-        let url = self
-            .inner
-            .tracker
-            .lock()
-            .unwrap()
+        let url = faktor_core::lock::recover(&self.inner.tracker)
             .get(request_id)
             .map(|record| record.url);
         let capturer = BodyCapturer::new(
@@ -615,7 +608,7 @@ impl Page {
         }
         self.set_state(PageState::Closed);
         self.release_permit();
-        if let Some(pump) = self.inner.pump.lock().unwrap().take() {
+        if let Some(pump) = faktor_core::lock::recover(&self.inner.pump).take() {
             pump.abort();
         }
         let result = self
@@ -650,12 +643,7 @@ impl Page {
     /// Release the profile slot now (idempotent). The permit is otherwise
     /// released when the last `Page` handle drops.
     pub(crate) fn release_permit(&self) {
-        let _ = self
-            .inner
-            .permit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        let _ = faktor_core::lock::recover(&self.inner.permit).take();
     }
 
     fn stop_automation(&self, signal: VerificationSignal) {
@@ -670,7 +658,7 @@ impl Page {
     }
 
     fn set_state(&self, state: PageState) {
-        *self.inner.state.lock().unwrap() = state;
+        *faktor_core::lock::recover(&self.inner.state) = state;
     }
 
     fn ensure_open(&self) -> Result<(), BrowserError> {
@@ -707,7 +695,7 @@ impl Page {
 
     fn document_status(&self) -> Result<Option<i64>, BrowserError> {
         self.ensure_history_complete()?;
-        let tracker = self.inner.tracker.lock().unwrap();
+        let tracker = faktor_core::lock::recover(&self.inner.tracker);
         let mut best: Option<i64> = None;
         for record in tracker.requests() {
             if record.resource_type == crate::interception::ResourceType::Document {
@@ -724,7 +712,7 @@ impl PageInner {
     /// Record lost observation events. The history is incomplete from here
     /// on; complete-history queries refuse typed.
     fn record_observation_gap(&self, skipped: u64) {
-        self.tracker.lock().unwrap().record_event_gap(skipped);
+        faktor_core::lock::recover(&self.tracker).record_event_gap(skipped);
     }
 
     /// The critical stream failed: mark the page failed (never continue with
@@ -732,19 +720,15 @@ impl PageInner {
     /// no `Fetch.requestPaused` is left waiting on a page nobody will serve.
     fn fail_stream(&self, skipped: u64) {
         {
-            let mut slot = self.critical_failure.lock().unwrap();
+            let mut slot = faktor_core::lock::recover(&self.critical_failure);
             if slot.is_none() {
                 *slot = Some(skipped);
             }
         }
         self.record_observation_gap(skipped);
         if !self.closed.swap(true, Ordering::SeqCst) {
-            *self.state.lock().unwrap() = PageState::Crashed;
-            let _ = self
-                .permit
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            *faktor_core::lock::recover(&self.state) = PageState::Crashed;
+            let _ = faktor_core::lock::recover(&self.permit).take();
             let _ = self.lifecycle.send_replace(Lifecycle::Failed);
             if let Some(host) = self.host.upgrade() {
                 host.release_page(&self.target_id);
@@ -856,7 +840,7 @@ async fn handle_page_event(inner: &Arc<PageInner>, event: CdpEvent) {
         | "Network.responseReceived"
         | "Network.loadingFinished"
         | "Network.loadingFailed" => {
-            let notice = inner.tracker.lock().unwrap().apply(&event);
+            let notice = faktor_core::lock::recover(&inner.tracker).apply(&event);
             if let Some(NetworkNotice::Failed {
                 url, error_text, ..
             }) = notice

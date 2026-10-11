@@ -223,7 +223,7 @@ impl std::fmt::Debug for DownloadManager {
         f.debug_struct("DownloadManager")
             .field("enabled", &self.policy.enabled)
             .field("dir", &self.dir_rel)
-            .field("records", &self.records.lock().unwrap().len())
+            .field("records", &faktor_core::lock::recover(&self.records).len())
             .finish()
     }
 }
@@ -304,19 +304,17 @@ impl DownloadManager {
 
     /// The latest download failure for this profile, if any.
     pub fn last_error(&self) -> Option<BrowserError> {
-        self.last_error.lock().unwrap().clone()
+        faktor_core::lock::recover(&self.last_error).clone()
     }
 
     pub fn stats(&self) -> DownloadStats {
-        self.stats.lock().unwrap().clone()
+        faktor_core::lock::recover(&self.stats).clone()
     }
 
     /// Bounded central snapshot in announcement order.
     pub fn records(&self) -> Vec<DownloadRecord> {
-        let records = self.records.lock().unwrap();
-        self.order
-            .lock()
-            .unwrap()
+        let records = faktor_core::lock::recover(&self.records);
+        faktor_core::lock::recover(&self.order)
             .iter()
             .filter_map(|guid| records.get(guid).cloned())
             .collect()
@@ -357,10 +355,11 @@ impl DownloadManager {
                     state: DownloadState::Cancelled,
                 });
                 {
-                    let mut stats = self.stats.lock().unwrap();
+                    let mut stats = faktor_core::lock::recover(&self.stats);
                     stats.blocked_total = stats.blocked_total.saturating_add(1);
                 }
-                *self.last_error.lock().unwrap() = Some(self.policy.denied_error(&url));
+                *faktor_core::lock::recover(&self.last_error) =
+                    Some(self.policy.denied_error(&url));
                 Some(NativeDownloadDenial { guid, url })
             }
             "Browser.downloadProgress" => {
@@ -371,10 +370,7 @@ impl DownloadManager {
                         return None;
                     }
                 };
-                let url = self
-                    .records
-                    .lock()
-                    .unwrap()
+                let url = faktor_core::lock::recover(&self.records)
                     .get(&guid)
                     .map(|record| record.url.clone())
                     .unwrap_or_default();
@@ -393,7 +389,7 @@ impl DownloadManager {
                     }
                 };
                 {
-                    let mut records = self.records.lock().unwrap();
+                    let mut records = faktor_core::lock::recover(&self.records);
                     if let Some(record) = records.get_mut(&guid) {
                         record.received_bytes = received;
                         record.total_bytes = total;
@@ -455,7 +451,7 @@ impl DownloadManager {
             return Ok(DownloadOutcome::Continued);
         }
         if let Err(error) = self.prepare() {
-            *self.last_error.lock().unwrap() = Some(error.clone());
+            *faktor_core::lock::recover(&self.last_error) = Some(error.clone());
             let _ = self
                 .deny(client, session, &request_id, deadline, cancel)
                 .await;
@@ -684,7 +680,7 @@ impl DownloadManager {
             state: DownloadState::Captured,
         });
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = faktor_core::lock::recover(&self.stats);
             stats.captured_total = stats.captured_total.saturating_add(1);
             stats.captured_bytes = stats.captured_bytes.saturating_add(written);
         }
@@ -749,9 +745,7 @@ impl DownloadManager {
 
     fn reject(&self, guid: &str, url_hint: &str, detail: &str, over_bound: bool) {
         let url = if url_hint.is_empty() {
-            self.records
-                .lock()
-                .unwrap()
+            faktor_core::lock::recover(&self.records)
                 .get(guid)
                 .map(|record| record.url.clone())
                 .unwrap_or_default()
@@ -772,13 +766,13 @@ impl DownloadManager {
             });
         }
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = faktor_core::lock::recover(&self.stats);
             stats.rejected_total = stats.rejected_total.saturating_add(1);
             if over_bound {
                 stats.cancelled_over_bound = stats.cancelled_over_bound.saturating_add(1);
             }
         }
-        *self.last_error.lock().unwrap() = Some(BrowserError::DownloadRejected {
+        *faktor_core::lock::recover(&self.last_error) = Some(BrowserError::DownloadRejected {
             url,
             detail: detail.to_string(),
         });
@@ -787,9 +781,9 @@ impl DownloadManager {
     fn record(&self, record: DownloadRecord) {
         let guid = record.guid.clone();
         {
-            let mut records = self.records.lock().unwrap();
+            let mut records = faktor_core::lock::recover(&self.records);
             if !records.contains_key(&guid) {
-                let mut order = self.order.lock().unwrap();
+                let mut order = faktor_core::lock::recover(&self.order);
                 while order.len() >= MAX_DOWNLOAD_RECORDS {
                     if let Some(evicted) = order.pop_front() {
                         records.remove(&evicted);

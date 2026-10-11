@@ -205,7 +205,7 @@ impl Interceptor {
     }
 
     pub fn stats(&self) -> InterceptionStats {
-        self.stats.lock().unwrap().clone()
+        faktor_core::lock::recover(&self.stats).clone()
     }
 
     /// The CDP command that enables interception on this session.
@@ -241,7 +241,7 @@ impl Interceptor {
             .unwrap_or("Other");
         let decision = self.policy.decide(&url, resource_type);
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = faktor_core::lock::recover(&self.stats);
             stats.paused_total = stats.paused_total.saturating_add(1);
             match &decision {
                 InterceptionDecision::Continue => {

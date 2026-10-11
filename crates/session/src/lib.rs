@@ -35,12 +35,16 @@
 //!   `CompactionPolicy::min_reduction_ratio` (default 25%). A "summary" that
 //!   reduces context by ~1% is rejected with a `CompactRejected` event.
 //!
-//! The API is deliberately **synchronous** and `Send + Sync`: there is no bare
-//! `tokio::spawn` defining application state here. Async callers (the server)
-//! wrap heavy calls in `tokio::task::spawn_blocking`; short calls may run
-//! inline. All public methods return `faktor_core::Result<T>` so the server can
-//! map failures with `faktor_protocol::error::from_core` without a second error
-//! surface.
+//! The durable [`SessionHandle`] API is synchronous and `Send + Sync`; the
+//! hot append/settle path additionally `await`s the supervised async
+//! [`actor::DbActor`]: a dedicated `std::thread` behind bounded channels
+//! moves the SQLite commit off every tokio worker, and a reply means
+//! "durable". There is no bare `tokio::spawn` defining application state
+//! here — the actor thread is owned, bounded and restarted over the same
+//! store. Async callers (the server) wrap heavy calls in
+//! `tokio::task::spawn_blocking`; short calls may run inline. All public
+//! methods return `faktor_core::Result<T>` so the server can map failures
+//! with `faktor_protocol::error::from_core` without a second error surface.
 
 /// Classified lock recovery for the session's in-memory registries:
 /// operation ownership, child-process ownership and the per-session resource
@@ -49,10 +53,7 @@
 /// can never wedge session ownership; the durable rows remain the authority
 /// (`SessionHandle::recover_all` re-derives from them after a crash).
 pub(crate) fn recover_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    lock.lock().unwrap_or_else(|poisoned| {
-        lock.clear_poison();
-        poisoned.into_inner()
-    })
+    faktor_core::lock::recover(lock)
 }
 
 pub mod actor;

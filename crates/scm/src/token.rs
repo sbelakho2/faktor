@@ -6,7 +6,10 @@
 //!
 //! 1. [`GitHubAppTokenSource::app_jwt`] signs `{"alg":"RS256","typ":"JWT"}`
 //!    with claims `iss` = app id, `iat` = now − skew, `exp` = iat + TTL —
-//!    the JWT is the APP credential and is cached until near expiry;
+//!    the JWT is the APP credential and is cached until near expiry. The
+//!    compact serialization and RS256 signature are produced by the audited
+//!    `jsonwebtoken` crate, never by hand; the private key stays a
+//!    [`SecretValue`] and is parsed once at construction;
 //! 2. [`GitHubAppTokenSource::token_for`] POSTs
 //!    `{api_base}/app/installations/{id}/access_tokens` with that bearer
 //!    through the checked [`HttpTransport`] (the daemon's ONE policy-gated
@@ -29,7 +32,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use faktor_provider::egress::{HttpTransport, RawRequest, RawResponse, RouteLabel};
 use faktor_security::secret::SecretValue;
-use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use jsonwebtoken::{
+    encode as jwt_encode, Algorithm as JwtAlgorithm, EncodingKey, Header as JwtHeader,
+};
+use ring::signature::RsaKeyPair;
 
 use crate::error::ScmError;
 use crate::github::{
@@ -164,6 +170,15 @@ struct AppJwt {
     expires_at_ms: i64,
 }
 
+/// The app JWT claims: `iss` = app id, `iat` backdated by the skew, `exp` =
+/// `iat` + TTL (GitHub's documented app-credential shape).
+#[derive(serde::Serialize)]
+struct AppJwtClaims {
+    iat: i64,
+    exp: i64,
+    iss: String,
+}
+
 impl fmt::Debug for AppJwt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppJwt")
@@ -177,7 +192,7 @@ impl fmt::Debug for AppJwt {
 /// cached installation tokens through the checked transport.
 pub struct GitHubAppTokenSource {
     config: GitHubAppTokenConfig,
-    key: Arc<RsaKeyPair>,
+    key: EncodingKey,
     transport: Arc<dyn HttpTransport>,
     clock: Arc<dyn Clock>,
     jwt: Mutex<Option<AppJwt>>,
@@ -203,8 +218,18 @@ impl GitHubAppTokenSource {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ScmError> {
         config.validate()?;
-        let der = decode_pkcs8_pem(config.private_key_pkcs8_pem.expose())?;
-        let key = RsaKeyPair::from_pkcs8(&der).map_err(|e| {
+        let pem = config.private_key_pkcs8_pem.expose();
+        let der = decode_pkcs8_pem(pem)?;
+        // Eager structural validation, exactly as before: a malformed key is
+        // a construction-time refusal, never a first-call surprise.
+        RsaKeyPair::from_pkcs8(&der).map_err(|e| {
+            ScmError::Config(format!(
+                "GitHub App private key is not a valid PKCS#8 RSA key: {e}"
+            ))
+        })?;
+        // The audited signer consumes the PKCS#1 body extracted from the
+        // validated PKCS#8 document (jsonwebtoken's own PEM decoder).
+        let key = EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
             ScmError::Config(format!(
                 "GitHub App private key is not a valid PKCS#8 RSA key: {e}"
             ))
@@ -214,7 +239,7 @@ impl GitHubAppTokenSource {
                 api_base: config.api_base.trim_end_matches('/').to_string(),
                 ..config
             },
-            key: Arc::new(key),
+            key,
             transport,
             clock,
             jwt: Mutex::new(None),
@@ -249,26 +274,19 @@ impl GitHubAppTokenSource {
         }
         let iat = (now_ms / 1000).saturating_sub(self.config.jwt_skew_secs);
         let exp = iat.saturating_add(self.config.jwt_ttl_secs);
-        let header = r#"{"alg":"RS256","typ":"JWT"}"#;
-        let claims = serde_json::json!({
-            "iat": iat,
-            "exp": exp,
-            "iss": self.config.app_id.to_string(),
-        });
-        let claims = serde_json::to_vec(&claims)
-            .map_err(|e| ScmError::Config(format!("app JWT claims: {e}")))?;
-        let signing_input = format!("{}.{}", b64url(header.as_bytes()), b64url(&claims));
-        let mut signature = vec![0u8; self.key.public().modulus_len()];
-        self.key
-            .sign(
-                &RSA_PKCS1_SHA256,
-                &ring::rand::SystemRandom::new(),
-                signing_input.as_bytes(),
-                &mut signature,
-            )
+        let claims = AppJwtClaims {
+            iat,
+            exp,
+            iss: self.config.app_id.to_string(),
+        };
+        // The audited `jsonwebtoken` signer mints the RS256 JWT
+        // (`{"alg":"RS256","typ":"JWT"}` header over base64url segments).
+        let mut header = JwtHeader::new(JwtAlgorithm::RS256);
+        header.typ = Some("JWT".into());
+        let token = jwt_encode(&header, &claims, &self.key)
             .map_err(|_| ScmError::Config("app JWT signing failed".into()))?;
         let jwt = AppJwt {
-            token: SecretValue::new(format!("{signing_input}.{}", b64url(&signature))),
+            token: SecretValue::new(token),
             expires_at_ms: exp.saturating_mul(1000),
         };
         *self.jwt_lock()? = Some(jwt.clone());
@@ -489,10 +507,6 @@ fn mint_retryable(error: &ScmError) -> bool {
         ScmError::Api { status, .. } => (500..=599).contains(status),
         _ => false,
     }
-}
-
-fn b64url(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Decode an unencrypted PKCS#8 (`BEGIN PRIVATE KEY`) PEM document. A

@@ -2,10 +2,10 @@
 //! server.
 //!
 //! Purpose (audit note): expose an ACP agent server so ACP-capable editors
-//! (Zed and others) can drive the Faktor core alongside the native API and
-//! the legacy compat surface. This crate implements the WIRE + lifecycle
-//! only; agent behavior is delegated to the injected backend seam, so the
-//! daemon can attach the real runtime without this crate knowing it.
+//! (Zed and others) can drive the Faktor core alongside the daemon's native
+//! API. This crate implements the WIRE + lifecycle only; agent behavior is
+//! delegated to the injected backend seam; the only compatibility surface
+//! is the wire-level `Content-Length` framing (see [`protocol`]).
 //!
 //! # Wire surface (official Agent Client Protocol v1 subset)
 //!

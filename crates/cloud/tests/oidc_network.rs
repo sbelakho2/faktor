@@ -46,6 +46,11 @@ struct MockKey {
     use_: Option<String>,
     /// The JWKS `key_ops` field (absent = `None`).
     key_ops: Option<Vec<String>>,
+    /// The `EC` curve name (`None` for RSA/oct keys).
+    crv: Option<String>,
+    /// The `EC` affine point coordinates (decoded; `None` for RSA/oct keys).
+    x: Option<Vec<u8>>,
+    y: Option<Vec<u8>>,
 }
 
 struct ProviderState {
@@ -170,6 +175,30 @@ const TEST_RSA_KEY_2_PKCS8_B64: &str = concat!(
     "8//KQP+/HuOToerD2AUkEdQaxONyheEhGHwy+A==",
 );
 
+/// A FIXED RS256 ID token (golden vector), signed once with
+/// `TEST_RSA_KEY_1` (`kid-1`) over the exact golden payload
+/// (`iss=https://idp.example`, `sub=sub-golden`, `aud=faktor-test`,
+/// `iat=1699999940`, `exp=1700000060`, `nonce=nonce-golden`). The token
+/// bytes never change, so the vetted verification path is pinned to a
+/// known-answer vector, not only to freshly minted tokens.
+const GOLDEN_RS256_ID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImtpZC0xIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoic3ViLWdvbGRlbiIsImF1ZCI6ImZha3Rvci10ZXN0IiwiZW1haWwiOiJnb2xkZW5AZXhhbXBsZS50ZXN0IiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImlhdCI6MTY5OTk5OTk0MCwiZXhwIjoxNzAwMDAwMDYwLCJub25jZSI6Im5vbmNlLWdvbGRlbiIsImdyb3VwcyI6WyJmYWt0b3ItYWRtaW5zIiwiZmFrdG9yLXZpZXdlcnMiXX0.GSDJ0tQcCwY5GeRXcpW4EkUpaz88BwzVi7zbx6UBPV-l-oD5QMAqWAoMZnasCsXZTA7uZg2745fvTR4gMm8YIlwFiy48h6IAJu3dGpyiqtW-e8P8K7a4Y8X9Hp4MU9jkWxyVLBl3lTF7TmeZgN4n6JD2HVqbfTJ1S4T0k8fRjfIOtuRGRYe0o1CfRPqYiq7Y5uUHBFVVeswqvjJBIatOnUhIMHfXnKuITOpiVmG-Dw1uzCgW2tAWsMEvi9WGIYu8sl6gqG98TDEH1vh1vv2j_pbQNICa1LccF_avyF2XSuariR16XENhOxbOwt-CaFXd4a2LHswkNUhG0CqY0sqAuA";
+
+/// The golden RS256 token with the header `kid` changed to `kid-evil`
+/// (the original signature is kept, so the refusal must be the key-id
+/// mismatch — never a signature error).
+const GOLDEN_RS256_WRONG_KID: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImtpZC1ldmlsIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoic3ViLWdvbGRlbiIsImF1ZCI6ImZha3Rvci10ZXN0IiwiZW1haWwiOiJnb2xkZW5AZXhhbXBsZS50ZXN0IiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImlhdCI6MTY5OTk5OTk0MCwiZXhwIjoxNzAwMDAwMDYwLCJub25jZSI6Im5vbmNlLWdvbGRlbiIsImdyb3VwcyI6WyJmYWt0b3ItYWRtaW5zIiwiZmFrdG9yLXZpZXdlcnMiXX0.GSDJ0tQcCwY5GeRXcpW4EkUpaz88BwzVi7zbx6UBPV-l-oD5QMAqWAoMZnasCsXZTA7uZg2745fvTR4gMm8YIlwFiy48h6IAJu3dGpyiqtW-e8P8K7a4Y8X9Hp4MU9jkWxyVLBl3lTF7TmeZgN4n6JD2HVqbfTJ1S4T0k8fRjfIOtuRGRYe0o1CfRPqYiq7Y5uUHBFVVeswqvjJBIatOnUhIMHfXnKuITOpiVmG-Dw1uzCgW2tAWsMEvi9WGIYu8sl6gqG98TDEH1vh1vv2j_pbQNICa1LccF_avyF2XSuariR16XENhOxbOwt-CaFXd4a2LHswkNUhG0CqY0sqAuA";
+
+/// The golden RS256 token with the header `alg` changed to `RS384`
+/// (never configured, never advertised): the algorithm policy must refuse
+/// it by NAME before any verifier runs.
+const GOLDEN_RS256_WRONG_ALG: &str = "eyJhbGciOiJSUzM4NCIsImtpZCI6ImtpZC0xIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoic3ViLWdvbGRlbiIsImF1ZCI6ImZha3Rvci10ZXN0IiwiZW1haWwiOiJnb2xkZW5AZXhhbXBsZS50ZXN0IiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImlhdCI6MTY5OTk5OTk0MCwiZXhwIjoxNzAwMDAwMDYwLCJub25jZSI6Im5vbmNlLWdvbGRlbiIsImdyb3VwcyI6WyJmYWt0b3ItYWRtaW5zIiwiZmFrdG9yLXZpZXdlcnMiXX0.GSDJ0tQcCwY5GeRXcpW4EkUpaz88BwzVi7zbx6UBPV-l-oD5QMAqWAoMZnasCsXZTA7uZg2745fvTR4gMm8YIlwFiy48h6IAJu3dGpyiqtW-e8P8K7a4Y8X9Hp4MU9jkWxyVLBl3lTF7TmeZgN4n6JD2HVqbfTJ1S4T0k8fRjfIOtuRGRYe0o1CfRPqYiq7Y5uUHBFVVeswqvjJBIatOnUhIMHfXnKuITOpiVmG-Dw1uzCgW2tAWsMEvi9WGIYu8sl6gqG98TDEH1vh1vv2j_pbQNICa1LccF_avyF2XSuariR16XENhOxbOwt-CaFXd4a2LHswkNUhG0CqY0sqAuA";
+
+/// A FIXED ES256 ID token (golden vector) over the same golden payload,
+/// signed once with the P-256 fixture whose public point is
+/// [`EC_X_B64`]/[`EC_Y_B64`] under `kid-ec` (raw `r || s` signature, as
+/// ES256 requires).
+const GOLDEN_ES256_ID_TOKEN: &str = "eyJhbGciOiJFUzI1NiIsImtpZCI6ImtpZC1lYyIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoic3ViLWdvbGRlbiIsImF1ZCI6ImZha3Rvci10ZXN0IiwiZW1haWwiOiJnb2xkZW5AZXhhbXBsZS50ZXN0IiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImlhdCI6MTY5OTk5OTk0MCwiZXhwIjoxNzAwMDAwMDYwLCJub25jZSI6Im5vbmNlLWdvbGRlbiIsImdyb3VwcyI6WyJmYWt0b3ItYWRtaW5zIiwiZmFrdG9yLXZpZXdlcnMiXX0.fBId_lynUGcuUiIoVujmAcKJPrp8tbRjg4NTgfzG7-PVwgukBcN3J6AbElfj_Lr0qnezJLcISB_iOOLwJbovVg";
+
 fn generate_key(kid: &str) -> MockKey {
     let b64 = if kid == "kid-1" {
         TEST_RSA_KEY_1_PKCS8_B64
@@ -190,6 +219,9 @@ fn generate_key(kid: &str) -> MockKey {
         alg: "RS256".into(),
         use_: Some("sig".into()),
         key_ops: None,
+        crv: None,
+        x: None,
+        y: None,
     }
 }
 
@@ -204,6 +236,31 @@ fn oct_key(kid: &str, secret: &[u8], use_: Option<&str>, key_ops: Option<&[&str]
         alg: "HS256".into(),
         use_: use_.map(str::to_string),
         key_ops: key_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect()),
+        crv: None,
+        x: None,
+        y: None,
+    }
+}
+
+/// The fixed P-256 public point (x, y) of the golden ES256 fixture token.
+const EC_X_B64: &str = "klpZ_qJq7UErqApX9ntrxxhyFvTTXexPuFgrqmVYvWY";
+const EC_Y_B64: &str = "0lFwn3D2rHWueuZb1_c4HBLHhwj3svDgBmombywAl1E";
+
+/// One P-256 EC key with the golden fixture's public coordinates.
+fn ec_key(kid: &str) -> MockKey {
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    MockKey {
+        kid: kid.to_string(),
+        keypair: None,
+        n: Vec::new(),
+        e: Vec::new(),
+        secret: None,
+        alg: "ES256".into(),
+        use_: Some("sig".into()),
+        key_ops: None,
+        crv: Some("P-256".into()),
+        x: Some(engine.decode(EC_X_B64).expect("x decodes")),
+        y: Some(engine.decode(EC_Y_B64).expect("y decodes")),
     }
 }
 
@@ -380,8 +437,15 @@ impl MockProvider {
                 .enumerate()
                 .filter(|(index, _)| *index == state.active)
                 .map(|(_, key)| {
+                    let kty = if key.secret.is_some() {
+                        "oct"
+                    } else if key.x.is_some() {
+                        "EC"
+                    } else {
+                        "RSA"
+                    };
                     let mut value = serde_json::json!({
-                        "kty": if key.secret.is_some() { "oct" } else { "RSA" },
+                        "kty": kty,
                         "kid": key.kid,
                         "alg": key.alg,
                     });
@@ -396,12 +460,22 @@ impl MockProvider {
                                 .collect(),
                         );
                     }
+                    if let Some(x) = &key.x {
+                        value["crv"] = serde_json::Value::String(
+                            key.crv.clone().unwrap_or_else(|| "P-256".into()),
+                        );
+                        value["x"] = serde_json::Value::String(b64url(x));
+                        if let Some(y) = &key.y {
+                            value["y"] = serde_json::Value::String(b64url(y));
+                        }
+                    }
                     match &key.secret {
                         Some(secret) => value["k"] = serde_json::Value::String(b64url(secret)),
-                        None => {
+                        None if key.x.is_none() => {
                             value["n"] = serde_json::Value::String(b64url(&key.n));
                             value["e"] = serde_json::Value::String(b64url(&key.e));
                         }
+                        None => {}
                     }
                     value
                 })
@@ -1751,4 +1825,121 @@ async fn a_stalled_issuer_is_a_typed_timeout_at_the_documented_bound() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "virtual time only: no real-time hang"
     );
+}
+
+// ------------------------------------------------- golden vectors: vetted path
+
+/// The expectations the fixed golden vectors were minted against.
+fn golden_expectations() -> IdTokenExpectations {
+    expectations(Some("nonce-golden"), NOW_MS)
+}
+
+/// A FIXED (never freshly minted) RS256 ID token verifies through the
+/// vetted `jsonwebtoken` path with every claim intact.
+#[tokio::test]
+async fn golden_rs256_id_token_is_verified_by_the_vetted_path() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider, clock);
+    let claims = adapter
+        .verify_id_token(GOLDEN_RS256_ID_TOKEN, &golden_expectations())
+        .await
+        .expect("the fixed RS256 vector verifies");
+    assert_eq!(claims.issuer, ISSUER);
+    assert_eq!(claims.subject, "sub-golden");
+    assert_eq!(claims.audience, [CLIENT]);
+    assert_eq!(claims.email.as_deref(), Some("golden@example.test"));
+    assert!(claims.email_verified);
+    assert_eq!(claims.issued_at_ms, 1_699_999_940_000);
+    assert_eq!(claims.expires_at_ms, 1_700_000_060_000);
+    assert_eq!(claims.groups, ["faktor-admins", "faktor-viewers"]);
+}
+
+/// The golden vector's teeth: a flipped signature byte, a renamed `kid` and
+/// a swapped `alg` are each refused with their OWN typed error, and
+/// `alg = none` never reaches a verifier.
+#[tokio::test]
+async fn golden_vector_tamper_wrong_alg_and_wrong_kid_are_refused_typed() {
+    let provider = Arc::new(MockProvider::new());
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter(provider, clock);
+
+    // A tampered signature over byte-identical claims is BadSignature.
+    let (head, sig) = GOLDEN_RS256_ID_TOKEN.rsplit_once('.').unwrap();
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut sig_bytes = engine.decode(sig).unwrap();
+    sig_bytes[0] ^= 0x01;
+    let tampered = format!("{head}.{}", b64url(&sig_bytes));
+    assert_eq!(
+        adapter
+            .verify_id_token(&tampered, &golden_expectations())
+            .await
+            .unwrap_err(),
+        OidcError::BadSignature
+    );
+
+    // A renamed kid is the typed key-id refusal, not a signature error.
+    assert_eq!(
+        adapter
+            .verify_id_token(GOLDEN_RS256_WRONG_KID, &golden_expectations())
+            .await
+            .unwrap_err(),
+        OidcError::UnknownKey("kid-evil".into())
+    );
+
+    // A swapped alg is refused BY NAME, naming every policy set.
+    match adapter
+        .verify_id_token(GOLDEN_RS256_WRONG_ALG, &golden_expectations())
+        .await
+        .unwrap_err()
+    {
+        OidcError::AlgorithmRefused {
+            alg,
+            discovery,
+            jwk,
+            configured,
+        } => {
+            assert_eq!(alg, "RS384");
+            assert_eq!(discovery, ["RS256"]);
+            assert_eq!(jwk, ["RS256"]);
+            assert_eq!(configured, ["RS256"]);
+        }
+        other => panic!("expected AlgorithmRefused, got {other:?}"),
+    }
+    let none_token = alg_none_token(&token_spec(Some("nonce-golden"), NOW_MS + 60_000));
+    assert!(matches!(
+        adapter
+            .verify_id_token(&none_token, &golden_expectations())
+            .await
+            .unwrap_err(),
+        OidcError::AlgorithmRefused { ref alg, .. } if alg == "none"
+    ));
+}
+
+/// A FIXED ES256 ID token verifies when (and only when) the deployment
+/// explicitly allows ES256; the default RS256-only policy refuses it typed.
+#[tokio::test]
+async fn golden_es256_id_token_is_verified_only_when_configured() {
+    let provider = Arc::new(MockProvider::new());
+    provider.push_key(ec_key("kid-ec"));
+    provider.set_discovery_algs(&["ES256", "RS256"]);
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let adapter = adapter_with_algs(provider.clone(), clock, &["ES256"]);
+    let claims = adapter
+        .verify_id_token(GOLDEN_ES256_ID_TOKEN, &golden_expectations())
+        .await
+        .expect("the fixed ES256 vector verifies under an ES256 policy");
+    assert_eq!(claims.subject, "sub-golden");
+    assert_eq!(claims.audience, [CLIENT]);
+
+    // The same fixed token under the default asymmetric policy: typed refusal.
+    let clock = Arc::new(ManualClock::new(NOW_MS));
+    let strict = adapter_with_algs(provider, clock, &["RS256"]);
+    assert!(matches!(
+        strict
+            .verify_id_token(GOLDEN_ES256_ID_TOKEN, &golden_expectations())
+            .await
+            .unwrap_err(),
+        OidcError::AlgorithmRefused { ref configured, .. } if configured == &["RS256"]
+    ));
 }

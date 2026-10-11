@@ -554,10 +554,7 @@ fn pin_reap_window(pid: u32) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc:
         pid,
         Arc::new(move || {
             let _ = entered_tx.send(());
-            let _ = release_rx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv();
+            let _ = faktor_core::lock::recover(&release_rx).recv();
         }),
     );
     (entered_rx, release_tx)

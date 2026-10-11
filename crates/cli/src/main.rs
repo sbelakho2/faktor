@@ -166,6 +166,20 @@ pub(crate) enum Command {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// The explicit sandbox shell choice (audit item 17): the fail-closed
+    /// default or the operator's recorded network-capable shell grant.
+    /// `status` reports the typed state; `choose` records the decision
+    /// durably (config file + audit line), never silently.
+    #[command(display_order = 25)]
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+        /// The daemon data dir (default `~/.faktor`).
+        #[arg(long, default_value = "~/.faktor", global = true)]
+        data_dir: String,
+        #[arg(long, global = true)]
+        config: Option<String>,
+    },
     /// List sessions.
     #[command(display_order = 30)]
     Sessions {
@@ -206,6 +220,25 @@ pub(crate) enum Command {
         data_dir: String,
         #[arg(long, global = true)]
         config: Option<String>,
+    },
+}
+
+/// The local sandbox admin subcommands (`faktor sandbox <action>`).
+#[derive(Subcommand)]
+pub(crate) enum SandboxAction {
+    /// Print the typed first-run choice state: platform backend, durable
+    /// record and the effective agent shell contract.
+    Status,
+    /// Record the explicit operator choice durably (decision document +
+    /// append-only audit line). Exactly one of the two flags is required.
+    Choose {
+        /// Option (a): keep the fail-closed default (the secure default).
+        #[arg(long)]
+        fail_closed: bool,
+        /// Option (b): grant network-capable shells; the exact trade-off is
+        /// printed and recorded as an explicit operator grant.
+        #[arg(long)]
+        network_capable_shell: bool,
     },
 }
 
@@ -548,6 +581,13 @@ pub(crate) async fn main() {
         Command::Sessions { data_dir } => {
             sessions(expand(&data_dir)).await;
         }
+        Command::Sandbox {
+            action,
+            data_dir,
+            config,
+        } => {
+            sandbox_command(action, expand(&data_dir), config.map(|c| expand(&c)));
+        }
         Command::Bootstrap {
             install_root,
             exec_args,
@@ -678,6 +718,10 @@ pub(crate) async fn run(
             std::process::exit(1);
         }
     };
+    // Present the typed first-run sandbox choice (audit item 17) before the
+    // daemon graph exists: fail-closed stays the effective default unless
+    // the operator recorded the grant explicitly.
+    config::announce_startup(&data_dir, &config);
     // PURE preflight BEFORE the daemon build touches the data dir: a pinned/
     // balanced routing refusal, an embeddings-policy refusal or a provider
     // resolution refusal (`--provider ghost`) must leave NO store/db/CAS
@@ -738,6 +782,113 @@ pub(crate) async fn run(
         Err(e) => {
             eprintln!("daemon build failed: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// `faktor sandbox <action>` — the typed first-run choice surface (audit
+/// item 17). `status` is read-only; `choose` records the operator's
+/// explicit decision durably and prints the exact trade-off. The command
+/// never changes behavior implicitly: choosing (a) keeps the secure
+/// fail-closed default, choosing (b) records the strictly weaker grant.
+pub(crate) fn sandbox_command(
+    action: SandboxAction,
+    data_dir: PathBuf,
+    config_path: Option<PathBuf>,
+) {
+    let config = match load_optional_config(&data_dir, config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("faktor sandbox: config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    match action {
+        SandboxAction::Status => {
+            let state = config::inspect(&data_dir, &config);
+            println!(
+                "sandbox first-run choice: decision={} platform={} backend_available={}",
+                state.decision.as_tag(),
+                std::env::consts::OS,
+                state.backend_available,
+            );
+            if let Some(record) = &state.record {
+                println!(
+                    "recorded decision: choice={} at_ms={} platform={} backend_available={}",
+                    record.choice.as_tag(),
+                    record.decided_at_ms,
+                    record.platform,
+                    record.network_backend_available,
+                );
+                if !record.trade_off.is_empty() {
+                    println!("recorded trade-off: {}", record.trade_off);
+                }
+            }
+            println!(
+                "decision document: {}",
+                config::decision_path(&data_dir).display()
+            );
+            println!("audit trail: {}", config::audit_path(&data_dir).display());
+            if let Some(text) = config::startup_notice(&state, &data_dir) {
+                println!("{text}");
+            }
+            if let Some(reason) = &state.corrupt_reason {
+                eprintln!("faktor sandbox: decision unreadable: {reason}");
+                std::process::exit(1);
+            }
+        }
+        SandboxAction::Choose {
+            fail_closed,
+            network_capable_shell,
+        } => {
+            if fail_closed == network_capable_shell {
+                eprintln!(
+                    "faktor sandbox choose: select exactly one of --fail-closed or \
+                     --network-capable-shell"
+                );
+                std::process::exit(2);
+            }
+            if config.sandbox.shell.is_some() {
+                eprintln!(
+                    "faktor sandbox choose: the config file explicitly sets [sandbox] shell; \
+                     that explicit key always wins — edit the config file instead of recording \
+                     a durable choice"
+                );
+                std::process::exit(1);
+            }
+            let choice = if fail_closed {
+                config::SandboxShellChoice::FailClosed
+            } else {
+                config::SandboxShellChoice::NetworkCapableUserGranted
+            };
+            match config::record_decision(&data_dir, choice, now_ms()) {
+                Ok(record) => {
+                    println!(
+                        "sandbox first-run choice recorded: {} (platform={}, \
+                         backend_available={})",
+                        record.choice.as_tag(),
+                        record.platform,
+                        record.network_backend_available,
+                    );
+                    println!(
+                        "recorded at: {}",
+                        config::decision_path(&data_dir).display()
+                    );
+                    println!("audit trail: {}", config::audit_path(&data_dir).display());
+                    if choice == config::SandboxShellChoice::NetworkCapableUserGranted {
+                        println!("trade-off: {}", config::NETWORK_CAPABLE_SHELL_TRADE_OFF);
+                    } else {
+                        println!(
+                            "the secure fail-closed default stays in force: agent shell and \
+                             verification children remain OS-isolation-required"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("faktor sandbox choose: cannot record the decision: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -878,9 +1029,14 @@ pub(crate) async fn updater_command(
             std::process::exit(1);
         }
     };
-    let probe: Arc<dyn faktor_updater::HealthProbe> = Arc::new(CliDoctorProbe {
-        data_dir: data_dir.clone(),
-    });
+    let probe: Arc<dyn faktor_updater::HealthProbe> =
+        Arc::new(faktor_updater::DataStoreSchemaProbe::new(
+            CliDoctorProbe {
+                data_dir: data_dir.clone(),
+            },
+            data_dir.join("store").join("faktor-plus.db"),
+            faktor_store::SCHEMA_HEAD,
+        ));
     let policy = match config.sandbox_policy() {
         Ok(policy) => policy
             .network
@@ -1089,17 +1245,30 @@ pub(crate) fn load_entry_config(
         None => {
             let discovered = data_dir.join("faktor-plus.json");
             if !discovered.exists() {
-                return Ok((config::Config::default(), graph::SemanticCfg::default()));
+                let mut config = config::Config::default();
+                config::apply_effective_choice(&mut config, data_dir);
+                return Ok((config, graph::SemanticCfg::default()));
             }
             discovered
         }
     };
     match load_config_document(&path) {
-        Ok(loaded) => Ok(loaded),
+        Ok((mut config, semantic)) => {
+            // Apply the durable first-run sandbox choice (audit item 17): an
+            // explicit `[sandbox] shell` key always wins; otherwise a
+            // recorded explicit grant switches the agent shell class to the
+            // app-level-only network-capable mode. Never widens silently —
+            // the grant is only ever applied from the operator's recorded
+            // decision.
+            config::apply_effective_choice(&mut config, data_dir);
+            Ok((config, semantic))
+        }
         Err(e) if explicit => Err(e),
         Err(e) => {
             tracing::error!("config error: {e}; using defaults");
-            Ok((config::Config::default(), graph::SemanticCfg::default()))
+            let mut config = config::Config::default();
+            config::apply_effective_choice(&mut config, data_dir);
+            Ok((config, graph::SemanticCfg::default()))
         }
     }
 }
@@ -1402,10 +1571,13 @@ pub(crate) fn doctor_run_with_config(
     let mut lines: Vec<String> = Vec::new();
     let mut issues = 0usize;
     doctor_worker_plane_line(config_path, &mut lines, &mut issues);
-    doctor_sandbox_shell_line(config_path, &mut lines, &mut issues);
+    doctor_sandbox_shell_line(config_path, data_dir, &mut lines, &mut issues);
+    doctor_sandbox_first_run_line(data_dir, config_path, &mut lines, &mut issues);
+    doctor_sandbox_agent_home_line(data_dir, config_path, &mut lines, &mut issues);
     doctor_network_isolation_line(&mut lines);
     doctor_tokenizer_certification_line(config_path, &mut lines, &mut issues);
     doctor_contract_compiler_line(&mut lines, &mut issues);
+    doctor_live_canary_line(&mut lines);
     match SessionManager::open_quick(data_dir.join("store"), data_dir.join("cas")) {
         Ok(session) => {
             lines.push("store: ok".into());
@@ -2114,19 +2286,18 @@ pub(crate) fn doctor_index_reason_fragment(reason: &str) -> String {
 /// never silently rendered as a healthy state.
 pub(crate) fn doctor_sandbox_shell_line(
     config_path: Option<&std::path::Path>,
+    data_dir: &std::path::Path,
     lines: &mut Vec<String>,
     issues: &mut usize,
 ) {
-    let cfg = match config_path {
-        Some(path) => match serve_config_and_semantic(Some(path.to_path_buf())) {
-            Ok((config, _semantic)) => config,
-            // The config refusal is already reported loudly by
-            // doctor_worker_plane_line (the daemon would not start); do not
-            // imply any shell state from a refused config.
-            Err(_) => return,
-        },
-        None => config::Config::default(),
+    let Some(mut cfg) = doctor_sandbox_config(config_path) else {
+        return;
     };
+    // Resolve the EFFECTIVE contract exactly as every daemon entry point
+    // does (config key first, then the durable first-run record): doctor
+    // must print the mode the daemon would enforce, never a config-only
+    // shadow of it.
+    config::apply_effective_choice(&mut cfg, data_dir);
     push_shell_class_line(
         "agent shell tool",
         cfg.sandbox_policy()
@@ -2163,6 +2334,101 @@ pub(crate) fn push_shell_class_line(
             lines.push(format!("sandbox shell execution ({class}): FAILED {e}"));
             *issues += 1;
         }
+    }
+}
+
+/// The doctor's first-run sandbox-choice surface (audit item 17): the typed
+/// decision the daemon would actually run under — explicit config key,
+/// recorded operator grant, recorded fail-closed, or PENDING on a
+/// backend-less platform. Pending is NOT an issue (the secure default is
+/// correct); an unreadable decision document IS an issue and the state
+/// remains fail-closed.
+pub(crate) fn doctor_sandbox_first_run_line(
+    data_dir: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let Some(config) = doctor_sandbox_config(config_path) else {
+        return;
+    };
+    let state = config::inspect(data_dir, &config);
+    let record = state
+        .record
+        .as_ref()
+        .map(|record| record.choice.as_tag())
+        .unwrap_or("none");
+    lines.push(format!(
+        "sandbox first-run choice: decision={} platform={} network_backend={} record={}",
+        state.decision.as_tag(),
+        std::env::consts::OS,
+        if state.backend_available {
+            "available"
+        } else {
+            "absent"
+        },
+        record,
+    ));
+    if let Some(text) = config::startup_notice(&state, data_dir) {
+        lines.push(text);
+    }
+    if let Some(reason) = &state.corrupt_reason {
+        lines.push(format!("sandbox first-run decision unreadable: {reason}"));
+        *issues += 1;
+    }
+}
+
+/// The doctor's agent-HOME surface (audit item 6): the effective HOME
+/// contract and the honest credential-confinement state of this platform.
+pub(crate) fn doctor_sandbox_agent_home_line(
+    data_dir: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    _issues: &mut usize,
+) {
+    let Some(config) = doctor_sandbox_config(config_path) else {
+        return;
+    };
+    let policy = config.sandbox.home;
+    lines.push(format!(
+        "sandbox agent home: policy={} scratch_root={}",
+        policy.as_tag(),
+        data_dir.join(faktor_terminal::AGENT_HOME_DIR).display(),
+    ));
+    if policy.passes_real_home() {
+        lines.push(
+            "sandbox agent home grant: EXPLICIT operator grant passes the real HOME through; \
+             credential directories stay denied by OS-level confinement wherever a backend is \
+             installed"
+                .to_string(),
+        );
+    }
+    let credential_state = if faktor_sandbox::filesystem_backend_available() {
+        "kernel-denied by the confinement policy (the OS backend never grants ~/.ssh, ~/.aws, \
+         ~/.config/gcloud, ~/.netrc or ~/.git-credentials; a Required confinement root that \
+         would cover one is a typed spawn refusal); on this platform the backend exists"
+            .to_string()
+    } else {
+        format!(
+            "honest limitation: no OS confinement backend on {} — the per-session scratch HOME \
+             keeps $HOME-relative credential discovery empty, but absolute-path reads are not \
+             OS-denied",
+            std::env::consts::OS
+        )
+    };
+    lines.push(format!("sandbox credential dirs: {credential_state}"));
+}
+
+/// The one config resolution for the new sandbox doctor lines: the explicit
+/// `--config` document (already validated by `doctor_worker_plane_line`,
+/// which reports a refusal loudly) or the daemon defaults. `None` means a
+/// refused config was already surfaced and nothing may be implied from it.
+fn doctor_sandbox_config(config_path: Option<&std::path::Path>) -> Option<config::Config> {
+    match config_path {
+        Some(path) => serve_config_and_semantic(Some(path.to_path_buf()))
+            .ok()
+            .map(|(config, _semantic)| config),
+        None => Some(config::Config::default()),
     }
 }
 
@@ -2292,6 +2558,19 @@ pub(crate) fn doctor_worker_plane_line(
             }
             *issues += 1;
         }
+    }
+}
+
+/// The additive live-canary status section (marketplace audit item 8): one
+/// informational line per marketplace source, `configured` when every
+/// opt-in canary environment variable is present, else `absent`. This is
+/// always information, never an ISSUE: absence is the default, and no
+/// vendor request happens without an operator explicitly providing the
+/// credentials (`crates/commerce-connectors/tests/live_canary.rs`; legal
+/// posture in `docs/legal/marketplace-acquisition.md`).
+pub(crate) fn doctor_live_canary_line(lines: &mut Vec<String>) {
+    for (source, status) in faktor_commerce_connectors::canary::canary_statuses_from_env() {
+        lines.push(format!("live-canary {source}: {}", status.label()));
     }
 }
 

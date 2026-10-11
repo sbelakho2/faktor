@@ -10,6 +10,7 @@ async-trait = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
 ring = "0.17"
+jsonwebtoken = "9"
 blake3.workspace = true
 faktor-provider.workspace = true
 faktor-security.workspace = true

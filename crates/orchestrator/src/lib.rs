@@ -1,11 +1,16 @@
 //! faktor-orchestrator — durable plan model and child-agent control plane for
 //! multi-agent orchestration.
 //!
-//! This crate is a PURE planning/control model plus policy: it never spawns
-//! processes, never touches sessions or files, and holds no I/O. The daemon
-//! drives the real runtime from these structures later; everything enters
-//! this crate as a method call on [`Orchestrator`] and every call leaves a
-//! durable, timestamped event on the control log.
+//! The durable planning/control model and policy half ([`Orchestrator`]:
+//! plan validation, ownership, the per-child control state machine, the
+//! pure [`parallelism_is_economic`] threshold rule) is paired with the
+//! EXECUTING half ([`runtime::OrchestratorRuntime`]): child sessions through
+//! `faktor-session`, isolated child worktrees/directories through
+//! `faktor-fs`, supervised children through the `faktor-terminal` process
+//! supervisor, git completion steps through `faktor-git` and the
+//! remote-worker completion gates. Everything enters this crate as a method
+//! call on [`Orchestrator`] or the runtime, and every call leaves a durable,
+//! timestamped event on the control log.
 //!
 //! Audit contract encoded here:
 //! - Read-only children are the DEFAULT. Write access is an explicit,
@@ -34,6 +39,10 @@ pub mod proof_probe;
 /// through the SAME post-run pipeline; non-self-verifying results refuse).
 pub mod remote_completion;
 pub mod runtime;
+/// Fault-certification seam vocabulary; compiled only for tests or under
+/// the `fault-injection` feature (production builds have no seam module).
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod seam;
 pub mod tournament;
 
 /// Per-WORK-ITEM write ownership (audits 7/8/21/22 + work-entry

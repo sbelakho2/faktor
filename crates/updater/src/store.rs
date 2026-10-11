@@ -198,6 +198,15 @@ pub struct UpdateOperation {
     /// treated as generation 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_generation: Option<u64>,
+    /// The data-store schema head of the binary that PERFORMED this
+    /// operation (recorded on `apply`/`activate` rows). On rollback this is
+    /// the head of the previous binary being restored: a live store whose
+    /// `user_version` is above it cannot be opened by that binary, so the
+    /// rollback must refuse instead of moving the pointer. Additive: absent
+    /// on pre-existing rows and on hosts whose probe cannot observe the
+    /// store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_schema_head: Option<i64>,
     /// The control-plane actor that explicitly authorized the operation
     /// (only the authorized downgrade carries one today); bounded text, never
     /// a secret.
@@ -236,6 +245,7 @@ impl UpdateOperation {
             before_artifact: None,
             artifact: None,
             release_generation: None,
+            store_schema_head: None,
             actor: None,
             identity: None,
             certification_level: None,
@@ -1201,7 +1211,8 @@ mod tests {
     fn exercise(store: &dyn UpdaterStore) {
         let staged = row(UpdateOpKind::Stage, UpdateOpStatus::Staged, 10);
         let check = row(UpdateOpKind::Check, UpdateOpStatus::Succeeded, 20);
-        let running = row(UpdateOpKind::Apply, UpdateOpStatus::Running, 30);
+        let mut running = row(UpdateOpKind::Apply, UpdateOpStatus::Running, 30);
+        running.store_schema_head = Some(33);
         store.insert(&staged).unwrap();
         store.insert(&check).unwrap();
         store.insert(&running).unwrap();
@@ -1222,6 +1233,17 @@ mod tests {
                 .unwrap(),
             None
         );
+        // The additive `store_schema_head` annotation round-trips, and a
+        // legacy payload without it decodes to None: the rollback guard
+        // stays inert instead of guessing a schema head.
+        let mut legacy_value: serde_json::Value =
+            serde_json::from_str(&encode(&running).unwrap()).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("store_schema_head");
+        let legacy: UpdateOperation = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.store_schema_head, None);
 
         // Transition: only the recorded row's status may move.
         let mut applied = running.clone();

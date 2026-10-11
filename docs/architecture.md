@@ -815,10 +815,10 @@ Test crates (each an independent workspace member):
 - `tests/fault` — fault injection: crash, corruption, truncation, races.
 - `tests/soak` — long-run stability (memory bounds, journal growth).
 - `tests/performance` — perf gates (§13) — `[perf]`.
-- `tests/visual` — pixel-level UI compatibility: zero-pixel-diff against
-  `fixtures/screenshots` **outside branding masks** (`BrandingMask` +
-  `compose_plus_overlay` for the "+" overlay region); fixtures regenerated
-  by an ignored `[visual]` test.
+- `tests/visual` — pixel-level UI compatibility: zero-pixel-diff **outside
+  branding masks** (`BrandingMask` + `compose_plus_overlay` for the "+"
+  overlay region). The frozen 16-case audit matrix is rendered at test time
+  at a bounded panel size; no screenshot corpus is committed.
 
 Ignore conventions (AGENTS.md, verified by CI):
 

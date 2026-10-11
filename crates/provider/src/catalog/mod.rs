@@ -67,7 +67,7 @@ pub use faktor_core::model::PricingState;
 pub const CATALOG_FIRST_EPOCH: u64 = 1;
 
 /// Source id of the built-in list-price table (audit item C: every built-in
-/// row's snapshot names `"faktor-builtin-v1"`).
+/// row's snapshot names the vendored catalog's `source_id`).
 pub use builtin::BUILTIN_SOURCE_ID;
 
 /// Source id stamped onto user-override snapshots (exact tables AND
@@ -275,7 +275,7 @@ impl Default for QualityPrior {
 /// Provenance of ONE price statement (audit item C): who priced it, when it
 /// took effect, when it was observed, until when it stays authoritative, and
 /// which catalog version produced it. The versioned built-in table stamps
-/// `source_id = "faktor-builtin-v2"`, `catalog_version = "builtin-v2"` with
+/// `source_id = "faktor-builtin-v3"`, `catalog_version = "builtin-v3"` with
 /// its row/table dates ([`builtin::provenance_of`]). `None` means the clock
 /// is unknown (legacy rows); it is NEVER 0-as-unknown — 0 is a real instant
 /// (1970-01-01). Settlement-relevant identity (epoch/source id) also rides
@@ -293,7 +293,7 @@ pub struct PricingProvenance {
     /// (`None` = no published expiry).
     pub valid_until_ms: Option<u64>,
     /// Version of the pricing catalog that produced the statement
-    /// (`"builtin-v2"` today; user overrides carry `"user-v1"`).
+    /// (`"builtin-v3"` today; user overrides carry `"user-v1"`).
     pub catalog_version: String,
 }
 
@@ -1587,6 +1587,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unknown_models_stay_conservative_unknown_and_never_free_under_official_origins() {
+        // A model the vendored table does not document gets NO price from
+        // any official origin: the row stays PricingState::Unknown
+        // (authority Unknown, no quote, no settlement) with the
+        // ConservativeUnknown quality placeholder — never a zero/free or
+        // 1-microUSD fabricated price.
+        let adapter = || {
+            Arc::new(LegacyTestProvider {
+                id: "openai".into(),
+            }) as Arc<dyn Provider>
+        };
+        for origin in [
+            BillingOrigin::OfficialOpenAi,
+            BillingOrigin::OfficialAnthropic,
+            BillingOrigin::OfficialGoogle,
+            BillingOrigin::OfficialDeepSeek,
+        ] {
+            let wrapped = BillingOriginProvider::wrap(
+                adapter(),
+                "official-unknown",
+                origin,
+                PricingOverrides::default(),
+            );
+            for model in [
+                "gpt-6",
+                "claude-opus-9",
+                "gemini-9",
+                "deepseek-v9",
+                "default",
+                "",
+            ] {
+                let e = wrapped.catalog_entry(model);
+                assert_eq!(e.pricing, PricingState::Unknown, "{origin:?}/{model:?}");
+                assert_eq!(e.pricing.authority(), PriceAuthority::Unknown);
+                assert_eq!(e.pricing.quote(), None, "no fabricated quote");
+                let snap = e.pricing_snapshot();
+                assert_eq!(snap.quote, None, "unknown carries no numbers");
+                assert_eq!(
+                    snap.settle_cost(1_000_000, 1_000_000, 0, 0),
+                    None,
+                    "unknown spend must never settle to a free/zero amount"
+                );
+                assert_eq!(e.quality_prior, QualityPrior::default());
+                assert_eq!(
+                    e.quality_prior.coding.authority,
+                    QualityAuthority::ConservativeUnknown,
+                    "quality stays the conservative-unknown placeholder"
+                );
+            }
+        }
+    }
+
     // ------------------------------------------------------ admission matrix
 
     fn state_for(authority: PriceAuthority) -> PricingState {
@@ -1911,7 +1964,7 @@ mod tests {
         assert_eq!(snap.settle_cost(0, 0, 1_000_000, 0), Some(30_000_000));
         assert_eq!(
             snap.valid_until_ms,
-            Some(builtin::BUILTIN_VALID_UNTIL_MS),
+            Some(builtin::valid_until_ms()),
             "the validity window reaches the route-time snapshot"
         );
         assert_eq!(snap.source_id, BUILTIN_SOURCE_ID);

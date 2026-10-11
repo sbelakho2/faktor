@@ -102,6 +102,24 @@ pub use faktor_core::command::NetworkIsolationRequirement;
 /// demand either confines the child or (Required) fails closed typed.
 pub use faktor_core::command::FilesystemIsolationRequirement;
 
+/// The typed HOME contract of agent children (audit item 6): a per-session
+/// scratch HOME by default, or the real HOME only through an explicit
+/// operator grant. Re-exported from the command authority.
+pub use faktor_core::command::AgentHomePolicy;
+
+/// The agent-child HOME machinery (audit item 6): the scratch-home layout,
+/// the no-follow creation walk, the operator real-home policy hook and the
+/// credential-overlap pre-spawn gate. Out-of-line so this file stays under
+/// the source-size ceiling.
+#[path = "agent_home.rs"]
+mod agent_home;
+use agent_home::isolation_gate;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use agent_home::override_credential_paths_for_tests;
+#[cfg(target_os = "linux")]
+use agent_home::real_home_credential_paths;
+pub use agent_home::{ensure_agent_scratch_home, AgentHomeSettings, AGENT_HOME_DIR};
+
 /// The daemon names a supervised Chromium child may inherit (values copied
 /// when set): executable resolution plus locale/timezone. Provider keys,
 /// tokens, API secrets, `FAKTOR_SERVER_PASSWORD` and proxy passwords are
@@ -923,10 +941,7 @@ impl ReapState {
     /// Publish the reap under the signal serial: after this returns, no
     /// guarded signal may ever reference the pid again.
     fn publish_reaped(&self, pid: u32) {
-        let _serial = self
-            .serial
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = faktor_core::lock::recover(&self.serial);
         #[cfg(all(test, unix))]
         reap_injection::fire(pid);
         #[cfg(not(all(test, unix)))]
@@ -945,10 +960,7 @@ impl ReapState {
         if pid == 0 {
             return false;
         }
-        let _serial = self
-            .serial
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = faktor_core::lock::recover(&self.serial);
         if self.reaped() {
             return false;
         }
@@ -976,10 +988,7 @@ impl ReapState {
     #[cfg(unix)]
     #[allow(unsafe_code)]
     fn consume_killed_child(&self, pid: u32) {
-        let _serial = self
-            .serial
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = faktor_core::lock::recover(&self.serial);
         if self.reaped() {
             return;
         }
@@ -1557,6 +1566,14 @@ pub struct ProcessSupervisor {
     /// every injected supervisor: daemon-owned supervisors are rooted by
     /// their constructor (the daemon CAS), never by a global temp root.
     _standalone_root: Option<tempfile::TempDir>,
+    /// The agent-child HOME contract (audit item 6): when set (the daemon
+    /// owner installs it at assembly), every `Session`/`Verification`-owned
+    /// spawn gets a per-session SCRATCH HOME under `base` and every HOME
+    /// anchor is rewritten to it — unless the explicit operator grant
+    /// ([`AgentHomePolicy::OperatorRealHome`]) passes the real HOME through.
+    /// `None` (bare library/test supervisors) keeps the historical
+    /// environment byte-identically.
+    agent_home: std::sync::RwLock<Option<AgentHomeSettings>>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -1577,7 +1594,7 @@ impl Drop for ProcessSupervisor {
     /// still-running member even if the terminate call were skipped).
     fn drop(&mut self) {
         let targets: Vec<(u64, u32)> = {
-            let reg = self.registry.lock().unwrap();
+            let reg = faktor_core::lock::recover(&self.registry);
             reg.iter()
                 .filter(|(_, s)| s.exited.is_none())
                 .map(|(id, s)| (*id, s.pid))
@@ -1592,7 +1609,7 @@ impl Drop for ProcessSupervisor {
         // any surviving group member, so descendants of already-exited
         // leaders die with the daemon's supervisor too.
         let rows: Vec<ChildState> = {
-            let mut reg = self.registry.lock().unwrap();
+            let mut reg = faktor_core::lock::recover(&self.registry);
             std::mem::take(&mut *reg).into_values().collect()
         };
         drop(rows);
@@ -1616,6 +1633,15 @@ impl ProcessSupervisor {
         standalone_root: Option<tempfile::TempDir>,
     ) -> Arc<Self> {
         let max_live = max_live.max(1);
+        // A standalone (try_shared) supervisor owns an ephemeral root: root
+        // the agent scratch homes there so even one-shot hosts get the
+        // scratch-HOME default without any wiring. Injected daemon
+        // supervisors stay `None` until their owner installs the real data
+        // dir contract via [`ProcessSupervisor::configure_agent_home`].
+        let agent_home = standalone_root.as_ref().map(|root| AgentHomeSettings {
+            base: root.path().join(AGENT_HOME_DIR),
+            policy: AgentHomePolicy::Scratch,
+        });
         Arc::new(Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
             cas,
@@ -1625,6 +1651,7 @@ impl ProcessSupervisor {
             spawn_serial: Mutex::new(()),
             artifact_filter: std::sync::RwLock::new(None),
             _standalone_root: standalone_root,
+            agent_home: std::sync::RwLock::new(agent_home),
         })
     }
 
@@ -1762,7 +1789,14 @@ impl ProcessSupervisor {
                 // the rule table and its C strings are built here, in the
                 // parent, before the fork.
                 unsafe {
-                    sandbox::apply_workspace_isolation(&mut cmd, roots, &[], false, *required);
+                    sandbox::apply_workspace_isolation(
+                        &mut cmd,
+                        roots,
+                        &[],
+                        false,
+                        *required,
+                        &real_home_credential_paths(),
+                    );
                 }
             }
             FilesystemIsolation::WorkspaceReadOnly {
@@ -1779,6 +1813,7 @@ impl ProcessSupervisor {
                         writable_roots,
                         true,
                         *required,
+                        &real_home_credential_paths(),
                     );
                 }
             }
@@ -1866,10 +1901,7 @@ impl ProcessSupervisor {
     /// holds `spawn_serial`, so admit→spawn→register is atomic and a spawn
     /// race can never overshoot the ceiling.
     fn admit(&self) -> Result<(), Error> {
-        let live = self
-            .registry
-            .lock()
-            .unwrap()
+        let live = faktor_core::lock::recover(&self.registry)
             .values()
             .filter(|s| s.exited.is_none())
             .count();
@@ -1895,7 +1927,7 @@ impl ProcessSupervisor {
         guardian: Option<guardian::GuardianHandle>,
     ) -> u64 {
         let id = self.alloc_id();
-        self.registry.lock().unwrap().insert(
+        faktor_core::lock::recover(&self.registry).insert(
             id,
             ChildState {
                 pid,
@@ -1914,9 +1946,7 @@ impl ProcessSupervisor {
     /// The row's reap/signal serial. `None` once the row was collected by
     /// [`ProcessSupervisor::reap`]: a collected row can never be signalled.
     fn reap_state(&self, id: u64) -> Option<Arc<ReapState>> {
-        self.registry
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.registry)
             .get(&id)
             .map(|state| state.reap.clone())
     }
@@ -2005,7 +2035,7 @@ impl ProcessSupervisor {
     /// is dropped (reap/Drop), the OS failsafe for anything still running.
     #[cfg(windows)]
     fn terminate_containment(&self, id: u64) {
-        let reg = self.registry.lock().unwrap();
+        let reg = faktor_core::lock::recover(&self.registry);
         if let Some(state) = reg.get(&id) {
             state.containment.terminate();
         }
@@ -2013,11 +2043,14 @@ impl ProcessSupervisor {
 
     /// Recent spawns, newest first (bounded; see [`SpawnTimeline`]).
     pub fn recent_spawns(&self) -> Vec<SpawnTimeline> {
-        self.timeline.lock().unwrap().iter().cloned().collect()
+        faktor_core::lock::recover(&self.timeline)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn timeline_spawn(&self, op_id: u64, pid: u32, argv: String, owner: &ProcessOwner) {
-        let mut tl = self.timeline.lock().unwrap();
+        let mut tl = faktor_core::lock::recover(&self.timeline);
         tl.push_front(SpawnTimeline {
             op_id,
             pid,
@@ -2062,7 +2095,7 @@ impl ProcessSupervisor {
 
     async fn run_inner(
         &self,
-        cfg: SpawnConfig,
+        mut cfg: SpawnConfig,
         budgets: Option<TreeBudgets>,
         deadline: Duration,
         token: CancellationToken,
@@ -2071,6 +2104,7 @@ impl ProcessSupervisor {
         // one): deleted on every return path after the child is gone.
         let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         isolation_gate(&cfg)?;
+        self.prepare_agent_home(&mut cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         use tokio::io::AsyncReadExt;
         use tokio::process::Command as TokioCommand;
@@ -2187,7 +2221,7 @@ impl ProcessSupervisor {
                         }, if !stdout_eof => {
                             match r {
                                 Ok(0) => { stdout_eof = true; stdout = None; }
-                                Ok(n) => { shared2.lock().unwrap().push(&out_buf[..n]); }
+                                Ok(n) => { faktor_core::lock::recover(&shared2).push(&out_buf[..n]); }
                                 Err(_) => { stdout_eof = true; stdout = None; }
                             }
                         }
@@ -2199,7 +2233,7 @@ impl ProcessSupervisor {
                         }, if !stderr_eof => {
                             match r {
                                 Ok(0) => { stderr_eof = true; stderr = None; }
-                                Ok(n) => { shared2.lock().unwrap().push(&err_buf[..n]); }
+                                Ok(n) => { faktor_core::lock::recover(&shared2).push(&err_buf[..n]); }
                                 Err(_) => { stderr_eof = true; stderr = None; }
                             }
                         }
@@ -2310,7 +2344,7 @@ impl ProcessSupervisor {
 
         let mut slice_hint = None;
         let (excerpt, artifact, artifact_truncated) = {
-            let mut g = shared.lock().unwrap();
+            let mut g = faktor_core::lock::recover(&shared);
             g.finalize_artifact();
             let mut excerpt = g.ring.excerpt();
             let artifact = g.artifact.clone();
@@ -2354,9 +2388,7 @@ impl ProcessSupervisor {
                 Some(p) => Self::read_bounded_head(Box::new(p), cap, Some(&progress2)),
                 None => (String::new(), false),
             };
-            *progress2
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = res.clone();
+            *faktor_core::lock::recover(&progress2) = res.clone();
             let _ = tx.send(res);
         });
         (rx, progress)
@@ -2364,9 +2396,7 @@ impl ProcessSupervisor {
 
     /// The bounded head published so far by one reader thread.
     fn head_snapshot(slot: &HeadSlot) -> (String, bool) {
-        slot.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        faktor_core::lock::recover(slot).clone()
     }
 
     /// Stream a child pipe into a bounded head: read incrementally, keep at
@@ -2401,7 +2431,7 @@ impl ProcessSupervisor {
                 truncated = true;
             }
             if let Some(slot) = progress {
-                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                *faktor_core::lock::recover(slot) =
                     (String::from_utf8_lossy(&head).into_owned(), truncated);
             }
         }
@@ -2464,7 +2494,7 @@ impl ProcessSupervisor {
 
     fn run_sync_inner(
         &self,
-        cfg: SpawnConfig,
+        mut cfg: SpawnConfig,
         budgets: Option<TreeBudgets>,
         deadline: Duration,
         stdout_cap: usize,
@@ -2474,6 +2504,7 @@ impl ProcessSupervisor {
         // one): deleted on every return path after the child is gone.
         let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         isolation_gate(&cfg)?;
+        self.prepare_agent_home(&mut cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         let effective_deadline = budgets
             .map(|budgets| budget::deadline_with_wall(deadline, &budgets))
@@ -2489,7 +2520,7 @@ impl ProcessSupervisor {
             .stderr(Stdio::piped());
         let started_ms = now_ms();
         let (mut child, pid, id, reap) = {
-            let _serial = self.spawn_serial.lock().unwrap();
+            let _serial = faktor_core::lock::recover(&self.spawn_serial);
             self.admit()?;
             // Windows containment: job BEFORE process, spawn suspended,
             // assign strictly, verify membership, resume LAST. Budgets are
@@ -2609,6 +2640,7 @@ impl ProcessSupervisor {
         // deleted only after the child exits.
         let cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         isolation_gate(&cfg)?;
+        self.prepare_agent_home(&mut cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         cfg.capture = false;
         let mut cmd = contain_on_create(self.command(&cfg));
@@ -2677,7 +2709,7 @@ impl ProcessSupervisor {
                 let _ = std::fs::remove_file(path);
             }
             let code = status.and_then(|s| s.code());
-            let mut reg = registry.lock().unwrap();
+            let mut reg = faktor_core::lock::recover(&registry);
             if let Some(state) = reg.get_mut(&id) {
                 state.exited = Some(code);
             }
@@ -2693,18 +2725,19 @@ impl ProcessSupervisor {
 
     /// Spawn detached with a reaper thread (no zombies); the caller owns the
     /// child and must kill/transfer deliberately.
-    pub fn spawn(&self, cfg: SpawnConfig) -> Result<ChildHandle, Error> {
+    pub fn spawn(&self, mut cfg: SpawnConfig) -> Result<ChildHandle, Error> {
         // The reaper thread owns the materialized cmd script (when lowering
         // produced one): deleted only after the child exits.
         let cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         isolation_gate(&cfg)?;
+        self.prepare_agent_home(&mut cfg)?;
         let bridge = prepare_network_isolation(&cfg)?;
         let mut cmd = contain_on_create(self.command(&cfg));
         install_network_isolation(&mut cmd, bridge.as_ref());
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let started_ms = now_ms();
         let (child, pid, id, reap) = {
-            let _serial = self.spawn_serial.lock().unwrap();
+            let _serial = faktor_core::lock::recover(&self.spawn_serial);
             self.admit()?;
             let containment = prepare_containment()?;
             let child = cmd.spawn().map_err(|e| spawn_failure(&cfg, e))?;
@@ -2759,7 +2792,7 @@ impl ProcessSupervisor {
                 let _ = std::fs::remove_file(path);
             }
             let code = status.and_then(|s| s.code());
-            let mut reg = registry.lock().unwrap();
+            let mut reg = faktor_core::lock::recover(&registry);
             if let Some(state) = reg.get_mut(&id) {
                 state.exited = Some(code);
             }
@@ -2773,10 +2806,7 @@ impl ProcessSupervisor {
     }
 
     pub fn kill(&self, id: u64, grace_ms: u64) -> Result<(), Error> {
-        let pid = self
-            .registry
-            .lock()
-            .unwrap()
+        let pid = faktor_core::lock::recover(&self.registry)
             .get(&id)
             .map(|c| c.pid)
             .ok_or_else(|| Error::not_found(format!("child {id}")))?;
@@ -2796,7 +2826,7 @@ impl ProcessSupervisor {
             return Err(Error::not_found("pid 0"));
         }
         let (live_id, known) = {
-            let reg = self.registry.lock().unwrap();
+            let reg = faktor_core::lock::recover(&self.registry);
             (
                 reg.iter()
                     .find(|(_, s)| s.pid == pid && s.exited.is_none())
@@ -2825,9 +2855,7 @@ impl ProcessSupervisor {
     /// The daemon-death guardian pid of one registered row (tests only).
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn guardian_pid_for_tests(&self, id: u64) -> Option<u32> {
-        self.registry
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.registry)
             .get(&id)
             .and_then(|s| s.guardian.as_ref())
             .map(|g| g.pid())
@@ -2839,10 +2867,7 @@ impl ProcessSupervisor {
     /// was present (tests only).
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn release_guardian_for_tests(&self, id: u64) -> bool {
-        let taken = self
-            .registry
-            .lock()
-            .unwrap()
+        let taken = faktor_core::lock::recover(&self.registry)
             .get_mut(&id)
             .and_then(|s| s.guardian.take());
         let present = taken.is_some();
@@ -2855,7 +2880,7 @@ impl ProcessSupervisor {
         let mut out = Vec::new();
         let mut removed: Vec<ChildState> = Vec::new();
         {
-            let mut reg = self.registry.lock().unwrap();
+            let mut reg = faktor_core::lock::recover(&self.registry);
             let ids: Vec<u64> = reg.keys().copied().collect();
             for id in ids {
                 let state = reg.get(&id).unwrap();
@@ -2881,9 +2906,7 @@ impl ProcessSupervisor {
     }
 
     pub fn alive(&self) -> Vec<ChildHandle> {
-        self.registry
-            .lock()
-            .unwrap()
+        faktor_core::lock::recover(&self.registry)
             .iter()
             .filter(|(_, s)| s.exited.is_none())
             .map(|(id, s)| ChildHandle {
@@ -2897,7 +2920,7 @@ impl ProcessSupervisor {
 
     /// Deliberate ownership transfer (spec §22).
     pub fn transfer(&self, id: u64, new_owner: ProcessOwner) -> Result<(), Error> {
-        let mut reg = self.registry.lock().unwrap();
+        let mut reg = faktor_core::lock::recover(&self.registry);
         let state = reg
             .get_mut(&id)
             .ok_or_else(|| Error::not_found(format!("child {id}")))?;
@@ -2912,7 +2935,7 @@ impl ProcessSupervisor {
         // must never serialize other callers), then mark exactly the
         // snapshotted rows exited.
         let targets: Vec<(u64, u32)> = {
-            let reg = self.registry.lock().unwrap();
+            let reg = faktor_core::lock::recover(&self.registry);
             reg.iter()
                 .filter(|(_, s)| s.owner == owner && s.exited.is_none())
                 .map(|(id, s)| (*id, s.pid))
@@ -2923,7 +2946,7 @@ impl ProcessSupervisor {
             let _ = self.terminate_registered_sync(*id, *pid, 2000);
             killed.push(*id);
         }
-        let mut reg = self.registry.lock().unwrap();
+        let mut reg = faktor_core::lock::recover(&self.registry);
         for (id, _) in &targets {
             if let Some(s) = reg.get_mut(id) {
                 if s.exited.is_none() {
@@ -2935,19 +2958,19 @@ impl ProcessSupervisor {
     }
 
     pub fn registered(&self) -> usize {
-        self.registry.lock().unwrap().len()
+        faktor_core::lock::recover(&self.registry).len()
     }
 
     fn mark_exited(&self, id: u64, code: Option<Option<i32>>) {
-        let mut reg = self.registry.lock().unwrap();
+        let mut reg = faktor_core::lock::recover(&self.registry);
         if let Some(s) = reg.get_mut(&id) {
             s.exited = code;
             let found = {
-                let tl = self.timeline.lock().unwrap();
+                let tl = faktor_core::lock::recover(&self.timeline);
                 tl.iter().any(|t| t.op_id == id)
             };
             if found {
-                let mut tl = self.timeline.lock().unwrap();
+                let mut tl = faktor_core::lock::recover(&self.timeline);
                 if let Some(t) = tl.iter_mut().find(|t| t.op_id == id) {
                     t.exited_ms = Some(now_ms());
                     t.exit_code = code.flatten();
@@ -3053,40 +3076,6 @@ fn install_network_isolation(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (cmd, bridge);
-}
-
-/// Pre-spawn fail-closed gate for OS-confinement requests. On Linux the
-/// real backends exist (pre-exec `unshare(CLONE_NEWNET)` and/or Landlock)
-/// and are ALWAYS attempted — capability heuristics never pre-judge them,
-/// only the actual syscalls prove or refuse; a failure refuses the spawn
-/// typed via [`spawn_failure`]. Every other platform has no filesystem
-/// backend at all, so a `Required` workspace demand is refused BEFORE
-/// spawn, typed, and no process is forked; `BestEffort` falls back to the
-/// honest application-policy-only execution (the projection never claimed
-/// otherwise).
-#[cfg(target_os = "linux")]
-fn isolation_gate(_cfg: &SpawnConfig) -> Result<(), Error> {
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn isolation_gate(cfg: &SpawnConfig) -> Result<(), Error> {
-    if cfg.network_isolation == NetworkIsolation::DenyAll {
-        return Err(Error::permission(format!(
-            "{DENY_ALL_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform provides no \
-             per-process network-isolation backend; never running the child unenforced",
-            cfg.cmd
-        )));
-    }
-    if cfg.filesystem_isolation.is_required() {
-        return Err(Error::permission(format!(
-            "{FILESYSTEM_REFUSAL_PREFIX} of `{}` BEFORE spawn: this platform provides no \
-             per-process filesystem-confinement backend; never running the child while the \
-             workspace guarantee claims enforcement",
-            cfg.cmd
-        )));
-    }
-    Ok(())
 }
 
 /// Map one spawn() io error. Under a Required confinement request
@@ -3210,7 +3199,14 @@ pub fn workspace_spawn_confinement(
                     // `cmd` (post-fork, pre-exec); the rule table and its C
                     // strings are built here, in the parent, before the fork.
                     unsafe {
-                        sandbox::apply_workspace_isolation(cmd, &roots, &[], false, required);
+                        sandbox::apply_workspace_isolation(
+                            cmd,
+                            &roots,
+                            &[],
+                            false,
+                            required,
+                            &real_home_credential_paths(),
+                        );
                     }
                 }))
             }
@@ -3233,6 +3229,7 @@ pub fn workspace_spawn_confinement(
                             &writable_roots,
                             true,
                             required,
+                            &real_home_credential_paths(),
                         );
                     }
                 }))
@@ -3980,6 +3977,7 @@ mod containment_policy_tests {
 #[cfg(test)]
 #[path = "budget_hostile.rs"]
 mod budget_hostile;
+
 #[cfg(all(test, target_os = "linux"))]
 #[path = "filesystem_hostile.rs"]
 mod filesystem_hostile;

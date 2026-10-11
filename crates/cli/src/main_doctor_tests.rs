@@ -96,9 +96,10 @@ fn doctor_reports_network_isolation_strength_honestly() {
 fn doctor_prints_both_shell_trust_classes_separately_and_honestly() {
     // No --config: two DISTINCT class lines (agent secure, terminals
     // user-granted), never merged into one implied contract.
+    let empty = tempfile::tempdir().unwrap();
     let mut lines = Vec::new();
     let mut issues = 0usize;
-    doctor_sandbox_shell_line(None, &mut lines, &mut issues);
+    doctor_sandbox_shell_line(None, empty.path(), &mut lines, &mut issues);
     assert_eq!(issues, 0);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(
@@ -129,7 +130,7 @@ fn doctor_prints_both_shell_trust_classes_separately_and_honestly() {
     .unwrap();
     let mut lines = Vec::new();
     let mut issues = 0usize;
-    doctor_sandbox_shell_line(Some(&os_config), &mut lines, &mut issues);
+    doctor_sandbox_shell_line(Some(&os_config), empty.path(), &mut lines, &mut issues);
     assert_eq!(issues, 0, "{lines:?}");
     assert_eq!(lines.len(), 2, "{lines:?}");
     for line in &lines {
@@ -150,7 +151,7 @@ fn doctor_prints_both_shell_trust_classes_separately_and_honestly() {
         .unwrap();
     let mut lines = Vec::new();
     let mut issues = 0usize;
-    doctor_sandbox_shell_line(Some(&grant_config), &mut lines, &mut issues);
+    doctor_sandbox_shell_line(Some(&grant_config), empty.path(), &mut lines, &mut issues);
     assert_eq!(issues, 0, "{lines:?}");
     assert_eq!(lines.len(), 2, "{lines:?}");
     for line in &lines {
@@ -1653,4 +1654,188 @@ fn doctor_certifies_the_native_contract_compiler_deterministically() {
     doctor_contract_compiler_line(&mut again, &mut again_issues);
     assert_eq!(again_issues, 0);
     assert_eq!(lines, again);
+}
+
+/// Marketplace audit item 8: the doctor reports one informational
+/// live-canary line per marketplace source (`configured` when every opt-in
+/// canary environment variable is present, else `absent`) and absence is
+/// never an issue.
+#[test]
+fn doctor_reports_live_canary_status_per_source_without_failing() {
+    let mut lines: Vec<String> = Vec::new();
+    doctor_live_canary_line(&mut lines);
+    for source in ["mouser", "digikey", "lcsc", "1688", "alibaba"] {
+        let prefix = format!("live-canary {source}: ");
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing live-canary line for {source}: {lines:?}"));
+        let status = line.strip_prefix(&prefix).expect("prefix");
+        assert!(
+            status == "configured" || status == "absent",
+            "unexpected live-canary status: {line}"
+        );
+    }
+    // The full doctor path prints the same section and stays green on a
+    // healthy store with default (absent) canary configuration.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        session
+            .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+            .unwrap();
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l == "live-canary mouser: configured" || l == "live-canary mouser: absent"),
+        "{:?}",
+        report.lines
+    );
+}
+
+/// Audit items 6 + 17: doctor reports the agent-HOME contract and the
+/// typed first-run choice honestly — the scratch default with the
+/// kernel-denial state of this platform, and (on backend-less platforms)
+/// the pending choice with BOTH options and the exact trade-off; an
+/// unreadable decision document is an ISSUE while the state stays
+/// fail-closed; a recorded grant is surfaced as strictly weaker.
+#[test]
+fn doctor_reports_agent_home_and_first_run_choice_honestly() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let session =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        session
+            .create_session(session.create_workspace("/w").unwrap(), "t", "p", "m")
+            .unwrap();
+    }
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let home_line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("sandbox agent home:"))
+        .expect("agent home line");
+    assert!(
+        home_line.contains("policy=scratch") && home_line.contains("scratch_root="),
+        "{home_line}"
+    );
+    let creds = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("sandbox credential dirs:"))
+        .expect("credential dirs line");
+    if faktor_sandbox::filesystem_backend_available() {
+        assert!(creds.contains("kernel-denied"), "{creds}");
+        assert!(creds.contains("~/.ssh"), "{creds}");
+    } else {
+        assert!(
+            creds.contains("honest limitation") && creds.contains(std::env::consts::OS),
+            "a missing backend must be an honest limitation, never a claim: {creds}"
+        );
+        assert!(creds.contains("scratch HOME"), "{creds}");
+    }
+    let choice = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("sandbox first-run choice:"))
+        .expect("first-run choice line");
+    assert!(choice.contains("platform="), "{choice}");
+    assert!(choice.contains("network_backend="), "{choice}");
+    if faktor_terminal::broker_only_supported() {
+        assert!(choice.contains("decision=fail_closed"), "{choice}");
+    } else {
+        assert!(choice.contains("decision=pending"), "{choice}");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("--network-capable-shell")
+                    && l.contains(config::NETWORK_CAPABLE_SHELL_TRADE_OFF)),
+            "the pending presentation names both options and the trade-off: {:?}",
+            report.lines
+        );
+    }
+
+    // A recorded grant: doctor reports it and the agent class contract as
+    // the app-level network-capable mode.
+    config::record_decision(
+        dir.path(),
+        config::SandboxShellChoice::NetworkCapableUserGranted,
+        7,
+    )
+    .unwrap();
+    let report = doctor_run(dir.path(), false);
+    assert_eq!(report.issues, 0, "{:?}", report.lines);
+    let choice = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("sandbox first-run choice:"))
+        .expect("choice line");
+    assert!(
+        choice.contains("decision=network_capable_user_granted"),
+        "{choice}"
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains("best_effort") && l.contains("agent shell tool")),
+        "the granted agent class must show the app-level guarantee: {:?}",
+        report.lines
+    );
+
+    // A corrupt decision document: ISSUE, and never a grant.
+    std::fs::write(config::decision_path(dir.path()), b"{corrupt").unwrap();
+    let report = doctor_run(dir.path(), false);
+    assert!(report.issues >= 1, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains("decision unreadable")),
+        "{:?}",
+        report.lines
+    );
+}
+
+/// The explicit operator real-home grant is surfaced as a grant on the
+/// doctor home line, and the default is never presented as such.
+#[test]
+fn doctor_surfaces_the_explicit_real_home_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("home-grant.json");
+    std::fs::write(
+        &cfg,
+        r#"{"model": "m", "sandbox": {"home": "operator_real_home"}}"#,
+    )
+    .unwrap();
+    let mut lines = Vec::new();
+    let mut issues = 0usize;
+    doctor_sandbox_agent_home_line(dir.path(), Some(&cfg), &mut lines, &mut issues);
+    assert_eq!(issues, 0);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("policy=operator_real_home")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("EXPLICIT operator grant")),
+        "{lines:?}"
+    );
+    // Default: scratch, no grant line.
+    let mut lines = Vec::new();
+    let mut issues = 0usize;
+    doctor_sandbox_agent_home_line(dir.path(), None, &mut lines, &mut issues);
+    assert!(lines[0].contains("policy=scratch"), "{lines:?}");
+    assert!(
+        !lines.iter().any(|l| l.contains("EXPLICIT operator grant")),
+        "{lines:?}"
+    );
 }

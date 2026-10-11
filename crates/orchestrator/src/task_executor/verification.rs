@@ -31,6 +31,7 @@ pub struct TournamentStartRequest {
     /// one (the wire never carries a path).
     pub isolated_root: PathBuf,
     /// Deterministic crash seam (adversarial tests only).
+    #[cfg(any(test, feature = "fault-injection"))]
     pub crash_seam: Option<CrashSeam>,
 }
 
@@ -48,6 +49,7 @@ impl Default for TournamentStartRequest {
             parent_caps: child_caps(WorkKind::Implementation),
             ceilings: crate::runtime::Ceilings::default(),
             isolated_root: PathBuf::new(),
+            #[cfg(any(test, feature = "fault-injection"))]
             crash_seam: None,
         }
     }

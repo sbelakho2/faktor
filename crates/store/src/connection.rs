@@ -233,6 +233,10 @@ impl Drop for ReadConn {
 
 /// One-shot fault-injection target of [`CrashSeam`]: crash at the
 /// `ordinal`-th crossing (0-based) of durability boundary `point`.
+///
+/// Compiled only for the crate's own tests or with the `fault-injection`
+/// feature (fault campaigns); the production profile has no arming API.
+#[cfg(any(test, feature = "fault-injection"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrashArm {
@@ -240,6 +244,7 @@ pub struct CrashArm {
     pub ordinal: u64,
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 #[derive(Default)]
 pub(crate) struct SeamState {
     pub(crate) armed: Option<CrashArm>,
@@ -252,11 +257,22 @@ pub(crate) struct SeamState {
 /// behavior or format changes. The fault campaigns arm exactly one
 /// boundary per interrupted run, panic the store mid-operation, drop the
 /// instance (the "process death") and reopen from disk.
+#[cfg(any(test, feature = "fault-injection"))]
 #[doc(hidden)]
 pub struct CrashSeam {
     pub(crate) state: Mutex<SeamState>,
 }
 
+/// Production profile: the seam payload is compiled out; the no-op keeps
+/// the surrounding plumbing (a `Store` field, `trip` call sites) uniform at
+/// zero runtime cost.
+#[cfg(not(any(test, feature = "fault-injection")))]
+#[derive(Debug, Default)]
+pub(crate) struct CrashSeam {
+    _compiled_out: (),
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
 impl std::fmt::Debug for CrashSeam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Ephemeral seam bookkeeping: a panic in one holder must not disable
@@ -266,6 +282,7 @@ impl std::fmt::Debug for CrashSeam {
     }
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 impl Default for CrashSeam {
     fn default() -> Self {
         Self {
@@ -274,6 +291,7 @@ impl Default for CrashSeam {
     }
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 impl CrashSeam {
     /// Arm ONE crossing, replacing any previous arm and resetting the
     /// crossing counter. The panic fires exactly once when `point` is
@@ -306,6 +324,12 @@ impl CrashSeam {
             arm.ordinal
         );
     }
+}
+
+#[cfg(not(any(test, feature = "fault-injection")))]
+impl CrashSeam {
+    #[inline(always)]
+    pub(crate) fn trip(&self, _point: &'static str) {}
 }
 
 /// One active maintenance task: its cancellation token plus the SQLite
@@ -1757,7 +1781,7 @@ impl Store {
 
         let mut conn = Connection::open(&db_path)?;
         configure(&conn)?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, Some(db_path.as_path()))?;
 
         if integrity_check {
             let issues = check_integrity(&conn)?;
@@ -1786,7 +1810,7 @@ impl Store {
 
         let mut conn = Connection::open(&db_path)?;
         configure(&conn)?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, Some(db_path.as_path()))?;
         // WAL recovery: opening + configuring recovered any frames a crashed
         // predecessor left in the -wal; the checkpoint folds them into the
         // main file so the quick check below validates the post-recovery
@@ -1817,7 +1841,7 @@ impl Store {
 
         let mut conn = Connection::open(&db_path)?;
         configure(&conn)?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, Some(db_path.as_path()))?;
         if integrity_check {
             let issues = check_integrity(&conn)?;
             if !issues.is_empty() {
@@ -1900,6 +1924,7 @@ impl Store {
 
     /// Arm this store instance's deterministic crash seam (fault
     /// certification only; see [`CrashSeam`]). Inert when never armed.
+    #[cfg(any(test, feature = "fault-injection"))]
     #[doc(hidden)]
     pub fn crash_arm(&self, arm: CrashArm) {
         self.seam.arm(arm);
@@ -1913,6 +1938,7 @@ impl Store {
     /// as the typed `StoreError::WriterUnavailable`. Seam-atomicity tests
     /// assert this BEFORE reopening the store, so a boundary that never fired
     /// can never be mistaken for a clean old/new world.
+    #[cfg(any(test, feature = "fault-injection"))]
     #[doc(hidden)]
     pub fn seam_crash_observed<T>(&self, caught: &std::thread::Result<T>) -> bool {
         caught.is_err() || !self.writer_available()

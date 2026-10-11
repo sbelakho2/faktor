@@ -2972,7 +2972,7 @@ async function daemonTests() {
     }
   });
 
-  await test('daemon refuses to start without a binary', async () => {
+  await test('daemon refuses to start without a binary (actionable, machine-scoped escapes only)', async () => {
     const saved = process.env.FAKTOR_BIN;
     delete process.env.FAKTOR_BIN;
     try {
@@ -2984,13 +2984,119 @@ async function daemonTests() {
             // never accidentally resolve through a real local install.
             installRoot: '/nonexistent-install-root-for-selftest',
           }),
-        (error) => error instanceof Error && /binary not found/.test(error.message),
-        'missing binary',
+        (error) =>
+          error instanceof Error &&
+          /binary not found/.test(error.message) &&
+          /faktor\.binaryPath/.test(error.message) &&
+          /Locate daemon/.test(error.message) &&
+          /target\//.test(error.message) &&
+          /never resolved or executed/.test(error.message),
+        'missing binary refusal names Locate daemon, the machine-scoped setting and the target/ invariant',
       );
     } finally {
       if (saved !== undefined) {
         process.env.FAKTOR_BIN = saved;
       }
+    }
+  });
+
+  await test('a workspace target/ build is never resolved or executed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-target-refusal-'));
+    const saved = process.env.FAKTOR_BIN;
+    delete process.env.FAKTOR_BIN;
+    try {
+      const targetBin = join(root, 'target', 'debug', 'faktor-cli');
+      const marker = join(root, 'executed.txt');
+      mkdirSync(join(root, 'target', 'debug'), { recursive: true });
+      writeExecutable(targetBin, `#!/bin/sh\necho ran > '${marker}'\n`);
+      let failure = null;
+      try {
+        dm.resolveDaemon({ workspaceRoot: root, installRoot: join(root, 'no-install') });
+      } catch (error) {
+        failure = error;
+      }
+      assert(failure !== null, 'a repository target/ build must never resolve as the daemon');
+      assert(failure instanceof Error && /binary not found/.test(failure.message), failure && failure.message);
+      assert(!existsSync(marker), 'the workspace-supplied binary must never be executed');
+      // The legacy helper has the same behaviour: workspaceRoot is
+      // informational only.
+      let legacyFailure = null;
+      try {
+        dm.findBinary({ workspaceRoot: root });
+      } catch (error) {
+        legacyFailure = error;
+      }
+      assert(legacyFailure !== null, 'findBinary must refuse the workspace target/ lookup too');
+      assert(!existsSync(marker), 'still never executed');
+    } finally {
+      if (saved !== undefined) {
+        process.env.FAKTOR_BIN = saved;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('workspace-scoped daemon settings are ignored and refused with a typed message', () => {
+    const ignored = dm.machineScopedSetting(
+      'faktor.binaryPath',
+      { workspaceValue: '/hostile/repo/faktor-cli' },
+      '',
+    );
+    assertEqual(ignored.value, '', 'the workspace value is never returned');
+    assert(ignored.refusal !== null, 'a workspace value must be refused typed');
+    assertEqual(ignored.refusal.code, 'workspace_scoped_setting_refused');
+    assert(
+      ignored.refusal.message.includes('faktor.binaryPath') &&
+        ignored.refusal.message.includes('workspace'),
+      ignored.refusal.message,
+    );
+    const both = dm.machineScopedSetting(
+      'faktor.installRoot',
+      {
+        globalValue: '/home/operator/.faktor/install',
+        workspaceValue: '/hostile/repo',
+        workspaceFolderValue: '/hostile/repo/sub',
+      },
+      '',
+    );
+    assertEqual(both.value, '/home/operator/.faktor/install', 'the machine/user value wins');
+    assert(both.refusal !== null, 'the present workspace value is still surfaced typed');
+    const clean = dm.machineScopedSetting('faktor.extraArgs', { globalValue: ['--x'] }, []);
+    assertDeepEqual(clean.value, ['--x']);
+    assertEqual(clean.refusal, null, 'a machine-scoped value alone is never refused');
+  });
+
+  await test('resolved-binary trust: checksum records verify, mismatches refuse, absence warns', () => {
+    const root = mkdtempSync(join(tmpdir(), 'faktor-trust-'));
+    try {
+      const bin = join(root, 'faktor-cli');
+      writeExecutable(bin, '#!/bin/sh\nexit 0\n');
+      const unverified = dm.binaryTrust({ executable: bin, source: 'binaryPath-setting' });
+      assertEqual(unverified.state, 'unverified', 'a missing checksum record is a warn+confirm state');
+      assert(unverified.detail.includes('.sha256'), unverified.detail);
+      const digest = createHash('sha256').update(readFileSync(bin)).digest('hex');
+      writeFileSync(`${bin}.sha256`, `${digest}  faktor-cli\n`);
+      const verified = dm.binaryTrust({ executable: bin, source: 'environment' });
+      assertEqual(verified.state, 'verified', 'a matching checksum record verifies the binary');
+      writeFileSync(`${bin}.sha256`, `${'0'.repeat(64)}  faktor-cli\n`);
+      const mismatch = dm.binaryTrust({ executable: bin, source: 'binaryPath-setting' });
+      assertEqual(mismatch.state, 'refused', 'a checksum mismatch must refuse the start');
+      assert(mismatch.detail.includes('checksum mismatch'), mismatch.detail);
+      writeFileSync(`${bin}.sha256`, 'not-a-digest\n');
+      assertEqual(
+        dm.binaryTrust({ executable: bin, source: 'binaryPath-setting' }).state,
+        'refused',
+        'a malformed checksum record must refuse the start',
+      );
+      const missing = dm.binaryTrust({
+        executable: join(root, 'does-not-exist'),
+        source: 'binaryPath-setting',
+      });
+      assertEqual(missing.state, 'refused', 'a nonexistent resolved path must refuse the start');
+      const layout = dm.binaryTrust({ executable: join(root, 'launcher'), source: 'install-layout' });
+      assertEqual(layout.state, 'verified', 'the install layout delegates to the signed bootstrap launcher');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -8009,7 +8115,6 @@ async function composerAttachmentTests() {
       'faktor.installRoot': 'string',
       'faktor.extraArgs': 'array',
       'faktor.startupTimeoutMs': 'number',
-      'faktor.autoStart': 'boolean',
       'faktor.defaultProvider': 'string',
       'faktor.defaultModel': 'string',
       'faktor.mutationMode': 'string',
@@ -8051,6 +8156,34 @@ async function composerAttachmentTests() {
       typeof props['faktor.controlToken'].deprecationMessage === 'string',
       true,
       'the legacy plaintext token must stay marked deprecated',
+    );
+    // Daemon-affecting settings are machine-scoped: no workspace-scoped
+    // value can ever select or parameterize the daemon.
+    for (const id of [
+      'faktor.binaryPath',
+      'faktor.dataDir',
+      'faktor.installRoot',
+      'faktor.extraArgs',
+      'faktor.startupTimeoutMs',
+      'faktor.controlPlaneEndpoint',
+      'faktor.controlPlaneOrganization',
+      'faktor.controlPlaneAuthSession',
+    ]) {
+      assertEqual(props[id].scope, 'machine', `${id} must be machine-scoped`);
+    }
+    assertEqual(
+      props['faktor.controlPlaneEndpoint'].default,
+      '',
+      'there is no default control-plane endpoint: empty by default, explicit configuration required',
+    );
+    assert(
+      /machine/i.test(props['faktor.binaryPath'].description) &&
+        props['faktor.binaryPath'].description.includes('target/'),
+      'the binaryPath description must state machine scoping and the target/ invariant',
+    );
+    assert(
+      !Object.values(props).some((entry) => /target\/debug\|release/.test(entry.description ?? '')),
+      'no setting may still document a workspace target/ lookup',
     );
   });
 
@@ -9879,6 +10012,22 @@ async function packagedLayoutTests(dir) {
     ]) {
       assert(existsSync(join(dir, ...rel.split('/'))), `packaged extension is missing ${rel}`);
     }
+    // The manifest's `license` field points at LICENSE.txt and the VSIX must
+    // carry it (plus the third-party notices) — a file the archive does not
+    // contain is the exact defect this row exists to catch.
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    const licenseMatch = /^SEE LICENSE IN (.*)$/.exec(manifest.license || '');
+    assert(licenseMatch !== null, 'package.json must name the packaged license file');
+    const licenseTarget = licenseMatch[1];
+    for (const rel of [licenseTarget, 'NOTICE']) {
+      const path = join(dir, rel);
+      assert(existsSync(path), `packaged extension is missing ${rel}`);
+      assert(readFileSync(path, 'utf8').trim().length > 0, `packaged ${rel} must not be empty`);
+    }
+    assert(
+      readFileSync(join(dir, licenseTarget), 'utf8').includes('Apache License'),
+      'packaged LICENSE.txt is the Apache-2.0 text the manifest references',
+    );
     // The Faktor-owned panel ships exactly the hand-written media files: an
     // allowlist makes ANY extra file (a vendored closure included) a failure.
     const media = readdirSync(join(dir, 'media')).sort();

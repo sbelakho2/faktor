@@ -38,6 +38,7 @@ impl TaskExecutor {
             handle
                 .ledger_integration_txn_set(txn)
                 .map_err(|e| ExecError::Internal(format!("integration txn write: {e}")))?;
+            #[cfg(any(test, feature = "fault-injection"))]
             self.check_settlement_seam(CrashSeam::DuringRollback)?;
         }
         txn.phase = faktor_session::ledger::IntegrationTxnPhase::RolledBack;
@@ -1219,6 +1220,7 @@ impl TaskExecutor {
             parent_caps: req.parent_caps,
             ceilings: req.ceilings,
             isolated_root: req.isolated_root,
+            #[cfg(any(test, feature = "fault-injection"))]
             crash_seam: req.crash_seam,
             ..Default::default()
         };

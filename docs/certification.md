@@ -736,7 +736,8 @@ step (after `certificate`) publishes a signed
 block: `{source_sha, tree_sha, workflow, event, pipeline_id,
 pipeline_number, build_environment_digest (the CI image digest),
 rust_toolchain, repository_tree_verified, artifacts{name: sha256}}`, signed
-with an ed25519 key from the trusted project's allowlist. Signing is
+with the **build role** ed25519 key (`faktor-ci-build`, role
+`build-attestation`) from the trusted project's allowlist. Signing is
 **fail-closed**: `node scripts/certification/attestation.mjs create` refuses
 to write anything when the signing key (the `faktor_attest_signing_key`
 secret, surfaced as `FAKTOR_ATTEST_SIGN_KEY_PEM`) is absent or unreadable —
@@ -748,9 +749,11 @@ Sigstore/keyless verification of the same payload against the pipeline's
 OIDC identity: the workflow attests through `cosign attest` (keyless) and
 the operator verifies the bundle against that identity. `scripts/certify.sh`
 fetches the block belonging to the exact trusted pipeline, verifies the
-signature **with the allowlisted key** (the embedded `public_key` must equal
-the `keys.json` entry for `signature.identity`; a substituted keypair under
-an allowlisted identity is refused), verifies repository full name
+signature **with the allowlisted key and the build role** (the embedded
+`public_key` must equal the `keys.json` entry for `signature.identity`; a
+substituted keypair under an allowlisted identity is refused, and a
+signature bound to any other role is refused typed with
+`signature-role-mismatch`), verifies repository full name
 (`--repo`), source SHA, tree, workflow, event, pipeline number and the
 OBSERVED API pipeline id — that id comparison is unconditional, so copying
 the pipeline number into the id field does not exempt it — and re-hashes
@@ -781,6 +784,31 @@ CI-built artifacts covered by the attestation, rather than locally rebuilt
 ones, is the preferred release model: the attestation is the binding
 between the certified run and the shipped bytes.
 
+**Role split: build attestation vs release signing.** The allowlist
+(`scripts/certification/attestation-keys.json`) binds every identity to
+exactly ONE role, and verifiers require the role for the artifact class:
+`faktor-ci-build` / `build-attestation` signs `faktor-build-attestation/v1`
+objects (the `attestation` step, `faktor_attest_signing_key` secret);
+`faktor-release-signing` / `release-signing` signs
+`faktor-release-signature/v1` objects (the `release-signature` step, the
+SEPARATE `faktor_release_signing_key` secret). The release signature binds
+the exact build-attestation canonical payload (digest plus
+repository/source/tree/workflow/event/pipeline fields) and the release
+artifact digests. A build attestation signed by the release key, or a
+release signature signed by the build key, is refused typed
+(`signature-role-mismatch`); an allowlist entry with no provisioned public
+key is refused typed (`signature-role-key-missing`). A RELEASE CERTIFICATE
+therefore requires BOTH a verified build-role attestation AND a verified
+release-role signature (`release_preconditions.release_signing_role_verified`);
+without the release key the trusted pipeline's `release-signature` step
+exits 3 with the typed `signing-key-missing` refusal, no release signature
+is emitted, and certification refuses the release class (source class only).
+The operator runbook — key generation, secret registration commands,
+fail-closed behavior, and rotation/revocation — is
+`scripts/woodpecker/setup.md` §4.1–§4.3. The release key is never reused
+for build attestations and vice versa; key generation never puts a private
+key in the repository.
+
 Pass and fail both write `target/certification/release-manifest.json`
 (`faktor-release-certification/v2`, written for pass and fail alike):
 repository identity/id, exact commit and tree (`git rev-parse
@@ -791,7 +819,9 @@ every packaged artifact (`--artifact PATH`, or auto-discovered
 `.vsix`/plugin-zip/`target/release/faktor-cli`) with an `artifact_digest`,
 the attestation evidence block (status, origin context, pipeline, step pid,
 signature identity, fetched-bytes digest, matched/attested artifact counts),
-`release_certificate`, and an `evidence_digest` = sha256 of the canonical
+the release-signature evidence block (status, origin context, pipeline, step
+pid, signature identity, role `release-signing`, fetched-bytes digest,
+signed artifact count), `release_certificate`, and an `evidence_digest` = sha256 of the canonical
 JSON of the verification core (context, observed facts, commit, tree, run,
 statuses, artifacts, attestation). Rejection codes are recorded in
 `problems[]`, non-fatal observations in `notes[]`.
@@ -869,7 +899,10 @@ context (operator error), the observed-fact rejection matrix
 (repository/config-file/trusted-class/event/pipeline-id), trusted-context
 attestation success plus failures for tampered, foreign-signature,
 allowlisted-identity-with-foreign-key, other-repository, unconditional-
-pipeline-id, unsigned and absent attestations, pr-context upgrade by a
+pipeline-id, unsigned and absent attestations, the release-signature role
+split (verified release-signing role signature, build-key-signed release
+signature refused typed `signature-role-mismatch`, absent `release-signature`
+step => source class only, release_preconditions binding), pr-context upgrade by a
 trusted attestation plus trusted-project identity/config/class re-fetch
 spoofs, the CI certification manifest matrix (absent/matching/schema/
 workflow/status/commit/tree/malformed/duplicate-keys), the CI status
@@ -916,7 +949,11 @@ in **realtime** mode (the registry records the exact `bash scripts/soak.sh
 --release -- --ignored --skip soak_12h_scale` command that the step runs; the
 trusted push gate runs the same driver as the 30–60 min churn), and
 `longrun` is the release lane;
-the key-gated `coding-benchmark-real-model` step is the live-paid lane. The
+the key-gated `coding-benchmark-real-model` step is the live-paid lane (it
+also runs `cargo test -p faktor-commerce-connectors --test live_canary --
+--ignored`; each marketplace canary skips unless its own `FAKTOR_LIVE_*`
+credentials are present, so the step stays inert by default — legal posture
+in `docs/legal/marketplace-acquisition.md`). The
 real-time soak test `soak_convergence_churn` is assigned to the `soak` lane
 and runs for a real 24 h there; the standalone accelerated `soak_12h_scale`,
 the `soak_24h_zero_drift_certification` ledger variant and the 10 GiB

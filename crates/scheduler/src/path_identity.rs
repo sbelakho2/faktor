@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use unicode_normalization::UnicodeNormalization;
+
 use crate::{OwnershipSet, WORKSPACE_ROOT_SENTINEL};
 
 /// Normalize one workspace-relative spelling WITHOUT touching the
@@ -30,34 +32,19 @@ pub(crate) fn lexical_relative(rel: &str) -> Option<PathBuf> {
 /// volume uses: Unicode lowercase, full canonical decomposition (NFD), then
 /// removal of every canonically-combining mark (combining class != 0).
 ///
-/// This is the standard casefold -> NFD -> strip-marks identity. It is
-/// normalization-pair complete and idempotent (both property-tested against
-/// the generated Unicode corpus), unlike a hand-maintained approximation, so
-/// `fold(x) == fold(y)` whenever a normalizing filesystem resolves x and y to
-/// the same name.
+/// This is the standard casefold -> NFD -> strip-marks identity, backed by
+/// the maintained `unicode-normalization` crate (Unicode 16 canonical data,
+/// including algorithmic Hangul decomposition) instead of a hand-committed
+/// table copy. It is normalization-pair complete and idempotent (both
+/// property-tested against the generated Unicode corpus), unlike a
+/// hand-maintained approximation, so `fold(x) == fold(y)` whenever a
+/// normalizing filesystem resolves x and y to the same name.
 pub(crate) fn fold_volume_identity(input: &str) -> String {
-    let mut decomposed = String::with_capacity(input.len());
-    for c in input.to_lowercase().chars() {
-        push_decomposed(c, &mut decomposed);
-    }
-    decomposed
-        .chars()
-        .filter(|c| crate::unicode_data::combining_class(*c as u32) == 0)
+    input
+        .to_lowercase()
+        .nfd()
+        .filter(|c| unicode_normalization::char::canonical_combining_class(*c) == 0)
         .collect()
-}
-
-/// Recursively expand one character's canonical decomposition into `out`.
-fn push_decomposed(c: char, out: &mut String) {
-    match crate::unicode_data::canonical_decomposition(c as u32) {
-        Some(sequence) => {
-            for code in sequence {
-                if let Some(inner) = char::from_u32(*code) {
-                    push_decomposed(inner, out);
-                }
-            }
-        }
-        None => out.push(c),
-    }
 }
 
 impl OwnershipSet {

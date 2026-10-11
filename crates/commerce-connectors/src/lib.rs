@@ -62,16 +62,28 @@
 //!
 //! # Adversarial testing
 //!
-//! Every test in this crate is fixture-based and offline: sanitized JSON per
-//! endpoint under `fixtures/`, replayed through [`testing::FixtureTransport`].
-//! Hostile fixtures (huge arrays, deep nesting, wrong types, unicode,
-//! truncated bodies, oversized bodies) must produce typed
-//! [`SourceError`]s — never a panic and never a misparsed price.
+//! Every CI test in this crate is fixture-based and offline: sanitized JSON
+//! per endpoint under `fixtures/`, replayed through
+//! [`testing::FixtureTransport`]. Hostile fixtures (huge arrays, deep
+//! nesting, wrong types, unicode, truncated bodies, oversized bodies) must
+//! produce typed [`SourceError`]s — never a panic and never a misparsed
+//! price.
+//!
+//! The one exception is the opt-in live canary suite
+//! (`tests/live_canary.rs`): `#[ignore]`-gated, assigned to the key-gated
+//! `live-paid` lane, and inert unless the operator provides that source's
+//! credentials. Each canary validates the live vendor response structurally
+//! (never against golden constants) and records a scrubbed evidence digest;
+//! [`canary`] is the shared registry and the same vocabulary the daemon's
+//! doctor reports. See `docs/legal/marketplace-acquisition.md` for the
+//! legal/compliance posture (ToS, robots, rate limits, stored sessions,
+//! human verification, per-source disable).
 
 mod aop;
 
 pub mod alibaba;
 pub mod browser;
+pub mod canary;
 pub mod china1688;
 pub mod config;
 pub mod context;

@@ -52,6 +52,10 @@ tempfile.workspace = true
 [dev-dependencies]
 faktor-session = { path = "../session", features = ["test-utils"] }
 faktor-provider = { workspace = true, features = ["test-utils"] }
+# Router tests drive the deterministic crash seams: the orchestrator's
+# execution seam vocabulary and the store's crash-arm boundaries.
+faktor-orchestrator = { workspace = true, features = ["fault-injection"] }
+faktor-store = { workspace = true, features = ["fault-injection"] }
 # Lifecycle-hook registries for the session-start wiring tests.
 faktor-hooks.workspace = true
 # The updater route tests sign manifests with a real ed25519 key and

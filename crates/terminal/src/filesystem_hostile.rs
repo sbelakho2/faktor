@@ -774,3 +774,109 @@ fn filesystem_isolation_mapping_and_tags_are_exact() {
         "the tag is the DEMAND; the spawn layer owns the typed refusal"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit item 6: the confinement policy never grants a home credential store.
+// ---------------------------------------------------------------------------
+
+/// RAII override of the real-home credential paths for one test; clears the
+/// process-global override on drop (even on assertion failure).
+struct CredentialOverride;
+
+impl CredentialOverride {
+    fn set(home: &Path) -> Self {
+        crate::override_credential_paths_for_tests(Some(
+            faktor_core::command::credential_paths_for_home(home),
+        ));
+        Self
+    }
+}
+
+impl Drop for CredentialOverride {
+    fn drop(&mut self) {
+        crate::override_credential_paths_for_tests(None);
+    }
+}
+
+/// A REQUIRED confinement whose workspace root covers a credential store
+/// (`~/.ssh` under a home-rooted workspace) must refuse the spawn typed
+/// BEFORE exec: the kernel can only grant whole subtrees, so the spawn can
+/// never be run while silently granting home credentials.
+#[test]
+fn required_root_covering_a_credential_store_refuses_before_exec() {
+    let _serial = serial();
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh").join("id_ed25519"), b"private-key").unwrap();
+    let _credentials = CredentialOverride::set(&home);
+    let marker = home.join("marker");
+    let (_d, sup) = supervisor();
+    let mut cfg = confined(
+        "/bin/sh",
+        vec!["-c".into(), format!("touch {}", marker.display())],
+        &home,
+        vec![home.clone()],
+        true,
+    );
+    cfg.env = EnvSpec::Minimal;
+    let err = sup
+        .run_sync(cfg, Duration::from_secs(10), 64 * 1024, 64 * 1024)
+        .expect_err("a required root covering credentials must refuse the spawn");
+    assert_eq!(err.kind, faktor_core::error::ErrorKind::Permission);
+    assert!(
+        err.message.contains("credential"),
+        "the refusal names the credential store: {err}"
+    );
+    assert!(
+        !marker.exists(),
+        "the refused program never ran (no marker file)"
+    );
+}
+
+/// A BEST-EFFORT demand never grants the store either: the overlapping root
+/// is dropped from the Landlock rule table, so the kernel denies the
+/// credential file itself (observed as EACCES from the child).
+#[test]
+fn best_effort_confinement_never_grants_a_credential_store() {
+    let _serial = serial();
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    let secret = home.join(".ssh").join("id_ed25519");
+    std::fs::write(&secret, b"private-key").unwrap();
+    let _credentials = CredentialOverride::set(&home);
+    let (_d, sup) = supervisor();
+    let cfg = confined(
+        "/bin/cat",
+        vec![secret.to_string_lossy().into_owned()],
+        &home,
+        vec![home.clone()],
+        false,
+    );
+    match sup.run_sync(cfg, Duration::from_secs(10), 64 * 1024, 64 * 1024) {
+        Ok(out) => {
+            assert!(
+                landlock_available(),
+                "a best-effort spawn succeeded without the Landlock backend, so the \
+                 credential store was reachable application-policy-only: {:?}",
+                out
+            );
+            assert!(
+                !out.stdout_head.contains("private-key"),
+                "the confined child read the credential file: {:?}",
+                out
+            );
+            assert_ne!(out.exit_code, Some(0), "denied reads exit non-zero");
+        }
+        Err(e) => {
+            // The refusal is acceptable too: a typed permission error can
+            // never be a silent grant.
+            assert_eq!(e.kind, faktor_core::error::ErrorKind::Permission);
+        }
+    }
+    assert!(
+        secret.exists(),
+        "the confinement never mutates the credential store"
+    );
+}

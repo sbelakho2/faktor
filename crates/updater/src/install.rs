@@ -390,6 +390,76 @@ impl InstallLayout {
 /// rollback.
 pub trait HealthProbe: Send + Sync {
     fn probe(&self, layout: &InstallLayout, pointer: &InstallPointer) -> Result<(), UpdateError>;
+
+    /// The RUNNING binary's data-store schema head plus the live database's
+    /// `PRAGMA user_version`, when this probe can observe them. `None` (the
+    /// default) leaves the updater's rollback schema-downgrade guard inert:
+    /// the guard only refuses when it can NAME both versions.
+    fn data_store_schema(&self) -> Option<DataStoreSchema> {
+        None
+    }
+}
+
+/// One observation of the DATA store's schema ladder, used by the updater's
+/// rollback guard:
+///
+/// - `head`: the schema head (migration ladder length) the RUNNING binary
+///   supports. It is recorded on apply rows so a later rollback knows what
+///   the binary it would restore can still open;
+/// - `live`: the live database's `PRAGMA user_version`, when the probe can
+///   observe the file (`None` = no database yet / unreadable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataStoreSchema {
+    pub head: i64,
+    pub live: Option<i64>,
+}
+
+/// A probe wrapper that adds the data-store schema observation to any
+/// [`HealthProbe`]: the inner probe's health check, plus the schema cursor of
+/// the SQLite file at `data_store_path` (when it exists and is readable)
+/// paired with the running binary's head.
+pub struct DataStoreSchemaProbe<P> {
+    inner: P,
+    data_store_path: PathBuf,
+    head: i64,
+}
+
+impl<P> DataStoreSchemaProbe<P> {
+    pub fn new(inner: P, data_store_path: PathBuf, head: i64) -> Self {
+        DataStoreSchemaProbe {
+            inner,
+            data_store_path,
+            head,
+        }
+    }
+}
+
+impl<P: HealthProbe> HealthProbe for DataStoreSchemaProbe<P> {
+    fn probe(&self, layout: &InstallLayout, pointer: &InstallPointer) -> Result<(), UpdateError> {
+        self.inner.probe(layout, pointer)
+    }
+
+    fn data_store_schema(&self) -> Option<DataStoreSchema> {
+        Some(DataStoreSchema {
+            head: self.head,
+            live: read_user_version(&self.data_store_path),
+        })
+    }
+}
+
+/// READ-ONLY `PRAGMA user_version` of one SQLite file without opening (and
+/// never migrating) the store: `None` when the file does not exist or cannot
+/// be read as a database. A corrupt store is the health probe's concern; the
+/// rollback guard never guesses a version.
+fn read_user_version(path: &Path) -> Option<i64> {
+    if !path.is_file() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok()
 }
 
 /// The default probe: the swapped artifact must exist, re-hash to the

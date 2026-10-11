@@ -1,14 +1,19 @@
 // The Faktor daemon lifecycle (extracted from the launcher-only
 // extension.ts):
 //
-//  1. Resolve the executable. An explicit `binaryPath`/FAKTOR_BIN wins;
+//  1. Resolve the executable from MACHINE/APPLICATION-SCOPED inputs only:
+//     the machine-scoped `faktor.binaryPath` setting (or FAKTOR_BIN) wins;
 //     otherwise, when an INSTALL LAYOUT exists at the install root
 //     (`<root>/launcher` beside a `current` pointer or `versions/`), the
 //     STABLE BOOTSTRAP LAUNCHER is spawned: it authenticates the activated
 //     release through the signed pointer and execs exactly those bytes, so
-//     an updater activation actually controls which binary runs. Only when
-//     NO install layout is present does resolution fall back to the legacy
-//     target/debug|release/faktor-cli lookup.
+//     an updater activation actually controls which binary runs. A workspace
+//     (repository-controlled) setting value or a workspace
+//     target/debug|release build is NEVER resolved or executed; with no
+//     machine-scoped input the start refuses with an actionable error.
+//     Where a checksum/signature record exists beside the resolved binary
+//     (`<binary>.sha256`), it MUST match before the daemon may start; without
+//     a record the caller warns and requires explicit confirmation.
 //  2. Generate a 64-hex FAKTOR_SERVER_PASSWORD and spawn the resolved
 //     executable with `serve --port 0` and it in the environment.
 //  3. Read stdout line-by-line until the EXACT frozen startup line
@@ -57,7 +62,7 @@
 import * as http from 'node:http';
 import * as crypto from 'node:crypto';
 import { ChildProcess, execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -91,11 +96,12 @@ const MAX_HEALTH_BODY_BYTES = 64 * 1024;
 const ANNOUNCEMENT_VERIFY_MS = 3_000;
 
 export interface DaemonOptions {
-  /** Workspace root used to locate target/debug|release/faktor-cli. */
+  /** Informational only: the workspace root is never consulted for binary
+   * resolution (repository-controlled paths must never select the daemon). */
   readonly workspaceRoot: string;
-  /** Explicit binary override (config `faktor.binaryPath` or FAKTOR_BIN).
-   * Wins over the bootstrap: an explicit operator path is never silently
-   * replaced. */
+  /** Machine-scoped explicit binary override (config `faktor.binaryPath` or
+   * FAKTOR_BIN). Wins over the bootstrap: an explicit operator path is never
+   * silently replaced. */
   readonly binaryPath?: string;
   /** Optional `--data-dir` for the daemon (config `faktor.dataDir`). */
   readonly dataDir?: string;
@@ -181,24 +187,99 @@ let activeHandle: DaemonHandle | null = null;
  */
 let starting: Promise<DaemonHandle> | null = null;
 
-export function findBinary(options: DaemonOptions): string {
-  const env = options.binaryPath ?? process.env.FAKTOR_BIN;
-  if (env && env.length > 0) {
-    return env;
-  }
-  const root = options.workspaceRoot;
-  const candidates = [
-    join(root, 'target', 'debug', 'faktor-cli'),
-    join(root, 'target', 'release', 'faktor-cli'),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  throw new Error(
-    `faktor-cli binary not found (looked for ${candidates.join(', ')}; set FAKTOR_BIN or faktor.binaryPath to override)`,
+/**
+ * The actionable missing-daemon refusal. Names every MACHINE-scoped escape
+ * hatch and states the invariant: repository-controlled inputs (workspace
+ * settings, target/ builds) never select or execute the daemon.
+ */
+export function missingDaemonMessage(): string {
+  return (
+    'faktor-cli binary not found: install the Faktor daemon into the signed install layout ' +
+    '(~/.faktor/install, or the machine-scoped "faktor.installRoot"), or set the machine-scoped ' +
+    '"faktor.binaryPath" setting (or FAKTOR_BIN) to the executable — use "Locate daemon…" to pick it. ' +
+    'Workspace-scoped settings and workspace target/ builds are never resolved or executed.'
   );
+}
+
+/**
+ * The machine/application-scoped value of one `faktor.*` setting. Only the
+ * global (user/machine) value is ever returned; a workspace or
+ * workspace-folder value is IGNORED and reported as a typed refusal so the
+ * caller can surface exactly why a repository-supplied value had no effect.
+ */
+export interface DaemonSettingScopes<T> {
+  readonly globalValue?: T;
+  readonly workspaceValue?: T;
+  readonly workspaceFolderValue?: T;
+}
+
+export interface DaemonSettingRefusal {
+  readonly code: 'workspace_scoped_setting_refused';
+  readonly message: string;
+}
+
+export interface DaemonSettingOutcome<T> {
+  readonly value: T;
+  readonly refusal: DaemonSettingRefusal | null;
+}
+
+export function machineScopedSetting<T>(
+  key: string,
+  scopes: DaemonSettingScopes<T> | undefined,
+  fallback: T,
+): DaemonSettingOutcome<T> {
+  const workspace = scopes?.workspaceValue;
+  const workspaceFolder = scopes?.workspaceFolderValue;
+  let refusal: DaemonSettingRefusal | null = null;
+  if (workspace !== undefined || workspaceFolder !== undefined) {
+    const where =
+      workspace !== undefined && workspaceFolder !== undefined
+        ? 'workspace and workspace-folder scope'
+        : workspace !== undefined
+          ? 'workspace scope'
+          : 'workspace-folder scope';
+    refusal = {
+      code: 'workspace_scoped_setting_refused',
+      message:
+        `${key} is set at ${where}; workspace-scoped daemon settings are never trusted and were ` +
+        'ignored. Set it at machine/user scope.',
+    };
+  }
+  const value = scopes?.globalValue !== undefined ? scopes.globalValue : fallback;
+  return { value, refusal };
+}
+
+/** Where the resolved executable came from (never a workspace). */
+export type DaemonResolutionSource = 'binaryPath-setting' | 'environment' | 'install-layout';
+
+export interface ResolvedDaemon {
+  readonly executable: string;
+  readonly source: DaemonResolutionSource;
+}
+
+/**
+ * Resolve the daemon executable from machine-scoped inputs only. Never
+ * consults the workspace: no target/debug|release lookup exists.
+ */
+export function resolveDaemon(options: DaemonOptions): ResolvedDaemon {
+  const configured = options.binaryPath;
+  if (configured !== undefined && configured.length > 0) {
+    return { executable: configured, source: 'binaryPath-setting' };
+  }
+  const env = process.env.FAKTOR_BIN;
+  if (env !== undefined && env.length > 0) {
+    return { executable: env, source: 'environment' };
+  }
+  const bootstrap = bootstrapBinary(options);
+  if (bootstrap !== null) {
+    return { executable: bootstrap, source: 'install-layout' };
+  }
+  throw new Error(missingDaemonMessage());
+}
+
+/** The executable alone (see [resolveDaemon] for the source). */
+export function findBinary(options: DaemonOptions): string {
+  return resolveDaemon(options).executable;
 }
 
 /** The install root this launcher resolves through. */
@@ -215,10 +296,10 @@ export function installRootFor(options: DaemonOptions): string {
 /**
  * The stable bootstrap launcher when an install layout exists:
  * `<installRoot>/launcher` beside a `current` pointer or a `versions/`
- * directory. `null` when no layout is present, in which case the caller
- * falls back to the legacy binary resolution. The bootstrap itself refuses
- * an unsigned/tampered release or a digest mismatch (exit 3); it never
- * falls back to another binary.
+ * directory. `null` when no layout is present, in which case resolution
+ * ends in the actionable missing-daemon refusal. The bootstrap itself
+ * refuses an unsigned/tampered release or a digest mismatch (exit 3); it
+ * never falls back to another binary.
  */
 export function bootstrapBinary(options: DaemonOptions): string | null {
   const root = installRootFor(options);
@@ -233,16 +314,115 @@ export function bootstrapBinary(options: DaemonOptions): string | null {
 }
 
 /**
- * The executable to spawn: an explicit operator override first, then the
- * bootstrap launcher when an install layout exists, then the legacy
- * workspace lookup. Exactly one of those decides.
+ * The executable to spawn: an explicit machine-scoped operator override
+ * first, then the bootstrap launcher when an install layout exists. Exactly
+ * one of those decides; a workspace is never consulted.
  */
 export function resolveExecutable(options: DaemonOptions): string {
-  const explicit = options.binaryPath ?? process.env.FAKTOR_BIN;
-  if (explicit && explicit.length > 0) {
-    return explicit;
+  return resolveDaemon(options).executable;
+}
+
+/**
+ * The trust state of a resolved executable:
+ *  - `verified`: either resolved through the signed install layout (the
+ *    bootstrap launcher authenticates the activated release digest before
+ *    exec) or matched an existing checksum record;
+ *  - `unverified`: no checksum record exists — documented warn + explicit
+ *    confirm is required before start;
+ *  - `refused`: a checksum record exists but does not confirm the file (a
+ *    mismatch or a malformed record): the daemon MUST NOT start.
+ */
+export interface BinaryTrust {
+  readonly state: 'verified' | 'unverified' | 'refused';
+  readonly source: DaemonResolutionSource;
+  readonly detail: string;
+}
+
+export function binaryTrust(resolved: ResolvedDaemon): BinaryTrust {
+  if (resolved.source === 'install-layout') {
+    return {
+      state: 'verified',
+      source: resolved.source,
+      detail:
+        'resolved through the signed install layout; the bootstrap launcher verifies the activated ' +
+        'release digest before exec',
+    };
   }
-  return bootstrapBinary(options) ?? findBinary(options);
+  if (!existsSync(resolved.executable)) {
+    return {
+      state: 'refused',
+      source: resolved.source,
+      detail:
+        `${resolved.executable} does not exist; install the daemon or use "Locate daemon…" to pick ` +
+        'the machine-scoped faktor.binaryPath',
+    };
+  }
+  const record = `${resolved.executable}.sha256`;
+  if (!existsSync(record)) {
+    return {
+      state: 'unverified',
+      source: resolved.source,
+      detail:
+        `no signed checksum record exists at ${record}; the resolved path must be confirmed before start`,
+    };
+  }
+  let expected: string | null = null;
+  try {
+    const token = (readFileSync(record, 'utf8').trim().split(/\s+/)[0] ?? '').toLowerCase();
+    expected = /^[0-9a-f]{64}$/.test(token) ? token : null;
+  } catch {
+    expected = null;
+  }
+  if (expected === null) {
+    return {
+      state: 'refused',
+      source: resolved.source,
+      detail: `the checksum record ${record} does not carry a sha256 digest`,
+    };
+  }
+  const actual = sha256OfFile(resolved.executable);
+  if (actual === null) {
+    return {
+      state: 'refused',
+      source: resolved.source,
+      detail: `cannot read ${resolved.executable} to verify it against ${record}`,
+    };
+  }
+  if (actual !== expected) {
+    return {
+      state: 'refused',
+      source: resolved.source,
+      detail: `checksum mismatch for ${resolved.executable}: record ${expected}, computed ${actual}`,
+    };
+  }
+  return {
+    state: 'verified',
+    source: resolved.source,
+    detail: `sha256 ${expected} matches the checksum record ${record}`,
+  };
+}
+
+/** Streaming sha256 (no whole-file buffer); null when the file is unreadable. */
+function sha256OfFile(path: string): string | null {
+  try {
+    const hash = crypto.createHash('sha256');
+    const fd = openSync(path, 'r');
+    try {
+      const buffer = Buffer.alloc(64 * 1024);
+      for (;;) {
+        const read = readSync(fd, buffer, 0, buffer.length, null);
+        if (read <= 0) {
+          break;
+        }
+        hash.update(buffer.subarray(0, read));
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return hash.digest('hex');
+  } catch {
+    return null;
+  }
 }
 
 export async function isRunning(): Promise<boolean> {

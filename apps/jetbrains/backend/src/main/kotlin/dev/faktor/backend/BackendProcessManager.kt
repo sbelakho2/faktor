@@ -232,6 +232,16 @@ class BackendProcessManager(
         if (!Files.isRegularFile(binaryPath) || !Files.isExecutable(binaryPath)) {
             throw BackendException("faktor-cli binary not found or not executable: $binaryPath")
         }
+        // Where a signature/checksum record exists beside the resolved
+        // executable, it MUST confirm those exact bytes; a mismatch (or a
+        // malformed record) is a hard refusal before any spawn. A missing
+        // record is the explicit unverified state the host UI warns and
+        // confirms (never silently trusted here).
+        when (val trust = DaemonBinary.checksumTrust(binaryPath)) {
+            is DaemonBinary.Trust.Refused ->
+                throw BackendException("refusing to start the daemon: ${trust.detail}")
+            else -> {}
+        }
         val password = generatePassword()
         val pb = ProcessBuilder(
             binaryPath.toAbsolutePath().toString(),

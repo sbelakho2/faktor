@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Durable plan model, child control plane, and economic parallelism policy for multi-agent orchestration"
 
+[features]
+# Deterministic execution crash seams (CrashSeam / PrOperationCrashPoint).
+# OFF in production builds: the seams and their checks are cfg-compiled out.
+fault-injection = []
+
 [dependencies]
 faktor-core.workspace = true
 faktor-session.workspace = true
@@ -30,10 +35,11 @@ blake3.workspace = true
 [dev-dependencies]
 faktor-session = { path = "../session", features = ["test-utils"] }
 faktor-provider.workspace = true
-faktor-cas.workspace = true
+faktor-cas = { workspace = true, features = ["fault-injection"] }
 # The parity waits read the store's ONE terminal-turn-record vocabulary
 # (`is_terminal_turn_record_status`) instead of re-spelling `!= "active"`.
-faktor-store.workspace = true
+# Unit tests also arm the store crash seam (admission crash rows).
+faktor-store = { workspace = true, features = ["fault-injection"] }
 futures.workspace = true
 tempfile.workspace = true
 async-trait = "0.1"

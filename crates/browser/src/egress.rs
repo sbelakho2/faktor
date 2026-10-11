@@ -902,39 +902,39 @@ struct AccountingCounters {
 
 impl BrokerInner {
     fn account_request(&self, host: &str) {
-        let mut counters = self.accounting.lock().unwrap();
+        let mut counters = faktor_core::lock::recover(&self.accounting);
         counters.requests_total = counters.requests_total.saturating_add(1);
         let entry = counters.per_host.entry(host.to_string()).or_insert(0);
         *entry = entry.saturating_add(1);
     }
 
     fn account_blocked(&self) {
-        let mut counters = self.accounting.lock().unwrap();
+        let mut counters = faktor_core::lock::recover(&self.accounting);
         counters.blocked_total = counters.blocked_total.saturating_add(1);
     }
 
     fn account_tunnel(&self) {
-        let mut counters = self.accounting.lock().unwrap();
+        let mut counters = faktor_core::lock::recover(&self.accounting);
         counters.tunnels_total = counters.tunnels_total.saturating_add(1);
     }
 
     fn account_error(&self, error: impl Into<String>) {
         let error = error.into();
         {
-            let mut counters = self.accounting.lock().unwrap();
+            let mut counters = faktor_core::lock::recover(&self.accounting);
             counters.errors_total = counters.errors_total.saturating_add(1);
         }
-        *self.last_error.lock().unwrap() = Some(error);
+        *faktor_core::lock::recover(&self.last_error) = Some(error);
     }
 
     fn account_bytes(&self, up: u64, down: u64) {
-        let mut counters = self.accounting.lock().unwrap();
+        let mut counters = faktor_core::lock::recover(&self.accounting);
         counters.bytes_up = counters.bytes_up.saturating_add(up);
         counters.bytes_down = counters.bytes_down.saturating_add(down);
     }
 
     fn snapshot(&self) -> EgressAccounting {
-        let counters = self.accounting.lock().unwrap();
+        let counters = faktor_core::lock::recover(&self.accounting);
         EgressAccounting {
             requests_total: counters.requests_total,
             blocked_total: counters.blocked_total,
@@ -947,7 +947,7 @@ impl BrokerInner {
     }
 
     fn state(&self) -> BrokerState {
-        *self.state.lock().unwrap()
+        *faktor_core::lock::recover(&self.state)
     }
 
     /// Move to `next` unless the state is already terminal (terminal is
@@ -955,7 +955,7 @@ impl BrokerInner {
     /// never becomes `Stopped`). Reaching a terminal state wakes every
     /// concurrent `shutdown()` waiter.
     fn transition(&self, next: BrokerState) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = faktor_core::lock::recover(&self.state);
         if matches!(*state, BrokerState::Stopped | BrokerState::Failed) {
             return;
         }
@@ -1011,7 +1011,7 @@ impl BrokerHandle {
             addr: self.inner.addr,
             active_connections: self.inner.active.load(Ordering::SeqCst),
             accounting: self.inner.snapshot(),
-            last_error: self.inner.last_error.lock().unwrap().clone(),
+            last_error: faktor_core::lock::recover(&self.inner.last_error).clone(),
             uptime_ms: now_ms().saturating_sub(self.inner.started_ms),
         }
     }
@@ -1030,7 +1030,7 @@ impl BrokerHandle {
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         self.inner.transition(BrokerState::Draining);
-        let task = self.task.lock().unwrap().take();
+        let task = faktor_core::lock::recover(&self.task).take();
         if let Some(task) = task {
             if task.await.is_err() {
                 // The accept task panicked or was aborted: the drain never
@@ -1062,7 +1062,7 @@ impl Drop for BrokerHandle {
         // their next poll). Terminal state records that no graceful drain
         // was owned.
         self.inner.transition(BrokerState::Failed);
-        if let Some(task) = self.task.lock().unwrap().take() {
+        if let Some(task) = faktor_core::lock::recover(&self.task).take() {
             task.abort();
         }
     }

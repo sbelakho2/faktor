@@ -35,6 +35,8 @@ object BackendProcessManagerTest {
         assertNativeRequestShapes()
         assertNativeResponseParsers()
         assertMissingBinaryFailsLoudly()
+        assertDaemonBinaryResolution()
+        assertDaemonBinaryTrust()
         assertCommandDrain()
         println("PASS all unit assertions")
     }
@@ -734,6 +736,122 @@ private fun assertMissingBinaryFailsLoudly() {
         fail("start() must fail loudly for a missing binary")
     } catch (e: BackendException) {
         assertTrue(e.message!!.contains("not found"), "message: ${e.message}")
+    }
+}
+
+// ----------------------------------- application/machine-scoped resolution
+// The daemon binary is resolved from MACHINE-scoped inputs only (application
+// setting, FAKTOR_BIN, app-level install layout). A project/workspace is not
+// an input of the resolution at all, so a repository target/ build and a
+// workspace-scoped path can never select the daemon.
+
+private fun assertDaemonBinaryResolution() {
+    val home = Files.createTempDirectory("faktor-resolve-home-")
+    try {
+        // Nothing machine-scoped: the actionable refusal names the installer
+        // location, the setting and the "Locate daemon…" action.
+        try {
+            DaemonBinary.resolve(null, home, emptyMap())
+            fail("resolution must refuse when nothing machine-scoped exists")
+        } catch (e: DaemonBinary.MissingDaemonException) {
+            val message = e.message ?: ""
+            assertTrue(message.contains("~/.faktor/install"), "installer path: $message")
+            assertTrue(message.contains("Locate daemon"), "locate action: $message")
+            assertTrue(message.contains("target/"), "target/ invariant: $message")
+        }
+
+        // The app-level install layout is resolved through its launcher.
+        val install = home.resolve(DaemonBinary.INSTALL_RELATIVE)
+        Files.createDirectories(install)
+        val launcher = install.resolve(DaemonBinary.LAUNCHER_NAME)
+        Files.write(launcher, "#!/bin/sh\n".toByteArray())
+        launcher.toFile().setExecutable(true)
+        val resolved = DaemonBinary.resolve(null, home, emptyMap())
+        assertEquals(launcher, resolved.executable, "install-layout launcher")
+        assertEquals("signed install layout", resolved.source)
+
+        // The application setting wins over the layout; FAKTOR_BIN is the
+        // fallback when no application setting exists.
+        val appLevel = Files.createTempDirectory("faktor-resolve-app-").resolve("faktor-cli")
+        Files.write(appLevel, "#!/bin/sh\n".toByteArray())
+        appLevel.toFile().setExecutable(true)
+        assertEquals(
+            appLevel,
+            DaemonBinary.resolve(appLevel.toString(), home, emptyMap()).executable,
+            "application setting"
+        )
+        assertEquals(
+            appLevel,
+            DaemonBinary.resolve(null, home, mapOf(DaemonBinary.ENV_BIN to appLevel.toString())).executable,
+            "FAKTOR_BIN fallback"
+        )
+
+        // A workspace target/debug build is proved irrelevant: the layout
+        // wins even when a checkout-like target/ tree exists beside it.
+        val checkout = Files.createTempDirectory("faktor-resolve-checkout-")
+        val workspaceBin = checkout.resolve("target/debug/faktor-cli")
+        Files.createDirectories(workspaceBin.parent)
+        Files.write(workspaceBin, "#!/bin/sh\necho ran\n".toByteArray())
+        workspaceBin.toFile().setExecutable(true)
+        assertEquals(
+            launcher,
+            DaemonBinary.resolve(null, home, emptyMap()).executable,
+            "the workspace target/ build must never be selected"
+        )
+        println("  daemon resolution: machine-scoped only; workspace target/ is never an input")
+    } finally {
+        home.toFile().deleteRecursively()
+    }
+}
+
+private fun assertDaemonBinaryTrust() {
+    val root = Files.createTempDirectory("faktor-trust-")
+    try {
+        val binary = root.resolve("faktor-cli")
+        Files.write(binary, "#!/bin/sh\nexit 0\n".toByteArray())
+        binary.toFile().setExecutable(true)
+        assertTrue(
+            DaemonBinary.checksumTrust(binary) is DaemonBinary.Trust.Unverified,
+            "a missing checksum record is the unverified warn+confirm state"
+        )
+        val digest = DaemonBinary.sha256(binary)
+        Files.write(
+            root.resolve("faktor-cli.sha256"),
+            "$digest  faktor-cli\n".toByteArray()
+        )
+        assertTrue(
+            DaemonBinary.checksumTrust(binary) is DaemonBinary.Trust.Verified,
+            "a matching checksum record verifies the exact bytes"
+        )
+        Files.write(
+            root.resolve("faktor-cli.sha256"),
+            "${"0".repeat(64)}  faktor-cli\n".toByteArray()
+        )
+        val mismatch = DaemonBinary.checksumTrust(binary)
+        assertTrue(mismatch is DaemonBinary.Trust.Refused, "a mismatch must refuse the start")
+        assertTrue(
+            (mismatch as DaemonBinary.Trust.Refused).detail.contains("checksum mismatch"),
+            "mismatch detail: ${mismatch.detail}"
+        )
+        Files.write(root.resolve("faktor-cli.sha256"), "not-a-digest\n".toByteArray())
+        assertTrue(
+            DaemonBinary.checksumTrust(binary) is DaemonBinary.Trust.Refused,
+            "a malformed checksum record must refuse the start"
+        )
+        // BackendProcessManager refuses to spawn on a mismatched record.
+        Files.write(
+            root.resolve("faktor-cli.sha256"),
+            "${"0".repeat(64)}  faktor-cli\n".toByteArray()
+        )
+        try {
+            BackendProcessManager(binary, Files.createTempDirectory("faktor-trust-data-")).start()
+            fail("start() must refuse a checksum mismatch before spawning")
+        } catch (e: BackendException) {
+            assertTrue(e.message!!.contains("checksum mismatch"), "message: ${e.message}")
+        }
+        println("  daemon trust: checksum records verify, mismatches refuse before spawn")
+    } finally {
+        root.toFile().deleteRecursively()
     }
 }
 

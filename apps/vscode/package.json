@@ -4,7 +4,7 @@
   "description": "An engineering agent in your editor: describe a task, follow the run, approve what it needs, and land verified changes.",
   "version": "0.1.0",
   "publisher": "faktor",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "SEE LICENSE IN LICENSE.txt",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -100,11 +100,6 @@
       {
         "title": "Faktor",
         "properties": {
-          "faktor.autoStart": {
-            "type": "boolean",
-            "default": false,
-            "description": "Start the daemon when the extension activates."
-          },
           "faktor.defaultProvider": {
             "type": "string",
             "default": "",
@@ -148,17 +143,20 @@
           "faktor.binaryPath": {
             "type": "string",
             "default": "",
-            "description": "Explicit path to the faktor-cli binary (overrides FAKTOR_BIN and the target/debug|release lookup)."
+            "scope": "machine",
+            "description": "Machine/user-scoped path to the faktor-cli executable. Workspace-scoped values are ignored and refused; repository target/ builds are never resolved or executed. Empty (default) resolves through the signed install layout (~/.faktor/install or faktor.installRoot) and otherwise refuses with a \"Locate daemon…\" action."
           },
           "faktor.dataDir": {
             "type": "string",
             "default": "",
-            "description": "Persistent daemon data directory; empty uses the daemon default."
+            "scope": "machine",
+            "description": "Machine/user-scoped persistent daemon data directory; empty uses the daemon default. Workspace-scoped values are ignored and refused."
           },
           "faktor.installRoot": {
             "type": "string",
             "default": "",
-            "description": "Install root holding the immutable release layout (current, launcher, versions/). When a layout exists there the daemon is spawned through the stable bootstrap launcher, so the activated release and only that release runs; empty resolves to <faktor.dataDir>/install (or ~/.faktor/install), with the legacy binary lookup as the fallback when no layout exists."
+            "scope": "machine",
+            "description": "Machine/user-scoped install root holding the immutable release layout (current, launcher, versions/). When a layout exists there the daemon is spawned through the stable bootstrap launcher (which verifies the activated release digest), so the activated release and only that release runs; empty resolves to <faktor.dataDir>/install or ~/.faktor/install. Workspace-scoped values are ignored and refused."
           },
           "faktor.extraArgs": {
             "type": "array",
@@ -166,28 +164,33 @@
               "type": "string"
             },
             "default": [],
-            "description": "Extra argv appended to `faktor-cli serve --port 0`."
+            "scope": "machine",
+            "description": "Machine/user-scoped extra argv appended to `faktor-cli serve --port 0`. Workspace-scoped values are ignored and refused."
           },
           "faktor.startupTimeoutMs": {
             "type": "number",
             "default": 45000,
             "minimum": 1000,
+            "scope": "machine",
             "description": "How long to wait for the daemon startup line before failing (must exceed the bootstrap launcher's ~30 s launch window)."
           },
           "faktor.controlPlaneEndpoint": {
             "type": "string",
-            "default": "https://api.faktor.dev",
-            "description": "Cloud control-plane endpoint the stored credential belongs to. Non-secret: it is half of the SecretStorage key (endpoint + organization), never a credential."
+            "default": "",
+            "scope": "machine",
+            "description": "Explicit cloud control-plane endpoint the stored credential belongs to; EMPTY BY DEFAULT (there is no built-in endpoint, so cloud control-plane calls stay disabled until configured). Non-secret: it is half of the SecretStorage key (endpoint + organization), never a credential."
           },
           "faktor.controlPlaneOrganization": {
             "type": "string",
             "default": "",
-            "description": "Organization (or account) id the stored control-plane credential belongs to. Non-secret: written by \"Faktor: Sign in to Control Plane\"."
+            "scope": "machine",
+            "description": "Organization (or account) id the stored control-plane credential belongs to. Non-secret: written by \"Faktor: Sign in to Control Plane\". Workspace-scoped values are ignored and refused."
           },
           "faktor.controlPlaneAuthSession": {
             "type": "string",
             "default": "",
-            "description": "Auth-session id (non-secret) the stored credential owns, from the SSO callback or bootstrap result. Written by \"Faktor: Sign in to Control Plane\"; used only to name the session in the daemon's sign-out revoke body. Never a credential."
+            "scope": "machine",
+            "description": "Auth-session id (non-secret) the stored credential owns, from the SSO callback or bootstrap result. Written by \"Faktor: Sign in to Control Plane\"; used only to name the session in the daemon's sign-out revoke body. Never a credential. Workspace-scoped values are ignored and refused."
           },
           "faktor.controlToken": {
             "type": "string",

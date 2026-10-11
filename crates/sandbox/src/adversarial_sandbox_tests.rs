@@ -838,3 +838,37 @@ fn capability_evaluation_is_policy_exact() {
         "rootless workspace read falls to the external rule"
     );
 }
+
+/// Audit item 6: the confinement policy never grants a home credential
+/// store, and the honest limitation on backend-less builds is the exact
+/// documented sentence. A workspace root covering a credential path is an
+/// offender; a sibling project directory is not.
+#[test]
+fn confinement_policy_never_grants_home_credentials() {
+    let home = Path::new("/home/operator");
+    let credentials = credential_paths_for_home(home);
+    assert_eq!(credentials.len(), CREDENTIAL_HOME_SUBPATHS.len());
+    // The normal workspace root grants nothing credential-shaped.
+    let clean = vec![PathBuf::from("/home/operator/projects/app")];
+    assert!(roots_granting_credentials(&clean, &credentials).is_empty());
+    // A root covering the home itself WOULD transitively grant every store:
+    // the spawn layer must refuse (Required) or strip (BestEffort) it.
+    let offenders = roots_granting_credentials(&[home.to_path_buf()], &credentials);
+    assert_eq!(
+        offenders.len(),
+        credentials.len(),
+        "the home root overlaps every credential store: {offenders:?}"
+    );
+    // A root beneath one store is an offender too (still credential data).
+    let nested = vec![home.join(".ssh").join("keys")];
+    assert_eq!(roots_granting_credentials(&nested, &credentials).len(), 1);
+    // Component-wise, never substring: `.ssh2` shares the spelling prefix.
+    let lookalike = vec![home.join(".ssh2")];
+    assert!(roots_granting_credentials(&lookalike, &credentials).is_empty());
+    // The honest limitation sentence is frozen and names the scratch HOME.
+    assert!(CREDENTIAL_CONFINEMENT_NOTE.contains("scratch HOME"));
+    assert!(CREDENTIAL_CONFINEMENT_NOTE.contains("honest limitation"));
+    // The typed HOME contract: scratch by default, explicit grant only.
+    assert_eq!(AgentHomePolicy::default(), AgentHomePolicy::Scratch);
+    assert!(!AgentHomePolicy::default().passes_real_home());
+}

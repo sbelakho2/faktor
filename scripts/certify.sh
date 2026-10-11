@@ -70,12 +70,16 @@
 #     ({source_sha, tree_sha, workflow, event, pipeline_id, pipeline_number,
 #     build_environment_digest (CI image digest), rust_toolchain,
 #     artifacts{name: sha256}}) into the step log (base64 marker block).
-#     Signing is FAIL-CLOSED: without the signing-key secret the step exits
-#     with the typed `signing-key-missing` error and writes no attestation,
-#     so an unsigned object can only arrive from foreign/legacy tooling.
+#     Signing is FAIL-CLOSED: without the BUILD role's signing-key secret
+#     (`faktor_attest_signing_key` / FAKTOR_ATTEST_SIGN_KEY_PEM) the step
+#     exits with the typed `signing-key-missing` error and writes no
+#     attestation, so an unsigned object can only arrive from foreign/legacy
+#     tooling.
 #     This script FETCHES the attestation belonging to the exact trusted
 #     pipeline, verifies the ed25519 signature with the ALLOWLISTED key (the
-#     embedded public key must equal it), verifies repository full name,
+#     embedded public key must equal it) AND the BUILD role `build-attestation`
+#     (a signature bound to any other role is refused typed with
+#     `signature-role-mismatch`), verifies repository full name,
 #     source SHA, tree, workflow, event, pipeline number and the OBSERVED
 #     pipeline id (no number/id substitution exemption), and re-hashes EVERY
 #     local/shipped artifact against the attested digests. Any mismatch is a
@@ -90,12 +94,28 @@
 #     of the same payload against the pipeline's OIDC identity
 #     (docs/certification.md §2.12).
 #
+#   * RELEASE-SIGNATURE ROLE (role split): the release artifact/certificate
+#     class (`faktor-release-signature/v1`, trusted workflow step
+#     `release-signature`) is signed by the SEPARATE release identity
+#     `faktor-release-signing` (role `release-signing`,
+#     `faktor_release_signing_key` / FAKTOR_RELEASE_SIGN_KEY_PEM) and binds
+#     the exact build-attestation payload plus the release artifact digests.
+#     This script fetches that block from the same pipeline and verifies it
+#     with the release role; a release signature made by the build key is a
+#     typed `signature-role-mismatch`. A RELEASE CERTIFICATE additionally
+#     requires `release_preconditions.release_signing_role_verified`; a
+#     missing release signature is a visible note and the class stays
+#     `source` (fail-closed: no release without the release role key). The
+#     operator runbook is scripts/woodpecker/setup.md §4.1-§4.3.
+#
 #   * CERTIFICATE CLASS (P1-K): `--verify-ci-evidence` (the renamed
 #     `--ci-only`) verifies the embedded CI run and terminates with
 #     "CI EVIDENCE: PASS — NOT A RELEASE CERTIFICATE". A release certificate
 #     is emitted ONLY when the full local gates pass AND (a trusted context
-#     verifies OR the signed remote attestation covers the gates). No flag
-#     weakens checks while preserving the certificate class.
+#     verifies OR the signed remote attestation covers the gates) AND every
+#     release precondition, including the verified release-signing role
+#     signature. No flag weakens checks while preserving the certificate
+#     class.
 #
 # Gate 10 (additive, audit 19): the trusted workflow's own certificate
 # artifact. `target/certification/ci-certification.json` (written by the
@@ -926,6 +946,12 @@ release_branding_scan() {
 
 ATTESTATION_JS="$ROOT/scripts/certification/attestation.mjs"
 ATTESTATION_STEP="attestation"
+# Role split: build attestations verify under the build role; the release
+# artifact/certificate class (faktor-release-signature/v1) verifies under the
+# release role. Cross-role signatures are typed refusals.
+BUILD_SIGN_ROLE="build-attestation"
+RELEASE_SIGN_ROLE="release-signing"
+RELEASE_SIGNATURE_STEP="release-signature"
 
 HASH_TOOL=()
 if command -v sha256sum >/dev/null 2>&1; then
@@ -1076,10 +1102,16 @@ elif mode == "context_boundaries":
             print("BOUNDARY\tworkflow %s is %s and no connected agent advertises platform=%s (self-hosted lane absent; typed, visible, never green)" % (name, state, platform))
         else:
             print("PROBLEM\tworkflow %s is %s (platform=%s)" % (name, state, platform or "unknown"))
-elif mode == "attestation_extract":
+elif mode in ("attestation_extract", "release_signature_extract"):
     # The log endpoint returns each entry's `data` base64-encoded; older
     # shapes may carry plain text. Search BOTH renderings so the block is
     # found either way (never silently missing).
+    if mode == "attestation_extract":
+        marker = "FAKTOR ATTESTATION"
+        prefix = "attestation-extract"
+    else:
+        marker = "FAKTOR RELEASE SIGNATURE"
+        prefix = "release-signature-extract"
     raw_parts = []
     decoded_parts = []
     if isinstance(data, list):
@@ -1102,7 +1134,7 @@ elif mode == "attestation_extract":
             decoded_parts.extend(x for x in data["lines"] if isinstance(x, str))
     text = "\n".join(raw_parts) + "\n" + "\n".join(decoded_parts)
     match = re.search(
-        r"-----BEGIN FAKTOR ATTESTATION-----(.*?)-----END FAKTOR ATTESTATION-----",
+        r"-----BEGIN %s-----(.*?)-----END %s-----" % (marker, marker),
         text, re.S,
     )
     if not match:
@@ -1111,7 +1143,7 @@ elif mode == "attestation_extract":
     try:
         obj = json.loads(base64.b64decode(blob).decode())
     except Exception as exc:
-        print("attestation-extract: %s" % exc, file=sys.stderr)
+        print("%s: %s" % (prefix, exc), file=sys.stderr)
         sys.exit(4)
     if not isinstance(obj, dict):
         sys.exit(4)
@@ -1236,6 +1268,7 @@ probe_attestation() { # api repo_id number detail event workflow commit tree art
         --repo "$REPO_FULL_NAME" \
         --source-sha "$commit" --tree-sha "$tree" --workflow "$workflow" --event "$event" \
         --pipeline-number "$number" --pipeline-id "$pipeline_id" \
+        --role "$BUILD_SIGN_ROLE" \
         --require-signed --keys "$ATT_KEYS" ${args[@]+"${args[@]}"} 2>&1)"
     rc=$?
     ATT_DIGEST="sha256:$(hash_file "$att_file")"
@@ -1287,6 +1320,89 @@ PY
 )"
     fi
     [ -n "$RA_ATTESTED" ] || RA_ATTESTED="0"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Release-signature probe (role split): find the `release-signature` step of
+# the SAME pipeline that published the verified build attestation, fetch its
+# log block, and verify the release artifact/certificate class
+# (`faktor-release-signature/v1`) with the RELEASE role (`faktor-release-signing`).
+# The release signature binds the EXACT build attestation bytes plus the
+# release artifact digests; a signature made by the build key (or any other
+# role) is refused typed (`signature-role-mismatch`). Returns 0 verified,
+# 1 invalid (problems appended), 3 no release-signature step (a NOTE: release
+# class stays refused fail-closed until the operator registers the
+# `faktor_release_signing_key` secret and enables the step per
+# scripts/woodpecker/setup.md §4).
+# ---------------------------------------------------------------------------
+REL_STATUS="absent"
+REL_ORIGIN=""
+REL_PIPELINE_NUMBER=""
+REL_PIPELINE_ID=""
+REL_STEP_PID=""
+REL_IDENTITY=""
+REL_DIGEST=""
+REL_ARTIFACTS="0"
+
+probe_release_signature() { # api repo_id number detail commit tree artifacts_tsv problems notes tmp pipeline_id attestation_file
+    local api="$1" repo_id="$2" number="$3" detail="$4" commit="$5" tree="$6"
+    local artifacts_tsv="$7" problems="$8" notes="$9" tmp="${10}" pipeline_id="${11}" att_file="${12}"
+    local pid log_file rel_file out rc code
+    if [ ! -f "$att_file" ]; then
+        REL_STATUS="absent"
+        return 3
+    fi
+    pid="$(py_json attestation_step "$detail" "$RELEASE_SIGNATURE_STEP")"
+    if [ -z "$pid" ]; then
+        REL_STATUS="absent"
+        return 3
+    fi
+    log_file="$tmp/release-signature-log.json"
+    rel_file="$tmp/release-signature.json"
+    code="$(api_get "$api" "/repos/$repo_id/logs/$number/$pid" "$log_file")"
+    if [ "$code" != "200" ]; then
+        printf 'release-signature-log-fetch: pipeline %s step %s log fetch failed (HTTP %s)\n' "$number" "$pid" "$code" >>"$problems"
+        REL_STATUS="failed"
+        return 1
+    fi
+    if ! py_json release_signature_extract "$log_file" >"$rel_file"; then
+        printf 'release-signature-log-parse: pipeline %s step %s published no valid release-signature block\n' "$number" "$pid" >>"$problems"
+        REL_STATUS="failed"
+        return 1
+    fi
+    if [ -z "$ATT_KEYS" ]; then
+        printf 'release-signature-keys-missing: a release signature exists for pipeline %s but no allowlist is configured (set FAKTOR_ATTEST_KEYS or pass --attestation-keys)\n' "$number" >>"$problems"
+        REL_STATUS="failed"
+        return 1
+    fi
+    command -v node >/dev/null 2>&1 || return 2
+    local args=()
+    local art_sha art_path
+    while IFS="$(printf '\t')" read -r art_sha art_path; do
+        [ -n "$art_path" ] || continue
+        args+=(--artifact "$art_path")
+    done <"$artifacts_tsv"
+    out="$(node "$ATTESTATION_JS" verify-release --release-signature "$rel_file" \
+        --attestation "$att_file" \
+        --repo "$REPO_FULL_NAME" \
+        --source-sha "$commit" --tree-sha "$tree" \
+        --pipeline-number "$number" --pipeline-id "$pipeline_id" \
+        --role "$RELEASE_SIGN_ROLE" \
+        --require-signed --keys "$ATT_KEYS" ${args[@]+"${args[@]}"} 2>&1)"
+    rc=$?
+    REL_DIGEST="sha256:$(hash_file "$rel_file")"
+    REL_STEP_PID="$pid"
+    REL_IDENTITY="$(py_json field "$rel_file" signature.identity)"
+    REL_ARTIFACTS="$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("artifacts"); print(len(a) if isinstance(a, dict) else 0)' "$rel_file" 2>/dev/null || printf '0')"
+    if [ "$rc" -ne 0 ]; then
+        printf 'release-signature-invalid: pipeline %s: %s\n' "$number" "$(printf '%s\n' "$out" | grep -m1 'release-signature problem:' || printf '%s\n' "$out" | head -n1)" >>"$problems"
+        REL_STATUS="failed"
+        return 1
+    fi
+    REL_STATUS="verified"
+    REL_PIPELINE_NUMBER="$number"
+    REL_PIPELINE_ID="$pipeline_id"
     return 0
 }
 
@@ -1389,6 +1505,16 @@ find_trusted_attestation() { # api commit tree artifacts_tsv problems notes tmp
         case "$prc" in
         0)
             ATT_ORIGIN="$tctx"
+            probe_release_signature "$api" "$trepo_id" "$tnumber" "$tdetail" "$commit" "$tree" \
+                "$artifacts_tsv" "$problems" "$notes" "$tmp" "$tobs_id" "$tmp/attestation.json"
+            case "$?" in
+            0) REL_ORIGIN="$tctx" ;;
+            2) return 2 ;;
+            3)
+                printf 'release-signature-absent: trusted pipeline %s published no %s step; release class is refused until the release-signing role key is registered and the step enabled (scripts/woodpecker/setup.md §4)\n' "$tnumber" "$RELEASE_SIGNATURE_STEP" >>"$notes"
+                ;;
+            *) : ;; # probe_release_signature already recorded the problem
+            esac
             return 0
             ;;
         1)
@@ -1431,6 +1557,11 @@ write_ci_manifest() { # out_file artifacts_file problems_file notes_file
         CERTIFY_M_RA_BRANDING="$RA_BRANDING" CERTIFY_M_RA_MISSING="$RA_MISSING" \
         CERTIFY_M_FAULT_STATUS="$FAULT_STATUS" CERTIFY_M_FAULT_COUNT="$FAULT_COUNT" \
         CERTIFY_M_FAULT_DIGEST="$FAULT_DIGEST" CERTIFY_M_FAULT_TESTS="$FAULT_RECORD" \
+        CERTIFY_M_REL_STATUS="$REL_STATUS" CERTIFY_M_REL_ORIGIN="$REL_ORIGIN" \
+        CERTIFY_M_REL_PIPELINE="$REL_PIPELINE_NUMBER" CERTIFY_M_REL_PIPELINE_ID="$REL_PIPELINE_ID" \
+        CERTIFY_M_REL_STEP_PID="$REL_STEP_PID" CERTIFY_M_REL_IDENTITY="$REL_IDENTITY" \
+        CERTIFY_M_REL_ROLE="$RELEASE_SIGN_ROLE" CERTIFY_M_REL_DIGEST="$REL_DIGEST" \
+        CERTIFY_M_REL_ARTIFACTS="$REL_ARTIFACTS" \
         CERTIFY_M_LOCAL_STATUS="$LOCAL_STATUS" \
         python3 <<'PY'
 import hashlib
@@ -1505,6 +1636,21 @@ attestation = {
     "artifacts_attested": env("CERTIFY_M_ATT_ARTIFACTS"),
     "evidence_digest": env("CERTIFY_M_ATT_DIGEST"),
 }
+# Role split: the release artifact/certificate class is signed by the
+# separate `release-signing` identity (faktor-release-signature/v1 binding
+# the build-attestation bytes + release artifact digests); the verifier
+# refuses a build-role signature typed.
+release_signature = {
+    "status": env("CERTIFY_M_REL_STATUS") or "not-run",
+    "origin_context": env("CERTIFY_M_REL_ORIGIN"),
+    "pipeline_number": env("CERTIFY_M_REL_PIPELINE"),
+    "pipeline_id": env("CERTIFY_M_REL_PIPELINE_ID"),
+    "step_pid": env("CERTIFY_M_REL_STEP_PID"),
+    "signature_identity": env("CERTIFY_M_REL_IDENTITY"),
+    "role": env("CERTIFY_M_REL_ROLE") or "release-signing",
+    "evidence_digest": env("CERTIFY_M_REL_DIGEST"),
+    "artifacts_signed": env("CERTIFY_M_REL_ARTIFACTS"),
+}
 local_status = env("CERTIFY_M_LOCAL_STATUS") or "not-run"
 
 
@@ -1556,6 +1702,10 @@ release_preconditions = {
     "artifact_branding_pass": release_artifacts["branding"] == "pass",
     "fault_campaign_pass": fault_campaign["status"] == "pass",
     "fault_tests_executed": fault_campaign["executed"] > 0,
+    # Role split: the release artifact/certificate class requires its own
+    # release-signing role signature (never the build key that signed the
+    # build attestation).
+    "release_signing_role_verified": release_signature["status"] == "verified",
 }
 release_ready = all(release_preconditions.values())
 release_certificate = (
@@ -1577,6 +1727,7 @@ core = {
     "tree": env("CERTIFY_M_TREE"),
     "workflow_state": observed["workflow_state"],
     "attestation": attestation,
+    "release_signature": release_signature,
     "release_artifacts": release_artifacts,
     "fault_campaign": fault_campaign,
 }
@@ -1603,6 +1754,7 @@ manifest = {
     "artifacts": artifacts,
     "artifact_digest": artifact_digest,
     "attestation": attestation,
+    "release_signature": release_signature,
     "release_artifacts": release_artifacts,
     "fault_campaign": fault_campaign,
     "release_preconditions": release_preconditions,
@@ -1611,9 +1763,10 @@ manifest = {
     "release_certificate": release_certificate,
     "release_rule": (
         "release = full local gates pass AND (trusted context verified OR signed "
-        "build attestation verified) AND ReleaseArtifactSet complete+attested "
-        "(required>0, matched==required, branding pass) AND fault campaign pass "
-        "with executed>0; no flag weakens this"
+        "build attestation verified) AND the release-signing role signature "
+        "(faktor-release-signature/v1) verifies AND ReleaseArtifactSet "
+        "complete+attested (required>0, matched==required, branding pass) AND "
+        "fault campaign pass with executed>0; no flag weakens this"
     ),
     "observed": observed,
     "evidence_digest": digest(json.dumps(core, sort_keys=True, separators=(",", ":"))),
@@ -1691,6 +1844,14 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
     ATT_MATCHED="0"
     ATT_ARTIFACTS="0"
     ATT_DIGEST=""
+    REL_STATUS="absent"
+    REL_ORIGIN=""
+    REL_PIPELINE_NUMBER=""
+    REL_PIPELINE_ID=""
+    REL_STEP_PID=""
+    REL_IDENTITY=""
+    REL_DIGEST=""
+    REL_ARTIFACTS="0"
     RA_ATTESTED="0"
 
     local api="${WOODPECKER_HOST%/}/api"
@@ -1908,7 +2069,25 @@ verify_woodpecker_context() { # commit tree manifest_out -> 0 verified, 1 not ve
                 "$problems_file" "$tmp" "$OBS_PIPELINE_ID"
             att_rc=$?
             case "$att_rc" in
-            0) ATT_ORIGIN="$CONTEXT" ;;
+            0)
+                ATT_ORIGIN="$CONTEXT"
+                # Role split: the release artifact/certificate class must be
+                # signed by the release-signing role, on the same pipeline.
+                probe_release_signature "$api" "$repo_id" "$pipeline_number" "$detail_file" \
+                    "$commit" "$tree" "$artifacts_file" "$problems_file" "$notes_file" \
+                    "$tmp" "$OBS_PIPELINE_ID" "$tmp/attestation.json"
+                case "$?" in
+                0) REL_ORIGIN="$CONTEXT" ;;
+                2)
+                    rm -rf "$tmp"
+                    return 2
+                    ;;
+                3)
+                    printf 'release-signature-absent: trusted pipeline %s published no %s step; release class is refused until the release-signing role key is registered and the step enabled (scripts/woodpecker/setup.md §4)\n' "$pipeline_number" "$RELEASE_SIGNATURE_STEP" >>"$notes_file"
+                    ;;
+                *) : ;; # probe_release_signature already recorded the problem
+                esac
+                ;;
             2)
                 rm -rf "$tmp"
                 return 2
@@ -2057,9 +2236,13 @@ verify_ci_certification_manifest() { # commit tree -> 0 match, 1 not verified
     esac
 }
 
-# P1 completeness: release preconditions beyond context/attestation. Every
-# one is mandatory for RELEASE CERTIFICATE; SOURCE CERTIFICATE can never
-# print the release class.
+# P1 completeness + role split: release preconditions beyond
+# context/attestation. Every one is mandatory for RELEASE CERTIFICATE;
+# SOURCE CERTIFICATE can never print the release class. The release
+# artifact/certificate class additionally requires a release signature
+# (faktor-release-signature/v1) verified with the RELEASE role — a build
+# attestation is not enough, and a release signature signed by the build key
+# is a typed refusal.
 release_preconditions_met() {
     [ "$RA_STATUS" = "complete" ] || return 1
     [ "$RA_REQUIRED" -gt 0 ] || return 1
@@ -2070,6 +2253,7 @@ release_preconditions_met() {
     [ "$FAULT_COUNT" -gt 0 ] || return 1
     [ "$CI_CERT_STATUS" = "match" ] || return 1
     [ "$VISUAL_PLATFORMS_STATUS" = "pass" ] || return 1
+    [ "$REL_STATUS" = "verified" ] || return 1
     return 0
 }
 
@@ -2088,6 +2272,9 @@ release_denial_reasons() {
     fi
     if [ "$VISUAL_PLATFORMS_STATUS" != "pass" ]; then
         reasons+=("visual platform certification: $VISUAL_PLATFORMS_STATUS${VISUAL_PLATFORMS_DETAIL:+ — $VISUAL_PLATFORMS_DETAIL}")
+    fi
+    if [ "$REL_STATUS" != "verified" ]; then
+        reasons+=("release-signing role ($RELEASE_SIGN_ROLE) signature: $REL_STATUS${REL_PIPELINE_NUMBER:+ pipeline=$REL_PIPELINE_NUMBER} — register the faktor_release_signing_key secret and enable the release-signature step (scripts/woodpecker/setup.md §4)")
     fi
     printf '%s\n' ${reasons[@]+"${reasons[@]}"}
 }
@@ -2182,8 +2369,21 @@ run_ci_selftest() {
     cp "${ART_FULL[1]}" "$tmp/relfull/extension/faktor.vsix"
     cp "${ART_FULL[2]}" "$tmp/relfull/plugin/faktor-jetbrains.zip"
     ART_FULL=("$tmp/relfull/bin/faktor-cli" "$tmp/relfull/extension/faktor.vsix" "$tmp/relfull/plugin/faktor-jetbrains.zip")
-    node "$ATTESTATION_JS" keygen --out-key "$tmp/sign.pem" --out-keys "$tmp/keys.json" --key-id faktor-selftest >/dev/null
-    node "$ATTESTATION_JS" keygen --out-key "$tmp/foreign.pem" --out-keys "$tmp/foreign-keys.json" --key-id foreign >/dev/null
+    node "$ATTESTATION_JS" keygen --out-key "$tmp/sign.pem" --out-keys "$tmp/build-keys.json" --key-id faktor-selftest --role build-attestation >/dev/null
+    node "$ATTESTATION_JS" keygen --out-key "$tmp/foreign.pem" --out-keys "$tmp/foreign-keys.json" --key-id foreign --role build-attestation >/dev/null
+    node "$ATTESTATION_JS" keygen --out-key "$tmp/release.pem" --out-keys "$tmp/release-keys.json" --key-id faktor-release-selftest --role release-signing >/dev/null
+    # Role split: the allowlist carries one build-bound identity and one
+    # release-bound identity; the two are not interchangeable at verification.
+    python3 - "$tmp/build-keys.json" "$tmp/release-keys.json" "$tmp/keys.json" <<'PY'
+import json
+import sys
+
+identities = {}
+for path in sys.argv[1:3]:
+    identities.update(json.load(open(path)).get("identities", {}))
+with open(sys.argv[3], "w") as fh:
+    json.dump({"schema": "faktor-signing-allowlist/v2", "identities": identities}, fh)
+PY
 
     port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
     python3 "$tmp/mock_server.py" "$port" "$tmp" >/dev/null 2>&1 &
@@ -2229,7 +2429,7 @@ run_ci_selftest() {
         python3 -c 'import json,sys; print(json.dumps({"number":int(sys.argv[1]),"id":int(sys.argv[2]),"status":sys.argv[3],"commit":sys.argv[4],"event":sys.argv[5]}))' "$@"
     }
 
-    detail_json() { # number id status commit event workflows [attestation_pid]
+    detail_json() { # number id status commit event workflows [attestation_pid] [release_signature_pid]
         python3 - "$@" <<'PY'
 import json
 import sys
@@ -2237,7 +2437,9 @@ import sys
 number, pid_value, status, commit, event, workflows = sys.argv[1:7]
 children = []
 if len(sys.argv) > 7 and sys.argv[7]:
-    children = [{"name": "attestation", "pid": int(sys.argv[7]), "state": "success"}]
+    children.append({"name": "attestation", "pid": int(sys.argv[7]), "state": "success"})
+if len(sys.argv) > 8 and sys.argv[8]:
+    children.append({"name": "release-signature", "pid": int(sys.argv[8]), "state": "success"})
 items = []
 for pair in workflows.split(","):
     if not pair:
@@ -2286,21 +2488,27 @@ with open(sys.argv[1], "w") as fh:
 PY
     }
 
-    log_block() { # attestation_file -> marker block text
-        printf '%s\n' '-----BEGIN FAKTOR ATTESTATION-----'
+    log_block() { # json_file [begin_marker end_marker]
+        local begin="${2:------BEGIN FAKTOR ATTESTATION-----}"
+        local end="${3:------END FAKTOR ATTESTATION-----}"
+        printf '%s\n' "$begin"
         base64 <"$1" | tr -d '\n'
         printf '\n'
-        printf '%s\n' '-----END FAKTOR ATTESTATION-----'
+        printf '%s\n' "$end"
     }
 
-    logs_json() { # marker_block_file pid
-        python3 - "$1" "$2" <<'PY'
+    logs_json() { # marker_block_file pid [marker_block_file pid ...]
+        python3 - "$@" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1]) as fh:
-    block = fh.read()
-print(json.dumps({sys.argv[2]: [{"data": block}]}))
+out = {}
+args = sys.argv[1:]
+for i in range(0, len(args) - 1, 2):
+    with open(args[i]) as fh:
+        block = fh.read()
+    out[str(args[i + 1])] = [{"data": block}]
+print(json.dumps(out))
 PY
     }
 
@@ -2320,6 +2528,21 @@ PY
             --rust-toolchain 1.98.0 \
             "${art_args[@]}" \
             "$@"
+    }
+
+    make_release_signature() { # out_file attestation_file [extra create-release args...]
+        local out="$1" att="$2"
+        shift 2
+        node "$ATTESTATION_JS" create-release \
+            --out "$out" --attestation "$att" \
+            --repo "${ATT_REPO:-acme/widgets}" \
+            --key-id "${REL_KEY_ID:-faktor-release-selftest}" \
+            --sign-key "${REL_SIGN_KEY:-$tmp/release.pem}" \
+            "$@"
+    }
+
+    release_block() { # release_signature_file -> marker block text
+        log_block "$1" '-----BEGIN FAKTOR RELEASE SIGNATURE-----' '-----END FAKTOR RELEASE SIGNATURE-----'
     }
 
     write_block() { # out_file marker_text
@@ -2494,14 +2717,19 @@ assert m["certificate_class"] == "source", m
     expect repo-mismatch 1
     expect_problem repo-mismatch 'repository-mismatch'
 
-    # --- trusted context success with a signed attestation (P1-I + P1-J).
+    # --- trusted context success with a signed attestation (P1-I + P1-J) and
+    # the release-signing role signature (role split): the build attestation
+    # verifies under `faktor-selftest` / build-attestation; the release
+    # signature verifies under `faktor-release-selftest` / release-signing.
     printf 'selftest artifact\n' >"$tmp/artifact.bin"
     LOCAL_STATUS="pass" # simulate a full local gate pass for release-class facts
     make_attestation "$tmp/trusted-att.json" --sign-key "$tmp/sign.pem" --key-id faktor-selftest >/dev/null
+    make_release_signature "$tmp/trusted-rel.json" "$tmp/trusted-att.json" >/dev/null
     log_block "$tmp/trusted-att.json" >"$tmp/trusted-block.txt"
+    release_block "$tmp/trusted-rel.json" >"$tmp/trusted-rel-block.txt"
     CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
-        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
-        CERTIFY_TEST_LOGS="$(logs_json "$tmp/trusted-block.txt" 701)" \
+        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701 702)" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/trusted-block.txt" 701 "$tmp/trusted-rel-block.txt" 702)" \
         set_state
     CONTEXT="ci/woodpecker/push/trusted"
     expect trusted-success 0
@@ -2517,12 +2745,49 @@ assert m["attestation"]["status"] == "verified", m
 assert m["attestation"]["pipeline_number"] == "21", m
 assert m["attestation"]["signature_identity"] == "faktor-selftest", m
 assert m["attestation"]["evidence_digest"].startswith("sha256:"), m
+assert m["release_signature"]["status"] == "verified", m
+assert m["release_signature"]["role"] == "release-signing", m
+assert m["release_signature"]["signature_identity"] == "faktor-release-selftest", m
+assert m["release_signature"]["pipeline_number"] == "21", m
+assert m["release_signature"]["evidence_digest"].startswith("sha256:"), m
+assert m["release_preconditions"]["release_signing_role_verified"] is True, m
 assert m["release_artifacts"]["status"] == "complete", m
 assert m["release_artifacts"]["required"] == 3 and m["release_artifacts"]["attested"] == 3, m
 assert m["release_artifacts"]["branding"] == "pass", m
 assert m["fault_campaign"]["status"] == "pass" and m["fault_campaign"]["executed"] > 0, m
 assert m["certificate_class"] == "release", m
 assert m["release_certificate"] is True, m
+'
+    # --- role split: a release signature made with the BUILD key is refused
+    # typed (signature-role-mismatch): the release artifact/certificate class
+    # requires the release-signing role, never the build identity.
+    REL_SIGN_KEY="$tmp/sign.pem" REL_KEY_ID=faktor-selftest make_release_signature "$tmp/build-signed-rel.json" "$tmp/trusted-att.json" >/dev/null
+    release_block "$tmp/build-signed-rel.json" >"$tmp/build-signed-rel-block.txt"
+    CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701 702)" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/trusted-block.txt" 701 "$tmp/build-signed-rel-block.txt" 702)" \
+        set_state
+    expect release-signature-role-mismatch 1
+    expect_problem release-signature-role-mismatch 'release-signature-invalid'
+    expect_problem release-signature-role-mismatch 'signature-role-mismatch'
+    # --- fail-closed role split: a trusted pipeline with a verified build
+    # attestation but no release-signature step cannot yield a release class;
+    # the absence is a visible note and the class stays source.
+    CERTIFY_TEST_PIPELINES="[$(list_json 21 211 success "$sha" push)]" \
+        CERTIFY_TEST_DETAIL="$(detail_json 21 211 success "$sha" push 'trusted=success' 701)" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/trusted-block.txt" 701)" \
+        set_state
+    expect release-signature-absent 0
+    expect_manifest release-signature-absent '
+import json, sys
+m = json.load(open(sys.argv[1]))
+assert m["status"] == "passed", m
+assert m["attestation"]["status"] == "verified", m
+assert m["release_signature"]["status"] == "absent", m
+assert m["release_preconditions"]["release_signing_role_verified"] is False, m
+assert m["release_certificate"] is False, m
+assert m["certificate_class"] == "source", m
+assert any("release-signature-absent" in n for n in m["notes"]), m
 '
     # --- attestation tamper: the local artifact no longer matches the attested digest.
     printf 'tampered artifact\n' >>"${ART_FULL[0]}"
@@ -2595,12 +2860,15 @@ PY
     expect trusted-absent 1
     expect_problem trusted-absent 'attestation-absent'
 
-    # --- pr context upgraded by a trusted attestation at the same SHA.
+    # --- pr context upgraded by a trusted attestation at the same SHA (plus
+    # the release-signing role signature over the same build attestation).
     make_attestation "$tmp/upgrade-att.json" --sign-key "$tmp/sign.pem" --key-id faktor-selftest >/dev/null
+    make_release_signature "$tmp/upgrade-rel.json" "$tmp/upgrade-att.json" >/dev/null
     log_block "$tmp/upgrade-att.json" >"$tmp/upgrade-block.txt"
+    release_block "$tmp/upgrade-rel.json" >"$tmp/upgrade-rel-block.txt"
     CERTIFY_TEST_PIPELINES="[$(list_json 11 111 success "$sha" pull_request),$(list_json 21 211 success "$sha" push)]" \
-        CERTIFY_TEST_DETAILS="$(details_json 11 "$(detail_json 11 111 success "$sha" pull_request 'pr=success,linux=success')" 21 "$(detail_json 21 211 success "$sha" push 'trusted=success' 701)")" \
-        CERTIFY_TEST_LOGS="$(logs_json "$tmp/upgrade-block.txt" 701)" \
+        CERTIFY_TEST_DETAILS="$(details_json 11 "$(detail_json 11 111 success "$sha" pull_request 'pr=success,linux=success')" 21 "$(detail_json 21 211 success "$sha" push 'trusted=success' 701 702)")" \
+        CERTIFY_TEST_LOGS="$(logs_json "$tmp/upgrade-block.txt" 701 "$tmp/upgrade-rel-block.txt" 702)" \
         set_state
     CONTEXT="ci/woodpecker/pr/pr"
     ATT_KEYS="$tmp/keys.json"
@@ -2611,6 +2879,9 @@ m = json.load(open(sys.argv[1]))
 assert m["context"]["class"] == "untrusted", m
 assert m["attestation"]["status"] == "verified", m
 assert m["attestation"]["origin_context"] == "ci/woodpecker/push/trusted", m
+assert m["release_signature"]["status"] == "verified", m
+assert m["release_signature"]["origin_context"] == "ci/woodpecker/push/trusted", m
+assert m["release_signature"]["role"] == "release-signing", m
 assert m["release_artifacts"]["attested"] == 3, m
 assert m["certificate_class"] == "release", m
 assert m["release_certificate"] is True, m
@@ -2681,6 +2952,8 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         CI_CERT_DETAIL="pipeline=21"
         VISUAL_PLATFORMS_STATUS="pass"
         VISUAL_PLATFORMS_DETAIL="selftest fixture"
+        REL_STATUS="verified"
+        REL_PIPELINE_NUMBER="21"
     }
     release_facts_off() {
         RA_STATUS="empty"
@@ -2692,6 +2965,8 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
         FAULT_COUNT=0
         VISUAL_PLATFORMS_STATUS="not-run"
         VISUAL_PLATFORMS_DETAIL=""
+        REL_STATUS="absent"
+        REL_PIPELINE_NUMBER=""
     }
     check_class() { # local ci class att want
         local got
@@ -2706,6 +2981,15 @@ assert any("attestation-not-checked" in n for n in m["notes"]), m
     release_facts_on
     check_class 1 0 untrusted verified release
     check_class 1 0 trusted absent release
+    # Role split: without a verified release-signing role signature the same
+    # facts can never print the release class, whatever the build attestation
+    # says.
+    REL_STATUS="failed"
+    check_class 1 0 untrusted verified source
+    check_class 1 0 trusted absent source
+    REL_STATUS="absent"
+    check_class 1 0 untrusted verified source
+    REL_STATUS="verified"
     release_facts_off
     check_class 1 0 untrusted verified source
     check_class 1 0 trusted absent source
@@ -3145,7 +3429,7 @@ YAML
     rm -rf "$tmp"
 
     if [ "$failures" -eq 0 ]; then
-        echo "certify selftest: PASS (context registry + observed-value matrix, attestation fetch/verification matrix, ReleaseArtifactSet matrix, gate parity + CI status contract, CI certification manifest gate, fault-campaign gate, certificate classes, temp-name migration)"
+        echo "certify selftest: PASS (context registry + observed-value matrix, attestation fetch/verification matrix, release-signature role split (release-signing role enforced, cross-role builds rejected typed, absent release step fail-closed), ReleaseArtifactSet matrix, gate parity + CI status contract, CI certification manifest gate, fault-campaign gate, certificate classes, temp-name migration)"
     else
         echo "certify selftest: FAIL ($failures case(s))" >&2
         return 1

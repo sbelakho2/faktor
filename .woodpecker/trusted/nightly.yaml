@@ -278,7 +278,7 @@ steps:
       - |
         set -eu
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
-          cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
+          cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored
           status="passed"; reason=""
         else
           status="skipped"
@@ -290,7 +290,7 @@ steps:
         CMDS="$(cat <<'CMDS'
         set -eu
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
-        cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
+        cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored
         status="passed"; reason=""
         else
         status="skipped"

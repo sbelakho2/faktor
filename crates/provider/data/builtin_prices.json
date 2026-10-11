@@ -1,0 +1,175 @@
+{
+  "catalog_version": "builtin-v3",
+  "source_id": "faktor-builtin-v3",
+  "source": "Vendored transcript of vendor-published list prices (one row per officially-known model). Each row names its own source URL and the observation date; conservative rows are documented Faktor upper bounds, not vendor list prices. Do not hand-edit numbers without updating recorded_at: the loader and its validation test reject an unknown schema, a zero/omitted price line, a duplicate (origin, model) row, a non-official origin, and a row whose dates are inconsistent.",
+  "effective_at_ms": 1789430400000,
+  "observed_at_ms": 1790812800000,
+  "valid_until_ms": 1806537600000,
+  "rows": [
+    {
+      "origin": "official_open_ai",
+      "model": "gpt-4o",
+      "class": "exact",
+      "input_micro_usd_per_million": 2500000,
+      "output_micro_usd_per_million": 10000000,
+      "cache_read_micro_usd_per_million": 1250000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_open_ai",
+      "model": "gpt-4o-mini",
+      "class": "exact",
+      "input_micro_usd_per_million": 150000,
+      "output_micro_usd_per_million": 600000,
+      "cache_read_micro_usd_per_million": 75000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_open_ai",
+      "model": "o3",
+      "class": "exact",
+      "input_micro_usd_per_million": 2000000,
+      "output_micro_usd_per_million": 8000000,
+      "cache_read_micro_usd_per_million": 500000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01; repriced from $10/$40)"
+    },
+    {
+      "origin": "official_open_ai",
+      "model": "o4-mini",
+      "class": "exact",
+      "input_micro_usd_per_million": 1100000,
+      "output_micro_usd_per_million": 4400000,
+      "cache_read_micro_usd_per_million": 275000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_open_ai",
+      "model": "gpt-5",
+      "class": "exact",
+      "input_micro_usd_per_million": 1250000,
+      "output_micro_usd_per_million": 10000000,
+      "cache_read_micro_usd_per_million": 125000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_open_ai",
+      "model": "gpt-5-mini",
+      "class": "exact",
+      "input_micro_usd_per_million": 250000,
+      "output_micro_usd_per_million": 2000000,
+      "cache_read_micro_usd_per_million": 25000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_open_ai",
+      "model": "gpt-5-nano",
+      "class": "exact",
+      "input_micro_usd_per_million": 50000,
+      "output_micro_usd_per_million": 400000,
+      "cache_read_micro_usd_per_million": 5000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "OpenAI API pricing https://openai.com/api/pricing/ (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_anthropic",
+      "model": "claude-opus-4",
+      "class": "exact",
+      "input_micro_usd_per_million": 15000000,
+      "output_micro_usd_per_million": 75000000,
+      "cache_read_micro_usd_per_million": 1500000,
+      "cache_write": { "kind": "ttl_dependent", "five_minutes": 18750000, "one_hour": 30000000 },
+      "source": "Anthropic API pricing https://www.anthropic.com/pricing (observed 2026-10-01; cache write 1.25x/2x input, cache read 0.1x)"
+    },
+    {
+      "origin": "official_anthropic",
+      "model": "claude-opus-4-1",
+      "class": "exact",
+      "input_micro_usd_per_million": 15000000,
+      "output_micro_usd_per_million": 75000000,
+      "cache_read_micro_usd_per_million": 1500000,
+      "cache_write": { "kind": "ttl_dependent", "five_minutes": 18750000, "one_hour": 30000000 },
+      "source": "Anthropic API pricing https://www.anthropic.com/pricing (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_anthropic",
+      "model": "claude-sonnet-4-5",
+      "class": "exact",
+      "input_micro_usd_per_million": 3000000,
+      "output_micro_usd_per_million": 15000000,
+      "cache_read_micro_usd_per_million": 300000,
+      "cache_write": { "kind": "ttl_dependent", "five_minutes": 3750000, "one_hour": 6000000 },
+      "source": "Anthropic API pricing https://www.anthropic.com/pricing (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_anthropic",
+      "model": "claude-haiku-4-5",
+      "class": "exact",
+      "input_micro_usd_per_million": 1000000,
+      "output_micro_usd_per_million": 5000000,
+      "cache_read_micro_usd_per_million": 100000,
+      "cache_write": { "kind": "ttl_dependent", "five_minutes": 1250000, "one_hour": 2000000 },
+      "source": "Anthropic API pricing https://www.anthropic.com/pricing (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_anthropic",
+      "model": "claude-sonnet-4",
+      "class": "exact",
+      "input_micro_usd_per_million": 3000000,
+      "output_micro_usd_per_million": 15000000,
+      "cache_read_micro_usd_per_million": 300000,
+      "cache_write": { "kind": "ttl_dependent", "five_minutes": 3750000, "one_hour": 6000000 },
+      "source": "Anthropic model deprecations https://docs.anthropic.com/en/docs/about-claude/model-deprecations (retired 2026-06-01; last published price recorded)",
+      "effective_at_ms": 1747872000000,
+      "valid_until_ms": 1780272000000,
+      "retired_at_ms": 1780272000000
+    },
+    {
+      "origin": "official_anthropic",
+      "model": "claude-haiku-3.5",
+      "class": "exact",
+      "input_micro_usd_per_million": 800000,
+      "output_micro_usd_per_million": 4000000,
+      "cache_read_micro_usd_per_million": 80000,
+      "cache_write": { "kind": "ttl_dependent", "five_minutes": 1000000, "one_hour": 1600000 },
+      "source": "Anthropic model deprecations https://docs.anthropic.com/en/docs/about-claude/model-deprecations (retired 2026-02-01; last published price recorded)",
+      "effective_at_ms": 1729555200000,
+      "valid_until_ms": 1769904000000,
+      "retired_at_ms": 1769904000000
+    },
+    {
+      "origin": "official_google",
+      "model": "gemini-2.0-flash",
+      "class": "exact",
+      "input_micro_usd_per_million": 100000,
+      "output_micro_usd_per_million": 400000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "Google Gemini API pricing https://ai.google.dev/gemini-api/docs/pricing (observed 2026-10-01)"
+    },
+    {
+      "origin": "official_google",
+      "model": "gemini-2.5-flash",
+      "class": "exact",
+      "input_micro_usd_per_million": 300000,
+      "output_micro_usd_per_million": 2500000,
+      "cache_read_micro_usd_per_million": 75000,
+      "cache_write": { "kind": "not_billed" },
+      "source": "Google Gemini API pricing https://ai.google.dev/gemini-api/docs/pricing (observed 2026-10-01; text/image/video tier)"
+    },
+    {
+      "origin": "official_deep_seek",
+      "model": "deepseek-chat",
+      "class": "conservative_schedule",
+      "input_micro_usd_per_million": 560000,
+      "output_micro_usd_per_million": 2200000,
+      "cache_read_micro_usd_per_million": 140000,
+      "cache_write": { "kind": "fixed", "rate": 560000 },
+      "source": "Faktor documented bound: 2x the greatest audited V3-era published cache-miss/output rates (V4-era schedules not documented as exact); write tokens bounded at the cache-miss rate (observed 2026-10-01)"
+    }
+  ]
+}

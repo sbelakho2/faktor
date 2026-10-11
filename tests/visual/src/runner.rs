@@ -1,9 +1,10 @@
-//! Pixel-regression runner over the frozen screenshot corpus
-//! (`fixtures/screenshots`). The audit contract: the branded `+` overlay
-//! must change pixels ONLY inside its explicit mask; every pixel outside
-//! the mask and the OS font-rendering tolerance zone must be byte-identical
-//! between baseline and overlay. Inside the mask, changes are required
-//! (the overlay must actually be visible).
+//! Pixel-regression runner over a bounded panel corpus (the test renders
+//! its own panels at test time; no screenshot corpus is committed). The
+//! audit contract: the branded `+` overlay must change pixels ONLY inside
+//! its explicit mask; every pixel outside the mask and the OS font-rendering
+//! tolerance zone must be byte-identical between baseline and overlay.
+//! Inside the mask, changes are required (the overlay must actually be
+//! visible).
 
 use std::path::Path;
 
