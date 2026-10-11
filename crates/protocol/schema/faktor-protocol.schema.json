@@ -960,6 +960,616 @@
           }
         ]
       }
+    },
+    {
+      "name": "OutcomeMetrics",
+      "doc": "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "runs",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedChanges",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedFirstPassChanges",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedFirstPassPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "totalVerifiedSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedCostPerChangeMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "totalSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "totalReworkSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "reworkCostRatioPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localSubstitutionPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "avoidedHostedInferenceMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "totalWallTimeMs",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "meanTimeToVerifiedChangeMs",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "humanInterventionRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "humanInterventionPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "rollbackRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "regressionRollbackPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "checksPassed",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "checksRequired",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "proofCoveragePpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "frontierEscalationRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "frontierEscalationPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "scanned",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "truncated",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "RunOutcomeModelStep",
+      "doc": "One provider/model step of a completed run's execution sequence (money as a decimal string).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "provider",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "model",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "local",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "spendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "RunOutcomeProof",
+      "doc": "One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "checksPassed",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "checksRequired",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "coveragePpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "RunOutcomeChangeScale",
+      "doc": "One completed run's changed-code scale.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "files",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "addedLines",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "removedLines",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "RunOutcome",
+      "doc": "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "runId",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "sessionId",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "taskId",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "taskClass",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "riskClass",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "candidateSnapshot",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "finalSnapshot",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "accepted",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "integrated",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verified",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedFirstAttempt",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "repairAttempts",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "modelSequence",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "RunOutcomeModelStep"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "modelSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verificationSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "reworkSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "avoidedHostedMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "wallTimeMs",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "humanInterventions",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "proof",
+            "type": {
+              "kind": "named",
+              "name": "RunOutcomeProof"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "changeScale",
+            "type": {
+              "kind": "named",
+              "name": "RunOutcomeChangeScale"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "rollbackEvents",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "recoveryEvents",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "finalBasis",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "frontierEscalations",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "completedAtMs",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "OutcomeCursor",
+      "doc": "The composite oldest-key cursor of one Engineering Outcome Ledger page (`nextCursor`); absent (null) when the page was not full.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "completedAtMs",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "runId",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "OutcomesPage",
+      "doc": "Response of GET /native/outcomes: the durable metrics fold plus one bounded newest-first page of completed-run projections and the composite cursor older pages continue from (null when exhausted).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "metrics",
+            "type": {
+              "kind": "named",
+              "name": "OutcomeMetrics"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "runs",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "RunOutcome"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "nextCursor",
+            "type": {
+              "kind": "named",
+              "name": "OutcomeCursor"
+            },
+            "nullable": true,
+            "optional": false
+          }
+        ]
+      }
     }
   ],
   "constants": {

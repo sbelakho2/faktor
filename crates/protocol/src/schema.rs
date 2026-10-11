@@ -487,6 +487,174 @@ fn type_defs() -> Vec<TypeDef> {
                 ],
             },
         },
+        // ---------------------------------- engineering outcome ledger (audit 7)
+        //
+        // The Engineering Outcome Ledger read surface (`GET /native/outcomes`)
+        // projects the durable `faktor_agent::outcome_ledger` records into a
+        // camelCase wire response. The schema mirrors that projection
+        // field-for-field (see `crates/server/src/native/outcomes.rs`): money
+        // keys ride the decimal-string `*Micro` encoding, every other number
+        // is a plain JSON integer and non-nullable. The strict scalar query
+        // (`limit` / `before_ms` / `before_run`) has no JSON body, so it is
+        // not a schema DTO.
+        TypeDef {
+            name: "OutcomeMetrics",
+            doc: "The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("runs", Ty::I64),
+                    req("verifiedChanges", Ty::I64),
+                    req("verifiedFirstPassChanges", Ty::I64),
+                    req("verifiedFirstPassPpm", Ty::I64),
+                    text_field("totalVerifiedSpendMicro"),
+                    text_field("verifiedCostPerChangeMicro"),
+                    text_field("totalSpendMicro"),
+                    text_field("totalReworkSpendMicro"),
+                    req("reworkCostRatioPpm", Ty::I64),
+                    req("localRuns", Ty::I64),
+                    req("localSubstitutionPpm", Ty::I64),
+                    text_field("avoidedHostedInferenceMicro"),
+                    req("totalWallTimeMs", Ty::I64),
+                    req("meanTimeToVerifiedChangeMs", Ty::I64),
+                    req("humanInterventionRuns", Ty::I64),
+                    req("humanInterventionPpm", Ty::I64),
+                    req("rollbackRuns", Ty::I64),
+                    req("regressionRollbackPpm", Ty::I64),
+                    req("checksPassed", Ty::I64),
+                    req("checksRequired", Ty::I64),
+                    req("proofCoveragePpm", Ty::I64),
+                    req("frontierEscalationRuns", Ty::I64),
+                    req("frontierEscalationPpm", Ty::I64),
+                    req("scanned", Ty::I64),
+                    req("truncated", Ty::Bool),
+                ],
+            },
+        },
+        TypeDef {
+            name: "RunOutcomeModelStep",
+            doc: "One provider/model step of a completed run's execution sequence (money as a decimal string).",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("provider"),
+                    text_field("model"),
+                    req("local", Ty::Bool),
+                    text_field("spendMicro"),
+                ],
+            },
+        },
+        TypeDef {
+            name: "RunOutcomeProof",
+            doc: "One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("checksPassed", Ty::I64),
+                    req("checksRequired", Ty::I64),
+                    req("coveragePpm", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "RunOutcomeChangeScale",
+            doc: "One completed run's changed-code scale.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req("files", Ty::I64),
+                    req("addedLines", Ty::I64),
+                    req("removedLines", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "RunOutcome",
+            doc: "One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    text_field("runId"),
+                    req("sessionId", Ty::I64),
+                    req("taskId", Ty::I64),
+                    text_field("taskClass"),
+                    text_field("riskClass"),
+                    nullable("candidateSnapshot", Ty::String),
+                    text_field("finalSnapshot"),
+                    req("accepted", Ty::Bool),
+                    req("integrated", Ty::Bool),
+                    req("verified", Ty::Bool),
+                    req("verifiedFirstAttempt", Ty::Bool),
+                    req("repairAttempts", Ty::I64),
+                    req(
+                        "modelSequence",
+                        Ty::List {
+                            of: Box::new(Ty::Named {
+                                name: "RunOutcomeModelStep",
+                            }),
+                        },
+                    ),
+                    text_field("modelSpendMicro"),
+                    text_field("verificationSpendMicro"),
+                    text_field("reworkSpendMicro"),
+                    text_field("avoidedHostedMicro"),
+                    req("wallTimeMs", Ty::I64),
+                    req("humanInterventions", Ty::I64),
+                    req(
+                        "proof",
+                        Ty::Named {
+                            name: "RunOutcomeProof",
+                        },
+                    ),
+                    req(
+                        "changeScale",
+                        Ty::Named {
+                            name: "RunOutcomeChangeScale",
+                        },
+                    ),
+                    req("rollbackEvents", Ty::I64),
+                    req("recoveryEvents", Ty::I64),
+                    text_field("finalBasis"),
+                    req("frontierEscalations", Ty::I64),
+                    req("completedAtMs", Ty::I64),
+                ],
+            },
+        },
+        TypeDef {
+            name: "OutcomeCursor",
+            doc: "The composite oldest-key cursor of one Engineering Outcome Ledger page (`nextCursor`); absent (null) when the page was not full.",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![req("completedAtMs", Ty::I64), text_field("runId")],
+            },
+        },
+        TypeDef {
+            name: "OutcomesPage",
+            doc: "Response of GET /native/outcomes: the durable metrics fold plus one bounded newest-first page of completed-run projections and the composite cursor older pages continue from (null when exhausted).",
+            unknown_fields: "ignore",
+            shape: Shape::Struct {
+                fields: vec![
+                    req(
+                        "metrics",
+                        Ty::Named {
+                            name: "OutcomeMetrics",
+                        },
+                    ),
+                    req(
+                        "runs",
+                        Ty::List {
+                            of: Box::new(Ty::Named { name: "RunOutcome" }),
+                        },
+                    ),
+                    nullable(
+                        "nextCursor",
+                        Ty::Named {
+                            name: "OutcomeCursor",
+                        },
+                    ),
+                ],
+            },
+        },
     ]
 }
 
@@ -676,6 +844,61 @@ mod tests {
             assert!(
                 names.contains(&name),
                 "audit 15 migration: {name} must stay in the canonical schema"
+            );
+        }
+    }
+
+    /// Economic audit item 7: the Engineering Outcome Ledger read DTOs must
+    /// STAY in the canonical schema — the live wire response shape is pinned
+    /// against these entries by the server route test
+    /// (`crates/server/src/native/outcomes_tests.rs`), so removing one is a
+    /// generated-client regression, not a label change.
+    #[test]
+    fn outcomes_wire_dtos_are_in_the_canonical_schema() {
+        let types = type_defs();
+        let names: Vec<&str> = types.iter().map(|def| def.name).collect();
+        for name in [
+            "OutcomeMetrics",
+            "RunOutcomeModelStep",
+            "RunOutcomeProof",
+            "RunOutcomeChangeScale",
+            "RunOutcome",
+            "OutcomeCursor",
+            "OutcomesPage",
+        ] {
+            assert!(
+                names.contains(&name),
+                "outcomes migration: {name} must stay in the canonical schema"
+            );
+        }
+        // Money rides the decimal-string `*Micro` wire encoding: those fields
+        // must stay strings, never integers.
+        let string_fields = |type_name: &str| -> Vec<&'static str> {
+            let def = types
+                .iter()
+                .find(|def| def.name == type_name)
+                .expect("type is present");
+            let Shape::Struct { fields } = &def.shape else {
+                panic!("{type_name} must be a struct")
+            };
+            fields
+                .iter()
+                .filter(|f| matches!(f.ty, Ty::String))
+                .map(|f| f.name)
+                .collect()
+        };
+        assert!(string_fields("OutcomeMetrics").contains(&"totalVerifiedSpendMicro"));
+        assert!(string_fields("OutcomeMetrics").contains(&"avoidedHostedInferenceMicro"));
+        assert!(string_fields("RunOutcomeModelStep").contains(&"spendMicro"));
+        for money in [
+            "modelSpendMicro",
+            "verificationSpendMicro",
+            "reworkSpendMicro",
+            "avoidedHostedMicro",
+        ] {
+            assert!(
+                string_fields("RunOutcome").contains(&money),
+                "RunOutcome.{money} must be a decimal-string field"
             );
         }
     }

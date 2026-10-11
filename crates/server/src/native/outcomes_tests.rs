@@ -273,3 +273,97 @@ async fn strict_query_and_page_bounds_are_typed_refusals() {
     assert_eq!(body["runs"].as_array().unwrap().len(), 0);
     handle.request_shutdown();
 }
+
+/// Economic audit item 7 migration parity: the live wire keys AND JSON kinds
+/// of `GET /native/outcomes` mirror the canonical schema types
+/// field-for-field (the schema entries are what the generated IDE clients
+/// parse; a drift is a generated-client bug). Adversarial directions: a
+/// schema-only field, a wire-only field, a wrong kind and a wrong
+/// nullability all fail here.
+#[tokio::test]
+async fn outcomes_wire_shape_matches_the_canonical_schema() {
+    use std::collections::BTreeSet;
+
+    use faktor_protocol::schema::{canonical, Shape, Ty, TypeDef};
+
+    fn schema_def<'a>(types: &'a [TypeDef], name: &str) -> &'a TypeDef {
+        types
+            .iter()
+            .find(|def| def.name == name)
+            .unwrap_or_else(|| panic!("{name} must be in the canonical schema"))
+    }
+
+    fn wire_keys(value: &serde_json::Value, path: &str) -> BTreeSet<String> {
+        value
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: expected a JSON object"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Structural parity of one schema struct against one live wire value.
+    fn assert_shape(types: &[TypeDef], name: &str, value: &serde_json::Value, path: &str) {
+        let def = schema_def(types, name);
+        let Shape::Struct { fields } = &def.shape else {
+            panic!("{name} must be a struct");
+        };
+        let wire = wire_keys(value, path);
+        let schema: BTreeSet<String> = fields.iter().map(|f| f.name.to_string()).collect();
+        assert_eq!(
+            wire, schema,
+            "{path}: wire keys must match schema type {name}"
+        );
+        for field in fields {
+            let entry = &value[field.name];
+            let field_path = format!("{path}.{}", field.name);
+            if entry.is_null() {
+                assert!(
+                    field.nullable,
+                    "{field_path}: wire null but the schema says non-nullable"
+                );
+                continue;
+            }
+            match &field.ty {
+                Ty::String => assert!(entry.is_string(), "{field_path}: expected a string"),
+                Ty::I64 | Ty::I32 => assert!(
+                    entry.is_i64() || entry.is_u64(),
+                    "{field_path}: expected an integer, got {entry}"
+                ),
+                Ty::Bool => assert!(entry.is_boolean(), "{field_path}: expected a boolean"),
+                Ty::Json => {}
+                Ty::Named { name } => assert_shape(types, name, entry, &field_path),
+                Ty::List { of } => {
+                    let items = entry
+                        .as_array()
+                        .unwrap_or_else(|| panic!("{field_path}: expected an array"));
+                    if let Ty::Named { name } = of.as_ref() {
+                        for (index, item) in items.iter().enumerate() {
+                            assert_shape(types, name, item, &format!("{field_path}[{index}]"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let records = vec![record("run-a", 1_000, false), record("run-b", 2_000, true)];
+    let (handle, token, _session) = outcomes_deps(dir.path(), &records).await;
+    let base = format!("http://{}", handle.addr);
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/native/outcomes?limit=1"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["nextCursor"].is_object(),
+        "the fixture needs a full page with a non-null cursor"
+    );
+    let schema = canonical();
+    assert_shape(&schema.types, "OutcomesPage", &body, "GET /native/outcomes");
+    handle.request_shutdown();
+}
