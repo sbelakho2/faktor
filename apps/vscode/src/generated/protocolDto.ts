@@ -344,6 +344,100 @@ export interface ProtocolSessionPromptReceipt {
   readonly queued: boolean;
 }
 
+/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm. (unknown_fields: ignore) */
+export interface ProtocolOutcomeMetrics {
+  readonly runs: number;
+  readonly verifiedChanges: number;
+  readonly verifiedFirstPassChanges: number;
+  readonly verifiedFirstPassPpm: number;
+  readonly totalVerifiedSpendMicro: string;
+  readonly verifiedCostPerChangeMicro: string;
+  readonly totalSpendMicro: string;
+  readonly totalReworkSpendMicro: string;
+  readonly reworkCostRatioPpm: number;
+  readonly localRuns: number;
+  readonly localSubstitutionPpm: number;
+  readonly avoidedHostedInferenceMicro: string;
+  readonly totalWallTimeMs: number;
+  readonly meanTimeToVerifiedChangeMs: number;
+  readonly humanInterventionRuns: number;
+  readonly humanInterventionPpm: number;
+  readonly rollbackRuns: number;
+  readonly regressionRollbackPpm: number;
+  readonly checksPassed: number;
+  readonly checksRequired: number;
+  readonly proofCoveragePpm: number;
+  readonly frontierEscalationRuns: number;
+  readonly frontierEscalationPpm: number;
+  readonly scanned: number;
+  readonly truncated: boolean;
+}
+
+/** One provider/model step of a completed run's execution sequence (money as a decimal string). (unknown_fields: ignore) */
+export interface ProtocolRunOutcomeModelStep {
+  readonly provider: string;
+  readonly model: string;
+  readonly local: boolean;
+  readonly spendMicro: string;
+}
+
+/** One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm. (unknown_fields: ignore) */
+export interface ProtocolRunOutcomeProof {
+  readonly checksPassed: number;
+  readonly checksRequired: number;
+  readonly coveragePpm: number;
+}
+
+/** One completed run's changed-code scale. (unknown_fields: ignore) */
+export interface ProtocolRunOutcomeChangeScale {
+  readonly files: number;
+  readonly addedLines: number;
+  readonly removedLines: number;
+}
+
+/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. (unknown_fields: ignore) */
+export interface ProtocolRunOutcome {
+  readonly runId: string;
+  readonly sessionId: number;
+  readonly taskId: number;
+  readonly taskClass: string;
+  readonly riskClass: string;
+  readonly candidateSnapshot: string | null;
+  readonly finalSnapshot: string;
+  readonly accepted: boolean;
+  readonly integrated: boolean;
+  readonly verified: boolean;
+  readonly verifiedFirstAttempt: boolean;
+  readonly repairAttempts: number;
+  readonly modelSequence: readonly ProtocolRunOutcomeModelStep[];
+  readonly modelSpendMicro: string;
+  readonly verificationSpendMicro: string;
+  readonly reworkSpendMicro: string;
+  readonly avoidedHostedMicro: string;
+  readonly wallTimeMs: number;
+  readonly humanInterventions: number;
+  readonly proof: ProtocolRunOutcomeProof;
+  readonly changeScale: ProtocolRunOutcomeChangeScale;
+  readonly rollbackEvents: number;
+  readonly recoveryEvents: number;
+  readonly finalBasis: string;
+  readonly frontierEscalations: number;
+  readonly completedAtMs: number;
+}
+
+/** The composite oldest-key cursor of one Engineering Outcome Ledger page (`nextCursor`); absent (null) when the page was not full. (unknown_fields: ignore) */
+export interface ProtocolOutcomeCursor {
+  readonly completedAtMs: number;
+  readonly runId: string;
+}
+
+/** Response of GET /native/outcomes: the durable metrics fold plus one bounded newest-first page of completed-run projections and the composite cursor older pages continue from (null when exhausted). (unknown_fields: ignore) */
+export interface ProtocolOutcomesPage {
+  readonly metrics: ProtocolOutcomeMetrics;
+  readonly runs: readonly ProtocolRunOutcome[];
+  readonly nextCursor: ProtocolOutcomeCursor | null;
+}
+
 // ------------------------------------------------------------ defaults
 
 function dtoDefaultProtocolPageMeta(): ProtocolPageMeta {
@@ -651,6 +745,144 @@ export function validateProtocolSessionPromptReceipt(value: ProtocolJson, path =
     run_id: dtoString(object, "run_id", path),
     accepted: dtoBool(object, "accepted", path),
     queued: dtoBool(object, "queued", path),
+  };
+}
+
+export function validateProtocolOutcomeMetrics(value: ProtocolJson, path = "ProtocolOutcomeMetrics"): ProtocolOutcomeMetrics {
+  const object = dtoObject(value, path);
+  const required = ["runs","verifiedChanges","verifiedFirstPassChanges","verifiedFirstPassPpm","totalVerifiedSpendMicro","verifiedCostPerChangeMicro","totalSpendMicro","totalReworkSpendMicro","reworkCostRatioPpm","localRuns","localSubstitutionPpm","avoidedHostedInferenceMicro","totalWallTimeMs","meanTimeToVerifiedChangeMs","humanInterventionRuns","humanInterventionPpm","rollbackRuns","regressionRollbackPpm","checksPassed","checksRequired","proofCoveragePpm","frontierEscalationRuns","frontierEscalationPpm","scanned","truncated"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    runs: dtoI64(object, "runs", path),
+    verifiedChanges: dtoI64(object, "verifiedChanges", path),
+    verifiedFirstPassChanges: dtoI64(object, "verifiedFirstPassChanges", path),
+    verifiedFirstPassPpm: dtoI64(object, "verifiedFirstPassPpm", path),
+    totalVerifiedSpendMicro: dtoString(object, "totalVerifiedSpendMicro", path),
+    verifiedCostPerChangeMicro: dtoString(object, "verifiedCostPerChangeMicro", path),
+    totalSpendMicro: dtoString(object, "totalSpendMicro", path),
+    totalReworkSpendMicro: dtoString(object, "totalReworkSpendMicro", path),
+    reworkCostRatioPpm: dtoI64(object, "reworkCostRatioPpm", path),
+    localRuns: dtoI64(object, "localRuns", path),
+    localSubstitutionPpm: dtoI64(object, "localSubstitutionPpm", path),
+    avoidedHostedInferenceMicro: dtoString(object, "avoidedHostedInferenceMicro", path),
+    totalWallTimeMs: dtoI64(object, "totalWallTimeMs", path),
+    meanTimeToVerifiedChangeMs: dtoI64(object, "meanTimeToVerifiedChangeMs", path),
+    humanInterventionRuns: dtoI64(object, "humanInterventionRuns", path),
+    humanInterventionPpm: dtoI64(object, "humanInterventionPpm", path),
+    rollbackRuns: dtoI64(object, "rollbackRuns", path),
+    regressionRollbackPpm: dtoI64(object, "regressionRollbackPpm", path),
+    checksPassed: dtoI64(object, "checksPassed", path),
+    checksRequired: dtoI64(object, "checksRequired", path),
+    proofCoveragePpm: dtoI64(object, "proofCoveragePpm", path),
+    frontierEscalationRuns: dtoI64(object, "frontierEscalationRuns", path),
+    frontierEscalationPpm: dtoI64(object, "frontierEscalationPpm", path),
+    scanned: dtoI64(object, "scanned", path),
+    truncated: dtoBool(object, "truncated", path),
+  };
+}
+
+export function validateProtocolRunOutcomeModelStep(value: ProtocolJson, path = "ProtocolRunOutcomeModelStep"): ProtocolRunOutcomeModelStep {
+  const object = dtoObject(value, path);
+  const required = ["provider","model","local","spendMicro"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    provider: dtoString(object, "provider", path),
+    model: dtoString(object, "model", path),
+    local: dtoBool(object, "local", path),
+    spendMicro: dtoString(object, "spendMicro", path),
+  };
+}
+
+export function validateProtocolRunOutcomeProof(value: ProtocolJson, path = "ProtocolRunOutcomeProof"): ProtocolRunOutcomeProof {
+  const object = dtoObject(value, path);
+  const required = ["checksPassed","checksRequired","coveragePpm"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    checksPassed: dtoI64(object, "checksPassed", path),
+    checksRequired: dtoI64(object, "checksRequired", path),
+    coveragePpm: dtoI64(object, "coveragePpm", path),
+  };
+}
+
+export function validateProtocolRunOutcomeChangeScale(value: ProtocolJson, path = "ProtocolRunOutcomeChangeScale"): ProtocolRunOutcomeChangeScale {
+  const object = dtoObject(value, path);
+  const required = ["files","addedLines","removedLines"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    files: dtoI64(object, "files", path),
+    addedLines: dtoI64(object, "addedLines", path),
+    removedLines: dtoI64(object, "removedLines", path),
+  };
+}
+
+export function validateProtocolRunOutcome(value: ProtocolJson, path = "ProtocolRunOutcome"): ProtocolRunOutcome {
+  const object = dtoObject(value, path);
+  const required = ["runId","sessionId","taskId","taskClass","riskClass","candidateSnapshot","finalSnapshot","accepted","integrated","verified","verifiedFirstAttempt","repairAttempts","modelSequence","modelSpendMicro","verificationSpendMicro","reworkSpendMicro","avoidedHostedMicro","wallTimeMs","humanInterventions","proof","changeScale","rollbackEvents","recoveryEvents","finalBasis","frontierEscalations","completedAtMs"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    runId: dtoString(object, "runId", path),
+    sessionId: dtoI64(object, "sessionId", path),
+    taskId: dtoI64(object, "taskId", path),
+    taskClass: dtoString(object, "taskClass", path),
+    riskClass: dtoString(object, "riskClass", path),
+    candidateSnapshot: dtoNullableString(object, "candidateSnapshot", path),
+    finalSnapshot: dtoString(object, "finalSnapshot", path),
+    accepted: dtoBool(object, "accepted", path),
+    integrated: dtoBool(object, "integrated", path),
+    verified: dtoBool(object, "verified", path),
+    verifiedFirstAttempt: dtoBool(object, "verifiedFirstAttempt", path),
+    repairAttempts: dtoI64(object, "repairAttempts", path),
+    modelSequence: dtoList(object, "modelSequence", path).map((item, index) => validateProtocolRunOutcomeModelStep(item, path + ".modelSequence[" + index + "]")),
+    modelSpendMicro: dtoString(object, "modelSpendMicro", path),
+    verificationSpendMicro: dtoString(object, "verificationSpendMicro", path),
+    reworkSpendMicro: dtoString(object, "reworkSpendMicro", path),
+    avoidedHostedMicro: dtoString(object, "avoidedHostedMicro", path),
+    wallTimeMs: dtoI64(object, "wallTimeMs", path),
+    humanInterventions: dtoI64(object, "humanInterventions", path),
+    proof: validateProtocolRunOutcomeProof(dtoRequired(object, "proof", path), path + ".proof"),
+    changeScale: validateProtocolRunOutcomeChangeScale(dtoRequired(object, "changeScale", path), path + ".changeScale"),
+    rollbackEvents: dtoI64(object, "rollbackEvents", path),
+    recoveryEvents: dtoI64(object, "recoveryEvents", path),
+    finalBasis: dtoString(object, "finalBasis", path),
+    frontierEscalations: dtoI64(object, "frontierEscalations", path),
+    completedAtMs: dtoI64(object, "completedAtMs", path),
+  };
+}
+
+export function validateProtocolOutcomeCursor(value: ProtocolJson, path = "ProtocolOutcomeCursor"): ProtocolOutcomeCursor {
+  const object = dtoObject(value, path);
+  const required = ["completedAtMs","runId"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    completedAtMs: dtoI64(object, "completedAtMs", path),
+    runId: dtoString(object, "runId", path),
+  };
+}
+
+export function validateProtocolOutcomesPage(value: ProtocolJson, path = "ProtocolOutcomesPage"): ProtocolOutcomesPage {
+  const object = dtoObject(value, path);
+  const required = ["metrics","runs","nextCursor"];
+  for (const key of required) {
+    dtoRequired(object, key, path);
+  }
+  return {
+    metrics: validateProtocolOutcomeMetrics(dtoRequired(object, "metrics", path), path + ".metrics"),
+    runs: dtoList(object, "runs", path).map((item, index) => validateProtocolRunOutcome(item, path + ".runs[" + index + "]")),
+    nextCursor: dtoRequired(object, "nextCursor", path) === null
+        ? null
+        : validateProtocolOutcomeCursor(dtoRequired(object, "nextCursor", path), path + ".nextCursor"),
   };
 }
 

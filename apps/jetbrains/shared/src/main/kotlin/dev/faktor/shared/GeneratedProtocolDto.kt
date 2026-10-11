@@ -180,6 +180,100 @@ data class ProtocolSessionPromptReceipt(
     val queued: Boolean
 )
 
+/** The Engineering Outcome Ledger's first-class aggregate metrics plus the fold's scan honesty (`scanned` / `truncated`). Money fields are decimal strings (`*Micro`); rates are integer ppm. (unknown_fields: ignore) */
+data class ProtocolOutcomeMetrics(
+    val runs: Long,
+    val verifiedChanges: Long,
+    val verifiedFirstPassChanges: Long,
+    val verifiedFirstPassPpm: Long,
+    val totalVerifiedSpendMicro: String,
+    val verifiedCostPerChangeMicro: String,
+    val totalSpendMicro: String,
+    val totalReworkSpendMicro: String,
+    val reworkCostRatioPpm: Long,
+    val localRuns: Long,
+    val localSubstitutionPpm: Long,
+    val avoidedHostedInferenceMicro: String,
+    val totalWallTimeMs: Long,
+    val meanTimeToVerifiedChangeMs: Long,
+    val humanInterventionRuns: Long,
+    val humanInterventionPpm: Long,
+    val rollbackRuns: Long,
+    val regressionRollbackPpm: Long,
+    val checksPassed: Long,
+    val checksRequired: Long,
+    val proofCoveragePpm: Long,
+    val frontierEscalationRuns: Long,
+    val frontierEscalationPpm: Long,
+    val scanned: Long,
+    val truncated: Boolean
+)
+
+/** One provider/model step of a completed run's execution sequence (money as a decimal string). (unknown_fields: ignore) */
+data class ProtocolRunOutcomeModelStep(
+    val provider: String,
+    val model: String,
+    val local: Boolean,
+    val spendMicro: String
+)
+
+/** One completed run's proof coverage: required checks, passed checks and the clamped coverage ppm. (unknown_fields: ignore) */
+data class ProtocolRunOutcomeProof(
+    val checksPassed: Long,
+    val checksRequired: Long,
+    val coveragePpm: Long
+)
+
+/** One completed run's changed-code scale. (unknown_fields: ignore) */
+data class ProtocolRunOutcomeChangeScale(
+    val files: Long,
+    val addedLines: Long,
+    val removedLines: Long
+)
+
+/** One completed run's wire projection in the Engineering Outcome Ledger page: identity, acceptance/integration/verification verdict, model sequence, spend (decimal-string money), wall time, interventions, proof, change scale, rollback/recovery counters and the final verification basis. (unknown_fields: ignore) */
+data class ProtocolRunOutcome(
+    val runId: String,
+    val sessionId: Long,
+    val taskId: Long,
+    val taskClass: String,
+    val riskClass: String,
+    val candidateSnapshot: String?,
+    val finalSnapshot: String,
+    val accepted: Boolean,
+    val integrated: Boolean,
+    val verified: Boolean,
+    val verifiedFirstAttempt: Boolean,
+    val repairAttempts: Long,
+    val modelSequence: List<ProtocolRunOutcomeModelStep>,
+    val modelSpendMicro: String,
+    val verificationSpendMicro: String,
+    val reworkSpendMicro: String,
+    val avoidedHostedMicro: String,
+    val wallTimeMs: Long,
+    val humanInterventions: Long,
+    val proof: ProtocolRunOutcomeProof,
+    val changeScale: ProtocolRunOutcomeChangeScale,
+    val rollbackEvents: Long,
+    val recoveryEvents: Long,
+    val finalBasis: String,
+    val frontierEscalations: Long,
+    val completedAtMs: Long
+)
+
+/** The composite oldest-key cursor of one Engineering Outcome Ledger page (`nextCursor`); absent (null) when the page was not full. (unknown_fields: ignore) */
+data class ProtocolOutcomeCursor(
+    val completedAtMs: Long,
+    val runId: String
+)
+
+/** Response of GET /native/outcomes: the durable metrics fold plus one bounded newest-first page of completed-run projections and the composite cursor older pages continue from (null when exhausted). (unknown_fields: ignore) */
+data class ProtocolOutcomesPage(
+    val metrics: ProtocolOutcomeMetrics,
+    val runs: List<ProtocolRunOutcome>,
+    val nextCursor: ProtocolOutcomeCursor?
+)
+
 // -------------------------------------------------------- parse functions
 
 fun parseProtocolMessage(v: JsonView): ProtocolMessage {
@@ -436,6 +530,107 @@ fun parseProtocolSessionPromptReceipt(v: JsonView): ProtocolSessionPromptReceipt
         runId = v.field("run_id").string(),
         accepted = v.field("accepted").bool(),
         queued = v.field("queued").bool()
+    )
+}
+
+fun parseProtocolOutcomeMetrics(v: JsonView): ProtocolOutcomeMetrics {
+    return ProtocolOutcomeMetrics(
+        runs = v.field("runs").long(),
+        verifiedChanges = v.field("verifiedChanges").long(),
+        verifiedFirstPassChanges = v.field("verifiedFirstPassChanges").long(),
+        verifiedFirstPassPpm = v.field("verifiedFirstPassPpm").long(),
+        totalVerifiedSpendMicro = v.field("totalVerifiedSpendMicro").string(),
+        verifiedCostPerChangeMicro = v.field("verifiedCostPerChangeMicro").string(),
+        totalSpendMicro = v.field("totalSpendMicro").string(),
+        totalReworkSpendMicro = v.field("totalReworkSpendMicro").string(),
+        reworkCostRatioPpm = v.field("reworkCostRatioPpm").long(),
+        localRuns = v.field("localRuns").long(),
+        localSubstitutionPpm = v.field("localSubstitutionPpm").long(),
+        avoidedHostedInferenceMicro = v.field("avoidedHostedInferenceMicro").string(),
+        totalWallTimeMs = v.field("totalWallTimeMs").long(),
+        meanTimeToVerifiedChangeMs = v.field("meanTimeToVerifiedChangeMs").long(),
+        humanInterventionRuns = v.field("humanInterventionRuns").long(),
+        humanInterventionPpm = v.field("humanInterventionPpm").long(),
+        rollbackRuns = v.field("rollbackRuns").long(),
+        regressionRollbackPpm = v.field("regressionRollbackPpm").long(),
+        checksPassed = v.field("checksPassed").long(),
+        checksRequired = v.field("checksRequired").long(),
+        proofCoveragePpm = v.field("proofCoveragePpm").long(),
+        frontierEscalationRuns = v.field("frontierEscalationRuns").long(),
+        frontierEscalationPpm = v.field("frontierEscalationPpm").long(),
+        scanned = v.field("scanned").long(),
+        truncated = v.field("truncated").bool()
+    )
+}
+
+fun parseProtocolRunOutcomeModelStep(v: JsonView): ProtocolRunOutcomeModelStep {
+    return ProtocolRunOutcomeModelStep(
+        provider = v.field("provider").string(),
+        model = v.field("model").string(),
+        local = v.field("local").bool(),
+        spendMicro = v.field("spendMicro").string()
+    )
+}
+
+fun parseProtocolRunOutcomeProof(v: JsonView): ProtocolRunOutcomeProof {
+    return ProtocolRunOutcomeProof(
+        checksPassed = v.field("checksPassed").long(),
+        checksRequired = v.field("checksRequired").long(),
+        coveragePpm = v.field("coveragePpm").long()
+    )
+}
+
+fun parseProtocolRunOutcomeChangeScale(v: JsonView): ProtocolRunOutcomeChangeScale {
+    return ProtocolRunOutcomeChangeScale(
+        files = v.field("files").long(),
+        addedLines = v.field("addedLines").long(),
+        removedLines = v.field("removedLines").long()
+    )
+}
+
+fun parseProtocolRunOutcome(v: JsonView): ProtocolRunOutcome {
+    return ProtocolRunOutcome(
+        runId = v.field("runId").string(),
+        sessionId = v.field("sessionId").long(),
+        taskId = v.field("taskId").long(),
+        taskClass = v.field("taskClass").string(),
+        riskClass = v.field("riskClass").string(),
+        candidateSnapshot = v.optionalField("candidateSnapshot")?.string(),
+        finalSnapshot = v.field("finalSnapshot").string(),
+        accepted = v.field("accepted").bool(),
+        integrated = v.field("integrated").bool(),
+        verified = v.field("verified").bool(),
+        verifiedFirstAttempt = v.field("verifiedFirstAttempt").bool(),
+        repairAttempts = v.field("repairAttempts").long(),
+        modelSequence = v.field("modelSequence").array().map { parseProtocolRunOutcomeModelStep(it) },
+        modelSpendMicro = v.field("modelSpendMicro").string(),
+        verificationSpendMicro = v.field("verificationSpendMicro").string(),
+        reworkSpendMicro = v.field("reworkSpendMicro").string(),
+        avoidedHostedMicro = v.field("avoidedHostedMicro").string(),
+        wallTimeMs = v.field("wallTimeMs").long(),
+        humanInterventions = v.field("humanInterventions").long(),
+        proof = parseProtocolRunOutcomeProof(v.field("proof")),
+        changeScale = parseProtocolRunOutcomeChangeScale(v.field("changeScale")),
+        rollbackEvents = v.field("rollbackEvents").long(),
+        recoveryEvents = v.field("recoveryEvents").long(),
+        finalBasis = v.field("finalBasis").string(),
+        frontierEscalations = v.field("frontierEscalations").long(),
+        completedAtMs = v.field("completedAtMs").long()
+    )
+}
+
+fun parseProtocolOutcomeCursor(v: JsonView): ProtocolOutcomeCursor {
+    return ProtocolOutcomeCursor(
+        completedAtMs = v.field("completedAtMs").long(),
+        runId = v.field("runId").string()
+    )
+}
+
+fun parseProtocolOutcomesPage(v: JsonView): ProtocolOutcomesPage {
+    return ProtocolOutcomesPage(
+        metrics = parseProtocolOutcomeMetrics(v.field("metrics")),
+        runs = v.field("runs").array().map { parseProtocolRunOutcome(it) },
+        nextCursor = v.optionalField("nextCursor")?.let { parseProtocolOutcomeCursor(it) }
     )
 }
 
