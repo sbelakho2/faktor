@@ -448,8 +448,10 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         )
         if (proof == null) return node
         // I04/VAL-LAND-2: the integration domain as its own facts (text +
-        // glyph), derived only from served proof members; a fact this DTO
-        // cannot distinguish stays an explicit unavailable, never a success.
+        // glyph) — Not integrated / Integrating / Conflict / Landed state
+        // matches verified state / Mismatch — derived only from served proof
+        // members; a fact the DTO cannot decide stays an explicit
+        // unavailable, never a success.
         for (fact in proof.integrationFacts()) {
             node.add(
                 DefaultMutableTreeNode(

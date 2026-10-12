@@ -112,7 +112,7 @@ when CI migrated (historical note only, no workflow files remain under
 | `docs` | linux/amd64 | `cargo doc --workspace --all-features --no-deps`; branding scan; docs-sync guard |
 | `soak-smoke` | linux/amd64 | per-release accelerated churn: `scripts/soak.sh --mode churn` runs the convergence churn workload for 1800 s (30–60 min band) with the mandatory quiescent-convergence checker; records `target/certification/soak.json`; a zero-test run, a missing metric sample or ANY failed convergence metric fails the lane |
 | `vscode` | linux/amd64 | `npm ci` + build; offline Faktor panel selftest; lockfile-pinned `vsce` VSIX; unzip + panel-surface verify + packaged selftest; IDE-load record (recorded skip when no `code` CLI exists) |
-| `vscode-e2e` | linux/amd64 | pinned VS Code tarball (version+commit+sha256 in `scripts/vscode-e2e.sh`) + real Extension Host smoke after `vscode`: extension activates, commands registered, compiled webview provider HTML carries the strict CSP and composer/attachment surface (no pixel comparison) |
+| `vscode-e2e` | linux/amd64 | pinned VS Code tarball (version+commit+sha256 in `scripts/vscode-e2e.sh`) + real Extension Host smoke after `vscode`: extension activates, commands registered, compiled webview provider HTML carries the strict CSP and composer/attachment surface (no pixel comparison); per-cell timeout derived from a same-run bounded Electron cold-start calibration with staged `progress.log` markers and typed timeout/kill reasons |
 | `jetbrains-build` | linux/amd64 | `./gradlew :frontend:buildPlugin --no-daemon --stacktrace` |
 | `jetbrains-smoke` | linux/amd64 | kotlinc split-mode compile + wire/native smokes against a real daemon |
 | `perf` | linux/amd64 | release `[perf]` gates; serialized after the other Rust lanes so budgets do not race a loaded agent |
@@ -1221,14 +1221,52 @@ fails with `unassigned`; an unconventional tag fails with
   the `--ozone-platform=headless --disable-gpu` fallback, with `--no-sandbox`
   as root). A host exit without an evidence file is always a failure and the
   harness folds captured host stdout, VS Code main/renderer/exthost logs and
-  crashdumps into `failure-diagnostic.txt` (no silent pass). Exact coverage is recorded in `target/certification/vscode-e2e.json`:
+  crashdumps into `failure-diagnostic.txt` (no silent pass).
+  - **Load-aware host timeout (emulated/VM runners).** Emulated x64
+    (Rosetta/VM) runners stretch Electron cold start and every in-host wait,
+    so the per-cell `timeout` is derived from a same-run control instead of
+    trusting the constant. A BOUNDED calibration launch of the same pinned
+    Electron host through the same launch path and Xvfb facility
+    (`scripts/vscode-e2e/calibration-host.cjs`,
+    `FAKTOR_VSCODE_E2E_CALIBRATION_TIMEOUT` default 900 s) runs immediately
+    before the cells and measures wall time to extension activation. The
+    derivation is `effective = min(max(requested, ceil(control_s) * factor),
+    cap)`: `--timeout` (default 600 s) is a floor that is never shrunk,
+    `FAKTOR_VSCODE_E2E_TIMEOUT_FACTOR` (default 30) is the documented full
+    capability battery / cold-start ratio on the product runner, and
+    `FAKTOR_VSCODE_E2E_TIMEOUT_CAP` (default 3600 s) is the hard ceiling.
+    The smoke module's bounded CDP/panel waits scale by
+    `control / FAKTOR_VSCODE_E2E_CALIBRATION_NOMINAL_MS` (default 4000 ms,
+    clamped to 16x). Every figure (control_ms, wait_factor,
+    effective_seconds, cap) is recorded in the `timeout` field of
+    `target/certification/vscode-e2e.json`. A calibration host that cannot
+    reach activation inside its bounded window fails the lane typed
+    (`extension-host-calibration-failed`) with diagnostics; no timeout is
+    ever guessed. A bogus policy (zero/negative/unparseable) is refused
+    before any host launch (`timeout-policy-invalid`).
+  - **Staged markers + typed kill attribution.** `download`, `unpack`,
+    `Xvfb up`, `electron spawn`, `host module live`, `extension activate`,
+    `matrix`, `verdict` markers are appended to `progress.log` under the
+    evidence work dir and each cell dir, so a kill is attributable to the
+    stage that was running. An evidence-less host exits typed:
+    `extension-host-timeout` (rc 124, load-aware `timeout` fired),
+    `extension-host-killed` (rc 137/143) or `extension-host-no-evidence`
+    (other rc), each folding the captured diagnostics and last stage into
+    the lane reason. The host process group and its Xvfb are TERM/KILL
+    reaped deterministically on every exit path and at harness exit; a
+    failed or killed cell is NEVER retried (the only retry in the lane is
+    curl's transport-level `--retry 3` for the tarball download).
+  - Exact coverage is recorded in `target/certification/vscode-e2e.json`:
   it does NOT prove rendered pixels/screenshots, a displayed workbench
   UI/WebviewView, or live daemon connectivity — the record carries that
   `does_not_prove` list verbatim. The lane runs on the digest-pinned
   Playwright image (Chromium runtime libraries), NOT on `node:24` (which
   lacks them and cannot start the Electron host). `bash scripts/vscode-e2e.sh
-  --selftest` proves the pin-tamper, missing-evidence, failed-check, wrong-
-  version and CLI-only cases without network or a real Electron.
+  --selftest` proves the pin-tamper, missing-evidence, running,
+  calibration-timeout/bad-status, loaded-timeout derivation, cell
+  timeout/killed, policy, failed-check, wrong-version, CLI-only and
+  packaged-VSIX cases without network or a real Electron (Linux-only; run it
+  in the pinned image like the lane).
 - **Windows visual baseline (`scripts/windows-visual-baseline.ps1`).** The
   `windows-visual-baseline` step runs on the self-hosted Windows agent and is
   part of `certificate-windows`. It FAILS when the pinned baseline has no
@@ -1315,7 +1353,7 @@ profile).
 | Linux lane | fmt/check/test/clippy/doctor | Woodpecker `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | Woodpecker `vscode` job | CI-LANE (shell IMPLEMENTED; `apps/vscode/src/extension.ts`) |
 | VS Code Faktor panel | hand-written panel (`apps/vscode/media/chat.js`, `chat.css`, `composer-state.js`) + provider (`apps/vscode/src/webview.ts`) | `node scripts/selftest.mjs` + `node scripts/verify-vsix.mjs` + Woodpecker `vscode` job; §2.10 | CI-LANE (Faktor-owned, no vendored closure; a real-IDE screenshot comparison stays a host capability not claimed offline) |
-| VS Code Extension Host E2E | pinned VS Code `1.140.0`/commit `07f806f9…`/sha256 `d32031e9…` + `scripts/vscode-e2e/extension-host-smoke.cjs` inside the real host | trusted `vscode-e2e` lane; `target/certification/vscode-e2e.json` (exact `does_not_prove` list) | CI-LANE (real host activation + registered commands + compiled webview HTML surface; NOT rendered pixels or a displayed workbench) |
+| VS Code Extension Host E2E | pinned VS Code `1.140.0`/commit `07f806f9…`/sha256 `d32031e9…` + `scripts/vscode-e2e/extension-host-smoke.cjs` inside the real host; per-cell timeout from a same-run Electron cold-start calibration (`timeout` field) | trusted `vscode-e2e` lane; `target/certification/vscode-e2e.json` (exact `does_not_prove` list) | CI-LANE (real host activation + registered commands + compiled webview HTML surface; NOT rendered pixels or a displayed workbench) |
 | JetBrains bridge | kotlinc `apps/jetbrains/compile-and-smoke.sh` (lifecycle + native + parity smokes); Gradle plugin build + verifier vs IC-2024.1.7 | Woodpecker `jetbrains-*` jobs / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier + parity smokes PASS locally 2026-09-13) |
 | JetBrains behavioral parity | executable parity matrix (`target/certification/jetbrains-parity.json`, behavioral axis) (generated) | `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParityMatrix.kt` + `apps/jetbrains/frontend/src/test/kotlin/dev/faktor/frontend/JetBrainsParitySmoke.kt`; 11/11 rows against canned frames AND the fake daemon; emitted by `bash apps/jetbrains/compile-and-smoke.sh` | IMPLEMENTED (HEAD-bound artifact; the smoke alone is not the claim) |
 | JetBrains visual parity | executable parity matrix (`target/certification/jetbrains-parity.json` (generated), visual axis) | offscreen Swing render + component-tree/state digest vs pinned `apps/jetbrains/frontend/src/test/resources/parity/visual-baselines.json`; 8 panels; pinned font env (`parity/fonts/core-fonts.conf` via `FONTCONFIG_FILE`); regenerated only with `bash apps/jetbrains/compile-and-smoke.sh --write-baselines`; the Windows platform record is gated by `scripts/windows-visual-baseline.ps1` | IMPLEMENTED (offline component-tree/state comparison on linux/macos; a real-IDE screenshot comparison stays a host capability not claimed here; windows is NOT certified until the Windows agent records its own record) |

@@ -488,7 +488,13 @@ steps:
   # does not display the workbench UI (the record states its exact coverage).
   # This image is digest-pinned because the Electron extension host needs the
   # Chromium runtime libraries, which the node:24 baseline does not ship and
-  # which are installed via NO apt step here.
+  # which are installed via NO apt step here. The per-cell timeout is derived
+  # from a same-run bounded Electron cold-start calibration
+  # (scripts/vscode-e2e/calibration-host.cjs, seeded by the launch path and
+  # Xvfb facility the real cells use), so emulated/loaded runners absorb
+  # startup stretch up to the documented cap; timeout/kill exits are typed
+  # (extension-host-timeout/killed) with staged progress.log markers folded
+  # into the diagnostics, and a failed cell is never retried or downgraded.
   - name: vscode-e2e
     image: mcr.microsoft.com/playwright:v1.55.0-noble@sha256:ffc33305f7b4b04057ae4a0caa70aad4fde87454fb403a1a22e7f931707dfcf9 # linux/amd64 manifest of playwright:v1.55.0-noble (lane requires genuine x86_64; Rosetta runs it on arm64 hosts)
     depends_on: [vscode]

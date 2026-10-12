@@ -2004,6 +2004,9 @@ object FrontendSmoke {
             assertEquals(CriterionVerdictTone.UNAVAILABLE, unavailableRow.tone)
             assertEquals("daemon", unavailableRow.bindingSource)
             assertEquals("no objective mechanism", unavailableRow.bindingDetail)
+            // T15: the claim has no served verdict, so the exact supporting
+            // sentence is rendered (never a pass, never a color-only cue).
+            assertEquals("No verdict is served for this claim.", unavailableRow.noVerdictCopy)
             assertTrue(!unavailableRow.snapshot.contains("unavailable"), unavailableRow.snapshot)
             assertTrue(
                 !unavailableRow.verificationTimestamp.contains("unavailable"),
@@ -2017,12 +2020,14 @@ object FrontendSmoke {
             assertEquals("file:src/legacy.rs", legacy.bindingReference)
             assertEquals("pass", legacy.verdict)
             assertTrue(legacy.unavailable.isNotEmpty(), legacy.unavailable.toString())
+            assertEquals(null, legacy.noVerdictCopy)
             // The explicit task criterion has no record verdict: unavailable,
             // with the precise reason — never a fabricated pass.
             val explicit = byKey["criterion A"] ?: fail("the explicit criterion must render a proof row")
             assertEquals("unavailable", explicit.verdict)
             assertEquals("unavailable", explicit.bindingKind)
             assertEquals(CriterionVerdictTone.UNAVAILABLE, explicit.tone)
+            assertEquals("No verdict is served for this claim.", explicit.noVerdictCopy)
             assertTrue(
                 explicit.verdictReason?.contains("no durable verification record") == true,
                 explicit.verdictReason
@@ -2090,6 +2095,18 @@ object FrontendSmoke {
                 labels.any { it.startsWith("[unavailable] criterion A") },
                 labels.toString()
             )
+            // T15 copy pin: every claim with no served verdict renders the
+            // exact sentence in BOTH per-claim surfaces (tree label + card).
+            assertTrue(
+                labels.any { it.contains("No verdict is served for this claim.") },
+                labels.toString()
+            )
+            val verificationPanel = VerificationPanel()
+            verificationPanel.updateModel(model)
+            assertTrue(
+                textsOf(verificationPanel).contains("No verdict is served for this claim."),
+                textsOf(verificationPanel).toString()
+            )
             assertTrue(
                 panel.criterionColor(CriterionVerdictTone.PASS) !=
                     panel.criterionColor(CriterionVerdictTone.FAIL),
@@ -2120,6 +2137,7 @@ object FrontendSmoke {
             for (row in model.criteriaProof) {
                 assertEquals("unavailable", row.verdict)
                 assertEquals(CriterionVerdictTone.UNAVAILABLE, row.tone)
+                assertEquals("No verdict is served for this claim.", row.noVerdictCopy)
                 assertTrue(row.unavailable.contains("verdict"), row.unavailable.toString())
                 assertTrue(row.unavailable.contains("binding"), row.unavailable.toString())
                 assertTrue(row.verdictReason?.contains("no durable verification record") == true, row.verdictReason)
@@ -2202,6 +2220,12 @@ object FrontendSmoke {
             val candidateRow = panel.summaryText("Verification")
             assertTrue(candidateRow.startsWith("Candidate checks passed"), candidateRow)
             assertTrue(!candidateRow.contains("Verified"), candidateRow)
+            // I04/VAL-LAND-2: with no proof read the integration row stays an
+            // explicit missing value, never a positive fact.
+            assertEquals(
+                "No integration facts are served for this run yet",
+                panel.summaryText("Integration")
+            )
             // A served but unverified proof keeps the candidate wording and
             // never borrows the verified one.
             panel.updateModel(
@@ -2230,6 +2254,9 @@ object FrontendSmoke {
             val unavailableRow = panel.summaryText("Verification")
             assertTrue(unavailableRow.startsWith("Verification unavailable"), unavailableRow)
             assertTrue(unavailableRow.contains("landed_snapshot mismatch"), unavailableRow)
+            // The integration row carries its own fact: the served mismatch
+            // is named, never collapsed into the verification wording.
+            assertEquals("✗ Mismatch", panel.summaryText("Integration"))
             // Only the strict verified proof renders the verified wording.
             panel.updateModel(
                 TaskTree.build(
@@ -2241,6 +2268,10 @@ object FrontendSmoke {
             assertTrue(
                 panel.summaryText("Verification").startsWith("Verified"),
                 panel.summaryText("Verification")
+            )
+            assertEquals(
+                "✓ Landed state matches verified state",
+                panel.summaryText("Integration")
             )
             // A completed run without verified proof stays neutral: the bare
             // state token never derives the positive tint.
@@ -2330,6 +2361,18 @@ object FrontendSmoke {
             assertEquals("pr-42", proof.pullRequestId)
             assertEquals(BigInteger.valueOf(12L), proof.spentCostMicro)
             assertEquals(2, proof.steps.size)
+            // The served `integration` block parses additively (I04 /
+            // VAL-LAND-2) with the exact VS Code integration DTO shape.
+            val integration = proof.integration ?: fail("the served integration block must parse")
+            assertEquals(true, integration.present)
+            assertEquals(false, integration.inFlight)
+            assertEquals("run-1", integration.runId)
+            assertEquals("tm1:bbb", integration.finalSnapshotHash)
+            assertEquals("tm1:bbb", integration.landedSnapshot)
+            assertEquals(1L, integration.integratedFileCount)
+            assertEquals(0L, integration.conflictCount)
+            assertEquals("blake3:x", integration.txn?.txnId)
+            assertEquals("landed", integration.txn?.phase)
 
             val model = TaskTree.build(task = task, proof = proof)
             val view = model.proof ?: fail("a served proof must build the view")
@@ -2381,6 +2424,137 @@ object FrontendSmoke {
             )
             assertTrue(!unavailableText.contains("VERIFIED "), unavailableText)
             assertTrue(!unavailableText.contains("verified==landed: yes"), unavailableText)
+            // The distinct integration facts: a landed/verified mismatch stays
+            // a separate, explicit fact — never a success.
+            assertEquals(listOf("✗ Mismatch"), unavailable.integrationFacts())
+
+            // No landed identity is served: the candidate has not landed, so
+            // the honest T18 fact is `Not integrated` (the served
+            // `trees.landed` is only set from a non-empty landed snapshot).
+            val notIntegrated = TaskTree.build(
+                task = task,
+                proof = parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        "\"landed\":\"tm1:bbb\",\"landedEqualsVerified\":true",
+                        "\"landed\":null,\"landedEqualsVerified\":null"
+                    )
+                )
+            ).proof ?: fail("not-integrated proof view")
+            assertEquals(listOf("○ Not integrated"), notIntegrated.integrationFacts())
+
+            // The daemon's served in-flight integration marker (an
+            // `integration_record` unavailable entry) renders `Integrating`,
+            // never `Not integrated`.
+            val integrating = TaskTree.build(
+                task = task,
+                proof = parseNativeTaskProof(
+                    TASK_PROOF_JSON
+                        .replace(
+                            "\"landed\":\"tm1:bbb\",\"landedEqualsVerified\":true",
+                            "\"landed\":null,\"landedEqualsVerified\":null"
+                        )
+                        .replace(
+                            "\"unavailable\":[]",
+                            "\"unavailable\":[{\"component\":\"integration_record\"," +
+                                "\"kind\":\"unavailable\",\"reason\":\"the integration record " +
+                                "is still in flight (no landed snapshot yet)\"}]"
+                        )
+                )
+            ).proof ?: fail("integrating proof view")
+            assertEquals(listOf("… Integrating"), integrating.integrationFacts())
+
+            // A served integration record with recorded conflicts renders the
+            // distinct `Conflict` fact (never folded into landed/mismatch),
+            // exactly like the VS Code integration view.
+            val conflictedModel = TaskTree.build(
+                task = task,
+                proof = parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace("\"conflictCount\":0", "\"conflictCount\":1")
+                )
+            )
+            val conflicted = conflictedModel.proof ?: fail("conflicted proof view")
+            assertEquals(listOf("! Conflict"), conflicted.integrationFacts())
+            val conflictPanel = TaskTreePanel()
+            conflictPanel.update(conflictedModel)
+            val conflictChildren = childLabelsOf(conflictPanel, "goal/section:proof")
+            assertTrue(
+                conflictChildren.contains("integration: ! Conflict"),
+                conflictChildren.toString()
+            )
+
+            // The PARSED `integration.inFlight` marker renders `Integrating`
+            // (the same fact as the legacy unavailable marker above).
+            val inFlightView = TaskTree.build(
+                task = task,
+                proof = parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace("\"inFlight\":false", "\"inFlight\":true")
+                )
+            ).proof ?: fail("in-flight proof view")
+            assertEquals(listOf("… Integrating"), inFlightView.integrationFacts())
+
+            // The served record's own `present=false` is the T18
+            // `Not integrated` state.
+            val presentFalse = TaskTree.build(
+                task = task,
+                proof = parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        "\"integration\":{\"present\":true",
+                        "\"integration\":{\"present\":false"
+                    )
+                )
+            ).proof ?: fail("present=false proof view")
+            assertEquals(listOf("○ Not integrated"), presentFalse.integrationFacts())
+
+            // Malformed integration members refuse the parse loudly (never a
+            // fabricated state): a non-boolean `present` ...
+            try {
+                parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        "\"integration\":{\"present\":true",
+                        "\"integration\":{\"present\":\"yes\""
+                    )
+                )
+                fail("a non-boolean integration.present must fail loudly")
+            } catch (e: NativeProtocolException) {
+                assertTrue(
+                    e.message?.contains("integration.present") == true,
+                    e.message ?: "(no message)"
+                )
+            }
+            // ... and a served txn without its required phase.
+            try {
+                parseNativeTaskProof(
+                    TASK_PROOF_JSON.replace(
+                        "\"txn\":{\"txnId\":\"blake3:x\",\"phase\":\"landed\"}",
+                        "\"txn\":{\"txnId\":\"blake3:x\"}"
+                    )
+                )
+                fail("a txn without phase must fail loudly")
+            } catch (e: NativeProtocolException) {
+                assertTrue(
+                    e.message?.contains("integration.txn") == true &&
+                        e.message?.contains("phase") == true,
+                    e.message ?: "(no message)"
+                )
+            }
+
+            // An ABSENT block stays null (a legacy daemon): no fabricated
+            // record, and the legacy tree-derived fact still renders.
+            val absentBlock = parseNativeTaskProof(
+                TASK_PROOF_JSON.replace("\"integration\":{", "\"integration_legacy\":{")
+            )
+            assertEquals(null, absentBlock.integration)
+            val absentView = TaskTree.build(task = task, proof = absentBlock).proof
+                ?: fail("absent-block proof view")
+            assertEquals(
+                listOf("✓ Landed state matches verified state"),
+                absentView.integrationFacts()
+            )
+            assertTrue(
+                absentView.integrationFacts()
+                    .none { it.contains("Conflict") || it.contains("Integrating") },
+                absentView.integrationFacts().toString()
+            )
 
             // A failed read (the client refused the payload) is the same
             // explicit unavailable state: the reason is surfaced verbatim.
@@ -2398,6 +2572,10 @@ object FrontendSmoke {
                 refused.reason ?: "(none)"
             )
             assertTrue(!refused.summaryText().contains("VERIFIED "), refused.summaryText())
+            assertEquals(
+                listOf("? Integration unavailable — proof read failed: corrupt_durable_state"),
+                refused.integrationFacts()
+            )
 
             // The drill-down route parses a missing step honestly.
             val steps = parseNativeTaskCompletionSteps(COMPLETION_STEPS_JSON)
@@ -4716,6 +4894,27 @@ private fun collectTexts(component: java.awt.Component, out: MutableList<String>
 private fun textsOf(component: java.awt.Component): List<String> {
     val out = ArrayList<String>()
     collectTexts(component, out)
+    return out
+}
+
+/** The labels of every direct child of the tree node at [keyPath] (smoke). */
+private fun childLabelsOf(panel: TaskTreePanel, keyPath: String): List<String> {
+    val root = panel.treeForTest().model.root as? DefaultMutableTreeNode ?: return emptyList()
+    fun walk(node: DefaultMutableTreeNode): DefaultMutableTreeNode? {
+        if (panel.nodeKeyPathForTest(node) == keyPath) return node
+        for (index in 0 until node.childCount) {
+            val found = walk(node.getChildAt(index) as DefaultMutableTreeNode)
+            if (found != null) return found
+        }
+        return null
+    }
+    val node = walk(root) ?: return emptyList()
+    val out = ArrayList<String>()
+    for (index in 0 until node.childCount) {
+        val child = node.getChildAt(index) as DefaultMutableTreeNode
+        val payload = child.userObject as? TaskTreeNode ?: continue
+        out.add(payload.label)
+    }
     return out
 }
 
