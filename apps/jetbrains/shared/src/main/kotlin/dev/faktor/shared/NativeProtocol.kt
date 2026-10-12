@@ -1227,6 +1227,36 @@ data class NativeProofUnavailable(
 )
 
 /**
+ * The served integration transaction (`integration.txn`): identity and
+ * durable phase only — the strict VS Code integration DTO contract. Extra
+ * wire members stay ignored (the additive contract).
+ */
+data class NativeIntegrationTxn(
+    val txnId: String,
+    val phase: String
+)
+
+/**
+ * The served `integration` block of the strict proof summary (I04 /
+ * VAL-LAND-2), typed exactly like the VS Code integration DTO: `present`
+ * is the served record presence, `inFlight` an integration record whose
+ * final snapshot is not written yet, `conflictCount > 0` a recorded
+ * integration conflict. Nullable members are honest absences. An ABSENT
+ * block (a daemon predating it) stays a null [NativeTaskProof.integration]
+ * — never a fabricated record.
+ */
+data class NativeIntegrationRecord(
+    val present: Boolean,
+    val inFlight: Boolean?,
+    val runId: String?,
+    val finalSnapshotHash: String?,
+    val landedSnapshot: String?,
+    val integratedFileCount: Long?,
+    val conflictCount: Long?,
+    val txn: NativeIntegrationTxn?
+)
+
+/**
  * `GET /native/tasks/{id}/proof?session=<sid>`: the full VERIFIED story in
  * one strict payload (`faktor-task-proof/v1`). `proofState` is the daemon's
  * own verdict — `verified` only when the whole durable chain backs it,
@@ -1264,6 +1294,8 @@ data class NativeTaskProof(
     val gateStatus: String?,
     val gateReason: String?,
     val steps: List<NativeProofStep>,
+    /** The served `integration` block; null when the daemon serves none. */
+    val integration: NativeIntegrationRecord? = null,
     val unavailable: List<NativeProofUnavailable>
 )
 
@@ -2487,6 +2519,28 @@ private fun reviewerText(v: JsonView): String? {
 private fun parseLandedEquals(v: JsonView): Boolean? =
     v.optionalField("landedEqualsVerified")?.let { it.bool() }
 
+private fun parseIntegrationTxn(v: JsonView): NativeIntegrationTxn = NativeIntegrationTxn(
+    txnId = v.field("txnId").string(),
+    phase = v.field("phase").string()
+)
+
+/**
+ * The `integration` block, strictly-but-additively: every PARSED member
+ * refuses a wrong-typed wire value (like the sibling proof members) while
+ * unknown extra members stay ignored (the VS Code integration DTO
+ * contract). The block itself is optional for this parser.
+ */
+private fun parseIntegration(v: JsonView): NativeIntegrationRecord = NativeIntegrationRecord(
+    present = v.field("present").bool(),
+    inFlight = v.optionalField("inFlight")?.bool(),
+    runId = v.optionalField("runId")?.string(),
+    finalSnapshotHash = v.optionalField("finalSnapshotHash")?.string(),
+    landedSnapshot = v.optionalField("landedSnapshot")?.string(),
+    integratedFileCount = v.optionalField("integratedFileCount")?.long(),
+    conflictCount = v.optionalField("conflictCount")?.long(),
+    txn = v.optionalField("txn")?.let { parseIntegrationTxn(it) }
+)
+
 /**
  * `GET /native/tasks/{id}/proof?session=<sid>` — strict parse of the
  * `faktor-task-proof/v1` payload. `proofState` is preserved verbatim (the
@@ -2538,6 +2592,7 @@ fun parseNativeTaskProof(json: String): NativeTaskProof {
         gateStatus = gate.optionalField("status")?.string(),
         gateReason = gate.optionalField("reason")?.let { jsonText(it) },
         steps = completion.field("steps").array().map { parseProofStep(it) },
+        integration = v.optionalField("integration")?.let { parseIntegration(it) },
         unavailable = v.field("unavailable").array().map { parseProofUnavailable(it) }
     )
 }

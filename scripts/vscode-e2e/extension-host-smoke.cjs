@@ -59,15 +59,49 @@ const check = (name, condition, detail) => {
 };
 
 const evidencePath = process.env.FAKTOR_VSCODE_E2E_EVIDENCE || '';
+const progressPath = process.env.FAKTOR_VSCODE_E2E_PROGRESS || '';
 const cdpPort = Number(process.env.FAKTOR_VSCODE_E2E_CDP_PORT || '0');
 const matrixMode = process.env.FAKTOR_VSCODE_E2E_MATRIX || 'full';
 const expectDpr = Number(process.env.FAKTOR_VSCODE_E2E_EXPECT_DPR || '1');
 const packageMode = process.env.FAKTOR_VSCODE_E2E_PACKAGE_MODE || 'dev';
 const cellLabel = process.env.FAKTOR_VSCODE_E2E_CELL || matrixMode;
 
+// Load-aware wait scaling: the harness derives a same-run wait factor from a
+// bounded calibration launch (scripts/vscode-e2e/calibration-host.cjs) and
+// passes it here. Every bounded wait/timeout in this module is scaled by it
+// (settling sleeps are not), so an emulated/loaded runner stretches time
+// budgets instead of flipping a check red. The default of 1 keeps the
+// documented product-runner behavior when no calibration is provided.
+const waitFactor = Math.max(
+  1,
+  Math.min(16, Number(process.env.FAKTOR_VSCODE_E2E_WAIT_FACTOR || '1') || 1),
+);
+const scaled = (ms) => Math.round(ms * waitFactor);
+
+// Staged progress markers (see scripts/vscode-e2e.sh): appended to the
+// harness-owned progress log under the evidence dir so a killed cell is
+// attributable to the exact stage that was running. A failed marker write is
+// never allowed to mask the verdict: markers are diagnostics only.
+function progressStage(stage, detail) {
+  if (!progressPath) return;
+  try {
+    fs.appendFileSync(
+      progressPath,
+      `${new Date().toISOString()} stage=${stage}${detail ? ` ${String(detail).slice(0, 200)}` : ''}\n`,
+    );
+  } catch {
+    /* diagnostics only */
+  }
+}
+
 const matrix = {
   enabled: cdpPort > 0,
   cell: { label: cellLabel, mode: matrixMode, expected_dpr: expectDpr, package_mode: packageMode },
+  load_aware: {
+    wait_factor: waitFactor,
+    host_timeout_seconds: Number(process.env.FAKTOR_VSCODE_E2E_TIMEOUT_SECONDS || '0'),
+    calibration_control_ms: Number(process.env.FAKTOR_VSCODE_E2E_CALIBRATION_MS || '0'),
+  },
   cdp: { connected: false, transport: 'Chrome DevTools Protocol over 127.0.0.1' },
   capabilities: {},
   not_emulatable: [
@@ -111,6 +145,7 @@ const fatal = (kind, error) => {
     console.error(`post-verdict ${kind} after the recorded verdict (ignored):`, error);
     return;
   }
+  progressStage('fatal', kind);
   try {
     writeEvidence('failed', error);
   } catch {
@@ -196,7 +231,7 @@ async function connectMatrixTarget(token, timeoutMs) {
   while (Date.now() < deadline) {
     let targets;
     try {
-      targets = await fetchJson(`http://127.0.0.1:${cdpPort}/json/list`, 5000);
+      targets = await fetchJson(`http://127.0.0.1:${cdpPort}/json/list`, scaled(5000));
     } catch (error) {
       lastError = String(error && error.message);
       await wait(400);
@@ -208,7 +243,7 @@ async function connectMatrixTarget(token, timeoutMs) {
     for (const candidate of candidates) {
       let connection = null;
       try {
-        connection = await cdpConnect(candidate.webSocketDebuggerUrl, 6000);
+        connection = await cdpConnect(candidate.webSocketDebuggerUrl, scaled(6000));
         await connection.send('Runtime.enable');
         await wait(400);
         const contexts = connection.events
@@ -424,6 +459,17 @@ async function runMatrix(vscode, ext, providerModule) {
   const host = {
     handle(message) {
       hostMessages.push(message);
+      // Production-mirroring ready handshake: the real extension re-posts the
+      // current snapshot when the webview reports `ready`
+      // (extension.ts handleWebviewMessage `ready` -> postSnapshot). A
+      // snapshot posted at resolveWebviewView time can precede chat.js's
+      // message listener and be dropped by the workbench webview host (the
+      // pinned pre script only queues while no frame is active), so the test
+      // host re-posts exactly like the product path. postSnapshot is
+      // idempotent (a full re-render from state).
+      if (message && message.type === 'ready' && provider && provider.snapshot) {
+        provider.postSnapshot(provider.snapshot);
+      }
     },
   };
   matrix.capabilities.zoom = {
@@ -450,11 +496,11 @@ async function runMatrix(vscode, ext, providerModule) {
   const first = createTestPanel(vscode, extensionUri, firstToken, sink);
   provider.resolveWebviewView(first.view);
   provider.postSnapshot(matrixSnapshot());
-  const ready = await waitForPanelMessage(sink, firstToken, 'ready', 15000);
+  const ready = await waitForPanelMessage(sink, firstToken, 'ready', scaled(15000));
   check(`matrix:${cellLabel}:webview-booted`, ready !== null, 'chat.js must post ready inside the real webview');
   await wait(600);
 
-  const target = await connectMatrixTarget(firstToken, 20000);
+  const target = await connectMatrixTarget(firstToken, scaled(20000));
   matrix.cdp.connected = true;
   matrix.cdp.target = 'out-of-process iframe (vscode-webview)';
   let liveConnection = target.connection;
@@ -467,7 +513,7 @@ async function runMatrix(vscode, ext, providerModule) {
       return await evaluate(liveConnection, liveContext, expression);
     } catch (error) {
       matrix.errors.push(`cdp-reconnect after evaluate: ${error && error.message}`);
-      const reconnected = await connectMatrixTarget(firstToken, 15000);
+      const reconnected = await connectMatrixTarget(firstToken, scaled(15000));
       try {
         liveConnection.close();
       } catch {
@@ -490,7 +536,7 @@ async function runMatrix(vscode, ext, providerModule) {
           modifiers: modifiers || 0,
         });
       } catch {
-        const reconnected = await connectMatrixTarget(firstToken, 15000);
+        const reconnected = await connectMatrixTarget(firstToken, scaled(15000));
         try {
           liveConnection.close();
         } catch {
@@ -512,7 +558,7 @@ async function runMatrix(vscode, ext, providerModule) {
       try {
         await liveConnection.send('Input.insertText', { text });
       } catch {
-        const reconnected = await connectMatrixTarget(firstToken, 15000);
+        const reconnected = await connectMatrixTarget(firstToken, scaled(15000));
         try {
           liveConnection.close();
         } catch {
@@ -750,10 +796,10 @@ async function measureWidths(ev, baselineInner) {
 }
 
 async function cdpPageTarget() {
-  const targets = await fetchJson(`http://127.0.0.1:${cdpPort}/json/list`, 5000);
+  const targets = await fetchJson(`http://127.0.0.1:${cdpPort}/json/list`, scaled(5000));
   const page = targets.find((target) => target.type === 'page' && target.webSocketDebuggerUrl);
   assert(page, 'the workbench page target must expose a CDP websocket');
-  const connection = await cdpConnect(page.webSocketDebuggerUrl, 6000);
+  const connection = await cdpConnect(page.webSocketDebuggerUrl, scaled(6000));
   return { connection };
 }
 
@@ -927,13 +973,28 @@ async function measureThemes(vscode, ev) {
 async function measureDisposalReopen(vscode, extensionUri, ChatViewProvider, sink) {
   const events = [];
   let provider = null;
+  // Host-owned attachment state, retained across dispose/reopen exactly like
+  // the product host retains it.
+  const retainedAttachments = [
+    { id: 'att-1', filename: 'spec.pdf', mime: 'application/pdf', bytes: 8, isImage: false, refusal: null },
+  ];
   const host = {
-    handle() {},
+    handle(message) {
+      // Production-mirroring ready handshake (see runMatrix): the reopened
+      // webview's `ready` re-delivers the retained snapshot and the
+      // host-owned attachments. Without it, a resolve-time post that wins
+      // the race against chat.js's listener is lost and the reopened view
+      // renders its empty defaults (title `none`, no attachments).
+      if (message && message.type === 'ready' && provider) {
+        if (provider.snapshot) {
+          provider.postSnapshot(provider.snapshot);
+        }
+        provider.postAttachments(retainedAttachments);
+      }
+    },
     onViewResolved() {
       events.push('resolved');
-      provider.postAttachments([
-        { id: 'att-1', filename: 'spec.pdf', mime: 'application/pdf', bytes: 8, isImage: false, refusal: null },
-      ]);
+      provider.postAttachments(retainedAttachments);
     },
   };
   provider = new ChatViewProvider(extensionUri, host);
@@ -941,10 +1002,10 @@ async function measureDisposalReopen(vscode, extensionUri, ChatViewProvider, sin
   const panelA = createTestPanel(vscode, extensionUri, tokenA, sink);
   provider.resolveWebviewView(panelA.view);
   provider.postSnapshot(matrixSnapshot());
-  const readyA = await waitForPanelMessage(sink, tokenA, 'ready', 12000);
+  const readyA = await waitForPanelMessage(sink, tokenA, 'ready', scaled(12000));
   check(`matrix:${cellLabel}:disposal-first-view-booted`, readyA !== null, 'first view must boot');
   await wait(600);
-  const firstTarget = await connectMatrixTarget(tokenA, 15000);
+  const firstTarget = await connectMatrixTarget(tokenA, scaled(15000));
   const titleA = await evaluate(firstTarget.connection, firstTarget.contextId, 'document.getElementById("session-title").textContent');
   firstTarget.connection.close();
   panelA.dispose();
@@ -953,10 +1014,10 @@ async function measureDisposalReopen(vscode, extensionUri, ChatViewProvider, sin
   const tokenB = nextProbeToken();
   const panelB = createTestPanel(vscode, extensionUri, tokenB, sink);
   provider.resolveWebviewView(panelB.view);
-  const readyB = await waitForPanelMessage(sink, tokenB, 'ready', 12000);
+  const readyB = await waitForPanelMessage(sink, tokenB, 'ready', scaled(12000));
   check(`matrix:${cellLabel}:disposal-second-view-booted`, readyB !== null, 'reopened view must boot');
   await wait(700);
-  const secondTarget = await connectMatrixTarget(tokenB, 15000);
+  const secondTarget = await connectMatrixTarget(tokenB, scaled(15000));
   const titleB = await evaluate(secondTarget.connection, secondTarget.contextId, 'document.getElementById("session-title").textContent');
   const attachments = await evaluate(
     secondTarget.connection,
@@ -980,12 +1041,14 @@ async function measureDisposalReopen(vscode, extensionUri, ChatViewProvider, sin
 
 exports.run = async function run() {
   writeEvidence('running', null);
+  progressStage('host-module-live', cellLabel);
   try {
     const vscode = require('vscode');
 
     const ext = vscode.extensions.getExtension('faktor.faktor');
     check('extension-present', ext, 'faktor.faktor must resolve under --extensionDevelopmentPath');
     await ext.activate();
+    progressStage('extension-activated', ext.id);
     check('activation-succeeded', true, `activated ${ext.id}`);
 
     const commands = await vscode.commands.getCommands(true);
@@ -1060,11 +1123,14 @@ exports.run = async function run() {
     const htmlDigest = crypto.createHash('sha256').update(html, 'utf8').digest('hex');
     checks.push({ name: 'webview-html-sha256', ok: true, detail: htmlDigest });
 
+    progressStage('matrix-start', cellLabel);
     await runMatrix(vscode, ext, providerModule);
 
     writeEvidence('passed', null);
+    progressStage('verdict-passed', cellLabel);
   } catch (error) {
     writeEvidence('failed', error);
+    progressStage('verdict-failed', String((error && error.message) || error));
     throw error;
   }
 };

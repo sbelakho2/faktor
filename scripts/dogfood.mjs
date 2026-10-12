@@ -52,6 +52,12 @@
 //                      needle must be pinned by that host's test corpus
 //                      (VS Code selftest/render/verify-vsix; JetBrains
 //                      src/test/kotlin + src/test/resources).
+//                      UIUX_STATE_DISPOSITIONS then reviews every §2 state
+//                      T00-T33 exactly once: enforced states must cite
+//                      existing UIUX_CONTRACT rows (or their documented
+//                      shipped representation), proposed states must record
+//                      the mandated copy that is not shipped yet, and a
+//                      proposed copy that a host starts rendering is stale.
 //   scripts            every scripts/**/*.{sh,mjs,js,cjs,ps1,py} must be
 //                      invoked by the dogfood run plan (scripts/dogfood.sh),
 //                      reachable from a planned script (text reference or
@@ -93,6 +99,11 @@
 //      diff-unavailable honesty, the I04 proof/integration/cost separation,
 //      the I07 outcome labels, the I05/I06/I10 prohibitions and the
 //      statically checkable validation-matrix rows (contract-uiux.md).
+//   8. the UI/UX state dispositions (UIUX_STATE_DISPOSITIONS): exactly one
+//      reviewed entry per §2 state T00-T33; enforced entries must resolve
+//      against live UIUX_CONTRACT rows, proposed entries must carry their
+//      unshipped mandated copy, and a proposed copy that appears in a host
+//      production file is a stale proposal.
 //
 // Modes:
 //   node scripts/dogfood.mjs --coverage   (default) full surface inventory
@@ -910,6 +921,72 @@ const UIUX_CONTRACT = [
     ],
     tests: { vscode: ['T05_STARTING'] },
   },
+  // ------------------------------------------------------------------ T13-T17 verification states
+  {
+    id: 'UIUX-T13-VSC',
+    spec: 'T13 [L1087-1089] "Completion pending" / "One required result is missing." / "View missing result"; renders T13 family as "Completion pending" (verificationVerdictOf criterion status line; the proposed supporting copy is not rendered)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', "return 'Completion pending'"],
+    ],
+    tests: { vscode: ['Completion pending'] },
+  },
+  {
+    id: 'UIUX-T14-VSC',
+    spec: 'T14 [L1092-1094] "Required check failed" / "Inspect the result and repair the candidate." / "View evidence"; renders T14 family as "Required check failed — <facts>" (verificationVerdictOf)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', 'Required check failed'],
+    ],
+    tests: { vscode: ['Required check failed'] },
+  },
+  {
+    id: 'UIUX-T15-VSC',
+    spec: 'T15 [L1097-1099] "Verification unavailable" / "No verdict is served for this claim." / "Inspect reason / Refresh"',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', 'Verification unavailable'],
+      ['apps/vscode/media/chat.js', 'No verdict is served for this claim.'],
+    ],
+    tests: { vscode: ['No verdict is served for this claim.', 'Verification unavailable'] },
+  },
+  {
+    id: 'UIUX-T15-JB',
+    spec: 'T15 [L1097-1099] "Verification unavailable" / "No verdict is served for this claim." / "Inspect reason / Refresh"',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"No verdict is served for this claim."'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', 'Verification unavailable'],
+    ],
+    tests: { jetbrains: ['No verdict is served for this claim.'] },
+  },
+  {
+    id: 'UIUX-T16-VSC',
+    spec: 'T16 [L1102-1104] "Verification refused" / "A policy or contract prevents this check." / "Inspect reason"; renders T16 family as "Verification refused" (verificationVerdictOf)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', "return 'Verification refused'"],
+    ],
+    tests: { vscode: ['Verification refused'] },
+  },
+  {
+    id: 'UIUX-T17-VSC',
+    spec: 'T17 [L1107-1111] "Candidate checks passed" / "The candidate’s required checks passed; integration and finish actions remain separate." / "Review changes"; renders T17 family as "Candidate checks passed — <facts>" (verificationVerdictOf)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', 'Candidate checks passed'],
+    ],
+    tests: { vscode: ['Candidate checks passed'] },
+  },
+  {
+    id: 'UIUX-T17-JB',
+    spec: 'T17 [L1107-1111] "Candidate checks passed"; JB renders "Candidate checks passed · <facts>" (OverviewPanel verification row)',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', '"Candidate checks passed · "'],
+    ],
+    tests: { jetbrains: ['Candidate checks passed'] },
+  },
   // ------------------------------------------------------------------ T10
   {
     id: 'UIUX-T10-VSC',
@@ -917,7 +994,7 @@ const UIUX_CONTRACT = [
     host: 'vscode',
     must: [
       ['apps/vscode/media/chat.js', 'Faktor needs your approval'],
-      ['apps/vscode/media/chat.js', 'Review the action, target and stated reason.'],
+      ['apps/vscode/src/webview.ts', 'Review the action, target and stated reason.'],
       ['apps/vscode/media/chat.js', "'Allow'"],
       ['apps/vscode/media/chat.js', "'Deny'"],
     ],
@@ -937,6 +1014,17 @@ const UIUX_CONTRACT = [
   },
   // ------------------------------------------------------------------ T22
   {
+    id: 'UIUX-T22-VSC',
+    spec: 'T22 [L1143-1146] "Pull request integration unavailable" / "Configure the native SCM integration; no PR success is inferred." / "Open setup guidance" (native_pr_scm_not_configured path)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/media/chat.js', 'Pull request integration unavailable'],
+      ['apps/vscode/media/chat.js', 'Configure the native SCM integration; no PR success is inferred.'],
+      ['apps/vscode/media/chat.js', 'Open setup guidance'],
+    ],
+    tests: { vscode: ['T22: a requested PR step blocked by SCM config renders the exact copy and the guidance action'] },
+  },
+  {
     id: 'UIUX-T22-JB',
     spec: 'T22 [L1143-1146] "Pull request integration unavailable" / "Configure the native SCM integration; no PR success is inferred." / "Open setup guidance"',
     host: 'jetbrains',
@@ -946,6 +1034,61 @@ const UIUX_CONTRACT = [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt', 'Open setup guidance'],
     ],
     tests: { jetbrains: ['Pull request integration unavailable'] },
+  },
+  // ------------------------------------------------------------------ T20/T23/T24 integration + proof states
+  {
+    id: 'UIUX-T20-VSC',
+    spec: 'T20 [L1133-1135] "Integrating the candidate" / "An integration transaction is in progress." / "Inspect transaction"; renders T20 family as "Integrating" (proofIntegrationLines state text with the … glyph)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', "'Integrating'"],
+    ],
+    tests: { vscode: ['Integrating'] },
+  },
+  {
+    id: 'UIUX-T20-JB',
+    spec: 'T20 [L1133-1135] "Integrating the candidate"; renders T20 family as "… Integrating" (TaskTreeModel integrationFacts)',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '… Integrating'],
+    ],
+    tests: { jetbrains: ['Integrating'] },
+  },
+  {
+    id: 'UIUX-T23-VSC',
+    spec: 'T23 [L1149-1151] "The result needs verification" / "The landed state differs from the verified candidate." / "Inspect mismatch"; renders T23 family as "Mismatch" (proofIntegrationLines state text with the ✗ glyph)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', "'Mismatch'"],
+    ],
+    tests: { vscode: ['Mismatch'] },
+  },
+  {
+    id: 'UIUX-T23-JB',
+    spec: 'T23 [L1149-1151] "The result needs verification"; renders T23 family as "✗ Mismatch" (TaskTreeModel integrationFacts)',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '✗ Mismatch'],
+    ],
+    tests: { jetbrains: ['Mismatch'] },
+  },
+  {
+    id: 'UIUX-T24-VSC',
+    spec: 'T24 [L1154-1158] "Verified complete"; VAL-LAND-3 [L1243-1244] "The final label Verified complete must come from the current proof summary"; renders T24 family as "VERIFIED" (proofSummaryLine, strict proof only)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', "? 'VERIFIED'"],
+    ],
+    tests: { vscode: ['cockpit renders the daemon VERIFIED view'] },
+  },
+  {
+    id: 'UIUX-T24-JB',
+    spec: 'T24 [L1154-1158]; VAL-LAND-3; renders T24 family as the strict-proof summary "VERIFIED" (TaskTreeModel summaryText)',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"verified" -> "VERIFIED"'],
+    ],
+    tests: { jetbrains: ['verification summary renders VERIFIED only under the strict verified proof'] },
   },
   // ------------------------------------------------------------------ T27
   {
@@ -1019,6 +1162,43 @@ const UIUX_CONTRACT = [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OutcomesPanel.kt', 'View details'],
     ],
     tests: { jetbrains: ['The current authority has not supplied a cost value.'] },
+  },
+  // ------------------------------------------------------------------ T30 / T33
+  {
+    id: 'UIUX-T30-VSC',
+    spec: 'T30 [L1198-1199] "Billing is disabled locally" / "This surface has no active billing data." / "Back"; renders T30 family as "billing disabled locally — <reason>" (cockpit usagePanelLines)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/cockpit.ts', 'billing disabled locally'],
+    ],
+    tests: { vscode: ['billing disabled locally'] },
+  },
+  {
+    id: 'UIUX-T30-JB',
+    spec: 'T30 [L1198-1199] "Billing is disabled locally"; renders T30 family as "Billing is disabled locally; no period numbers are served." (UsagePanel disabled card)',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/UsagePanel.kt', 'Billing is disabled locally; no period numbers are served.'],
+    ],
+    tests: { jetbrains: ['Billing is disabled locally; no period numbers are served.'] },
+  },
+  {
+    id: 'UIUX-T33-VSC',
+    spec: 'T33 [L1212-1215] "Repository context is partial" / "The index is rebuilding or capped; no full coverage is implied." / "Inspect coverage"; renders T33 family as "index: partial <n>/<m> files" (nativeClient indexCoverageLabel)',
+    host: 'vscode',
+    must: [
+      ['apps/vscode/src/nativeClient.ts', 'index: partial'],
+    ],
+    tests: { vscode: ['index: partial'] },
+  },
+  {
+    id: 'UIUX-T33-JB',
+    spec: 'T33 [L1212-1215] "Repository context is partial"; renders T33 family as "index: partial <n>/<m> files" (shared NativeProtocol indexCoverageLabel)',
+    host: 'jetbrains',
+    must: [
+      ['apps/jetbrains/shared/src/main/kotlin/dev/faktor/shared/NativeProtocol.kt', 'index: partial'],
+    ],
+    tests: { jetbrains: ['index: partial'] },
   },
   // ------------------------------------------------------------------ T31
   {
@@ -1099,6 +1279,7 @@ const UIUX_CONTRACT = [
       ['apps/vscode/src/cockpit.ts', "title: 'Integration'"],
       ['apps/vscode/src/cockpit.ts', "'Not integrated'"],
       ['apps/vscode/src/cockpit.ts', "'Landed state matches verified state'"],
+      ['apps/vscode/src/cockpit.ts', 'Conflict'],
       ['apps/vscode/src/outcomes.ts', 'COST_UNAVAILABLE_LABEL'],
     ],
     tests: { vscode: ['integration is its own section: served states render distinct facts, absence is unavailable', 'a missing spend never renders as zero', 'cockpit renders the daemon VERIFIED view'] },
@@ -1111,10 +1292,12 @@ const UIUX_CONTRACT = [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"VERIFIED"'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', '"Candidate checks passed · "'],
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/OverviewPanel.kt', '"Cost unavailable"'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt', 'Not integrated'],
-      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt', 'Landed state matches verified state'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'Not integrated'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', 'Landed state matches verified state'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt', '"! Conflict"'],
+      ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt', '"integration: " + fact'],
     ],
-    tests: { jetbrains: ['verification summary renders VERIFIED only under the strict verified proof', 'overview keeps proof, spend and completed states honest'] },
+    tests: { jetbrains: ['verification summary renders VERIFIED only under the strict verified proof', 'overview keeps proof, spend and completed states honest', 'integration: ✓ Landed state matches verified state', '! Conflict'] },
   },
   // ------------------------------------------------------------------ I07
   {
@@ -1199,7 +1382,7 @@ const UIUX_CONTRACT = [
     must: [
       ['apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/FaktorToolWindowFactory.kt', 'NO automatic daemon start'],
     ],
-    tests: { jetbrains: ['NO automatic daemon start'] },
+    tests: { jetbrains: ['I06: opening the tool window never starts the daemon implicitly'] },
   },
   {
     id: 'UIUX-I10-SANDBOX-VSC',
@@ -1297,6 +1480,285 @@ const UIUX_CONTRACT = [
     ],
     tests: { jetbrains: ['state/empty/'] },
   },
+];
+
+// ---------------------------------------------------------------------------
+// UI/UX state dispositions (contract-uiux.md §2 T00-T33). Exactly one
+// reviewed entry per state:
+//   - `enforced`: a host renders the state's mandated label/copy group (or
+//     its documented shipped representation, mapped in the note) and `rows`
+//     references the UIUX_CONTRACT ids that pin it; a dangling reference or
+//     a lost production needle is a gap.
+//   - `proposed`: no host renders the mandated copy yet; `copy` records the
+//     exact mandated sentence(s) so a later product fix that ships one turns
+//     the entry stale (`uiux-state-proposal-stale`) instead of silent, and
+//     the note carries the spec citation plus the citing screens' status
+//     classes. The PDF marks every layout a design proposal; T24 is the only
+//     state whose "Verified complete?" cell reads "Yes, only current full
+//     proof". Cross-cutting §6 rows (reduced motion, keyboard, empty
+//     honesty) stay pinned in UIUX_CONTRACT; the statically checkable
+//     text+glyph rows are folded into the dispositions they anchor.
+// ---------------------------------------------------------------------------
+const UIUX_STATE_IDS = Array.from({ length: 34 }, (_, index) => `T${String(index).padStart(2, '0')}`);
+
+const UIUX_STATE_DISPOSITIONS = [
+  {
+    state: 'T00',
+    spec: 'T00 [L1003-1005] "Workspace unavailable" / "Open a project to choose where this run works." / "Open project"',
+    disposition: 'enforced',
+    rows: ['UIUX-T00-VSC'],
+    note: 'VS Code preflight.ts renders the mandated label, copy and Open project action; pinned by UIUX-T00-VSC and its T00_WORKSPACE_UNAVAILABLE test.',
+  },
+  {
+    state: 'T01',
+    spec: 'T01 [L1016-1018] "Faktor is stopped" / "Start the service when you are ready." / "Start service"',
+    disposition: 'enforced',
+    rows: ['UIUX-T01-VSC'],
+    note: 'VS Code preflight.ts renders the mandated label, copy and Start service action; pinned by UIUX-T01-VSC and its T01_STOPPED test.',
+  },
+  {
+    state: 'T02',
+    spec: 'T02 [L1021-1024] "Faktor could not find its service" / "Locate an application-level executable or install the service." / "Locate daemon…"',
+    disposition: 'enforced',
+    rows: ['UIUX-T02-VSC'],
+    note: 'VS Code preflight.ts renders the mandated label, copy and Locate daemon… action; pinned by UIUX-T02-VSC and its T02_MISSING test.',
+  },
+  {
+    state: 'T03',
+    spec: 'T03 [L1027-1030] "Checksum record unavailable" / "Confirm the exact executable before starting." / "Start anyway / Cancel"',
+    disposition: 'enforced',
+    rows: ['UIUX-T03-VSC'],
+    note: 'VS Code preflight.ts renders the mandated label, copy and Start anyway / Cancel actions; pinned by UIUX-T03-VSC and its T03_UNVERIFIED test.',
+  },
+  {
+    state: 'T04',
+    spec: 'T04 [L1033-1035] "The service executable does not match its record" / "Choose another executable or repair the installation." / "Locate daemon…"',
+    disposition: 'enforced',
+    rows: ['UIUX-T04-VSC'],
+    note: 'VS Code preflight.ts renders the mandated label, copy and Locate daemon… action; pinned by UIUX-T04-VSC and its T04_REFUSED test.',
+  },
+  {
+    state: 'T05',
+    spec: 'T05 [L1038-1041] "Starting Faktor" / "Resolving the confirmed executable and waiting for readiness." / "Cancel startup"',
+    disposition: 'enforced',
+    rows: ['UIUX-T05-VSC'],
+    note: 'VS Code preflight.ts renders the mandated label, copy and Cancel startup action; pinned by UIUX-T05-VSC and its T05_STARTING test.',
+  },
+  {
+    state: 'T06',
+    spec: 'T06 [L1044-1045] "Ready" / "Describe a task or ask a question." / "Run task"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['Describe a task or ask a question.'],
+    note: 'T06 [L1044-1045]: no host renders the mandated copy; citing screens S03 presentation_refinement, S04 proposed_ui_existing_backend, S05 presentation_refinement, S29 proposed_ui_existing_backend and S36 presentation_refinement; the only nearby shipped surface is the unpinned chat.js header status line "Ready".',
+  },
+  {
+    state: 'T07',
+    spec: 'T07 [L1048-1049] "Starting the run" / "Your captured draft is being admitted once." / "Wait"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['Your captured draft is being admitted once.'],
+    note: 'T07 [L1048-1049]: no host renders the mandated copy; citing screens S04 proposed_ui_existing_backend and S06 presentation_refinement; single-flight capture and retained submission identity exist (PRESENT-S06) but the state presentation is a design proposal.',
+  },
+  {
+    state: 'T08',
+    spec: 'T08 [L1052-1055] "Start response unavailable" / "The draft was kept. Retry checks the same logical submission." / "Review and retry"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['The draft was kept. Retry checks the same logical submission.'],
+    note: 'T08 [L1052-1055]: no host renders the mandated label or copy; citing screens S05 presentation_refinement and S07 proposed_ui_existing_backend; VS ships the "Review and retry" action label only (errors.ts), never the state presentation.',
+  },
+  {
+    state: 'T09',
+    spec: 'T09 [L1058-1061] "Running" / "The candidate is separate from your workspace." / "Inspect / Stop current run"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['The candidate is separate from your workspace.'],
+    note: 'T09 [L1058-1061]: no host renders the mandated copy; citing screens S08/S12/S22/S23/S25/S35, all presentation_refinement; the chat.js header status line "Running · …" is unpinned and not a full state rendering.',
+  },
+  {
+    state: 'T10',
+    spec: 'T10 [L1072-1074] "Faktor needs your approval" / "Review the action, target and stated reason." / "Allow / Deny"',
+    disposition: 'enforced',
+    rows: ['UIUX-T10-VSC', 'UIUX-T10-JB'],
+    note: 'both hosts render the mandated label and copy and per-request Allow / Deny: VS chat.js cards + webview.ts card markup, JB ApprovalCards.kt; pinned by UIUX-T10-VSC and UIUX-T10-JB.',
+  },
+  {
+    state: 'T11',
+    spec: 'T11 [L1077-1079] "Needs your input" / "The run is waiting for a decision or clarification." / "Reply in composer"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['The run is waiting for a decision or clarification.'],
+    note: 'T11 [L1077-1079]: no host renders the mandated label or copy; citing screens S10/S12/S22/S23, all presentation_refinement; blocker state/actions exist (PRESENT-S10) but the human copy is proposed.',
+  },
+  {
+    state: 'T12',
+    spec: 'T12 [L1082-1084] "Checking the change" / "Required results remain attached to this candidate." / "Inspect verification"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['Required results remain attached to this candidate.'],
+    note: 'T12 [L1082-1084]: no host renders the mandated label or copy; citing screens S08/S11/S24, all presentation_refinement; current run and cockpit exist (PRESENT-S08/S11) but the checking-change presentation is proposed.',
+  },
+  {
+    state: 'T13',
+    spec: 'T13 [L1087-1089] "Completion pending" / "One required result is missing." / "View missing result"',
+    disposition: 'enforced',
+    rows: ['UIUX-T13-VSC'],
+    note: 'renders T13 family as "Completion pending" (VS cockpit verificationVerdictOf criterion status line); the proposed supporting copy is not rendered; pinned by UIUX-T13-VSC.',
+  },
+  {
+    state: 'T14',
+    spec: 'T14 [L1092-1094] "Required check failed" / "Inspect the result and repair the candidate." / "View evidence"',
+    disposition: 'enforced',
+    rows: ['UIUX-T14-VSC'],
+    note: 'renders T14 family as "Required check failed — <facts>" (VS cockpit verificationVerdictOf); the proposed supporting copy is not rendered; pinned by UIUX-T14-VSC.',
+  },
+  {
+    state: 'T15',
+    spec: 'T15 [L1097-1099] "Verification unavailable" / "No verdict is served for this claim." / "Inspect reason / Refresh"',
+    disposition: 'enforced',
+    rows: ['UIUX-T15-VSC', 'UIUX-T15-JB', 'UIUX-VAL-TEXT-GLYPH-JB'],
+    note: 'both hosts render the mandated label and the exact sentence: VS cockpit label + chat.js criterion card, JB Overview label + TaskTreeModel NO_VERDICT_COPY rendered by VerificationPanel/TaskTreePanel; pinned by UIUX-T15-VSC/UIUX-T15-JB and the JB criterion text+glyph row.',
+  },
+  {
+    state: 'T16',
+    spec: 'T16 [L1102-1104] "Verification refused" / "A policy or contract prevents this check." / "Inspect reason"',
+    disposition: 'enforced',
+    rows: ['UIUX-T16-VSC'],
+    note: 'renders T16 family as "Verification refused" (VS cockpit verificationVerdictOf); the proposed supporting copy is not rendered; pinned by UIUX-T16-VSC.',
+  },
+  {
+    state: 'T17',
+    spec: 'T17 [L1107-1111] "Candidate checks passed" / "The candidate’s required checks passed; integration and finish actions remain separate." / "Review changes"',
+    disposition: 'enforced',
+    rows: ['UIUX-T17-VSC', 'UIUX-T17-JB'],
+    note: 'renders T17 family as "Candidate checks passed — <facts>" (VS cockpit verificationVerdictOf) and "Candidate checks passed · <facts>" (JB OverviewPanel); the proposed supporting copy is not rendered; pinned by UIUX-T17-VSC/UIUX-T17-JB.',
+  },
+  {
+    state: 'T18',
+    spec: 'T18 [L1114-1116] "Not integrated" / "The verified candidate has not landed." / "Review changes"',
+    disposition: 'enforced',
+    rows: ['UIUX-I04-VSC', 'UIUX-I04-JB', 'UIUX-VAL-TEXT-GLYPH-VSC'],
+    note: 'renders T18 family as the exact "Not integrated" integration fact in both hosts (VS cockpit proofIntegrationLines, JB TaskTreeModel integrationFacts, rendered text+glyph); pinned by UIUX-I04-VSC/UIUX-I04-JB.',
+  },
+  {
+    state: 'T19',
+    spec: 'T19 [L1127-1130] "Workspace changed" / "The current workspace no longer matches the integration basis." / "Inspect conflict"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['The current workspace no longer matches the integration basis.'],
+    note: 'T19 [L1127-1130]: no host renders the mandated label or copy; citing screens S10 presentation_refinement, S14 proposed_host_integration and S15 proposed_backend_extension; a proof/conflict count exists but no host renders the workspace-changed state.',
+  },
+  {
+    state: 'T20',
+    spec: 'T20 [L1133-1135] "Integrating the candidate" / "An integration transaction is in progress." / "Inspect transaction"',
+    disposition: 'enforced',
+    rows: ['UIUX-T20-VSC', 'UIUX-T20-JB', 'UIUX-VAL-TEXT-GLYPH-VSC'],
+    note: 'renders T20 family as "Integrating" (VS cockpit proofIntegrationLines, glyph …; JB "… Integrating" TaskTreeModel), text+glyph; pinned by UIUX-T20-VSC/UIUX-T20-JB.',
+  },
+  {
+    state: 'T21',
+    spec: 'T21 [L1138-1140] "Finish action pending" / "A requested action lacks a succeeded durable result." / "View finish actions"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['A requested action lacks a succeeded durable result.'],
+    note: 'T21 [L1138-1140]: no host renders the mandated label or copy; citing screens S11 and S19, both presentation_refinement; durable finish rows exist (PRESENT-S19) but the pending-action presentation is proposed.',
+  },
+  {
+    state: 'T22',
+    spec: 'T22 [L1143-1146] "Pull request integration unavailable" / "Configure the native SCM integration; no PR success is inferred." / "Open setup guidance"',
+    disposition: 'enforced',
+    rows: ['UIUX-T22-VSC', 'UIUX-T22-JB'],
+    note: 'both hosts render the mandated label, copy and Open setup guidance action (VS chat.js pr-scm-setup notice from the native_pr_scm_not_configured step, JB FaktorChatPanel); pinned by UIUX-T22-VSC/UIUX-T22-JB.',
+  },
+  {
+    state: 'T23',
+    spec: 'T23 [L1149-1151] "The result needs verification" / "The landed state differs from the verified candidate." / "Inspect mismatch"',
+    disposition: 'enforced',
+    rows: ['UIUX-T23-VSC', 'UIUX-T23-JB', 'UIUX-VAL-TEXT-GLYPH-VSC'],
+    note: 'renders T23 family as "Mismatch" (VS cockpit proofIntegrationLines, glyph ✗; JB "✗ Mismatch" TaskTreeModel), text+glyph; pinned by UIUX-T23-VSC/UIUX-T23-JB.',
+  },
+  {
+    state: 'T24',
+    spec: 'T24 [L1154-1158] "Verified complete" / "The current proof summary supports completion and requested finish actions." / "Review result / New task"; "Verified complete?" cell "Yes, only current full proof"',
+    disposition: 'enforced',
+    rows: ['UIUX-T24-VSC', 'UIUX-T24-JB', 'UIUX-I04-VSC', 'UIUX-I04-JB'],
+    note: 'renders T24 family as "VERIFIED" only from the current strict proof summary (VS cockpit proofSummaryLine, JB TaskTreeModel summaryText; VAL-LAND-3); pinned by UIUX-T24-VSC/UIUX-T24-JB and the I04 proof rows.',
+  },
+  {
+    state: 'T25',
+    spec: 'T25 [L1161-1164] "Run cancelled" / "Cancellation is a terminal run outcome, not verification success." / "Review recorded work / New task"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['Cancellation is a terminal run outcome, not verification success.'],
+    note: 'T25 [L1161-1164]: no host renders the mandated label or copy; citing screen S21 presentation_refinement; cancellation routes/records exist (PRESENT-S21) but the terminal-outcome copy is proposed.',
+  },
+  {
+    state: 'T26',
+    spec: 'T26 [L1167-1170] "Run failed" / "The result and reason remain available for inspection." / "Inspect result"',
+    disposition: 'proposed',
+    rows: [],
+    copy: ['The result and reason remain available for inspection.'],
+    note: 'T26 [L1167-1170]: no host renders the mandated label or copy; citing screen S21 presentation_refinement; failure routes/records exist (PRESENT-S21) but the terminal-outcome copy is proposed.',
+  },
+  {
+    state: 'T27',
+    spec: 'T27 [L1181-1183] "Reconnecting live updates" / "The last valid journal position is kept." / "Wait / Refresh"',
+    disposition: 'enforced',
+    rows: ['UIUX-T27-VSC', 'UIUX-T27-JB'],
+    note: 'both hosts render the mandated label and copy and Wait / Refresh (VS preflight + chat.js, JB DiagnosticsPanel); pinned by UIUX-T27-VSC/UIUX-T27-JB.',
+  },
+  {
+    state: 'T28',
+    spec: 'T28 [L1186-1190] "Live updates paused" / "The client cannot read the next durable event. Nothing is skipped." / "Reconnect / Refresh from snapshot"',
+    disposition: 'enforced',
+    rows: ['UIUX-T28-VSC', 'UIUX-T28-JB'],
+    note: 'both hosts render the mandated label and copy and Reconnect / Refresh from snapshot (VS preflight + chat.js, JB DiagnosticsPanel); pinned by UIUX-T28-VSC/UIUX-T28-JB.',
+  },
+  {
+    state: 'T29',
+    spec: 'T29 [L1193-1195] "Cost unavailable" / "The current authority has not supplied a cost value." / "View details"',
+    disposition: 'enforced',
+    rows: ['UIUX-T29-VSC', 'UIUX-T29-JB'],
+    note: 'both hosts render the mandated label, copy and View details (VS outcomes/chat.js, JB OutcomesPanel); pinned by UIUX-T29-VSC/UIUX-T29-JB.',
+  },
+  {
+    state: 'T30',
+    spec: 'T30 [L1198-1199] "Billing is disabled locally" / "This surface has no active billing data." / "Back"',
+    disposition: 'enforced',
+    rows: ['UIUX-T30-VSC', 'UIUX-T30-JB'],
+    note: 'renders T30 family as "billing disabled locally — <reason>" (VS cockpit usagePanelLines) and "Billing is disabled locally; no period numbers are served." (JB UsagePanel disabled card); the proposed supporting copy is not rendered; pinned by UIUX-T30-VSC/UIUX-T30-JB.',
+  },
+  {
+    state: 'T31',
+    spec: 'T31 [L1202-1204] "History unavailable" / "The conversation list could not be read." / "Refresh history"',
+    disposition: 'enforced',
+    rows: ['UIUX-T31-VSC', 'UIUX-T31-JB'],
+    note: 'both hosts render the mandated label and copy and Refresh history (VS history-state.js, JB HistoryPanel); pinned by UIUX-T31-VSC/UIUX-T31-JB.',
+  },
+  {
+    state: 'T32',
+    spec: 'T32 [L1207-1209] "Shell execution needs a decision" / "The secure default remains fail-closed on this platform." / "Open setup guidance"',
+    disposition: 'enforced',
+    rows: ['UIUX-T32-VSC', 'UIUX-T32-JB'],
+    note: 'both hosts render the mandated label and copy and Open setup guidance (VS preflight + webview, JB DiagnosticsPanel); pinned by UIUX-T32-VSC/UIUX-T32-JB.',
+  },
+  {
+    state: 'T33',
+    spec: 'T33 [L1212-1215] "Repository context is partial" / "The index is rebuilding or capped; no full coverage is implied." / "Inspect coverage"',
+    disposition: 'enforced',
+    rows: ['UIUX-T33-VSC', 'UIUX-T33-JB'],
+    note: 'renders T33 family as "index: partial <n>/<m> files" (VS nativeClient indexCoverageLabel, JB shared NativeProtocol indexCoverageLabel); the proposed label/copy are not rendered; pinned by UIUX-T33-VSC/UIUX-T33-JB.',
+  },
+];
+
+// Product directories the proposed-copy staleness scan reads (the host
+// surfaces that render the state matrix).
+const UIUX_PRODUCTION_DIRS = [
+  'apps/vscode/src',
+  'apps/vscode/media',
+  'apps/jetbrains/frontend/src/main',
+  'apps/jetbrains/backend/src',
 ];
 
 // ---------------------------------------------------------------------------
@@ -2415,6 +2877,98 @@ export function uiuxContractGaps(root, contract = UIUX_CONTRACT) {
   return gaps;
 }
 
+/**
+ * The UIUX_STATE_DISPOSITIONS gate: every contract-uiux.md §2 state T00-T33
+ * must have exactly one reviewed disposition entry. `enforced` entries must
+ * cite UIUX_CONTRACT ids that still carry their production needles;
+ * `proposed` entries must record their mandated copy, and the moment any host
+ * production file renders that copy the proposal is stale (the product fix
+ * landed without an enforced row). Gap kinds:
+ *   - `uiux-state-undispositioned`: a state has no entry;
+ *   - `uiux-state-dangling`: an enforced entry cites an unknown contract row;
+ *   - `uiux-state-disposition-stale`: a cited row's production needle is gone;
+ *   - `uiux-state-proposal-stale`: a proposed copy now exists in production.
+ * `options` (dispositions/contract/states/productionDirs) exists for the
+ * adversarial selftest and defaults to the real tables this checker ships.
+ */
+export function uiuxStateGaps(root, options = {}) {
+  const dispositions = options.dispositions ?? UIUX_STATE_DISPOSITIONS;
+  const contract = options.contract ?? UIUX_CONTRACT;
+  const states = options.states ?? UIUX_STATE_IDS;
+  const productionDirs = options.productionDirs ?? UIUX_PRODUCTION_DIRS;
+  const gaps = [];
+  const contractById = new Map(contract.map((entry) => [entry.id, entry]));
+  const known = new Set(states);
+
+  const entriesByState = new Map();
+  for (const entry of dispositions) {
+    if (!entriesByState.has(entry.state)) entriesByState.set(entry.state, []);
+    entriesByState.get(entry.state).push(entry);
+  }
+  for (const state of states) {
+    const entries = entriesByState.get(state) ?? [];
+    if (entries.length === 0) {
+      gaps.push(`uiux-state-undispositioned: ${state} has no disposition entry`);
+    } else if (entries.length > 1) {
+      gaps.push(`uiux-state-undispositioned: ${state} has ${entries.length} disposition entries; exactly one reviewed entry per state is required`);
+    }
+  }
+
+  const production = new Map();
+  if (dispositions.some((entry) => entry.disposition === 'proposed' && (entry.copy ?? []).length > 0)) {
+    for (const dir of productionDirs) {
+      for (const file of walkFiles(join(root, dir), (path) => /\.(ts|js|css|kt)$/.test(path))) {
+        production.set(rel(root, file), readIf(file));
+      }
+    }
+  }
+
+  for (const entry of dispositions) {
+    if (!known.has(entry.state)) {
+      gaps.push(`uiux-state-undispositioned: ${entry.state} is not a contract-uiux.md §2 state (T00-T33); re-review UIUX_STATE_DISPOSITIONS`);
+      continue;
+    }
+    if (entry.disposition === 'enforced') {
+      const rows = Array.isArray(entry.rows) ? entry.rows : [];
+      if (rows.length === 0) {
+        gaps.push(`uiux-state-disposition-stale: ${entry.state} is enforced without a contract row reference; cite the UIUX_CONTRACT ids that pin it`);
+        continue;
+      }
+      for (const id of rows) {
+        const row = contractById.get(id);
+        if (row === undefined) {
+          gaps.push(`uiux-state-dangling: ${entry.state} references unknown contract row ${id}`);
+          continue;
+        }
+        for (const [file, needle] of row.must ?? []) {
+          if (!readIf(join(root, file)).includes(needle)) {
+            gaps.push(`uiux-state-disposition-stale: ${entry.state} is enforced via ${id} but ${JSON.stringify(needle)} is no longer present in ${file}`);
+          }
+        }
+      }
+      continue;
+    }
+    if (entry.disposition !== 'proposed') {
+      gaps.push(`uiux-state-disposition-stale: ${entry.state} has disposition ${JSON.stringify(entry.disposition)}; expected 'enforced' or 'proposed'`);
+      continue;
+    }
+    if (typeof entry.note !== 'string' || entry.note.trim().length < 30) {
+      gaps.push(`uiux-state-proposal-unreviewed: ${entry.state} is proposed without a reviewed reason (>= 30 chars citing the spec and the status class)`);
+    }
+    const copies = Array.isArray(entry.copy) ? entry.copy : [];
+    if (copies.length === 0) {
+      gaps.push(`uiux-state-proposal-unreviewed: ${entry.state} is proposed but records no mandated copy; no copy may be silently omitted`);
+    }
+    for (const needle of copies) {
+      const match = [...production.entries()].find(([, text]) => text.includes(needle));
+      if (match !== undefined) {
+        gaps.push(`uiux-state-proposal-stale: ${entry.state} is reviewed as proposed but its mandated copy ${JSON.stringify(needle)} now exists in ${match[0]} — add an enforced row`);
+      }
+    }
+  }
+  return gaps;
+}
+
 // ---------------------------------------------------------------------------
 // Full analysis (used by --coverage and by the real-tree half of --selftest).
 // ---------------------------------------------------------------------------
@@ -2495,9 +3049,9 @@ export function analyze(root = ROOT, options = {}) {
 
   classes.push({
     surface: 'UI/UX contract',
-    items: UIUX_CONTRACT.length,
-    gate: 'UIUX_CONTRACT production needles per host file + host test-corpus pins (contract-uiux.md I01-I10/T00-T33/§6/§8/§9)',
-    gaps: uiuxContractGaps(root),
+    items: UIUX_CONTRACT.length + UIUX_STATE_DISPOSITIONS.length,
+    gate: 'UIUX_CONTRACT production needles per host file + host test-corpus pins, one reviewed disposition per §2 state T00-T33 (contract-uiux.md I01-I10/T00-T33/§6/§8/§9)',
+    gaps: [...uiuxContractGaps(root), ...uiuxStateGaps(root)],
   });
 
   const testCrates = testCrateSurface(root);
@@ -2616,7 +3170,7 @@ function runCoverage() {
   }
   console.log('');
   console.log(`discovered product ids cross-checked: ${discovered}`);
-  console.log('UI/UX rules: raw color, terminal argv, calm card headers, internal-identifier labels, visual identity pins, host-matrix state coverage, UI/UX contract pins');
+  console.log('UI/UX rules: raw color, terminal argv, calm card headers, internal-identifier labels, visual identity pins, host-matrix state coverage, UI/UX contract pins, UI/UX state dispositions');
   const exceptions = reviewedExceptions(ROOT, readIf(join(ROOT, PLAN_FILE)));
   if (exceptions.length > 0) {
     console.log('');
@@ -3031,20 +3585,121 @@ function selftest() {
     );
   });
 
+  // (k) the UI/UX state dispositions (contract-uiux.md §2 T00-T33): exactly
+  // one reviewed entry per state; enforced entries must resolve against live
+  // contract rows; a proposed copy that appears in a host production file is
+  // a stale proposal.
+  const dispositionStates = ['T00', 'T01'];
+  const dispositionContract = [
+    {
+      id: 'UIUX-DISPOSITION-FIXTURE-1',
+      spec: 'fixture §2 T00',
+      host: 'vscode',
+      must: [['apps/vscode/src/dispositionFixture.ts', 'DISPOSITION_FIXTURE_MARKER']],
+      tests: { vscode: ['DISPOSITION_FIXTURE_TEST'] },
+    },
+    {
+      id: 'UIUX-DISPOSITION-FIXTURE-2',
+      spec: 'fixture §2 T01',
+      host: 'vscode',
+      must: [['apps/vscode/src/dispositionFixture2.ts', 'DISPOSITION_FIXTURE_MARKER_TWO']],
+      tests: { vscode: ['DISPOSITION_FIXTURE_TEST'] },
+    },
+  ];
+  const dispositionTable = [
+    {
+      state: 'T00',
+      spec: 'fixture T00',
+      disposition: 'enforced',
+      rows: ['UIUX-DISPOSITION-FIXTURE-1'],
+      note: 'fixture enforced entry with a resolved contract row',
+    },
+    {
+      state: 'T01',
+      spec: 'fixture T01',
+      disposition: 'proposed',
+      rows: [],
+      copy: ['FIXTURE_PROPOSED_COPY: no host renders this sentence yet'],
+      note: 'fixture proposed reason (fixture T01, presentation_refinement) long enough to count as reviewed',
+    },
+  ];
+  const dispositionOptions = (overrides = {}) => ({
+    dispositions: dispositionTable,
+    contract: dispositionContract,
+    states: dispositionStates,
+    productionDirs: ['apps/vscode/src'],
+    ...overrides,
+  });
+  withFixture((fixture) => {
+    const writeDispositionFixture = () => {
+      writeFixture(fixture, 'apps/vscode/src/dispositionFixture.ts', 'export const marker = "DISPOSITION_FIXTURE_MARKER";\n');
+      writeFixture(fixture, 'apps/vscode/src/dispositionFixture2.ts', 'export const marker = "DISPOSITION_FIXTURE_MARKER_TWO";\n');
+    };
+    writeDispositionFixture();
+    check(
+      'the canonical UI/UX state-disposition fixture passes',
+      uiuxStateGaps(fixture, dispositionOptions()).length === 0,
+      uiuxStateGaps(fixture, dispositionOptions()).join('; '),
+    );
+    check(
+      'an undispositioned state is detected',
+      uiuxStateGaps(fixture, dispositionOptions({ dispositions: [dispositionTable[0]] })).some((gap) =>
+        gap.includes('uiux-state-undispositioned: T01 has no disposition entry'),
+      ),
+      uiuxStateGaps(fixture, dispositionOptions({ dispositions: [dispositionTable[0]] })).join('; '),
+    );
+    check(
+      'a dangling disposition reference is detected',
+      uiuxStateGaps(
+        fixture,
+        dispositionOptions({ dispositions: [{ ...dispositionTable[0], rows: ['UIUX-GONE-ROW'] }, dispositionTable[1]] }),
+      ).some((gap) => gap.includes('uiux-state-dangling: T00 references unknown contract row UIUX-GONE-ROW')),
+      uiuxStateGaps(
+        fixture,
+        dispositionOptions({ dispositions: [{ ...dispositionTable[0], rows: ['UIUX-GONE-ROW'] }, dispositionTable[1]] }),
+      ).join('; '),
+    );
+    writeFixture(fixture, 'apps/vscode/src/dispositionFixture.ts', 'export const marker = "SOMETHING_ELSE";\n');
+    check(
+      'an enforced disposition whose production needle vanished is detected',
+      uiuxStateGaps(fixture, dispositionOptions()).some((gap) =>
+        gap.includes('uiux-state-disposition-stale: T00 is enforced via UIUX-DISPOSITION-FIXTURE-1'),
+      ),
+      uiuxStateGaps(fixture, dispositionOptions()).join('; '),
+    );
+    writeFixture(
+      fixture,
+      'apps/vscode/src/dispositionFixture.ts',
+      'export const marker = "DISPOSITION_FIXTURE_MARKER";\nexport const proposed = "FIXTURE_PROPOSED_COPY: no host renders this sentence yet";\n',
+    );
+    check(
+      'a stale proposal (the proposed copy now ships) is detected',
+      uiuxStateGaps(fixture, dispositionOptions()).some(
+        (gap) =>
+          gap.includes('uiux-state-proposal-stale: T01') &&
+          gap.includes('is reviewed as proposed but its mandated copy') &&
+          gap.includes('now exists in apps/vscode/src/dispositionFixture.ts'),
+      ),
+      uiuxStateGaps(fixture, dispositionOptions()).join('; '),
+    );
+    writeDispositionFixture();
+    check(
+      'the disposition fixture is restored to its canonical shape',
+      uiuxStateGaps(fixture, dispositionOptions()).length === 0,
+      uiuxStateGaps(fixture, dispositionOptions()).join('; '),
+    );
+  });
+
   // The fixtures above prove the detectors work; this proves the current tree
-  // has no gaps OUTSIDE the UI/UX contract table. The contract table is a
-  // live gate with its own surface class: its findings are the working list
-  // for the product fix lanes and --coverage always reports them, so they are
-  // surfaced here as an explicit note (count + rows) instead of being
-  // re-asserted per selftest run.
+  // is fully green. The UI/UX contract class (UIUX_CONTRACT rows + state
+  // dispositions) is strict here too: any real-tree contract finding fails
+  // the selftest exactly like --coverage, so the class can never silently
+  // regress behind a note.
   const real = analyze(ROOT);
-  const contractGaps = real.gaps.filter((gap) => gap.startsWith('uiux-contract-'));
-  const otherGaps = real.gaps.filter((gap) => !gap.startsWith('uiux-contract-'));
-  if (contractGaps.length > 0) {
-    console.log(`selftest note: the real tree carries ${contractGaps.length} uiux-contract finding(s) (reported by --coverage):`);
-    for (const gap of contractGaps) console.log(`selftest note:   - ${gap}`);
-  }
-  check(`the real tree reports 0 gate gaps outside the UI/UX contract table (${otherGaps.length})`, otherGaps.length === 0, otherGaps.slice(0, 10).join('; '));
+  const contractGaps = real.gaps.filter((gap) => gap.startsWith('uiux-contract-') || gap.startsWith('uiux-state-'));
+  const otherGaps = real.gaps.filter((gap) => !gap.startsWith('uiux-contract-') && !gap.startsWith('uiux-state-'));
+  check(`the real tree reports 0 UI/UX contract findings (${contractGaps.length})`, contractGaps.length === 0, contractGaps.slice(0, 10).join('; '));
+  check(`the real tree reports 0 gate gaps outside the UI/UX contract class (${otherGaps.length})`, otherGaps.length === 0, otherGaps.slice(0, 10).join('; '));
   check(`the real tree reports 0 UI/UX violations (${real.violations.length})`, real.violations.length === 0, real.violations.slice(0, 10).join('; '));
 
   if (failures > 0) {

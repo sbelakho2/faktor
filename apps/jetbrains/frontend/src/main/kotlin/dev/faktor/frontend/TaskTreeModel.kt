@@ -24,6 +24,7 @@ import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeContractEvidenceRef
 import dev.faktor.shared.NativeCriterionBinding
 import dev.faktor.shared.NativeCriterionVerdict
+import dev.faktor.shared.NativeIntegrationRecord
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativeProjection
@@ -383,6 +384,12 @@ data class ProofView(
     val steps: List<ProofStepView>,
     val unavailable: List<ProofUnavailableView>,
     /**
+     * The served `integration` block of the proof payload, when the daemon
+     * serves one; null on a payload without it (a legacy daemon) and on a
+     * refused read (no payload was fetched).
+     */
+    val integration: NativeIntegrationRecord? = null,
+    /**
      * TRUE only for the synthetic view of a REFUSED proof read: no payload
      * was fetched, so no integration fact may be claimed.
      */
@@ -438,29 +445,40 @@ data class ProofView(
 
     /**
      * The separate integration facts (I04 / VAL-LAND-2) the PARSED DTO can
-     * actually distinguish. This client's DTO does not carry the served
-     * `integration` block (present/inFlight/conflictCount/txn), so only the
-     * facts its parsed members serve render; every other case stays an
-     * explicit unavailable — never success, and never `Not integrated` by
-     * assumption beyond the served absence of a landed identity:
+     * actually distinguish. The served `integration` block wins when
+     * present, projected exactly like the VS Code integration view:
      *
-     *  - `landedEqualsVerified` true/false -> landed / mismatch;
-     *  - the served in-flight integration-record marker -> integrating;
-     *  - no landed identity served -> `Not integrated` (the served
-     *    `trees.landed` is only set from an integration record's non-empty
-     *    landed snapshot, so no landed state exists for this candidate);
-     *  - a landed identity without a served comparison -> explicit
-     *    unavailable naming the missing member;
-     *  - a refused proof read -> explicit unavailable, no fact claimed.
+     *  - `present == false` -> `Not integrated` (the served no-record state);
+     *  - `conflictCount > 0` -> `Conflict` (a recorded integration conflict);
+     *  - `inFlight == true` -> `Integrating`;
+     *  - otherwise the served `landedEqualsVerified` comparison decides
+     *    landed / mismatch.
      *
-     * The served `conflictCount` is NOT a member of this DTO, so no Conflict
-     * fact is invented (reported to the contract gate).
+     * A payload WITHOUT the block (a legacy daemon) keeps the previous
+     * derivation: the served in-flight `integration_record` unavailable
+     * marker -> integrating; `landedEqualsVerified` -> landed / mismatch;
+     * no landed identity -> `Not integrated` (the served `trees.landed` is
+     * only set from an integration record's non-empty landed snapshot); a
+     * landed identity without a served comparison -> explicit unavailable
+     * naming the missing member. A refused proof read -> explicit
+     * unavailable, no fact claimed — never a fabricated `Conflict`.
      */
     fun integrationFacts(): List<String> {
         if (readFailed) {
             return listOf(
                 "? Integration unavailable — " + (reason ?: "the proof read was not fetched")
             )
+        }
+        val served = integration
+        if (served != null) {
+            // The VS Code projection order for a served block: absence,
+            // recorded conflict, then an in-flight transaction.
+            if (!served.present) return listOf("○ Not integrated")
+            val conflictCount = served.conflictCount
+            if (conflictCount != null && conflictCount > 0L) {
+                return listOf("! Conflict")
+            }
+            if (served.inFlight == true) return listOf("… Integrating")
         }
         val inFlight = unavailable.any {
             it.component == "integration_record" && it.kind == "unavailable"
@@ -759,7 +777,8 @@ object TaskTree {
             },
             unavailable = proof.unavailable.map {
                 ProofUnavailableView(it.component, it.kind, it.reason)
-            }
+            },
+            integration = proof.integration
         )
     }
 
