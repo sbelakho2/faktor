@@ -1170,7 +1170,7 @@ steps:
         platform: linux/amd64
       status: [success]
     environment:
-      # FAKTOR_RELEASE_SIGN_KEY_PEM: { from_secret: faktor_release_signing_key }
+      FAKTOR_RELEASE_SIGN_KEY_PEM: { from_secret: faktor_release_signing_key }
       FAKTOR_RELEASE_SIGN_KEY_ID: faktor-release-signing
     commands:
       - |
