@@ -29,13 +29,25 @@
 //! -------
 //! [`OutcomeLedgerMetrics::compute`] is pure integer math over records
 //! (saturating, u128 intermediates; never floating point) and exposes the
-//! ten first-class durable metrics: Verified Cost per Successful Change,
-//! Verified First-Pass Rate, Rework Cost Ratio, Local-Model Substitution
-//! Rate, Avoided Hosted Inference, Mean Time to Verified Change, Human
-//! Intervention Rate, Regression/Rollback Rate, Proof Coverage and Frontier
-//! Escalation Rate. Rates are floor-divided ppm ("at least"); cost/time
-//! averages round UP (never understate). Zero denominators yield zero, never
-//! a fabricated number.
+//! first-class durable metrics: Successful-Run Cost, Verified Cost per
+//! Successful Change (the TOTAL eligible-cohort spend over successful
+//! verified changes), Verified First-Pass Rate, Rework Cost Ratio, the
+//! local split (Local-Only Verified, Local-Final Verified, Local-First
+//! Success, Local-to-Frontier Fallback, Frontier-Only), Avoided Hosted
+//! Inference, Mean Time to Verified Change, Human Intervention Rate,
+//! Regression/Rollback Rate, Proof Coverage and Frontier Escalation Rate.
+//! Rates are floor-divided ppm ("at least"); cost/time averages round UP
+//! (never understate). Zero denominators yield zero, never a fabricated
+//! number.
+//!
+//! Production producer
+//! -------------------
+//! [`OutcomeLedger::record_terminal_run`] is the production entry point:
+//! the runtime's completion gate and the task executor's terminal run
+//! settlement derive ONE record per completed run (success, failure or
+//! cancellation) from durable, frozen facts and append it exactly once,
+//! with the terminal turn's explicit verified samples fed atomically by
+//! the same transaction.
 
 use std::sync::Arc;
 
@@ -429,6 +441,8 @@ fn risk_class_tag(bucket: RiskBucket) -> &'static str {
 pub enum OutcomeLedgerError {
     #[error("invalid run outcome record: {0}")]
     Invalid(String),
+    #[error("terminal run facts are unavailable: {0}")]
+    Facts(String),
     #[error("outcome ledger store failure: {0}")]
     Store(#[from] faktor_store::StoreError),
     #[error("outcome ledger row {run_id} is corrupt: {detail}")]
@@ -660,21 +674,65 @@ pub struct OutcomeLedgerMetrics {
     pub verified_first_pass_changes: u64,
     /// Verified First-Pass Rate = first-pass verified / verified.
     pub verified_first_pass_ppm: u32,
-    /// model + verification spend over the VERIFIED runs (microUSD).
+    /// model + verification spend over the VERIFIED (successful) runs
+    /// (microUSD).
     pub total_verified_spend_micro: u64,
-    /// Verified Cost per Successful Change: the above / verified changes,
-    /// rounded UP (microUSD).
-    pub verified_cost_per_change_micro: u64,
-    /// model + verification spend over ALL runs (microUSD).
+    /// Successful-Run Cost: `total_verified_spend_micro` / verified changes,
+    /// rounded UP (microUSD) — the average spend of a run that DID succeed.
+    /// This is NOT the cost of a successful change: failed attempts are
+    /// excluded from this numerator but not from the business.
+    pub successful_run_cost_micro: u64,
+    /// model + verification spend over ALL attempted runs (the eligible
+    /// cohort spend, failures and cancellations included; microUSD).
     pub total_spend_micro: u64,
+    /// Verified Cost per Successful Change (VCSC): the TOTAL eligible-cohort
+    /// spend across attempted work (`total_spend_micro`) divided by the
+    /// successful verified changes, rounded UP (microUSD). Audit example:
+    /// 9 failed attempts at $10 plus 1 verified change at $1 => $91 per
+    /// successful change (never $1).
+    pub verified_cost_per_successful_change_micro: u64,
     /// Rework spend over all runs (microUSD).
     pub total_rework_spend_micro: u64,
     /// Rework Cost Ratio = rework spend / total spend (ppm).
     pub rework_cost_ratio_ppm: u32,
     /// Runs that used at least one local model.
     pub local_runs: u64,
-    /// Local-Model Substitution Rate = local runs / all runs (ppm).
-    pub local_substitution_ppm: u32,
+    /// Runs whose model sequence is ENTIRELY local (at least one step, every
+    /// step local): the denominator of the Local-Only Verified Rate.
+    pub local_only_runs: u64,
+    /// Verified changes among the local-only runs: the local model produced
+    /// the whole verified run.
+    pub local_only_verified_changes: u64,
+    /// Local-Only Verified Rate = local_only_verified_changes /
+    /// local_only_runs (ppm): how often a purely local run verifies.
+    pub local_only_verified_ppm: u32,
+    /// Runs whose FINAL model step is local: the denominator of the
+    /// Local-Final Verified Rate.
+    pub local_final_runs: u64,
+    /// Verified changes among the local-final runs.
+    pub local_final_verified_changes: u64,
+    /// Local-Final Verified Rate = local_final_verified_changes /
+    /// local_final_runs (ppm).
+    pub local_final_verified_ppm: u32,
+    /// Runs whose FIRST model step is local (the denominator of the
+    /// local-first and local-to-frontier rates).
+    pub local_first_runs: u64,
+    /// Local-first runs that verified on their FIRST implementation attempt.
+    pub local_first_success_changes: u64,
+    /// Local-First Success Rate = local_first_success_changes /
+    /// local_first_runs (ppm).
+    pub local_first_success_ppm: u32,
+    /// Runs that started local and ENDED on a hosted (non-local) provider:
+    /// a local-then-hosted repair is a FALLBACK, never a local substitution.
+    pub local_to_frontier_fallback_runs: u64,
+    /// Local-to-Frontier Fallback Rate = local_to_frontier_fallback_runs /
+    /// local_first_runs (ppm).
+    pub local_to_frontier_fallback_ppm: u32,
+    /// Runs with NO local step at all (the whole sequence ran on hosted
+    /// providers).
+    pub frontier_only_runs: u64,
+    /// Frontier-Only Rate = frontier_only_runs / all runs (ppm).
+    pub frontier_only_ppm: u32,
     /// Avoided Hosted Inference = the recorded counterfactual over all
     /// runs (microUSD; only explicitly recorded values, never fabricated).
     pub avoided_hosted_inference_micro: u64,
@@ -714,6 +772,14 @@ impl OutcomeLedgerMetrics {
         let mut checks_passed: u128 = 0;
         let mut checks_required: u128 = 0;
         let mut local_runs: u128 = 0;
+        let mut local_only_runs: u128 = 0;
+        let mut local_only_verified: u128 = 0;
+        let mut local_final_runs: u128 = 0;
+        let mut local_final_verified: u128 = 0;
+        let mut local_first_runs: u128 = 0;
+        let mut local_first_success: u128 = 0;
+        let mut local_to_frontier: u128 = 0;
+        let mut frontier_only: u128 = 0;
         let mut intervention_runs: u128 = 0;
         let mut rollback_runs: u128 = 0;
         let mut frontier_runs: u128 = 0;
@@ -725,8 +791,38 @@ impl OutcomeLedgerMetrics {
             total_spend = total_spend.saturating_add(spend);
             rework_spend = rework_spend.saturating_add(u128::from(record.rework_spend_micro));
             avoided = avoided.saturating_add(u128::from(record.avoided_hosted_micro));
+            let steps = &record.model_sequence;
+            let first_local = steps.first().is_some_and(|s| s.local);
+            let last_local = steps.last().is_some_and(|s| s.local);
+            let all_local = !steps.is_empty() && steps.iter().all(|s| s.local);
             if record.local_used() {
                 local_runs = local_runs.saturating_add(1);
+            }
+            if !steps.is_empty() && all_local {
+                local_only_runs = local_only_runs.saturating_add(1);
+                if record.verified() {
+                    local_only_verified = local_only_verified.saturating_add(1);
+                }
+            }
+            if !steps.is_empty() && last_local {
+                local_final_runs = local_final_runs.saturating_add(1);
+                if record.verified() {
+                    local_final_verified = local_final_verified.saturating_add(1);
+                }
+            }
+            if first_local {
+                local_first_runs = local_first_runs.saturating_add(1);
+                if steps.last().is_some_and(|s| !s.local) {
+                    // Started local, ENDED hosted: a fallback, never a
+                    // substitution — it must not count toward any local
+                    // success rate.
+                    local_to_frontier = local_to_frontier.saturating_add(1);
+                } else if record.verified() && record.verified_first_attempt {
+                    local_first_success = local_first_success.saturating_add(1);
+                }
+            }
+            if !record.local_used() && !steps.is_empty() {
+                frontier_only = frontier_only.saturating_add(1);
             }
             if record.human_interventions > 0 {
                 intervention_runs = intervention_runs.saturating_add(1);
@@ -756,6 +852,14 @@ impl OutcomeLedgerMetrics {
         let runs = u128::from(m.runs);
         m.verified_first_pass_changes = sat_u64(verified_first_pass);
         m.local_runs = sat_u64(local_runs);
+        m.local_only_runs = sat_u64(local_only_runs);
+        m.local_only_verified_changes = sat_u64(local_only_verified);
+        m.local_final_runs = sat_u64(local_final_runs);
+        m.local_final_verified_changes = sat_u64(local_final_verified);
+        m.local_first_runs = sat_u64(local_first_runs);
+        m.local_first_success_changes = sat_u64(local_first_success);
+        m.local_to_frontier_fallback_runs = sat_u64(local_to_frontier);
+        m.frontier_only_runs = sat_u64(frontier_only);
         m.human_intervention_runs = sat_u64(intervention_runs);
         m.rollback_runs = sat_u64(rollback_runs);
         m.frontier_escalation_runs = sat_u64(frontier_runs);
@@ -770,14 +874,19 @@ impl OutcomeLedgerMetrics {
         m.verified_first_pass_ppm =
             meaning_ppm(verified_first_pass, u128::from(m.verified_changes));
         m.rework_cost_ratio_ppm = meaning_ppm(rework_spend, total_spend);
-        m.local_substitution_ppm = meaning_ppm(local_runs, runs);
+        m.local_only_verified_ppm = meaning_ppm(local_only_verified, local_only_runs);
+        m.local_final_verified_ppm = meaning_ppm(local_final_verified, local_final_runs);
+        m.local_first_success_ppm = meaning_ppm(local_first_success, local_first_runs);
+        m.local_to_frontier_fallback_ppm = meaning_ppm(local_to_frontier, local_first_runs);
+        m.frontier_only_ppm = meaning_ppm(frontier_only, runs);
         m.human_intervention_ppm = meaning_ppm(intervention_runs, runs);
         m.regression_rollback_ppm = meaning_ppm(rollback_runs, runs);
         m.proof_coverage_ppm = meaning_ppm(checks_passed, checks_required);
         m.frontier_escalation_ppm = meaning_ppm(frontier_runs, runs);
         // Money/time averages: ceil ("never understate").
-        m.verified_cost_per_change_micro =
-            ceil_div_u64(verified_spend, u128::from(m.verified_changes));
+        m.successful_run_cost_micro = ceil_div_u64(verified_spend, u128::from(m.verified_changes));
+        m.verified_cost_per_successful_change_micro =
+            ceil_div_u64(total_spend, u128::from(m.verified_changes));
         m.mean_time_to_verified_change_ms =
             ceil_div_u64(verified_wall, u128::from(m.verified_changes));
         m
@@ -803,6 +912,338 @@ fn ceil_div_u64(n: u128, d: u128) -> u64 {
         return 0;
     }
     sat_u64(n.div_ceil(d))
+}
+
+// ---------------------------------------------------------------------------
+// The production producer: terminal run settlement -> one ledger record
+// ---------------------------------------------------------------------------
+
+/// The canonical per-session terminal-run identity (`tx-session-<id>`): the
+/// SAME identity the task executor's in-session settlement uses, so the
+/// runtime's terminal gate and the executor's settlement describe ONE run
+/// (a task row is created once per session and can reach a terminal state
+/// once, so the identity is total).
+pub fn session_terminal_run_id(session: faktor_core::id::SessionId) -> String {
+    format!("tx-session-{}", session.raw())
+}
+
+/// The non-derivable facts of one terminal run: the semantic risk bucket the
+/// terminal turn's attributed samples key by, and the explicit verified
+/// samples the terminal turn collected. Everything else is derived from
+/// durable rows by [`OutcomeLedger::record_terminal_run`].
+#[derive(Debug, Clone, Default)]
+pub struct TerminalRunFacts {
+    /// The risk bucket of the terminal turn's verified attribution. Only
+    /// meaningful when `samples` is non-empty (the router feed keys by it);
+    /// records without samples use the honest default.
+    pub risk_class: Option<RiskBucket>,
+    /// The terminal turn's explicit per-call verified samples. Every sample
+    /// rides the record's atomic append (the store absorbs them into the
+    /// router registry IN the record's transaction).
+    pub samples: Vec<RunVerifiedSample>,
+}
+
+impl OutcomeLedger {
+    /// The PRODUCTION producer (economic audit item 7 P1): record ONE
+    /// completed run from its durable, terminal state. Called at the
+    /// terminal settlement of every run — the runtime's completion gate and
+    /// the task executor's post-run settlement — and idempotent by
+    /// construction:
+    ///
+    /// - an already-recorded run id returns `Ok(None)` WITHOUT re-deriving
+    ///   (a replay never rewrites and never double-feeds the router);
+    /// - otherwise the record is derived purely from durable facts and
+    ///   validated before the append: task identity/state/time, the
+    ///   verification records (attempts, proof coverage, review evidence),
+    ///   the settled spend rows (provider/model sequence, local zero-cost
+    ///   steps, spend, rework after the first failed attempt), the durable
+    ///   integration record (snapshots), the integration transaction
+    ///   (rollback), the permission decisions (human interventions) and the
+    ///   recovery events;
+    /// - the append is the store's exactly-once immediate transaction: the
+    ///   row and the router samples commit together or not at all, and a
+    ///   byte-identical replay is a `Replayed` no-op.
+    ///
+    /// Facts with no durable authority are honest zeros, documented per
+    /// field below (never fabricated numbers).
+    pub fn record_terminal_run(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        run_id: &str,
+        facts: TerminalRunFacts,
+    ) -> Result<Option<LedgerAppend>, OutcomeLedgerError> {
+        if self.get(run_id)?.is_some() {
+            return Ok(None);
+        }
+        let record = self.derive_terminal_run_record(handle, run_id, facts)?;
+        Ok(Some(self.record(&record)?))
+    }
+
+    /// Derive the terminal run record from durable rows only. Every read is
+    /// fallible; a failed read refuses the record (never a partial or
+    /// fabricated one). Deterministic over frozen terminal state, so a
+    /// concurrent re-derivation of the same run produces a byte-identical
+    /// row.
+    fn derive_terminal_run_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        run_id: &str,
+        facts: TerminalRunFacts,
+    ) -> Result<RunOutcomeRecord, OutcomeLedgerError> {
+        let task_id = handle
+            .task_id()
+            .map_err(|e| OutcomeLedgerError::Facts(format!("task id read failed: {e}")))?;
+        let task = handle
+            .get_task(task_id)
+            .map_err(|e| OutcomeLedgerError::Facts(format!("task row read failed: {e}")))?
+            .ok_or_else(|| {
+                OutcomeLedgerError::Facts(format!(
+                    "terminal run {run_id} has no durable task row; refusing to record"
+                ))
+            })?;
+        let revision = handle
+            .task_revision(task_id)
+            .map_err(|e| OutcomeLedgerError::Facts(format!("task revision read failed: {e}")))?;
+        let records = handle.list_verification_records(task_id).map_err(|e| {
+            OutcomeLedgerError::Facts(format!("verification records read failed: {e}"))
+        })?;
+        let spend = handle
+            .durable_spend_rows(task_id, faktor_session::MAX_DURABLE_SPEND_ROWS)
+            .map_err(|e| {
+                OutcomeLedgerError::Facts(format!("settled spend rows read failed: {e}"))
+            })?;
+        let integration = handle
+            .ledger_integration_record_for_task(task_id.raw())
+            .map_err(|e| {
+                OutcomeLedgerError::Facts(format!("integration record read failed: {e}"))
+            })?;
+        let txn = match handle.ledger_integration_txn_read(run_id) {
+            faktor_session::ledger::DurableRead::PresentValid(txn) => Some(txn),
+            faktor_session::ledger::DurableRead::Missing => None,
+            faktor_session::ledger::DurableRead::PresentMalformed(detail) => {
+                return Err(OutcomeLedgerError::Facts(format!(
+                    "integration transaction of run {run_id} is corrupt: {detail}"
+                )))
+            }
+            faktor_session::ledger::DurableRead::StoreFailure(detail) => {
+                return Err(OutcomeLedgerError::Facts(format!(
+                    "integration transaction read failed: {detail}"
+                )))
+            }
+        };
+        let store = &self.store;
+
+        let accepted = task.state == crate::TaskState::VerifiedComplete;
+        let completed_at_ms = task.updated_ms.max(task.created_ms);
+        let wall_time_ms =
+            u64::try_from(completed_at_ms.saturating_sub(task.created_ms)).unwrap_or(0);
+        // Attempts: every Failed verification record is one repair attempt;
+        // a verified run with zero failed records verified first-pass.
+        let repair_attempts = records
+            .iter()
+            .filter(|r| r.status == crate::VerificationStatus::Failed)
+            .count() as u64;
+        // The certifying record: the newest Passed record for an accepted
+        // run, else the newest attempt record (evidence of the failure).
+        let certifying = if accepted {
+            records
+                .iter()
+                .rev()
+                .find(|r| r.status == crate::VerificationStatus::Passed)
+        } else {
+            records.last()
+        };
+        let (checks_passed, checks_required) = match certifying {
+            Some(record) => (
+                record
+                    .checks
+                    .iter()
+                    .filter(|c| c.status == crate::VerificationStatus::Passed)
+                    .count() as u64,
+                record.checks.len() as u64,
+            ),
+            None => (0, 0),
+        };
+        let has_review = certifying.is_some_and(|r| r.reviewer.is_some());
+        let final_basis = if !accepted {
+            FinalVerificationBasis::Unverified
+        } else if checks_required > 0 {
+            if has_review {
+                FinalVerificationBasis::DeterministicChecksAndReview
+            } else {
+                FinalVerificationBasis::DeterministicChecks
+            }
+        } else if has_review {
+            FinalVerificationBasis::ReviewOnly
+        } else {
+            FinalVerificationBasis::Unverified
+        };
+        // The verified predicate of THIS derivation (the record does not
+        // exist yet): accepted + integrated + deterministic basis.
+        let verified = accepted && final_basis.is_deterministic_verified();
+        // The provider/model sequence is the settled-spend projection
+        // (settled reservations in occurrence order). A locally-served
+        // (zero-cost) attributed settlement is one local step; the
+        // unattributed provenance label is never local. Groups are
+        // first-seen ordered and single-stepped; a pathological run with
+        // more than MAX_RUN_MODEL_STEPS distinct groups folds the excess
+        // into one explicit aggregate tail step (the spend sum is exact).
+        let mut groups: Vec<RunModelStep> = Vec::new();
+        let mut folded_groups: u64 = 0;
+        let mut folded_spend: u128 = 0;
+        let mut model_spend: u128 = 0;
+        for row in &spend {
+            model_spend = model_spend.saturating_add(u128::from(row.provider_cost_micro));
+            let local = row.provider != faktor_session::UNATTRIBUTED_PROVENANCE
+                && row.provider_cost_micro == 0;
+            if let Some(last) = groups.last_mut() {
+                if last.provider == row.provider && last.model == row.model && last.local == local {
+                    last.spend_micro = last.spend_micro.saturating_add(row.provider_cost_micro);
+                    continue;
+                }
+            }
+            if groups.len() < MAX_RUN_MODEL_STEPS - 1 {
+                groups.push(RunModelStep {
+                    provider: row.provider.clone(),
+                    model: row.model.clone(),
+                    local,
+                    spend_micro: row.provider_cost_micro,
+                });
+            } else {
+                folded_groups = folded_groups.saturating_add(1);
+                folded_spend = folded_spend.saturating_add(u128::from(row.provider_cost_micro));
+            }
+        }
+        if folded_groups > 0 {
+            groups.push(RunModelStep {
+                provider: "aggregate".into(),
+                model: format!("{folded_groups} folded steps"),
+                local: false,
+                spend_micro: sat_u64(folded_spend),
+            });
+        }
+        let model_spend_micro = sat_u64(model_spend);
+        // Rework: settled spend STRICTLY AFTER the first failed attempt's
+        // completion; zero when no attempt failed (never fabricated).
+        let rework_spend_micro = match records
+            .iter()
+            .find(|r| r.status == crate::VerificationStatus::Failed)
+        {
+            Some(first_failure) => {
+                let at = first_failure
+                    .completed_ms
+                    .unwrap_or(first_failure.started_ms);
+                let rework: u128 = spend
+                    .iter()
+                    .filter(|row| row.occurred_at_ms > at)
+                    .map(|row| u128::from(row.provider_cost_micro))
+                    .sum();
+                sat_u64(rework).min(model_spend_micro)
+            }
+            None => 0,
+        };
+        let candidate_snapshot = integration
+            .as_ref()
+            .and_then(|r| r.candidate_snapshot.clone())
+            .or_else(|| {
+                certifying
+                    .and_then(|r| r.candidate_proof_ref.as_ref())
+                    .and_then(|r| r.candidate_snapshot.clone())
+            });
+        let final_snapshot = integration
+            .as_ref()
+            .and_then(|r| r.landed_snapshot.clone())
+            .or_else(|| {
+                integration
+                    .as_ref()
+                    .and_then(|r| r.candidate_snapshot.clone())
+            })
+            .or_else(|| candidate_snapshot.clone())
+            .or_else(|| certifying.and_then(|r| r.tree_hash.clone()))
+            .or_else(|| {
+                certifying
+                    .and_then(|r| r.environment_fingerprint.as_ref())
+                    .and_then(|f| f.base_tree_hash.clone())
+            })
+            .unwrap_or_else(|| format!("unavailable:rev-{}", revision.raw()));
+        let changed_files = certifying
+            .map(|r| r.changed_files.len() as u64)
+            .unwrap_or(0);
+        let rollback_events = match txn {
+            Some(txn)
+                if matches!(
+                    txn.phase,
+                    faktor_session::ledger::IntegrationTxnPhase::RollingBack
+                        | faktor_session::ledger::IntegrationTxnPhase::RolledBack
+                ) =>
+            {
+                1
+            }
+            _ => 0,
+        };
+        let human_interventions = store
+            .engineering_outcome_human_interventions(handle.id())
+            .map_err(|e| {
+                OutcomeLedgerError::Facts(format!("human interventions read failed: {e}"))
+            })?;
+        let recovery_events = store
+            .engineering_outcome_recovery_events(handle.id())
+            .map_err(|e| OutcomeLedgerError::Facts(format!("recovery events read failed: {e}")))?;
+        let record = RunOutcomeRecord {
+            schema_version: OUTCOME_RECORD_SCHEMA_V,
+            run_id: run_id.to_string(),
+            session_id: handle.id().raw(),
+            task_id: task_id.raw(),
+            // The runtime's graph carries no per-task class dimension; the
+            // honest Medium default is the SAME class the router feed uses.
+            task_class: TaskClass::Medium,
+            risk_class: facts.risk_class.unwrap_or(RiskBucket::Medium),
+            candidate_snapshot,
+            final_snapshot,
+            accepted,
+            // A VerifiedComplete task row can only be reached after its
+            // changes landed on the owner root (or were written there
+            // directly); failed/cancelled runs integrated nothing.
+            integrated: accepted,
+            // First attempt: no repair, resting on the DETERMINISTIC basis.
+            // A review-only no-op completion is a legitimate terminal
+            // record, but it is not a verified change (`verified()` is
+            // false), so it never claims a verified first pass.
+            verified_first_attempt: repair_attempts == 0 && verified,
+            repair_attempts,
+            model_sequence: groups,
+            model_spend_micro,
+            // No durable verification-process spend ledger exists; review
+            // model calls are part of the settled model spend above.
+            verification_spend_micro: 0,
+            rework_spend_micro,
+            // No durable counterfactual authority: 0 = unmeasured.
+            avoided_hosted_micro: 0,
+            wall_time_ms,
+            human_interventions,
+            proof: ProofCoverage {
+                checks_passed,
+                checks_required,
+            },
+            // Files come from the certifying record's content-addressed
+            // evidence; no durable line-count source exists (honest zeros).
+            change_scale: ChangedCodeScale {
+                files: changed_files,
+                added_lines: 0,
+                removed_lines: 0,
+            },
+            rollback_events,
+            recovery_events,
+            final_basis,
+            // No durable frontier-tier authority exists; a hosted step is
+            // never INFERRED as frontier (0 = unrecorded).
+            frontier_escalations: 0,
+            completed_at_ms,
+            verified_samples: facts.samples,
+        };
+        record.validate()?;
+        Ok(record)
+    }
 }
 
 #[cfg(test)]
@@ -1050,12 +1491,30 @@ mod tests {
         assert_eq!(m.verified_first_pass_ppm, 750_000);
         // Verified spend: A 1_100_000 + B 50_000 + C 3_200_000 + E 700_000.
         assert_eq!(m.total_verified_spend_micro, 5_050_000);
-        assert_eq!(m.verified_cost_per_change_micro, 1_262_500);
+        // Successful-Run Cost = verified spend / verified changes.
+        assert_eq!(m.successful_run_cost_micro, 1_262_500);
         assert_eq!(m.total_spend_micro, 5_550_000);
+        // VCSC = TOTAL eligible cohort spend / verified changes (the failed
+        // D's 500_000 is in the denominator's numerator, never dropped).
+        assert_eq!(m.verified_cost_per_successful_change_micro, 1_387_500);
         assert_eq!(m.total_rework_spend_micro, 3_000_000);
         assert_eq!(m.rework_cost_ratio_ppm, 540_540);
-        assert_eq!(m.local_runs, 2, "B and C substituted a local model");
-        assert_eq!(m.local_substitution_ppm, 400_000);
+        assert_eq!(m.local_runs, 2, "B and C used a local model");
+        // B is local-only and verified; C is a local-then-hosted repair and
+        // must NEVER count as a local substitution.
+        assert_eq!(m.local_only_runs, 1);
+        assert_eq!(m.local_only_verified_changes, 1);
+        assert_eq!(m.local_only_verified_ppm, 1_000_000);
+        assert_eq!(m.local_final_runs, 1);
+        assert_eq!(m.local_final_verified_changes, 1);
+        assert_eq!(m.local_final_verified_ppm, 1_000_000);
+        assert_eq!(m.local_first_runs, 2);
+        assert_eq!(m.local_first_success_changes, 1);
+        assert_eq!(m.local_first_success_ppm, 500_000);
+        assert_eq!(m.local_to_frontier_fallback_runs, 1);
+        assert_eq!(m.local_to_frontier_fallback_ppm, 500_000);
+        assert_eq!(m.frontier_only_runs, 3);
+        assert_eq!(m.frontier_only_ppm, 600_000);
         assert_eq!(
             m.avoided_hosted_inference_micro, 250_000,
             "only B recorded a counterfactual; zero stays zero"
@@ -1070,6 +1529,252 @@ mod tests {
         assert_eq!(m.proof_coverage_ppm, 1_000_000);
         assert_eq!(m.frontier_escalation_runs, 3);
         assert_eq!(m.frontier_escalation_ppm, 600_000);
+    }
+
+    #[test]
+    fn terminal_run_producer_crashes_cleanly_and_replays_without_duplicates() {
+        use faktor_core::state::{TaskState, TaskTransition};
+        use faktor_session::{SessionManager, Task as SessionTask, TaskBudget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let cas_root = dir.path().join("cas");
+        let run_id;
+        let session_id;
+        {
+            let manager = SessionManager::open_quick(store_root.clone(), cas_root.clone()).unwrap();
+            let workspace = manager.create_workspace("/tmp/pw-outcome").unwrap();
+            let handle = manager
+                .create_session(workspace, "ledger fault", "p", "m")
+                .unwrap();
+            session_id = handle.id();
+            let task_id = handle.task_id().unwrap();
+            let now = handle.now_ms();
+            handle
+                .create_task(SessionTask {
+                    task_id,
+                    session_id,
+                    goal: "fault run".into(),
+                    acceptance_criteria: Vec::new(),
+                    plan: Vec::new(),
+                    attachments: Vec::new(),
+                    contract: Default::default(),
+                    budget: TaskBudget::default(),
+                    state: TaskState::Pending,
+                    created_ms: now,
+                    updated_ms: now,
+                })
+                .unwrap();
+            // A cancelled terminal run: the record must still exist.
+            for transition in [TaskTransition::StartRunning, TaskTransition::Cancel] {
+                let revision = handle.task_revision(task_id).unwrap();
+                handle
+                    .transition_task(task_id, revision, transition, None)
+                    .unwrap();
+            }
+            run_id = session_terminal_run_id(session_id);
+            let ledger = OutcomeLedger::new(manager.store());
+            // The armed precommit boundary: the append (and its router feed)
+            // rolls back together; nothing is recorded.
+            manager.store().crash_arm(faktor_store::CrashArm {
+                point: "engineering_outcome_precommit",
+                ordinal: 0,
+            });
+            let facts = TerminalRunFacts {
+                risk_class: Some(RiskBucket::Low),
+                samples: vec![sample("p", "m", RouterPhase::Implement, false, 0, 0)],
+            };
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ledger.record_terminal_run(&handle, &run_id, facts.clone())
+            }));
+            assert!(
+                manager.store().seam_crash_observed(&caught),
+                "the armed precommit seam must fire"
+            );
+        }
+        {
+            // Reopen over the same durable root: the crash left no record
+            // and no sample; the SAME settlement retry records exactly one.
+            let manager = SessionManager::open_quick(store_root, cas_root).unwrap();
+            let handle = manager.get_session(session_id).unwrap().unwrap();
+            let ledger = OutcomeLedger::new(manager.store());
+            assert_eq!(
+                ledger.count().unwrap(),
+                0,
+                "the crash rolled back the record"
+            );
+            let facts = TerminalRunFacts {
+                risk_class: Some(RiskBucket::Low),
+                samples: vec![sample("p", "m", RouterPhase::Implement, false, 0, 0)],
+            };
+            assert_eq!(
+                ledger.record_terminal_run(&handle, &run_id, facts).unwrap(),
+                Some(LedgerAppend::Recorded)
+            );
+            let record = ledger.get(&run_id).unwrap().unwrap();
+            assert!(!record.accepted && !record.integrated);
+            assert_eq!(record.final_basis, FinalVerificationBasis::Unverified);
+            assert_eq!(record.risk_class, RiskBucket::Low);
+            assert_eq!(record.verified_samples.len(), 1);
+            assert_eq!(ledger.count().unwrap(), 1);
+            let key = faktor_router::OutcomeKey {
+                provider: "p".into(),
+                model: "m".into(),
+                phase: RouterPhase::Implement,
+                task_class: TaskClass::Medium,
+                risk_bucket: RiskBucket::Low,
+            };
+            let view = StoreOutcomeStore::new(manager.store());
+            assert_eq!(
+                view.stats(&key)
+                    .expect("the record fed the router")
+                    .sample_count,
+                1
+            );
+            // The settlement replay: a present record short-circuits — no
+            // second row, no second sample.
+            assert_eq!(
+                ledger
+                    .record_terminal_run(&handle, &run_id, TerminalRunFacts::default())
+                    .unwrap(),
+                None
+            );
+            assert_eq!(ledger.count().unwrap(), 1);
+            assert_eq!(view.stats(&key).unwrap().sample_count, 1);
+        }
+    }
+
+    #[test]
+    fn accepted_run_without_a_deterministic_basis_never_claims_a_verified_first_pass() {
+        // Regression: the reviewer-proved no-op path (RequiresCriterionProof)
+        // completes with zero checks and a root record that persists no
+        // reviewer JSON — a non-deterministic basis. Such a run is a
+        // legitimate terminal record, but it must NOT claim
+        // `verified_first_attempt` (the validation invariant: that flag
+        // implies a deterministic verified basis).
+        use faktor_core::state::{TaskState, TaskTransition};
+        use faktor_session::{SessionManager, Task as SessionTask, TaskBudget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            SessionManager::open_quick(dir.path().join("store"), dir.path().join("cas")).unwrap();
+        let workspace = manager.create_workspace("/tmp/pw-review-only").unwrap();
+        let handle = manager
+            .create_session(workspace, "review-only", "p", "m")
+            .unwrap();
+        let session_id = handle.id();
+        let task_id = handle.task_id().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(SessionTask {
+                task_id,
+                session_id,
+                goal: "reviewer-proved no-op".into(),
+                acceptance_criteria: Vec::new(),
+                plan: Vec::new(),
+                attachments: Vec::new(),
+                contract: Default::default(),
+                budget: TaskBudget::default(),
+                state: TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        for transition in [
+            TaskTransition::StartRunning,
+            TaskTransition::RequestVerification,
+            TaskTransition::StartVerification,
+        ] {
+            let revision = handle.task_revision(task_id).unwrap();
+            handle
+                .transition_task(task_id, revision, transition, None)
+                .unwrap();
+        }
+        // The no-op completion record: zero checks, zero criteria and NO
+        // persisted reviewer (the historical shape of every orchestrated
+        // root record) — a review-only proof by construction.
+        let record = handle
+            .create_verification_record_with_evidence(
+                task_id,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                crate::VerificationStatus::Passed,
+                now,
+                None,
+                None,
+            )
+            .unwrap();
+        let revision = handle.task_revision(task_id).unwrap();
+        handle
+            .complete_verified_task(task_id, revision, record)
+            .unwrap();
+        assert_eq!(
+            handle.get_task(task_id).unwrap().unwrap().state,
+            TaskState::VerifiedComplete
+        );
+
+        let run_id = session_terminal_run_id(session_id);
+        let ledger = OutcomeLedger::new(manager.store());
+        let append = ledger
+            .record_terminal_run(&handle, &run_id, TerminalRunFacts::default())
+            .unwrap();
+        assert_eq!(append, Some(LedgerAppend::Recorded));
+        let record = ledger.get(&run_id).unwrap().unwrap();
+        assert!(record.accepted && record.integrated);
+        assert_eq!(record.repair_attempts, 0, "no attempt ever failed");
+        assert_eq!(record.final_basis, FinalVerificationBasis::Unverified);
+        assert!(
+            !record.verified_first_attempt,
+            "a non-deterministic basis never claims a verified first pass"
+        );
+        assert!(!record.verified());
+    }
+
+    #[test]
+    fn vcsc_counts_the_whole_attempt_cohort_not_only_the_successes() {
+        // Audit example: 9 failed attempts at $10 plus 1 verified change at
+        // $1 => $91 per successful verified change, NOT $1.
+        let mut records = Vec::new();
+        for index in 0..9u64 {
+            let mut failed = full_record();
+            failed.run_id = format!("fail-{index}");
+            failed.accepted = false;
+            failed.integrated = false;
+            failed.verified_first_attempt = false;
+            failed.repair_attempts = 1;
+            failed.model_sequence = vec![step("hosted", "m", false, 10_000_000)];
+            failed.model_spend_micro = 10_000_000;
+            failed.verification_spend_micro = 0;
+            failed.rework_spend_micro = 10_000_000;
+            failed.final_basis = FinalVerificationBasis::Unverified;
+            failed.verified_samples.clear();
+            records.push(failed);
+        }
+        let mut success = full_record();
+        success.run_id = "success".into();
+        success.model_sequence = vec![step("hosted", "m", false, 1_000_000)];
+        success.model_spend_micro = 1_000_000;
+        success.verification_spend_micro = 0;
+        success.rework_spend_micro = 0;
+        success.verified_samples.clear();
+        records.push(success);
+        let m = OutcomeLedgerMetrics::compute(&records);
+        assert_eq!(m.runs, 10);
+        assert_eq!(m.verified_changes, 1);
+        // The average spend of a run that DID succeed...
+        assert_eq!(m.successful_run_cost_micro, 1_000_000);
+        assert_eq!(m.total_verified_spend_micro, 1_000_000);
+        // ...versus the cost of a successful CHANGE over the whole cohort.
+        assert_eq!(m.total_spend_micro, 91_000_000);
+        assert_eq!(m.verified_cost_per_successful_change_micro, 91_000_000);
+        assert_ne!(
+            m.verified_cost_per_successful_change_micro, m.successful_run_cost_micro,
+            "the audit's $1-vs-$91 distinction must be visible"
+        );
     }
 
     #[test]
@@ -1093,7 +1798,7 @@ mod tests {
         let m = OutcomeLedgerMetrics::compute(std::slice::from_ref(&read));
         assert_eq!(m.total_verified_spend_micro, big + 1);
         // ceil div of (2^53+1+1)/1 stays exact; no float ever participates.
-        assert_eq!(m.verified_cost_per_change_micro, big + 1);
+        assert_eq!(m.successful_run_cost_micro, big + 1);
         assert_eq!(m.rework_cost_ratio_ppm, 999_999);
         // Two verified records with an odd micro sum: the per-change average
         // rounds UP (never understates spend).
@@ -1104,7 +1809,7 @@ mod tests {
         assert_eq!(report.metrics.runs, 2);
         assert_eq!(report.metrics.verified_changes, 2);
         assert_eq!(report.metrics.total_verified_spend_micro, (big + 1) * 2);
-        assert_eq!(report.metrics.verified_cost_per_change_micro, big + 1);
+        assert_eq!(report.metrics.successful_run_cost_micro, big + 1);
     }
 
     #[test]
@@ -1255,6 +1960,6 @@ mod tests {
         let m = OutcomeLedgerMetrics::compute(std::slice::from_ref(&hostile));
         assert!(m.proof_coverage_ppm <= 1_000_000);
         assert!(m.rework_cost_ratio_ppm <= 1_000_000);
-        assert!(m.verified_cost_per_change_micro > 0);
+        assert!(m.successful_run_cost_micro > 0);
     }
 }

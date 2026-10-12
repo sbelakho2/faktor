@@ -18,7 +18,9 @@
 #
 # Coverage: [fault] campaigns at scale, the longrun suite (release), the
 # efficiency harness, the economy suite (synthetic policy gates) plus the
-# economic certification against real verified tasks, the
+# router-economics regression (scripted fake model; router discipline only,
+# never model-quality evidence) and the deterministic CI replay of frozen
+# coding-benchmark outputs, the
 # coding-benchmark smoke, the
 # provider-key real-model run (recorded as an explicit skip unless keys are
 # supplied out-of-band — CI requires NO secrets by default), and the
@@ -224,25 +226,28 @@ steps:
       - faktor-nightly-cargo-git:/usr/local/cargo/git
       - faktor-nightly-target-economy:/woodpecker-cache/target
     commands:
-      # The synthetic economic-policy suite plus the real-verified-task
-      # economic certification (audit item 9): a frozen coding corpus, a
+      # The synthetic economic-policy suite plus the router-economics
+      # REGRESSION (audit item 9): a frozen corpus, a policy-independent
       # scripted fake coding model, real subprocess verification, and the
-      # real router/outcome-learning loop; the certification writes
-      # target/certification/economic-certification.json, bound into the
-      # lane marker below.
+      # real router/outcome-learning loop. The regression proves router
+      # economics discipline only — NOT model quality — and writes
+      # target/certification/router-economics-regression.json, bound into
+      # the lane marker below. The same `cargo test -p` invocation also runs
+      # the deterministic CI replay of the frozen coding-benchmark outputs
+      # (fixture records: machinery proof, not model evidence).
       - cargo test -p faktor-tests-economy
-      - cargo test -p faktor-tests-economic-certification
+      - cargo test -p faktor-tests-router-economics
       - |
         set -eu
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
         cargo test -p faktor-tests-economy
-        cargo test -p faktor-tests-economic-certification
+        cargo test -p faktor-tests-router-economics
         CMDS
         )"
         printf '%s' "$CMDS" | sh scripts/certification/lane-marker.sh write \
           --lane economy --status passed \
-          --artifact target/certification/economic-certification.json \
+          --artifact target/certification/router-economics-regression.json \
           --out target/certification/lanes/economy.json
   - name: coding-benchmark
     image: rust:1.98.0@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 # rust:1.98.0 @ 2026-09-24; rustup baseline only — rust-toolchain.toml is authoritative
@@ -277,6 +282,11 @@ steps:
     commands:
       - |
         set -eu
+        if [ "${FAKTOR_ECON_CAPTURE:-}" = "1" ]; then
+          cargo test -p faktor-tests-router-economics --test capture -- --ignored
+        else
+          echo "economic-capture: skipped (FAKTOR_ECON_CAPTURE is not set; live capture is opt-in and never runs by default)"
+        fi
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
           cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored
           status="passed"; reason=""
@@ -289,6 +299,11 @@ steps:
         mkdir -p target/certification/lanes
         CMDS="$(cat <<'CMDS'
         set -eu
+        if [ "${FAKTOR_ECON_CAPTURE:-}" = "1" ]; then
+        cargo test -p faktor-tests-router-economics --test capture -- --ignored
+        else
+        echo "economic-capture: skipped (FAKTOR_ECON_CAPTURE is not set; live capture is opt-in and never runs by default)"
+        fi
         if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
         cargo test -p faktor-tests-coding-benchmark --test real -- --ignored && cargo test -p faktor-commerce-connectors --test live_canary -- --ignored
         status="passed"; reason=""

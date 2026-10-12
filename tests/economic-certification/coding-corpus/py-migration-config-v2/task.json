@@ -1,0 +1,10 @@
+{
+  "id": "py-migration-config-v2",
+  "order": 6,
+  "category": "migration",
+  "language": "python",
+  "runtime": "python3",
+  "task_class": "medium",
+  "phase": "implement",
+  "goal": "migrate.py converts a v1 device config JSON to v2. v1 has {host, user_name} and OPTIONAL port (default 443) and OPTIONAL tls (default false). v2 must be {version: 2, endpoint: {host, port}, user, tls}. The current code crashes when port is absent and wrongly defaults tls to true. Fix migrate.py so the conversion is correct, and make it idempotent: migrating an already-v2 config must leave it unchanged."
+}

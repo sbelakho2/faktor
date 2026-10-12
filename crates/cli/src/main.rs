@@ -1571,6 +1571,10 @@ pub(crate) fn doctor_run_with_config(
     let mut lines: Vec<String> = Vec::new();
     let mut issues = 0usize;
     doctor_worker_plane_line(config_path, &mut lines, &mut issues);
+    // The additive value-centric entitlement section: the [billing] plan
+    // table's paid VALUE features (inference-independent; offline default
+    // denies typed while the local product is unaffected).
+    doctor_value_entitlements_line(config_path, &mut lines, &mut issues);
     doctor_sandbox_shell_line(config_path, data_dir, &mut lines, &mut issues);
     doctor_sandbox_first_run_line(data_dir, config_path, &mut lines, &mut issues);
     doctor_sandbox_agent_home_line(data_dir, config_path, &mut lines, &mut issues);
@@ -1939,12 +1943,13 @@ pub(crate) fn doctor_outcome_ledger_line(
                 return;
             }
             lines.push(format!(
-                "outcomes: {} run(s), {} verified, first-pass {}%, verified cost/change {} \
-                 microUSD, rework ratio {}%, rollback {}%{}",
+                "outcomes: {} run(s), {} verified, first-pass {}%, successful-run cost {} \
+                 microUSD, all-in cost/verified change {} microUSD, rework ratio {}%, rollback {}%{}",
                 m.runs,
                 m.verified_changes,
                 doctor_ppm_percent(m.verified_first_pass_ppm),
-                m.verified_cost_per_change_micro,
+                m.successful_run_cost_micro,
+                m.verified_cost_per_successful_change_micro,
                 doctor_ppm_percent(m.rework_cost_ratio_ppm),
                 doctor_ppm_percent(m.regression_rollback_ppm),
                 if report.truncated {
@@ -2574,6 +2579,105 @@ pub(crate) fn doctor_live_canary_line(lines: &mut Vec<String>) {
     }
 }
 
+/// The value-centric entitlement doctor section (additive; product closure):
+/// reports the `[billing]` plan table's VALUE entitlements — the paid
+/// product capabilities that are independent of inference volume (advanced
+/// verification policy, organization contracts, shared/cross-repo
+/// intelligence, outcome analytics, signed proof/provenance, audit
+/// retention history, model-optimization learning, private runners,
+/// enterprise governance with its SSO/SCIM capability flags).
+///
+/// Reporting rules:
+///
+/// - no `[billing]` section (or disabled): the OFFLINE DEFAULT is reported
+///   honestly — value features are denied typed and the local product is
+///   unaffected; this is never an ISSUE (local-only deployments stay fully
+///   functional);
+/// - enabled: one line per plan maps the plan's value feature tags and
+///   effective governance flags. A plan mapping nothing is legal (a pure
+///   inference-billing plan) and informational;
+/// - a config with a billing-specific refusal is an ISSUE; a config the
+///   daemon refuses wholesale is reported as refused WITHOUT a second issue
+///   (the worker-plane line above already counts it once).
+pub(crate) fn doctor_value_entitlements_line(
+    config_path: Option<&std::path::Path>,
+    lines: &mut Vec<String>,
+    issues: &mut usize,
+) {
+    let Some(path) = config_path else {
+        lines.push(
+            "value entitlements: state=disabled enabled=false plans=0 (offline default: value features are denied typed; the local product is unaffected)"
+                .into(),
+        );
+        return;
+    };
+    match serve_config_and_semantic(Some(path.to_path_buf())) {
+        Ok((config, _semantic)) => {
+            if !config.billing.enabled {
+                lines.push(
+                    "value entitlements: state=disabled enabled=false plans=0 (billing disabled: value features are denied typed; the local product is unaffected)"
+                        .into(),
+                );
+                return;
+            }
+            match config.billing.service_config() {
+                Ok(Some(billing)) => {
+                    lines.push(format!(
+                        "value entitlements: state=enabled enabled=true plans={} default_plan={} (plan-mapped, inference-independent)",
+                        billing.plans.len(),
+                        billing.default_plan.as_deref().unwrap_or("-")
+                    ));
+                    for (plan_id, plan) in &billing.plans {
+                        let entitlements = plan
+                            .value_entitlements()
+                            .iter()
+                            .map(|entitlement| entitlement.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let governance = plan.governance_capabilities();
+                        let mut flags = Vec::new();
+                        if governance.sso {
+                            flags.push("sso");
+                        }
+                        if governance.scim {
+                            flags.push("scim");
+                        }
+                        lines.push(format!(
+                            "value plan {plan_id}: entitlements={} governance={}",
+                            if entitlements.is_empty() {
+                                "-"
+                            } else {
+                                &entitlements
+                            },
+                            if flags.is_empty() {
+                                "-".to_string()
+                            } else {
+                                flags.join(",")
+                            }
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    lines.push("value entitlements: state=disabled enabled=false plans=0".into())
+                }
+                Err(e) => {
+                    lines.push(format!(
+                        "value entitlements: FAILED state=refused enabled=true {e}"
+                    ));
+                    *issues += 1;
+                }
+            }
+        }
+        Err(e) => {
+            // The daemon refuses this config wholesale; the worker-plane
+            // section above already counts that refusal once.
+            lines.push(format!(
+                "value entitlements: unavailable state=refused (the daemon refuses this config) {e}"
+            ));
+        }
+    }
+}
+
 /// The tokenizer certification section (audit item 22): iterates every
 /// BUILT-IN documented catalog row plus (when a config is named) every
 /// configured provider's catalog rows, reporting
@@ -3132,6 +3236,9 @@ mod main_worker_tests;
 
 #[cfg(test)]
 mod main_doctor_tests;
+
+#[cfg(test)]
+mod main_value_tests;
 
 #[cfg(test)]
 mod main_cli_tests;

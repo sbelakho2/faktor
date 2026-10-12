@@ -55,6 +55,44 @@ is a deterministic-checks basis. A first-attempt verified run MUST be a
 verified change. A verified sample may carry rework ONLY as a failure
 sample; a first-pass success with nonzero rework is refused.
 
+## The producer (terminal run settlement)
+
+The record is produced in production, not only in tests. Every terminal
+run settlement appends exactly one record:
+
+- the runtime's completion gate appends the record the moment the task row
+  reaches `VerifiedComplete` (the terminal turn's explicit verified
+  samples ride the record's atomic append — they are the run's ONE feed
+  for that turn, never also the per-call feed);
+- the task executor's post-run settlement (`settle_run`, both the
+  in-session and the orchestrated arm) and both durable cancel paths
+  append the record for a terminal task row (`VerifiedComplete`,
+  `Failed`, `Cancelled`).
+
+The record is DERIVED from durable, frozen terminal facts — never from
+model-authored prose: the task row (identity, state, start/terminal
+times), the verification records (repair attempts, first-pass, proof
+coverage, review evidence, candidate snapshot), the settled spend rows
+(provider/model sequence, zero-cost local steps, model spend, rework after
+the first failed attempt), the durable integration record (snapshots), the
+integration transaction (rollback), the resolved permission decisions
+(human interventions) and the recovery events. Facts with no durable
+authority stay honest zeros: `avoided_hosted_micro` (no counterfactual
+recorder), `verification_spend_micro` (no process-spend ledger; review
+model calls are inside model spend), `frontier_escalations` (no
+frontier-tier authority; a hosted step is never inferred as frontier) and
+`added_lines`/`removed_lines` (no durable line-count source). A run whose
+facts are unreadable records NOTHING — a read failure is a typed refusal,
+never a partial record.
+
+Crash/replay semantics: the append is the store's ONE immediate
+transaction; a crash before commit leaves no row and no router sample (the
+next settlement pass re-derives and appends), a present record
+short-circuits before any re-derivation (a replay is a no-op), and a
+concurrent producer that lost the race is surfaced loudly with the
+existing append-only record left authoritative. Neither a record nor a
+router sample can be lost or doubled.
+
 ## Exactly-once durability
 
 The record lands in the store crate's `engineering_outcome` table
@@ -81,8 +119,12 @@ deterministic gate sites record success/failure and measured rework;
 "the model said done" is not a sample. Recording a run feeds each sample
 into the durable per-key projection keyed by `(provider, model, phase,
 task_class, risk_class)`, so every `RouterService` wired over
-`StoreOutcomeStore` consults the learned history exactly as before — with
-no change to the existing economics paths. The ledger adds no second
+`StoreOutcomeStore` consults the learned history exactly as before. The
+terminal turn's samples ride the run record's transaction (fed exactly
+once); samples of non-terminal gates keep the per-call feed, and a
+turn settling more samples than one record carries (`MAX_RUN_VERIFIED_SAMPLES`)
+splits at the cap — the record feeds the first samples and the remainder
+feeds per call, never dropped and never doubled. The ledger adds no second
 learning mechanism; it makes the run-level record that feeds the existing
 one.
 
@@ -95,16 +137,21 @@ denominator yields zero.
 
 | Metric | Definition |
 | --- | --- |
-| Verified Cost per Successful Change | (model + verification spend over verified changes) ÷ verified changes, rounded up (`verifiedCostPerChangeMicro`) |
+| Successful-Run Cost | model + verification spend over the successful (verified) runs ÷ verified changes, rounded up (`successfulRunCostMicro`) — the average spend of a run that DID succeed |
+| Verified Cost per Successful Change (VCSC) | TOTAL eligible-cohort spend over ALL attempted work (failed and cancelled runs included) ÷ verified changes, rounded up (`verifiedCostPerSuccessfulChangeMicro`). Audit example: 9 failures at $10 + 1 verified change at $1 => $91 per successful change (never $1) |
 | Verified First-Pass Rate | first-attempt verified changes ÷ verified changes (`verifiedFirstPassPpm`) |
 | Rework Cost Ratio | rework spend ÷ (model + verification spend), all runs (`reworkCostRatioPpm`) |
-| Local-Model Substitution Rate | runs with ≥ 1 local step ÷ all runs (`localSubstitutionPpm`) |
+| Local-Only Verified Rate | verified local-only runs ÷ local-only runs (`localOnlyVerifiedPpm`, with the `localOnlyRuns`/`localOnlyVerifiedChanges` counts): how often a purely local run verifies |
+| Local-Final Verified Rate | verified local-final runs ÷ runs whose FINAL model step is local (`localFinalVerifiedPpm`, with the `localFinalRuns`/`localFinalVerifiedChanges` counts) |
+| Local-First Success Rate | local-first runs that verified on their first attempt ÷ runs whose FIRST step is local (`localFirstSuccessPpm`) |
+| Local-to-Frontier Fallback Rate | runs that started local and ENDED hosted ÷ runs whose first step is local (`localToFrontierFallbackPpm`); a local-then-hosted repair is a FALLBACK, never a local substitution |
+| Frontier-Only Rate | runs with no local step at all ÷ all runs (`frontierOnlyPpm`) |
 | Avoided Hosted Inference | sum of recorded `avoided_hosted_micro` (never fabricated) |
 | Mean Time to Verified Change | wall time over verified changes ÷ verified changes, rounded up (`meanTimeToVerifiedChangeMs`) |
 | Human Intervention Rate | runs with ≥ 1 intervention ÷ all runs (`humanInterventionPpm`) |
 | Regression/Rollback Rate | runs with ≥ 1 rollback event ÷ all runs (`regressionRollbackPpm`) |
 | Proof Coverage | passed checks ÷ required checks over runs that required any, clamped to 100% (`proofCoveragePpm`) |
-| Frontier Escalation Rate | runs with ≥ 1 frontier escalation ÷ all runs (`frontierEscalationPpm`) |
+| Frontier Escalation Rate | runs with ≥ 1 recorded frontier escalation ÷ all runs (`frontierEscalationPpm`) |
 
 The fold scans at most `MAX_METRICS_RECORDS` (10 000) newest records; a
 larger ledger reports `truncated: true` instead of pretending to be
@@ -117,9 +164,10 @@ exact.
   newest-first run page (`limit` 1..=200; `before_ms` + `before_run`
   cursor), money as decimal strings. See `docs/native-protocol.md`.
 - `faktor doctor` prints one read-only line:
-  `outcomes: N run(s), M verified, first-pass P%, verified cost/change C
-  microUSD, rework ratio R%, rollback B%` (or an explicit empty-ledger
-  line). A ledger read failure is a doctor ISSUE.
+  `outcomes: N run(s), M verified, first-pass P%, successful-run cost C
+  microUSD, all-in cost/verified change V microUSD, rework ratio R%,
+  rollback B%` (or an explicit empty-ledger line). A ledger read failure
+  is a doctor ISSUE.
 
 ## Bounds
 

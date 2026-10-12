@@ -150,7 +150,13 @@ async fn empty_ledger_answers_zero_metrics_and_no_runs() {
     assert_eq!(metrics["verifiedChanges"], 0);
     assert_eq!(metrics["verifiedFirstPassPpm"], 0);
     assert_eq!(metrics["reworkCostRatioPpm"], 0);
-    assert_eq!(metrics["localSubstitutionPpm"], 0);
+    assert_eq!(metrics["successfulRunCostMicro"], "0");
+    assert_eq!(metrics["verifiedCostPerSuccessfulChangeMicro"], "0");
+    assert_eq!(metrics["localOnlyVerifiedPpm"], 0);
+    assert_eq!(metrics["localFinalVerifiedPpm"], 0);
+    assert_eq!(metrics["localFirstSuccessPpm"], 0);
+    assert_eq!(metrics["localToFrontierFallbackPpm"], 0);
+    assert_eq!(metrics["frontierOnlyPpm"], 0);
     assert_eq!(metrics["meanTimeToVerifiedChangeMs"], 0);
     assert_eq!(metrics["humanInterventionPpm"], 0);
     assert_eq!(metrics["regressionRollbackPpm"], 0);
@@ -189,12 +195,27 @@ async fn ledger_metrics_and_run_page_match_the_durable_records() {
     assert_eq!(metrics["verifiedFirstPassChanges"], 3);
     assert_eq!(metrics["verifiedFirstPassPpm"], 1_000_000);
     assert_eq!(metrics["totalVerifiedSpendMicro"], "2300000");
-    assert_eq!(metrics["verifiedCostPerChangeMicro"], "766667"); // ceil
+    assert_eq!(metrics["successfulRunCostMicro"], "766667"); // ceil
     assert_eq!(metrics["totalSpendMicro"], "2300000");
+    // No failed attempts in this fixture: the all-in VCSC equals the
+    // successful-run cost.
+    assert_eq!(metrics["verifiedCostPerSuccessfulChangeMicro"], "766667");
     assert_eq!(metrics["totalReworkSpendMicro"], "0");
     assert_eq!(metrics["reworkCostRatioPpm"], 0);
     assert_eq!(metrics["localRuns"], 1);
-    assert_eq!(metrics["localSubstitutionPpm"], 333_333);
+    assert_eq!(metrics["localOnlyRuns"], 1);
+    assert_eq!(metrics["localOnlyVerifiedChanges"], 1);
+    assert_eq!(metrics["localOnlyVerifiedPpm"], 1_000_000);
+    assert_eq!(metrics["localFinalRuns"], 1);
+    assert_eq!(metrics["localFinalVerifiedChanges"], 1);
+    assert_eq!(metrics["localFinalVerifiedPpm"], 1_000_000);
+    assert_eq!(metrics["localFirstRuns"], 1);
+    assert_eq!(metrics["localFirstSuccessChanges"], 1);
+    assert_eq!(metrics["localFirstSuccessPpm"], 1_000_000);
+    assert_eq!(metrics["localToFrontierFallbackRuns"], 0);
+    assert_eq!(metrics["localToFrontierFallbackPpm"], 0);
+    assert_eq!(metrics["frontierOnlyRuns"], 2);
+    assert_eq!(metrics["frontierOnlyPpm"], 666_666);
     assert_eq!(metrics["avoidedHostedInferenceMicro"], "250000");
     assert_eq!(metrics["totalWallTimeMs"], 3_000);
     assert_eq!(metrics["meanTimeToVerifiedChangeMs"], 1_000);

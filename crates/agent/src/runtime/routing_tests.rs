@@ -301,7 +301,15 @@ async fn routed_decision_sees_the_real_planned_dimensions_never_the_old_guess() 
         vec![],
     );
     let manager = seed_deps.session.clone();
-    let ws = manager.create_workspace("/w").unwrap();
+    // A genuinely readable (empty) workspace root: the drive-start baseline
+    // scan is COMPLETE, so the compiled contract stays risk-neutral and the
+    // hard Implement floor is the intent's own 60. A nonexistent root would
+    // truthfully scan as Unavailable, whose Unknown risk escalates the floor
+    // through the contract verification policy (covered by the contract
+    // compiler tests, not this routing test).
+    let ws_root = _dir0.path().join("dims-ws");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    let ws = manager.create_workspace(ws_root.to_str().unwrap()).unwrap();
     let session = manager
         .create_session(ws, "dims", "fake", "m")
         .unwrap()

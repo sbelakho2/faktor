@@ -1627,7 +1627,11 @@ fn doctor_reports_the_engineering_outcome_ledger_honestly() {
     assert!(line.contains("1 run(s), 1 verified"), "{line}");
     assert!(line.contains("first-pass 100.0%"), "{line}");
     assert!(
-        line.contains("verified cost/change 40000 microUSD"),
+        line.contains("successful-run cost 40000 microUSD"),
+        "{line}"
+    );
+    assert!(
+        line.contains("all-in cost/verified change 40000 microUSD"),
         "{line}"
     );
 }

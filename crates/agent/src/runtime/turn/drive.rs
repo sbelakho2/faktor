@@ -955,19 +955,95 @@ impl AgentRuntime {
         // not attributable at this site yet (0 = unmeasured); routing treats
         // a failed-verification history with the documented escalation fallback.
         if let Some(gate) = &gate {
+            // Build this turn's attributed settled calls FIRST: when the
+            // turn just completed the task, the run's ONE engineering-outcome
+            // record carries exactly these samples (fed atomically by the
+            // ledger append) instead of the per-call verified feed — a
+            // sample is never fed twice and never dropped.
+            let mut attributed: Vec<SettledCallOutcome> = Vec::with_capacity(settled_calls.len());
+            let mut turn_risk: Option<RiskBucket> = None;
             for (settled, risk) in settled_calls.drain(..) {
-                let mut attributed = settled;
-                attributed.verified = Some(VerifiedCallAttribution {
+                let bucket = risk_bucket_of(risk);
+                turn_risk = Some(bucket);
+                let mut call = settled;
+                call.verified = Some(VerifiedCallAttribution {
                     // The runtime has no per-task class dimension (every
                     // task is a goal-driven coding task on this graph); the
                     // class key stays the honest Medium default.
                     task_class: TaskClass::Medium,
-                    risk_bucket: risk_bucket_of(risk),
+                    risk_bucket: bucket,
                     verified_success: matches!(gate, CompletionGate::VerifiedComplete),
                     rework_cost_micro: 0,
                     rework_turns: 0,
                 });
-                self.deps.routing.record_call_outcome(&attributed);
+                attributed.push(call);
+            }
+            let feed_per_call = |call: &SettledCallOutcome| {
+                self.deps.routing.record_call_outcome(call);
+            };
+            let feed_telemetry_only = |call: &SettledCallOutcome| {
+                // The verified sample already rides the ledger record's
+                // transaction; the telemetry record still lands per call.
+                let mut telemetry = call.clone();
+                telemetry.verified = None;
+                self.deps.routing.record_call_outcome(&telemetry);
+            };
+            // A run whose task just reached its terminal state records the
+            // ONE durable engineering-outcome row HERE (idempotent when an
+            // earlier settlement already recorded it). The record derivation
+            // is fully durable; the samples are the terminal turn's explicit
+            // attributed calls.
+            let terminal = self
+                .session_task(handle)?
+                .is_some_and(|task| task.state == TaskState::VerifiedComplete);
+            let mut ledger_recorded = 0usize;
+            if terminal && !attributed.is_empty() {
+                let samples: Vec<RunVerifiedSample> = attributed
+                    .iter()
+                    .filter_map(|call| {
+                        let verified = call.verified?;
+                        Some(RunVerifiedSample {
+                            provider: call.provider.clone(),
+                            model: call.model.clone(),
+                            phase: call.phase,
+                            verified_success: verified.verified_success,
+                            rework_cost_micro: verified.rework_cost_micro,
+                            rework_turns: verified.rework_turns,
+                        })
+                    })
+                    .collect();
+                // A pathological turn settling more samples than one record
+                // carries splits at the cap: the record feeds the first
+                // `MAX_RUN_VERIFIED_SAMPLES`, the remainder still feeds
+                // per-call (never dropped, never doubled).
+                let recorded = samples.len().min(MAX_RUN_VERIFIED_SAMPLES);
+                let ledger = OutcomeLedger::new(self.deps.session.store());
+                match ledger.record_terminal_run(
+                    handle,
+                    &session_terminal_run_id(handle.id()),
+                    TerminalRunFacts {
+                        risk_class: turn_risk,
+                        samples: samples[..recorded].to_vec(),
+                    },
+                ) {
+                    Ok(Some(_recorded_append)) => ledger_recorded = recorded,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            session = %handle.id(),
+                            %error,
+                            "terminal run outcome record failed; the settled calls keep their \
+                             per-call verified feed and the next settlement retries the record"
+                        );
+                    }
+                }
+            }
+            for (index, call) in attributed.iter().enumerate() {
+                if index < ledger_recorded {
+                    feed_telemetry_only(call);
+                } else {
+                    feed_per_call(call);
+                }
             }
         } else {
             settled_calls.clear();

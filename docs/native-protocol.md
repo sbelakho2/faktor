@@ -292,12 +292,17 @@ The create-session contract validates BOTH the provider and the model against th
   parameters; unknown query keys are a 400).
 - `GET /native/outcomes` — the Engineering Outcome Ledger (economic audit
   item 7): the durable completed-run metrics aggregate plus one bounded
-  newest-first page of run records. `metrics` carries the ten first-class
-  metrics (`verifiedCostPerChangeMicro`, `verifiedFirstPassPpm`,
-  `reworkCostRatioPpm`, `localSubstitutionPpm`,
-  `avoidedHostedInferenceMicro`, `meanTimeToVerifiedChangeMs`,
-  `humanInterventionPpm`, `regressionRollbackPpm`, `proofCoveragePpm`,
-  `frontierEscalationPpm`) plus their exact totals and the fold's scan
+  newest-first page of run records. `metrics` carries the first-class
+  metrics (`successfulRunCostMicro` — spend on successful runs / successes;
+  `verifiedCostPerSuccessfulChangeMicro` — TOTAL eligible-cohort spend over
+  successful verified changes, so 9 failures at $10 plus 1 success at $1
+  reads $91/change; `verifiedFirstPassPpm`, `reworkCostRatioPpm`, the local
+  split `localOnlyVerifiedPpm` / `localFinalVerifiedPpm` /
+  `localFirstSuccessPpm` / `localToFrontierFallbackPpm` / `frontierOnlyPpm`
+  with their counts, `avoidedHostedInferenceMicro`,
+  `meanTimeToVerifiedChangeMs`, `humanInterventionPpm`,
+  `regressionRollbackPpm`, `proofCoveragePpm`, `frontierEscalationPpm`)
+  plus their exact totals and the fold's scan
   honesty (`scanned`/`truncated`); `runs` is a page of the ledger rows
   with the full record shape; `nextCursor` is the composite
   `{completedAtMs, runId}` continuation. Query (strict DTO): `limit`
@@ -305,6 +310,29 @@ The create-session contract validates BOTH the provider and the model against th
   together. Money fields are decimal strings (`*Micro`); rates are
   integer ppm. A corrupt or payload/projection-drifted ledger row is a
   typed 500, never a fabricated metric. See `docs/outcome-ledger.md`.
+- `GET /native/value-entitlements` — the caller organization's DERIVED
+  value-centric entitlement report: the plan-mapped paid value features
+  that are independent of inference volume. The response's
+  `value_entitlements` carries `organization_id`, `plan_id`, `plan_found`,
+  `subscription_active`, `plan_entitlements` (the resolved plan's value
+  feature tags: `advanced_verification_policy`, `organization_contracts`,
+  `shared_intelligence`, `cross_repo_intelligence`, `outcome_analytics`,
+  `signed_proof_provenance`, `audit_retention_history`,
+  `model_optimization_learning`, `private_runners`,
+  `enterprise_governance`), `governance` (`{sso, scim}` capability flags,
+  effective only behind `enterprise_governance`; vocabulary only — no
+  protocol implementation rides this route) and `decisions` — one entry per
+  value entitlement naming its `hook` (`verification_policy`,
+  `contract_compiler`, `intelligence_federation`, `cross_repo_index`,
+  `outcome_ledger`, `proof_attestation`, `audit_history`,
+  `outcome_learning`, `worker_placement`, `identity_federation`), whether
+  it is `granted` now and, when not, the typed `cause` (`plan_missing`,
+  `subscription_inactive`, `not_in_plan`). The route NEVER folds usage,
+  credits or tokens: a 100% local organization with zero provider attempts
+  resolves the same picture as a metered one (the offline default — no
+  `[billing]` section — answers the shared typed 409 `billing_disabled`
+  while the local product stays fully functional). Control-plane principal
+  required (`BillingRead`, viewer and above).
 - `GET /native/session/{id}/turns` — the session's durable turn records,
   newest first: `[{opId, status, provider, model, variant?, toolMode?,
   startedAt, updatedMs, queueSeq?, promptMessageId?}]` (`status` =

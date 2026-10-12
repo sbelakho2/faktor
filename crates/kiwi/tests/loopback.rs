@@ -647,6 +647,57 @@ async fn claim_round_trip_preserves_obligation_identity() {
     }
 }
 
+/// A claim batch that DECLARES a subject snapshot round-trips it through
+/// Kiwi: the provider echoes the request's identity into every neutral
+/// result (subject snapshot AND basis subject), the registry validates that
+/// echo, and the caller receives exactly the declared identity — never a
+/// stamped candidate.
+#[tokio::test]
+async fn claim_round_trip_echoes_the_declared_subject_snapshot() {
+    use faktor_core::contract::{AcceptedStrength, EvidenceBinding, Requirement};
+    use faktor_core::SubjectSnapshot;
+
+    let server = FakeKiwi::start();
+    let provider = provider(&server, 5_000);
+    let mut registry = VerificationRegistry::new();
+    registry.register(provider);
+    let claims = vec![ClaimRequest {
+        obligation_id: "po1:alpha".to_string(),
+        claim: "claim po1:alpha holds".to_string(),
+        evidence_kind: ProofEvidenceKind::ContractCheck,
+        requirement: Requirement::Required,
+        binding: EvidenceBinding::ContractIds(vec!["c-alpha".to_string()]),
+        accepted_strength: AcceptedStrength::Supported,
+    }];
+    let snapshot = SubjectSnapshot::new("tm1:kiwi-candidate").with_environment("env-7");
+    let batch = request(VerificationOp::CheckContracts).with_subject_snapshot(snapshot.clone());
+    server.push(http_reply(serde_json::json!({
+        "v": KIWI_SCHEMA_VERSION,
+        "op": "check_contracts",
+        "job_id": job_id_for(&batch),
+        "outcome": "passed",
+        "summary": "verified against the declared candidate",
+        "claims": [
+            {"claim_id": "po1:alpha", "state": "supported",
+             "evidence": [{"kind": "contract_check", "source": "kiwi",
+                           "detail": "contract c-alpha observed"}]}
+        ],
+        "evidence": [],
+    })));
+    let results = registry
+        .verify_claims(batch, claims)
+        .await
+        .expect("claim batch round trip");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].subject_snapshot.as_ref(),
+        Some(&snapshot),
+        "kiwi echoes the declared subject snapshot"
+    );
+    assert_eq!(results[0].basis.subject.as_ref(), Some(&snapshot));
+    assert_eq!(results[0].provider.as_str(), "kiwi");
+}
+
 /// A positive verdict without evidence is refused by the neutral import even
 /// when the provider claims a whole batch is fine.
 #[tokio::test]

@@ -1009,7 +1009,7 @@
             "optional": false
           },
           {
-            "name": "verifiedCostPerChangeMicro",
+            "name": "successfulRunCostMicro",
             "type": {
               "kind": "string"
             },
@@ -1018,6 +1018,14 @@
           },
           {
             "name": "totalSpendMicro",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "verifiedCostPerSuccessfulChangeMicro",
             "type": {
               "kind": "string"
             },
@@ -1049,7 +1057,103 @@
             "optional": false
           },
           {
-            "name": "localSubstitutionPpm",
+            "name": "localOnlyRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localOnlyVerifiedChanges",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localOnlyVerifiedPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localFinalRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localFinalVerifiedChanges",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localFinalVerifiedPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localFirstRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localFirstSuccessChanges",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localFirstSuccessPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localToFrontierFallbackRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "localToFrontierFallbackPpm",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "frontierOnlyRuns",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "frontierOnlyPpm",
             "type": {
               "kind": "i64"
             },
@@ -1566,6 +1670,156 @@
               "name": "OutcomeCursor"
             },
             "nullable": true,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ValueGovernanceCapabilities",
+      "doc": "The value-entitlement report's governance capability picture (`governance`): `sso`/`scim` are capability vocabulary, effective only behind the `enterprise_governance` value entitlement (never an implementation).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "sso",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "scim",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ValueEntitlementDecision",
+      "doc": "One per-entitlement value decision of the report: the entitlement tag, its typed enforcement hook, whether it is enforceable now and (only when not) the exact refusal cause. A granted decision omits `cause` (the schema field is optional).",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "entitlement",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "hook",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "granted",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "cause",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "ValueEntitlementsReport",
+      "doc": "The caller organization's DERIVED value-entitlement report (`value_entitlements` member of GET /native/value-entitlements): the plan resolution, the plan-mapped inference-independent value tags, the effective governance capability flags and one typed decision per entitlement. The report never folds usage, credits or tokens.",
+      "unknown_fields": "ignore",
+      "shape": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "organization_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "plan_id",
+            "type": {
+              "kind": "string"
+            },
+            "nullable": true,
+            "optional": false
+          },
+          {
+            "name": "plan_found",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "subscription_active",
+            "type": {
+              "kind": "bool"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "plan_entitlements",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "string"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "governance",
+            "type": {
+              "kind": "named",
+              "name": "ValueGovernanceCapabilities"
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "decisions",
+            "type": {
+              "kind": "list",
+              "of": {
+                "kind": "named",
+                "name": "ValueEntitlementDecision"
+              }
+            },
+            "nullable": false,
+            "optional": false
+          },
+          {
+            "name": "now_ms",
+            "type": {
+              "kind": "i64"
+            },
+            "nullable": false,
             "optional": false
           }
         ]

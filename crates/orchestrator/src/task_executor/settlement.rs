@@ -18,13 +18,76 @@ impl TaskExecutor {
         self: &Arc<Self>,
         run: RunSettlement,
     ) -> Result<SettlementOutcome, ExecError> {
-        match run {
+        let (parent, run_id) = match &run {
+            RunSettlement::InSession { parent, run_id } => (*parent, run_id.clone()),
+            RunSettlement::Orchestrated { parent, run_id } => (*parent, run_id.clone()),
+        };
+        let outcome = match run {
             RunSettlement::InSession { parent, run_id } => {
                 self.settle_in_session(parent, run_id).await
             }
             RunSettlement::Orchestrated { parent, run_id } => {
                 self.settle_orchestrated(parent, run_id).await
             }
+        }?;
+        // The TERMINAL run settlement is the authoritative producer site of
+        // the Engineering Outcome Ledger (P1): a run whose durable task row
+        // reached a terminal state (VerifiedComplete / Failed / Cancelled)
+        // gets its ONE `engineering_outcome` row here — exactly once, from
+        // its durable facts, with the router feed atomic in the store's
+        // append transaction. A replay of the same settlement is a no-op
+        // (an existing record short-circuits and never double-feeds).
+        self.record_terminal_run_outcome(parent, &run_id)?;
+        Ok(outcome)
+    }
+
+    /// Record the ONE engineering-outcome row of a terminal run (see
+    /// [`Self::settle_run`]). Not-terminal runs record nothing (the run is
+    /// still in flight; completion is the ledger's boundary). A concurrent
+    /// producer that already won the run id leaves a byte-different row only
+    /// when late settlement movement changed a derived money fact — the
+    /// append-only identity stands and the existing record is authoritative
+    /// (loud, never overwritten, never a second sample).
+    pub(super) fn record_terminal_run_outcome(
+        &self,
+        parent: SessionId,
+        run_id: &str,
+    ) -> Result<(), ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let task_id = handle
+            .task_id()
+            .map_err(|e| ExecError::Internal(format!("task id read: {e}")))?;
+        let task = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?;
+        let Some(task) = task else {
+            return Ok(());
+        };
+        if !task.state.is_terminal() {
+            return Ok(());
+        }
+        let ledger = faktor_agent::OutcomeLedger::new(self.session.store());
+        match ledger.record_terminal_run(&handle, run_id, faktor_agent::TerminalRunFacts::default())
+        {
+            Ok(_) => Ok(()),
+            Err(faktor_agent::OutcomeLedgerError::Store(faktor_store::StoreError::Conflict(
+                detail,
+            ))) => {
+                tracing::warn!(
+                    session = %parent,
+                    run_id,
+                    %detail,
+                    "terminal outcome record already exists under the run id (a concurrent \
+                     producer won); the append-only record stays authoritative"
+                );
+                Ok(())
+            }
+            Err(e) => Err(ExecError::Internal(format!(
+                "terminal outcome record of run {run_id}: {e}"
+            ))),
         }
     }
 

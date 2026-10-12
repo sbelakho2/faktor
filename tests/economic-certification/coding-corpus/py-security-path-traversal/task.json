@@ -1,0 +1,10 @@
+{
+  "id": "py-security-path-traversal",
+  "order": 7,
+  "category": "security-fix",
+  "language": "python",
+  "runtime": "python3",
+  "task_class": "hard",
+  "phase": "review",
+  "goal": "reader.py serves a file from the data/ directory. resolve() joins the requested name onto the data directory without any containment check, so `../secret.txt` and absolute paths escape the directory. Fix reader.py so a request can only ever resolve to a regular file inside data/: reject absolute paths and any name whose real path leaves the data directory. `reader.py ok.txt` must still print the file content."
+}

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::{
     build_daemon, build_daemon_with_acquisition_planner, build_daemon_with_mcp_and_chunks,
-    build_daemon_with_scm_seams,
+    build_daemon_with_scm_seams, build_daemon_with_system_intelligence,
 };
 
 pub use crate::config::{CloudGithubAppCfg, CommerceCfg, Config};
@@ -67,6 +67,22 @@ pub async fn build_production_graph_with_mcp(
     config: Config,
 ) -> Result<DaemonGraph, String> {
     build_daemon_with_mcp_and_chunks(data_dir, Some(config), None).await
+}
+
+/// [`build_production_graph`] with an explicit system-intelligence provider
+/// seam for drive-start contract compilation. The SAME production
+/// `build_daemon_core` assembly runs and installs the injected provider on
+/// the runtime (the certification spy proves the compile path consults it);
+/// `None` is the production default, where the core itself installs the
+/// semantic-registry adapter only when `[semantic] providers` is configured.
+pub fn build_production_graph_with_system_intelligence(
+    data_dir: &Path,
+    config: Config,
+    provider: Option<
+        Arc<dyn faktor_core::contract_compile::SystemIntelligenceProvider + Send + Sync>,
+    >,
+) -> Result<DaemonGraph, String> {
+    build_daemon_with_system_intelligence(data_dir, Some(config), provider)
 }
 
 /// The daemon's ONE commerce service when `[commerce]` was enabled at build

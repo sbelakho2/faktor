@@ -89,8 +89,9 @@ use crate::tool::{
 };
 use crate::tool_json::ToolCallMode;
 use crate::{
-    FactSource, ModelOutput, OutputTrust, RiskBucket, RouteDecision, RouterPhase,
-    SettledCallOutcome, TaskClass, TrustRefusal, VerifiedCallAttribution,
+    session_terminal_run_id, FactSource, ModelOutput, OutcomeLedger, OutputTrust, RiskBucket,
+    RouteDecision, RouterPhase, RunVerifiedSample, SettledCallOutcome, TaskClass, TerminalRunFacts,
+    TrustRefusal, VerifiedCallAttribution, MAX_RUN_VERIFIED_SAMPLES,
 };
 
 mod request;

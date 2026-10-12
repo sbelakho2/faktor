@@ -187,12 +187,25 @@ data class ProtocolOutcomeMetrics(
     val verifiedFirstPassChanges: Long,
     val verifiedFirstPassPpm: Long,
     val totalVerifiedSpendMicro: String,
-    val verifiedCostPerChangeMicro: String,
+    val successfulRunCostMicro: String,
     val totalSpendMicro: String,
+    val verifiedCostPerSuccessfulChangeMicro: String,
     val totalReworkSpendMicro: String,
     val reworkCostRatioPpm: Long,
     val localRuns: Long,
-    val localSubstitutionPpm: Long,
+    val localOnlyRuns: Long,
+    val localOnlyVerifiedChanges: Long,
+    val localOnlyVerifiedPpm: Long,
+    val localFinalRuns: Long,
+    val localFinalVerifiedChanges: Long,
+    val localFinalVerifiedPpm: Long,
+    val localFirstRuns: Long,
+    val localFirstSuccessChanges: Long,
+    val localFirstSuccessPpm: Long,
+    val localToFrontierFallbackRuns: Long,
+    val localToFrontierFallbackPpm: Long,
+    val frontierOnlyRuns: Long,
+    val frontierOnlyPpm: Long,
     val avoidedHostedInferenceMicro: String,
     val totalWallTimeMs: Long,
     val meanTimeToVerifiedChangeMs: Long,
@@ -272,6 +285,32 @@ data class ProtocolOutcomesPage(
     val metrics: ProtocolOutcomeMetrics,
     val runs: List<ProtocolRunOutcome>,
     val nextCursor: ProtocolOutcomeCursor?
+)
+
+/** The value-entitlement report's governance capability picture (`governance`): `sso`/`scim` are capability vocabulary, effective only behind the `enterprise_governance` value entitlement (never an implementation). (unknown_fields: ignore) */
+data class ProtocolValueGovernanceCapabilities(
+    val sso: Boolean,
+    val scim: Boolean
+)
+
+/** One per-entitlement value decision of the report: the entitlement tag, its typed enforcement hook, whether it is enforceable now and (only when not) the exact refusal cause. A granted decision omits `cause` (the schema field is optional). (unknown_fields: ignore) */
+data class ProtocolValueEntitlementDecision(
+    val entitlement: String,
+    val hook: String,
+    val granted: Boolean,
+    val cause: String?
+)
+
+/** The caller organization's DERIVED value-entitlement report (`value_entitlements` member of GET /native/value-entitlements): the plan resolution, the plan-mapped inference-independent value tags, the effective governance capability flags and one typed decision per entitlement. The report never folds usage, credits or tokens. (unknown_fields: ignore) */
+data class ProtocolValueEntitlementsReport(
+    val organizationId: String,
+    val planId: String?,
+    val planFound: Boolean,
+    val subscriptionActive: Boolean,
+    val planEntitlements: List<String>,
+    val governance: ProtocolValueGovernanceCapabilities,
+    val decisions: List<ProtocolValueEntitlementDecision>,
+    val nowMs: Long
 )
 
 // -------------------------------------------------------- parse functions
@@ -540,12 +579,25 @@ fun parseProtocolOutcomeMetrics(v: JsonView): ProtocolOutcomeMetrics {
         verifiedFirstPassChanges = v.field("verifiedFirstPassChanges").long(),
         verifiedFirstPassPpm = v.field("verifiedFirstPassPpm").long(),
         totalVerifiedSpendMicro = v.field("totalVerifiedSpendMicro").string(),
-        verifiedCostPerChangeMicro = v.field("verifiedCostPerChangeMicro").string(),
+        successfulRunCostMicro = v.field("successfulRunCostMicro").string(),
         totalSpendMicro = v.field("totalSpendMicro").string(),
+        verifiedCostPerSuccessfulChangeMicro = v.field("verifiedCostPerSuccessfulChangeMicro").string(),
         totalReworkSpendMicro = v.field("totalReworkSpendMicro").string(),
         reworkCostRatioPpm = v.field("reworkCostRatioPpm").long(),
         localRuns = v.field("localRuns").long(),
-        localSubstitutionPpm = v.field("localSubstitutionPpm").long(),
+        localOnlyRuns = v.field("localOnlyRuns").long(),
+        localOnlyVerifiedChanges = v.field("localOnlyVerifiedChanges").long(),
+        localOnlyVerifiedPpm = v.field("localOnlyVerifiedPpm").long(),
+        localFinalRuns = v.field("localFinalRuns").long(),
+        localFinalVerifiedChanges = v.field("localFinalVerifiedChanges").long(),
+        localFinalVerifiedPpm = v.field("localFinalVerifiedPpm").long(),
+        localFirstRuns = v.field("localFirstRuns").long(),
+        localFirstSuccessChanges = v.field("localFirstSuccessChanges").long(),
+        localFirstSuccessPpm = v.field("localFirstSuccessPpm").long(),
+        localToFrontierFallbackRuns = v.field("localToFrontierFallbackRuns").long(),
+        localToFrontierFallbackPpm = v.field("localToFrontierFallbackPpm").long(),
+        frontierOnlyRuns = v.field("frontierOnlyRuns").long(),
+        frontierOnlyPpm = v.field("frontierOnlyPpm").long(),
         avoidedHostedInferenceMicro = v.field("avoidedHostedInferenceMicro").string(),
         totalWallTimeMs = v.field("totalWallTimeMs").long(),
         meanTimeToVerifiedChangeMs = v.field("meanTimeToVerifiedChangeMs").long(),
@@ -631,6 +683,35 @@ fun parseProtocolOutcomesPage(v: JsonView): ProtocolOutcomesPage {
         metrics = parseProtocolOutcomeMetrics(v.field("metrics")),
         runs = v.field("runs").array().map { parseProtocolRunOutcome(it) },
         nextCursor = v.optionalField("nextCursor")?.let { parseProtocolOutcomeCursor(it) }
+    )
+}
+
+fun parseProtocolValueGovernanceCapabilities(v: JsonView): ProtocolValueGovernanceCapabilities {
+    return ProtocolValueGovernanceCapabilities(
+        sso = v.field("sso").bool(),
+        scim = v.field("scim").bool()
+    )
+}
+
+fun parseProtocolValueEntitlementDecision(v: JsonView): ProtocolValueEntitlementDecision {
+    return ProtocolValueEntitlementDecision(
+        entitlement = v.field("entitlement").string(),
+        hook = v.field("hook").string(),
+        granted = v.field("granted").bool(),
+        cause = v.optionalField("cause")?.string()
+    )
+}
+
+fun parseProtocolValueEntitlementsReport(v: JsonView): ProtocolValueEntitlementsReport {
+    return ProtocolValueEntitlementsReport(
+        organizationId = v.field("organization_id").string(),
+        planId = v.optionalField("plan_id")?.string(),
+        planFound = v.field("plan_found").bool(),
+        subscriptionActive = v.field("subscription_active").bool(),
+        planEntitlements = v.field("plan_entitlements").array().map { it.string() },
+        governance = parseProtocolValueGovernanceCapabilities(v.field("governance")),
+        decisions = v.field("decisions").array().map { parseProtocolValueEntitlementDecision(it) },
+        nowMs = v.field("now_ms").long()
     )
 }
 

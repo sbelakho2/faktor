@@ -185,10 +185,13 @@ certificate; branch protection requires the resulting
 `.woodpecker/trusted/nightly.yaml` cron workflow owns the campaigns that are
 too long for push/PR: the ignored `[fault]` campaign at scale, the longrun
 suite, efficiency, economy (its synthetic policy gates plus the
-economic certification against real verified tasks, audit item 9), the
+router-economics regression — a scripted, policy-blind fake model that
+certifies router discipline only, **never** model quality, audit item 9 —
+and the deterministic CI replay of the frozen coding-benchmark outputs), the
 coding-benchmark smoke, the provider-key
 real-model run (an explicit recorded skip unless keys are supplied
-out-of-band) and supply-chain evidence. Its `soak` lane drives
+out-of-band; the same step also carries the opt-in `FAKTOR_ECON_CAPTURE=1`
+live coding-capture lane) and supply-chain evidence. Its `soak` lane drives
 `scripts/soak.sh` in **realtime** mode (`FAKTOR_SOAK_MODE=realtime`,
 `FAKTOR_SOAK_REALTIME_SECONDS=86400`): the convergence churn workload runs
 for a real 24 h of wall clock (never shortened) together with the keyless
@@ -422,26 +425,93 @@ be green:
 | Hard budget | routing never overshoots a task's remaining budget |
 | Efficiency KPI | exact deterministic derivation from durable rows (no double counting of prefix rows, corrupt shapes rejected, reopen stable) |
 
-Real verified-task economic certification (`tests/economic-certification`,
-nightly `economy` lane): a frozen 12-task coding corpus whose planted defects
-are verified by real `sh verify.sh` subprocess runs (pristine repos fail,
-scripted fixes pass at the documented attempt, unsolvable patches never
-pass), driven through the real `RouterService` + `EconomicRoutingPolicy` and
-the real verified-outcome learning channel (`record_call_outcome`). The
-cheap-first lane is compared against an always-frontier control on verified
-completion, total rework cost, Verified Cost per Successful Change, frontier
-escalation rate and local substitution rate, under GENEROUS bounds (cost ≤
-65% of frontier, completion within 15 points of frontier, ≥ 25% local
-substitution, unsolvable verified = 0). The machine-readable artifact is
-`target/certification/economic-certification.json`, hashed into the nightly
-lane marker. Deterministic across runs; an always-frontier regression still
-runs the harness but fails the cost/substitution bounds.
+**Router-economics regression** (`tests/economic-certification`, package
+`faktor-tests-router-economics`, nightly `economy` lane): a frozen 12-task
+corpus whose planted defects are verified by real `sh verify.sh` subprocess
+runs (pristine repos fail, scripted fixes pass at the documented attempt,
+unsolvable patches never pass), driven through the real `RouterService` +
+`EconomicRoutingPolicy` and the real verified-outcome learning channel
+(`record_call_outcome`). The cheap-first lane is compared against an
+always-frontier control on verified completion, total rework cost, Verified
+Cost per Successful Change, frontier escalation rate and local substitution
+rate, under GENEROUS bounds (cost ≤ 65% of frontier, completion within 15
+points of frontier, ≥ 25% local substitution, unsolvable verified = 0). The
+machine-readable artifact is
+`target/certification/router-economics-regression.json` (schema
+`faktor-router-economics-regression/v1`), hashed into the nightly lane
+marker. Deterministic across runs; an always-frontier regression still runs
+the harness but fails the cost/substitution bounds.
 
-Real-model coding-benchmark runs (`--test real -- --ignored`) need provider
-keys and are **always recorded as skipped** by the local profile. A release
-that claims verified real-model economics must attach one such run for the
-same SHA and record the `real_provider` gate (§1); the offline certificate
-never implies it.
+**This regression is not model-quality evidence.** Its coding model is a
+deterministic, policy-independent script (`fix_at_attempt` plants the
+outcome), so it can only certify that the ROUTER's decisions are
+economically sane. It must never be published as coding-competitiveness,
+local-model ability or frontier-comparison evidence.
+
+#### 2.8.1 Real coding-benchmark harness (capture + replay)
+
+`tests/economic-certification` also ships the real-model benchmark harness
+over a separate frozen **coding corpus** (9 tasks across shell, Python and
+awk covering debugging, migrations, security fixes and cross-file
+refactors; every task has an objective `sh verify.sh` that fails on the
+pristine repository and passes on the reference fix — both directions are
+enforced as tests):
+
+- **Capture mode** (live-paid, opt-in, `FAKTOR_ECON_CAPTURE=1` plus model
+  configuration): runs REAL local models (native Ollama) and/or frontier
+  models (OpenAI-compatible, explicit key and EXACT prices — the lane never
+  fabricates a price) through the pipeline: the real contract compiler
+  (`compile_contract`), the native intelligence brief, the real
+  `EconomicRoutingPolicy`/`RouterService`, the real provider adapters over
+  the policy-checked egress transport, the task's real verification
+  subprocess, and the wired Engineering Outcome Ledger. It freezes each
+  candidate output, the resulting file contents, regenerable unified diffs
+  and verification outcomes as `frozen/<capture-id>/capture.json`
+  (`faktor-coding-benchmark-capture/v1`), then immediately replays the
+  artifact. The lane is wired additively into the nightly
+  `coding-benchmark-real-model` step behind `FAKTOR_ECON_CAPTURE=1` (and is
+  the ignored `[live-paid]` test `live_coding_capture_requires_env_...`).
+- **Replay mode** (CI-deterministic, nightly `economy` lane with the
+  regression): re-runs every frozen output offline — prompt hashes, routing
+  decisions (over the same per-arm outcome history), the before-hash
+  file-chain, regenerated diffs and the REAL verification subprocess must
+  all reproduce the artifact (any drift is a hard error). It writes every
+  run through the durable Engineering Outcome Ledger and reports, per arm
+  and cohort: total in/out tokens, inference spend, attempts, verified
+  first-pass rate, total rework, wall time, local-only verified rate,
+  local→frontier fallback rate, frontier escalation, and the ledger's
+  **Verified Cost per Successful Change** (total eligible-cohort spend ÷
+  verified changes). Artifact:
+  `target/certification/router-economics-replay.json` (schema
+  `faktor-coding-benchmark-replay/v1`).
+- **Second axis**: the same model runs WITH vs WITHOUT Faktor's
+  contract/intelligence/proof machinery (identical corpus and routing;
+  only the machinery prompt/obligations differ), measuring token and
+  completion differences (`prompt_tokens_delta`, `tokens_in/out_delta`,
+  completion/first-pass deltas, VCSC delta), reported per capture.
+
+**Evidence honesty.** Artifacts self-describe: `capture_source = live`
+(real model outputs; `token_basis = provider_usage`, `wall_time_basis =
+captured`) is the ONLY class that may be cited as model or
+coding-competitiveness evidence. The committed `frozen/fixture` set is
+`capture_source = fixture` (`token_basis = estimate`, `wall_time_basis =
+fixture`): a labeled, policy-blind scripted plan whose only purpose is to
+prove the replay/measurement machinery deterministically; it encodes no
+model behavior and its numbers must never be published as model-quality
+results. As of this revision **no `capture_source = live` artifact is
+committed, so the harness publishes no real-model numbers**; replay numbers
+currently resting on the fixture are labeled as such in the report
+(`source: "fixture"`, `fixtures_only: true`). To publish real numbers, run
+the capture lane (documented in
+`tests/economic-certification/tests/capture.rs`), commit the produced
+`frozen/<capture-id>/` directory, and cite that artifact's replayed report.
+
+Live real-model benchmark runs (`--test real -- --ignored` in
+`tests/coding-benchmark`, and the capture lane here) need provider keys and
+are **always recorded as skipped** unless configured out-of-band. A release
+that claims verified real-model coding economics must attach a committed
+`capture_source = live` capture replayed on the same SHA and record the
+`real_provider` gate (§1); the offline certificate never implies it.
 
 ### 2.9 Installable artifacts and the installation matrix
 

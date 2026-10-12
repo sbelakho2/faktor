@@ -1,10 +1,22 @@
-//! Economic certification against real verified tasks (audit item 9
-//! follow-up): a frozen corpus of small coding tasks with planted defects,
-//! a scripted fake coding model, REAL verification (each task's own test
-//! script runs as a subprocess and must exit zero), and the REAL economic
-//! router + verified-outcome-learning loop.
+//! ROUTER-ECONOMICS REGRESSION (audit item 9 follow-up). This suite is a
+//! regression test for the ROUTER's economics discipline, NOT a measure of
+//! local-model coding competitiveness:
 //!
-//! What is real here (nothing is simulated as a success probability):
+//! - the coding model is a deterministic, frozen SCRIPT. For attempt index
+//!   i (0-based) it copies `patches/attempt-{min(i+1, n)}.sh` over the
+//!   repository's `program.sh` — policy-independent, so its success rate is
+//!   planted in the corpus by construction (`fix_at_attempt`), never
+//!   measured from a model;
+//! - because the script ignores the router, the suite can only certify that
+//!   the ROUTER's decisions are economically sane (cheap-first ordering,
+//!   escalation past a failed model, verified-cost discipline, unsolvable
+//!   work never counted as success). It must never be published as
+//!   model-quality, coding-competitiveness or local-model ability evidence.
+//!   Real model evidence lives in the capture/replay coding benchmark in
+//!   this crate (`coding`, `capture`, `replay` modules), whose artifacts
+//!   carry `capture_source = live` only when produced by real models.
+//!
+//! What is real here (nothing is simulated as a model success probability):
 //!
 //! - routing: every attempt's (provider, model) decision comes from the
 //!   production [`faktor_agent::EconomicRoutingPolicy`] over a real
@@ -19,16 +31,13 @@
 //!   the calls whose failure caused it); the next task's routes consult
 //!   that durable-style [`faktor_router::MemoryOutcomeStore`] through the
 //!   conservative work-cost estimate — never a fabricated prior;
-//! - verification: the fake model's scripted patch is applied to a fresh
-//!   copy of the task repo and `<repo>/verify.sh` is executed with `sh`.
-//!   Pass/fail is the real exit status, bounded by a hard timeout.
+//! - verification: the scripted patch is applied to a fresh copy of the
+//!   task repo and `<repo>/verify.sh` is executed with `sh`. Pass/fail is
+//!   the real exit status, bounded by a hard timeout.
 //!
-//! The fake coding model is deterministic and frozen: for attempt index i
-//! (0-based) it copies `patches/attempt-{min(i+1, n)}.sh` over the
-//! repository's `program.sh`. Tasks whose scripts only pass from a later
-//! attempt require rework (`fix_at_attempt`); unsolvable tasks
-//! (`fix_at_attempt: null`) have only failing patches and therefore count
-//! as failures — never as successes.
+//! Tasks whose scripts only pass from a later attempt require rework
+//! (`fix_at_attempt`); unsolvable tasks (`fix_at_attempt: null`) have only
+//! failing patches and therefore count as failures — never as successes.
 //!
 //! Two lanes are measured over the same frozen corpus in the same fixed
 //! order: `economy` (the real Economy policy over the full candidate set)
@@ -43,10 +52,17 @@
 //! escalation discipline of the economy suite) and re-consults the real
 //! policy.
 //!
-//! The certification artifact is written to
-//! `target/certification/economic-certification.json` (override with
+//! The regression artifact is written to
+//! `target/certification/router-economics-regression.json` (override with
 //! `FAKTOR_ECON_CERT_OUT`), and the comparison is evaluated against
 //! GENEROUS regression bounds whose constants live below.
+
+pub mod capture;
+pub mod coding;
+pub mod fixture;
+pub mod frozen;
+pub mod pipeline;
+pub mod replay;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -70,8 +86,9 @@ use faktor_router::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Artifact schema id.
-pub const SCHEMA: &str = "faktor-economic-certification/v1";
+/// Artifact schema id. The artifact is a router-economics regression record,
+/// not model-quality evidence (see the module docs).
+pub const SCHEMA: &str = "faktor-router-economics-regression/v1";
 /// Attempt cap per task (a failed attempt still spent its call cost).
 pub const MAX_ATTEMPTS: usize = 4;
 /// Hard wall-clock bound on ONE verification subprocess run.
@@ -175,7 +192,7 @@ struct RawTask {
     fix_at_attempt: Option<u32>,
 }
 
-fn io_err(what: &str, e: io::Error) -> String {
+pub(crate) fn io_err(what: &str, e: io::Error) -> String {
     format!("{what}: {e}")
 }
 
@@ -326,7 +343,7 @@ fn load_task(dir: &Path) -> Result<TaskSpec, String> {
     })
 }
 
-fn require_regular(path: &Path) -> Result<(), String> {
+pub(crate) fn require_regular(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|e| io_err(&path.display().to_string(), e))?;
     if !meta.file_type().is_file() {
         return Err(format!("{} is not a regular file", path.display()));
@@ -334,7 +351,7 @@ fn require_regular(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_symlinks(root: &Path) -> Result<(), String> {
+pub(crate) fn reject_symlinks(root: &Path) -> Result<(), String> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).map_err(|e| io_err(&dir.display().to_string(), e))? {
@@ -460,7 +477,7 @@ pub fn apply_scripted_patch(
     Ok(())
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -1061,7 +1078,7 @@ pub struct TaskCertRow {
     pub frontier_only: TaskLaneRow,
 }
 
-/// The machine-readable certification artifact.
+/// The machine-readable router-economics regression artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Certificate {
     pub schema: String,
@@ -1176,9 +1193,9 @@ pub fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus")
 }
 
-/// Run the full certification: both lanes over the frozen corpus with fresh
-/// outcome stores, then evaluate the generous bounds for the selected
-/// primary policy.
+/// Run the full router-economics regression: both lanes over the frozen
+/// corpus with fresh outcome stores, then evaluate the generous bounds for
+/// the selected primary policy.
 pub fn run_certification(primary_policy: PrimaryPolicy) -> Result<Certificate, String> {
     let corpus = load_corpus(&corpus_root())?;
     let scratch = tempfile::TempDir::new().map_err(|e| io_err("create scratch dir", e))?;
@@ -1257,7 +1274,7 @@ pub fn run_certification(primary_policy: PrimaryPolicy) -> Result<Certificate, S
     })
 }
 
-/// Default artifact path: `<workspace>/target/certification/economic-certification.json`
+/// Default artifact path: `<workspace>/target/certification/router-economics-regression.json`
 /// (override with `FAKTOR_ECON_CERT_OUT`). Independent of CARGO_TARGET_DIR so
 /// the nightly lane's `--artifact target/certification/...` marker binding
 /// always resolves against the repository checkout.
@@ -1271,7 +1288,7 @@ pub fn default_artifact_path() -> PathBuf {
         .expect("workspace root")
         .join("target")
         .join("certification")
-        .join("economic-certification.json")
+        .join("router-economics-regression.json")
 }
 
 /// Write the artifact atomically (tmp + rename).

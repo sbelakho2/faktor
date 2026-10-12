@@ -43,6 +43,7 @@
 //!   anywhere in this crate (locked by a source-scan test).
 
 pub mod cache;
+pub mod enrichment;
 pub mod external;
 pub mod fallback;
 pub mod health;
@@ -55,6 +56,7 @@ pub use cache::{
     CacheEntry, SemanticCache, SemanticCacheEntryKey, SemanticCacheKey, SemanticCached,
     SemanticCachedProvider, SemanticInvalidation, SemanticSnapshotRef,
 };
+pub use enrichment::{SemanticIntelligenceAdapter, SEMANTIC_ENRICHMENT_PROVIDER_ID};
 pub use external::{
     HttpSemanticClient, ProcessSemanticClient, SemanticClientEnv, SemanticProviderConfig,
     MAX_EXTERNAL_ARGS, MAX_EXTERNAL_ARG_BYTES, MAX_EXTERNAL_AUTH_ENV_BYTES,
@@ -72,9 +74,11 @@ pub use health::{
 };
 pub use intelligence::{
     confidence_bps_for, fallback_intelligence_capabilities, fallback_intelligence_capability,
-    highest_available_tier, native_capabilities, IntelligenceCapability, IntelligenceTier,
-    NativeIntelligenceReport, NativeIntelligenceService, MAX_INTELLIGENCE_TIER,
-    MAX_NATIVE_INTELLIGENCE_SERVICES,
+    highest_available_tier, native_capabilities, native_evidence_dimensions, ConfidenceDimensions,
+    EvidenceCorroboration, EvidenceDeterminism, EvidenceDimensions, EvidenceFreshness,
+    EvidenceProvenance, EvidenceScope, EvidenceUncertainty, IntelligenceCapability,
+    IntelligenceTier, NativeIntelligenceReport, NativeIntelligenceService, RevisionBinding,
+    MAX_COUNTED_CORROBORATION, MAX_INTELLIGENCE_TIER, MAX_NATIVE_INTELLIGENCE_SERVICES,
 };
 pub use registry::{guard_call, GuardedCall, SemanticProviderRegistry, SemanticSelection};
 pub use risk::{capability_intersection, RiskPolicy};

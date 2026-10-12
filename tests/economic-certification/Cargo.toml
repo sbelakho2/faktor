@@ -1,27 +1,50 @@
 [package]
-name = "faktor-tests-economic-certification"
+name = "faktor-tests-router-economics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
 
-# Test-only crate (audit item 9 follow-up): economic certification against a
-# frozen corpus of real, objectively verified coding tasks. A scripted fake
-# coding model applies deterministic patches; verification is a real
-# subprocess run of each task's own test script; routing, escalation and
-# outcome learning come from the real faktor-router RouterService and
-# faktor-agent EconomicRoutingPolicy. The suite writes
-# target/certification/economic-certification.json and is wired additively
-# into the nightly economy lane.
+# Test-only crate with two separate evidence surfaces:
+#
+# 1. ROUTER-ECONOMICS REGRESSION (audit item 9 follow-up):
+#    `faktor-router-economics-regression/v1` over a frozen 12-task corpus of
+#    small, objectively verified coding tasks. A scripted fake coding model
+#    applies deterministic patches (policy-independent); verification is a
+#    real subprocess run of each task's own test script; routing, escalation
+#    and outcome learning come from the real faktor-router RouterService and
+#    faktor-agent EconomicRoutingPolicy. This suite proves the ROUTER's
+#    economics discipline (cheap-first, escalation, unsolvable = failure) and
+#    is NOT model-quality evidence: the fake model's success is scripted.
+#    It writes target/certification/router-economics-regression.json and is
+#    wired additively into the nightly economy lane.
+#
+# 2. CODING BENCHMARK HARNESS (capture + replay): a frozen multi-language
+#    coding corpus with objective verification, a live-paid capture lane that
+#    runs REAL local (Ollama) and frontier models through the Faktor pipeline
+#    (contract compiler + intelligence/proof machinery + router + verification
+#    + the wired Engineering Outcome Ledger) and freezes their candidate
+#    outputs, and a deterministic CI replay mode that re-runs those frozen
+#    outputs and measures tokens, spend, attempts, first-pass rate, rework,
+#    fallback/escalation and Verified Cost per Successful Change from the
+#    ledger. Replayed fixture records are machinery proof, never model
+#    evidence; only `capture_source = live` records are.
 [dependencies]
 faktor-agent.workspace = true
 faktor-core.workspace = true
 faktor-router.workspace = true
+faktor-store.workspace = true
+faktor-provider.workspace = true
+faktor-ollama.workspace = true
+faktor-openai.workspace = true
+faktor-security.workspace = true
 blake3.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "net"] }
 
 [lints]
 workspace = true

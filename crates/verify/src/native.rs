@@ -1045,4 +1045,40 @@ mod tests {
         );
         assert!(!response.claims[0].counterexample.is_empty());
     }
+
+    #[tokio::test]
+    async fn native_claim_verdicts_echo_the_declared_subject_snapshot() {
+        use crate::claims::ClaimRequest;
+        use faktor_core::contract::{
+            AcceptedStrength, EvidenceBinding, Requirement, SubjectSnapshot,
+        };
+
+        let claim = ClaimRequest {
+            obligation_id: "po1:builds".to_string(),
+            claim: "the workspace compiles".to_string(),
+            evidence_kind: ProofEvidenceKind::Compile,
+            requirement: Requirement::Required,
+            binding: EvidenceBinding::CheckIds(vec!["rust_check".to_string()]),
+            accepted_strength: AcceptedStrength::Supported,
+        };
+        let dir = cargo_fixture("verify_native_claims_subject", "pub fn f() {}\n");
+        let provider = provider(dir.path());
+        let snapshot = SubjectSnapshot::new("tm1:native-candidate").with_environment("env-1");
+        let batch = request(VerificationOp::Build)
+            .with_claims(vec![claim])
+            .with_subject_snapshot(snapshot.clone());
+        let response = provider.verify(batch).await.expect("claim batch");
+        let result = response
+            .claims
+            .iter()
+            .find(|claim| claim.obligation_id == "po1:builds")
+            .expect("a native result per claim");
+        assert_eq!(
+            result.subject_snapshot.as_ref(),
+            Some(&snapshot),
+            "the native path echoes the declared subject snapshot"
+        );
+        assert_eq!(result.basis.subject.as_ref(), Some(&snapshot));
+        assert_eq!(result.basis.scope, ProofScope::SnapshotBound);
+    }
 }

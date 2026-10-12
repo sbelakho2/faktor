@@ -232,13 +232,15 @@ impl SemanticProviderRegistry {
         fallback_operation_status(op)
     }
 
-    /// The per-operation intelligence capability (tier + bounded
+    /// The per-operation intelligence capability (tier metadata + bounded
     /// confidence) over the SAME selection rules [`Self::operation_status`]
     /// uses: a registered provider whose VALIDATED descriptor covers the
     /// operation reports its DECLARED tier (absent = `None`, never assumed
-    /// high); otherwise the generic fallback reports Tier 0 (filesystem +
-    /// text search) with heuristic fidelity. Unavailable operations keep
-    /// their true tier and report zero confidence.
+    /// high) and its declared evidence dimensions; otherwise the generic
+    /// fallback reports Tier 0 (filesystem + text search) with heuristic
+    /// fidelity. Confidence is computed from the orthogonal dimensions
+    /// only — never from the tier. Unavailable operations keep their true
+    /// tier and report zero confidence.
     pub fn intelligence_capability(&self, op: SemanticOp) -> IntelligenceCapability {
         for (index, provider) in self.providers.iter().enumerate() {
             let Some(descriptor) = self.cached_descriptor(index) else {
@@ -252,13 +254,17 @@ impl SemanticProviderRegistry {
                     op,
                     // The descriptor was validated at handshake, so an
                     // out-of-range tier cannot appear here; a failed parse
-                    // conservatively degrades to `None` (no bonus).
+                    // conservatively degrades to `None` (capability metadata
+                    // only, never scored).
                     tier: descriptor.intelligence_tier(),
                     available: true,
-                    fidelity: descriptor.fidelity.unwrap_or(SemanticFidelity::None),
-                    completeness: descriptor
-                        .completeness
-                        .unwrap_or(SemanticCompleteness::Unknown),
+                    dimensions: crate::intelligence::ConfidenceDimensions::new(
+                        descriptor.fidelity.unwrap_or(SemanticFidelity::None),
+                        descriptor
+                            .completeness
+                            .unwrap_or(SemanticCompleteness::Unknown),
+                        descriptor.evidence,
+                    ),
                     source: provider.id().as_str().to_string(),
                 };
             }
@@ -276,9 +282,9 @@ impl SemanticProviderRegistry {
     }
 
     /// The bounded confidence (`0..=10_000`) for one operation under the
-    /// shared fidelity × completeness × tier mapping (see
+    /// shared orthogonal-dimension mapping (see
     /// [`crate::intelligence::confidence_bps_for`]). Unavailable operations
-    /// report `0`.
+    /// report `0`. The tier is never an input.
     pub fn confidence_for(&self, op: SemanticOp) -> u16 {
         self.intelligence_capability(op).confidence_bps()
     }
@@ -1243,11 +1249,13 @@ mod tests {
     }
 
     /// The intelligence projection reports a declared tier verbatim, `None`
-    /// when no tier was declared (never assumed high), computes confidence
-    /// WITHOUT a bonus for the absent declaration, and reports the generic
-    /// fallback as Tier 0.
+    /// when no tier was declared (never assumed high), and NEVER scores it:
+    /// identical declared dimensions produce identical confidence at every
+    /// tier. The generic fallback is reported as Tier 0.
     #[test]
-    fn intelligence_capability_reports_declared_tier_and_never_assumes() {
+    fn intelligence_capability_reports_declared_tier_and_never_scores_it() {
+        use crate::intelligence::{EvidenceDeterminism, EvidenceDimensions, EvidenceFreshness};
+
         let handshake = |registry: &SemanticProviderRegistry| {
             assert!(block_on(registry.fetch_descriptors(
                 SemanticOp::Context,
@@ -1256,21 +1264,23 @@ mod tests {
             ))
             .is_ok());
         };
+        let tiered = |id: &str, tier: Option<u8>| {
+            let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+            let mut provider =
+                ScriptedProvider::new(id, SemanticCapabilities::CONTEXT, ScriptedBehavior::Ready)
+                    .declaring(
+                        SemanticFidelity::CompilerExact,
+                        SemanticCompleteness::Complete,
+                    );
+            if let Some(tier) = tier {
+                provider = provider.tiering(tier);
+            }
+            registry.register(Arc::new(provider));
+            handshake(&registry);
+            registry
+        };
 
-        let mut two = SemanticProviderRegistry::new(GenericSemanticFallback::default());
-        two.register(Arc::new(
-            ScriptedProvider::new(
-                "tier-two",
-                SemanticCapabilities::CONTEXT,
-                ScriptedBehavior::Ready,
-            )
-            .declaring(
-                SemanticFidelity::CompilerExact,
-                SemanticCompleteness::Complete,
-            )
-            .tiering(2),
-        ));
-        handshake(&two);
+        let two = tiered("tier-two", Some(2));
         let capability = two.intelligence_capability(SemanticOp::Context);
         assert_eq!(capability.op, SemanticOp::Context);
         assert_eq!(
@@ -1279,49 +1289,41 @@ mod tests {
         );
         assert!(capability.available);
         assert_eq!(capability.source, "tier-two");
-        // 8000 × 10000 / 10000 + 2 × 200 = 8400.
-        assert_eq!(capability.confidence_bps(), 8_400);
-        assert_eq!(two.confidence_for(SemanticOp::Context), 8_400);
+        assert_eq!(capability.dimensions.freshness, EvidenceFreshness::Unknown);
+        assert_eq!(
+            capability.dimensions.determinism,
+            EvidenceDeterminism::Unknown
+        );
+        // 8000 × 0.7^4 × 0.8: no evidence axis was declared, so no bonus.
+        assert_eq!(capability.confidence_bps(), 1_536);
+        assert_eq!(two.confidence_for(SemanticOp::Context), 1_536);
 
-        let mut absent = SemanticProviderRegistry::new(GenericSemanticFallback::default());
-        absent.register(Arc::new(
-            ScriptedProvider::new(
-                "no-tier",
-                SemanticCapabilities::CONTEXT,
-                ScriptedBehavior::Ready,
-            )
-            .declaring(
-                SemanticFidelity::CompilerExact,
-                SemanticCompleteness::Complete,
-            ),
-        ));
-        handshake(&absent);
+        let absent = tiered("no-tier", None);
         let capability = absent.intelligence_capability(SemanticOp::Context);
         assert_eq!(capability.tier, None, "an absent tier stays unknown");
         assert_eq!(
             capability.confidence_bps(),
-            8_000,
-            "no tier bonus without a declared tier"
+            1_536,
+            "an absent tier changes nothing; confidence has no tier term"
         );
-
-        let mut five = SemanticProviderRegistry::new(GenericSemanticFallback::default());
-        five.register(Arc::new(
-            ScriptedProvider::new(
-                "tier-five",
-                SemanticCapabilities::CONTEXT,
-                ScriptedBehavior::Ready,
-            )
-            .declaring(
+        assert_eq!(
+            capability.dimensions,
+            crate::intelligence::ConfidenceDimensions::new(
                 SemanticFidelity::CompilerExact,
                 SemanticCompleteness::Complete,
+                EvidenceDimensions::default(),
             )
-            .tiering(5),
-        ));
-        handshake(&five);
-        assert_eq!(five.confidence_for(SemanticOp::Context), 9_000);
-        assert!(
-            absent.confidence_for(SemanticOp::Context) < five.confidence_for(SemanticOp::Context),
-            "an undeclared tier must never be assumed as high"
+        );
+
+        let five = tiered("tier-five", Some(5));
+        assert_eq!(
+            five.confidence_for(SemanticOp::Context),
+            absent.confidence_for(SemanticOp::Context),
+            "a tier-5 claim must never outscore a tier-less identical claim"
+        );
+        assert_eq!(
+            five.intelligence_capability(SemanticOp::Context).tier,
+            Some(crate::intelligence::IntelligenceTier::ENRICHED)
         );
 
         // The fallback path is Tier 0 with heuristic fidelity; unavailable
@@ -1333,6 +1335,100 @@ mod tests {
             Some(crate::intelligence::IntelligenceTier::FILESYSTEM)
         );
         assert_eq!(fallback.confidence_bps(), 0);
+        assert_eq!(
+            absent.confidence_for(SemanticOp::Context),
+            five.confidence_for(SemanticOp::Context)
+        );
+    }
+
+    /// Declared evidence dimensions drive confidence through the registry
+    /// projection: a native deterministic exact fact outranks an external
+    /// heuristic opinion at equal declared fidelity/completeness, even when
+    /// the external claims the highest tier — and measured corroboration is
+    /// what can close (or flip) that gap.
+    #[test]
+    fn declared_evidence_dimensions_drive_confidence_not_tier() {
+        use crate::intelligence::{
+            EvidenceCorroboration, EvidenceDeterminism, EvidenceDimensions, EvidenceFreshness,
+            EvidenceProvenance, EvidenceScope, EvidenceUncertainty, RevisionBinding,
+        };
+
+        let all_good = EvidenceDimensions {
+            freshness: EvidenceFreshness::Current,
+            determinism: EvidenceDeterminism::Deterministic,
+            revision_binding: RevisionBinding::Exact,
+            provenance: EvidenceProvenance {
+                scope: EvidenceScope::Direct,
+                uncertainty: EvidenceUncertainty::None,
+            },
+            corroboration: EvidenceCorroboration::Unknown,
+        };
+        let heuristic = EvidenceDimensions {
+            freshness: EvidenceFreshness::Aged,
+            determinism: EvidenceDeterminism::Heuristic,
+            revision_binding: RevisionBinding::Inferred,
+            provenance: EvidenceProvenance {
+                scope: EvidenceScope::Adjacent,
+                uncertainty: EvidenceUncertainty::Declared,
+            },
+            corroboration: EvidenceCorroboration::Unknown,
+        };
+        let projected = |id: &str, tier: Option<u8>, evidence: EvidenceDimensions| {
+            let mut registry = SemanticProviderRegistry::new(GenericSemanticFallback::default());
+            let mut provider =
+                ScriptedProvider::new(id, SemanticCapabilities::CONTEXT, ScriptedBehavior::Ready)
+                    .declaring(
+                        SemanticFidelity::CompilerExact,
+                        SemanticCompleteness::Complete,
+                    )
+                    .evidencing(evidence);
+            if let Some(tier) = tier {
+                provider = provider.tiering(tier);
+            }
+            registry.register(Arc::new(provider));
+            assert!(block_on(registry.fetch_descriptors(
+                SemanticOp::Context,
+                &CancellationToken::new(),
+                None
+            ))
+            .is_ok());
+            registry.intelligence_capability(SemanticOp::Context)
+        };
+
+        let native = projected("native.exact", Some(0), all_good);
+        let external = projected("external.heuristic", Some(5), heuristic);
+        assert_eq!(native.dimensions.fidelity, external.dimensions.fidelity);
+        assert_eq!(
+            native.dimensions.completeness,
+            external.dimensions.completeness
+        );
+        assert_eq!(native.confidence_bps(), 8_000);
+        assert_eq!(external.confidence_bps(), 3_758);
+        assert!(
+            native.confidence_bps() > external.confidence_bps(),
+            "the native exact fact must outrank the tier-5 external heuristic"
+        );
+
+        // Identical evidence at a different tier scores identically.
+        let same_dimensions_other_tier = projected("external.exact", Some(5), all_good);
+        assert_eq!(
+            same_dimensions_other_tier.confidence_bps(),
+            native.confidence_bps()
+        );
+
+        // Measured corroboration raises the external heuristic above its
+        // un-corroborated self (and towards the native fact).
+        let corroborated = projected(
+            "external.corroborated",
+            Some(5),
+            EvidenceDimensions {
+                corroboration: EvidenceCorroboration::Measured {
+                    independent_sources: crate::intelligence::MAX_COUNTED_CORROBORATION,
+                },
+                ..heuristic
+            },
+        );
+        assert!(corroborated.confidence_bps() > external.confidence_bps());
     }
 
     /// An out-of-range tier is refused at handshake, so the invalid claim is
@@ -1360,7 +1456,7 @@ mod tests {
             capability.tier,
             Some(crate::intelligence::IntelligenceTier::FILESYSTEM)
         );
-        assert_eq!(capability.fidelity, SemanticFidelity::Heuristic);
+        assert_eq!(capability.fidelity(), SemanticFidelity::Heuristic);
     }
 
     /// Tangerine-2 production wiring: the registry dispatch path ITSELF
@@ -1479,6 +1575,7 @@ mod tests {
         fidelity_declared: Option<SemanticFidelity>,
         completeness_declared: Option<SemanticCompleteness>,
         tier_declared: Option<u8>,
+        evidence_declared: crate::intelligence::EvidenceDimensions,
     }
 
     impl ScriptedProvider {
@@ -1494,6 +1591,7 @@ mod tests {
                 fidelity_declared: None,
                 completeness_declared: None,
                 tier_declared: None,
+                evidence_declared: crate::intelligence::EvidenceDimensions::default(),
             }
         }
 
@@ -1513,6 +1611,11 @@ mod tests {
 
         fn tiering(mut self, tier: u8) -> Self {
             self.tier_declared = Some(tier);
+            self
+        }
+
+        fn evidencing(mut self, evidence: crate::intelligence::EvidenceDimensions) -> Self {
+            self.evidence_declared = evidence;
             self
         }
 
@@ -1572,6 +1675,7 @@ mod tests {
             descriptor.fidelity = self.fidelity_declared;
             descriptor.completeness = self.completeness_declared;
             descriptor.tier = self.tier_declared;
+            descriptor.evidence = self.evidence_declared;
             descriptor
         }
 

@@ -221,9 +221,9 @@ impl SemanticProvider for GenericSemanticFallback {
     }
 
     /// The fallback's honest self-description: heuristic fidelity, partial
-    /// completeness and Tier 0 (filesystem + text search). It never claims
-    /// a tier or capability it cannot deliver — snapshot/verify stay
-    /// uncovered in `capabilities`.
+    /// completeness, Tier 0 (filesystem + text search) and the native
+    /// evidence dimensions. It never claims a tier or capability it cannot
+    /// deliver — snapshot/verify stay uncovered in `capabilities`.
     fn descriptor(&self) -> SemanticProviderDescriptor {
         let mut descriptor = SemanticProviderDescriptor::new(
             self.provider_id(),
@@ -234,6 +234,7 @@ impl SemanticProvider for GenericSemanticFallback {
         descriptor.fidelity = Some(SemanticFidelity::Heuristic);
         descriptor.completeness = Some(SemanticCompleteness::Partial);
         descriptor.tier = Some(crate::intelligence::IntelligenceTier::FILESYSTEM.raw());
+        descriptor.evidence = crate::intelligence::native_evidence_dimensions();
         descriptor
     }
 

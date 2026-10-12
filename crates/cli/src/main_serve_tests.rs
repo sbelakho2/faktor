@@ -150,6 +150,7 @@ fn semantic_registry_arc_is_the_one_authority_for_agent_and_server() {
         None,
         semantic,
         None,
+        None,
         GithubAppSeams::default(),
     )
     .expect("daemon core builds with a configured semantic provider");

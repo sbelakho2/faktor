@@ -579,6 +579,11 @@ pub async fn serve_arc(deps: Arc<ServerDeps>, port: u16) -> std::io::Result<Serv
         // Without the `[billing]` section every one answers 409.
         .route("/native/entitlements", get(native_entitlements))
         .route("/native/credits/grant", post(native_credits_grant))
+        // Value-centric paid entitlements (additive): the plan-mapped,
+        // inference-independent value report (value features, governance
+        // capability flags, one typed decision per entitlement). Without the
+        // `[billing]` section it answers the same typed 409.
+        .route("/native/value-entitlements", get(native_value_entitlements))
         // Session bootstrap (native): create one durable session on a
         // workspace root, list the durable sessions, and run ONE ordinary
         // prompt through the daemon's executor entry.

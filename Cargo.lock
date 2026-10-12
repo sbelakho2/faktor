@@ -1739,19 +1739,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "faktor-tests-economic-certification"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "faktor-agent",
- "faktor-core",
- "faktor-router",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "faktor-tests-economy"
 version = "0.1.0"
 dependencies = [
@@ -1974,6 +1961,26 @@ dependencies = [
  "faktor-session",
  "faktor-store",
  "faktor-verify",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "faktor-tests-router-economics"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "faktor-agent",
+ "faktor-core",
+ "faktor-ollama",
+ "faktor-openai",
+ "faktor-provider",
+ "faktor-router",
+ "faktor-security",
+ "faktor-store",
+ "futures",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

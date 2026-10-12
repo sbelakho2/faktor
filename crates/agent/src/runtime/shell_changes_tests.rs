@@ -2027,3 +2027,137 @@ async fn provider_omission_blocks_a_passing_gate_typed() {
         other => panic!("expected a blocked gate, got {other:?}"),
     }
 }
+
+/// A provider verdict that OMITS the subject snapshot the request declared
+/// is refused at the registry boundary: the candidate is never stamped onto
+/// the foreign verdict, no proof state changes, and a passing gate cannot
+/// stand on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_verdict_omitting_the_declared_subject_changes_no_proof_state() {
+    use super::contract_eval::{
+        apply_contract_outcome, evaluate_and_persist_contract, ContractProviderDispatch,
+    };
+    use faktor_core::contract::{
+        AcceptedStrength, ContractOrigin, EngineeringContract, EvidenceBinding, ProofEvidenceKind,
+        Requirement,
+    };
+    use faktor_core::SubjectSnapshot;
+    use faktor_verify::{
+        ArtifactRef, BoxFuture, ClaimVerificationResult, EvidenceStrength,
+        VerificationCapabilities, VerificationError, VerificationOp, VerificationOutcome,
+        VerificationProvider, VerificationProviderId, VerificationRegistry, VerificationRequest,
+        VerificationResponse,
+    };
+
+    // Answers a Supported verdict but never echoes `request.subject_snapshot`:
+    // the exact defect shape (a provider that does not identify its subject).
+    struct SubjectForgettingVerifier;
+    impl VerificationProvider for SubjectForgettingVerifier {
+        fn id(&self) -> VerificationProviderId {
+            VerificationProviderId::parse("external").unwrap()
+        }
+
+        fn capabilities(&self) -> VerificationCapabilities {
+            VerificationCapabilities::of_many(&VerificationOp::ALL)
+        }
+
+        fn verify(
+            &self,
+            request: VerificationRequest,
+        ) -> BoxFuture<'_, Result<VerificationResponse, VerificationError>> {
+            let provider = self.id();
+            let first = request.claims[0].obligation_id.clone();
+            let op = request.op;
+            Box::pin(async move {
+                Ok(
+                    VerificationResponse::new(provider.clone(), op, VerificationOutcome::Passed)
+                        .with_claims(vec![ClaimVerificationResult::verdict(
+                            provider,
+                            first,
+                            faktor_core::contract::ClaimState::Supported,
+                            EvidenceStrength::Observed,
+                            vec![ArtifactRef::new(
+                                ProofEvidenceKind::ContractCheck,
+                                "external",
+                                "claimed pass",
+                            )
+                            .unwrap()],
+                            Vec::new(),
+                        )]),
+                )
+            })
+        }
+    }
+
+    let env = shell_env(vec![ScriptedResponse::End]);
+    let handle = env.manager.get_session(env.session).unwrap().unwrap();
+    let task_id = handle.task_id().unwrap();
+    let now = handle.now_ms();
+    let obligation = EngineeringContract::obligation_bound(
+        "the declared candidate holds the contract",
+        ProofEvidenceKind::ContractCheck,
+        ContractOrigin::User,
+        Requirement::Required,
+        EvidenceBinding::ContractIds(vec!["c-candidate".into()]),
+        AcceptedStrength::Supported,
+    );
+    handle
+        .create_task(faktor_session::Task {
+            task_id,
+            session_id: env.session,
+            goal: "subject identity".into(),
+            acceptance_criteria: vec![],
+            plan: vec![],
+            attachments: Vec::new(),
+            budget: Default::default(),
+            state: faktor_core::state::TaskState::Pending,
+            created_ms: now,
+            updated_ms: now,
+            contract: EngineeringContract {
+                proof_obligations: vec![obligation],
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+    let mut registry = VerificationRegistry::new();
+    registry.register(Arc::new(SubjectForgettingVerifier));
+    let dispatch = ContractProviderDispatch {
+        registry: &registry,
+        op_id: OpId::new(79),
+        cancellation: faktor_core::CancellationToken::new(),
+    };
+    let candidate = SubjectSnapshot::new("tm1:the-candidate").with_environment("env-1");
+    let outcome =
+        evaluate_and_persist_contract(&handle, &[], None, Some(&candidate), Some(&dispatch)).await;
+    // The omission is a typed refusal: the contract is not treated as
+    // evaluated and the verdict is never accepted.
+    let super::contract_eval::ContractGateOutcome::Unavailable(detail) = &outcome else {
+        panic!("expected an unavailable outcome, got {outcome:?}");
+    };
+    assert!(detail.contains("refused"), "{detail}");
+    assert!(detail.contains("subject"), "{detail}");
+
+    // NO proof state change: the claim stays unresolved, with no proof, no
+    // confidence and no evidence ref stamped from the foreign verdict.
+    let row = handle.get_task(task_id).unwrap().unwrap();
+    let stored = &row.contract.proof_obligations[0];
+    assert_eq!(
+        stored.state,
+        faktor_core::contract::ClaimState::Unknown,
+        "a refused verdict must never change the proof state"
+    );
+    assert!(stored.proofs.is_empty());
+    assert!(stored.evidence_refs.is_empty());
+    assert_eq!(stored.confidence_bps, None);
+
+    // A passing gate is blocked with the unavailable reason.
+    match apply_contract_outcome(super::CompletionGate::VerifiedComplete, outcome) {
+        super::CompletionGate::BlockedVerification { reasons } => {
+            assert!(reasons
+                .iter()
+                .any(|reason| reason.code == faktor_core::state::ReasonCode::CheckUnavailable));
+        }
+        other => panic!("expected a blocked gate, got {other:?}"),
+    }
+}
